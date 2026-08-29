@@ -1,0 +1,10 @@
+{
+  "name": "@oxideloop/react-renderer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": { "@oxideloop/sdk": "workspace:*", "react": "19.1.1", "react-reconciler": "0.31.0" },
+  "devDependencies": { "@types/react": "19.1.10", "@types/react-reconciler": "0.28.9", "typescript": "5.8.3" },
+  "scripts": { "typecheck": "tsc -p tsconfig.json" }
+}

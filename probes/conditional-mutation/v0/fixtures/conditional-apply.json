@@ -1,0 +1,45 @@
+{
+  "name": "matching identity uses conditional force-false apply",
+  "input": {
+    "probeVersion": "mutation-probe.oxideloop.dev/v0",
+    "qualification": {
+      "class": "nativeStructuralCrd",
+      "kubernetesMinor": "1.35",
+      "gvr": "example.io/v1/widgets",
+      "compatibilityManifest": "release-0.0.0-test"
+    },
+    "intent": {
+      "operation": "apply",
+      "observation": {
+        "state": "existing",
+        "identity": { "uid": "uid-1", "resourceVersion": "17" }
+      },
+      "expected": { "uid": "uid-1", "resourceVersion": "17" },
+      "fieldManager": "oxideloop.test",
+      "object": {
+        "apiVersion": "example.io/v1",
+        "kind": "Widget",
+        "metadata": { "name": "example" },
+        "spec": { "enabled": true }
+      }
+    }
+  },
+  "expected": {
+    "decision": "conditionalApply",
+    "method": "PATCH",
+    "contentType": "application/apply-patch+yaml",
+    "fieldManager": "oxideloop.test",
+    "force": false,
+    "expected": { "uid": "uid-1", "resourceVersion": "17" },
+    "body": {
+      "apiVersion": "example.io/v1",
+      "kind": "Widget",
+      "metadata": {
+        "name": "example",
+        "uid": "uid-1",
+        "resourceVersion": "17"
+      },
+      "spec": { "enabled": true }
+    }
+  }
+}

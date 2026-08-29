@@ -1,0 +1,18 @@
+import React from "react";
+import { createOxideLoopRoot } from "@oxideloop/react-renderer";
+import { jsx } from "@oxideloop/react-like-runtime/jsx-runtime";
+import { createRenderer } from "@oxideloop/react-like-runtime";
+import { ReactWorkload, Workload } from "./workload.js";
+import { withHookEnvironment } from "@oxideloop/sdk/hooks";
+const root = createOxideLoopRoot();
+withHookEnvironment({ read: ref => ({ ref: { ...ref, namespace: ref.namespace ?? "default" }, present: true, value: { ...ref, spec: {}, uid: "svc-1", resourceVersion: "7" } as never, observation: { uid: "svc-1", resourceVersion: "7" } }) }, () => root.render(React.createElement(ReactWorkload, { name: "api" })));
+await new Promise(resolve => setTimeout(resolve, 0));
+if (root.snapshot()[0]?.type !== "Deployment") throw new Error("React renderer did not produce Deployment");
+if (JSON.stringify(root.trace().dependencies) !== JSON.stringify([{ type: "object", apiVersion: "v1", kind: "Service", namespace: "default", name: "api-service", uid: "svc-1", resourceVersion: "7" }])) throw new Error("present dependency identity changed");
+const element = jsx(Workload, { name: "api" });
+const output = withHookEnvironment({ read: ref => ({ ref: { ...ref, namespace: ref.namespace ?? "default" }, present: false, value: undefined as never, observation: { uid: null, resourceVersion: null } }) }, () => createRenderer().render(element));
+if (output.resources.length !== 1) throw new Error("React-like runtime did not produce one resource");
+const dependency = output.dependencies[0];
+if (JSON.stringify(dependency) !== JSON.stringify({ type: "object", apiVersion: "v1", kind: "Service", namespace: "default", name: "api-service", uid: null, resourceVersion: null })) throw new Error("dependency identity or absence semantics changed");
+if (output.dependencies.length !== 1) throw new Error("repeated reads must deduplicate deterministically");
+console.log("runtime matrix: react=ok react-like=ok hook-phase=ok");

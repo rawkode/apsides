@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "abiVersion": {
+      "type": "string"
+    },
+    "automationIdentity": {
+      "type": "string"
+    },
+    "eventMetadata": true,
+    "occurrenceId": {
+      "type": "string"
+    },
+    "sourceResourceVersion": {
+      "type": "string"
+    },
+    "sourceUid": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "abiVersion",
+    "automationIdentity",
+    "occurrenceId",
+    "sourceUid",
+    "sourceResourceVersion",
+    "eventMetadata"
+  ],
+  "title": "ActionInputV0",
+  "type": "object"
+}

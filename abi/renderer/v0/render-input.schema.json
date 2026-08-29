@@ -1,0 +1,109 @@
+{
+  "$defs": {
+    "Observation": {
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "namespace": {
+          "type": "string"
+        },
+        "resourceVersion": {
+          "type": "string"
+        },
+        "uid": {
+          "type": "string"
+        },
+        "value": true
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "namespace",
+        "name",
+        "uid",
+        "resourceVersion",
+        "value"
+      ],
+      "type": "object"
+    },
+    "RootProjection": {
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "type": "string"
+        },
+        "generation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "namespace": {
+          "type": "string"
+        },
+        "spec": true,
+        "uid": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "namespace",
+        "name",
+        "uid",
+        "generation",
+        "spec"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "abiVersion": {
+      "type": "string"
+    },
+    "bundleDigest": {
+      "type": "string"
+    },
+    "cacheEpoch": {
+      "type": "string"
+    },
+    "observationToken": {
+      "type": "string"
+    },
+    "observations": {
+      "items": {
+        "$ref": "#/$defs/Observation"
+      },
+      "type": "array"
+    },
+    "root": {
+      "$ref": "#/$defs/RootProjection"
+    }
+  },
+  "required": [
+    "abiVersion",
+    "root",
+    "bundleDigest",
+    "cacheEpoch",
+    "observationToken",
+    "observations"
+  ],
+  "title": "RenderInputV0",
+  "type": "object"
+}

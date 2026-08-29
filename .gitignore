@@ -1,0 +1,7 @@
+/target/
+/node_modules/
+/packages/*/node_modules/
+/packages/fixtures/dist/
+/work/
+*.log
+.DS_Store

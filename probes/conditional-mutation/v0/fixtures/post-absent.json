@@ -1,0 +1,31 @@
+{
+  "name": "absent built-in object uses POST",
+  "input": {
+    "probeVersion": "mutation-probe.oxideloop.dev/v0",
+    "qualification": {
+      "class": "builtInTested",
+      "kubernetesMinor": "1.35",
+      "gvr": "v1/configmaps"
+    },
+    "intent": {
+      "operation": "create",
+      "observation": { "state": "absent" },
+      "object": {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": { "name": "example" },
+        "data": { "message": "hello" }
+      }
+    }
+  },
+  "expected": {
+    "decision": "post",
+    "method": "POST",
+    "body": {
+      "apiVersion": "v1",
+      "kind": "ConfigMap",
+      "metadata": { "name": "example" },
+      "data": { "message": "hello" }
+    }
+  }
+}

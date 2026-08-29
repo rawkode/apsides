@@ -1,0 +1,391 @@
+{
+  "$defs": {
+    "BackendQualification": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "class": {
+              "const": "builtInTested",
+              "type": "string"
+            },
+            "gvr": {
+              "type": "string"
+            },
+            "kubernetesMinor": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "class",
+            "kubernetesMinor",
+            "gvr"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "class": {
+              "const": "nativeStructuralCrd",
+              "type": "string"
+            },
+            "compatibilityManifest": {
+              "type": "string"
+            },
+            "gvr": {
+              "type": "string"
+            },
+            "kubernetesMinor": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "class",
+            "kubernetesMinor",
+            "gvr",
+            "compatibilityManifest"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "class": {
+              "const": "unsupported",
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "class",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "HttpMethod": {
+      "enum": [
+        "POST",
+        "PATCH",
+        "DELETE"
+      ],
+      "type": "string"
+    },
+    "MutationDecision": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "body": true,
+            "decision": {
+              "const": "post",
+              "type": "string"
+            },
+            "method": {
+              "$ref": "#/$defs/HttpMethod"
+            }
+          },
+          "required": [
+            "decision",
+            "method",
+            "body"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "body": true,
+            "contentType": {
+              "type": "string"
+            },
+            "decision": {
+              "const": "conditionalApply",
+              "type": "string"
+            },
+            "expected": {
+              "$ref": "#/$defs/ObjectIdentity"
+            },
+            "fieldManager": {
+              "type": "string"
+            },
+            "force": {
+              "type": "boolean"
+            },
+            "method": {
+              "$ref": "#/$defs/HttpMethod"
+            }
+          },
+          "required": [
+            "decision",
+            "method",
+            "contentType",
+            "fieldManager",
+            "force",
+            "expected",
+            "body"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "decision": {
+              "const": "preconditionedDelete",
+              "type": "string"
+            },
+            "method": {
+              "$ref": "#/$defs/HttpMethod"
+            },
+            "preconditions": {
+              "$ref": "#/$defs/ObjectIdentity"
+            }
+          },
+          "required": [
+            "decision",
+            "method",
+            "preconditions"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "decision": {
+              "const": "refetchNoAdopt",
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "decision",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "decision": {
+              "const": "conflict",
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "decision",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "decision": {
+              "const": "hold",
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "decision",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "MutationIntent": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "object": true,
+            "observation": {
+              "$ref": "#/$defs/Observation"
+            },
+            "operation": {
+              "const": "create",
+              "type": "string"
+            }
+          },
+          "required": [
+            "operation",
+            "observation",
+            "object"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "expected": {
+              "$ref": "#/$defs/ObjectIdentity"
+            },
+            "fieldManager": {
+              "type": "string"
+            },
+            "object": true,
+            "observation": {
+              "$ref": "#/$defs/Observation"
+            },
+            "operation": {
+              "const": "apply",
+              "type": "string"
+            }
+          },
+          "required": [
+            "operation",
+            "observation",
+            "expected",
+            "fieldManager",
+            "object"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "expected": {
+              "$ref": "#/$defs/ObjectIdentity"
+            },
+            "observation": {
+              "$ref": "#/$defs/Observation"
+            },
+            "operation": {
+              "const": "delete",
+              "type": "string"
+            }
+          },
+          "required": [
+            "operation",
+            "observation",
+            "expected"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "createConflict",
+              "type": "string"
+            },
+            "refetched": {
+              "$ref": "#/$defs/Observation"
+            },
+            "requestedName": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "operation",
+            "requestedName",
+            "refetched"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "MutationPlanInputV0": {
+      "additionalProperties": false,
+      "properties": {
+        "intent": {
+          "$ref": "#/$defs/MutationIntent"
+        },
+        "probeVersion": {
+          "type": "string"
+        },
+        "qualification": {
+          "$ref": "#/$defs/BackendQualification"
+        }
+      },
+      "required": [
+        "probeVersion",
+        "qualification",
+        "intent"
+      ],
+      "type": "object"
+    },
+    "ObjectIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "resourceVersion": {
+          "type": "string"
+        },
+        "uid": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "uid",
+        "resourceVersion"
+      ],
+      "type": "object"
+    },
+    "Observation": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "const": "absent",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "identity": {
+              "$ref": "#/$defs/ObjectIdentity"
+            },
+            "state": {
+              "const": "existing",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "identity"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "expected": {
+      "$ref": "#/$defs/MutationDecision"
+    },
+    "input": {
+      "$ref": "#/$defs/MutationPlanInputV0"
+    },
+    "name": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "input",
+    "expected"
+  ],
+  "title": "ProbeCaseV0",
+  "type": "object"
+}
