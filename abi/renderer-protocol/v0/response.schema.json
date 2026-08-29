@@ -1,0 +1,105 @@
+{
+  "$defs": {
+    "ErrorCategoryV0": {
+      "enum": [
+        "invalidInput",
+        "guestFailure",
+        "bundleUnavailable",
+        "deadlineExceeded",
+        "heapLimit",
+        "memoryKilled",
+        "processLost",
+        "integrityFailure",
+        "internal",
+        "protocolViolation"
+      ],
+      "type": "string"
+    },
+    "PhaseV0": {
+      "enum": [
+        "descriptor",
+        "render",
+        "action"
+      ],
+      "type": "string"
+    },
+    "RequestIdV0": {
+      "properties": {
+        "bytes": {
+          "items": {
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 16,
+          "minItems": 16,
+          "type": "array"
+        }
+      },
+      "required": [
+        "bytes"
+      ],
+      "type": "object"
+    },
+    "ResponseStatusV0": {
+      "enum": [
+        "ok",
+        "recoverable",
+        "fatal",
+        "protocol"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "bundleDigest": {
+      "type": "string"
+    },
+    "errorCategory": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ErrorCategoryV0"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "moduleDigest": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "payload": {
+      "items": {
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "type": "array"
+    },
+    "phase": {
+      "$ref": "#/$defs/PhaseV0"
+    },
+    "requestId": {
+      "$ref": "#/$defs/RequestIdV0"
+    },
+    "status": {
+      "$ref": "#/$defs/ResponseStatusV0"
+    }
+  },
+  "required": [
+    "requestId",
+    "phase",
+    "bundleDigest",
+    "status",
+    "payload"
+  ],
+  "title": "ResponseV0",
+  "type": "object"
+}

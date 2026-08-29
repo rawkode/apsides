@@ -1,0 +1,165 @@
+{
+  "$defs": {
+    "BundleIntegrityManifestV0": {
+      "additionalProperties": false,
+      "description": "The only canonical integrity root for an installed v0 bundle.\n\n`bundleDigest` deliberately does not appear here: it is SHA-256 over the\ncanonical JSON bytes of this document and lives in the outer install record.",
+      "properties": {
+        "actionModules": {
+          "items": {
+            "$ref": "#/$defs/ModuleIntegrityV0"
+          },
+          "type": "array"
+        },
+        "bundler": {
+          "$ref": "#/$defs/ToolIdentityV0"
+        },
+        "compiler": {
+          "$ref": "#/$defs/ToolIdentityV0"
+        },
+        "descriptor": {
+          "$ref": "#/$defs/FileIntegrityV0"
+        },
+        "manifestVersion": {
+          "type": "string"
+        },
+        "phaseModules": {
+          "items": {
+            "$ref": "#/$defs/PhaseModuleV0"
+          },
+          "type": "array"
+        },
+        "renderModules": {
+          "items": {
+            "$ref": "#/$defs/ModuleIntegrityV0"
+          },
+          "type": "array"
+        },
+        "rendererAbiVersion": {
+          "type": "string"
+        },
+        "sourceMaps": {
+          "items": {
+            "$ref": "#/$defs/FileIntegrityV0"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "manifestVersion",
+        "compiler",
+        "bundler",
+        "rendererAbiVersion",
+        "descriptor",
+        "renderModules",
+        "actionModules",
+        "sourceMaps",
+        "phaseModules"
+      ],
+      "type": "object"
+    },
+    "ExecutionPhaseV0": {
+      "enum": [
+        "descriptor",
+        "render",
+        "action"
+      ],
+      "type": "string"
+    },
+    "FileIntegrityV0": {
+      "additionalProperties": false,
+      "properties": {
+        "length": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "length",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "ModuleIntegrityV0": {
+      "additionalProperties": false,
+      "properties": {
+        "identity": {
+          "type": "string"
+        },
+        "length": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "identity",
+        "path",
+        "length",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "PhaseModuleV0": {
+      "additionalProperties": false,
+      "properties": {
+        "moduleIdentity": {
+          "type": "string"
+        },
+        "phase": {
+          "$ref": "#/$defs/ExecutionPhaseV0"
+        }
+      },
+      "required": [
+        "phase",
+        "moduleIdentity"
+      ],
+      "type": "object"
+    },
+    "ToolIdentityV0": {
+      "additionalProperties": false,
+      "properties": {
+        "identity": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "identity",
+        "version"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "bundleDigest": {
+      "type": "string"
+    },
+    "manifest": {
+      "$ref": "#/$defs/BundleIntegrityManifestV0"
+    }
+  },
+  "required": [
+    "bundleDigest",
+    "manifest"
+  ],
+  "title": "BundleInstallRecordV0",
+  "type": "object"
+}
