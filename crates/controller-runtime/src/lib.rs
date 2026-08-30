@@ -2,8 +2,13 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc, clippy::must_use_candidate)]
 
+#[cfg(all(feature = "test-failpoints", not(debug_assertions)))]
+compile_error!("the test-failpoints feature is only available in debug builds");
+
 mod adapters;
 mod engine;
+#[cfg(feature = "test-failpoints")]
+pub mod failpoint_uds;
 pub use adapters::{
     KubeAutomationPortV0, KubeFixedPointPortV0, UnixRendererPortV0, desired_observation,
 };
@@ -24,7 +29,7 @@ use oxideloop_controller_api::{
     WebApplicationSpec, WebApplicationStatus,
 };
 use oxideloop_controller_core::{
-    CommandV0, EventV0, MachineStateV0, PhaseV0, RootSnapshotV0, reduce,
+    CommandV0, EventV0, InternalReconcileCauseV0, MachineStateV0, PhaseV0, RootSnapshotV0, reduce,
 };
 use oxideloop_event_planner::{
     ObjectRef as PlannerObjectRefV0, PlannedEventV0, PlannerError, RunCorrelationV0, plan_event,
@@ -117,9 +122,10 @@ pub struct FailpointsV0 {
 
 impl FailpointsV0 {
     pub fn arm(&mut self, point: FailpointV0) -> Result<(), RuntimeErrorV0> {
-        if self.armed.replace(point).is_some() {
+        if self.armed.is_some() {
             return Err(RuntimeErrorV0::Hold("a failpoint is already armed".into()));
         }
+        self.armed = Some(point);
         Ok(())
     }
 
@@ -335,6 +341,7 @@ impl RootActorV0 {
         self.last_dependency_observation = Some(fingerprint);
         self.barrier.generation = self.barrier.generation.saturating_add(1);
         self.enqueue_observation(EventV0::ReconcileRequested {
+            cause: InternalReconcileCauseV0::DependencyWatch,
             observation_token,
             cache_epoch,
         });
@@ -547,7 +554,9 @@ pub fn root_snapshot_from_object(
     Ok(RootSnapshotV0 {
         uid: object.metadata.uid.clone(),
         namespace: namespace.into(),
+        name: name.into(),
         generation,
+        spec: spec.clone(),
         bundle_digest: spec.program.digest,
         status,
         state_name: state
@@ -1432,6 +1441,7 @@ pub async fn drive_automation<P: AutomationPortV0, R: RendererPortV0>(
         ));
     }
     Ok(EventV0::AutomationCompleted {
+        spec: spec.clone(),
         occurrence_id: spec.occurrence_id.clone(),
         name: execution.run.identity.name.clone(),
         uid: ack.uid,
@@ -1487,7 +1497,8 @@ mod tests {
     use oxideloop_controller_api::{
         ApplyOutcome, ApplyResult, AutomationPending, DeletionTransaction,
         GenerationAdvanceClosurePurpose, InventoryEntry, OxideLoopStateSpec, PersistPurpose,
-        RootBinding, StateBody, StateLink, WebApplicationStatus, bootstrap_id,
+        ProgramBundleReference, RootBinding, StateBody, StateLink, WebApplicationSpec,
+        WebApplicationStatus, bootstrap_id,
     };
     use oxideloop_controller_core::{
         ActionTriggerV0, AutomationRunCleanupV0, DesiredObservationV0, FrozenInputV0,
@@ -1498,6 +1509,18 @@ mod tests {
     use oxideloop_renderer_abi::model::{
         ABI_VERSION_V0, RenderDisposition, ResourceDeclaration, RootProjection,
     };
+
+    fn root_spec(digest: impl Into<String>) -> WebApplicationSpec {
+        WebApplicationSpec {
+            message: "hello".into(),
+            expose: false,
+            program: ProgramBundleReference {
+                config_map_name: "bundle".into(),
+                key: "program.mjs".into(),
+                digest: digest.into(),
+            },
+        }
+    }
     use oxideloop_renderer_abi::parse_validate_render_input;
 
     #[derive(Default)]
@@ -1522,7 +1545,7 @@ mod tests {
     fn loader_port_for_machine(machine: &MachineStateV0, state_rv: &str) -> LoaderPort {
         let root = machine.root();
         let mut root_metadata = serde_json::json!({
-            "name": "demo",
+            "name": root.name,
             "namespace": root.namespace,
             "uid": root.uid,
             "resourceVersion": root.root_resource_version,
@@ -1539,7 +1562,7 @@ mod tests {
         let root_ref = ObjectRefV0 {
             resource: ResourceKindV0::WebApplication,
             namespace: root.namespace.clone(),
-            name: "demo".into(),
+            name: root.name.clone(),
         };
         let root_object = ObjectV0 {
             reference: root_ref.clone(),
@@ -1553,15 +1576,7 @@ mod tests {
                 "apiVersion": "demo.oxideloop.dev/v1alpha1",
                 "kind": "WebApplication",
                 "metadata": root_metadata,
-                "spec": {
-                    "message": "demo",
-                    "expose": false,
-                    "program": {
-                        "configMapName": "bundle",
-                        "key": "program.mjs",
-                        "digest": root.bundle_digest,
-                    }
-                },
+                "spec": root.spec,
                 "status": root.status,
             }),
         };
@@ -1677,7 +1692,9 @@ mod tests {
             MachineStateV0::bootstrap(RootSnapshotV0 {
                 uid: "root-uid".into(),
                 namespace: "ns".into(),
+                name: "demo".into(),
                 generation: 1,
+                spec: root_spec("0".repeat(64)),
                 bundle_digest: "0".repeat(64),
                 status: WebApplicationStatus::default(),
                 state_name: String::new(),
@@ -1698,7 +1715,9 @@ mod tests {
             RootSnapshotV0 {
                 uid: "root-uid".into(),
                 namespace: "ns".into(),
+                name: "demo".into(),
                 generation: 7,
+                spec: root_spec("a".repeat(64)),
                 bundle_digest: "a".repeat(64),
                 status: WebApplicationStatus {
                     observed_generation: Some(7),
@@ -1756,9 +1775,9 @@ mod tests {
                 kind: "WebApplication".into(),
                 uid: "root-uid".into(),
                 namespace: "ns".into(),
-                name: "demo".into(),
+                name: render.state.root().name.clone(),
                 generation: 7,
-                spec: serde_json::json!({"program":{"digest":"a".repeat(64)}}),
+                spec: serde_json::to_value(&render.state.root().spec).unwrap(),
             },
             bundle_digest: "a".repeat(64),
             cache_epoch: "1".into(),
@@ -1771,6 +1790,7 @@ mod tests {
             state_resource_version: "state-rv-1".into(),
             observation_token: "observation-1".into(),
             cache_epoch: "1".into(),
+            final_observation_fence_token: "f".repeat(64),
             render_input_hash: parse_validate_render_input(&input).unwrap().sha256,
         };
         let identity = oxideloop_controller_api::ObjectIdentity {
@@ -1909,9 +1929,9 @@ mod tests {
                 kind: "WebApplication".into(),
                 uid: "root-uid".into(),
                 namespace: "ns".into(),
-                name: "demo".into(),
+                name: render.state.root().name.clone(),
                 generation: 7,
-                spec: serde_json::json!({"program":{"digest":"a".repeat(64)}}),
+                spec: serde_json::to_value(&render.state.root().spec).unwrap(),
             },
             bundle_digest: "a".repeat(64),
             cache_epoch: "1".into(),
@@ -1924,6 +1944,7 @@ mod tests {
             state_resource_version: "state-rv-1".into(),
             observation_token: "observation-1".into(),
             cache_epoch: "1".into(),
+            final_observation_fence_token: "f".repeat(64),
             render_input_hash: parse_validate_render_input(&input).unwrap().sha256,
         };
         let output = serde_json::to_string(&RenderOutputV0 {
@@ -2017,12 +2038,17 @@ mod tests {
 
     fn automation_completion_pending() -> (MachineStateV0, EventV0) {
         let (machine, ensured) = automation_ensure_pending();
+        let spec = match &ensured {
+            EventV0::AutomationRunEnsured { spec, .. } => spec.clone(),
+            _ => panic!("expected automation ensure acknowledgement"),
+        };
         let pending = reduce(machine, ensured).unwrap();
         let ready = acknowledge_persist(pending, "state-rv-5");
         let run = ready.state.journal().state.automation.pending[0].clone();
         (
             ready.state,
             EventV0::AutomationCompleted {
+                spec,
                 occurrence_id: run.occurrence_id,
                 name: run.run_name,
                 uid: run.run_uid,
@@ -2124,6 +2150,7 @@ mod tests {
             run_name: "ol-run-one".into(),
             run_uid: "run-uid".into(),
             run_resource_version: "run-rv-1".into(),
+            spec_hash: "a".repeat(64),
         };
         let prepared = reduce(
             deleting_machine(vec![], vec![pending.clone()]),
@@ -2274,9 +2301,9 @@ mod tests {
                 kind: "WebApplication".into(),
                 uid: root.uid.clone(),
                 namespace: root.namespace.clone(),
-                name: "demo".into(),
+                name: root.name.clone(),
                 generation: u64::try_from(root.generation).unwrap(),
-                spec: serde_json::json!({"program":{"digest":root.bundle_digest}}),
+                spec: serde_json::to_value(&root.spec).unwrap(),
             },
             bundle_digest: root.bundle_digest.clone(),
             cache_epoch: "1".into(),
@@ -2305,6 +2332,9 @@ mod tests {
                 state_resource_version: state_resource_version.into(),
                 observation_token: observation_token.into(),
                 cache_epoch: "1".into(),
+                final_observation_fence_token: oxideloop_renderer_abi::sha256_hex(
+                    format!("prune-final-fence/v0/{observation_token}").as_bytes(),
+                ),
                 render_input_hash: parse_validate_render_input(&input).unwrap().sha256,
             },
             input,
@@ -2626,6 +2656,7 @@ mod tests {
 
         // A genuinely new observation token supplies the second prune barrier.
         actor.enqueue(EventV0::ReconcileRequested {
+            cause: InternalReconcileCauseV0::PruneConfirmation,
             observation_token: "observation-2".into(),
             cache_epoch: "1".into(),
         });
@@ -2816,7 +2847,9 @@ mod tests {
         RootSnapshotV0 {
             uid: "root-uid".into(),
             namespace: "ns".into(),
+            name: "demo".into(),
             generation: 3,
+            spec: root_spec("0".repeat(64)),
             bundle_digest: "0".repeat(64),
             status: WebApplicationStatus {
                 deletion_cleanup_receipt: Some(oxideloop_controller_api::DeletionCleanupReceipt {
@@ -3153,6 +3186,8 @@ mod tests {
         assert!(!right.take(FailpointV0::AfterEventBeforeStatus));
         right.arm(FailpointV0::AfterStatusBeforeAck).unwrap();
         assert!(right.arm(FailpointV0::AfterEventBeforeStatus).is_err());
+        assert!(right.take(FailpointV0::AfterStatusBeforeAck));
+        assert!(!right.take(FailpointV0::AfterEventBeforeStatus));
     }
 
     #[test]

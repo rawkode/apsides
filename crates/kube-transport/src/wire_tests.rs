@@ -14,7 +14,7 @@ use http::{Method, Request, Response, StatusCode};
 use kube::{Client, client::Body};
 use oxideloop_controller_api::{
     AutomationRunCompletion, AutomationRunCompletionState, AutomationRunSpec, AutomationRunStatus,
-    ObjectIdentity,
+    ObjectIdentity, ProgramBundleReference,
 };
 use oxideloop_controller_core::{CommandV0, MutationCommandV0, PreconditionsV0};
 use oxideloop_event_planner::{
@@ -251,7 +251,12 @@ fn automation_spec() -> AutomationRunSpec {
         source_transition_id: input_document.source_transition_id,
         automation_id: input_document.automation_identity,
         automation_version: input_document.automation_version,
-        bundle_digest: input_document.bundle_digest,
+        bundle_digest: input_document.bundle_digest.clone(),
+        program: ProgramBundleReference {
+            config_map_name: "bundle".into(),
+            key: "program.mjs".into(),
+            digest: input_document.bundle_digest,
+        },
         action_module_identity: input_document.action_module_identity,
         action_module_digest: input_document.action_module_digest,
         renderer_abi_version: input_document.abi_version,

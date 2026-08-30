@@ -2504,6 +2504,7 @@ dependencies = [
  "oxideloop-renderer-abi",
  "oxideloop-renderer-client",
  "oxideloop-renderer-protocol",
+ "rustix 1.1.4",
  "serde_json",
  "thiserror",
  "tokio",

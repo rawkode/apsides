@@ -68,6 +68,29 @@ spec:
                 maxLength: 253
                 minLength: 1
                 type: string
+              program:
+                description: |-
+                  Exact ConfigMap/key/digest authority for fetching the immutable action
+                  program. The digest is required to equal `bundleDigest`.
+                properties:
+                  configMapName:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  digest:
+                    maxLength: 64
+                    minLength: 64
+                    pattern: ^[0-9a-f]{64}$
+                    type: string
+                  key:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                required:
+                - configMapName
+                - digest
+                - key
+                type: object
               rendererAbiVersion:
                 description: ABI version pinned independently of the replay payload for indexing and admission.
                 maxLength: 128
@@ -124,6 +147,7 @@ spec:
             - bundleDigest
             - eventMetadataHash
             - occurrenceId
+            - program
             - rendererAbiVersion
             - rootUid
             - source
@@ -171,6 +195,7 @@ spec:
         type: object
         x-kubernetes-validations:
         - rule: self.spec == oldSelf.spec
+        - rule: self.spec.program.digest == self.spec.bundleDigest
     served: true
     storage: true
     subresources:
@@ -592,6 +617,16 @@ spec:
                               - name
                               - namespace
                               type: object
+                            specHash:
+                              description: |-
+                                SHA-256 of the canonical complete immutable `AutomationRunSpec`.
+
+                                This field is intentionally required without a migration path: the
+                                v1alpha1 durable layout is supported for fresh clusters only.
+                              maxLength: 64
+                              minLength: 64
+                              pattern: ^[0-9a-f]{64}$
+                              type: string
                           required:
                           - automationId
                           - occurrenceId
@@ -599,6 +634,7 @@ spec:
                           - runResourceVersion
                           - runUid
                           - source
+                          - specHash
                           type: object
                         maxItems: 1024
                         type: array
@@ -923,7 +959,9 @@ spec:
                       firstObservation:
                         properties:
                           barrierToken:
-                            description: Exact list/watch/reread barrier which produced this observation.
+                            description: |-
+                              Exact completed final-observation fence which produced this
+                              observation. This is not the global renderer observation token.
                             maxLength: 253
                             minLength: 1
                             type: string
@@ -993,7 +1031,9 @@ spec:
                         nullable: true
                         properties:
                           barrierToken:
-                            description: Exact list/watch/reread barrier which produced this observation.
+                            description: |-
+                              Exact completed final-observation fence which produced this
+                              observation. This is not the global renderer observation token.
                             maxLength: 253
                             minLength: 1
                             type: string

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use oxideloop_bundle_contract::{BundleDescriptorV0, DescriptorModuleV0};
 use oxideloop_controller_api::{
     AutomationRunCompletion, AutomationRunCompletionState, AutomationRunSpec, AutomationRunStatus,
-    ObjectIdentity as ApiObjectIdentity, automation_run_name,
+    ObjectIdentity as ApiObjectIdentity, ProgramBundleReference, automation_run_name,
 };
 use oxideloop_controller_core::EventV0;
 use oxideloop_controller_runtime::{
@@ -207,6 +207,11 @@ fn spec(occurrence_id: &str) -> AutomationRunSpec {
         automation_id: "input-changed".into(),
         automation_version: "v1".into(),
         bundle_digest: BUNDLE_DIGEST.into(),
+        program: ProgramBundleReference {
+            config_map_name: "bundle".into(),
+            key: "program.mjs".into(),
+            digest: BUNDLE_DIGEST.into(),
+        },
         action_module_identity: "actions/input-changed.mjs".into(),
         action_module_digest: ACTION_DIGEST.into(),
         renderer_abi_version: ABI_VERSION_V0.into(),
@@ -366,6 +371,7 @@ fn planned_event(spec: &AutomationRunSpec) -> PlannedEventV0 {
 
 fn expected_completion(spec: &AutomationRunSpec) -> EventV0 {
     EventV0::AutomationCompleted {
+        spec: spec.clone(),
         occurrence_id: spec.occurrence_id.clone(),
         name: automation_run_name(&spec.root_uid, &spec.occurrence_id).expect("run name"),
         uid: "automation-run-uid".into(),

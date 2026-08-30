@@ -22,8 +22,8 @@ use oxideloop_controller_api::{
     GenerationAdvanceClosurePurpose, InventoryEntry, MAX_ACTION_INPUT_CANONICAL_BYTES,
     MAX_CLOSURE_REBASES, MAX_IDENTIFIER_BYTES, MAX_LIST_ENTRIES, ObjectIdentity,
     OxideLoopStateSpec, PersistOperation, PersistPurpose, PreparedRecoveryClaim, PruneCandidate,
-    PruneObservation, StateBody, WebApplicationStatus, automation_run_name, bootstrap_id,
-    state_name, validate_automation_run_name, validate_root_state_link,
+    PruneObservation, StateBody, WebApplicationSpec, WebApplicationStatus, automation_run_name,
+    bootstrap_id, state_name, validate_automation_run_name, validate_root_state_link,
 };
 use oxideloop_mutation_model::{
     BackendQualification, HttpMethod, MutationDecision, MutationIntent, MutationPlanInputV0,
@@ -46,7 +46,12 @@ const MAX_AUTOMATION_ATTEMPTS: u16 = 32;
 pub struct RootSnapshotV0 {
     pub uid: String,
     pub namespace: String,
+    /// Immutable Kubernetes object name for the observed root UID.
+    pub name: String,
     pub generation: i64,
+    /// Exact validated authored spec projected to the renderer and used to
+    /// authorize program source fetches.
+    pub spec: WebApplicationSpec,
     pub bundle_digest: String,
     pub status: WebApplicationStatus,
     pub state_name: String,
@@ -67,6 +72,10 @@ pub struct FrozenInputV0 {
     pub state_resource_version: String,
     pub observation_token: String,
     pub cache_epoch: String,
+    /// Exact completed final-observation fence used for destructive prune
+    /// confirmation. It is intentionally distinct from the renderer's
+    /// global observation token, which may advance for unrelated changes.
+    pub final_observation_fence_token: String,
     pub render_input_hash: String,
 }
 
@@ -428,6 +437,15 @@ pub struct ActionTriggerV0 {
     pub event_metadata: Value,
 }
 
+/// Internal reason for a root-local render request. This is deliberately
+/// separate from renderer observation tokens: a prune confirmation must not
+/// manufacture a source transition for an automation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InternalReconcileCauseV0 {
+    DependencyWatch,
+    PruneConfirmation,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum EventV0 {
@@ -439,6 +457,7 @@ pub enum EventV0 {
     },
     /// Token-only dependency/prune wakeup. It never carries root authority.
     ReconcileRequested {
+        cause: InternalReconcileCauseV0,
         observation_token: String,
         cache_epoch: String,
     },
@@ -500,6 +519,9 @@ pub enum EventV0 {
         resource_version: String,
     },
     AutomationCompleted {
+        /// The exact immutable spec reread with the completed status. The
+        /// reducer canonicalizes it before accepting the durable pending run.
+        spec: AutomationRunSpec,
         occurrence_id: String,
         name: String,
         uid: String,
@@ -741,9 +763,16 @@ pub fn reduce(mut state: MachineStateV0, event: EventV0) -> Result<TransitionV0,
         EventV0::Start => start(&mut state, &mut commands),
         EventV0::RootRefreshed { root } => root_refreshed(&mut state, root, &mut commands)?,
         EventV0::ReconcileRequested {
+            cause,
             observation_token,
             cache_epoch,
-        } => reconcile_requested(&mut state, &observation_token, &cache_epoch, &mut commands),
+        } => reconcile_requested(
+            &mut state,
+            cause,
+            &observation_token,
+            &cache_epoch,
+            &mut commands,
+        ),
         EventV0::BootstrapAcknowledged {
             token,
             state_name,
@@ -911,6 +940,7 @@ pub fn reduce(mut state: MachineStateV0, event: EventV0) -> Result<TransitionV0,
             &mut commands,
         )?,
         EventV0::AutomationCompleted {
+            spec,
             occurrence_id,
             name,
             uid,
@@ -922,6 +952,7 @@ pub fn reduce(mut state: MachineStateV0, event: EventV0) -> Result<TransitionV0,
             materialization_uid,
         } => automation_completed(
             &mut state,
+            &spec,
             occurrence_id,
             name,
             uid,
@@ -1137,6 +1168,9 @@ fn root_refresh_compatible(
     if root.namespace != state.root.namespace {
         return Err("fresh root namespace changed");
     }
+    if root.name != state.root.name {
+        return Err("fresh root name changed");
+    }
     if !state.root.state_name.is_empty()
         && (root.state_name != state.root.state_name || root.state_uid != state.root.state_uid)
     {
@@ -1145,6 +1179,9 @@ fn root_refresh_compatible(
     let deleting = state.journal.state.deletion.is_some() || state.root.deleting || root.deleting;
     if !deleting && root.bundle_digest != state.root.bundle_digest {
         return Err("nondeleting root changed immutable bundle digest");
+    }
+    if !deleting && root.spec.program != state.root.spec.program {
+        return Err("nondeleting root changed immutable program reference");
     }
     Ok(())
 }
@@ -1325,6 +1362,7 @@ fn root_refreshed(
 
 fn reconcile_requested(
     state: &mut MachineStateV0,
+    cause: InternalReconcileCauseV0,
     observation_token: &str,
     cache_epoch: &str,
     commands: &mut Vec<CommandV0>,
@@ -1340,6 +1378,10 @@ fn reconcile_requested(
     if state.phase != PhaseV0::Ready || state.root.deleting {
         stale(commands, "dependency reconcile request phase mismatch");
         return;
+    }
+    match cause {
+        InternalReconcileCauseV0::DependencyWatch | InternalReconcileCauseV0::PruneConfirmation => {
+        }
     }
     state.phase = PhaseV0::RenderPending;
     let mut preconditions = pins(&state.root);
@@ -3356,6 +3398,7 @@ fn trigger_automation(
         automation_id: trigger.automation_identity,
         automation_version: trigger.automation_version,
         bundle_digest: state.root.bundle_digest.clone(),
+        program: state.root.spec.program.clone(),
         action_module_identity: trigger.action_module_identity,
         action_module_digest: trigger.action_module_digest,
         renderer_abi_version: oxideloop_renderer_abi::model::ABI_VERSION_V0.into(),
@@ -3530,6 +3573,7 @@ fn automation_ensured(
             "automation baseline disappeared".into(),
         ));
     };
+    let spec_hash = automation_run_spec_hash(spec)?;
     item.token = pending.next_baseline_token;
     state
         .journal
@@ -3543,6 +3587,7 @@ fn automation_ensured(
             run_name: name.into(),
             run_uid: uid.into(),
             run_resource_version: rv.into(),
+            spec_hash,
         });
     sort_automation(state);
     state.runtime.pending_automation = None;
@@ -3555,9 +3600,24 @@ fn automation_ensured(
     )
 }
 
+/// Hashes the complete immutable run specification, rather than a selected
+/// subset of its fields. This durable authentication value intentionally has
+/// no migration path because older pending records cannot prove which source
+/// program authority was used.
+fn automation_run_spec_hash(spec: &AutomationRunSpec) -> Result<String, ReconcileError> {
+    spec.validate()
+        .map_err(|error| ReconcileError::Automation(error.to_string()))?;
+    let value = serde_json::to_value(spec)
+        .map_err(|error| ReconcileError::Automation(error.to_string()))?;
+    let bytes =
+        canonical_bytes(&value).map_err(|error| ReconcileError::Automation(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn automation_completed(
     state: &mut MachineStateV0,
+    spec: &AutomationRunSpec,
     occurrence: String,
     name: String,
     uid: String,
@@ -3569,22 +3629,14 @@ fn automation_completed(
     materialization_uid: String,
     commands: &mut Vec<CommandV0>,
 ) -> Result<(), ReconcileError> {
-    if state.phase != PhaseV0::Ready
-        || attempts == 0
-        || attempts > MAX_AUTOMATION_ATTEMPTS
-        || name.is_empty()
-        || uid.is_empty()
-        || old_rv.is_empty()
-        || new_rv.is_empty()
-        || old_rv == new_rv
-        || materialization_name.is_empty()
-        || materialization_uid.is_empty()
-        || name == materialization_name
-        || uid == materialization_uid
-    {
+    if state.phase != PhaseV0::Ready {
         stale(commands, "automation completion phase/bounds mismatch");
         return Ok(());
     }
+    // A stale completion owns no current pending record.  Its complete spec is
+    // therefore untrusted data and must not be parsed or validated before this
+    // exact correlation check: a foreign malformed object cannot poison the
+    // active occurrence by driving it to Hold.
     let Some(index) = state
         .journal
         .state
@@ -3604,6 +3656,52 @@ fn automation_completed(
         );
         return Ok(());
     };
+    if attempts == 0
+        || attempts > MAX_AUTOMATION_ATTEMPTS
+        || name.is_empty()
+        || uid.is_empty()
+        || old_rv.is_empty()
+        || new_rv.is_empty()
+        || old_rv == new_rv
+        || materialization_name.is_empty()
+        || materialization_uid.is_empty()
+        || name == materialization_name
+        || uid == materialization_uid
+    {
+        stale(commands, "automation completion phase/bounds mismatch");
+        return Ok(());
+    }
+    let supplied_spec_hash = match automation_run_spec_hash(spec) {
+        Ok(hash) => hash,
+        Err(reason) => {
+            state.phase = PhaseV0::Hold;
+            commands.push(CommandV0::Hold {
+                reason: format!("completed AutomationRun spec is invalid: {reason}"),
+            });
+            return Ok(());
+        }
+    };
+    if validate_automation_run_name(&name, spec).is_err()
+        || spec.occurrence_id != occurrence
+        || spec.root_uid != state.root.uid
+    {
+        state.phase = PhaseV0::Hold;
+        commands.push(CommandV0::Hold {
+            reason: "completed AutomationRun spec identity is invalid".into(),
+        });
+        return Ok(());
+    }
+    let pending = &state.journal.state.automation.pending[index];
+    if pending.spec_hash != supplied_spec_hash
+        || spec.automation_id != pending.automation_id
+        || spec.source != pending.source
+    {
+        state.phase = PhaseV0::Hold;
+        commands.push(CommandV0::Hold {
+            reason: "completed AutomationRun spec hash does not match pending occurrence".into(),
+        });
+        return Ok(());
+    }
     let outcome = match completion {
         AutomationRunCompletionState::Succeeded => AutomationCompletionOutcome::Succeeded,
         AutomationRunCompletionState::Failed => AutomationCompletionOutcome::Failed,
@@ -3872,13 +3970,14 @@ fn plan_graph(
                                 && old.second_observation.as_ref().map_or_else(
                                     || {
                                         old.first_observation.barrier_token
-                                            != frozen.observation_token
+                                            != frozen.final_observation_fence_token
                                     },
                                     |second| {
                                         second.observed_generation == frozen.root_generation
                                             && second.observed_resource_version
                                                 == actual.resource_version
-                                            && second.barrier_token == frozen.observation_token
+                                            && second.barrier_token
+                                                == frozen.final_observation_fence_token
                                     },
                                 )
                         });
@@ -3919,19 +4018,19 @@ fn plan_graph(
                                 first_observation: PruneObservation {
                                     observed_resource_version: actual.resource_version.clone(),
                                     observed_generation: frozen.root_generation,
-                                    barrier_token: frozen.observation_token.clone(),
+                                    barrier_token: frozen.final_observation_fence_token.clone(),
                                 },
                                 second_observation: Some(PruneObservation {
                                     observed_resource_version: actual.resource_version.clone(),
                                     observed_generation: frozen.root_generation,
-                                    barrier_token: frozen.observation_token.clone(),
+                                    barrier_token: frozen.final_observation_fence_token.clone(),
                                 }),
                             },
                             |mut old| {
                                 old.second_observation = Some(PruneObservation {
                                     observed_resource_version: actual.resource_version.clone(),
                                     observed_generation: frozen.root_generation,
-                                    barrier_token: frozen.observation_token.clone(),
+                                    barrier_token: frozen.final_observation_fence_token.clone(),
                                 });
                                 old
                             },
@@ -3943,7 +4042,7 @@ fn plan_graph(
                             first_observation: PruneObservation {
                                 observed_resource_version: actual.resource_version,
                                 observed_generation: frozen.root_generation,
-                                barrier_token: frozen.observation_token.clone(),
+                                barrier_token: frozen.final_observation_fence_token.clone(),
                             },
                             second_observation: None,
                         });
@@ -4044,6 +4143,10 @@ fn validate_input(
 ) -> Result<(), ReconcileError> {
     if input.root.uid != state.root.uid
         || input.root.namespace != state.root.namespace
+        || input.root.name != state.root.name
+        || input.root.spec
+            != serde_json::to_value(&state.root.spec)
+                .map_err(|error| ReconcileError::Renderer(error.to_string()))?
         || input.bundle_digest != state.root.bundle_digest
         || input.root.generation != u64::try_from(frozen.root_generation).unwrap_or(u64::MAX)
         || input.observation_token != frozen.observation_token
@@ -4200,6 +4303,7 @@ fn validate_bootstrap_root(root: &RootSnapshotV0) -> Result<(), ReconcileError> 
     for (field, value) in [
         ("root.uid", root.uid.as_str()),
         ("root.namespace", root.namespace.as_str()),
+        ("root.name", root.name.as_str()),
         ("root.bundleDigest", root.bundle_digest.as_str()),
         ("root.resourceVersion", root.root_resource_version.as_str()),
     ] {
@@ -4212,6 +4316,14 @@ fn validate_bootstrap_root(root: &RootSnapshotV0) -> Result<(), ReconcileError> 
     if root.generation < 0 {
         return Err(ReconcileError::Link(
             "root generation is invalid for bootstrap".into(),
+        ));
+    }
+    root.spec
+        .validate()
+        .map_err(|error| ReconcileError::Link(error.to_string()))?;
+    if root.spec.program.digest != root.bundle_digest {
+        return Err(ReconcileError::Link(
+            "root program digest does not match root bundle digest".into(),
         ));
     }
     Ok(())
@@ -4296,6 +4408,7 @@ fn pins(root: &RootSnapshotV0) -> PreconditionsV0 {
 fn matches_root(state: &MachineStateV0, frozen: &FrozenInputV0) -> bool {
     frozen.root_generation == state.root.generation
         && frozen.state_resource_version == state.root.state_resource_version
+        && is_raw_sha256(&frozen.final_observation_fence_token)
 }
 fn stale(commands: &mut Vec<CommandV0>, reason: &str) {
     commands.push(CommandV0::IgnoredStale {
@@ -4419,11 +4532,23 @@ fn sort_automation(state: &mut MachineStateV0) {
 mod tests {
     use super::*;
     use oxideloop_controller_api::{
-        ConditionStatus, RootBinding, RootCondition, RootConditionType, STATE_VERSION_V1,
-        StateBody, StateLink, bootstrap_id, state_name,
+        ConditionStatus, ProgramBundleReference, RootBinding, RootCondition, RootConditionType,
+        STATE_VERSION_V1, StateBody, StateLink, WebApplicationSpec, bootstrap_id, state_name,
     };
     use oxideloop_renderer_abi::RenderOutputV0;
     use oxideloop_renderer_abi::model::{ABI_VERSION_V0, ResourceDeclaration, RootProjection};
+
+    fn web_application_spec(digest: impl Into<String>) -> WebApplicationSpec {
+        WebApplicationSpec {
+            message: "hello".into(),
+            expose: false,
+            program: ProgramBundleReference {
+                config_map_name: "bundle".into(),
+                key: "program.mjs".into(),
+                digest: digest.into(),
+            },
+        }
+    }
 
     fn state() -> MachineStateV0 {
         let root_uid = "root-uid";
@@ -4432,7 +4557,9 @@ mod tests {
             RootSnapshotV0 {
                 uid: root_uid.into(),
                 namespace: "demo".into(),
+                name: "demo".into(),
                 generation: 7,
+                spec: web_application_spec("a".repeat(64)),
                 bundle_digest: "a".repeat(64),
                 state_name: state_name.clone(),
                 state_uid: "state-uid".into(),
@@ -4513,10 +4640,10 @@ mod tests {
                 api_version: "demo.oxideloop.dev/v1alpha1".into(),
                 kind: "WebApplication".into(),
                 namespace: root.namespace.clone(),
-                name: "demo".into(),
+                name: root.name.clone(),
                 uid: root.uid.clone(),
                 generation: root.generation as u64,
-                spec: serde_json::json!({}),
+                spec: serde_json::to_value(&root.spec).unwrap(),
             },
             bundle_digest: root.bundle_digest.clone(),
             cache_epoch: "epoch-1".into(),
@@ -4548,6 +4675,7 @@ mod tests {
                 state_resource_version: root.state_resource_version.clone(),
                 observation_token: "observation-1".into(),
                 cache_epoch: "epoch-1".into(),
+                final_observation_fence_token: "f".repeat(64),
                 render_input_hash: parse_validate_render_input(&input_json).unwrap().sha256,
             },
             input_json,
@@ -4563,6 +4691,51 @@ mod tests {
                 deletion_recovery_proof: None,
             }],
         )
+    }
+
+    #[test]
+    fn rendered_root_projection_requires_exact_name_and_spec_authority() {
+        let machine = boot_to_render(state());
+        let (frozen, input, output, observed) = rendered(&machine.root, vec![]);
+        let mut wrong_name: RenderInputV0 = serde_json::from_str(&input).unwrap();
+        wrong_name.root.name = "forged-name".into();
+        let wrong_name = serde_json::to_string(&wrong_name).unwrap();
+        let wrong_name_frozen = FrozenInputV0 {
+            render_input_hash: parse_validate_render_input(&wrong_name).unwrap().sha256,
+            ..frozen.clone()
+        };
+        assert_eq!(
+            reduce(
+                machine.clone(),
+                EventV0::Rendered {
+                    frozen: wrong_name_frozen,
+                    render_input_json: wrong_name,
+                    render_output_json: output.clone(),
+                    observed: observed.clone(),
+                }
+            ),
+            Err(ReconcileError::FrozenPinMismatch)
+        );
+
+        let mut wrong_spec: RenderInputV0 = serde_json::from_str(&input).unwrap();
+        wrong_spec.root.spec = serde_json::json!({"message":"forged"});
+        let wrong_spec = serde_json::to_string(&wrong_spec).unwrap();
+        let wrong_spec_frozen = FrozenInputV0 {
+            render_input_hash: parse_validate_render_input(&wrong_spec).unwrap().sha256,
+            ..frozen
+        };
+        assert_eq!(
+            reduce(
+                machine,
+                EventV0::Rendered {
+                    frozen: wrong_spec_frozen,
+                    render_input_json: wrong_spec,
+                    render_output_json: output,
+                    observed,
+                }
+            ),
+            Err(ReconcileError::FrozenPinMismatch)
+        );
     }
 
     fn complete_single_apply_to_ready(
@@ -5337,8 +5510,8 @@ mod tests {
             issued.state.clone(),
             EventV0::AutomationRunEnsured {
                 token: "0".repeat(64),
-                name,
-                spec,
+                name: name.clone(),
+                spec: spec.clone(),
                 uid: "run-uid".into(),
                 resource_version: "8".into(),
             },
@@ -5360,20 +5533,26 @@ mod tests {
             .automation
             .pending
             .push(AutomationPending {
-                occurrence_id: "occurrence".into(),
-                automation_id: "smoke".into(),
-                source,
-                run_name: "ol-run".into(),
+                occurrence_id: spec.occurrence_id.clone(),
+                automation_id: spec.automation_id.clone(),
+                source: spec.source.clone(),
+                run_name: name.clone(),
                 run_uid: "run-uid".into(),
                 run_resource_version: "8".into(),
+                spec_hash: automation_run_spec_hash(&spec).unwrap(),
             });
+        let mut historic_program_mismatch = spec.clone();
+        historic_program_mismatch.program.digest = "c".repeat(64);
+        // A foreign UID/RV must be ignored before its malformed full spec can
+        // influence the current exact pending occurrence.
         let stale_completion = reduce(
             completion_state.clone(),
             EventV0::AutomationCompleted {
-                occurrence_id: "occurrence".into(),
-                name: "ol-run".into(),
+                spec: historic_program_mismatch.clone(),
+                occurrence_id: spec.occurrence_id.clone(),
+                name: name.clone(),
                 uid: "other-uid".into(),
-                old_resource_version: "8".into(),
+                old_resource_version: "stale-rv".into(),
                 new_resource_version: "9".into(),
                 completion: AutomationRunCompletionState::Succeeded,
                 attempts: 1,
@@ -5386,11 +5565,61 @@ mod tests {
             stale_completion.state.journal.state.automation.pending,
             completion_state.journal.state.automation.pending
         );
+        assert!(matches!(
+            stale_completion.commands.as_slice(),
+            [CommandV0::IgnoredStale { .. }]
+        ));
+        let held = reduce(
+            completion_state.clone(),
+            EventV0::AutomationCompleted {
+                spec: historic_program_mismatch,
+                occurrence_id: spec.occurrence_id.clone(),
+                name: name.clone(),
+                uid: "run-uid".into(),
+                old_resource_version: "8".into(),
+                new_resource_version: "9".into(),
+                completion: AutomationRunCompletionState::Succeeded,
+                attempts: 1,
+                materialization_name: "event".into(),
+                materialization_uid: "event-uid".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(held.state.phase, PhaseV0::Hold);
+        assert!(matches!(held.commands.as_slice(), [CommandV0::Hold { .. }]));
+
+        let mut historic_hash_mismatch = spec.clone();
+        // This is a valid exact run identity with every field duplicated in
+        // AutomationPending intact. Only the program source authority changes,
+        // so the canonical full-spec hash must be what rejects it.
+        historic_hash_mismatch.program.config_map_name = "replacement-bundle".into();
+        let held = reduce(
+            completion_state.clone(),
+            EventV0::AutomationCompleted {
+                spec: historic_hash_mismatch,
+                occurrence_id: spec.occurrence_id.clone(),
+                name: name.clone(),
+                uid: "run-uid".into(),
+                old_resource_version: "8".into(),
+                new_resource_version: "9".into(),
+                completion: AutomationRunCompletionState::Succeeded,
+                attempts: 1,
+                materialization_name: "event".into(),
+                materialization_uid: "event-uid".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(held.state.phase, PhaseV0::Hold);
+        assert!(matches!(held.commands.as_slice(), [CommandV0::Hold { .. }]));
+
         let completed = reduce(
             completion_state,
             EventV0::AutomationCompleted {
-                occurrence_id: "occurrence".into(),
-                name: "ol-run".into(),
+                spec,
+                occurrence_id: stale_completion.state.journal.state.automation.pending[0]
+                    .occurrence_id
+                    .clone(),
+                name,
                 uid: "run-uid".into(),
                 old_resource_version: "8".into(),
                 new_resource_version: "9".into(),
@@ -5570,6 +5799,97 @@ mod tests {
     }
 
     #[test]
+    fn prune_requires_distinct_completed_final_observation_fences() {
+        let mut machine = boot_to_render(state());
+        let identity = ObjectIdentity {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: "demo".into(),
+            name: "old".into(),
+        };
+        let inventory = InventoryEntry {
+            identity: identity.clone(),
+            logical_id: "old".into(),
+            uid: "old-uid".into(),
+            resource_version: "10".into(),
+            bundle_digest: "a".repeat(64),
+        };
+        machine.journal.state.inventory.push(inventory.clone());
+        let (frozen, input, output, _) = rendered(&machine.root, vec![]);
+        let mut output: RenderOutputV0 = serde_json::from_str(&output).unwrap();
+        output.resources.clear();
+        output.disposition = RenderDisposition::ExplicitEmpty;
+        let output = serde_json::to_string(&output).unwrap();
+        let observed = vec![DesiredObservationV0 {
+            identity,
+            observation: Observation::Existing {
+                identity: MutationIdentity {
+                    uid: "old-uid".into(),
+                    resource_version: "10".into(),
+                },
+            },
+            qualification: BackendQualification::BuiltInTested {
+                kubernetes_minor: "1.36".into(),
+                gvr: "configmaps".into(),
+            },
+            recovery_proof: None,
+            deletion_recovery_proof: None,
+        }];
+
+        let first = plan_graph(&machine, &frozen, &input, &output, observed.clone()).unwrap();
+        assert!(first.intents.is_empty());
+        let first_candidate = first.candidate.unwrap();
+        assert_eq!(
+            first_candidate.first_observation.barrier_token,
+            frozen.final_observation_fence_token
+        );
+        machine.journal.state.prune_candidate = Some(first_candidate.clone());
+
+        // Repeating the same completed final fence, even with the same root,
+        // epoch, and renderer token, cannot authorize a delete.
+        let same_fence = plan_graph(&machine, &frozen, &input, &output, observed.clone()).unwrap();
+        assert!(same_fence.intents.is_empty());
+        assert_eq!(
+            same_fence
+                .candidate
+                .as_ref()
+                .unwrap()
+                .first_observation
+                .barrier_token,
+            frozen.final_observation_fence_token
+        );
+        assert!(
+            same_fence
+                .candidate
+                .as_ref()
+                .unwrap()
+                .second_observation
+                .is_none()
+        );
+
+        let second_frozen = FrozenInputV0 {
+            final_observation_fence_token: "e".repeat(64),
+            ..frozen
+        };
+        let confirmed = plan_graph(&machine, &second_frozen, &input, &output, observed).unwrap();
+        assert!(
+            confirmed
+                .intents
+                .iter()
+                .any(|intent| intent.operation == ApplyOperation::Delete)
+        );
+        let candidate = confirmed.candidate.unwrap();
+        assert_eq!(
+            candidate.second_observation.as_ref().unwrap().barrier_token,
+            second_frozen.final_observation_fence_token
+        );
+        assert_ne!(
+            candidate.first_observation.barrier_token,
+            candidate.second_observation.unwrap().barrier_token
+        );
+    }
+
+    #[test]
     fn stale_prune_generation_is_replaced_then_next_generation_match_prepares_delete() {
         let mut machine = boot_to_render(state());
         let old = ObjectIdentity {
@@ -5685,6 +6005,7 @@ mod tests {
                 frozen: FrozenInputV0 {
                     state_resource_version: "13".into(),
                     observation_token: "observation-2".into(),
+                    final_observation_fence_token: "e".repeat(64),
                     render_input_hash: parse_validate_render_input(&second_input).unwrap().sha256,
                     ..frozen
                 },
@@ -6150,6 +6471,7 @@ mod tests {
             state_resource_version: "11".into(),
             observation_token: "forged".into(),
             cache_epoch: "forged".into(),
+            final_observation_fence_token: "f".repeat(64),
             render_input_hash: "a".repeat(64),
         });
         let recovered: MachineStateV0 =
@@ -6945,6 +7267,7 @@ mod tests {
         let requested = reduce(
             ready,
             EventV0::ReconcileRequested {
+                cause: InternalReconcileCauseV0::DependencyWatch,
                 observation_token: "barrier-2".into(),
                 cache_epoch: "epoch-2".into(),
             },
@@ -6962,7 +7285,74 @@ mod tests {
     }
 
     #[test]
-    fn exact_root_refresh_invalidates_same_bundle_and_holds_uid_or_digest_replacement() {
+    fn unchanged_source_across_epoch_and_global_barrier_emits_no_automation_occurrence() {
+        let mut machine = state();
+        machine.phase = PhaseV0::Ready;
+        let mut trigger = ActionTriggerV0 {
+            automation_identity: "smoke".into(),
+            automation_version: "v1".into(),
+            action_module_identity: "actions/smoke.mjs".into(),
+            action_module_digest: "b".repeat(64),
+            source: ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "demo".into(),
+                name: "source".into(),
+            },
+            source_uid: "source-uid".into(),
+            source_resource_version: "7".into(),
+            observation_token: String::new(),
+            event_metadata: serde_json::json!({"reason":"unchanged"}),
+        };
+        trigger.observation_token = automation_source_transition_token(&trigger);
+        machine
+            .journal
+            .state
+            .automation
+            .baselines
+            .push(AutomationBaseline {
+                automation_id: trigger.automation_identity.clone(),
+                source: trigger.source.clone(),
+                token: trigger.observation_token.clone(),
+            });
+
+        let requested = reduce(
+            machine,
+            EventV0::ReconcileRequested {
+                cause: InternalReconcileCauseV0::DependencyWatch,
+                observation_token: "global-barrier-2".into(),
+                cache_epoch: "epoch-2".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            requested.commands.as_slice(),
+            [CommandV0::RequestRender { .. }]
+        ));
+
+        // Model the unchanged render's return to Ready. Neither the global
+        // barrier nor cache epoch participates in the source-transition key.
+        let mut ready_after_unchanged_render = requested.state;
+        ready_after_unchanged_render.phase = PhaseV0::Ready;
+        let no_occurrence = reduce(
+            ready_after_unchanged_render,
+            EventV0::TriggerAutomation { trigger },
+        )
+        .unwrap();
+        assert!(no_occurrence.commands.is_empty());
+        assert!(
+            no_occurrence
+                .state
+                .journal
+                .state
+                .automation
+                .pending
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn exact_root_refresh_invalidates_same_bundle_and_holds_uid_digest_or_program_replacement() {
         let machine = boot_to_render(state());
         let (frozen, input, output, observed) = rendered(&machine.root, vec![]);
         let ready = complete_single_apply_to_ready(
@@ -6978,6 +7368,7 @@ mod tests {
         advanced.generation += 1;
         advanced.root_resource_version = "31".into();
         advanced.status.observed_generation = Some(advanced.generation);
+        advanced.spec.message = "refreshed root spec".into();
         let refreshed = reduce(
             ready.clone(),
             EventV0::RootRefreshed {
@@ -7006,8 +7397,37 @@ mod tests {
                 .as_slice(),
             [CommandV0::Hold { .. }]
         ));
+        let mut changed_program_config_map = ready.root.clone();
+        changed_program_config_map.spec.program.config_map_name = "replacement-bundle".into();
+        assert!(matches!(
+            reduce(
+                ready.clone(),
+                EventV0::RootRefreshed {
+                    root: changed_program_config_map
+                }
+            )
+            .unwrap()
+            .commands
+            .as_slice(),
+            [CommandV0::Hold { .. }]
+        ));
+        let mut changed_program_key = ready.root.clone();
+        changed_program_key.spec.program.key = "replacement-program.mjs".into();
+        assert!(matches!(
+            reduce(
+                ready.clone(),
+                EventV0::RootRefreshed {
+                    root: changed_program_key
+                }
+            )
+            .unwrap()
+            .commands
+            .as_slice(),
+            [CommandV0::Hold { .. }]
+        ));
         let mut changed_digest = ready.root.clone();
         changed_digest.bundle_digest = "b".repeat(64);
+        changed_digest.spec.program.digest = "b".repeat(64);
         assert!(matches!(
             reduce(
                 ready,
@@ -7242,7 +7662,9 @@ mod tests {
         RootSnapshotV0 {
             uid: root_uid.into(),
             namespace: "demo".into(),
+            name: "demo".into(),
             generation: 9,
+            spec: web_application_spec("c".repeat(64)),
             bundle_digest: "c".repeat(64),
             status: WebApplicationStatus {
                 state: Some(StateLink {
@@ -7458,6 +7880,7 @@ mod tests {
         refreshed_root.generation += 1;
         refreshed_root.root_resource_version = "root-rv-21".into();
         refreshed_root.bundle_digest = "f".repeat(64);
+        refreshed_root.spec.program.digest = "f".repeat(64);
         let refreshed = reduce(
             started.state.clone(),
             EventV0::RootRefreshed {

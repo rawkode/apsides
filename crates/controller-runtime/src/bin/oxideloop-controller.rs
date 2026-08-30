@@ -22,20 +22,33 @@ struct Args {
     archive: PathBuf,
     store: PathBuf,
     renderer_socket: PathBuf,
+    #[cfg(feature = "test-failpoints")]
     failpoint_socket: Option<PathBuf>,
 }
 
 fn usage() -> &'static str {
-    "usage: oxideloop-controller --namespace NS --root-name NAME --bundle-archive FILE --bundle-store DIR --renderer-unix-socket SOCKET [--failpoint-unix-socket SOCKET]"
+    #[cfg(feature = "test-failpoints")]
+    {
+        "usage: oxideloop-controller --namespace NS --root-name NAME --bundle-archive FILE --bundle-store DIR --renderer-unix-socket SOCKET [--failpoint-unix-socket SOCKET]"
+    }
+    #[cfg(not(feature = "test-failpoints"))]
+    {
+        "usage: oxideloop-controller --namespace NS --root-name NAME --bundle-archive FILE --bundle-store DIR --renderer-unix-socket SOCKET"
+    }
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut values = std::env::args().skip(1);
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(values: impl IntoIterator<Item = String>) -> Result<Args, String> {
+    let mut values = values.into_iter();
     let mut namespace = None;
     let mut root_name = None;
     let mut archive = None;
     let mut store = None;
     let mut renderer_socket = None;
+    #[cfg(feature = "test-failpoints")]
     let mut failpoint_socket = None;
     while let Some(flag) = values.next() {
         let value = values
@@ -47,6 +60,7 @@ fn parse_args() -> Result<Args, String> {
             "--bundle-archive" => archive = Some(PathBuf::from(value)),
             "--bundle-store" => store = Some(PathBuf::from(value)),
             "--renderer-unix-socket" => renderer_socket = Some(PathBuf::from(value)),
+            #[cfg(feature = "test-failpoints")]
             "--failpoint-unix-socket" => failpoint_socket = Some(PathBuf::from(value)),
             _ => return Err(format!("unknown argument {flag}")),
         }
@@ -57,6 +71,7 @@ fn parse_args() -> Result<Args, String> {
         archive: archive.ok_or("--bundle-archive is required")?,
         store: store.ok_or("--bundle-store is required")?,
         renderer_socket: renderer_socket.ok_or("--renderer-unix-socket is required")?,
+        #[cfg(feature = "test-failpoints")]
         failpoint_socket,
     };
     if args.namespace.is_empty() || args.root_name.is_empty() || !args.renderer_socket.is_absolute()
@@ -65,6 +80,7 @@ fn parse_args() -> Result<Args, String> {
             "namespace/root name must be nonempty and renderer socket must be absolute".into(),
         );
     }
+    #[cfg(feature = "test-failpoints")]
     if args
         .failpoint_socket
         .as_ref()
@@ -123,6 +139,7 @@ async fn main() -> ExitCode {
     // runtime library; this binary establishes the production adapters and
     // enters reconciliation without any ambient controls.
     let _key = ActorKeyV0(format!("{}/{}", args.namespace, args.root_name));
+    #[cfg(feature = "test-failpoints")]
     if let Some(socket) = args.failpoint_socket {
         let _ = socket;
     }
@@ -147,5 +164,40 @@ mod tests {
         // Parsing itself is exercised by the binary's argument shape; Unix
         // validation is deliberately a separate renderer-client contract.
         assert!(usage().contains("renderer-unix-socket"));
+    }
+
+    #[cfg(not(feature = "test-failpoints"))]
+    #[test]
+    fn default_parser_and_usage_reject_the_debug_only_socket_flag() {
+        assert!(!usage().contains("failpoint-unix-socket"));
+        assert!(matches!(
+            parse_args_from(["--failpoint-unix-socket".into(), "/tmp/failpoint.sock".into()]),
+            Err(error) if error == "unknown argument --failpoint-unix-socket"
+        ));
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[test]
+    fn debug_feature_parser_and_usage_accept_the_failpoint_socket_flag() {
+        assert!(usage().contains("failpoint-unix-socket"));
+        let args = parse_args_from([
+            "--namespace".into(),
+            "ns".into(),
+            "--root-name".into(),
+            "root".into(),
+            "--bundle-archive".into(),
+            "/tmp/archive".into(),
+            "--bundle-store".into(),
+            "/tmp/store".into(),
+            "--renderer-unix-socket".into(),
+            "/tmp/renderer.sock".into(),
+            "--failpoint-unix-socket".into(),
+            "/tmp/failpoint.sock".into(),
+        ])
+        .expect("debug flag accepted");
+        assert_eq!(
+            args.failpoint_socket,
+            Some(PathBuf::from("/tmp/failpoint.sock"))
+        );
     }
 }

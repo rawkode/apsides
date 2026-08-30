@@ -52,6 +52,8 @@ pub enum SpecValidationError {
     AutomationRunNameMismatch,
     #[error("AutomationRun specs are immutable after creation")]
     ImmutableAutomationRunSpec,
+    #[error("AutomationRun program digest must match its bundle digest")]
+    AutomationRunProgramDigestMismatch,
     #[error("the persisted ActionInputV0 is not canonical JSON")]
     NonCanonicalActionInput,
     #[error("the persisted ActionInputV0 does not match its indexed immutable pins")]
@@ -1157,7 +1159,8 @@ pub struct PruneObservation {
     #[schemars(length(min = 1, max = 253))]
     pub observed_resource_version: String,
     pub observed_generation: i64,
-    /// Exact list/watch/reread barrier which produced this observation.
+    /// Exact completed final-observation fence which produced this
+    /// observation. This is not the global renderer observation token.
     #[schemars(length(min = 1, max = 253))]
     pub barrier_token: String,
 }
@@ -1268,10 +1271,12 @@ impl AutomationState {
                     item.run_resource_version.as_str(),
                     MAX_IDENTIFIER_BYTES,
                 ),
+                ("automation.pending.specHash", item.spec_hash.as_str(), 64),
             ] {
                 non_empty_within(value, field, maximum)?;
             }
             item.source.validate()?;
+            raw_sha256(&item.spec_hash, "automation.pending.specHash")?;
         }
         let mut completions = std::collections::BTreeSet::new();
         for completion in &self.completions {
@@ -1353,6 +1358,12 @@ pub struct AutomationPending {
     pub run_uid: String,
     #[schemars(length(min = 1, max = 253))]
     pub run_resource_version: String,
+    /// SHA-256 of the canonical complete immutable `AutomationRunSpec`.
+    ///
+    /// This field is intentionally required without a migration path: the
+    /// v1alpha1 durable layout is supported for fresh clusters only.
+    #[schemars(length(min = 64, max = 64), regex(pattern = "^[0-9a-f]{64}$"))]
+    pub spec_hash: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -1391,7 +1402,8 @@ pub enum AutomationCompletionOutcome {
     namespaced,
     status = "AutomationRunStatus",
     shortname = "olar",
-    validation = "self.spec == oldSelf.spec"
+    validation = "self.spec == oldSelf.spec",
+    validation = "self.spec.program.digest == self.spec.bundleDigest"
 )]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AutomationRunSpec {
@@ -1413,6 +1425,9 @@ pub struct AutomationRunSpec {
     pub automation_version: String,
     #[schemars(length(min = 64, max = 64))]
     pub bundle_digest: String,
+    /// Exact ConfigMap/key/digest authority for fetching the immutable action
+    /// program. The digest is required to equal `bundleDigest`.
+    pub program: ProgramBundleReference,
     #[schemars(length(min = 1, max = 128))]
     pub action_module_identity: String,
     #[schemars(length(min = 64, max = 64))]
@@ -1445,6 +1460,7 @@ impl AutomationRunSpec {
     /// Returns an error when the payload exceeds the Action protocol cap, is
     /// not canonical strict ABI JSON, or has been retargeted relative to its
     /// immutable indexed fields.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), SpecValidationError> {
         for (field, value, maximum) in [
             (
@@ -1510,6 +1526,10 @@ impl AutomationRunSpec {
         raw_sha256(&self.action_input_hash, "actionInputHash")?;
         raw_sha256(&self.event_metadata_hash, "eventMetadataHash")?;
         self.source.validate()?;
+        self.program.validate()?;
+        if self.program.digest != self.bundle_digest {
+            return Err(SpecValidationError::AutomationRunProgramDigestMismatch);
+        }
         if self.action_input_v0.len() > MAX_ACTION_INPUT_CANONICAL_BYTES {
             return Err(SpecValidationError::TooLong {
                 field: "actionInputV0",
@@ -1773,6 +1793,11 @@ mod tests {
             automation_id: "smoke".into(),
             automation_version: "v1".into(),
             bundle_digest: "a".repeat(64),
+            program: ProgramBundleReference {
+                config_map_name: "bundle".into(),
+                key: "program.mjs".into(),
+                digest: "a".repeat(64),
+            },
             action_module_identity: "actions/smoke.mjs".into(),
             action_module_digest: "b".repeat(64),
             renderer_abi_version: oxideloop_renderer_abi::model::ABI_VERSION_V0.into(),
@@ -1891,6 +1916,17 @@ mod tests {
         assert_eq!(
             changed.validate_immutable_against(&original),
             Err(SpecValidationError::ImmutableAutomationRunSpec)
+        );
+    }
+
+    #[test]
+    fn automation_run_program_is_an_exact_bundle_digest_pin() {
+        let mut run = run_spec();
+        assert!(run.validate().is_ok());
+        run.program.digest = "c".repeat(64);
+        assert_eq!(
+            run.validate(),
+            Err(SpecValidationError::AutomationRunProgramDigestMismatch)
         );
     }
 

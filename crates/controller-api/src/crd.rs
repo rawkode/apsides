@@ -86,6 +86,11 @@ fn verify_generated_schema_contracts(document: &Value) -> Result<(), CrdError> {
                 "self.spec == oldSelf.spec",
                 "AutomationRun spec immutability CEL is missing",
             )?;
+            require_cel(
+                document,
+                "self.spec.program.digest == self.spec.bundleDigest",
+                "AutomationRun program digest pin CEL is missing",
+            )?;
         }
         "OxideLoopState" => {
             require_cel(
@@ -98,6 +103,14 @@ fn verify_generated_schema_contracts(document: &Value) -> Result<(), CrdError> {
                 "self.spec.root == oldSelf.spec.root",
                 "OxideLoopState root immutability CEL is missing",
             )?;
+            let pending_spec_hash = document.pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/state/properties/automation/properties/pending/items/properties/specHash/pattern",
+            );
+            if pending_spec_hash.and_then(Value::as_str) != Some("^[0-9a-f]{64}$") {
+                return Err(CrdError::Contract(
+                    "OxideLoopState AutomationPending specHash must be a lowercase SHA-256",
+                ));
+            }
         }
         "WebApplication" => {}
         _ => return Err(CrdError::Contract("unexpected generated CRD kind")),
@@ -226,6 +239,8 @@ mod tests {
         assert!(!document.contains("x-kubernetes-preserve-unknown-fields: true"));
         assert!(!document.contains("additionalProperties:"));
         assert!(document.contains("rule: self.spec == oldSelf.spec"));
+        assert!(document.contains("rule: self.spec.program.digest == self.spec.bundleDigest"));
+        assert!(document.contains("specHash:"));
         // This is deliberately a generated-schema inspection only. It cannot
         // exercise the API server's structural-schema or CEL admission path.
     }
