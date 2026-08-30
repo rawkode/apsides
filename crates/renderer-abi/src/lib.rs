@@ -216,6 +216,7 @@ fn validate_render_output(output: &RenderOutputV0) -> Result<(), AbiError> {
             "automation.actionModuleDigest",
             &automation.action_module_digest,
         )?;
+        limits::validate_event_metadata(&automation.event_metadata)?;
         validate_automation_source_dependency(&automation.source_dependency)?;
     }
     Ok(())
@@ -289,6 +290,7 @@ fn validate_action_input(input: &ActionInputV0) -> Result<(), AbiError> {
     }
     require_raw_digest("bundleDigest", &input.bundle_digest)?;
     require_raw_digest("actionModuleDigest", &input.action_module_digest)?;
+    limits::validate_event_metadata(&input.event_metadata)?;
     Ok(())
 }
 

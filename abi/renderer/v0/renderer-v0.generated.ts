@@ -21,6 +21,12 @@ export type AutomationDeclaration = { identity: string, version: string,
  */
 sourceDependency: Dependency,
 /**
+ * Canonical event payload supplied to the action module for this
+ * automation. It is captured at declaration time so retries use the
+ * exact same authored metadata.
+ */
+eventMetadata: JsonValue,
+/**
  * The digest-addressed installed bundle that owns this declaration.
  */
 bundleDigest: string, actionModuleIdentity: string, actionModuleDigest: string, rendererAbiVersion: string, };

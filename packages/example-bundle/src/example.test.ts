@@ -14,6 +14,10 @@ const present = render(input({ message: "updated", expose: true }, [{ apiVersion
 if (present.resources.length !== 2 || (present.resources[0]?.object as never as { data: Record<string, string> }).data.flavor !== "vanilla") throw new Error("present input enrichment mismatch");
 if (present.resources[1]?.logicalId !== "service/portal-service") throw new Error("expose true service mismatch");
 if (present.automations.length !== 1 || present.automations[0]?.bundleDigest !== BUNDLE_DIGEST || present.automations[0]?.actionModuleDigest !== ACTION_DIGEST) throw new Error("automation pinning mismatch");
+const tombstone = render(input({ message: "deleted", expose: true }, [{ apiVersion: "v1", kind: "ConfigMap", namespace: "demo", name: "demo-input", uid: "input-gone", resourceVersion: "3", value: null }]));
+if (tombstone.automations.length !== 0) throw new Error("tombstones must not create an automation");
+const tombstoneDependency = tombstone.dependencies[0];
+if (tombstone.dependencies.length !== 1 || tombstoneDependency?.type !== "object" || tombstoneDependency.uid !== null || tombstoneDependency.resourceVersion !== null) throw new Error("tombstone dependency must be absent");
 const expectedAction = JSON.parse(readFileSync(new URL("../fixtures/input-changed-action-output.json", import.meta.url), "utf8"));
 const actualAction = action({ occurrenceId: "occurrence-1", eventMetadata: { source: { namespace: "demo", name: "input" }, note: "updated" }, canonical: {} as never });
 if (JSON.stringify(actualAction) !== JSON.stringify(expectedAction)) throw new Error("checked-in action fixture mismatch");

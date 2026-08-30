@@ -21,7 +21,8 @@ try {
   const rootDir = resolve(fileURLToPath(new URL("../../example-bundle/src/", import.meta.url)));
   const [first, second] = await Promise.all([buildBundle({ rootDir }), buildBundle({ rootDir })]);
   if (!first.archiveBytes.equals(second.archiveBytes)) throw new Error("archive bytes must be deterministic");
-  if (createHash("sha256").update(first.archiveBytes).digest("hex") !== "ebc91b7124057096431f0440414ac95ad445408975e1efa1afe999a956a60c8e") {
+  // P7's deterministic action metadata is part of the signed archive input.
+  if (createHash("sha256").update(first.archiveBytes).digest("hex") !== "283bb2a6e7914cf1ed7a92a15f5685b2e5bdd7a4bb736cf30e874db24a415ce8") {
     throw new Error("archive golden bytes changed");
   }
   const original = first.archiveBytes.at(0);

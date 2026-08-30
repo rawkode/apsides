@@ -13,6 +13,9 @@
           "description": "The digest-addressed installed bundle that owns this declaration.",
           "type": "string"
         },
+        "eventMetadata": {
+          "description": "Canonical event payload supplied to the action module for this\nautomation. It is captured at declaration time so retries use the\nexact same authored metadata."
+        },
         "identity": {
           "type": "string"
         },
@@ -31,6 +34,7 @@
         "identity",
         "version",
         "sourceDependency",
+        "eventMetadata",
         "bundleDigest",
         "actionModuleIdentity",
         "actionModuleDigest",

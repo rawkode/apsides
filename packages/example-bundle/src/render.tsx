@@ -31,6 +31,13 @@ function WebApplication({ input, session }: { input: RenderInputV0; session: Hoo
         resourceVersion: observed.observation.resourceVersion,
         observationToken: input.observationToken,
       },
+      eventMetadata: {
+        source: {
+          namespace: observed.ref.namespace ?? "",
+          name: observed.ref.name,
+        },
+        note: "input changed",
+      },
       // Runtime-owned RenderInputV0 carries the final manifest digest, so this
       // callable never needs to contain the self-referential bundle digest.
       bundleDigest: input.bundleDigest,
@@ -65,6 +72,7 @@ function environment(input: RenderInputV0) {
   return { observationToken: input.observationToken, read(ref: ResourceRef) {
     const normalized = { ...ref, namespace: ref.namespace ?? input.root.namespace };
     const observation = input.observations.find((candidate) => candidate.apiVersion === normalized.apiVersion && candidate.kind === normalized.kind && candidate.namespace === normalized.namespace && candidate.name === normalized.name);
-    return { ref: normalized, present: observation !== undefined, value: observation ? ({ ...normalized, ...(observation.value as object) } as never) : undefined, observation: { uid: observation?.uid ?? null, resourceVersion: observation?.resourceVersion ?? null } };
+    const present = observation !== undefined && observation.value !== null;
+    return { ref: normalized, present, value: present ? ({ ...normalized, ...(observation?.value as object) } as never) : undefined, observation: { uid: present ? observation?.uid ?? null : null, resourceVersion: present ? observation?.resourceVersion ?? null : null } };
   } };
 }

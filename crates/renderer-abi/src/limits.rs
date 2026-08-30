@@ -10,6 +10,11 @@ pub const MAX_DEPENDENCIES: usize = 1_024;
 pub const MAX_AUTOMATIONS: usize = 64;
 pub const MAX_DIAGNOSTICS: usize = 64;
 pub const MAX_ACTIONS: usize = 64;
+/// Maximum canonical UTF-8 JSON size for automation event metadata. This is
+/// shared by render declarations and action inputs so the durable action
+/// protocol cannot receive metadata accepted by the render ABI but rejected
+/// by its action phase.
+pub const MAX_EVENT_METADATA_CANONICAL_BYTES: usize = 512 * 1024;
 pub const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
 /// Validate recursive and canonical-size limits for an untyped JSON value.
@@ -25,6 +30,20 @@ pub fn validate_json_limits(value: &Value) -> Result<(), AbiError> {
         return Err(AbiError::CanonicalBytesLimit {
             actual: byte_count,
             maximum: MAX_CANONICAL_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// Validate JSON limits for event metadata and apply the tighter action
+/// protocol bound in canonical UTF-8 bytes.
+pub fn validate_event_metadata(value: &Value) -> Result<(), AbiError> {
+    validate_json_limits(value)?;
+    let byte_count = canonical::canonical_bytes(value)?.len();
+    if byte_count > MAX_EVENT_METADATA_CANONICAL_BYTES {
+        return Err(AbiError::CanonicalBytesLimit {
+            actual: byte_count,
+            maximum: MAX_EVENT_METADATA_CANONICAL_BYTES,
         });
     }
     Ok(())

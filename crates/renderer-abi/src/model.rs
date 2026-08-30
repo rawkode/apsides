@@ -96,6 +96,11 @@ pub struct AutomationDeclaration {
     /// unobserved objects are not valid automation sources.
     #[ts(type = "Dependency")]
     pub source_dependency: Dependency,
+    /// Canonical event payload supplied to the action module for this
+    /// automation. It is captured at declaration time so retries use the
+    /// exact same authored metadata.
+    #[ts(type = "JsonValue")]
+    pub event_metadata: Value,
     /// The digest-addressed installed bundle that owns this declaration.
     pub bundle_digest: String,
     pub action_module_identity: String,

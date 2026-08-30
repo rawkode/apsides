@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 pub const BUNDLE_MANIFEST_VERSION_V0: &str = "bundle.oxideloop.dev/v0";
+pub const DESCRIPTOR_VERSION_V0: &str = "oxideloop.dev/descriptor/v0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -66,4 +67,20 @@ pub struct BundleIntegrityManifestV0 {
 pub struct BundleInstallRecordV0 {
     pub bundle_digest: String,
     pub manifest: BundleIntegrityManifestV0,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DescriptorModuleV0 {
+    pub identity: String,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BundleDescriptorV0 {
+    pub descriptor_version: String,
+    pub renderer_abi_version: String,
+    pub render_module: DescriptorModuleV0,
+    pub action_modules: Vec<DescriptorModuleV0>,
 }

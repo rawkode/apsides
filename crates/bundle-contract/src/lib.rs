@@ -18,7 +18,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub use model::{
-    BUNDLE_MANIFEST_VERSION_V0, BundleInstallRecordV0, BundleIntegrityManifestV0, ExecutionPhaseV0,
+    BUNDLE_MANIFEST_VERSION_V0, BundleDescriptorV0, BundleInstallRecordV0,
+    BundleIntegrityManifestV0, DESCRIPTOR_VERSION_V0, DescriptorModuleV0, ExecutionPhaseV0,
     FileIntegrityV0, ModuleIntegrityV0, PhaseModuleV0, ToolIdentityV0,
 };
 
@@ -32,6 +33,7 @@ const MAX_INSTALL_RECORD_BYTES: usize = 256 * 1024;
 pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_CANONICAL_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_IDENTITY_BYTES: usize = 256;
+const MAX_DESCRIPTOR_MODULES: usize = 32;
 const MAX_PATH_BYTES: usize = 512;
 static TEMPORARY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -119,6 +121,70 @@ pub fn parse_validate_manifest(input: &str) -> Result<ValidatedManifestV0, Bundl
         canonical_bytes,
         bundle_digest,
     })
+}
+
+/// # Errors
+/// Returns [`BundleError`] when the descriptor is malformed or disagrees with the manifest.
+pub fn parse_validate_descriptor(
+    input: &str,
+    manifest: &BundleIntegrityManifestV0,
+) -> Result<BundleDescriptorV0, BundleError> {
+    if input.len() > MAX_MANIFEST_BYTES {
+        return Err(BundleError::Limit);
+    }
+    let value = parse_strict_value(input).map_err(|_| BundleError::InvalidJson)?;
+    let descriptor = serde_json::from_value::<BundleDescriptorV0>(value)
+        .map_err(|_| BundleError::InvalidManifest)?;
+    validate_descriptor(&descriptor, manifest)?;
+    Ok(descriptor)
+}
+
+/// # Errors
+/// Returns [`BundleError`] when any descriptor field or route is invalid.
+pub fn validate_descriptor(
+    descriptor: &BundleDescriptorV0,
+    manifest: &BundleIntegrityManifestV0,
+) -> Result<(), BundleError> {
+    if descriptor.descriptor_version != DESCRIPTOR_VERSION_V0
+        || descriptor.renderer_abi_version != manifest.renderer_abi_version
+        || descriptor.renderer_abi_version != oxideloop_renderer_abi::model::ABI_VERSION_V0
+        || descriptor.action_modules.is_empty()
+        || descriptor.action_modules.len() > MAX_DESCRIPTOR_MODULES
+    {
+        return Err(BundleError::InvalidContract);
+    }
+    let valid = |module: &DescriptorModuleV0, phase: ExecutionPhaseV0| {
+        module.identity.len() <= MAX_IDENTITY_BYTES
+            && !blank(&module.identity)
+            && valid_digest(&module.digest)
+            && manifest
+                .phase_modules
+                .iter()
+                .any(|m| m.phase == phase && m.module_identity == module.identity)
+            && match phase {
+                ExecutionPhaseV0::Render => manifest
+                    .render_modules
+                    .iter()
+                    .any(|m| m.identity == module.identity && m.file.sha256 == module.digest),
+                ExecutionPhaseV0::Action => manifest
+                    .action_modules
+                    .iter()
+                    .any(|m| m.identity == module.identity && m.file.sha256 == module.digest),
+                ExecutionPhaseV0::Descriptor => false,
+            }
+    };
+    if !valid(&descriptor.render_module, ExecutionPhaseV0::Render) {
+        return Err(BundleError::InvalidContract);
+    }
+    let mut identities = HashSet::new();
+    identities.insert(descriptor.render_module.identity.as_str());
+    for module in &descriptor.action_modules {
+        if !identities.insert(module.identity.as_str()) || !valid(module, ExecutionPhaseV0::Action)
+        {
+            return Err(BundleError::InvalidContract);
+        }
+    }
+    Ok(())
 }
 
 /// Validate a typed manifest before it is serialized or installed.
@@ -769,6 +835,14 @@ impl InstalledBundle {
     #[must_use]
     pub fn manifest(&self) -> &BundleIntegrityManifestV0 {
         &self.record.manifest
+    }
+
+    /// # Errors
+    /// Returns [`BundleError`] when the installed descriptor fails integrity or contract checks.
+    pub fn descriptor(&self) -> Result<BundleDescriptorV0, BundleError> {
+        let artifact = self.open_declared(&self.record.manifest.descriptor.path)?;
+        let text = std::str::from_utf8(artifact.bytes()).map_err(|_| BundleError::InvalidJson)?;
+        parse_validate_descriptor(text, &self.record.manifest)
     }
 
     /// Read the exact verified bytes that a renderer must consume.

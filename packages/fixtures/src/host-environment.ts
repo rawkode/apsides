@@ -27,16 +27,19 @@ export function hookEnvironment(input: RenderInputV0): HookEnvironment {
           candidate.name === normalizedRef.name &&
           candidate.namespace === normalizedRef.namespace,
       );
-      const value = observation === undefined
+      // A retained tombstone is a negative observation, not a present
+      // resource. Its final UID/RV must not leak into hook dependency identity.
+      const present = observation !== undefined && observation.value !== null;
+      const value = !present
         ? undefined
-        : ({ ...normalizedRef, ...(observation.value as object) } as T);
+        : ({ ...normalizedRef, ...(observation?.value as object) } as T);
       return {
         ref: normalizedRef,
         value,
-        present: observation !== undefined,
+        present,
         observation: {
-          uid: observation?.uid ?? null,
-          resourceVersion: observation?.resourceVersion ?? null,
+          uid: present ? observation?.uid ?? null : null,
+          resourceVersion: present ? observation?.resourceVersion ?? null : null,
         },
       };
     },

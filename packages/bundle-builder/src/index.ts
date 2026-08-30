@@ -51,9 +51,11 @@ export async function buildBundle(options: BundleOptions): Promise<BuiltBundle> 
     const descriptor = {
       descriptorVersion: "oxideloop.dev/descriptor/v0",
       rendererAbiVersion: ABI,
-      renderModule: "render",
-      actionModules: [{ identity: ACTION_IDENTITY, module: "action" }],
+      renderModule: { identity: RENDER_IDENTITY, digest: "" },
+      actionModules: [{ identity: ACTION_IDENTITY, digest: actionFile.sha256 }],
     };
+    const renderFile = await integrity(renderPath, staging);
+    descriptor.renderModule.digest = renderFile.sha256;
     await writeFile(descriptorPath, `${JSON.stringify(descriptor, null, 2)}\n`, "utf8");
 
     const manifest: BundleIntegrityManifestV0 = {
@@ -62,7 +64,7 @@ export async function buildBundle(options: BundleOptions): Promise<BuiltBundle> 
       bundler: { identity: "rolldown", version: options.bundlerVersion ?? "1.0.0-beta.35" },
       rendererAbiVersion: ABI,
       descriptor: await integrity(descriptorPath, staging),
-      renderModules: [{ identity: RENDER_IDENTITY, ...await integrity(renderPath, staging) }],
+      renderModules: [{ identity: RENDER_IDENTITY, ...renderFile }],
       actionModules: [{ identity: ACTION_IDENTITY, ...actionFile }],
       sourceMaps: [],
       phaseModules: [

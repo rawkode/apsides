@@ -85,6 +85,30 @@ fn make_writable(path: &std::path::Path, mode: u32) {
 }
 
 #[test]
+fn descriptor_is_strict_and_cross_validated() {
+    let source = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    let mut manifest = manifest();
+    let render = &manifest.render_modules[0];
+    let action = &manifest.action_modules[0];
+    let descriptor = format!(
+        r#"{{"descriptorVersion":"oxideloop.dev/descriptor/v0","rendererAbiVersion":"renderer.oxideloop.dev/v0","renderModule":{{"identity":"{}","digest":"{}"}},"actionModules":[{{"identity":"{}","digest":"{}"}}]}}"#,
+        render.identity, render.file.sha256, action.identity, action.file.sha256
+    );
+    manifest.descriptor = file("descriptor.json", descriptor.as_bytes());
+    fs::write(source.path().join("descriptor.json"), descriptor).unwrap();
+    fs::write(source.path().join("render.js"), b"render").unwrap();
+    fs::write(source.path().join("action.js"), b"action").unwrap();
+    fs::write(source.path().join("render.js.map"), b"map").unwrap();
+    let validated = validated(&manifest);
+    let store = BundleStore::new(storage.path()).unwrap();
+    let installed = store.install_directory(source.path(), &validated).unwrap();
+    assert_eq!(installed.descriptor().unwrap().action_modules.len(), 1);
+    let unknown = r#"{"descriptorVersion":"oxideloop.dev/descriptor/v0","rendererAbiVersion":"renderer.oxideloop.dev/v0","renderModule":{"identity":"render.main","digest":"0000000000000000000000000000000000000000000000000000000000000000"},"actionModules":[],"extra":1}"#;
+    assert!(oxideloop_bundle_contract::parse_validate_descriptor(unknown, &manifest).is_err());
+}
+
+#[test]
 fn install_uses_canonical_digest_and_verified_handles() {
     let source = TempDir::new().unwrap();
     let storage = TempDir::new().unwrap();
