@@ -14,7 +14,7 @@ use http::{Method, Request, Response, StatusCode};
 use kube::{Client, client::Body};
 use oxideloop_controller_api::{
     AutomationRunCompletion, AutomationRunCompletionState, AutomationRunSpec, AutomationRunStatus,
-    ObjectIdentity, ProgramBundleReference,
+    ObjectIdentity, ProgramBundleReference, automation_run_name,
 };
 use oxideloop_controller_core::{CommandV0, MutationCommandV0, PreconditionsV0};
 use oxideloop_event_planner::{
@@ -29,9 +29,12 @@ use serde_json::{Value, json};
 use tower::service_fn;
 
 use super::{
-    COMMAND_ID_ANNOTATION, KubeTransportV0, ObjectMetaV0, ObjectRefV0, ObjectV0, ROOT_FINALIZER,
+    AutomationRunExpectationV0, AutomationRunObservationBarrierV0, COMMAND_ID_ANNOTATION,
+    KubeTransportV0, ListV0, ObjectMetaV0, ObjectRefV0, ObjectV0, ROOT_FINALIZER,
     ROOT_UID_ANNOTATION, ResourceKindV0, RootAddressV0, TRANSACTION_ID_ANNOTATION,
-    TransportErrorV0,
+    TransportErrorV0, WatchEventV0, WatchHandleV0, validate_automation_run_get,
+    validate_automation_run_list, validate_automation_run_observation,
+    validate_automation_watch_event,
 };
 
 struct Expected {
@@ -96,7 +99,7 @@ impl ScriptedApi {
             }
         });
         (
-            KubeTransportV0::from_client(Client::new(service, "default")),
+            KubeTransportV0::test_from_client(Client::new(service, "default")),
             api,
         )
     }
@@ -290,6 +293,73 @@ fn automation_response(
         "spec": spec,
         "status": status_value,
     })
+}
+
+fn pending_automation_expectation(
+    spec: &AutomationRunSpec,
+    resource_version: &str,
+) -> AutomationRunExpectationV0 {
+    let name =
+        automation_run_name(&spec.root_uid, &spec.occurrence_id).expect("deterministic name");
+    AutomationRunExpectationV0 {
+        root: ObjectRefV0 {
+            resource: ResourceKindV0::WebApplication,
+            namespace: "tenant-a".into(),
+            name: "app-a".into(),
+        },
+        root_uid: spec.root_uid.clone(),
+        occurrence_id: spec.occurrence_id.clone(),
+        run_name: name,
+        run_uid: "run-uid".into(),
+        run_resource_version: resource_version.into(),
+        spec_hash: sha256_hex(
+            &canonical_bytes(&serde_json::to_value(spec).expect("serializable spec"))
+                .expect("canonical spec"),
+        ),
+    }
+}
+
+fn observed_pending_run(
+    expectation: &AutomationRunExpectationV0,
+    spec: &AutomationRunSpec,
+    status: AutomationRunStatus,
+    resource_version: &str,
+) -> ObjectV0 {
+    let annotations = BTreeMap::new();
+    ObjectV0 {
+        reference: ObjectRefV0 {
+            resource: ResourceKindV0::AutomationRun,
+            namespace: expectation.root.namespace.clone(),
+            name: expectation.run_name.clone(),
+        },
+        metadata: ObjectMetaV0 {
+            uid: expectation.run_uid.clone(),
+            resource_version: resource_version.into(),
+            annotations: annotations.clone(),
+            owner_uids: vec![expectation.root_uid.clone()],
+        },
+        value: json!({
+            "apiVersion":"runtime.oxideloop.dev/v1alpha1",
+            "kind":"AutomationRun",
+            "metadata":{
+                "name":expectation.run_name,
+                "namespace":expectation.root.namespace,
+                "uid":expectation.run_uid,
+                "resourceVersion":resource_version,
+                "annotations":annotations,
+                "ownerReferences":[{
+                    "apiVersion":"demo.oxideloop.dev/v1alpha1",
+                    "kind":"WebApplication",
+                    "name":expectation.root.name,
+                    "uid":expectation.root_uid,
+                    "controller":true,
+                    "blockOwnerDeletion":false
+                }]
+            },
+            "spec":spec,
+            "status":status,
+        }),
+    }
 }
 
 fn object_json(kind: ResourceKindV0, name: &str, uid: &str, rv: &str) -> Value {
@@ -612,6 +682,36 @@ async fn watch_eof_invalidates_the_epoch() {
 }
 
 #[tokio::test]
+async fn watch_decodes_a_complete_automation_run_event_before_stream_end() {
+    let spec = automation_spec();
+    let expectation = pending_automation_expectation(&spec, "z-old-rv");
+    let completed = observed_pending_run(&expectation, &spec, completion_status(), "a-new-rv");
+    let watch_body = format!(
+        "{}\n",
+        serde_json::json!({"type":"MODIFIED","object":completed.value})
+    );
+    let (transport, api) = ScriptedApi::transport([Expected {
+        method: Method::GET,
+        path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/automationruns?&watch=true&timeoutSeconds=290&allowWatchBookmarks=true&resourceVersion=99",
+        content_type: None,
+        body: None,
+        response: Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(watch_body.into_bytes()))
+            .expect("watch response"),
+    }]);
+    let mut watch = transport
+        .watch_from(ResourceKindV0::AutomationRun, "tenant-a", "99")
+        .await
+        .expect("watch opens");
+    assert!(matches!(
+        watch.next_event().await,
+        Ok(WatchEventV0::Modified(_))
+    ));
+    api.assert_drained();
+}
+
+#[tokio::test]
 async fn terminal_watch_error_is_latched_and_never_releases_a_queued_event() {
     let (sender, receiver) = tokio::sync::mpsc::channel(2);
     sender
@@ -637,6 +737,156 @@ async fn terminal_watch_error_is_latched_and_never_releases_a_queued_event() {
         watch.next_event().await,
         Err(TransportErrorV0::WatchGone)
     ));
+}
+
+#[test]
+fn pending_automation_authentication_matrix_covers_list_watch_and_exact_get() {
+    let spec = automation_spec();
+    // These values intentionally run backwards lexically.  Completion accepts
+    // only inequality with the durable old RV; Kubernetes RVs are opaque.
+    let expectation = pending_automation_expectation(&spec, "z-old-rv");
+    let pristine = observed_pending_run(
+        &expectation,
+        &spec,
+        AutomationRunStatus::default(),
+        "z-old-rv",
+    );
+    let completed = observed_pending_run(&expectation, &spec, completion_status(), "a-new-rv");
+    let unrelated_malformed = ObjectV0 {
+        reference: ObjectRefV0 {
+            resource: ResourceKindV0::AutomationRun,
+            namespace: "tenant-a".into(),
+            name: "foreign".into(),
+        },
+        metadata: ObjectMetaV0 {
+            uid: String::new(),
+            resource_version: String::new(),
+            annotations: BTreeMap::new(),
+            owner_uids: vec![],
+        },
+        value: json!(null),
+    };
+
+    let listed = validate_automation_run_list(
+        &ListV0 {
+            items: vec![unrelated_malformed.clone(), pristine.clone()],
+            resource_version: "list-rv".into(),
+        },
+        &expectation,
+    )
+    .expect("LIST authenticates the pristine durable run")
+    .expect("exact list candidate");
+    assert!(listed.is_pristine());
+    assert_eq!(listed.program(), &spec.program);
+
+    let got = validate_automation_run_get(Some(pristine.clone()), &expectation)
+        .expect("GET authenticates the pristine durable run");
+    assert_eq!(got.resource_version(), "z-old-rv");
+    let watched =
+        validate_automation_watch_event(&WatchEventV0::Modified(completed.clone()), &expectation)
+            .expect("WATCH authenticates completion")
+            .expect("exact watch candidate");
+    let completion = watched.completion().expect("completed status");
+    assert_eq!(completion.old_resource_version(), "z-old-rv");
+    assert_eq!(completion.new_resource_version(), "a-new-rv");
+    assert_eq!(
+        completion.completion(),
+        AutomationRunCompletionState::Succeeded
+    );
+
+    assert_eq!(
+        validate_automation_run_observation(&unrelated_malformed, &expectation),
+        Ok(None),
+        "unrelated malformed runs are ignored"
+    );
+    let mut deleting = pristine.clone();
+    deleting.value["metadata"]["deletionTimestamp"] = json!("2026-08-30T00:00:00Z");
+    assert!(matches!(
+        validate_automation_run_list(
+            &ListV0 {
+                items: vec![deleting.clone()],
+                resource_version: "list-rv".into(),
+            },
+            &expectation,
+        ),
+        Err(TransportErrorV0::AutomationObservationHold(_)),
+    ));
+    assert!(matches!(
+        validate_automation_run_get(Some(deleting.clone()), &expectation),
+        Err(TransportErrorV0::AutomationObservationHold(_)),
+    ));
+    for event in [
+        WatchEventV0::Added(deleting.clone()),
+        WatchEventV0::Modified(deleting),
+    ] {
+        assert!(matches!(
+            validate_automation_watch_event(&event, &expectation),
+            Err(TransportErrorV0::AutomationObservationHold(_)),
+        ));
+    }
+    assert!(matches!(
+        validate_automation_watch_event(&WatchEventV0::Deleted(pristine), &expectation),
+        Err(TransportErrorV0::AutomationObservationHold(_)),
+    ));
+    assert!(matches!(
+        validate_automation_run_get(None, &expectation),
+        Err(TransportErrorV0::AutomationObservationHold(_)),
+    ));
+
+    let mut wrong_spec = completed;
+    wrong_spec.value["spec"]["automationId"] = json!("retargeted");
+    assert!(
+        matches!(
+            validate_automation_run_observation(&wrong_spec, &expectation),
+            Err(TransportErrorV0::AutomationObservationHold(_))
+        ),
+        "same-name immutable spec mismatches hold"
+    );
+}
+
+#[tokio::test]
+async fn pending_automation_list_watch_reread_retains_a_race_completion() {
+    let spec = automation_spec();
+    let expectation = pending_automation_expectation(&spec, "z-old-rv");
+    let pristine = observed_pending_run(
+        &expectation,
+        &spec,
+        AutomationRunStatus::default(),
+        "z-old-rv",
+    );
+    let completed = observed_pending_run(&expectation, &spec, completion_status(), "a-new-rv");
+    validate_automation_run_list(
+        &ListV0 {
+            items: vec![pristine.clone()],
+            resource_version: "list-rv".into(),
+        },
+        &expectation,
+    )
+    .expect("LIST leg authenticates the durable candidate");
+    // This is the already-buffered WATCH leg that arrives between the exact
+    // GET and the caller taking ownership of the retained barrier.
+    let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    sender
+        .send(Ok(WatchEventV0::Modified(completed)))
+        .await
+        .expect("buffered watch event");
+    let current = validate_automation_run_get(Some(pristine), &expectation)
+        .expect("exact reread before watch drain");
+    let mut observer = AutomationRunObservationBarrierV0 {
+        expectation,
+        watch: WatchHandleV0 {
+            events: receiver,
+            overflowed: Arc::new(AtomicBool::new(false)),
+            terminal: None,
+        },
+        current,
+    };
+    let changed = observer
+        .next_change()
+        .await
+        .expect("buffered completion survives the list-watch race");
+    assert_eq!(changed.resource_version(), "a-new-rv");
+    assert!(changed.completion().is_some());
 }
 
 #[tokio::test]

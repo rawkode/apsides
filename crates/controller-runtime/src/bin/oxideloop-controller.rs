@@ -7,7 +7,6 @@
 use std::{path::PathBuf, process::ExitCode};
 
 use oxideloop_bundle_contract::BundleStore;
-use oxideloop_controller_core::EventV0;
 use oxideloop_controller_runtime::{
     ActorKeyV0, BundleRuntimeV0, FileArchiveSourceV0, RootActorV0, RuntimeErrorV0,
     load_machine_from_transport,
@@ -134,7 +133,7 @@ async fn main() -> ExitCode {
     };
     let _archive = FileArchiveSourceV0::new(args.archive);
     let mut actor = RootActorV0::new(machine);
-    actor.enqueue(EventV0::Start);
+    actor.start();
     // A full retained watch/reconcile loop is intentionally owned by the
     // runtime library; this binary establishes the production adapters and
     // enters reconciliation without any ambient controls.

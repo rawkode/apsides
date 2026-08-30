@@ -10,7 +10,9 @@ mod engine;
 #[cfg(feature = "test-failpoints")]
 pub mod failpoint_uds;
 pub use adapters::{
-    KubeAutomationPortV0, KubeFixedPointPortV0, UnixRendererPortV0, desired_observation,
+    CompletedObservationFenceOutcomeV0, KubeAutomationObservationPortV0, KubeAutomationPortV0,
+    KubeDeletionObservationPortV0, KubeFixedPointPortV0, RetainedWatchCoordinationV0,
+    UnixRendererPortV0, desired_observation,
 };
 pub use engine::reconcile_with_watch_restarts;
 
@@ -26,10 +28,11 @@ use oxideloop_bundle_contract::{
 };
 use oxideloop_controller_api::{
     AutomationRunCompletion, AutomationRunCompletionState, AutomationRunSpec, AutomationRunStatus,
-    WebApplicationSpec, WebApplicationStatus,
+    InventoryEntry, ObjectIdentity, WebApplicationSpec, WebApplicationStatus,
 };
 use oxideloop_controller_core::{
-    CommandV0, EventV0, InternalReconcileCauseV0, MachineStateV0, PhaseV0, RootSnapshotV0, reduce,
+    AutomationRunCleanupV0, CommandV0, DesiredObservationV0, EventV0, InternalReconcileCauseV0,
+    MachineStateV0, PhaseV0, PreconditionsV0, RootSnapshotV0, reduce,
 };
 use oxideloop_event_planner::{
     ObjectRef as PlannerObjectRefV0, PlannedEventV0, PlannerError, RunCorrelationV0, plan_event,
@@ -76,10 +79,11 @@ pub fn schedule_prune_confirmation(
     delete_issued: bool,
 ) -> Option<BarrierScheduleV0> {
     if prune_pending && !delete_issued {
-        Some(BarrierScheduleV0::ImmediateFreshBarrier(BarrierV0 {
-            generation: current.generation.saturating_add(1),
-            cache_epoch: current.cache_epoch,
-        }))
+        // A second prune observation needs a fresh list/watch/reread fence,
+        // not a fabricated global dependency generation.  The completed
+        // fence gets its own unique token even when this global barrier is
+        // unchanged.
+        Some(BarrierScheduleV0::ImmediateFreshBarrier(current))
     } else {
         None
     }
@@ -102,6 +106,192 @@ type RootObservationFingerprintV0 = (
     bool,
     bool,
 );
+
+/// A non-forgeable retained-watch delta. Only the retained observation
+/// adapter can derive it from canonical final observations; it carries no
+/// caller-chosen renderer token.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GenuineChangeV0 {
+    barrier: BarrierV0,
+    retained_incarnation: u64,
+    fingerprint: String,
+}
+
+/// An authenticated retained-watch transition that arrived while a durable
+/// command still owns the actor.  It is deliberately private: only the
+/// retained-watch coordinator can create the underlying change, and only the
+/// actor can turn it into its internal reconciliation event after the durable
+/// acknowledgement has reduced to `Ready`.
+#[derive(Clone, Debug)]
+struct DeferredGenuineChangeV0 {
+    change: GenuineChangeV0,
+    observation_token: String,
+    cache_epoch: String,
+}
+
+/// A readiness acknowledgement is valid only for the exact root snapshot and
+/// retained cache barrier that admitted it. Keeping the full root snapshot is
+/// intentionally conservative: any changed root pin drops the signal rather
+/// than allowing an old informer pass to issue a render command.
+#[derive(Clone, Debug)]
+struct QueuedInformerReadinessV0 {
+    barrier: BarrierV0,
+    root: RootSnapshotV0,
+}
+
+impl QueuedInformerReadinessV0 {
+    fn current(barrier: BarrierV0, root: &RootSnapshotV0) -> Self {
+        Self {
+            barrier,
+            root: root.clone(),
+        }
+    }
+
+    fn matches(&self, barrier: BarrierV0, root: &RootSnapshotV0) -> bool {
+        self.barrier == barrier && self.root == *root
+    }
+}
+
+/// Token-bearing dependency wakeups use the same sealed root/barrier pin as
+/// informer readiness. The reducer still receives the canonical core event,
+/// but only after the runtime has established that it remains current.
+#[derive(Clone, Debug)]
+struct QueuedObservationV0 {
+    barrier: BarrierV0,
+    root: RootSnapshotV0,
+    event: EventV0,
+}
+
+impl QueuedObservationV0 {
+    fn reconcile(
+        barrier: BarrierV0,
+        root: &RootSnapshotV0,
+        observation_token: String,
+        cache_epoch: String,
+    ) -> Self {
+        Self {
+            barrier,
+            root: root.clone(),
+            event: EventV0::ReconcileRequested {
+                cause: InternalReconcileCauseV0::DependencyWatch,
+                observation_token,
+                cache_epoch,
+            },
+        }
+    }
+
+    fn matches(&self, barrier: BarrierV0, root: &RootSnapshotV0) -> bool {
+        self.barrier == barrier && self.root == *root
+    }
+}
+
+/// Opaque proof that a deletion list/reread was performed for the exact
+/// in-flight deletion-observation command. Its fields are private so a driver
+/// cannot turn a caller-provided `DeletionRevalidated` event into authority.
+pub struct ValidatedDeletionObservationV0 {
+    request_token: String,
+    preconditions: PreconditionsV0,
+    observed_inventory: Vec<InventoryEntry>,
+    observed_automation_runs: Vec<AutomationRunCleanupV0>,
+}
+
+/// Opaque acknowledgement authority for one exact owned render command.  It
+/// is minted only after the concrete Kubernetes fixed-point port has consumed
+/// its one-shot provenance and completed the full retained-observation fence.
+/// In particular, a driver cannot turn a raw `Rendered`/`Revalidated` event,
+/// or an arbitrary fence token, into reducer authority.
+#[derive(Debug, PartialEq)]
+pub struct ValidatedRenderObservationV0 {
+    request_id: String,
+    preconditions: PreconditionsV0,
+    event: EventV0,
+    fence: CompletedObservationFenceV0,
+}
+
+impl ValidatedRenderObservationV0 {
+    #[must_use]
+    pub fn fence(&self) -> &CompletedObservationFenceV0 {
+        &self.fence
+    }
+
+    #[must_use]
+    pub fn token(&self) -> &str {
+        self.fence.token()
+    }
+
+    #[must_use]
+    pub fn sequence(&self) -> u64 {
+        self.fence.sequence()
+    }
+
+    #[must_use]
+    pub fn barrier(&self) -> BarrierV0 {
+        self.fence.barrier()
+    }
+
+    #[must_use]
+    pub fn desired_observations(&self) -> &[DesiredObservationV0] {
+        self.fence.desired_observations()
+    }
+}
+
+/// A render provenance seed is captured only while the actor owns an exact
+/// `RequestRender` command. The concrete fixed-point adapter finishes it once a
+/// retained barrier incarnation exists.
+#[derive(Clone, Debug)]
+struct FixedPointProvenanceSeedV0 {
+    request_id: String,
+    preconditions: PreconditionsV0,
+    root_name: String,
+    root_namespace: String,
+    root_uid: String,
+    root_generation: i64,
+    root_spec: Value,
+    bundle_digest: String,
+    barrier: BarrierV0,
+    port_identity: u64,
+}
+
+#[derive(Debug)]
+struct FixedPointProvenanceV0 {
+    seed: FixedPointProvenanceSeedV0,
+    retained_incarnation: u64,
+}
+
+impl FixedPointProvenanceSeedV0 {
+    fn complete(self, retained_incarnation: u64) -> FixedPointProvenanceV0 {
+        FixedPointProvenanceV0 {
+            seed: self,
+            retained_incarnation,
+        }
+    }
+}
+
+impl FixedPointProvenanceV0 {
+    fn request(&self) -> (&PreconditionsV0, &str) {
+        (&self.seed.preconditions, &self.seed.request_id)
+    }
+}
+
+impl GenuineChangeV0 {
+    fn from_observations(
+        observations: &[oxideloop_renderer_abi::model::Observation],
+        barrier: BarrierV0,
+        retained_incarnation: u64,
+    ) -> Result<Self, RuntimeErrorV0> {
+        let snapshot = serde_json::to_value(observations).map_err(|_| {
+            RuntimeErrorV0::Hold("retained dependency observations cannot be canonicalized".into())
+        })?;
+        let canonical = oxideloop_renderer_abi::canonical_bytes(&snapshot).map_err(|_| {
+            RuntimeErrorV0::Hold("retained dependency observations cannot be canonicalized".into())
+        })?;
+        Ok(Self {
+            barrier,
+            retained_incarnation,
+            fingerprint: oxideloop_renderer_abi::sha256_hex(&canonical),
+        })
+    }
+}
 
 /// The only crash simulation points permitted by the reusable action driver.
 /// This is deliberately instance owned: production wiring decides whether to
@@ -283,16 +473,29 @@ pub struct RootActorV0 {
     state: MachineStateV0,
     mode: ModeV0,
     in_flight: bool,
+    owned_in_flight: Option<CommandV0>,
     barrier: BarrierV0,
     /// Reducer/effect acknowledgements are durable work. Observation events may
     /// be discarded when a watch cache is invalidated; these may not.
     priority_ack: Option<EventV0>,
     core_events: VecDeque<EventV0>,
     pending_root_refresh: Option<RootSnapshotV0>,
-    observation_events: VecDeque<EventV0>,
+    pending_informer_readiness: Option<QueuedInformerReadinessV0>,
+    observation_events: VecDeque<QueuedObservationV0>,
     commands: VecDeque<CommandV0>,
-    last_dependency_observation: Option<(String, String)>,
+    /// Dedupe is scoped to the retained-barrier incarnation and bounded to
+    /// the most recently delivered canonical snapshot. A retained handle is
+    /// dropped after every genuine transition, so older deliveries cannot
+    /// re-enter under a later barrier incarnation.
+    last_dependency_observation: Option<(BarrierV0, u64, String)>,
+    /// Latest genuine retained snapshot received while an effect, durable
+    /// persistence, or closure command owns the in-flight slot.  It must not
+    /// cancel that command; delivery is deferred until the actor is quiescent
+    /// and `Ready`.
+    deferred_genuine_change: Option<DeferredGenuineChangeV0>,
     last_root_observation: Option<RootObservationFingerprintV0>,
+    active_render_input: Option<(BarrierV0, RenderInputV0)>,
+    render_provenance_request: Option<String>,
 }
 impl RootActorV0 {
     pub fn new(state: MachineStateV0) -> Self {
@@ -300,6 +503,7 @@ impl RootActorV0 {
             state,
             mode: ModeV0::Running,
             in_flight: false,
+            owned_in_flight: None,
             barrier: BarrierV0 {
                 generation: 0,
                 cache_epoch: 0,
@@ -307,10 +511,14 @@ impl RootActorV0 {
             priority_ack: None,
             core_events: VecDeque::new(),
             pending_root_refresh: None,
+            pending_informer_readiness: None,
             observation_events: VecDeque::new(),
             commands: VecDeque::new(),
             last_dependency_observation: None,
+            deferred_genuine_change: None,
             last_root_observation: None,
+            active_render_input: None,
+            render_provenance_request: None,
         }
     }
     pub fn barrier(&self) -> BarrierV0 {
@@ -322,29 +530,493 @@ impl RootActorV0 {
     pub fn state(&self) -> &MachineStateV0 {
         &self.state
     }
-    pub fn enqueue(&mut self, event: EventV0) {
+
+    /// Seals the only completion inputs accepted by the retained-observation
+    /// adapter. The final render result came from the fixed-point loop (its
+    /// fields have no public constructor), while inventory and already-used
+    /// prune fence tokens come directly from this actor's validated durable
+    /// journal.
+    fn completed_observation_session(
+        &self,
+        final_result: &FixedPointResultV0,
+        retained_barrier: BarrierV0,
+        retained_incarnation: u64,
+        port_identity: u64,
+        provenance: &FixedPointProvenanceV0,
+    ) -> Result<CompletedObservationSessionV0, RuntimeErrorV0> {
+        let root_snapshot = self.state.root();
+        if root_snapshot.uid.is_empty()
+            || root_snapshot.namespace.is_empty()
+            || root_snapshot.name.is_empty()
+        {
+            return Err(RuntimeErrorV0::Hold(
+                "completed observation session root identity is invalid".into(),
+            ));
+        }
+        let (active_barrier, active_input) =
+            self.active_render_input.as_ref().ok_or_else(|| {
+                RuntimeErrorV0::Hold(
+                    "completed observation session has no active fixed-point input pin".into(),
+                )
+            })?;
+        if *active_barrier != self.barrier
+            || retained_barrier != self.barrier
+            || final_result.input != *active_input
+            || provenance.seed.port_identity != port_identity
+            || provenance.retained_incarnation != retained_incarnation
+            || provenance.seed.barrier != self.barrier
+            || provenance.seed.root_name != root_snapshot.name
+            || provenance.seed.root_namespace != root_snapshot.namespace
+            || provenance.seed.root_uid != root_snapshot.uid
+            || provenance.seed.root_generation != root_snapshot.generation
+            || provenance.seed.root_spec
+                != serde_json::to_value(&root_snapshot.spec).map_err(|_| {
+                    RuntimeErrorV0::Hold(
+                        "completed observation session root spec cannot be canonicalized".into(),
+                    )
+                })?
+            || provenance.seed.bundle_digest != root_snapshot.bundle_digest
+            || !preconditions_match_root(&provenance.seed.preconditions, root_snapshot)
+            || final_result.input.observation_token
+                != provenance.seed.preconditions.observation_token
+            || final_result.input.cache_epoch != provenance.seed.preconditions.cache_epoch
+            || provenance.seed.request_id != fixed_point_request_id(&provenance.seed.preconditions)
+            || !matches!(
+                self.owned_in_flight.as_ref(),
+                Some(CommandV0::RequestRender { preconditions })
+                    if preconditions == &provenance.seed.preconditions
+            )
+            || final_result.input.root.spec != provenance.seed.root_spec
+            || !render_input_matches_root_and_barrier(
+                &final_result.input,
+                root_snapshot,
+                self.barrier,
+            )
+        {
+            return Err(RuntimeErrorV0::Hold(
+                "completed observation session fixed-point input does not match the current actor barrier".into(),
+            ));
+        }
+        let desired_identities =
+            desired_resource_identities(&final_result.output, &root_snapshot.namespace)?;
+        let durable = &self.state.journal().state;
+        let durable_prune_tokens = durable
+            .prune_candidate
+            .iter()
+            .flat_map(|candidate| {
+                std::iter::once(candidate.first_observation.barrier_token.clone()).chain(
+                    candidate
+                        .second_observation
+                        .iter()
+                        .map(|observation| observation.barrier_token.clone()),
+                )
+            })
+            .collect();
+        Ok(CompletedObservationSessionV0 {
+            root: ObjectRefV0 {
+                resource: ResourceKindV0::WebApplication,
+                namespace: root_snapshot.namespace.clone(),
+                name: root_snapshot.name.clone(),
+            },
+            root_uid: root_snapshot.uid.clone(),
+            dependencies: final_result.dependencies.clone(),
+            desired_identities,
+            durable_inventory: durable.inventory.clone(),
+            durable_prune_tokens,
+            retained_barrier,
+            retained_incarnation,
+        })
+    }
+
+    fn begin_fixed_point_provenance(
+        &mut self,
+        input: &RenderInputV0,
+        port_identity: u64,
+    ) -> Result<FixedPointProvenanceSeedV0, RuntimeErrorV0> {
+        let Some(CommandV0::RequestRender { preconditions }) = self.owned_in_flight.as_ref() else {
+            return Err(RuntimeErrorV0::Hold(
+                "fixed-point provenance requires an owned RequestRender command".into(),
+            ));
+        };
+        let root = self.state.root();
+        let root_spec = serde_json::to_value(&root.spec).map_err(|_| {
+            RuntimeErrorV0::Hold("fixed-point provenance root spec cannot be canonicalized".into())
+        })?;
+        if !preconditions_match_root(preconditions, root)
+            || !render_input_matches_root_and_barrier(input, root, self.barrier)
+            || input.root.spec != root_spec
+            || input.observation_token != preconditions.observation_token
+            || input.cache_epoch != preconditions.cache_epoch
+        {
+            return Err(RuntimeErrorV0::Hold(
+                "fixed-point provenance input does not match the owned render command".into(),
+            ));
+        }
+        let request_id = fixed_point_request_id(preconditions);
+        if self.render_provenance_request.is_some() {
+            return Err(RuntimeErrorV0::Hold(
+                "an owned RequestRender command already issued a fixed-point provenance capability"
+                    .into(),
+            ));
+        }
+        let seed = FixedPointProvenanceSeedV0 {
+            request_id: request_id.clone(),
+            preconditions: preconditions.clone(),
+            root_name: root.name.clone(),
+            root_namespace: root.namespace.clone(),
+            root_uid: root.uid.clone(),
+            root_generation: root.generation,
+            root_spec,
+            bundle_digest: root.bundle_digest.clone(),
+            barrier: self.barrier,
+            port_identity,
+        };
+        self.render_provenance_request = Some(request_id);
+        Ok(seed)
+    }
+
+    fn validated_deletion_observation(
+        &self,
+        preconditions: PreconditionsV0,
+        request_token: String,
+        observed_inventory: Vec<InventoryEntry>,
+        observed_automation_runs: Vec<AutomationRunCleanupV0>,
+    ) -> Result<ValidatedDeletionObservationV0, RuntimeErrorV0> {
+        let Some(CommandV0::RequestDeletionObservation {
+            preconditions: owned_preconditions,
+        }) = self.owned_in_flight.as_ref()
+        else {
+            return Err(RuntimeErrorV0::Hold(
+                "deletion observation has no owned RequestDeletionObservation command".into(),
+            ));
+        };
+        if !self.state.root().deleting
+            || &preconditions != owned_preconditions
+            || !preconditions_match_root(&preconditions, self.state.root())
+            || request_token != deletion_observation_request_token(&preconditions)
+        {
+            return Err(RuntimeErrorV0::Hold(
+                "deletion observation pins do not match the owned command".into(),
+            ));
+        }
+        Ok(ValidatedDeletionObservationV0 {
+            request_token,
+            preconditions,
+            observed_inventory,
+            observed_automation_runs,
+        })
+    }
+
+    fn validated_render_observation(
+        &self,
+        final_result: &FixedPointResultV0,
+        preconditions: &PreconditionsV0,
+        request_id: &str,
+        fence: CompletedObservationFenceV0,
+    ) -> Result<ValidatedRenderObservationV0, RuntimeErrorV0> {
+        let Some(CommandV0::RequestRender {
+            preconditions: owned_preconditions,
+        }) = self.owned_in_flight.as_ref()
+        else {
+            return Err(RuntimeErrorV0::Hold(
+                "render observation has no owned RequestRender command".into(),
+            ));
+        };
+        let root = self.state.root();
+        let Some((active_barrier, active_input)) = self.active_render_input.as_ref() else {
+            return Err(RuntimeErrorV0::Hold(
+                "render observation has no active fixed-point input pin".into(),
+            ));
+        };
+        if owned_preconditions != preconditions
+            || request_id != fixed_point_request_id(preconditions)
+            || !preconditions_match_root(preconditions, root)
+            || *active_barrier != self.barrier
+            || active_input != final_result.input()
+            || !render_input_matches_root_and_barrier(final_result.input(), root, self.barrier)
+            || fence.barrier != self.barrier
+            || fence.token.is_empty()
+        {
+            return Err(RuntimeErrorV0::Hold(
+                "render observation does not match the owned render capability".into(),
+            ));
+        }
+        let render_input = canonical_render_input(final_result.input())?;
+        let raw_output = serde_json::to_string(final_result.output())
+            .map_err(|_| RuntimeErrorV0::RendererAbi)?;
+        let render_output = parse_validate_render_output(&raw_output)
+            .map_err(|_| RuntimeErrorV0::RendererAbi)?
+            .canonical_bytes;
+        let render_input_json =
+            String::from_utf8(render_input.clone()).map_err(|_| RuntimeErrorV0::RendererAbi)?;
+        let render_output_json =
+            String::from_utf8(render_output).map_err(|_| RuntimeErrorV0::RendererAbi)?;
+        let frozen = oxideloop_controller_core::FrozenInputV0 {
+            root_generation: preconditions.root_generation,
+            state_resource_version: preconditions.state_resource_version.clone(),
+            observation_token: preconditions.observation_token.clone(),
+            cache_epoch: preconditions.cache_epoch.clone(),
+            final_observation_fence_token: fence.token.clone(),
+            render_input_hash: oxideloop_renderer_abi::sha256_hex(&render_input),
+        };
+        let observed = fence.desired_observations.clone();
+        let event = match self.state.phase() {
+            // A concrete actor can only own RequestRender in RenderPending or
+            // RevalidatePending. InformersPending is retained for the narrow
+            // in-crate fixture path that proves a manually armed command is
+            // still subject to the same private capability checks.
+            PhaseV0::RenderPending | PhaseV0::InformersPending => EventV0::Rendered {
+                frozen,
+                render_input_json,
+                render_output_json,
+                observed,
+            },
+            PhaseV0::RevalidatePending => EventV0::Revalidated {
+                frozen,
+                render_input_json,
+                render_output_json,
+                observed,
+            },
+            _ => {
+                return Err(RuntimeErrorV0::Hold(
+                    "render observation acknowledgement phase mismatch".into(),
+                ));
+            }
+        };
+        Ok(ValidatedRenderObservationV0 {
+            request_id: request_id.into(),
+            preconditions: preconditions.clone(),
+            event,
+            fence,
+        })
+    }
+
+    fn deletion_observation_request(&self) -> Result<(PreconditionsV0, String), RuntimeErrorV0> {
+        let Some(CommandV0::RequestDeletionObservation { preconditions }) =
+            self.owned_in_flight.as_ref()
+        else {
+            return Err(RuntimeErrorV0::Hold(
+                "deletion observation has no owned RequestDeletionObservation command".into(),
+            ));
+        };
+        if !self.state.root().deleting
+            || !preconditions_match_root(preconditions, self.state.root())
+        {
+            return Err(RuntimeErrorV0::Hold(
+                "deletion observation request pins do not match the current root".into(),
+            ));
+        }
+        Ok((
+            preconditions.clone(),
+            deletion_observation_request_token(preconditions),
+        ))
+    }
+
+    /// Captures the exact fixed-point input currently being evaluated by the
+    /// engine. This is crate-private so a production driver cannot mint a
+    /// completion pin independently of the fixed-point loop.
+    pub(crate) fn bind_fixed_point_input(&mut self, input: &RenderInputV0) {
+        self.active_render_input = Some((self.barrier, input.clone()));
+    }
+    /// Starts the actor without exposing its internal event queue to a driver.
+    /// Effect acknowledgements remain checked by [`Self::acknowledge`], while
+    /// dependency wakeups are accepted only from the sealed retained-watch
+    /// coordinator.
+    pub fn start(&mut self) {
+        self.enqueue(EventV0::Start);
+    }
+
+    pub(crate) fn enqueue(&mut self, event: EventV0) {
         match event {
-            EventV0::RootRefreshed { root } => self.pending_root_refresh = Some(root),
+            EventV0::RootRefreshed { root } => {
+                self.drop_superseded_observation_queue();
+                self.pending_root_refresh = Some(root);
+            }
+            // This crate-private test/recovery seam still cannot queue a raw
+            // reducer readiness event. It is sealed to the current root and
+            // cache barrier exactly like the public readiness callback.
+            EventV0::InformersReady => self.queue_informer_readiness(self.barrier),
             event => self.core_events.push_back(event),
         }
     }
-    pub fn enqueue_observation(&mut self, event: EventV0) {
-        self.observation_events.push_back(event);
+
+    fn queue_informer_readiness(&mut self, candidate: BarrierV0) {
+        if candidate == self.barrier && matches!(self.mode, ModeV0::Running) {
+            self.pending_informer_readiness = Some(QueuedInformerReadinessV0::current(
+                candidate,
+                self.state.root(),
+            ));
+        }
     }
-    /// Records one genuine dependency barrier. Duplicate delivery of the same
-    /// token/epoch pair is ignored and cannot satisfy a second prune barrier.
-    pub fn dependency_observed(&mut self, observation_token: String, cache_epoch: String) -> bool {
-        let fingerprint = (observation_token.clone(), cache_epoch.clone());
-        if self.last_dependency_observation.as_ref() == Some(&fingerprint) {
+
+    fn enqueue_observation_reconcile(&mut self, observation_token: String, cache_epoch: String) {
+        self.observation_events
+            .push_back(QueuedObservationV0::reconcile(
+                self.barrier,
+                self.state.root(),
+                observation_token,
+                cache_epoch,
+            ));
+    }
+
+    fn take_current_observation_event(&mut self) -> Option<EventV0> {
+        while let Some(observation) = self.observation_events.pop_front() {
+            if observation.matches(self.barrier, self.state.root()) {
+                return Some(observation.event);
+            }
+        }
+        None
+    }
+
+    fn take_current_informer_readiness(&mut self) -> bool {
+        self.pending_informer_readiness
+            .take()
+            .is_some_and(|readiness| readiness.matches(self.barrier, self.state.root()))
+    }
+
+    /// Root or cache-barrier replacement invalidates every queued
+    /// observation-only transition. Durable acknowledgements and core events
+    /// remain intact.
+    fn drop_superseded_observation_queue(&mut self) {
+        self.pending_informer_readiness = None;
+        self.observation_events.clear();
+        self.deferred_genuine_change = None;
+    }
+    /// Consumes a canonical retained-watch change. This crate-private handoff
+    /// prevents external orchestration from manufacturing a dependency token
+    /// or advancing the global renderer barrier without an authenticated
+    /// watch/list/reread snapshot.
+    pub(crate) fn record_genuine_dependency_change(&mut self, change: &GenuineChangeV0) -> bool {
+        if change.barrier != self.barrier {
             return false;
         }
-        self.last_dependency_observation = Some(fingerprint);
+        let dedupe_key = (
+            change.barrier,
+            change.retained_incarnation,
+            change.fingerprint.clone(),
+        );
+        if self.last_dependency_observation.as_ref() == Some(&dedupe_key) {
+            return false;
+        }
+        self.last_dependency_observation = Some(dedupe_key);
+        self.pending_informer_readiness = None;
+        self.observation_events.clear();
         self.barrier.generation = self.barrier.generation.saturating_add(1);
-        self.enqueue_observation(EventV0::ReconcileRequested {
+        let observation_token = oxideloop_renderer_abi::sha256_hex(
+            format!(
+                "oxideloop-genuine-dependency-change/v0\0{}\0{}\0{}\0{}",
+                self.state.root().uid,
+                self.barrier.generation,
+                self.barrier.cache_epoch,
+                change.fingerprint,
+            )
+            .as_bytes(),
+        );
+        let deferred = DeferredGenuineChangeV0 {
+            change: change.clone(),
+            observation_token: observation_token.clone(),
+            cache_epoch: self.barrier.cache_epoch.to_string(),
+        };
+        if self.delivery_is_quiescent() {
+            self.active_render_input = None;
+            self.render_provenance_request = None;
+            self.enqueue_observation_reconcile(
+                observation_token,
+                self.barrier.cache_epoch.to_string(),
+            );
+            true
+        } else if self.can_supersede_observation_only() {
+            self.supersede_observation_only(observation_token)
+        } else {
+            // A durable command is still authoritative.  Keep its ownership
+            // and coalesce to the latest authenticated final snapshot.
+            self.deferred_genuine_change = Some(deferred);
+            true
+        }
+    }
+
+    fn delivery_is_quiescent(&self) -> bool {
+        self.state.phase() == PhaseV0::Ready
+            && !self.in_flight
+            && self.owned_in_flight.is_none()
+            && self.priority_ack.is_none()
+            && self.core_events.is_empty()
+            && self.pending_root_refresh.is_none()
+            && self.pending_informer_readiness.is_none()
+            && self.observation_events.is_empty()
+            && self.commands.is_empty()
+    }
+
+    /// Delivers exactly one coalesced retained-watch transition after all
+    /// durable reducer work has completed. The event is internal and its
+    /// token was derived when the retained watch authenticated the snapshot;
+    /// no driver-controlled token enters this path.
+    fn deliver_deferred_genuine_change(&mut self) -> Result<(), RuntimeErrorV0> {
+        if !self.delivery_is_quiescent() {
+            return Ok(());
+        }
+        let Some(deferred) = self.deferred_genuine_change.take() else {
+            return Ok(());
+        };
+        if deferred.change.barrier.cache_epoch != self.barrier.cache_epoch
+            || deferred.cache_epoch != self.barrier.cache_epoch.to_string()
+            || deferred.change.fingerprint.is_empty()
+        {
+            self.hold(
+                "deferred genuine dependency change no longer matches the actor barrier".into(),
+            );
+            return Err(RuntimeErrorV0::Hold(
+                "deferred genuine dependency change no longer matches the actor barrier".into(),
+            ));
+        }
+        self.reduce_event(EventV0::ReconcileRequested {
             cause: InternalReconcileCauseV0::DependencyWatch,
+            observation_token: deferred.observation_token,
+            cache_epoch: deferred.cache_epoch,
+        })
+    }
+
+    fn can_supersede_observation_only(&self) -> bool {
+        matches!(self.owned_in_flight, Some(CommandV0::RequestRender { .. }))
+            || (!self.in_flight
+                && matches!(
+                    self.state.phase(),
+                    PhaseV0::InformersPending | PhaseV0::RenderPending | PhaseV0::RevalidatePending
+                ))
+    }
+
+    /// Atomically consumes only a no-effect render/informer continuation and
+    /// returns the reducer to `InformersPending` with authenticated pins. A
+    /// durable effect is never cancelled by a retained watch event.
+    fn supersede_observation_only(&mut self, observation_token: String) -> bool {
+        if !self.can_supersede_observation_only() {
+            return false;
+        }
+        let root = self.state.root();
+        let preconditions = PreconditionsV0 {
+            root_uid: root.uid.clone(),
+            root_generation: root.generation,
+            root_resource_version: root.root_resource_version.clone(),
+            state_uid: root.state_uid.clone(),
+            state_resource_version: root.state_resource_version.clone(),
             observation_token,
-            cache_epoch,
-        });
+            cache_epoch: self.barrier.cache_epoch.to_string(),
+        };
+        self.in_flight = false;
+        self.owned_in_flight = None;
+        self.active_render_input = None;
+        self.render_provenance_request = None;
+        self.deferred_genuine_change = None;
+        self.commands.clear();
+        self.pending_informer_readiness = None;
+        self.observation_events.clear();
+        if self
+            .reduce_event(EventV0::ObservationSuperseded { preconditions })
+            .is_err()
+        {
+            self.hold("observation supersession reducer transition failed".into());
+            return false;
+        }
         true
     }
     /// Enqueues an exact fresh root snapshot once. Root authority is retained
@@ -367,6 +1039,12 @@ impl RootActorV0 {
         }
         self.last_root_observation = Some(fingerprint);
         self.barrier.generation = self.barrier.generation.saturating_add(1);
+        self.active_render_input = None;
+        self.render_provenance_request = None;
+        // A root snapshot supersedes all dependency authority captured under
+        // its predecessor; the root refresh itself will establish a new
+        // retained observation barrier.
+        self.drop_superseded_observation_queue();
         self.enqueue(EventV0::RootRefreshed { root });
         true
     }
@@ -391,16 +1069,17 @@ impl RootActorV0 {
                 }
                 self.reduce_event(EventV0::RootRefreshed { root })?;
             }
+        } else if let Some(root) = self.pending_root_refresh.take() {
+            if self.state.phase() != PhaseV0::RootDeletionVerifyPending {
+                self.commands.clear();
+            }
+            self.reduce_event(EventV0::RootRefreshed { root })?;
         } else {
-            let event = self
-                .core_events
-                .pop_front()
-                .or_else(|| {
-                    self.pending_root_refresh
-                        .take()
-                        .map(|root| EventV0::RootRefreshed { root })
-                })
-                .or_else(|| self.observation_events.pop_front());
+            let event = self.core_events.pop_front().or_else(|| {
+                self.take_current_informer_readiness()
+                    .then_some(EventV0::InformersReady)
+                    .or_else(|| self.take_current_observation_event())
+            });
             if let Some(event) = event {
                 self.reduce_event(event)?;
             }
@@ -409,8 +1088,10 @@ impl RootActorV0 {
             self.terminal_root_deleted();
             return Ok(None);
         }
+        self.deliver_deferred_genuine_change()?;
         if let Some(command) = self.commands.pop_front() {
             self.in_flight = true;
+            self.owned_in_flight = Some(command.clone());
             Ok(Some(command))
         } else {
             Ok(None)
@@ -418,10 +1099,319 @@ impl RootActorV0 {
     }
     /// Release the one in-flight slot only after the effect's core event is
     /// durable/available to the reducer.
-    pub fn acknowledge(&mut self, event: EventV0) {
+    pub fn acknowledge(&mut self, event: EventV0) -> Result<(), RuntimeErrorV0> {
+        if matches!(
+            event,
+            EventV0::DeletionRevalidated { .. }
+                | EventV0::Rendered { .. }
+                | EventV0::Revalidated { .. }
+        ) {
+            self.hold("raw deletion or render events are not acknowledgement capabilities".into());
+            return Err(RuntimeErrorV0::Hold(
+                "raw deletion or render events are not acknowledgement capabilities".into(),
+            ));
+        }
+        let Some(command) = self.owned_in_flight.as_ref() else {
+            self.hold("effect acknowledgement arrived without an owned in-flight command".into());
+            return Err(RuntimeErrorV0::Hold(
+                "effect acknowledgement arrived without an owned in-flight command".into(),
+            ));
+        };
+        if !self.acknowledgement_matches(command, &event) {
+            self.hold(
+                "effect acknowledgement does not exactly correlate to the owned in-flight command"
+                    .into(),
+            );
+            return Err(RuntimeErrorV0::Hold(
+                "effect acknowledgement does not exactly correlate to the owned in-flight command"
+                    .into(),
+            ));
+        }
+        self.accept_acknowledgement(event)
+    }
+
+    /// Consumes a sealed deletion observation minted by the exact
+    /// list/reread adapter. There is intentionally no `EventV0` overload for
+    /// this acknowledgement.
+    pub fn acknowledge_deletion_observation(
+        &mut self,
+        observation: ValidatedDeletionObservationV0,
+    ) -> Result<(), RuntimeErrorV0> {
+        let Some(CommandV0::RequestDeletionObservation { preconditions }) =
+            self.owned_in_flight.as_ref()
+        else {
+            self.hold("deletion observation arrived without an owned request".into());
+            return Err(RuntimeErrorV0::Hold(
+                "deletion observation arrived without an owned request".into(),
+            ));
+        };
+        if preconditions != &observation.preconditions
+            || observation.request_token
+                != deletion_observation_request_token(&observation.preconditions)
+            || !preconditions_match_root(preconditions, self.state.root())
+        {
+            self.hold("deletion observation does not match the owned request pins".into());
+            return Err(RuntimeErrorV0::Hold(
+                "deletion observation does not match the owned request pins".into(),
+            ));
+        }
+        self.accept_acknowledgement(EventV0::DeletionRevalidated {
+            observed_inventory: observation.observed_inventory,
+            observed_automation_runs: observation.observed_automation_runs,
+        })
+    }
+
+    /// Consumes the one exact render acknowledgement minted by the concrete
+    /// fixed-point port after a full retained-observation fence.
+    pub fn acknowledge_render_observation(
+        &mut self,
+        observation: ValidatedRenderObservationV0,
+    ) -> Result<(), RuntimeErrorV0> {
+        let Some(CommandV0::RequestRender { preconditions }) = self.owned_in_flight.as_ref() else {
+            self.hold("render observation arrived without an owned request".into());
+            return Err(RuntimeErrorV0::Hold(
+                "render observation arrived without an owned request".into(),
+            ));
+        };
+        if preconditions != &observation.preconditions
+            || observation.request_id != fixed_point_request_id(preconditions)
+            || !preconditions_match_root(preconditions, self.state.root())
+            || observation.fence.barrier != self.barrier
+            || self.render_provenance_request.as_deref() != Some(observation.request_id.as_str())
+            || !matches!(
+                &observation.event,
+                EventV0::Rendered { frozen, .. } | EventV0::Revalidated { frozen, .. }
+                    if frozen_matches_preconditions(frozen, preconditions)
+            )
+        {
+            self.hold("render observation does not match the owned request pins".into());
+            return Err(RuntimeErrorV0::Hold(
+                "render observation does not match the owned request pins".into(),
+            ));
+        }
+        self.accept_acknowledgement(observation.event)
+    }
+
+    fn accept_acknowledgement(&mut self, event: EventV0) -> Result<(), RuntimeErrorV0> {
         self.in_flight = false;
+        self.owned_in_flight = None;
+        self.render_provenance_request = None;
         if self.priority_ack.replace(event).is_some() {
             self.hold("multiple acknowledgements attempted to occupy the priority slot".into());
+            return Err(RuntimeErrorV0::Hold(
+                "multiple acknowledgements attempted to occupy the priority slot".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    // Keep the complete command/event correlation matrix together: splitting
+    // it would make an omitted acknowledgement variant harder to audit.
+    #[allow(clippy::match_same_arms, clippy::too_many_lines)]
+    fn acknowledgement_matches(&self, command: &CommandV0, event: &EventV0) -> bool {
+        match (command, event) {
+            (
+                CommandV0::EnsureBootstrap {
+                    token,
+                    root_uid,
+                    root_resource_version,
+                    state_name,
+                    ..
+                },
+                EventV0::BootstrapAcknowledged {
+                    token: event_token,
+                    state_name: event_state_name,
+                    old_root_resource_version,
+                    status_state_link,
+                    ..
+                },
+            ) => {
+                token == event_token
+                    && state_name == event_state_name
+                    && root_resource_version == old_root_resource_version
+                    && root_uid == &status_state_link.root_uid
+            }
+            (
+                CommandV0::Persist {
+                    preconditions,
+                    operation,
+                    ..
+                },
+                EventV0::Persisted {
+                    token,
+                    old_state_resource_version,
+                    state_uid,
+                    ..
+                },
+            ) => {
+                token == &operation.token
+                    && old_state_resource_version == &operation.old_state_resource_version
+                    && state_uid == &preconditions.state_uid
+            }
+            (
+                CommandV0::PersistRootStatus {
+                    token,
+                    root_uid,
+                    old_root_resource_version,
+                    ..
+                },
+                EventV0::RootStatusPersisted {
+                    token: event_token,
+                    root_uid: event_root_uid,
+                    old_root_resource_version: event_old_root_resource_version,
+                    ..
+                },
+            ) => {
+                token == event_token
+                    && root_uid == event_root_uid
+                    && old_root_resource_version == event_old_root_resource_version
+            }
+            (
+                CommandV0::RequestDescriptor { token, .. },
+                EventV0::DescriptorReady {
+                    token: event_token,
+                    bundle_digest,
+                },
+            ) => token == event_token && bundle_digest == &self.state.root().bundle_digest,
+            (
+                CommandV0::Mutate {
+                    transaction_id,
+                    attempt_token,
+                    ..
+                },
+                EventV0::MutationAcknowledged {
+                    transaction_id: event_transaction_id,
+                    attempt_token: event_attempt_token,
+                    ..
+                }
+                | EventV0::MutationFailed {
+                    transaction_id: event_transaction_id,
+                    attempt_token: event_attempt_token,
+                    ..
+                },
+            ) => transaction_id == event_transaction_id && attempt_token == event_attempt_token,
+            (
+                CommandV0::EnsureAutomationRun {
+                    token, name, spec, ..
+                },
+                EventV0::AutomationRunEnsured {
+                    token: event_token,
+                    name: event_name,
+                    spec: event_spec,
+                    ..
+                },
+            ) => token == event_token && name == event_name && spec == event_spec,
+            (
+                CommandV0::DeleteAutomationRun {
+                    token,
+                    occurrence_id,
+                    name,
+                    uid,
+                    resource_version,
+                    ..
+                },
+                EventV0::AutomationRunDeleted {
+                    token: event_token,
+                    occurrence_id: event_occurrence_id,
+                    name: event_name,
+                    uid: event_uid,
+                    resource_version: event_resource_version,
+                },
+            ) => {
+                token == event_token
+                    && occurrence_id == event_occurrence_id
+                    && name == event_name
+                    && uid == event_uid
+                    && resource_version == event_resource_version
+            }
+            (
+                CommandV0::DeleteAutomationRun { token, .. },
+                EventV0::AutomationRunDeleteFailed {
+                    token: event_token, ..
+                },
+            ) => token == event_token,
+            (
+                CommandV0::VerifyOwnedChildrenAbsent {
+                    token,
+                    preconditions,
+                },
+                EventV0::OwnedChildrenVerifiedAbsent {
+                    token: event_token,
+                    root_uid,
+                    root_generation,
+                    root_resource_version,
+                    state_uid,
+                    state_resource_version,
+                    cleanup_token,
+                },
+            ) => {
+                token == event_token
+                    && token == cleanup_token
+                    && root_uid == &preconditions.root_uid
+                    && root_generation == &preconditions.root_generation
+                    && root_resource_version == &preconditions.root_resource_version
+                    && state_uid == &preconditions.state_uid
+                    && state_resource_version == &preconditions.state_resource_version
+            }
+            (
+                CommandV0::VerifyOwnedChildrenAbsent { token, .. },
+                EventV0::OwnedChildrenVerificationFailed {
+                    token: event_token, ..
+                },
+            ) => token == event_token,
+            (
+                CommandV0::RemoveStateFinalizer {
+                    token,
+                    preconditions,
+                    ..
+                },
+                EventV0::StateFinalizerRemoved {
+                    token: event_token,
+                    state_uid,
+                    old_state_resource_version,
+                    ..
+                },
+            ) => {
+                token == event_token
+                    && state_uid == &preconditions.state_uid
+                    && old_state_resource_version == &preconditions.state_resource_version
+            }
+            (
+                CommandV0::RemoveRootFinalizer {
+                    token,
+                    preconditions,
+                    ..
+                },
+                EventV0::RootFinalizerRemoved {
+                    token: event_token,
+                    root_uid,
+                    old_root_resource_version,
+                    ..
+                },
+            ) => {
+                token == event_token
+                    && root_uid == &preconditions.root_uid
+                    && old_root_resource_version == &preconditions.root_resource_version
+            }
+            (
+                CommandV0::VerifyRootUidAbsent {
+                    token, root_uid, ..
+                },
+                EventV0::RootUidVerifiedAbsent {
+                    token: event_token,
+                    root_uid: event_root_uid,
+                },
+            ) => token == event_token && root_uid == event_root_uid,
+            (
+                CommandV0::VerifyRootUidAbsent {
+                    token, root_uid, ..
+                },
+                EventV0::RootUidAbsenceFailed {
+                    token: event_token,
+                    observed_uid,
+                },
+            ) => token == event_token && root_uid != observed_uid,
+            _ => false,
         }
     }
 
@@ -435,28 +1425,48 @@ impl RootActorV0 {
 
     fn recover_stale_preflight(&mut self, root: RootSnapshotV0) {
         self.in_flight = false;
+        self.owned_in_flight = None;
+        self.render_provenance_request = None;
         self.commands.clear();
+        self.drop_superseded_observation_queue();
         self.pending_root_refresh = Some(root);
     }
     /// `Hold` and `IgnoredStale` are local reducer commands. They are consumed
     /// by the driver and never manufactured as a transport acknowledgement.
     fn consume_internal(&mut self) {
         self.in_flight = false;
+        self.owned_in_flight = None;
+        self.render_provenance_request = None;
     }
     pub fn begin_observation_barrier(&mut self) -> BarrierV0 {
-        self.barrier.generation += 1;
+        // Starting a list/watch/reread pass is not itself a cluster change.
+        // Only root/dependency change or watch invalidation advances the
+        // global renderer-observation barrier.
         self.barrier
     }
     pub fn informers_ready(&mut self, candidate: BarrierV0) {
-        if candidate == self.barrier && matches!(self.mode, ModeV0::Running) {
-            self.enqueue(EventV0::InformersReady);
-        }
+        self.queue_informer_readiness(candidate);
     }
-    pub fn watch_invalidated(&mut self) {
+    pub(crate) fn watch_invalidated(&mut self) {
+        let prior_token = self
+            .active_render_input
+            .as_ref()
+            .map(|(_, input)| input.observation_token.clone())
+            .or_else(|| self.state.root().status.input_token.clone())
+            .unwrap_or_else(|| self.state.root().uid.clone());
         self.barrier.cache_epoch += 1;
         self.barrier.generation += 1;
+        self.pending_informer_readiness = None;
         self.observation_events.clear();
         self.last_dependency_observation = None;
+        self.deferred_genuine_change = None;
+        let observation_token = observation_token_for_barrier(&prior_token, self.barrier);
+        if self.can_supersede_observation_only() {
+            let _ = self.supersede_observation_only(observation_token);
+        } else {
+            self.active_render_input = None;
+            self.render_provenance_request = None;
+        }
         // A 410 only invalidates observation state. In-flight durable effects,
         // their acknowledgements, and command ownership remain intact.
     }
@@ -465,19 +1475,177 @@ impl RootActorV0 {
         self.core_events.clear();
         self.priority_ack = None;
         self.pending_root_refresh = None;
+        self.pending_informer_readiness = None;
         self.observation_events.clear();
         self.commands.clear();
         self.in_flight = false;
+        self.owned_in_flight = None;
+        self.active_render_input = None;
+        self.render_provenance_request = None;
+        self.deferred_genuine_change = None;
     }
     pub fn terminal_root_deleted(&mut self) {
         self.mode = ModeV0::Terminal;
         self.core_events.clear();
         self.priority_ack = None;
         self.pending_root_refresh = None;
+        self.pending_informer_readiness = None;
         self.observation_events.clear();
         self.commands.clear();
         self.in_flight = false;
+        self.owned_in_flight = None;
+        self.active_render_input = None;
+        self.render_provenance_request = None;
     }
+}
+
+fn frozen_matches_preconditions(
+    frozen: &oxideloop_controller_core::FrozenInputV0,
+    preconditions: &oxideloop_controller_core::PreconditionsV0,
+) -> bool {
+    frozen.root_generation == preconditions.root_generation
+        && frozen.state_resource_version == preconditions.state_resource_version
+        // Bootstrap/recovery renders predate the first dependency barrier and
+        // therefore have no token-bearing command preconditions. Once either
+        // pin exists, the acknowledgement must match it exactly.
+        && (preconditions.observation_token.is_empty()
+            || frozen.observation_token == preconditions.observation_token)
+        && (preconditions.cache_epoch.is_empty() || frozen.cache_epoch == preconditions.cache_epoch)
+}
+
+fn render_input_matches_root_and_barrier(
+    input: &RenderInputV0,
+    root: &RootSnapshotV0,
+    barrier: BarrierV0,
+) -> bool {
+    input.root.api_version == "demo.oxideloop.dev/v1alpha1"
+        && input.root.kind == "WebApplication"
+        && input.root.namespace == root.namespace
+        && input.root.name == root.name
+        && input.root.uid == root.uid
+        && u64::try_from(root.generation).ok() == Some(input.root.generation)
+        && input.bundle_digest == root.bundle_digest
+        && input.cache_epoch == barrier.cache_epoch.to_string()
+        && !input.observation_token.is_empty()
+}
+
+fn preconditions_match_root(preconditions: &PreconditionsV0, root: &RootSnapshotV0) -> bool {
+    preconditions.root_uid == root.uid
+        && preconditions.root_generation == root.generation
+        && preconditions.root_resource_version == root.root_resource_version
+        && preconditions.state_uid == root.state_uid
+        && preconditions.state_resource_version == root.state_resource_version
+}
+
+fn fixed_point_request_id(preconditions: &PreconditionsV0) -> String {
+    oxideloop_renderer_abi::sha256_hex(
+        format!(
+            "oxideloop-fixed-point-request/v0\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            preconditions.root_uid,
+            preconditions.root_generation,
+            preconditions.root_resource_version,
+            preconditions.state_uid,
+            preconditions.state_resource_version,
+            preconditions.observation_token,
+            preconditions.cache_epoch,
+        )
+        .as_bytes(),
+    )
+}
+
+fn deletion_observation_request_token(preconditions: &PreconditionsV0) -> String {
+    oxideloop_renderer_abi::sha256_hex(
+        format!(
+            "oxideloop-deletion-observation-request/v0\0{}\0{}\0{}\0{}\0{}",
+            preconditions.root_uid,
+            preconditions.root_generation,
+            preconditions.root_resource_version,
+            preconditions.state_uid,
+            preconditions.state_resource_version,
+        )
+        .as_bytes(),
+    )
+}
+
+fn desired_resource_identities(
+    output: &RenderOutputV0,
+    root_namespace: &str,
+) -> Result<Vec<ObjectIdentity>, RuntimeErrorV0> {
+    let mut identities = BTreeMap::new();
+    for resource in &output.resources {
+        let metadata = resource
+            .object
+            .get("metadata")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                RuntimeErrorV0::Hold(
+                    "final renderer resource lacks object metadata for observation fencing".into(),
+                )
+            })?;
+        let identity = ObjectIdentity {
+            api_version: resource
+                .object
+                .get("apiVersion")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    RuntimeErrorV0::Hold(
+                        "final renderer resource lacks apiVersion for observation fencing".into(),
+                    )
+                })?
+                .into(),
+            kind: resource
+                .object
+                .get("kind")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    RuntimeErrorV0::Hold(
+                        "final renderer resource lacks kind for observation fencing".into(),
+                    )
+                })?
+                .into(),
+            namespace: metadata
+                .get("namespace")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(root_namespace)
+                .into(),
+            name: metadata
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    RuntimeErrorV0::Hold(
+                        "final renderer resource lacks name for observation fencing".into(),
+                    )
+                })?
+                .into(),
+        };
+        match (identity.api_version.as_str(), identity.kind.as_str()) {
+            ("v1", "ConfigMap" | "Service") => {}
+            _ => {
+                return Err(RuntimeErrorV0::Hold(
+                    "completed observation fence contains an unsupported desired identity".into(),
+                ));
+            }
+        }
+        if identity.namespace != root_namespace {
+            return Err(RuntimeErrorV0::Hold(
+                "final renderer resource escapes the root namespace".into(),
+            ));
+        }
+        let key = format!(
+            "{}\0{}\0{}\0{}",
+            identity.api_version, identity.kind, identity.namespace, identity.name
+        );
+        if identities.insert(key, identity).is_some() {
+            return Err(RuntimeErrorV0::Hold(
+                "final renderer resources contain duplicate observation identities".into(),
+            ));
+        }
+    }
+    Ok(identities.into_values().collect())
 }
 
 #[derive(Default)]
@@ -946,7 +2114,7 @@ async fn drive_kubernetes_with_dispatcher<D: KubernetesDispatcherV0>(
         match dispatcher.dispatch(&command).await {
             Ok(Some(event)) => {
                 sequencing_retries = 0;
-                actor.acknowledge(event);
+                actor.acknowledge(event)?;
             }
             // The command remains owned by this loop until the transport gives
             // a durable core event; do not let an observation invalidate it.
@@ -1083,6 +2251,11 @@ pub trait FixedPointPortV0: Send {
         dependencies: &[Dependency],
     ) -> Result<Vec<oxideloop_renderer_abi::model::Observation>, RuntimeErrorV0>;
 
+    /// Installs the current global barrier without manufacturing a renderer
+    /// observation transition.  Concrete ports use it to bind a fresh
+    /// list/watch/reread fence to the actor's genuine-change generation.
+    fn set_barrier(&mut self, _barrier: BarrierV0) {}
+
     /// Drop any retained observation cache after a watch epoch is invalidated.
     /// The default keeps lightweight fake ports source-compatible.
     fn watch_invalidated(&mut self, _barrier: BarrierV0) {}
@@ -1102,11 +2275,132 @@ pub fn observation_token_for_barrier(token: &str, barrier: BarrierV0) -> String 
     )
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub struct FixedPointResultV0 {
-    pub input: RenderInputV0,
-    pub output: RenderOutputV0,
-    pub dependencies: Vec<Dependency>,
+    input: RenderInputV0,
+    output: RenderOutputV0,
+    dependencies: Vec<Dependency>,
+    provenance: Option<FixedPointProvenanceV0>,
+}
+
+// Cloning a generic fixed-point result intentionally drops the one-shot
+// completion authority. This keeps ordinary engine tests ergonomic while a
+// copied result can never be replayed as a completed-observation capability.
+impl Clone for FixedPointResultV0 {
+    fn clone(&self) -> Self {
+        Self {
+            input: self.input.clone(),
+            output: self.output.clone(),
+            dependencies: self.dependencies.clone(),
+            provenance: None,
+        }
+    }
+}
+
+impl FixedPointResultV0 {
+    #[must_use]
+    pub fn input(&self) -> &RenderInputV0 {
+        &self.input
+    }
+
+    #[must_use]
+    pub fn output(&self) -> &RenderOutputV0 {
+        &self.output
+    }
+
+    #[must_use]
+    pub fn dependencies(&self) -> &[Dependency] {
+        &self.dependencies
+    }
+}
+
+/// A sealed hand-off from a validated fixed-point result plus the actor's
+/// authenticated durable state to the retained observation adapter.  There is
+/// deliberately no public constructor: callers cannot assert a smaller
+/// desired/inventory set or choose prune tokens to make a fence complete.
+#[derive(Clone, Debug)]
+struct CompletedObservationSessionV0 {
+    root: ObjectRefV0,
+    root_uid: String,
+    dependencies: Vec<Dependency>,
+    desired_identities: Vec<ObjectIdentity>,
+    durable_inventory: Vec<InventoryEntry>,
+    durable_prune_tokens: Vec<String>,
+    retained_barrier: BarrierV0,
+    retained_incarnation: u64,
+}
+
+/// A completed dependency observation fence.  It is separate from the
+/// actor's global renderer-observation generation: two completed fences over
+/// an unchanged snapshot receive different tokens, while neither can invent a
+/// dependency-change token.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompletedObservationFenceV0 {
+    token: String,
+    barrier: BarrierV0,
+    sequence: u64,
+    dependencies: Vec<Dependency>,
+    renderer_observations: Vec<oxideloop_renderer_abi::model::Observation>,
+    desired_observations: Vec<DesiredObservationV0>,
+}
+
+impl CompletedObservationFenceV0 {
+    #[must_use]
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    #[must_use]
+    pub const fn barrier(&self) -> BarrierV0 {
+        self.barrier
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    #[must_use]
+    pub fn dependencies(&self) -> &[Dependency] {
+        &self.dependencies
+    }
+
+    #[must_use]
+    pub fn renderer_observations(&self) -> &[oxideloop_renderer_abi::model::Observation] {
+        &self.renderer_observations
+    }
+
+    #[must_use]
+    pub fn desired_observations(&self) -> &[DesiredObservationV0] {
+        &self.desired_observations
+    }
+}
+
+/// Deterministically authenticates one completed final snapshot.  `sequence`
+/// is local to the retained observation port and must advance for every
+/// completed fence; callers pass durable prune tokens to skip after restart.
+///
+/// # Panics
+///
+/// Panics only if `final_snapshot` cannot be represented as canonical JSON.
+/// The completed-fence adapter constructs it solely from serializable DTOs.
+#[must_use]
+fn completed_observation_fence_token(
+    root_uid: &str,
+    barrier: BarrierV0,
+    sequence: u64,
+    final_snapshot: &serde_json::Value,
+) -> String {
+    let canonical = oxideloop_renderer_abi::canonical_bytes(final_snapshot)
+        .expect("completed observation fence snapshot is serializable JSON");
+    let snapshot_hash = oxideloop_renderer_abi::sha256_hex(&canonical);
+    oxideloop_renderer_abi::sha256_hex(
+        format!(
+            "oxideloop-completed-observation-fence/v0\0{root_uid}\0{}\0{sequence}\0{snapshot_hash}",
+            barrier.cache_epoch
+        )
+        .as_bytes(),
+    )
 }
 
 /// Speculatively render, establish a full dependency barrier, then rerender
@@ -1126,6 +2420,7 @@ pub async fn reconcile_fixed_point<P: FixedPointPortV0>(
                 input,
                 output,
                 dependencies,
+                provenance: None,
             });
         }
         input.observations = port.observe_after_barrier(&dependencies).await?;
@@ -1160,6 +2455,9 @@ pub async fn reconcile_fixed_point<P: FixedPointPortV0>(
 /// dependencies and are repeated after every watch is established.
 pub struct ObservationBarrierV0 {
     pub generation: BarrierV0,
+    /// The normalized dependency declaration set that this exact
+    /// list/watch/reread snapshot covers.
+    pub dependencies: Vec<Dependency>,
     pub collections: BTreeMap<(ResourceKindV0, String), ListV0>,
     pub objects: Vec<(ObjectRefV0, Option<oxideloop_kube_transport::ObjectV0>)>,
     pub(crate) watches: Vec<WatchHandleV0>,
@@ -1246,6 +2544,7 @@ pub async fn establish_dependencies_async(
     }
     Ok(ObservationBarrierV0 {
         generation,
+        dependencies,
         collections: reread_collections,
         objects: observed_objects,
         watches,
@@ -1493,12 +2792,20 @@ pub fn renderer_payload(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::VecDeque,
+        convert::Infallible,
+        sync::{Arc, Mutex},
+    };
+
     use super::*;
+    use http::{Method, Request, Response};
+    use kube::{Client, client::Body};
     use oxideloop_controller_api::{
         ApplyOutcome, ApplyResult, AutomationPending, DeletionTransaction,
-        GenerationAdvanceClosurePurpose, InventoryEntry, OxideLoopStateSpec, PersistPurpose,
-        ProgramBundleReference, RootBinding, StateBody, StateLink, WebApplicationSpec,
-        WebApplicationStatus, bootstrap_id,
+        GenerationAdvanceClosurePurpose, InventoryEntry, ObjectIdentity, OxideLoopStateSpec,
+        PersistPurpose, ProgramBundleReference, RootBinding, StateBody, StateLink,
+        WebApplicationSpec, WebApplicationStatus, bootstrap_id,
     };
     use oxideloop_controller_core::{
         ActionTriggerV0, AutomationRunCleanupV0, DesiredObservationV0, FrozenInputV0,
@@ -1522,6 +2829,7 @@ mod tests {
         }
     }
     use oxideloop_renderer_abi::parse_validate_render_input;
+    use tower::service_fn;
 
     #[derive(Default)]
     struct LoaderPort {
@@ -1652,6 +2960,101 @@ mod tests {
             observation_token: "t".into(),
         }
     }
+
+    struct DeferredStableRendererV0 {
+        output: RenderOutputV0,
+    }
+
+    #[async_trait]
+    impl RendererPortV0 for DeferredStableRendererV0 {
+        async fn call(&mut self, request: &RequestV0) -> Result<ResponseV0, RuntimeErrorV0> {
+            Ok(ResponseV0 {
+                request_id: request.request_id,
+                phase: request.phase,
+                bundle_digest: request.bundle_digest.clone(),
+                module_digest: request.module_digest.clone(),
+                status: ResponseStatusV0::Ok,
+                error_category: None,
+                payload: serde_json::to_vec(&self.output)
+                    .expect("deferred test render output serializes"),
+            })
+        }
+    }
+
+    fn deferred_test_descriptor() -> BundleDescriptorV0 {
+        BundleDescriptorV0 {
+            descriptor_version: "oxideloop.dev/descriptor/v0".into(),
+            renderer_abi_version: ABI_VERSION_V0.into(),
+            render_module: oxideloop_bundle_contract::DescriptorModuleV0 {
+                identity: "render/main.mjs".into(),
+                digest: "a".repeat(64),
+            },
+            action_modules: vec![],
+        }
+    }
+
+    fn dependency_object(resource_version: &str) -> ObjectV0 {
+        ObjectV0 {
+            reference: ObjectRefV0 {
+                resource: ResourceKindV0::ConfigMap,
+                namespace: "ns".into(),
+                name: "dependency".into(),
+            },
+            metadata: ObjectMetaV0 {
+                uid: "dependency-uid".into(),
+                resource_version: resource_version.into(),
+                annotations: BTreeMap::new(),
+                owner_uids: vec![],
+            },
+            value: serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "dependency",
+                    "namespace": "ns",
+                    "uid": "dependency-uid",
+                    "resourceVersion": resource_version,
+                },
+                "data": {"revision": resource_version},
+            }),
+        }
+    }
+
+    fn deferred_render_input(
+        actor: &RootActorV0,
+        preconditions: &PreconditionsV0,
+    ) -> RenderInputV0 {
+        let root = actor.state().root();
+        RenderInputV0 {
+            abi_version: ABI_VERSION_V0.into(),
+            root: RootProjection {
+                api_version: "demo.oxideloop.dev/v1alpha1".into(),
+                kind: "WebApplication".into(),
+                uid: root.uid.clone(),
+                namespace: root.namespace.clone(),
+                name: root.name.clone(),
+                generation: u64::try_from(root.generation)
+                    .expect("test root generation is non-negative"),
+                spec: serde_json::to_value(&root.spec).expect("test root spec serializes"),
+            },
+            bundle_digest: root.bundle_digest.clone(),
+            cache_epoch: preconditions.cache_epoch.clone(),
+            observation_token: preconditions.observation_token.clone(),
+            observations: vec![],
+        }
+    }
+
+    fn deferred_render_output() -> RenderOutputV0 {
+        RenderOutputV0 {
+            abi_version: ABI_VERSION_V0.into(),
+            disposition: RenderDisposition::ExplicitEmpty,
+            resources: vec![],
+            dependencies: vec![],
+            automations: vec![],
+            diagnostics: vec![],
+        }
+    }
+
     #[test]
     fn discovery_lists_watches_exact_rv_then_rereads_absence() {
         let mut p = Port::default();
@@ -1750,6 +3153,33 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn informers_pending_actor() -> RootActorV0 {
+        let mut actor = RootActorV0::new(linked_machine());
+        actor.start();
+        let CommandV0::RequestDescriptor { token, .. } = actor
+            .next_command()
+            .expect("descriptor request is issued")
+            .expect("linked actor requests its descriptor")
+        else {
+            panic!("linked actor did not issue a descriptor request");
+        };
+        actor
+            .acknowledge(EventV0::DescriptorReady {
+                token,
+                bundle_digest: "a".repeat(64),
+            })
+            .expect("descriptor acknowledgement is exact");
+        assert!(
+            actor
+                .next_command()
+                .expect("descriptor acknowledgement reduces")
+                .is_none(),
+            "linked actor should now await sealed informer readiness"
+        );
+        assert_eq!(actor.state().phase(), PhaseV0::InformersPending);
+        actor
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2036,6 +3466,32 @@ mod tests {
         )
     }
 
+    fn automation_ensure_pending_command() -> (MachineStateV0, EventV0, CommandV0) {
+        let (machine, acknowledgement) = automation_ensure_pending();
+        let EventV0::AutomationRunEnsured {
+            token, name, spec, ..
+        } = &acknowledgement
+        else {
+            panic!("automation pending fixture has an unexpected acknowledgement");
+        };
+        let root = machine.root();
+        let command = CommandV0::EnsureAutomationRun {
+            token: token.clone(),
+            name: name.clone(),
+            spec: spec.clone(),
+            preconditions: PreconditionsV0 {
+                root_uid: root.uid.clone(),
+                root_generation: root.generation,
+                root_resource_version: root.root_resource_version.clone(),
+                state_uid: root.state_uid.clone(),
+                state_resource_version: root.state_resource_version.clone(),
+                observation_token: String::new(),
+                cache_epoch: String::new(),
+            },
+        };
+        (machine, acknowledgement, command)
+    }
+
     fn automation_completion_pending() -> (MachineStateV0, EventV0) {
         let (machine, ensured) = automation_ensure_pending();
         let spec = match &ensured {
@@ -2077,6 +3533,478 @@ mod tests {
             deletion_start_generation: root.generation,
         });
         MachineStateV0::recover(root, journal).unwrap()
+    }
+
+    struct DeletionWireExpectation {
+        path: String,
+        response: Response<Body>,
+    }
+
+    #[derive(Clone)]
+    struct DeletionWireApi {
+        expected: Arc<Mutex<VecDeque<DeletionWireExpectation>>>,
+    }
+
+    impl DeletionWireApi {
+        fn transport(
+            expected: impl IntoIterator<Item = DeletionWireExpectation>,
+        ) -> (KubeTransportV0, Self) {
+            let api = Self {
+                expected: Arc::new(Mutex::new(expected.into_iter().collect())),
+            };
+            let queued = Arc::clone(&api.expected);
+            let service = service_fn(move |request: Request<Body>| {
+                let queued = Arc::clone(&queued);
+                async move {
+                    let expected = queued
+                        .lock()
+                        .expect("deletion wire script lock")
+                        .pop_front()
+                        .expect("unexpected deletion observation request");
+                    assert_eq!(request.method(), Method::GET);
+                    assert_eq!(
+                        request
+                            .uri()
+                            .path_and_query()
+                            .expect("deletion observation request URI")
+                            .as_str(),
+                        expected.path
+                    );
+                    let body = request
+                        .into_body()
+                        .collect_bytes()
+                        .await
+                        .expect("read deletion observation request body");
+                    assert!(body.is_empty());
+                    Ok::<_, Infallible>(expected.response)
+                }
+            });
+            (
+                KubeTransportV0::test_from_client(Client::new(service, "default")),
+                api,
+            )
+        }
+
+        fn assert_drained(&self) {
+            assert!(
+                self.expected
+                    .lock()
+                    .expect("deletion wire script lock")
+                    .is_empty(),
+                "unissued deletion observation requests"
+            );
+        }
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn deletion_response(value: serde_json::Value) -> Response<Body> {
+        Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&value).expect("deletion response JSON"),
+            ))
+            .expect("deletion response")
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn deletion_list(kind: &str, items: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": format!("{kind}List"),
+            "metadata": {"resourceVersion": "list-rv"},
+            "items": items,
+        })
+    }
+
+    fn deletion_root(actor: &RootActorV0, resource_version: &str) -> serde_json::Value {
+        let root = actor.state().root();
+        serde_json::json!({
+            "apiVersion": "demo.oxideloop.dev/v1alpha1",
+            "kind": "WebApplication",
+            "metadata": {
+                "name": root.name,
+                "namespace": root.namespace,
+                "uid": root.uid,
+                "resourceVersion": resource_version,
+                "generation": root.generation,
+                "deletionTimestamp": "2026-08-30T00:00:00Z",
+            },
+        })
+    }
+
+    fn deletion_state(actor: &RootActorV0, resource_version: &str) -> serde_json::Value {
+        let root = actor.state().root();
+        serde_json::json!({
+            "apiVersion": "runtime.oxideloop.dev/v1alpha1",
+            "kind": "OxideLoopState",
+            "metadata": {
+                "name": root.state_name,
+                "namespace": root.namespace,
+                "uid": root.state_uid,
+                "resourceVersion": resource_version,
+            },
+        })
+    }
+
+    fn deletion_owner(actor: &RootActorV0) -> serde_json::Value {
+        let root = actor.state().root();
+        serde_json::json!([{
+            "apiVersion": "demo.oxideloop.dev/v1alpha1",
+            "kind": "WebApplication",
+            "name": root.name,
+            "uid": root.uid,
+            "controller": true,
+            "blockOwnerDeletion": false,
+        }])
+    }
+
+    fn deletion_child(
+        actor: &RootActorV0,
+        api_version: &str,
+        kind: &str,
+        name: &str,
+        uid: &str,
+        resource_version: &str,
+        owned: bool,
+    ) -> serde_json::Value {
+        let root = actor.state().root();
+        let mut metadata = serde_json::json!({
+            "name": name,
+            "namespace": root.namespace,
+            "uid": uid,
+            "resourceVersion": resource_version,
+        });
+        if owned {
+            metadata["ownerReferences"] = deletion_owner(actor);
+        }
+        serde_json::json!({
+            "apiVersion": api_version,
+            "kind": kind,
+            "metadata": metadata,
+        })
+    }
+
+    fn deletion_automation_run(
+        actor: &RootActorV0,
+        name: &str,
+        uid: &str,
+        resource_version: &str,
+    ) -> serde_json::Value {
+        let mut run = deletion_child(
+            actor,
+            "runtime.oxideloop.dev/v1alpha1",
+            "AutomationRun",
+            name,
+            uid,
+            resource_version,
+            true,
+        );
+        run["spec"] = serde_json::json!({
+            "occurrenceId": "occurrence-one",
+            "rootUid": actor.state().root().uid,
+            "source": {"apiVersion":"v1","kind":"ConfigMap","namespace":"ns","name":"source"},
+            "sourceUid": "source-uid",
+            "sourceResourceVersion": "source-rv",
+            "sourceTransitionId": "transition",
+            "automationId": "smoke",
+            "automationVersion": "v1",
+            "bundleDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "program": {"configMapName":"bundle","key":"program.mjs","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+            "actionModuleIdentity": "action.mjs",
+            "actionModuleDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "rendererAbiVersion": "renderer.oxideloop.dev/v0",
+            "actionInputV0": "{}",
+            "actionInputHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "eventMetadataHash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        });
+        run
+    }
+
+    fn deletion_request_actor(
+        inventory: Vec<InventoryEntry>,
+        automation_pending: Vec<AutomationPending>,
+    ) -> RootActorV0 {
+        let mut actor = RootActorV0::new(deleting_machine(inventory, automation_pending));
+        actor.start();
+        let prepare = actor
+            .next_command()
+            .expect("deletion prepare command")
+            .expect("deleting actor must persist preparation");
+        actor
+            .acknowledge(persisted_event(&prepare, "state-rv-deletion-observation"))
+            .expect("deletion preparation acknowledgement");
+        assert!(matches!(
+            actor.next_command(),
+            Ok(Some(CommandV0::RequestDeletionObservation { .. }))
+        ));
+        actor
+    }
+
+    fn deletion_address(actor: &RootActorV0) -> oxideloop_kube_transport::RootAddressV0 {
+        let root = actor.state().root();
+        oxideloop_kube_transport::RootAddressV0 {
+            namespace: root.namespace.clone(),
+            name: root.name.clone(),
+            state_name: root.state_name.clone(),
+        }
+    }
+
+    fn deletion_fence_prefix(actor: &RootActorV0) -> Vec<DeletionWireExpectation> {
+        let root = actor.state().root();
+        vec![
+            DeletionWireExpectation {
+                path: format!(
+                    "/apis/demo.oxideloop.dev/v1alpha1/namespaces/{}/webapplications/{}",
+                    root.namespace, root.name
+                ),
+                response: deletion_response(deletion_root(actor, &root.root_resource_version)),
+            },
+            DeletionWireExpectation {
+                path: format!(
+                    "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/{}/oxideloopstates/{}",
+                    root.namespace, root.state_name
+                ),
+                response: deletion_response(deletion_state(actor, &root.state_resource_version)),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn deletion_observation_port_empty_fence_acknowledges_the_owned_request() {
+        let mut actor = deletion_request_actor(vec![], vec![]);
+        let mut script = deletion_fence_prefix(&actor);
+        script.extend([
+            DeletionWireExpectation {
+                path: "/api/v1/namespaces/ns/configmaps?".into(),
+                response: deletion_response(deletion_list("ConfigMap", vec![])),
+            },
+            DeletionWireExpectation {
+                path: "/api/v1/namespaces/ns/services?".into(),
+                response: deletion_response(deletion_list("Service", vec![])),
+            },
+            DeletionWireExpectation {
+                path: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/ns/automationruns?".into(),
+                response: deletion_response(deletion_list("AutomationRun", vec![])),
+            },
+        ]);
+        let (transport, wire) = DeletionWireApi::transport(script);
+        let port = KubeDeletionObservationPortV0::new(&transport, deletion_address(&actor));
+        let observation = port
+            .observe_for_actor(&actor)
+            .await
+            .expect("exact empty deletion fence");
+        actor
+            .acknowledge_deletion_observation(observation)
+            .expect("sealed empty deletion observation acknowledgement");
+        assert!(matches!(
+            actor.next_command(),
+            Ok(Some(CommandV0::VerifyOwnedChildrenAbsent { .. }))
+        ));
+        wire.assert_drained();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn deletion_observation_port_retains_only_exact_owned_children_on_all_routes() {
+        let config = InventoryEntry {
+            identity: ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                name: "owned-config".into(),
+            },
+            logical_id: "owned-config".into(),
+            uid: "config-uid".into(),
+            resource_version: "config-rv".into(),
+            bundle_digest: "a".repeat(64),
+        };
+        let service = InventoryEntry {
+            identity: ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "Service".into(),
+                namespace: "ns".into(),
+                name: "owned-service".into(),
+            },
+            logical_id: "owned-service".into(),
+            uid: "service-uid".into(),
+            resource_version: "service-rv".into(),
+            bundle_digest: "a".repeat(64),
+        };
+        let pending = AutomationPending {
+            occurrence_id: "occurrence-one".into(),
+            automation_id: "smoke".into(),
+            source: ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                name: "source".into(),
+            },
+            run_name: "owned-run".into(),
+            run_uid: "run-uid".into(),
+            run_resource_version: "run-rv".into(),
+            spec_hash: "a".repeat(64),
+        };
+        let mut actor =
+            deletion_request_actor(vec![config.clone(), service.clone()], vec![pending]);
+        let config_value = deletion_child(
+            &actor,
+            "v1",
+            "ConfigMap",
+            "owned-config",
+            "config-uid",
+            "config-rv",
+            true,
+        );
+        let foreign_config = deletion_child(
+            &actor,
+            "v1",
+            "ConfigMap",
+            "foreign-config",
+            "foreign-uid",
+            "foreign-rv",
+            false,
+        );
+        let service_value = deletion_child(
+            &actor,
+            "v1",
+            "Service",
+            "owned-service",
+            "service-uid",
+            "service-rv",
+            true,
+        );
+        let run_value = deletion_automation_run(&actor, "owned-run", "run-uid", "run-rv");
+        let mut script = deletion_fence_prefix(&actor);
+        script.extend([
+            DeletionWireExpectation {
+                path: "/api/v1/namespaces/ns/configmaps?".into(),
+                response: deletion_response(deletion_list(
+                    "ConfigMap",
+                    vec![config_value.clone(), foreign_config],
+                )),
+            },
+            DeletionWireExpectation {
+                path: "/api/v1/namespaces/ns/configmaps/owned-config".into(),
+                response: deletion_response(config_value),
+            },
+            DeletionWireExpectation {
+                path: "/api/v1/namespaces/ns/services?".into(),
+                response: deletion_response(deletion_list("Service", vec![service_value.clone()])),
+            },
+            DeletionWireExpectation {
+                path: "/api/v1/namespaces/ns/services/owned-service".into(),
+                response: deletion_response(service_value),
+            },
+            DeletionWireExpectation {
+                path: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/ns/automationruns?".into(),
+                response: deletion_response(deletion_list(
+                    "AutomationRun",
+                    vec![run_value.clone()],
+                )),
+            },
+            DeletionWireExpectation {
+                path: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/ns/automationruns/owned-run"
+                    .into(),
+                response: deletion_response(run_value),
+            },
+        ]);
+        let (transport, wire) = DeletionWireApi::transport(script);
+        let port = KubeDeletionObservationPortV0::new(&transport, deletion_address(&actor));
+        let observation = port
+            .observe_for_actor(&actor)
+            .await
+            .expect("owned exact deletion children");
+        assert_eq!(observation.observed_inventory.len(), 2);
+        assert_eq!(observation.observed_automation_runs.len(), 1);
+        actor
+            .acknowledge_deletion_observation(observation)
+            .expect("sealed owned deletion observation acknowledgement");
+        wire.assert_drained();
+    }
+
+    #[tokio::test]
+    async fn deletion_observation_port_rejects_stale_root_or_state_pins() {
+        for stale_state in [false, true] {
+            let actor = deletion_request_actor(vec![], vec![]);
+            let root = actor.state().root();
+            let mut script = deletion_fence_prefix(&actor);
+            if stale_state {
+                script[1].response = deletion_response(deletion_state(&actor, "stale-state-rv"));
+            } else {
+                script[0].response = deletion_response(deletion_root(&actor, "stale-root-rv"));
+            }
+            let (transport, wire) = DeletionWireApi::transport(script);
+            let port = KubeDeletionObservationPortV0::new(&transport, deletion_address(&actor));
+            assert!(matches!(
+                port.observe_for_actor(&actor).await,
+                Err(RuntimeErrorV0::Discovery(TransportErrorV0::Stale(_)))
+            ));
+            assert!(
+                actor.in_flight,
+                "stale fence must not acknowledge the request"
+            );
+            wire.assert_drained();
+            assert_eq!(root.uid, "root-uid");
+        }
+    }
+
+    #[tokio::test]
+    async fn deletion_observation_port_holds_when_listed_child_changes_before_exact_get() {
+        let inventory = InventoryEntry {
+            identity: ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                name: "owned-config".into(),
+            },
+            logical_id: "owned-config".into(),
+            uid: "listed-uid".into(),
+            resource_version: "listed-rv".into(),
+            bundle_digest: "a".repeat(64),
+        };
+        let actor = deletion_request_actor(vec![inventory], vec![]);
+        let listed = deletion_child(
+            &actor,
+            "v1",
+            "ConfigMap",
+            "owned-config",
+            "listed-uid",
+            "listed-rv",
+            true,
+        );
+        let replacement = deletion_child(
+            &actor,
+            "v1",
+            "ConfigMap",
+            "owned-config",
+            "replacement-uid",
+            "replacement-rv",
+            true,
+        );
+        let mut script = deletion_fence_prefix(&actor);
+        script.extend([
+            DeletionWireExpectation {
+                path: "/api/v1/namespaces/ns/configmaps?".into(),
+                response: deletion_response(deletion_list("ConfigMap", vec![listed])),
+            },
+            DeletionWireExpectation {
+                path: "/api/v1/namespaces/ns/configmaps/owned-config".into(),
+                response: deletion_response(replacement),
+            },
+        ]);
+        let (transport, wire) = DeletionWireApi::transport(script);
+        let port = KubeDeletionObservationPortV0::new(&transport, deletion_address(&actor));
+        assert!(matches!(
+            port.observe_for_actor(&actor).await,
+            Err(RuntimeErrorV0::Discovery(TransportErrorV0::Stale(
+                "deletion child identity"
+            )))
+        ));
+        assert!(
+            actor.in_flight,
+            "replaced child must not be treated as absent"
+        );
+        wire.assert_drained();
     }
 
     fn deletion_mutation_pending() -> (MachineStateV0, EventV0) {
@@ -2293,6 +4221,7 @@ mod tests {
         root: &RootSnapshotV0,
         state_resource_version: &str,
         observation_token: &str,
+        cache_epoch: &str,
     ) -> (FrozenInputV0, String, String, Vec<DesiredObservationV0>) {
         let input_document = RenderInputV0 {
             abi_version: ABI_VERSION_V0.into(),
@@ -2306,7 +4235,7 @@ mod tests {
                 spec: serde_json::to_value(&root.spec).unwrap(),
             },
             bundle_digest: root.bundle_digest.clone(),
-            cache_epoch: "1".into(),
+            cache_epoch: cache_epoch.into(),
             observation_token: observation_token.into(),
             observations: vec![],
         };
@@ -2331,7 +4260,7 @@ mod tests {
                 root_generation: root.generation,
                 state_resource_version: state_resource_version.into(),
                 observation_token: observation_token.into(),
-                cache_epoch: "1".into(),
+                cache_epoch: cache_epoch.into(),
                 final_observation_fence_token: oxideloop_renderer_abi::sha256_hex(
                     format!("prune-final-fence/v0/{observation_token}").as_bytes(),
                 ),
@@ -2377,12 +4306,10 @@ mod tests {
         for watch_first in [true, false] {
             let root = advanced_root(machine, 8, "2");
             let mut actor = RootActorV0::new(machine.clone());
-            actor.in_flight = true;
+            actor.priority_ack = Some(ack.clone());
             if watch_first {
                 assert!(actor.root_observed(root.clone()));
-                actor.acknowledge(ack.clone());
             } else {
-                actor.acknowledge(ack.clone());
                 assert!(actor.root_observed(root));
             }
             assert!(matches!(
@@ -2498,8 +4425,7 @@ mod tests {
 
         for (name, (machine, ack), purpose, expected_recovery_purpose) in cases {
             let mut actor = RootActorV0::new(machine);
-            actor.in_flight = true;
-            actor.acknowledge(ack);
+            actor.priority_ack = Some(ack);
             let mut deletion_refresh = advanced_root(actor.state(), 8, "closure");
             deletion_refresh.deleting = true;
             assert!(actor.root_observed(deletion_refresh));
@@ -2618,10 +4544,12 @@ mod tests {
             CommandV0::RequestDescriptor { token, .. } => token,
             command => panic!("unexpected recovery command: {command:?}"),
         };
-        actor.acknowledge(EventV0::DescriptorReady {
-            token: descriptor_token,
-            bundle_digest: "a".repeat(64),
-        });
+        actor
+            .acknowledge(EventV0::DescriptorReady {
+                token: descriptor_token,
+                bundle_digest: "a".repeat(64),
+            })
+            .unwrap();
         assert!(actor.next_command().unwrap().is_none());
         actor.enqueue(EventV0::InformersReady);
         assert!(matches!(
@@ -2629,29 +4557,37 @@ mod tests {
             Some(CommandV0::RequestRender { .. })
         ));
         let (first_frozen, first_input, output, observed) =
-            prune_render_documents(actor.state().root(), "state-rv-1", "observation-1");
-        actor.acknowledge(EventV0::Rendered {
-            frozen: first_frozen.clone(),
-            render_input_json: first_input.clone(),
-            render_output_json: output.clone(),
-            observed: observed.clone(),
-        });
+            prune_render_documents(actor.state().root(), "state-rv-1", "observation-1", "1");
+        actor
+            .accept_acknowledgement(EventV0::Rendered {
+                frozen: first_frozen.clone(),
+                render_input_json: first_input.clone(),
+                render_output_json: output.clone(),
+                observed: observed.clone(),
+            })
+            .unwrap();
         let first_prepare = actor.next_command().unwrap().unwrap();
-        actor.acknowledge(persisted_event(&first_prepare, "state-rv-2"));
+        actor
+            .acknowledge(persisted_event(&first_prepare, "state-rv-2"))
+            .unwrap();
         assert!(matches!(
             actor.next_command().unwrap(),
             Some(CommandV0::RequestRender { .. })
         ));
         let mut first_revalidated_frozen = first_frozen;
         first_revalidated_frozen.state_resource_version = "state-rv-2".into();
-        actor.acknowledge(EventV0::Revalidated {
-            frozen: first_revalidated_frozen,
-            render_input_json: first_input,
-            render_output_json: output.clone(),
-            observed: observed.clone(),
-        });
+        actor
+            .accept_acknowledgement(EventV0::Revalidated {
+                frozen: first_revalidated_frozen,
+                render_input_json: first_input,
+                render_output_json: output.clone(),
+                observed: observed.clone(),
+            })
+            .unwrap();
         let first_completion = actor.next_command().unwrap().unwrap();
-        actor.acknowledge(persisted_event(&first_completion, "state-rv-3"));
+        actor
+            .acknowledge(persisted_event(&first_completion, "state-rv-3"))
+            .unwrap();
         assert!(actor.next_command().unwrap().is_none());
 
         // A genuinely new observation token supplies the second prune barrier.
@@ -2665,13 +4601,15 @@ mod tests {
             Some(CommandV0::RequestRender { .. })
         ));
         let (second_frozen, second_input, _, second_observed) =
-            prune_render_documents(actor.state().root(), "state-rv-3", "observation-2");
-        actor.acknowledge(EventV0::Rendered {
-            frozen: second_frozen.clone(),
-            render_input_json: second_input.clone(),
-            render_output_json: output.clone(),
-            observed: second_observed.clone(),
-        });
+            prune_render_documents(actor.state().root(), "state-rv-3", "observation-2", "1");
+        actor
+            .accept_acknowledgement(EventV0::Rendered {
+                frozen: second_frozen.clone(),
+                render_input_json: second_input.clone(),
+                render_output_json: output.clone(),
+                observed: second_observed.clone(),
+            })
+            .unwrap();
         let status = actor.next_command().unwrap().unwrap();
         let (status_token, old_root_rv) = match &status {
             CommandV0::PersistRootStatus {
@@ -2681,24 +4619,30 @@ mod tests {
             } => (token.clone(), old_root_resource_version.clone()),
             command => panic!("second barrier skipped root status durability: {command:?}"),
         };
-        actor.acknowledge(EventV0::RootStatusPersisted {
-            token: status_token,
-            old_root_resource_version: old_root_rv,
-            new_root_resource_version: "root-rv-2".into(),
-            root_uid: "root-uid".into(),
-        });
+        actor
+            .acknowledge(EventV0::RootStatusPersisted {
+                token: status_token,
+                old_root_resource_version: old_root_rv,
+                new_root_resource_version: "root-rv-2".into(),
+                root_uid: "root-uid".into(),
+            })
+            .unwrap();
         assert!(matches!(
             actor.next_command().unwrap(),
             Some(CommandV0::RequestRender { .. })
         ));
-        actor.acknowledge(EventV0::Rendered {
-            frozen: second_frozen.clone(),
-            render_input_json: second_input.clone(),
-            render_output_json: output.clone(),
-            observed: second_observed.clone(),
-        });
+        actor
+            .accept_acknowledgement(EventV0::Rendered {
+                frozen: second_frozen.clone(),
+                render_input_json: second_input.clone(),
+                render_output_json: output.clone(),
+                observed: second_observed.clone(),
+            })
+            .unwrap();
         let delete_prepare = actor.next_command().unwrap().unwrap();
-        actor.acknowledge(persisted_event(&delete_prepare, "state-rv-4"));
+        actor
+            .acknowledge(persisted_event(&delete_prepare, "state-rv-4"))
+            .unwrap();
         assert!(matches!(
             actor.next_command().unwrap(),
             Some(CommandV0::RequestRender { .. })
@@ -2719,10 +4663,12 @@ mod tests {
             CommandV0::RequestDescriptor { token, .. } => token,
             command => panic!("recreated delete skipped descriptor: {command:?}"),
         };
-        recreated.acknowledge(EventV0::DescriptorReady {
-            token: descriptor_token,
-            bundle_digest: "a".repeat(64),
-        });
+        recreated
+            .acknowledge(EventV0::DescriptorReady {
+                token: descriptor_token,
+                bundle_digest: "a".repeat(64),
+            })
+            .unwrap();
         assert!(recreated.next_command().unwrap().is_none());
         recreated.enqueue(EventV0::InformersReady);
         assert!(matches!(
@@ -2731,12 +4677,14 @@ mod tests {
         ));
         let mut recovered_frozen = second_frozen;
         recovered_frozen.state_resource_version = "state-rv-4".into();
-        recreated.acknowledge(EventV0::Revalidated {
-            frozen: recovered_frozen,
-            render_input_json: second_input,
-            render_output_json: output,
-            observed: second_observed,
-        });
+        recreated
+            .accept_acknowledgement(EventV0::Revalidated {
+                frozen: recovered_frozen,
+                render_input_json: second_input,
+                render_output_json: output,
+                observed: second_observed,
+            })
+            .unwrap();
         let retried = recreated.next_command().unwrap().unwrap();
         assert!(matches!(
             retried,
@@ -2802,8 +4750,7 @@ mod tests {
         let (machine, ack) = mutation_pending();
         let root = advanced_root(&machine, 8, "2");
         let mut actor = RootActorV0::new(machine);
-        actor.in_flight = true;
-        actor.acknowledge(ack);
+        actor.priority_ack = Some(ack);
         actor.root_observed(root);
 
         let mut fresh_root = advanced_root(actor.state(), 9, "3");
@@ -2920,15 +4867,17 @@ mod tests {
             } => (token, preconditions),
             command => panic!("unexpected command: {command:?}"),
         };
-        actor.acknowledge(EventV0::OwnedChildrenVerifiedAbsent {
-            token: verify_token.clone(),
-            root_uid: verify_pins.root_uid,
-            root_generation: verify_pins.root_generation,
-            root_resource_version: verify_pins.root_resource_version,
-            state_uid: verify_pins.state_uid,
-            state_resource_version: verify_pins.state_resource_version,
-            cleanup_token: verify_token,
-        });
+        actor
+            .acknowledge(EventV0::OwnedChildrenVerifiedAbsent {
+                token: verify_token.clone(),
+                root_uid: verify_pins.root_uid,
+                root_generation: verify_pins.root_generation,
+                root_resource_version: verify_pins.root_resource_version,
+                state_uid: verify_pins.state_uid,
+                state_resource_version: verify_pins.state_resource_version,
+                cleanup_token: verify_token,
+            })
+            .unwrap();
         let (finalizer_token, old_root_rv) = match actor.next_command().unwrap().unwrap() {
             CommandV0::RemoveRootFinalizer {
                 token,
@@ -2940,12 +4889,14 @@ mod tests {
         watched.root_finalizer_present = false;
         watched.root_resource_version = "root-rv-4".into();
         assert!(actor.root_observed(watched));
-        actor.acknowledge(EventV0::RootFinalizerRemoved {
-            token: finalizer_token,
-            root_uid: "root-uid".into(),
-            old_root_resource_version: old_root_rv,
-            new_root_resource_version: "root-rv-4".into(),
-        });
+        actor
+            .acknowledge(EventV0::RootFinalizerRemoved {
+                token: finalizer_token,
+                root_uid: "root-uid".into(),
+                old_root_resource_version: old_root_rv,
+                new_root_resource_version: "root-rv-4".into(),
+            })
+            .unwrap();
         assert!(matches!(
             actor.next_command(),
             Ok(Some(CommandV0::VerifyRootUidAbsent { root_uid, .. }))
@@ -2958,12 +4909,11 @@ mod tests {
     fn state_backed_root_finalizer_watch_before_ack_still_proves_original_uid_absent() {
         let (machine, ack) = state_backed_root_finalizer_pending();
         let mut actor = RootActorV0::new(machine);
-        actor.in_flight = true;
         let mut watched = actor.state().root().clone();
         watched.root_finalizer_present = false;
         watched.root_resource_version = "root-rv-3".into();
         assert!(actor.root_observed(watched));
-        actor.acknowledge(ack);
+        actor.priority_ack = Some(ack);
         assert!(matches!(
             actor.next_command(),
             Ok(Some(CommandV0::VerifyRootUidAbsent { root_uid, .. }))
@@ -3121,13 +5071,162 @@ mod tests {
             Err(RuntimeErrorV0::InFlight)
         ));
     }
+
+    #[test]
+    fn acknowledge_rejects_non_ack_events_and_never_releases_a_render_path() {
+        let mut reconcile_in_flight = actor();
+        reconcile_in_flight.start();
+        assert!(matches!(
+            reconcile_in_flight.next_command(),
+            Ok(Some(CommandV0::EnsureBootstrap { .. }))
+        ));
+        assert!(matches!(
+            reconcile_in_flight.acknowledge(EventV0::ReconcileRequested {
+                cause: InternalReconcileCauseV0::DependencyWatch,
+                observation_token: "fabricated-token".into(),
+                cache_epoch: "99".into(),
+            }),
+            Err(RuntimeErrorV0::Hold(_))
+        ));
+        assert!(matches!(reconcile_in_flight.mode(), ModeV0::Hold(_)));
+        assert!(matches!(
+            reconcile_in_flight.next_command(),
+            Err(RuntimeErrorV0::Hold(_))
+        ));
+
+        let mut refresh_in_flight = actor();
+        let root = refresh_in_flight.state().root().clone();
+        refresh_in_flight.start();
+        assert!(refresh_in_flight.next_command().unwrap().is_some());
+        assert!(matches!(
+            refresh_in_flight.acknowledge(EventV0::RootRefreshed { root }),
+            Err(RuntimeErrorV0::Hold(_))
+        ));
+        assert!(matches!(refresh_in_flight.mode(), ModeV0::Hold(_)));
+
+        let mut no_in_flight = actor();
+        assert!(matches!(
+            no_in_flight.acknowledge(EventV0::ReconcileRequested {
+                cause: InternalReconcileCauseV0::DependencyWatch,
+                observation_token: "fabricated-token".into(),
+                cache_epoch: "99".into(),
+            }),
+            Err(RuntimeErrorV0::Hold(_))
+        ));
+        assert!(matches!(no_in_flight.mode(), ModeV0::Hold(_)));
+
+        for raw_render in [
+            EventV0::Rendered {
+                frozen: FrozenInputV0 {
+                    root_generation: 1,
+                    state_resource_version: "state-rv".into(),
+                    observation_token: "forged".into(),
+                    cache_epoch: "0".into(),
+                    final_observation_fence_token: "f".repeat(64),
+                    render_input_hash: "0".repeat(64),
+                },
+                render_input_json: "{}".into(),
+                render_output_json: "{}".into(),
+                observed: vec![],
+            },
+            EventV0::Revalidated {
+                frozen: FrozenInputV0 {
+                    root_generation: 1,
+                    state_resource_version: "state-rv".into(),
+                    observation_token: "forged".into(),
+                    cache_epoch: "0".into(),
+                    final_observation_fence_token: "f".repeat(64),
+                    render_input_hash: "0".repeat(64),
+                },
+                render_input_json: "{}".into(),
+                render_output_json: "{}".into(),
+                observed: vec![],
+            },
+        ] {
+            let mut actor = actor();
+            assert!(matches!(
+                actor.acknowledge(raw_render),
+                Err(RuntimeErrorV0::Hold(_))
+            ));
+            assert!(matches!(actor.mode(), ModeV0::Hold(_)));
+        }
+    }
+
+    #[test]
+    fn deletion_revalidation_requires_a_sealed_owned_observation_capability() {
+        fn deletion_request_actor() -> (RootActorV0, PreconditionsV0) {
+            let mut actor = RootActorV0::new(deleting_machine(vec![], vec![]));
+            let root = actor.state().root().clone();
+            let preconditions = PreconditionsV0 {
+                root_uid: root.uid,
+                root_generation: root.generation,
+                root_resource_version: root.root_resource_version,
+                state_uid: root.state_uid,
+                state_resource_version: root.state_resource_version,
+                observation_token: "deletion-observation".into(),
+                cache_epoch: "0".into(),
+            };
+            actor.in_flight = true;
+            actor.owned_in_flight = Some(CommandV0::RequestDeletionObservation {
+                preconditions: preconditions.clone(),
+            });
+            (actor, preconditions)
+        }
+
+        let (mut raw_actor, _) = deletion_request_actor();
+        assert!(matches!(
+            raw_actor.acknowledge(EventV0::DeletionRevalidated {
+                observed_inventory: vec![],
+                observed_automation_runs: vec![],
+            }),
+            Err(RuntimeErrorV0::Hold(_))
+        ));
+
+        let (mut exact_actor, preconditions) = deletion_request_actor();
+        let observation = exact_actor
+            .validated_deletion_observation(
+                preconditions.clone(),
+                deletion_observation_request_token(&preconditions),
+                vec![],
+                vec![],
+            )
+            .expect("exact owned deletion pins mint the sealed observation");
+        exact_actor
+            .acknowledge_deletion_observation(observation)
+            .expect("sealed deletion observation acknowledges the owned command");
+        assert!(!exact_actor.in_flight);
+
+        let (source_actor, preconditions) = deletion_request_actor();
+        let observation = source_actor
+            .validated_deletion_observation(
+                preconditions.clone(),
+                deletion_observation_request_token(&preconditions),
+                vec![],
+                vec![],
+            )
+            .expect("exact pins mint before the stale transition");
+        let stale_machine = deleting_machine(vec![], vec![]);
+        let mut stale_root = stale_machine.root().clone();
+        stale_root.root_resource_version = "stale-root-rv".into();
+        let mut stale_actor = RootActorV0::new(
+            MachineStateV0::recover(stale_root, stale_machine.journal().clone())
+                .expect("stale-root test machine remains durable-valid"),
+        );
+        stale_actor.in_flight = true;
+        stale_actor.owned_in_flight = Some(CommandV0::RequestDeletionObservation { preconditions });
+        assert!(matches!(
+            stale_actor.acknowledge_deletion_observation(observation),
+            Err(RuntimeErrorV0::Hold(_))
+        ));
+    }
+
     #[test]
     fn stale_readiness_does_not_enqueue_an_observation_event() {
         let mut actor = actor();
         let current = actor.begin_observation_barrier();
         actor.informers_ready(BarrierV0 {
-            generation: current.generation - 1,
-            ..current
+            cache_epoch: current.cache_epoch.saturating_add(1),
+            generation: current.generation,
         });
         assert!(actor.next_command().unwrap().is_none());
         actor.informers_ready(current);
@@ -3140,19 +5239,309 @@ mod tests {
     }
 
     #[test]
+    fn sealed_same_barrier_readiness_still_issues_the_current_render() {
+        let mut actor = informers_pending_actor();
+        let barrier = actor.barrier();
+        let root = actor.state().root().clone();
+
+        actor.informers_ready(barrier);
+
+        assert!(matches!(
+            actor.next_command(),
+            Ok(Some(CommandV0::RequestRender { ref preconditions }))
+                if preconditions.root_uid == root.uid
+                    && preconditions.root_generation == root.generation
+                    && preconditions.root_resource_version == root.root_resource_version
+                    && preconditions.state_uid == root.state_uid
+                    && preconditions.state_resource_version == root.state_resource_version
+        ));
+    }
+
+    #[test]
+    fn root_refresh_drops_queued_readiness_before_it_can_render_old_pins() {
+        let mut actor = informers_pending_actor();
+        let barrier_a = actor.barrier();
+        let root_a = actor.state().root().clone();
+        actor.informers_ready(barrier_a);
+        assert!(actor.pending_informer_readiness.is_some());
+
+        let root_b = advanced_root(&actor.state, root_a.generation + 1, "readiness-race");
+        assert!(actor.root_observed(root_b.clone()));
+        assert!(actor.pending_informer_readiness.is_none());
+        assert!(actor.observation_events.is_empty());
+        assert!(actor.deferred_genuine_change.is_none());
+
+        // Root authority is reduced before any observation-only queue. A
+        // changed generation requires its durable invalidation; the old
+        // readiness can never issue a RequestRender for A.
+        assert!(matches!(
+            actor.next_command(),
+            Ok(Some(CommandV0::Persist { ref preconditions, .. }))
+                if preconditions.root_uid == root_b.uid
+                    && preconditions.root_generation == root_b.generation
+                    && preconditions.root_resource_version == root_b.root_resource_version
+                    && preconditions.state_uid == root_b.state_uid
+                    && preconditions.state_resource_version == root_b.state_resource_version
+        ));
+        assert_ne!(actor.state().root().generation, root_a.generation);
+        assert_eq!(actor.state().root().generation, root_b.generation);
+    }
+
+    #[test]
     fn genuine_dependency_and_root_observations_advance_once() {
         let mut actor = actor();
         let initial = actor.barrier();
-        assert!(actor.dependency_observed("dependency-1".into(), "epoch-1".into()));
-        assert!(!actor.dependency_observed("dependency-1".into(), "epoch-1".into()));
+        let genuine = GenuineChangeV0::from_observations(
+            &[oxideloop_renderer_abi::model::Observation {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                name: "config".into(),
+                uid: "uid-1".into(),
+                resource_version: "rv-1".into(),
+                value: serde_json::json!({"data":{"key":"value"}}),
+            }],
+            initial,
+            1,
+        )
+        .unwrap();
+        assert!(actor.record_genuine_dependency_change(&genuine));
+        assert!(!actor.record_genuine_dependency_change(&genuine));
         assert_eq!(actor.barrier().generation, initial.generation + 1);
+        // Bootstrap is not `Ready`, so retained authority is sealed for later
+        // delivery instead of manufacturing a token-only event or cancelling
+        // a non-observation command.
+        assert!(actor.observation_events.is_empty());
+        assert!(actor.deferred_genuine_change.is_some());
 
         let root = actor.state().root().clone();
         assert!(actor.root_observed(root.clone()));
         assert!(!actor.root_observed(root));
         assert_eq!(actor.barrier().generation, initial.generation + 2);
-        assert_eq!(actor.observation_events.len(), 1);
+        assert!(actor.observation_events.is_empty());
         assert!(actor.pending_root_refresh.is_some());
+        assert!(actor.deferred_genuine_change.is_none());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn retained_changes_defer_behind_durable_work_then_complete_a_fresh_render() {
+        let (machine, automation_ack, owned_automation) = automation_ensure_pending_command();
+        let mut actor = RootActorV0::new(machine);
+        actor.commands.push_back(owned_automation);
+        let owned = actor
+            .next_command()
+            .expect("automation command is issued")
+            .expect("automation command exists");
+        assert!(matches!(owned, CommandV0::EnsureAutomationRun { .. }));
+
+        let mut collections = BTreeMap::new();
+        collections.insert(
+            (ResourceKindV0::ConfigMap, "ns".into()),
+            ListV0 {
+                items: vec![dependency_object("rv-1")],
+                resource_version: "list-rv-1".into(),
+            },
+        );
+        let first_barrier = actor.barrier();
+        let (first_sender, first_watch) = WatchHandleV0::test_channel(2);
+        first_sender
+            .try_send(Ok(WatchEventV0::Modified(dependency_object("rv-2"))))
+            .expect("first genuine watch event is buffered");
+        // The same object/RV is a duplicate delivery and must not advance the
+        // actor a second time while the durable command remains owned.
+        first_sender
+            .try_send(Ok(WatchEventV0::Modified(dependency_object("rv-2"))))
+            .expect("duplicate watch event is buffered");
+        let mut first_port = KubeFixedPointPortV0::<()>::retained_for_test(
+            first_barrier,
+            ObservationBarrierV0 {
+                generation: first_barrier,
+                dependencies: vec![],
+                collections,
+                objects: vec![],
+                watches: vec![first_watch],
+            },
+        );
+        assert_eq!(
+            first_port
+                .coordinate_retained_watch(&mut actor)
+                .await
+                .expect("first retained change is authenticated"),
+            RetainedWatchCoordinationV0::ReconcileScheduled
+        );
+        assert!(actor.in_flight, "durable command ownership is retained");
+        assert!(matches!(
+            actor.owned_in_flight,
+            Some(CommandV0::EnsureAutomationRun { .. })
+        ));
+        assert!(!first_port.has_retained_observation_barrier());
+        let first_deferred_token = actor
+            .deferred_genuine_change
+            .as_ref()
+            .expect("genuine change is sealed for deferred delivery")
+            .observation_token
+            .clone();
+
+        // A newer retained barrier delivers a distinct final snapshot before
+        // the durable acknowledgement. It replaces, rather than loses, the
+        // deferred authority and advances the global barrier exactly once.
+        let second_barrier = actor.barrier();
+        let (second_sender, second_watch) = WatchHandleV0::test_channel(1);
+        second_sender
+            .try_send(Ok(WatchEventV0::Modified(dependency_object("rv-3"))))
+            .expect("newer genuine watch event is buffered");
+        let mut second_collections = BTreeMap::new();
+        second_collections.insert(
+            (ResourceKindV0::ConfigMap, "ns".into()),
+            ListV0 {
+                items: vec![dependency_object("rv-2")],
+                resource_version: "list-rv-2".into(),
+            },
+        );
+        let mut second_port = KubeFixedPointPortV0::<()>::retained_for_test(
+            second_barrier,
+            ObservationBarrierV0 {
+                generation: second_barrier,
+                dependencies: vec![],
+                collections: second_collections,
+                objects: vec![],
+                watches: vec![second_watch],
+            },
+        );
+        assert_eq!(
+            second_port
+                .coordinate_retained_watch(&mut actor)
+                .await
+                .expect("newer retained change is authenticated"),
+            RetainedWatchCoordinationV0::ReconcileScheduled
+        );
+        let latest_token = actor
+            .deferred_genuine_change
+            .as_ref()
+            .expect("latest genuine change remains deferred")
+            .observation_token
+            .clone();
+        assert_ne!(latest_token, first_deferred_token);
+        assert_eq!(actor.barrier().generation, first_barrier.generation + 2);
+
+        actor
+            .acknowledge(automation_ack)
+            .expect("exact durable acknowledgement remains accepted");
+        let durable_persist = actor
+            .next_command()
+            .expect("durable acknowledgement reduces")
+            .expect("durable acknowledgement is persisted");
+        assert!(matches!(durable_persist, CommandV0::Persist { .. }));
+        actor
+            .acknowledge(persisted_event(&durable_persist, "state-rv-after-durable"))
+            .expect("exact durable persistence acknowledgement is accepted");
+
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("deferred reconciliation is delivered once Ready")
+            .expect("deferred reconciliation requests a fresh render")
+        else {
+            panic!("durable completion did not issue the deferred render");
+        };
+        assert_eq!(preconditions.observation_token, latest_token);
+        let input = deferred_render_input(&actor, &preconditions);
+        let retry_barrier = actor.barrier();
+        let mut retry_port = KubeFixedPointPortV0::fixed_point_for_test(
+            DeferredStableRendererV0 {
+                output: deferred_render_output(),
+            },
+            deferred_test_descriptor(),
+            retry_barrier,
+            ObservationBarrierV0 {
+                generation: retry_barrier,
+                dependencies: vec![],
+                collections: BTreeMap::new(),
+                objects: vec![],
+                watches: vec![],
+            },
+        );
+        let mut result = retry_port
+            .reconcile_for_actor(&mut actor, input)
+            .await
+            .expect("fresh concrete fixed-point retry succeeds");
+        let CompletedObservationFenceOutcomeV0::Completed(capability) = retry_port
+            .complete_observation_fence(&mut actor, &mut result)
+            .expect("fresh fixed point completes a full fence")
+        else {
+            panic!("fresh fixed point did not mint a sealed render capability");
+        };
+        actor
+            .acknowledge_render_observation(*capability)
+            .expect("sealed retry render acknowledgement is accepted");
+        assert!(matches!(
+            actor.next_command(),
+            Ok(Some(
+                CommandV0::Persist { .. } | CommandV0::PersistRootStatus { .. }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn retained_delete_defers_behind_durable_work_without_cancelling_ownership() {
+        let (machine, automation_ack, owned_automation) = automation_ensure_pending_command();
+        let mut actor = RootActorV0::new(machine);
+        actor.commands.push_back(owned_automation);
+        assert!(matches!(
+            actor.next_command(),
+            Ok(Some(CommandV0::EnsureAutomationRun { .. }))
+        ));
+        let barrier = actor.barrier();
+        let (sender, watch) = WatchHandleV0::test_channel(1);
+        sender
+            .try_send(Ok(WatchEventV0::Deleted(dependency_object("rv-2"))))
+            .expect("UID-correlated retained delete is buffered");
+        let mut collections = BTreeMap::new();
+        collections.insert(
+            (ResourceKindV0::ConfigMap, "ns".into()),
+            ListV0 {
+                items: vec![dependency_object("rv-1")],
+                resource_version: "list-rv-1".into(),
+            },
+        );
+        let mut port = KubeFixedPointPortV0::<()>::retained_for_test(
+            barrier,
+            ObservationBarrierV0 {
+                generation: barrier,
+                dependencies: vec![],
+                collections,
+                objects: vec![],
+                watches: vec![watch],
+            },
+        );
+        assert_eq!(
+            port.coordinate_retained_watch(&mut actor)
+                .await
+                .expect("retained delete is authenticated"),
+            RetainedWatchCoordinationV0::ReconcileScheduled
+        );
+        assert!(actor.in_flight, "delete cannot cancel the durable command");
+        let deferred_token = actor
+            .deferred_genuine_change
+            .as_ref()
+            .expect("retained delete is deferred")
+            .observation_token
+            .clone();
+        actor
+            .acknowledge(automation_ack)
+            .expect("exact durable acknowledgement remains accepted");
+        let persist = actor
+            .next_command()
+            .expect("durable acknowledgement reduces")
+            .expect("durable acknowledgement persists");
+        actor
+            .acknowledge(persisted_event(&persist, "state-rv-after-delete"))
+            .expect("exact persistence acknowledgement remains accepted");
+        assert!(matches!(
+            actor.next_command(),
+            Ok(Some(CommandV0::RequestRender { ref preconditions }))
+                if preconditions.observation_token == deferred_token
+        ));
     }
 
     #[test]
@@ -3214,10 +5603,7 @@ mod tests {
         };
         assert_eq!(
             schedule_prune_confirmation(current, true, false),
-            Some(BarrierScheduleV0::ImmediateFreshBarrier(BarrierV0 {
-                generation: 8,
-                cache_epoch: 3,
-            }))
+            Some(BarrierScheduleV0::ImmediateFreshBarrier(current))
         );
         assert_eq!(schedule_prune_confirmation(current, true, true), None);
     }
@@ -3283,7 +5669,7 @@ mod tests {
         .unwrap();
         assert_eq!(port.renders, 2);
         assert_eq!(port.barriers, 1);
-        assert_eq!(result.dependencies, [dep()]);
+        assert_eq!(result.dependencies(), [dep()]);
     }
 
     #[test]
@@ -3364,10 +5750,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(actor.barrier().cache_epoch, 1);
-        assert_eq!(result.input.cache_epoch, "1");
-        assert_ne!(result.input.observation_token, "t");
+        assert_eq!(result.input().cache_epoch, "1");
+        assert_ne!(result.input().observation_token, "t");
         assert_eq!(
-            result.input.observation_token,
+            result.input().observation_token,
             observation_token_for_barrier(
                 "t",
                 BarrierV0 {
@@ -3416,8 +5802,8 @@ mod tests {
                 cache_epoch: 1
             }
         );
-        assert_eq!(result.input.cache_epoch, "1");
-        assert_ne!(result.input.observation_token, "gone-token");
+        assert_eq!(result.input().cache_epoch, "1");
+        assert_ne!(result.input().observation_token, "gone-token");
         assert_eq!(port.invalidations, 1);
         assert_eq!(port.barrier, Some(actor.barrier()));
     }

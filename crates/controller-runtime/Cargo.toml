@@ -29,5 +29,11 @@ futures-util = "0.3"
 rustix = { version = "1", optional = true, features = ["event", "fs", "process"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
+[dev-dependencies]
+oxideloop-kube-transport = { path = "../kube-transport", features = ["test-support"] }
+http = "1"
+kube = { version = "4.2", default-features = false, features = ["client", "rustls-tls"] }
+tower = { version = "0.5", features = ["util"] }
+
 [lints]
 workspace = true

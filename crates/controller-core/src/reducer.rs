@@ -131,6 +131,11 @@ pub struct RuntimeStateV0 {
     /// accepted and can be durably closed without replaying the effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_root_refresh: Option<RootSnapshotV0>,
+    /// A retained dependency barrier may supersede an observation-only render
+    /// before it has had any durable effect.  This stays in the skipped
+    /// runtime continuation: recovery always obtains a fresh informer fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_observation: Option<PreconditionsV0>,
 }
 
 impl Default for RuntimeStateV0 {
@@ -142,6 +147,7 @@ impl Default for RuntimeStateV0 {
             pending_bootstrap: None,
             pending_descriptor_token: None,
             pending_root_refresh: None,
+            pending_observation: None,
         }
     }
 }
@@ -248,6 +254,7 @@ impl MachineStateV0 {
                 pending_bootstrap: None,
                 pending_descriptor_token: None,
                 pending_root_refresh: None,
+                pending_observation: None,
             },
         })
     }
@@ -296,6 +303,7 @@ impl MachineStateV0 {
                 pending_bootstrap: None,
                 pending_descriptor_token: None,
                 pending_root_refresh: None,
+                pending_observation: None,
             },
         })
     }
@@ -460,6 +468,12 @@ pub enum EventV0 {
         cause: InternalReconcileCauseV0,
         observation_token: String,
         cache_epoch: String,
+    },
+    /// Actor-local replacement of an observation-only informer/render pass.
+    /// This event is never persisted and deliberately carries exact root/state
+    /// pins, rather than a token-only wakeup that could bypass `Ready`.
+    ObservationSuperseded {
+        preconditions: PreconditionsV0,
     },
     BootstrapAcknowledged {
         token: String,
@@ -773,6 +787,9 @@ pub fn reduce(mut state: MachineStateV0, event: EventV0) -> Result<TransitionV0,
             &cache_epoch,
             &mut commands,
         ),
+        EventV0::ObservationSuperseded { preconditions } => {
+            observation_superseded(&mut state, preconditions, &mut commands)
+        }
         EventV0::BootstrapAcknowledged {
             token,
             state_name,
@@ -808,7 +825,11 @@ pub fn reduce(mut state: MachineStateV0, event: EventV0) -> Result<TransitionV0,
                     PhaseV0::RenderPending
                 };
                 commands.push(CommandV0::RequestRender {
-                    preconditions: pins(&state.root),
+                    preconditions: state
+                        .runtime
+                        .pending_observation
+                        .take()
+                        .unwrap_or_else(|| pins(&state.root)),
                 });
             } else {
                 stale(&mut commands, "informers acknowledgement phase mismatch");
@@ -1390,6 +1411,38 @@ fn reconcile_requested(
     commands.push(CommandV0::RequestRender { preconditions });
 }
 
+/// Replace a non-durable informer/render pass with the exact authoritative
+/// pins from a retained-watch snapshot.  In particular, this intentionally
+/// does not use `ReconcileRequested`: that token-only event is legal only in
+/// `Ready`, where no command ownership needs to be cancelled.
+fn observation_superseded(
+    state: &mut MachineStateV0,
+    preconditions: PreconditionsV0,
+    commands: &mut Vec<CommandV0>,
+) {
+    if state.root.deleting
+        || !matches!(
+            state.phase,
+            PhaseV0::InformersPending | PhaseV0::RenderPending | PhaseV0::RevalidatePending
+        )
+        || preconditions.root_uid != state.root.uid
+        || preconditions.root_generation != state.root.generation
+        || preconditions.root_resource_version != state.root.root_resource_version
+        || preconditions.state_uid != state.root.state_uid
+        || preconditions.state_resource_version != state.root.state_resource_version
+        || preconditions.observation_token.is_empty()
+        || preconditions.observation_token.len() > MAX_IDENTIFIER_BYTES
+        || preconditions.cache_epoch.is_empty()
+        || preconditions.cache_epoch.len() > MAX_IDENTIFIER_BYTES
+    {
+        stale(commands, "observation supersession phase or pins mismatch");
+        return;
+    }
+    state.frozen = None;
+    state.runtime.pending_observation = Some(preconditions);
+    state.phase = PhaseV0::InformersPending;
+}
+
 fn start(state: &mut MachineStateV0, commands: &mut Vec<CommandV0>) {
     if state.root_only_deletion_recovery {
         if state.phase != PhaseV0::Recovery {
@@ -1428,6 +1481,7 @@ fn start(state: &mut MachineStateV0, commands: &mut Vec<CommandV0>) {
             pending_bootstrap: None,
             pending_descriptor_token: None,
             pending_root_refresh: None,
+            pending_observation: None,
         };
         if !bootstrap_confirmed(state) {
             issue_bootstrap(state, commands);

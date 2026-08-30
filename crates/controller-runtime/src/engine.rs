@@ -16,18 +16,26 @@ pub async fn reconcile_with_watch_restarts<P: FixedPointPortV0>(
     mut input: RenderInputV0,
 ) -> Result<FixedPointResultV0, RuntimeErrorV0> {
     loop {
+        port.set_barrier(actor.barrier());
         input.cache_epoch = actor.barrier().cache_epoch.to_string();
+        actor.bind_fixed_point_input(&input);
         match reconcile_fixed_point(port, input.clone()).await {
             Err(RuntimeErrorV0::Discovery(
                 TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow,
             )) => {
                 actor.watch_invalidated();
                 port.watch_invalidated(actor.barrier());
+                port.set_barrier(actor.barrier());
                 input.cache_epoch = actor.barrier().cache_epoch.to_string();
                 input.observation_token =
                     observation_token_for_barrier(&input.observation_token, actor.barrier());
             }
-            result => return result,
+            result => {
+                if let Ok(final_result) = &result {
+                    actor.bind_fixed_point_input(final_result.input());
+                }
+                return result;
+            }
         }
     }
 }

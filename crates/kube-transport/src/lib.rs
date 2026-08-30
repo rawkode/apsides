@@ -22,9 +22,10 @@ use std::sync::{
 
 use futures_util::StreamExt;
 use oxideloop_controller_api::{
-    ApplyOutcome, ApplyResult, AutomationRunCompletionState, AutomationRunSpec,
-    AutomationRunStatus, DeletionCleanupReceipt, ObjectIdentity, OxideLoopStateSpec,
-    ROOT_FINALIZER, STATE_FINALIZER, StateLink, WebApplicationStatus,
+    ApplyOutcome, ApplyResult, AutomationPending, AutomationRunCompletionState, AutomationRunSpec,
+    AutomationRunStatus, DeletionCleanupReceipt, MAX_MESSAGE_BYTES, ObjectIdentity,
+    OxideLoopStateSpec, ROOT_FINALIZER, STATE_FINALIZER, StateLink, WebApplicationStatus,
+    validate_automation_run_name,
 };
 use oxideloop_controller_core::{CommandV0, MutationCommandV0, PreconditionsV0};
 use oxideloop_event_planner::{PlannedEventV0, materialize_event, semantically_equal};
@@ -218,6 +219,172 @@ pub struct AutomationCompletionAckV0 {
     pub completion: AutomationRunCompletionState,
 }
 
+/// Durable identity pins for exactly one pending `AutomationRun` occurrence.
+///
+/// The caller must construct this from the journal record which issued the
+/// run, never from an informer object.  A same-name object which fails any of
+/// these pins is an authentication failure, not a candidate for adoption.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutomationRunExpectationV0 {
+    root: ObjectRefV0,
+    root_uid: String,
+    occurrence_id: String,
+    run_name: String,
+    run_uid: String,
+    run_resource_version: String,
+    spec_hash: String,
+}
+
+impl AutomationRunExpectationV0 {
+    /// Builds the exact expectation only from a durable pending journal item
+    /// and the already-authenticated root identity.
+    pub fn from_pending(
+        root: ObjectRefV0,
+        root_uid: impl Into<String>,
+        pending: &AutomationPending,
+    ) -> Result<Self, TransportErrorV0> {
+        let expectation = Self {
+            root,
+            root_uid: root_uid.into(),
+            occurrence_id: pending.occurrence_id.clone(),
+            run_name: pending.run_name.clone(),
+            run_uid: pending.run_uid.clone(),
+            run_resource_version: pending.run_resource_version.clone(),
+            spec_hash: pending.spec_hash.clone(),
+        };
+        validate_automation_expectation(&expectation)?;
+        Ok(expectation)
+    }
+}
+
+/// A run which has passed the one P6 authentication gate for list, watch and
+/// exact GET observations.  Its fields are private so a caller cannot forge a
+/// validated run without going through [`validate_automation_run_observation`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedAutomationRunV0 {
+    reference: ObjectRefV0,
+    uid: String,
+    pending_resource_version: String,
+    resource_version: String,
+    spec: AutomationRunSpec,
+    status: AutomationRunStatus,
+}
+
+impl ValidatedAutomationRunV0 {
+    #[must_use]
+    pub fn reference(&self) -> &ObjectRefV0 {
+        &self.reference
+    }
+
+    #[must_use]
+    pub fn uid(&self) -> &str {
+        &self.uid
+    }
+
+    #[must_use]
+    pub fn resource_version(&self) -> &str {
+        &self.resource_version
+    }
+
+    /// The durable pending RV captured when the run was ensured.  This is the
+    /// only valid old RV for a completion acknowledgement; current and old
+    /// Kubernetes RVs must never be ordered lexically.
+    #[must_use]
+    pub fn pending_resource_version(&self) -> &str {
+        &self.pending_resource_version
+    }
+
+    #[must_use]
+    pub fn spec(&self) -> &AutomationRunSpec {
+        &self.spec
+    }
+
+    /// Returns the immutable historical program authority.  Incomplete replay
+    /// must use this value, not a newer root program reference.
+    #[must_use]
+    pub fn program(&self) -> &oxideloop_controller_api::ProgramBundleReference {
+        &self.spec.program
+    }
+
+    #[must_use]
+    pub fn status(&self) -> &AutomationRunStatus {
+        &self.status
+    }
+
+    #[must_use]
+    pub fn is_pristine(&self) -> bool {
+        self.status == AutomationRunStatus::default()
+    }
+
+    /// Completion data is available only after the validator has checked the
+    /// complete status/materialization shape and the completion RV differs
+    /// from the durable pending RV.
+    #[must_use]
+    pub fn completion(&self) -> Option<ValidatedAutomationCompletionV0> {
+        let completion = self.status.completion.as_ref()?;
+        Some(ValidatedAutomationCompletionV0 {
+            uid: self.uid.clone(),
+            old_resource_version: self.pending_resource_version.clone(),
+            new_resource_version: self.resource_version.clone(),
+            attempts: self.status.attempts,
+            materialization_name: self.status.materialization_name.clone()?,
+            materialization_uid: self.status.materialization_uid.clone()?,
+            completion: completion.state,
+        })
+    }
+}
+
+/// Authenticated completion facts.  The old resourceVersion deliberately is
+/// not carried by Kubernetes: callers must use the durable pending pin from
+/// their `AutomationRunExpectationV0`, never infer an ordering between RVs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedAutomationCompletionV0 {
+    uid: String,
+    old_resource_version: String,
+    new_resource_version: String,
+    attempts: u16,
+    materialization_name: String,
+    materialization_uid: String,
+    completion: AutomationRunCompletionState,
+}
+
+impl ValidatedAutomationCompletionV0 {
+    #[must_use]
+    pub fn uid(&self) -> &str {
+        &self.uid
+    }
+
+    #[must_use]
+    pub fn new_resource_version(&self) -> &str {
+        &self.new_resource_version
+    }
+
+    #[must_use]
+    pub fn old_resource_version(&self) -> &str {
+        &self.old_resource_version
+    }
+
+    #[must_use]
+    pub const fn attempts(&self) -> u16 {
+        self.attempts
+    }
+
+    #[must_use]
+    pub fn materialization_name(&self) -> &str {
+        &self.materialization_name
+    }
+
+    #[must_use]
+    pub fn materialization_uid(&self) -> &str {
+        &self.materialization_uid
+    }
+
+    #[must_use]
+    pub const fn completion(&self) -> AutomationRunCompletionState {
+        self.completion
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ObjectV0 {
@@ -232,6 +399,17 @@ pub struct ListV0 {
     pub items: Vec<ObjectV0>,
     /// Present even for an empty list; it is the exact collection RV.
     pub resource_version: String,
+}
+
+/// A deletion-only list/reread snapshot. It is deliberately not a generic
+/// discovery result: root and state pins were checked immediately before the
+/// lists, and every retained child is exact-re-read before it is returned.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeletionObservationSnapshotV0 {
+    pub root: ObjectV0,
+    pub state: ObjectV0,
+    pub inventory: Vec<ObjectV0>,
+    pub automation_runs: Vec<ObjectV0>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -265,6 +443,8 @@ pub enum TransportErrorV0 {
     WatchGone,
     #[error("watch buffer overflow; invalidate the cache epoch")]
     WatchOverflow,
+    #[error("AutomationRun observation cannot authenticate the durable pending occurrence: {0}")]
+    AutomationObservationHold(String),
     #[error("Kubernetes conflict (409)")]
     Conflict,
     #[error("transport failure: {0}")]
@@ -323,6 +503,27 @@ pub struct WatchHandleV0 {
 }
 
 impl WatchHandleV0 {
+    /// Test-only watch injection. This is feature-gated and unavailable from
+    /// the production transport capability surface.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn test_channel(
+        capacity: usize,
+    ) -> (
+        tokio::sync::mpsc::Sender<Result<WatchEventV0, TransportErrorV0>>,
+        Self,
+    ) {
+        let (sender, events) = tokio::sync::mpsc::channel(capacity);
+        (
+            sender,
+            Self {
+                events,
+                overflowed: Arc::new(AtomicBool::new(false)),
+                terminal: None,
+            },
+        )
+    }
+
     /// Reads the next event. A 410 or an upstream error is mapped to a domain
     /// failure so the caller must invalidate its cache epoch.
     pub async fn next_event(&mut self) -> Result<WatchEventV0, TransportErrorV0> {
@@ -345,6 +546,87 @@ impl WatchHandleV0 {
         }
         event
     }
+
+    /// Returns one already-buffered event without waiting.  Closing a watch is
+    /// terminal just as it is for [`Self::next_event`]; callers must restart
+    /// the epoch instead of treating an empty local buffer as authority.
+    pub fn try_next_event(&mut self) -> Result<Option<WatchEventV0>, TransportErrorV0> {
+        if let Some(error) = &self.terminal {
+            return Err(error.clone());
+        }
+        if self.overflowed.load(Ordering::Acquire) {
+            self.terminal = Some(TransportErrorV0::WatchOverflow);
+            return Err(TransportErrorV0::WatchOverflow);
+        }
+        match self.events.try_recv() {
+            Ok(event) => {
+                if let Err(error) = &event {
+                    self.terminal = Some(error.clone());
+                }
+                event.map(Some)
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                self.terminal = Some(TransportErrorV0::WatchGone);
+                Err(TransportErrorV0::WatchGone)
+            }
+        }
+    }
+}
+
+/// Retained, authenticated watch state for one durable pending automation
+/// occurrence.  It is created only through
+/// [`KubeTransportV0::observe_pending_automation_run`], which establishes the
+/// list/watch/reread barrier before returning it.
+pub struct AutomationRunObservationBarrierV0 {
+    expectation: AutomationRunExpectationV0,
+    watch: WatchHandleV0,
+    current: ValidatedAutomationRunV0,
+}
+
+impl AutomationRunObservationBarrierV0 {
+    #[must_use]
+    pub fn current(&self) -> &ValidatedAutomationRunV0 {
+        &self.current
+    }
+
+    /// Drains buffered list-to-watch-race events.  Delivery order, not
+    /// lexical resourceVersion ordering, decides the final value.
+    pub fn drain_buffered_events(&mut self) -> Result<bool, TransportErrorV0> {
+        let mut changed = false;
+        while let Some(event) = self.watch.try_next_event()? {
+            changed |= self.apply(event)?;
+        }
+        Ok(changed)
+    }
+
+    /// Waits until an authenticated change for this occurrence arrives.
+    /// Unrelated list/watch traffic is ignored after the common validator
+    /// identifies it as outside the durable pending name.
+    pub async fn next_change(&mut self) -> Result<ValidatedAutomationRunV0, TransportErrorV0> {
+        loop {
+            if self.drain_buffered_events()? {
+                return Ok(self.current.clone());
+            }
+            let event = self.watch.next_event().await?;
+            if self.apply(event)? {
+                return Ok(self.current.clone());
+            }
+        }
+    }
+
+    fn apply(&mut self, event: WatchEventV0) -> Result<bool, TransportErrorV0> {
+        let Some(validated) = validate_automation_watch_event(&event, &self.expectation)? else {
+            return Ok(false);
+        };
+        if self.current.uid == validated.uid
+            && self.current.resource_version == validated.resource_version
+        {
+            return Ok(false);
+        }
+        self.current = validated;
+        Ok(true)
+    }
 }
 
 impl KubeTransportV0 {
@@ -360,9 +642,13 @@ impl KubeTransportV0 {
         Ok(Self { client })
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)]
-    fn from_client(client: Client) -> Self {
+    /// Builds a transport around an in-memory Kubernetes client for external
+    /// adapter contract tests.  This is feature-gated so production callers
+    /// cannot substitute an arbitrary Kubernetes service.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_from_client(client: Client) -> Self {
         Self { client }
     }
 
@@ -1275,6 +1561,91 @@ impl KubeTransportV0 {
         })
     }
 
+    /// Performs the exact deletion-observation read path for one owned root.
+    ///
+    /// The root/state fence is pinned to the in-flight command, deletion is
+    /// rechecked from the live root, and only children having the exact sole
+    /// controller owner are returned after an exact identity reread. This is
+    /// intentionally the only transport API that produces a deletion
+    /// revalidation snapshot.
+    pub async fn observe_deletion_revalidation(
+        &self,
+        address: &RootAddressV0,
+        preconditions: &PreconditionsV0,
+    ) -> Result<DeletionObservationSnapshotV0, TransportErrorV0> {
+        validate_address(address)?;
+        let fence = self.reread_fence(address, preconditions).await?;
+        let generation = fence
+            .root
+            .value
+            .pointer("/metadata/generation")
+            .and_then(Value::as_i64);
+        if generation != Some(preconditions.root_generation)
+            || fence.root.reference.resource != ResourceKindV0::WebApplication
+            || fence.root.reference.namespace != address.namespace
+            || fence.root.reference.name != address.name
+            || fence
+                .root
+                .value
+                .pointer("/metadata/deletionTimestamp")
+                .is_none_or(Value::is_null)
+        {
+            return Err(TransportErrorV0::Stale("deletion observation root pins"));
+        }
+
+        let mut inventory = Vec::new();
+        for resource in [ResourceKindV0::ConfigMap, ResourceKindV0::Service] {
+            let listed = self.list_exact(resource, &address.namespace).await?;
+            for object in listed.items {
+                if !has_exact_canonical_owner(
+                    &object,
+                    &fence.root.reference,
+                    &fence.root.metadata.uid,
+                ) {
+                    continue;
+                }
+                match self.reread(&object.reference).await? {
+                    None => {}
+                    Some(reread)
+                        if reread.metadata.uid == object.metadata.uid
+                            && reread.metadata.resource_version
+                                == object.metadata.resource_version =>
+                    {
+                        inventory.push(reread);
+                    }
+                    Some(_) => return Err(TransportErrorV0::Stale("deletion child identity")),
+                }
+            }
+        }
+
+        let mut automation_runs = Vec::new();
+        let listed = self
+            .list_exact(ResourceKindV0::AutomationRun, &address.namespace)
+            .await?;
+        for object in listed.items {
+            if !has_exact_canonical_owner(&object, &fence.root.reference, &fence.root.metadata.uid)
+            {
+                continue;
+            }
+            match self.reread(&object.reference).await? {
+                None => {}
+                Some(reread)
+                    if reread.metadata.uid == object.metadata.uid
+                        && reread.metadata.resource_version == object.metadata.resource_version =>
+                {
+                    automation_runs.push(reread);
+                }
+                Some(_) => return Err(TransportErrorV0::Stale("deletion AutomationRun identity")),
+            }
+        }
+        Ok(DeletionObservationSnapshotV0 {
+            root: fence.root,
+            state: fence.state,
+            inventory,
+            automation_runs,
+        })
+    }
+
     /// Re-reads one exact allowlisted namespace-scoped object.
     ///
     /// # Errors
@@ -1752,6 +2123,45 @@ impl KubeTransportV0 {
         })
     }
 
+    /// Establishes an authenticated list/watch/reread barrier for one durable
+    /// pending `AutomationRun`.  The list validates a same-name collision,
+    /// the watch starts from that list's exact RV, and the exact GET plus
+    /// buffered-event drain closes the creation race before the retained
+    /// handle is returned.
+    pub async fn observe_pending_automation_run(
+        &self,
+        expectation: AutomationRunExpectationV0,
+    ) -> Result<AutomationRunObservationBarrierV0, TransportErrorV0> {
+        validate_automation_expectation(&expectation)?;
+        let list = self
+            .list_exact(ResourceKindV0::AutomationRun, &expectation.root.namespace)
+            .await?;
+        let _ = validate_automation_run_list(&list, &expectation)?;
+        let watch = self
+            .watch_from(
+                ResourceKindV0::AutomationRun,
+                &expectation.root.namespace,
+                &list.resource_version,
+            )
+            .await?;
+        let reference = ObjectRefV0 {
+            resource: ResourceKindV0::AutomationRun,
+            namespace: expectation.root.namespace.clone(),
+            name: expectation.run_name.clone(),
+        };
+        let current = validate_automation_run_get(self.reread(&reference).await?, &expectation)?;
+        let mut barrier = AutomationRunObservationBarrierV0 {
+            expectation,
+            watch,
+            current,
+        };
+        // A delete or malformed same-name event in this gap is a hold, not a
+        // reason to use the reread value.  The final delivery wins without
+        // assuming Kubernetes resourceVersions are lexically ordered.
+        let _ = barrier.drain_buffered_events()?;
+        Ok(barrier)
+    }
+
     /// Creates only `OxideLoopState` objects.
     async fn create_state(&self, object: &ObjectV0) -> Result<ObjectV0, TransportErrorV0> {
         self.create(object, ResourceKindV0::OxideLoopState).await
@@ -2201,6 +2611,242 @@ fn completion_recovery(
             .ok_or(TransportErrorV0::ForeignCollision)?,
         completion,
     })
+}
+
+fn automation_observation_hold(reason: impl Into<String>) -> TransportErrorV0 {
+    TransportErrorV0::AutomationObservationHold(reason.into())
+}
+
+fn validate_automation_expectation(
+    expectation: &AutomationRunExpectationV0,
+) -> Result<(), TransportErrorV0> {
+    if expectation.root.resource != ResourceKindV0::WebApplication
+        || expectation.root.namespace.is_empty()
+        || expectation.root.name.is_empty()
+        || expectation.root_uid.is_empty()
+        || expectation.occurrence_id.is_empty()
+        || expectation.run_name.is_empty()
+        || expectation.run_uid.is_empty()
+        || expectation.run_resource_version.is_empty()
+        || expectation.spec_hash.len() != 64
+        || !expectation
+            .spec_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(automation_observation_hold(
+            "durable pending AutomationRun expectation is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn is_durable_pending_name(object: &ObjectV0, expectation: &AutomationRunExpectationV0) -> bool {
+    object.reference.namespace == expectation.root.namespace
+        && object.reference.name == expectation.run_name
+}
+
+/// The one shared authentication gate for every `AutomationRun` observation
+/// route.  Objects outside the durable pending name are intentionally ignored
+/// even if malformed.  A same-name object must meet every immutable pin or
+/// becomes an explicit Hold instead of an adoption opportunity.
+pub fn validate_automation_run_observation(
+    object: &ObjectV0,
+    expectation: &AutomationRunExpectationV0,
+) -> Result<Option<ValidatedAutomationRunV0>, TransportErrorV0> {
+    validate_automation_expectation(expectation)?;
+    if !is_durable_pending_name(object, expectation) {
+        return Ok(None);
+    }
+    if object.reference.resource != ResourceKindV0::AutomationRun
+        || object.reference.namespace != expectation.root.namespace
+        || object.reference.name != expectation.run_name
+        || object.metadata.uid != expectation.run_uid
+        || object.metadata.resource_version.is_empty()
+    {
+        return Err(automation_observation_hold(
+            "same-name AutomationRun identity does not match durable pending pins",
+        ));
+    }
+    let metadata = object
+        .value
+        .get("metadata")
+        .and_then(Value::as_object)
+        .ok_or_else(|| automation_observation_hold("AutomationRun metadata is malformed"))?;
+    if object.value.get("apiVersion").and_then(Value::as_str)
+        != Some(ResourceKindV0::AutomationRun.api_version())
+        || object.value.get("kind").and_then(Value::as_str)
+            != Some(ResourceKindV0::AutomationRun.kind())
+        || metadata.get("name").and_then(Value::as_str) != Some(expectation.run_name.as_str())
+        || metadata.get("namespace").and_then(Value::as_str)
+            != Some(expectation.root.namespace.as_str())
+        || metadata.get("uid").and_then(Value::as_str) != Some(object.metadata.uid.as_str())
+        || metadata.get("resourceVersion").and_then(Value::as_str)
+            != Some(object.metadata.resource_version.as_str())
+    {
+        return Err(automation_observation_hold(
+            "AutomationRun GVK or metadata differs from the exact response identity",
+        ));
+    }
+    // A journaled pending run is live only while its exact pinned object has
+    // not entered deletion.  This applies uniformly to list, exact GET, and
+    // Added/Modified watch observations because they all pass this gate.
+    // `Deleted` is separately fail-closed below, so no route can turn a
+    // disappearing pending occurrence into successful completion.
+    if metadata
+        .get("deletionTimestamp")
+        .is_some_and(|timestamp| !timestamp.is_null())
+    {
+        return Err(automation_observation_hold(
+            "durable pending AutomationRun is deleting",
+        ));
+    }
+    let annotations = metadata
+        .get("annotations")
+        .map(|value| serde_json::from_value::<BTreeMap<String, String>>(value.clone()))
+        .transpose()
+        .map_err(|_| automation_observation_hold("AutomationRun annotations are malformed"))?
+        .unwrap_or_default();
+    if annotations != object.metadata.annotations
+        || !has_exact_canonical_owner(object, &expectation.root, &expectation.root_uid)
+    {
+        return Err(automation_observation_hold(
+            "AutomationRun metadata lacks the exact sole controller owner",
+        ));
+    }
+    let spec: AutomationRunSpec = serde_json::from_value(
+        object
+            .value
+            .get("spec")
+            .cloned()
+            .ok_or_else(|| automation_observation_hold("AutomationRun spec is absent"))?,
+    )
+    .map_err(|_| automation_observation_hold("AutomationRun immutable spec is malformed"))?;
+    spec.validate()
+        .map_err(|_| automation_observation_hold("AutomationRun immutable spec is invalid"))?;
+    validate_automation_run_name(&expectation.run_name, &spec)
+        .map_err(|_| automation_observation_hold("AutomationRun name is not deterministic"))?;
+    let spec_value = serde_json::to_value(&spec)
+        .map_err(|_| automation_observation_hold("AutomationRun spec cannot be canonicalized"))?;
+    let canonical = oxideloop_renderer_abi::canonical_bytes(&spec_value)
+        .map_err(|_| automation_observation_hold("AutomationRun spec cannot be canonicalized"))?;
+    if oxideloop_renderer_abi::sha256_hex(&canonical) != expectation.spec_hash
+        || spec.root_uid != expectation.root_uid
+        || spec.occurrence_id != expectation.occurrence_id
+    {
+        return Err(automation_observation_hold(
+            "AutomationRun immutable spec does not match durable pending occurrence",
+        ));
+    }
+    let status: AutomationRunStatus = match object.value.get("status") {
+        Some(status) => serde_json::from_value(status.clone())
+            .map_err(|_| automation_observation_hold("AutomationRun status is malformed"))?,
+        None => AutomationRunStatus::default(),
+    };
+    status
+        .validate()
+        .map_err(|_| automation_observation_hold("AutomationRun status is invalid"))?;
+    match &status.completion {
+        None if status == AutomationRunStatus::default() => {
+            if object.metadata.resource_version != expectation.run_resource_version {
+                return Err(automation_observation_hold(
+                    "incomplete AutomationRun resourceVersion differs from durable pending pin",
+                ));
+            }
+        }
+        None => {
+            return Err(automation_observation_hold(
+                "incomplete AutomationRun status is not pristine",
+            ));
+        }
+        Some(completion)
+            if status.attempts == 0
+                || status.attempts > 32
+                || completion.message.len() > MAX_MESSAGE_BYTES
+                || status.materialization_name.is_none()
+                || status.materialization_uid.is_none()
+                || status.materialization_name.as_deref()
+                    == Some(expectation.run_name.as_str())
+                || status.materialization_uid.as_deref() == Some(expectation.run_uid.as_str())
+                || object.metadata.resource_version == expectation.run_resource_version =>
+        {
+            return Err(automation_observation_hold(
+                "completed AutomationRun status/materialization is not exact",
+            ));
+        }
+        Some(_) => {}
+    }
+    Ok(Some(ValidatedAutomationRunV0 {
+        reference: object.reference.clone(),
+        uid: object.metadata.uid.clone(),
+        pending_resource_version: expectation.run_resource_version.clone(),
+        resource_version: object.metadata.resource_version.clone(),
+        spec,
+        status,
+    }))
+}
+
+/// Validates the LIST leg of a pending-run barrier.  A malformed unrelated
+/// item has no authority; duplicate same-name candidates are a hold.
+pub fn validate_automation_run_list(
+    list: &ListV0,
+    expectation: &AutomationRunExpectationV0,
+) -> Result<Option<ValidatedAutomationRunV0>, TransportErrorV0> {
+    if list.resource_version.is_empty() {
+        return Err(automation_observation_hold(
+            "AutomationRun list lacks a collection resourceVersion",
+        ));
+    }
+    let mut exact = None;
+    for object in &list.items {
+        let Some(validated) = validate_automation_run_observation(object, expectation)? else {
+            continue;
+        };
+        if exact.replace(validated).is_some() {
+            return Err(automation_observation_hold(
+                "AutomationRun list contains duplicate durable pending candidates",
+            ));
+        }
+    }
+    Ok(exact)
+}
+
+/// Validates the exact GET leg.  Absence of a durable pending run is never a
+/// benign observation, because the journal has already recorded its UID/RV.
+pub fn validate_automation_run_get(
+    object: Option<ObjectV0>,
+    expectation: &AutomationRunExpectationV0,
+) -> Result<ValidatedAutomationRunV0, TransportErrorV0> {
+    let object = object
+        .ok_or_else(|| automation_observation_hold("durable pending AutomationRun is absent"))?;
+    validate_automation_run_observation(&object, expectation)?.ok_or_else(|| {
+        automation_observation_hold("exact AutomationRun GET returned an unrelated object")
+    })
+}
+
+/// Validates the watch leg using the same object gate as LIST and GET.
+/// Deletion of the durable pending candidate is always a hold, even when the
+/// tombstone otherwise carries a valid immutable spec.
+pub fn validate_automation_watch_event(
+    event: &WatchEventV0,
+    expectation: &AutomationRunExpectationV0,
+) -> Result<Option<ValidatedAutomationRunV0>, TransportErrorV0> {
+    match event {
+        WatchEventV0::Added(object) | WatchEventV0::Modified(object) => {
+            validate_automation_run_observation(object, expectation)
+        }
+        WatchEventV0::Deleted(object) => {
+            let validated = validate_automation_run_observation(object, expectation)?;
+            if validated.is_some() {
+                Err(automation_observation_hold(
+                    "durable pending AutomationRun was deleted",
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+        WatchEventV0::Bookmark { .. } => Ok(None),
+    }
 }
 
 fn inject_resource_version(
