@@ -16,8 +16,9 @@ export const action = defineAction<InputChangedActionInput>(({ eventMetadata: in
     specification: {
       apiVersion: "events.k8s.io/v1",
       kind: "Event",
-      metadata: { namespace: input.source.namespace, generateName: "demo-input-changed-" },
+      metadata: { namespace: input.source.namespace },
       regarding: { apiVersion: "v1", kind: "ConfigMap", name: input.source.name, namespace: input.source.namespace },
+      action: "InputChanged",
       note: input.note,
       type: "Normal",
       reason: "InputChanged",

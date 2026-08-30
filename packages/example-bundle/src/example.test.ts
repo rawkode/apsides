@@ -1,5 +1,7 @@
 import { render } from "./render.js";
+import { action } from "./action.js";
 import type { RenderInputV0 } from "@oxideloop/sdk";
+import { readFileSync } from "node:fs";
 
 const BUNDLE_DIGEST = "a".repeat(64);
 const ACTION_DIGEST = "b".repeat(64);
@@ -12,3 +14,6 @@ const present = render(input({ message: "updated", expose: true }, [{ apiVersion
 if (present.resources.length !== 2 || (present.resources[0]?.object as never as { data: Record<string, string> }).data.flavor !== "vanilla") throw new Error("present input enrichment mismatch");
 if (present.resources[1]?.logicalId !== "service/portal-service") throw new Error("expose true service mismatch");
 if (present.automations.length !== 1 || present.automations[0]?.bundleDigest !== BUNDLE_DIGEST || present.automations[0]?.actionModuleDigest !== ACTION_DIGEST) throw new Error("automation pinning mismatch");
+const expectedAction = JSON.parse(readFileSync(new URL("../fixtures/input-changed-action-output.json", import.meta.url), "utf8"));
+const actualAction = action({ occurrenceId: "occurrence-1", eventMetadata: { source: { namespace: "demo", name: "input" }, note: "updated" }, canonical: {} as never });
+if (JSON.stringify(actualAction) !== JSON.stringify(expectedAction)) throw new Error("checked-in action fixture mismatch");
