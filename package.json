@@ -9,6 +9,7 @@
     "fixtures:typecheck": "pnpm --filter @oxideloop/fixtures typecheck",
     "fixtures:transform": "pnpm --filter @oxideloop/fixtures transform",
     "fixtures:bundle": "pnpm --filter @oxideloop/fixtures bundle",
-    "fixtures:matrix": "pnpm --filter @oxideloop/fixtures test"
+    "fixtures:matrix": "pnpm --filter @oxideloop/fixtures test",
+    "bundle:e2e": "pnpm --filter @oxideloop/bundle-builder bundle:e2e"
   }
 }
