@@ -1,0 +1,29 @@
+[package]
+name = "oxideloop-kube-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+k8s-openapi = { version = "0.28", default-features = false, features = ["v1_36"] }
+kube = { version = "4.2", default-features = false, features = ["client", "runtime", "rustls-tls"] }
+oxideloop-controller-api = { path = "../controller-api" }
+oxideloop-controller-core = { path = "../controller-core" }
+oxideloop-mutation-model = { path = "../mutation-model" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+futures-util = "0.3"
+json-patch = "4"
+tokio = { version = "1", features = ["rt", "sync"] }
+
+[dev-dependencies]
+http = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

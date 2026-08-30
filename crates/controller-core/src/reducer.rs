@@ -519,6 +519,7 @@ pub enum CommandV0 {
         state: OxideLoopStateSpec,
         root_uid: String,
         root_generation: i64,
+        root_resource_version: String,
         state_name: String,
     },
     Persist {
@@ -530,6 +531,7 @@ pub enum CommandV0 {
         token: String,
         root_uid: String,
         old_root_resource_version: String,
+        preconditions: PreconditionsV0,
         status: WebApplicationStatus,
     },
     RequestDescriptor {
@@ -996,6 +998,7 @@ fn issue_bootstrap(state: &mut MachineStateV0, commands: &mut Vec<CommandV0>) {
         state: state.journal.clone(),
         root_uid: state.root.uid.clone(),
         root_generation: state.root.generation,
+        root_resource_version: state.root.root_resource_version.clone(),
         state_name,
     });
 }
@@ -1123,6 +1126,8 @@ fn queue_root_status(
     if status == state.root.status {
         return false;
     }
+    // Do not include this operation proof in its own hash: that would make
+    // token construction circular and would cause a perpetual status diff.
     let status_hash = sha256_hex(
         &canonical_bytes(&serde_json::to_value(&status).expect("root status serializable"))
             .expect("root status canonical"),
@@ -1134,6 +1139,8 @@ fn queue_root_status(
         &state.root.root_resource_version,
         &status_hash,
     ]);
+    let mut status = status;
+    status.last_status_persist_token = Some(token.clone());
     state.runtime.pending_root_status = Some(PendingRootStatusV0 {
         token: token.clone(),
         old_resource_version: state.root.root_resource_version.clone(),
@@ -1145,6 +1152,7 @@ fn queue_root_status(
         token,
         root_uid: state.root.uid.clone(),
         old_root_resource_version: state.root.root_resource_version.clone(),
+        preconditions: pins(&state.root),
         status,
     });
     true

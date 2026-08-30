@@ -1087,6 +1087,11 @@ spec:
                 maxLength: 128
                 nullable: true
                 type: string
+              lastStatusPersistToken:
+                description: Controller-issued token proving the exact status persist operation.
+                maxLength: 128
+                nullable: true
+                type: string
               observedGeneration:
                 format: int64
                 nullable: true
