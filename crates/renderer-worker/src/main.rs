@@ -47,6 +47,34 @@ fn main() {
             Supervisor::bind(WorkerConfig::new(address, PathBuf::from(root), binary))
                 .and_then(|supervisor| supervisor.run())
         }
+        #[cfg(unix)]
+        Some("--listen-unix") => {
+            let Some(socket) = arguments.next() else {
+                process::exit(64);
+            };
+            let Some(flag) = arguments.next() else {
+                process::exit(64);
+            };
+            let Some(root) = arguments.next() else {
+                process::exit(64);
+            };
+            if flag != "--store-root" {
+                process::exit(64);
+            }
+            let Ok(current_binary) = std::env::current_exe() else {
+                process::exit(70);
+            };
+            let Ok(binary) =
+                choose_evaluator_binary(&mut arguments, current_binary, cfg!(debug_assertions))
+            else {
+                process::exit(64);
+            };
+            Supervisor::bind_unix(
+                WorkerConfig::new("127.0.0.1:0".parse().unwrap(), PathBuf::from(root), binary),
+                PathBuf::from(socket),
+            )
+            .and_then(|supervisor| supervisor.run())
+        }
         _ => {
             process::exit(64);
         }

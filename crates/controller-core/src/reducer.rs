@@ -17,12 +17,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use oxideloop_controller_api::{
     ApplyIntent, ApplyOperation, ApplyOutcome, ApplyRecoveryPolicy, ApplyResult, ApplyTransaction,
     AutomationBaseline, AutomationCompletion, AutomationCompletionOutcome, AutomationPending,
-    AutomationRunCompletionState, AutomationRunSpec, DeletionTransaction, DependencySnapshot,
-    DependencySnapshotType, DurablePhase, InventoryEntry, MAX_ACTION_INPUT_CANONICAL_BYTES,
-    MAX_IDENTIFIER_BYTES, MAX_LIST_ENTRIES, ObjectIdentity, OxideLoopStateSpec, PersistOperation,
-    PersistPurpose, PreparedRecoveryClaim, PruneCandidate, PruneObservation, StateBody,
-    WebApplicationStatus, automation_run_name, bootstrap_id, state_name,
-    validate_automation_run_name, validate_root_state_link,
+    AutomationRunCompletionState, AutomationRunSpec, DeletionCleanupReceipt, DeletionTransaction,
+    DependencySnapshot, DependencySnapshotType, DurablePhase, GenerationAdvanceClosure,
+    GenerationAdvanceClosurePurpose, InventoryEntry, MAX_ACTION_INPUT_CANONICAL_BYTES,
+    MAX_CLOSURE_REBASES, MAX_IDENTIFIER_BYTES, MAX_LIST_ENTRIES, ObjectIdentity,
+    OxideLoopStateSpec, PersistOperation, PersistPurpose, PreparedRecoveryClaim, PruneCandidate,
+    PruneObservation, StateBody, WebApplicationStatus, automation_run_name, bootstrap_id,
+    state_name, validate_automation_run_name, validate_root_state_link,
 };
 use oxideloop_mutation_model::{
     BackendQualification, HttpMethod, MutationDecision, MutationIntent, MutationPlanInputV0,
@@ -54,6 +55,9 @@ pub struct RootSnapshotV0 {
     pub root_resource_version: String,
     pub root_finalizer_present: bool,
     pub state_finalizer_present: bool,
+    /// True only when a fresh root read contains `deletionTimestamp`.
+    #[serde(default)]
+    pub deleting: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,11 +92,14 @@ pub enum PhaseV0 {
     DeletionMutationPersistPending,
     DeletionAutomationCleanupPending,
     DeletionAutomationPersistPending,
+    GenerationAdvanceClosurePersistPending,
     DeletionObservationPending,
     OwnedChildrenVerifyPending,
     StateFinalizerPending,
     RootFinalizerPending,
+    RootDeletionVerifyPending,
     RootStatusPersistPending,
+    Terminal,
     Hold,
 }
 
@@ -110,6 +117,11 @@ pub struct RuntimeStateV0 {
     pub pending_bootstrap: Option<PendingBootstrapV0>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_descriptor_token: Option<String>,
+    /// Root watch notifications have no authority to cancel an in-flight
+    /// external effect. They are coalesced until its acknowledgement has been
+    /// accepted and can be durably closed without replaying the effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_root_refresh: Option<RootSnapshotV0>,
 }
 
 impl Default for RuntimeStateV0 {
@@ -120,6 +132,7 @@ impl Default for RuntimeStateV0 {
             pending_root_status: None,
             pending_bootstrap: None,
             pending_descriptor_token: None,
+            pending_root_refresh: None,
         }
     }
 }
@@ -154,6 +167,7 @@ pub struct PendingBootstrapV0 {
 pub enum RootStatusContinuationV0 {
     Informers,
     Render,
+    DeletionStateFinalizer,
 }
 
 /// Validated root-plus-durable-journal state for the pure reducer.
@@ -164,6 +178,12 @@ pub struct MachineStateV0 {
     journal: OxideLoopStateSpec,
     phase: PhaseV0,
     frozen: Option<FrozenInputV0>,
+    /// True only for the receipt-backed recovery path after the linked state
+    /// object is freshly observed absent. This mode can verify and remove the
+    /// root finalizer, but it can never bootstrap or persist a replacement
+    /// state object.
+    #[serde(default)]
+    root_only_deletion_recovery: bool,
     #[serde(skip, default)]
     runtime: RuntimeStateV0,
 }
@@ -179,6 +199,8 @@ struct MachineStateWireV0 {
     phase: PhaseV0,
     #[allow(dead_code)]
     frozen: Option<FrozenInputV0>,
+    #[serde(default)]
+    root_only_deletion_recovery: bool,
 }
 
 impl<'de> Deserialize<'de> for MachineStateV0 {
@@ -194,6 +216,7 @@ impl<'de> Deserialize<'de> for MachineStateV0 {
             journal: wire.journal,
             phase: PhaseV0::Recovery,
             frozen: None,
+            root_only_deletion_recovery: wire.root_only_deletion_recovery,
             runtime: RuntimeStateV0::default(),
         })
     }
@@ -208,12 +231,14 @@ impl MachineStateV0 {
             journal,
             phase: PhaseV0::Bootstrap,
             frozen: None,
+            root_only_deletion_recovery: false,
             runtime: RuntimeStateV0 {
                 requires_revalidation: false,
                 pending_automation: None,
                 pending_root_status: None,
                 pending_bootstrap: None,
                 pending_descriptor_token: None,
+                pending_root_refresh: None,
             },
         })
     }
@@ -254,12 +279,14 @@ impl MachineStateV0 {
             journal: state,
             phase: PhaseV0::Bootstrap,
             frozen: None,
+            root_only_deletion_recovery: false,
             runtime: RuntimeStateV0 {
                 requires_revalidation: false,
                 pending_automation: None,
                 pending_root_status: None,
                 pending_bootstrap: None,
                 pending_descriptor_token: None,
+                pending_root_refresh: None,
             },
         })
     }
@@ -277,11 +304,53 @@ impl MachineStateV0 {
         Ok(state)
     }
 
+    /// Recovers deletion after the linked state object has been freshly
+    /// observed absent. The durable status receipt is the sole journal
+    /// authority; this constructor never creates bootstrap capability.
+    pub fn recover_deleting_root_without_state(
+        mut root: RootSnapshotV0,
+    ) -> Result<Self, ReconcileError> {
+        validate_bootstrap_root(&root)?;
+        let receipt = validate_deleting_root_receipt(&root)?.clone();
+        root.state_name.clone_from(&receipt.state_name);
+        root.state_uid.clone_from(&receipt.state_uid);
+        root.state_resource_version.clear();
+        root.state_finalizer_present = false;
+        let journal = OxideLoopStateSpec {
+            state_version: oxideloop_controller_api::STATE_VERSION_V1,
+            root: oxideloop_controller_api::RootBinding {
+                uid: root.uid.clone(),
+                bootstrap_id: bootstrap_id(&root.uid)
+                    .map_err(|error| ReconcileError::Recovery(error.to_string()))?,
+                bundle_digest: root.bundle_digest.clone(),
+            },
+            state: StateBody {
+                deletion: Some(DeletionTransaction {
+                    id: receipt.deletion_id,
+                    deletion_start_generation: receipt.deletion_start_generation,
+                }),
+                ..StateBody::default()
+            },
+        };
+        let state = Self {
+            root,
+            journal,
+            phase: PhaseV0::Recovery,
+            frozen: None,
+            root_only_deletion_recovery: true,
+            runtime: RuntimeStateV0::default(),
+        };
+        validate_root_only_deletion_machine(&state)?;
+        Ok(state)
+    }
+
     /// Safe serde recovery entry point. It never restores runtime issuance.
     pub fn recover_json(serialized: &str) -> Result<Self, ReconcileError> {
         let state: Self = serde_json::from_str(serialized)
             .map_err(|e| ReconcileError::Recovery(e.to_string()))?;
-        if validate_root_and_journal(&state.root, &state.journal).is_err() {
+        if state.root_only_deletion_recovery {
+            validate_root_only_deletion_machine(&state)?;
+        } else if validate_root_and_journal(&state.root, &state.journal).is_err() {
             validate_bootstrap_machine(&state)?;
         }
         Ok(state)
@@ -363,6 +432,16 @@ pub struct ActionTriggerV0 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum EventV0 {
     Start,
+    /// Exact fresh root reread. This is distinct from a dependency wakeup:
+    /// only this event may replace root UID/generation/resourceVersion pins.
+    RootRefreshed {
+        root: RootSnapshotV0,
+    },
+    /// Token-only dependency/prune wakeup. It never carries root authority.
+    ReconcileRequested {
+        observation_token: String,
+        cache_epoch: String,
+    },
     BootstrapAcknowledged {
         token: String,
         state_name: String,
@@ -454,6 +533,7 @@ pub enum EventV0 {
         root_resource_version: String,
         state_uid: String,
         state_resource_version: String,
+        cleanup_token: String,
     },
     OwnedChildrenVerificationFailed {
         token: String,
@@ -476,6 +556,14 @@ pub enum EventV0 {
         root_uid: String,
         old_root_resource_version: String,
         new_root_resource_version: String,
+    },
+    RootUidVerifiedAbsent {
+        token: String,
+        root_uid: String,
+    },
+    RootUidAbsenceFailed {
+        token: String,
+        observed_uid: String,
     },
 }
 
@@ -575,6 +663,11 @@ pub enum CommandV0 {
         token: String,
         preconditions: PreconditionsV0,
     },
+    VerifyRootUidAbsent {
+        token: String,
+        root_uid: String,
+        preconditions: PreconditionsV0,
+    },
     Hold {
         reason: String,
     },
@@ -621,7 +714,9 @@ pub fn reduce(mut state: MachineStateV0, event: EventV0) -> Result<TransitionV0,
             "recovered state accepts only Start".into(),
         ));
     }
-    if matches!(
+    if state.root_only_deletion_recovery {
+        validate_root_only_deletion_machine(&state)?;
+    } else if matches!(
         state.phase,
         PhaseV0::Bootstrap | PhaseV0::BootstrapPending | PhaseV0::Recovery
     ) {
@@ -629,12 +724,26 @@ pub fn reduce(mut state: MachineStateV0, event: EventV0) -> Result<TransitionV0,
     } else {
         validate_root_and_journal(&state.root, &state.journal)?;
     }
+    if state.root_only_deletion_recovery && !root_only_event_allowed(&event) {
+        state.phase = PhaseV0::Hold;
+        return finish(
+            state,
+            vec![CommandV0::Hold {
+                reason: "event is outside root-only deletion recovery authority".into(),
+            }],
+        );
+    }
     if matches!(event, EventV0::BeginDeletion) {
         return begin_deletion(state);
     }
     let mut commands = Vec::new();
     match event {
         EventV0::Start => start(&mut state, &mut commands),
+        EventV0::RootRefreshed { root } => root_refreshed(&mut state, root, &mut commands)?,
+        EventV0::ReconcileRequested {
+            observation_token,
+            cache_epoch,
+        } => reconcile_requested(&mut state, &observation_token, &cache_epoch, &mut commands),
         EventV0::BootstrapAcknowledged {
             token,
             state_name,
@@ -867,6 +976,7 @@ pub fn reduce(mut state: MachineStateV0, event: EventV0) -> Result<TransitionV0,
             root_resource_version,
             state_uid,
             state_resource_version,
+            cleanup_token,
         } => owned_children_verified(
             &mut state,
             &token,
@@ -875,6 +985,7 @@ pub fn reduce(mut state: MachineStateV0, event: EventV0) -> Result<TransitionV0,
             &root_resource_version,
             &state_uid,
             &state_resource_version,
+            &cleanup_token,
             &mut commands,
         ),
         EventV0::OwnedChildrenVerificationFailed { token, reason } => {
@@ -931,12 +1042,336 @@ pub fn reduce(mut state: MachineStateV0, event: EventV0) -> Result<TransitionV0,
             &new_root_resource_version,
             &mut commands,
         ),
+        EventV0::RootUidVerifiedAbsent { token, root_uid } => {
+            if state.phase == PhaseV0::RootDeletionVerifyPending
+                && token == root_absence_token(&state)
+                && root_uid == state.root.uid
+            {
+                state.phase = PhaseV0::Terminal;
+            } else {
+                stale(&mut commands, "root absence acknowledgement mismatch");
+            }
+        }
+        EventV0::RootUidAbsenceFailed {
+            token,
+            observed_uid,
+        } => {
+            if state.phase == PhaseV0::RootDeletionVerifyPending
+                && token == root_absence_token(&state)
+            {
+                state.phase = PhaseV0::Hold;
+                commands.push(CommandV0::Hold {
+                    reason: format!(
+                        "original root UID remains after finalizer removal: {observed_uid}"
+                    ),
+                });
+            } else {
+                stale(&mut commands, "root absence failure token mismatch");
+            }
+        }
         EventV0::BeginDeletion => unreachable!(),
     }
     finish(state, commands)
 }
 
+fn effect_closure_purpose(purpose: PersistPurpose) -> Option<GenerationAdvanceClosurePurpose> {
+    match purpose {
+        PersistPurpose::MutationResult => Some(GenerationAdvanceClosurePurpose::MutationResult),
+        PersistPurpose::AutomationPending => {
+            Some(GenerationAdvanceClosurePurpose::AutomationPending)
+        }
+        PersistPurpose::AutomationCompletion => {
+            Some(GenerationAdvanceClosurePurpose::AutomationCompletion)
+        }
+        PersistPurpose::DeletionMutationResult => {
+            Some(GenerationAdvanceClosurePurpose::DeletionMutationResult)
+        }
+        PersistPurpose::DeletionAutomationCleanup => {
+            Some(GenerationAdvanceClosurePurpose::DeletionAutomationCleanup)
+        }
+        _ => None,
+    }
+}
+
+fn root_only_event_allowed(event: &EventV0) -> bool {
+    matches!(
+        event,
+        EventV0::Start
+            | EventV0::RootRefreshed { .. }
+            | EventV0::OwnedChildrenVerifiedAbsent { .. }
+            | EventV0::OwnedChildrenVerificationFailed { .. }
+            | EventV0::RootFinalizerRemoved { .. }
+            | EventV0::RootUidVerifiedAbsent { .. }
+            | EventV0::RootUidAbsenceFailed { .. }
+    )
+}
+
+fn root_only_command_allowed(command: &CommandV0) -> bool {
+    matches!(
+        command,
+        CommandV0::VerifyOwnedChildrenAbsent { .. }
+            | CommandV0::RemoveRootFinalizer { .. }
+            | CommandV0::VerifyRootUidAbsent { .. }
+            | CommandV0::Hold { .. }
+            | CommandV0::IgnoredStale { .. }
+    )
+}
+
+fn is_effect_ack_pending(phase: PhaseV0) -> bool {
+    matches!(
+        phase,
+        PhaseV0::MutationPending
+            | PhaseV0::AutomationEnsurePending
+            | PhaseV0::DeletionMutationPending
+            | PhaseV0::DeletionAutomationCleanupPending
+    )
+}
+
+fn root_refresh_compatible(
+    state: &MachineStateV0,
+    root: &RootSnapshotV0,
+) -> Result<(), &'static str> {
+    if root.uid != state.root.uid {
+        return Err("fresh root UID replacement is not adopted");
+    }
+    if root.namespace != state.root.namespace {
+        return Err("fresh root namespace changed");
+    }
+    if !state.root.state_name.is_empty()
+        && (root.state_name != state.root.state_name || root.state_uid != state.root.state_uid)
+    {
+        return Err("fresh root state identity changed");
+    }
+    let deleting = state.journal.state.deletion.is_some() || state.root.deleting || root.deleting;
+    if !deleting && root.bundle_digest != state.root.bundle_digest {
+        return Err("nondeleting root changed immutable bundle digest");
+    }
+    Ok(())
+}
+
+fn install_root_refresh(state: &mut MachineStateV0, mut root: RootSnapshotV0) {
+    // Once deletion is observed it is absorbing for this root UID. A later
+    // same-UID update may advance generation/RV/spec but cannot revive normal
+    // reconciliation.
+    root.deleting |= state.root.deleting || state.journal.state.deletion.is_some();
+    state.root = root;
+}
+
+fn root_refreshed(
+    state: &mut MachineStateV0,
+    mut root: RootSnapshotV0,
+    commands: &mut Vec<CommandV0>,
+) -> Result<(), ReconcileError> {
+    validate_bootstrap_root(&root)?;
+    if state.root_only_deletion_recovery {
+        if matches!(
+            state.phase,
+            PhaseV0::RootDeletionVerifyPending | PhaseV0::Terminal | PhaseV0::Hold
+        ) {
+            stale(
+                commands,
+                "root refresh cannot replace post-finalizer UID absence verification",
+            );
+            return Ok(());
+        }
+        let current_receipt = validate_deleting_root_receipt(&state.root)?.clone();
+        let receipt = match validate_deleting_root_receipt(&root) {
+            Ok(receipt)
+                if root.uid == state.root.uid
+                    && root.namespace == state.root.namespace
+                    && root.root_finalizer_present == state.root.root_finalizer_present
+                    && receipt == &current_receipt =>
+            {
+                receipt.clone()
+            }
+            Ok(_) | Err(_) => {
+                state.phase = PhaseV0::Hold;
+                commands.push(CommandV0::Hold {
+                    reason: "root-only deletion refresh changed UID, namespace, finalizer, deletion state, or cleanup receipt".into(),
+                });
+                return Ok(());
+            }
+        };
+        root.state_name.clone_from(&receipt.state_name);
+        root.state_uid.clone_from(&receipt.state_uid);
+        root.state_resource_version.clear();
+        root.state_finalizer_present = false;
+        state
+            .journal
+            .root
+            .bundle_digest
+            .clone_from(&root.bundle_digest);
+        state.root = root;
+        if state.root.root_finalizer_present {
+            let token = owned_children_token(state).expect("receipt recovery has deletion record");
+            state.phase = PhaseV0::OwnedChildrenVerifyPending;
+            commands.push(CommandV0::VerifyOwnedChildrenAbsent {
+                token,
+                preconditions: pins(&state.root),
+            });
+        } else {
+            state.phase = PhaseV0::RootDeletionVerifyPending;
+            commands.push(CommandV0::VerifyRootUidAbsent {
+                token: root_absence_token(state),
+                root_uid: state.root.uid.clone(),
+                preconditions: pins(&state.root),
+            });
+        }
+        return Ok(());
+    }
+    if let Err(reason) = root_refresh_compatible(state, &root) {
+        state.phase = PhaseV0::Hold;
+        commands.push(CommandV0::Hold {
+            reason: reason.into(),
+        });
+        return Ok(());
+    }
+    if root == state.root {
+        stale(commands, "duplicate root refresh");
+        return Ok(());
+    }
+    if matches!(
+        state.phase,
+        PhaseV0::RootDeletionVerifyPending | PhaseV0::Terminal
+    ) {
+        stale(
+            commands,
+            "root refresh cannot replace post-finalizer UID absence verification",
+        );
+        return Ok(());
+    }
+    if is_effect_ack_pending(state.phase) {
+        state.runtime.pending_root_refresh = Some(root);
+        stale(
+            commands,
+            "root refresh coalesced behind effect acknowledgement",
+        );
+        return Ok(());
+    }
+    if let Some(operation) = state.journal.state.pending_persist.clone()
+        && let Some(purpose) = effect_closure_purpose(operation.purpose)
+    {
+        let source = state.root.clone();
+        install_root_refresh(state, root);
+        state.journal.state.generation_advance_closure = Some(GenerationAdvanceClosure {
+            root_uid: state.root.uid.clone(),
+            source_generation: source.generation,
+            source_root_resource_version: source.root_resource_version,
+            source_state_uid: source.state_uid,
+            source_state_resource_version: source.state_resource_version,
+            rebase_count: 0,
+            purpose,
+        });
+        return queue_persist(
+            state,
+            PersistPurpose::GenerationAdvanceClosure,
+            DurablePhase::GenerationAdvanceClosure,
+            PhaseV0::GenerationAdvanceClosurePersistPending,
+            commands,
+        );
+    }
+    if state.phase == PhaseV0::GenerationAdvanceClosurePersistPending {
+        let Some(mut closure) = state.journal.state.generation_advance_closure.clone() else {
+            state.phase = PhaseV0::Hold;
+            commands.push(CommandV0::Hold {
+                reason: "generation closure phase has no closure".into(),
+            });
+            return Ok(());
+        };
+        if closure.rebase_count >= MAX_CLOSURE_REBASES {
+            state.phase = PhaseV0::Hold;
+            commands.push(CommandV0::Hold {
+                reason: "generation acknowledgement closure rebase bound exceeded".into(),
+            });
+            return Ok(());
+        }
+        install_root_refresh(state, root);
+        closure.rebase_count += 1;
+        state.journal.state.generation_advance_closure = Some(closure);
+        return queue_persist(
+            state,
+            PersistPurpose::GenerationAdvanceClosure,
+            DurablePhase::GenerationAdvanceClosure,
+            PhaseV0::GenerationAdvanceClosurePersistPending,
+            commands,
+        );
+    }
+
+    let deleting = state.journal.state.deletion.is_some() || root.deleting;
+    install_root_refresh(state, root);
+    state.runtime.pending_root_refresh = None;
+    if deleting {
+        state.phase = PhaseV0::DeletionObservationPending;
+        commands.push(CommandV0::RequestDeletionObservation {
+            preconditions: pins(&state.root),
+        });
+        return Ok(());
+    }
+
+    // A fresh same-bundle root generation invalidates every plan computed
+    // under the old pins. The durable invalidate lands before a new render.
+    state.frozen = None;
+    state.journal.state.apply_transaction = None;
+    state.journal.state.pending_dependencies.clear();
+    state.journal.state.prune_candidate = None;
+    queue_persist(
+        state,
+        PersistPurpose::Invalidate,
+        DurablePhase::Invalidate,
+        PhaseV0::PersistPending,
+        commands,
+    )
+}
+
+fn reconcile_requested(
+    state: &mut MachineStateV0,
+    observation_token: &str,
+    cache_epoch: &str,
+    commands: &mut Vec<CommandV0>,
+) {
+    if observation_token.is_empty()
+        || observation_token.len() > MAX_IDENTIFIER_BYTES
+        || cache_epoch.is_empty()
+        || cache_epoch.len() > MAX_IDENTIFIER_BYTES
+    {
+        stale(commands, "dependency reconcile token is invalid");
+        return;
+    }
+    if state.phase != PhaseV0::Ready || state.root.deleting {
+        stale(commands, "dependency reconcile request phase mismatch");
+        return;
+    }
+    state.phase = PhaseV0::RenderPending;
+    let mut preconditions = pins(&state.root);
+    preconditions.observation_token = observation_token.into();
+    preconditions.cache_epoch = cache_epoch.into();
+    commands.push(CommandV0::RequestRender { preconditions });
+}
+
 fn start(state: &mut MachineStateV0, commands: &mut Vec<CommandV0>) {
+    if state.root_only_deletion_recovery {
+        if state.phase != PhaseV0::Recovery {
+            stale(commands, "root-only deletion recovery is already active");
+            return;
+        }
+        state.runtime = RuntimeStateV0::default();
+        if state.root.root_finalizer_present {
+            let token = owned_children_token(state).expect("receipt recovery has deletion record");
+            state.phase = PhaseV0::OwnedChildrenVerifyPending;
+            commands.push(CommandV0::VerifyOwnedChildrenAbsent {
+                token,
+                preconditions: pins(&state.root),
+            });
+        } else {
+            state.phase = PhaseV0::RootDeletionVerifyPending;
+            commands.push(CommandV0::VerifyRootUidAbsent {
+                token: root_absence_token(state),
+                root_uid: state.root.uid.clone(),
+                preconditions: pins(&state.root),
+            });
+        }
+        return;
+    }
     if state.phase == PhaseV0::Recovery {
         // Recovery deliberately throws away serialized continuations. It will
         // start again at the descriptor boundary after verifying the durable
@@ -950,16 +1385,107 @@ fn start(state: &mut MachineStateV0, commands: &mut Vec<CommandV0>) {
             pending_root_status: None,
             pending_bootstrap: None,
             pending_descriptor_token: None,
+            pending_root_refresh: None,
         };
         if !bootstrap_confirmed(state) {
             issue_bootstrap(state, commands);
             return;
         }
+        if let Some(closure) = state.journal.state.generation_advance_closure.take() {
+            // Loading a journal which contains the closure proves the
+            // persistence-only handoff landed. Clear the marker with another
+            // effect-free write; never recreate the acknowledged effect.
+            state.journal.state.pending_persist = None;
+            let normal_closure = matches!(
+                closure.purpose,
+                GenerationAdvanceClosurePurpose::MutationResult
+                    | GenerationAdvanceClosurePurpose::AutomationPending
+                    | GenerationAdvanceClosurePurpose::AutomationCompletion
+            );
+            let deletion_closure = matches!(
+                closure.purpose,
+                GenerationAdvanceClosurePurpose::DeletionMutationResult
+                    | GenerationAdvanceClosurePurpose::DeletionAutomationCleanup
+            );
+            let result = if state.root.deleting && normal_closure {
+                // Deletion is absorbing even when the closure write landed but
+                // its acknowledgement was lost to a crash. The accepted facts
+                // remain in the journal, but no normal invalidate/completion
+                // work may resume under a deleting root.
+                begin_deletion_durable(state, commands)
+            } else if deletion_closure
+                && (!state.root.deleting || state.journal.state.deletion.is_none())
+            {
+                Err(ReconcileError::Recovery(
+                    "deletion closure recovered without durable deletion authority".into(),
+                ))
+            } else {
+                match closure.purpose {
+                    GenerationAdvanceClosurePurpose::MutationResult => {
+                        state.journal.state.apply_transaction = None;
+                        state.journal.state.pending_dependencies.clear();
+                        state.journal.state.prune_candidate = None;
+                        queue_persist(
+                            state,
+                            PersistPurpose::Invalidate,
+                            DurablePhase::Invalidate,
+                            PhaseV0::PersistPending,
+                            commands,
+                        )
+                    }
+                    GenerationAdvanceClosurePurpose::AutomationPending
+                    | GenerationAdvanceClosurePurpose::AutomationCompletion => queue_persist(
+                        state,
+                        PersistPurpose::Completion,
+                        DurablePhase::Completion,
+                        PhaseV0::PersistPending,
+                        commands,
+                    ),
+                    GenerationAdvanceClosurePurpose::DeletionMutationResult => queue_persist(
+                        state,
+                        PersistPurpose::DeletionMutationResult,
+                        DurablePhase::DeletionMutationResult,
+                        PhaseV0::DeletionMutationPersistPending,
+                        commands,
+                    ),
+                    GenerationAdvanceClosurePurpose::DeletionAutomationCleanup => queue_persist(
+                        state,
+                        PersistPurpose::DeletionAutomationCleanup,
+                        DurablePhase::DeletionAutomationCleanup,
+                        PhaseV0::DeletionAutomationPersistPending,
+                        commands,
+                    ),
+                }
+            };
+            if let Err(error) = result {
+                state.phase = PhaseV0::Hold;
+                commands.push(CommandV0::Hold {
+                    reason: error.to_string(),
+                });
+            }
+            return;
+        }
+        if state.root.deleting && state.journal.state.deletion.is_none() {
+            if let Err(error) = begin_deletion_durable(state, commands) {
+                state.phase = PhaseV0::Hold;
+                commands.push(CommandV0::Hold {
+                    reason: error.to_string(),
+                });
+            }
+            return;
+        }
         if state.journal.state.deletion.is_some() {
-            state.phase = PhaseV0::DeletionObservationPending;
-            commands.push(CommandV0::RequestDeletionObservation {
-                preconditions: pins(&state.root),
-            });
+            if state.journal.state.apply_transaction.is_some() {
+                state.phase = PhaseV0::DeletionObservationPending;
+                commands.push(CommandV0::RequestDeletionObservation {
+                    preconditions: pins(&state.root),
+                });
+            } else if let Err(error) = deletion_prepare(state, commands) {
+                state.phase = PhaseV0::Hold;
+                commands.push(CommandV0::Hold {
+                    reason: error.to_string(),
+                });
+            }
             return;
         }
         request_descriptor(state, commands);
@@ -1198,17 +1724,30 @@ fn root_status_ack(
                 preconditions: pins(&state.root),
             });
         }
+        RootStatusContinuationV0::DeletionStateFinalizer => {
+            state.phase = PhaseV0::StateFinalizerPending;
+            commands.push(CommandV0::RemoveStateFinalizer {
+                token: state_finalizer_token(state),
+                preconditions: pins(&state.root),
+            });
+        }
     }
 }
 
 fn begin_deletion(mut state: MachineStateV0) -> Result<TransitionV0, ReconcileError> {
-    // A root observed during deletion can still be a fresh or partial root.
-    // Never issue a state-journal write with empty/fabricated state pins; the
-    // same exact bootstrap acknowledgement is required first.
+    state.root.deleting = true;
+    // A deleting root is never bootstrapped. If its internal state is already
+    // gone, only the bounded status receipt is admissible recovery evidence;
+    // missing or mismatched evidence holds without creating anything.
     if !bootstrap_confirmed(&state) {
-        let mut commands = Vec::new();
-        issue_bootstrap(&mut state, &mut commands);
-        return finish(state, commands);
+        let reason = validate_deleting_root_receipt(&state.root)
+            .err()
+            .map_or_else(
+                || "deleting root state is absent; receipt recovery requires a fresh owned-child verification".into(),
+                |error| error.to_string(),
+            );
+        state.phase = PhaseV0::Hold;
+        return finish(state, vec![CommandV0::Hold { reason }]);
     }
     if state.journal.state.deletion.is_some() {
         return finish(
@@ -1218,9 +1757,26 @@ fn begin_deletion(mut state: MachineStateV0) -> Result<TransitionV0, ReconcileEr
             }],
         );
     }
+    let mut commands = Vec::new();
+    begin_deletion_durable(&mut state, &mut commands)?;
+    finish(state, commands)
+}
+
+fn begin_deletion_durable(
+    state: &mut MachineStateV0,
+    commands: &mut Vec<CommandV0>,
+) -> Result<(), ReconcileError> {
+    if state.journal.state.deletion.is_some() {
+        state.phase = PhaseV0::DeletionObservationPending;
+        commands.push(CommandV0::RequestDeletionObservation {
+            preconditions: pins(&state.root),
+        });
+        return Ok(());
+    }
     // Remove every normal issuance capability. The first deletion effect is
     // impossible until this replacement journal write has been acknowledged.
     state.runtime.pending_automation = None;
+    state.runtime.pending_root_refresh = None;
     state.frozen = None;
     state.journal.state.apply_transaction = None;
     state.journal.state.pending_dependencies.clear();
@@ -1233,26 +1789,92 @@ fn begin_deletion(mut state: MachineStateV0) -> Result<TransitionV0, ReconcileEr
             &state.root.root_resource_version,
             &state.root.state_resource_version,
         ]),
-        root_generation: state.root.generation,
+        deletion_start_generation: state.root.generation,
     });
-    let mut commands = Vec::new();
     queue_persist(
-        &mut state,
+        state,
         PersistPurpose::DeletionStart,
         DurablePhase::DeletionStart,
         PhaseV0::DeletionStartPersistPending,
-        &mut commands,
-    )?;
-    finish(state, commands)
+        commands,
+    )
+}
+
+/// Validates the only bounded evidence accepted when a deleting root's
+/// internal state object is already absent. This function is pure and never
+/// grants mutation authority by itself; an adapter must still perform a fresh
+/// owned-child absence check before asking to remove the root finalizer.
+pub fn validate_deleting_root_receipt(
+    root: &RootSnapshotV0,
+) -> Result<&DeletionCleanupReceipt, ReconcileError> {
+    if !root.deleting {
+        return Err(ReconcileError::Recovery(
+            "receipt recovery requires a deleting root".into(),
+        ));
+    }
+    let receipt = root
+        .status
+        .deletion_cleanup_receipt
+        .as_ref()
+        .ok_or_else(|| ReconcileError::Recovery("deleting root has no cleanup receipt".into()))?;
+    receipt
+        .validate()
+        .map_err(|error| ReconcileError::Recovery(error.to_string()))?;
+    let expected_state_name =
+        state_name(&root.uid).map_err(|error| ReconcileError::Recovery(error.to_string()))?;
+    if receipt.root_uid != root.uid
+        || receipt.state_name != expected_state_name
+        || (!root.state_name.is_empty() && receipt.state_name != root.state_name)
+        || (!root.state_uid.is_empty() && receipt.state_uid != root.state_uid)
+    {
+        return Err(ReconcileError::Recovery(
+            "deletion cleanup receipt identity mismatch".into(),
+        ));
+    }
+    if let Some(link) = &root.status.state
+        && (link.root_uid != root.uid
+            || link.name != receipt.state_name
+            || link.uid != receipt.state_uid)
+    {
+        return Err(ReconcileError::Recovery(
+            "deletion cleanup receipt state link mismatch".into(),
+        ));
+    }
+    Ok(receipt)
 }
 
 fn queue_persist(
     state: &mut MachineStateV0,
-    purpose: PersistPurpose,
-    durable_phase: DurablePhase,
-    phase: PhaseV0,
+    mut purpose: PersistPurpose,
+    mut durable_phase: DurablePhase,
+    mut phase: PhaseV0,
     commands: &mut Vec<CommandV0>,
 ) -> Result<(), ReconcileError> {
+    if let Some(closure_purpose) = effect_closure_purpose(purpose)
+        && let Some(root) = state.runtime.pending_root_refresh.take()
+    {
+        if let Err(reason) = root_refresh_compatible(state, &root) {
+            state.phase = PhaseV0::Hold;
+            commands.push(CommandV0::Hold {
+                reason: reason.into(),
+            });
+            return Ok(());
+        }
+        let source = state.root.clone();
+        install_root_refresh(state, root);
+        state.journal.state.generation_advance_closure = Some(GenerationAdvanceClosure {
+            root_uid: state.root.uid.clone(),
+            source_generation: source.generation,
+            source_root_resource_version: source.root_resource_version,
+            source_state_uid: source.state_uid,
+            source_state_resource_version: source.state_resource_version,
+            rebase_count: 0,
+            purpose: closure_purpose,
+        });
+        purpose = PersistPurpose::GenerationAdvanceClosure;
+        durable_phase = DurablePhase::GenerationAdvanceClosure;
+        phase = PhaseV0::GenerationAdvanceClosurePersistPending;
+    }
     state.journal.state.pending_persist = None;
     let body = serde_json::to_value(&state.journal.state)
         .map_err(|e| ReconcileError::Link(e.to_string()))?;
@@ -1339,9 +1961,54 @@ fn persist_ack(
         | PersistPurpose::AutomationPending
         | PersistPurpose::AutomationCompletion => state.phase = PhaseV0::Ready,
         PersistPurpose::DeletionStart => deletion_prepare(state, commands)?,
-        PersistPurpose::DeletionPrepare => deletion_issue(state, commands)?,
+        PersistPurpose::DeletionPrepare => {
+            state.phase = PhaseV0::DeletionObservationPending;
+            commands.push(CommandV0::RequestDeletionObservation {
+                preconditions: pins(&state.root),
+            });
+        }
         PersistPurpose::DeletionMutationResult | PersistPurpose::DeletionAutomationCleanup => {
             deletion_advance(state, commands)?
+        }
+        PersistPurpose::GenerationAdvanceClosure => {
+            let Some(closure) = state.journal.state.generation_advance_closure.take() else {
+                state.phase = PhaseV0::Hold;
+                commands.push(CommandV0::Hold {
+                    reason: "generation closure acknowledgement has no durable closure".into(),
+                });
+                return Ok(());
+            };
+            match closure.purpose {
+                GenerationAdvanceClosurePurpose::MutationResult => {
+                    if state.root.deleting {
+                        begin_deletion_durable(state, commands)?;
+                    } else {
+                        state.frozen = None;
+                        state.journal.state.apply_transaction = None;
+                        state.journal.state.pending_dependencies.clear();
+                        state.journal.state.prune_candidate = None;
+                        queue_persist(
+                            state,
+                            PersistPurpose::Invalidate,
+                            DurablePhase::Invalidate,
+                            PhaseV0::PersistPending,
+                            commands,
+                        )?;
+                    }
+                }
+                GenerationAdvanceClosurePurpose::AutomationPending
+                | GenerationAdvanceClosurePurpose::AutomationCompletion => {
+                    if state.root.deleting {
+                        begin_deletion_durable(state, commands)?;
+                    } else {
+                        state.phase = PhaseV0::Ready;
+                    }
+                }
+                GenerationAdvanceClosurePurpose::DeletionMutationResult
+                | GenerationAdvanceClosurePurpose::DeletionAutomationCleanup => {
+                    deletion_advance(state, commands)?;
+                }
+            }
         }
     }
     Ok(())
@@ -1362,6 +2029,9 @@ fn phase_matches(phase: PhaseV0, purpose: PersistPurpose) -> bool {
         PersistPurpose::DeletionAutomationCleanup => {
             phase == PhaseV0::DeletionAutomationPersistPending
         }
+        PersistPurpose::GenerationAdvanceClosure => {
+            phase == PhaseV0::GenerationAdvanceClosurePersistPending
+        }
     }
 }
 
@@ -1377,6 +2047,13 @@ fn deletion_prepare(
         .ok_or_else(|| ReconcileError::Link("deletion record disappeared".into()))?
         .id
         .clone();
+    let deletion_start_generation = state
+        .journal
+        .state
+        .deletion
+        .as_ref()
+        .expect("deletion checked above")
+        .deletion_start_generation;
     let mut intents = state
         .journal
         .state
@@ -1408,7 +2085,7 @@ fn deletion_prepare(
         .collect();
     state.journal.state.apply_transaction = Some(ApplyTransaction {
         id: deletion_id,
-        generation: state.root.generation,
+        generation: deletion_start_generation,
         frozen_render_input_hash: "0".repeat(64),
         desired_graph_hash: hash(&[
             "deletion-graph/v0",
@@ -1453,8 +2130,8 @@ fn deletion_revalidated(
         .state
         .inventory
         .iter()
-        .map(|item| identity_key(&item.identity))
-        .collect::<BTreeSet<_>>();
+        .map(|item| (identity_key(&item.identity), item.clone()))
+        .collect::<BTreeMap<_, _>>();
     if observed_inventory.len() > MAX_LIST_ENTRIES
         || observed_automation_runs.len() > MAX_LIST_ENTRIES
     {
@@ -1491,17 +2168,19 @@ fn deletion_revalidated(
             return Ok(());
         }
     }
-    let observed_inventory_keys = observed_inventory
+    let observed_inventory_by_key = observed_inventory
         .iter()
-        .map(|item| identity_key(&item.identity))
-        .collect::<BTreeSet<_>>();
+        .map(|item| (identity_key(&item.identity), item))
+        .collect::<BTreeMap<_, _>>();
     let observed_runs = observed_automation_runs
         .iter()
         .map(|item| item.occurrence_id.as_str())
         .collect::<BTreeSet<_>>();
-    if observed_inventory_keys.len() != observed_inventory.len()
+    if observed_inventory_by_key.len() != observed_inventory.len()
         || observed_runs.len() != observed_automation_runs.len()
-        || !observed_inventory_keys.is_subset(&known_inventory)
+        || !observed_inventory_by_key
+            .keys()
+            .all(|key| known_inventory.contains_key(key))
         || observed_automation_runs.iter().any(|item| {
             item.occurrence_id.is_empty()
                 || item.name.is_empty()
@@ -1516,62 +2195,71 @@ fn deletion_revalidated(
         })
         || observed_inventory
             .iter()
-            .any(|item| item.bundle_digest != state.root.bundle_digest)
+            .any(|item| item.bundle_digest != state.journal.root.bundle_digest)
     {
-        stale(
-            commands,
-            "deletion revalidation contains unowned or duplicate child",
-        );
+        state.phase = PhaseV0::Hold;
+        commands.push(CommandV0::Hold {
+            reason: "deletion revalidation contains unowned or duplicate child".into(),
+        });
         return Ok(());
     }
-    // Validate a clone before replacing anything. This makes malformed fresh
-    // observations a stale no-op rather than a partially-mutated recovery.
-    let mut candidate = state.journal.clone();
-    candidate.state.inventory = observed_inventory;
-    let observed_by_occurrence = observed_automation_runs
-        .iter()
-        .map(|item| (item.occurrence_id.as_str(), item))
-        .collect::<BTreeMap<_, _>>();
-    candidate.state.automation.pending.retain_mut(|item| {
-        let Some(observed) = observed_by_occurrence.get(item.occurrence_id.as_str()) else {
-            return false;
-        };
-        item.run_name.clone_from(&observed.name);
-        item.run_uid.clone_from(&observed.uid);
-        item.run_resource_version
-            .clone_from(&observed.resource_version);
-        true
-    });
-    candidate.state.automation.completions.retain_mut(|item| {
-        let Some(observed) = observed_by_occurrence.get(item.occurrence_id.as_str()) else {
-            return false;
-        };
-        item.run_name.clone_from(&observed.name);
-        item.run_uid.clone_from(&observed.uid);
-        item.completed_resource_version
-            .clone_from(&observed.resource_version);
-        true
-    });
-    candidate
-        .state
-        .inventory
-        .sort_by_key(|item| identity_key(&item.identity));
-    candidate
-        .state
-        .automation
-        .pending
-        .sort_by(|left, right| left.occurrence_id.cmp(&right.occurrence_id));
-    candidate
-        .state
-        .automation
-        .completions
-        .sort_by(|left, right| left.occurrence_id.cmp(&right.occurrence_id));
-    if candidate.validate().is_err() {
-        stale(commands, "deletion revalidation violates durable bounds");
+
+    // Replacement UIDs and changed resourceVersions are never adopted, and
+    // AutomationRun absence is not covered by the managed-child DELETE
+    // recovery exception.
+    if observed_inventory_by_key.iter().any(|(key, observed)| {
+        known_inventory.get(key).is_none_or(|known| {
+            known.uid != observed.uid || known.resource_version != observed.resource_version
+        })
+    }) || observed_runs.len() != known_runs.len()
+    {
+        state.phase = PhaseV0::Hold;
+        commands.push(CommandV0::Hold {
+            reason: "deletion child identity changed or AutomationRun disappeared".into(),
+        });
         return Ok(());
     }
-    state.journal = candidate;
-    deletion_prepare(state, commands)
+    let Some(tx) = state.journal.state.apply_transaction.clone() else {
+        state.phase = PhaseV0::Hold;
+        commands.push(CommandV0::Hold {
+            reason: "deletion observation has no durable prepared transaction".into(),
+        });
+        return Ok(());
+    };
+    let Some(intent) = next_unrecorded_intent(&tx) else {
+        return deletion_advance(state, commands);
+    };
+    let key = identity_key(&intent.identity);
+    if observed_inventory_by_key.contains_key(&key) {
+        return deletion_issue(state, commands);
+    }
+    if !claim_matches(state, &tx, intent)
+        || intent.operation != ApplyOperation::Delete
+        || intent.expected_uid.is_none()
+        || intent.expected_resource_version.is_none()
+    {
+        state.phase = PhaseV0::Hold;
+        commands.push(CommandV0::Hold {
+            reason: "absent deletion child lacks an exact durable prepared claim".into(),
+        });
+        return Ok(());
+    }
+    let recovered = ApplyResult {
+        command_id: intent.command_id.clone(),
+        attempt_token: tx.attempt_token.clone(),
+        identity: intent.identity.clone(),
+        outcome: ApplyOutcome::AlreadyAbsent,
+        uid: None,
+        resource_version: None,
+    };
+    record_mutation_results(state, &[recovered])?;
+    queue_persist(
+        state,
+        PersistPurpose::DeletionMutationResult,
+        DurablePhase::DeletionMutationResult,
+        PhaseV0::DeletionMutationPersistPending,
+        commands,
+    )
 }
 
 fn deletion_issue(
@@ -1642,11 +2330,13 @@ fn revalidate(
         .apply_transaction
         .clone()
         .ok_or_else(|| ReconcileError::Mutation("revalidation has no transaction".into()))?;
-    if tx.frozen_render_input_hash != frozen.render_input_hash
-        || state
-            .frozen
-            .as_ref()
-            .is_some_and(|previous| previous != &frozen)
+    let exact_effect_recovery = tx.generation != state.root.generation || state.frozen.is_none();
+    if !exact_effect_recovery
+        && (tx.frozen_render_input_hash != frozen.render_input_hash
+            || state
+                .frozen
+                .as_ref()
+                .is_some_and(|previous| previous != &frozen))
     {
         stale(commands, "revalidation frozen hash mismatch");
         return Ok(());
@@ -1658,6 +2348,73 @@ fn revalidate(
     // check; the actual fresh observation is retained for result recovery.
     let planning_observed = recovered_observation_projection(state, &tx, &observed);
     let plan = plan_graph(state, &frozen, input, output, planning_observed)?;
+    if exact_effect_recovery {
+        let recovered = recover_prepared_result(state, &tx, &observed)?;
+        if !recovered.is_empty() {
+            state.frozen = Some(frozen);
+            record_mutation_results(state, &recovered)?;
+            return queue_persist(
+                state,
+                PersistPurpose::MutationResult,
+                DurablePhase::MutationResult,
+                PhaseV0::PersistPending,
+                commands,
+            );
+        }
+        let desired_flipped_present = next_unrecorded_intent(&tx).is_some_and(|intent| {
+            intent.operation == ApplyOperation::Delete && plan.hash != tx.desired_graph_hash
+        });
+        if desired_flipped_present {
+            state.journal.state.apply_transaction = None;
+            state.journal.state.pending_dependencies.clear();
+            state.journal.state.prune_candidate = None;
+            return queue_persist(
+                state,
+                PersistPurpose::Invalidate,
+                DurablePhase::Invalidate,
+                PhaseV0::PersistPending,
+                commands,
+            );
+        }
+        if plan.hash == tx.desired_graph_hash
+            && next_unrecorded_intent(&tx).is_some_and(|intent| {
+                intent.operation == ApplyOperation::Delete
+                    && observed.iter().any(|item| {
+                        item.identity == intent.identity
+                            && matches!(
+                                &item.observation,
+                                Observation::Existing { identity }
+                                    if intent.expected_uid.as_deref()
+                                        == Some(identity.uid.as_str())
+                                        && intent.expected_resource_version.as_deref()
+                                            == Some(identity.resource_version.as_str())
+                            )
+                    })
+            })
+            && let Ok(effects) = plan.remaining_effects(state, &tx)
+            && matches!(
+                effects.as_slice(),
+                [MutationCommandV0 {
+                    decision: MutationDecision::PreconditionedDelete { .. },
+                    ..
+                }]
+            )
+        {
+            state.frozen = Some(frozen);
+            state.phase = PhaseV0::MutationPending;
+            commands.push(CommandV0::Mutate {
+                transaction_id: tx.id,
+                attempt_token: tx.attempt_token,
+                commands: effects,
+            });
+            return Ok(());
+        }
+        state.phase = PhaseV0::Hold;
+        commands.push(CommandV0::Hold {
+            reason: "recovered effect cannot be exactly proven; refusing replay".into(),
+        });
+        return Ok(());
+    }
     if plan.hash != tx.desired_graph_hash || tx.frozen_render_input_hash != frozen.render_input_hash
     {
         state.journal.state.apply_transaction = None;
@@ -1669,6 +2426,29 @@ fn revalidate(
             PhaseV0::PersistPending,
             commands,
         );
+    }
+    if let Some(intent) = next_unrecorded_intent(&tx)
+        && intent.operation == ApplyOperation::Delete
+    {
+        let observation = observed
+            .iter()
+            .find(|item| item.identity == intent.identity);
+        let authorized = observation.is_some_and(|item| match &item.observation {
+            Observation::Absent => deletion_recovery_matches(state, &tx, intent, item),
+            Observation::Existing { identity } => {
+                intent.expected_uid.as_deref() == Some(identity.uid.as_str())
+                    && intent.expected_resource_version.as_deref()
+                        == Some(identity.resource_version.as_str())
+            }
+        });
+        if !authorized {
+            state.phase = PhaseV0::Hold;
+            commands.push(CommandV0::Hold {
+                reason: "prepared DELETE fresh read is absent without proof or has changed UID/RV"
+                    .into(),
+            });
+            return Ok(());
+        }
     }
     let Ok(effects) = plan.remaining_effects(state, &tx) else {
         state.journal.state.apply_transaction = None;
@@ -2138,9 +2918,9 @@ fn deletion_advance(
     commands: &mut Vec<CommandV0>,
 ) -> Result<(), ReconcileError> {
     if !state.journal.state.inventory.is_empty() {
-        state.phase = PhaseV0::Hold;
-        commands.push(CommandV0::Hold {
-            reason: "deletion inventory remains after acknowledged cleanup".into(),
+        state.phase = PhaseV0::DeletionObservationPending;
+        commands.push(CommandV0::RequestDeletionObservation {
+            preconditions: pins(&state.root),
         });
         return Ok(());
     }
@@ -2169,9 +2949,16 @@ fn deletion_advance(
 
 fn owned_children_token(state: &MachineStateV0) -> Option<String> {
     state.journal.state.deletion.as_ref().map(|deletion| {
+        let finalizer_barrier_stage = if state.root.state_finalizer_present {
+            "before-state-finalizer"
+        } else {
+            "before-root-finalizer"
+        };
         hash(&[
             "verify-owned-children-absent/v0",
+            finalizer_barrier_stage,
             &deletion.id,
+            &deletion.deletion_start_generation.to_string(),
             &state.root.uid,
             &state.root.generation.to_string(),
             &state.root.root_resource_version,
@@ -2189,6 +2976,7 @@ fn owned_children_verified(
     root_resource_version: &str,
     state_uid: &str,
     state_resource_version: &str,
+    cleanup_token: &str,
     commands: &mut Vec<CommandV0>,
 ) {
     if state.phase != PhaseV0::OwnedChildrenVerifyPending
@@ -2198,6 +2986,7 @@ fn owned_children_verified(
         || root_resource_version != state.root.root_resource_version
         || state_uid != state.root.state_uid
         || state_resource_version != state.root.state_resource_version
+        || cleanup_token != token
     {
         stale(
             commands,
@@ -2205,11 +2994,41 @@ fn owned_children_verified(
         );
         return;
     }
-    state.phase = PhaseV0::StateFinalizerPending;
-    commands.push(CommandV0::RemoveStateFinalizer {
-        token: state_finalizer_token(state),
-        preconditions: pins(&state.root),
-    });
+    if state.root.state_finalizer_present {
+        let deletion = state
+            .journal
+            .state
+            .deletion
+            .as_ref()
+            .expect("owned-child verification requires deletion");
+        let mut status = state.root.status.clone();
+        status.deletion_cleanup_receipt = Some(DeletionCleanupReceipt {
+            root_uid: state.root.uid.clone(),
+            deletion_id: deletion.id.clone(),
+            deletion_start_generation: deletion.deletion_start_generation,
+            state_name: state.root.state_name.clone(),
+            state_uid: state.root.state_uid.clone(),
+            cleanup_token: cleanup_token.into(),
+        });
+        if !queue_root_status(
+            state,
+            status,
+            RootStatusContinuationV0::DeletionStateFinalizer,
+            commands,
+        ) {
+            state.phase = PhaseV0::StateFinalizerPending;
+            commands.push(CommandV0::RemoveStateFinalizer {
+                token: state_finalizer_token(state),
+                preconditions: pins(&state.root),
+            });
+        }
+    } else {
+        state.phase = PhaseV0::RootFinalizerPending;
+        commands.push(CommandV0::RemoveRootFinalizer {
+            token: root_finalizer_token(state),
+            preconditions: pins(&state.root),
+        });
+    }
 }
 
 fn state_finalizer_token(state: &MachineStateV0) -> String {
@@ -2229,6 +3048,14 @@ fn root_finalizer_token(state: &MachineStateV0) -> String {
         &state.root.root_resource_version,
         &state.root.state_uid,
         &state.root.state_resource_version,
+    ])
+}
+
+fn root_absence_token(state: &MachineStateV0) -> String {
+    hash(&[
+        "root-uid-absent/v0",
+        &state.root.uid,
+        &state.root.root_resource_version,
     ])
 }
 
@@ -2255,9 +3082,10 @@ fn state_finalizer_ack(
     }
     state.root.state_resource_version = new.into();
     state.root.state_finalizer_present = false;
-    state.phase = PhaseV0::RootFinalizerPending;
-    commands.push(CommandV0::RemoveRootFinalizer {
-        token: root_finalizer_token(state),
+    let token = owned_children_token(state).expect("deletion record exists");
+    state.phase = PhaseV0::OwnedChildrenVerifyPending;
+    commands.push(CommandV0::VerifyOwnedChildrenAbsent {
+        token,
         preconditions: pins(&state.root),
     });
 }
@@ -2274,6 +3102,9 @@ fn root_finalizer_ack(
         || token != root_finalizer_token(state)
         || root_uid != state.root.uid
         || old != state.root.root_resource_version
+        || !state.root.deleting
+        || !state.root.root_finalizer_present
+        || validate_deleting_root_receipt(&state.root).is_err()
         || new.is_empty()
         || new == old
     {
@@ -2285,7 +3116,12 @@ fn root_finalizer_ack(
     }
     state.root.root_resource_version = new.into();
     state.root.root_finalizer_present = false;
-    state.phase = PhaseV0::Bootstrap;
+    state.phase = PhaseV0::RootDeletionVerifyPending;
+    commands.push(CommandV0::VerifyRootUidAbsent {
+        token: root_absence_token(state),
+        root_uid: state.root.uid.clone(),
+        preconditions: pins(&state.root),
+    });
 }
 
 fn automation_deleted(
@@ -2619,6 +3455,11 @@ fn validate_action_trigger(trigger: &ActionTriggerV0) -> Result<(), ReconcileErr
             "actionModuleDigest must be a lowercase SHA-256".into(),
         ));
     }
+    if trigger.observation_token != automation_source_transition_token(trigger) {
+        return Err(ReconcileError::Automation(
+            "automation observation token is not source-specific".into(),
+        ));
+    }
     let bytes = canonical_bytes(&trigger.event_metadata)
         .map_err(|error| ReconcileError::Automation(error.to_string()))?;
     if bytes.len() > MAX_ACTION_INPUT_CANONICAL_BYTES {
@@ -2627,6 +3468,22 @@ fn validate_action_trigger(trigger: &ActionTriggerV0) -> Result<(), ReconcileErr
         ));
     }
     Ok(())
+}
+
+/// Derives the automation baseline token exclusively from the automation and
+/// its exact source transition. A global render/dependency barrier token is
+/// intentionally absent, so unrelated cluster changes cannot create an
+/// occurrence.
+#[must_use]
+pub fn automation_source_transition_token(trigger: &ActionTriggerV0) -> String {
+    hash(&[
+        "automation-source-observation/v0",
+        &trigger.automation_identity,
+        &trigger.automation_version,
+        &identity_key(&trigger.source),
+        &trigger.source_uid,
+        &trigger.source_resource_version,
+    ])
 }
 
 fn automation_ensured(
@@ -3012,11 +3869,18 @@ fn plan_graph(
                                     == actual.resource_version
                                 && old.first_observation.observed_generation
                                     == frozen.root_generation
-                                && old.second_observation.as_ref().is_none_or(|second| {
-                                    second.observed_generation == frozen.root_generation
-                                        && second.observed_resource_version
-                                            == actual.resource_version
-                                })
+                                && old.second_observation.as_ref().map_or_else(
+                                    || {
+                                        old.first_observation.barrier_token
+                                            != frozen.observation_token
+                                    },
+                                    |second| {
+                                        second.observed_generation == frozen.root_generation
+                                            && second.observed_resource_version
+                                                == actual.resource_version
+                                            && second.barrier_token == frozen.observation_token
+                                    },
+                                )
                         });
                     if matching_candidate {
                         let command_id = hash(&[
@@ -3055,16 +3919,19 @@ fn plan_graph(
                                 first_observation: PruneObservation {
                                     observed_resource_version: actual.resource_version.clone(),
                                     observed_generation: frozen.root_generation,
+                                    barrier_token: frozen.observation_token.clone(),
                                 },
                                 second_observation: Some(PruneObservation {
                                     observed_resource_version: actual.resource_version.clone(),
                                     observed_generation: frozen.root_generation,
+                                    barrier_token: frozen.observation_token.clone(),
                                 }),
                             },
                             |mut old| {
                                 old.second_observation = Some(PruneObservation {
                                     observed_resource_version: actual.resource_version.clone(),
                                     observed_generation: frozen.root_generation,
+                                    barrier_token: frozen.observation_token.clone(),
                                 });
                                 old
                             },
@@ -3076,6 +3943,7 @@ fn plan_graph(
                             first_observation: PruneObservation {
                                 observed_resource_version: actual.resource_version,
                                 observed_generation: frozen.root_generation,
+                                barrier_token: frozen.observation_token.clone(),
                             },
                             second_observation: None,
                         });
@@ -3278,6 +4146,11 @@ fn validate_root_and_journal(
     journal
         .validate()
         .map_err(|e| ReconcileError::Link(e.to_string()))?;
+    if journal.state.deletion.is_none() && root.bundle_digest != journal.root.bundle_digest {
+        return Err(ReconcileError::Link(
+            "nondeleting root bundle digest changed".into(),
+        ));
+    }
     validate_journal_generation(root, journal)?;
     validate_root_state_link(
         &root.uid,
@@ -3287,6 +4160,40 @@ fn validate_root_and_journal(
         journal,
     )
     .map_err(|e| ReconcileError::Link(e.to_string()))
+}
+
+fn validate_root_only_deletion_machine(state: &MachineStateV0) -> Result<(), ReconcileError> {
+    validate_bootstrap_root(&state.root)?;
+    let receipt = validate_deleting_root_receipt(&state.root)?;
+    if state.root.state_name != receipt.state_name
+        || state.root.state_uid != receipt.state_uid
+        || !state.root.state_resource_version.is_empty()
+        || state.root.state_finalizer_present
+    {
+        return Err(ReconcileError::Recovery(
+            "root-only deletion state pins do not match the cleanup receipt".into(),
+        ));
+    }
+    state
+        .journal
+        .validate()
+        .map_err(|error| ReconcileError::Recovery(error.to_string()))?;
+    if state.journal.root.uid != state.root.uid
+        || state.journal.root.bundle_digest != state.root.bundle_digest
+        || state.journal.state
+            != (StateBody {
+                deletion: Some(DeletionTransaction {
+                    id: receipt.deletion_id.clone(),
+                    deletion_start_generation: receipt.deletion_start_generation,
+                }),
+                ..StateBody::default()
+            })
+    {
+        return Err(ReconcileError::Recovery(
+            "root-only deletion journal exceeds receipt authority".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_bootstrap_root(root: &RootSnapshotV0) -> Result<(), ReconcileError> {
@@ -3314,37 +4221,33 @@ fn validate_journal_generation(
     root: &RootSnapshotV0,
     journal: &OxideLoopStateSpec,
 ) -> Result<(), ReconcileError> {
-    for (field, generation) in [
-        (
-            "apply transaction",
-            journal
+    if let Some(transaction) = &journal.state.apply_transaction {
+        let allowed_old_generation =
+            journal.state.deletion.as_ref().is_some_and(|deletion| {
+                transaction.generation == deletion.deletion_start_generation
+            }) || journal
                 .state
-                .apply_transaction
+                .generation_advance_closure
                 .as_ref()
-                .map(|transaction| transaction.generation),
-        ),
-        (
-            "pending persist",
-            journal
-                .state
-                .pending_persist
-                .as_ref()
-                .map(|operation| operation.root_generation),
-        ),
-        (
-            "deletion transaction",
-            journal
-                .state
-                .deletion
-                .as_ref()
-                .map(|transaction| transaction.root_generation),
-        ),
-    ] {
-        if generation.is_some_and(|actual| actual != root.generation) {
-            return Err(ReconcileError::Link(format!(
-                "{field} generation does not match root generation"
-            )));
+                .is_some_and(|closure| transaction.generation == closure.source_generation);
+        let recoverable_old_generation = journal.state.deletion.is_none()
+            && transaction.generation >= 0
+            && transaction.generation < root.generation;
+        if transaction.generation != root.generation
+            && !allowed_old_generation
+            && !recoverable_old_generation
+        {
+            return Err(ReconcileError::Link(
+                "apply transaction generation does not match root or closure".into(),
+            ));
         }
+    }
+    if let Some(operation) = &journal.state.pending_persist
+        && operation.root_generation != root.generation
+    {
+        return Err(ReconcileError::Link(
+            "pending persist generation does not match root generation".into(),
+        ));
     }
     Ok(())
 }
@@ -3403,7 +4306,17 @@ fn finish(state: MachineStateV0, commands: Vec<CommandV0>) -> Result<TransitionV
     if commands.len() > MAX_COMMANDS {
         Err(ReconcileError::CommandBound)
     } else {
-        if matches!(
+        if state.root_only_deletion_recovery {
+            validate_root_only_deletion_machine(&state)?;
+            if commands
+                .iter()
+                .any(|command| !root_only_command_allowed(command))
+            {
+                return Err(ReconcileError::Recovery(
+                    "command exceeds root-only deletion recovery authority".into(),
+                ));
+            }
+        } else if matches!(
             state.phase,
             PhaseV0::Bootstrap | PhaseV0::BootstrapPending | PhaseV0::Recovery
         ) {
@@ -3527,6 +4440,7 @@ mod tests {
                 root_resource_version: "20".into(),
                 root_finalizer_present: true,
                 state_finalizer_present: true,
+                deleting: false,
                 status: WebApplicationStatus {
                     state: Some(StateLink {
                         root_uid: root_uid.into(),
@@ -3800,7 +4714,7 @@ mod tests {
         let restart_start = reduce(restarted, EventV0::Start).unwrap();
         assert!(matches!(
             restart_start.commands.as_slice(),
-            [CommandV0::RequestDeletionObservation { .. }]
+            [CommandV0::Persist { .. }]
         ));
         let start_operation = match &started.commands[0] {
             CommandV0::Persist { operation, .. } => operation.clone(),
@@ -3829,13 +4743,25 @@ mod tests {
             CommandV0::Persist { operation, .. } => operation.clone(),
             _ => panic!(),
         };
-        let verify = reduce(
+        let observe = reduce(
             prepared.state,
             EventV0::Persisted {
                 token: prepare_operation.token,
                 old_state_resource_version: prepare_operation.old_state_resource_version,
                 new_state_resource_version: "13".into(),
                 state_uid: "state-uid".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            observe.commands.as_slice(),
+            [CommandV0::RequestDeletionObservation { .. }]
+        ));
+        let verify = reduce(
+            observe.state,
+            EventV0::DeletionRevalidated {
+                observed_inventory: vec![],
+                observed_automation_runs: vec![],
             },
         )
         .unwrap();
@@ -3850,12 +4776,13 @@ mod tests {
         .unwrap();
         assert!(matches!(
             verification_restart.commands.as_slice(),
-            [CommandV0::RequestDeletionObservation { .. }]
+            [CommandV0::Persist { .. }]
         ));
         let stale = reduce(
             verify.state.clone(),
             EventV0::OwnedChildrenVerifiedAbsent {
                 token: "0".repeat(64),
+                cleanup_token: "0".repeat(64),
                 root_uid: "root-uid".into(),
                 root_generation: 7,
                 root_resource_version: "20".into(),
@@ -3865,10 +4792,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stale.state.phase, PhaseV0::OwnedChildrenVerifyPending);
-        let finalizer = reduce(
+        let receipt = reduce(
             verify.state,
             EventV0::OwnedChildrenVerifiedAbsent {
-                token,
+                token: token.clone(),
+                cleanup_token: token,
                 root_uid: "root-uid".into(),
                 root_generation: 7,
                 root_resource_version: "20".into(),
@@ -3878,9 +4806,27 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            finalizer.commands.as_slice(),
-            [CommandV0::RemoveStateFinalizer { .. }]
+            receipt.commands.as_slice(),
+            [CommandV0::PersistRootStatus { .. }]
         ));
+        let (status_token, old_root_rv) = match &receipt.commands[0] {
+            CommandV0::PersistRootStatus {
+                token,
+                old_root_resource_version,
+                ..
+            } => (token.clone(), old_root_resource_version.clone()),
+            _ => unreachable!(),
+        };
+        let finalizer = reduce(
+            receipt.state,
+            EventV0::RootStatusPersisted {
+                token: status_token,
+                old_root_resource_version: old_root_rv,
+                new_root_resource_version: "21".into(),
+                root_uid: "root-uid".into(),
+            },
+        )
+        .unwrap();
         let token = match &finalizer.commands[0] {
             CommandV0::RemoveStateFinalizer { token, .. } => token.clone(),
             _ => unreachable!(),
@@ -3906,11 +4852,204 @@ mod tests {
             },
         )
         .unwrap();
-        match &root_finalizer.commands[0] {
-            CommandV0::RemoveRootFinalizer { preconditions, .. } => {
-                assert_eq!(preconditions.state_resource_version, "14")
+        let second_token = match &root_finalizer.commands[0] {
+            CommandV0::VerifyOwnedChildrenAbsent {
+                token,
+                preconditions,
+            } => {
+                assert_eq!(preconditions.state_resource_version, "14");
+                token.clone()
+            }
+            _ => panic!("state acknowledgement must trigger a fresh absence barrier"),
+        };
+        let root_finalizer = reduce(
+            root_finalizer.state,
+            EventV0::OwnedChildrenVerifiedAbsent {
+                token: second_token.clone(),
+                cleanup_token: second_token,
+                root_uid: "root-uid".into(),
+                root_generation: 7,
+                root_resource_version: "21".into(),
+                state_uid: "state-uid".into(),
+                state_resource_version: "14".into(),
+            },
+        )
+        .unwrap();
+        let root_finalizer_token = match &root_finalizer.commands[0] {
+            CommandV0::RemoveRootFinalizer {
+                token,
+                preconditions,
+            } => {
+                assert_eq!(preconditions.state_resource_version, "14");
+                token.clone()
             }
             _ => panic!("state acknowledgement must pin its new RV before root finalization"),
+        };
+        let absence = reduce(
+            root_finalizer.state,
+            EventV0::RootFinalizerRemoved {
+                token: root_finalizer_token,
+                root_uid: "root-uid".into(),
+                old_root_resource_version: "21".into(),
+                new_root_resource_version: "22".into(),
+            },
+        )
+        .unwrap();
+        let absence_token = match &absence.commands[0] {
+            CommandV0::VerifyRootUidAbsent {
+                token, root_uid, ..
+            } => {
+                assert_eq!(root_uid, "root-uid");
+                token.clone()
+            }
+            _ => panic!("root finalizer acknowledgement must be followed by an exact UID read"),
+        };
+        let terminal = reduce(
+            absence.state,
+            EventV0::RootUidVerifiedAbsent {
+                token: absence_token,
+                root_uid: "root-uid".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(terminal.state.phase, PhaseV0::Terminal);
+        assert!(terminal.commands.is_empty());
+    }
+
+    #[test]
+    fn deleting_state_present_restarts_without_receipt_in_every_pre_receipt_phase() {
+        let mut machine = state();
+        let inventory = InventoryEntry {
+            identity: ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "demo".into(),
+                name: "managed".into(),
+            },
+            logical_id: "managed".into(),
+            uid: "managed-uid".into(),
+            resource_version: "managed-rv-1".into(),
+            bundle_digest: "a".repeat(64),
+        };
+        machine.journal.state.inventory.push(inventory.clone());
+
+        let deletion_start = reduce(machine, EventV0::BeginDeletion).unwrap();
+        let deletion_start_operation = match &deletion_start.commands[0] {
+            CommandV0::Persist { operation, .. } => operation.clone(),
+            command => panic!("unexpected deletion-start command: {command:?}"),
+        };
+        let deletion_prepare = reduce(
+            deletion_start.state.clone(),
+            EventV0::Persisted {
+                token: deletion_start_operation.token,
+                old_state_resource_version: deletion_start_operation.old_state_resource_version,
+                new_state_resource_version: "12".into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .unwrap();
+        let deletion_prepare_operation = match &deletion_prepare.commands[0] {
+            CommandV0::Persist { operation, .. } => operation.clone(),
+            command => panic!("unexpected deletion-prepare command: {command:?}"),
+        };
+        let deletion_observation = reduce(
+            deletion_prepare.state.clone(),
+            EventV0::Persisted {
+                token: deletion_prepare_operation.token,
+                old_state_resource_version: deletion_prepare_operation.old_state_resource_version,
+                new_state_resource_version: "13".into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .unwrap();
+        let deletion_mutation = reduce(
+            deletion_observation.state.clone(),
+            EventV0::DeletionRevalidated {
+                observed_inventory: vec![inventory.clone()],
+                observed_automation_runs: vec![],
+            },
+        )
+        .unwrap();
+        let (transaction_id, attempt_token, command) = match &deletion_mutation.commands[0] {
+            CommandV0::Mutate {
+                transaction_id,
+                attempt_token,
+                commands,
+            } => (
+                transaction_id.clone(),
+                attempt_token.clone(),
+                commands[0].clone(),
+            ),
+            command => panic!("unexpected deletion mutation command: {command:?}"),
+        };
+        let deletion_result = reduce(
+            deletion_mutation.state.clone(),
+            EventV0::MutationAcknowledged {
+                transaction_id,
+                attempt_token: attempt_token.clone(),
+                results: vec![ApplyResult {
+                    command_id: command.command_id,
+                    attempt_token,
+                    identity: inventory.identity,
+                    outcome: ApplyOutcome::Deleted,
+                    uid: Some("managed-uid".into()),
+                    resource_version: Some("managed-rv-1".into()),
+                }],
+            },
+        )
+        .unwrap();
+        let deletion_result_operation = match &deletion_result.commands[0] {
+            CommandV0::Persist { operation, .. } => operation.clone(),
+            command => panic!("unexpected deletion-result command: {command:?}"),
+        };
+        let owned_children = reduce(
+            deletion_result.state.clone(),
+            EventV0::Persisted {
+                token: deletion_result_operation.token,
+                old_state_resource_version: deletion_result_operation.old_state_resource_version,
+                new_state_resource_version: "14".into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .unwrap();
+
+        let restart_phases = vec![
+            ("deletion-start", deletion_start.state),
+            ("deletion-prepare", deletion_prepare.state),
+            ("deletion-observation", deletion_observation.state),
+            ("deletion-mutation", deletion_mutation.state),
+            ("deletion-result", deletion_result.state),
+            ("owned-children", owned_children.state),
+        ]
+        .into_boxed_slice();
+        for (phase, persisted_state) in restart_phases {
+            assert!(
+                persisted_state
+                    .root
+                    .status
+                    .deletion_cleanup_receipt
+                    .is_none()
+            );
+            assert!(!persisted_state.root.state_uid.is_empty());
+            let recreated =
+                MachineStateV0::recover_json(&serde_json::to_string(&persisted_state).unwrap())
+                    .unwrap_or_else(|error| panic!("{phase} state did not recover: {error}"));
+            let resumed = reduce(recreated, EventV0::Start)
+                .unwrap_or_else(|error| panic!("{phase} state did not resume: {error}"));
+            assert!(
+                matches!(
+                    resumed.commands.as_slice(),
+                    [CommandV0::Persist { .. } | CommandV0::RequestDeletionObservation { .. }]
+                ),
+                "{phase} resumed outside durable deletion: {:?}",
+                resumed.commands
+            );
+            assert!(resumed.commands.iter().all(|command| !matches!(
+                command,
+                CommandV0::EnsureBootstrap { .. }
+                    | CommandV0::RequestDescriptor { .. }
+                    | CommandV0::Mutate { .. }
+            )));
         }
     }
 
@@ -3925,7 +5064,7 @@ mod tests {
         };
         machine.journal.state.deletion = Some(DeletionTransaction {
             id: "d".repeat(64),
-            root_generation: 7,
+            deletion_start_generation: 7,
         });
         machine.journal.state.apply_transaction = Some(ApplyTransaction {
             id: "d".repeat(64),
@@ -4151,6 +5290,21 @@ mod tests {
             namespace: "demo".into(),
             name: "source".into(),
         };
+        let mut trigger = ActionTriggerV0 {
+            automation_identity: "smoke".into(),
+            automation_version: "v1".into(),
+            action_module_identity: "actions/smoke.mjs".into(),
+            action_module_digest: "b".repeat(64),
+            source: source.clone(),
+            source_uid: "source-uid".into(),
+            source_resource_version: "7".into(),
+            observation_token: String::new(),
+            event_metadata: serde_json::json!({"reason":"changed"}),
+        };
+        trigger.observation_token = automation_source_transition_token(&trigger);
+        let mut prior = trigger.clone();
+        prior.source_resource_version = "6".into();
+        let prior_token = automation_source_transition_token(&prior);
         machine
             .journal
             .state
@@ -4159,19 +5313,19 @@ mod tests {
             .push(AutomationBaseline {
                 automation_id: "smoke".into(),
                 source: source.clone(),
-                token: "old".into(),
+                token: prior_token,
             });
-        let trigger = ActionTriggerV0 {
-            automation_identity: "smoke".into(),
-            automation_version: "v1".into(),
-            action_module_identity: "actions/smoke.mjs".into(),
-            action_module_digest: "b".repeat(64),
-            source: source.clone(),
-            source_uid: "source-uid".into(),
-            source_resource_version: "7".into(),
-            observation_token: "new".into(),
-            event_metadata: serde_json::json!({"reason":"changed"}),
-        };
+        let mut unrelated_global = trigger.clone();
+        unrelated_global.observation_token = "global-barrier-changed".into();
+        assert!(matches!(
+            reduce(
+                machine.clone(),
+                EventV0::TriggerAutomation {
+                    trigger: unrelated_global
+                }
+            ),
+            Err(ReconcileError::Automation(_))
+        ));
         let issued = reduce(machine, EventV0::TriggerAutomation { trigger }).unwrap();
         let (token, name, spec) = match &issued.commands[0] {
             CommandV0::EnsureAutomationRun {
@@ -4438,6 +5592,7 @@ mod tests {
             first_observation: PruneObservation {
                 observed_resource_version: "old-rv".into(),
                 observed_generation: 6,
+                barrier_token: "old-barrier".into(),
             },
             second_observation: None,
         });
@@ -4520,14 +5675,20 @@ mod tests {
         assert_eq!(next_render.phase, PhaseV0::Ready);
         // A fresh external reconcile schedules the next render boundary.
         next_render.phase = PhaseV0::RenderPending;
+        next_render.root.status.input_token = Some("observation-2".into());
+        let mut second_input_document: RenderInputV0 = serde_json::from_str(&input).unwrap();
+        second_input_document.observation_token = "observation-2".into();
+        let second_input = serde_json::to_string(&second_input_document).unwrap();
         let second = reduce(
             next_render,
             EventV0::Rendered {
                 frozen: FrozenInputV0 {
                     state_resource_version: "13".into(),
+                    observation_token: "observation-2".into(),
+                    render_input_hash: parse_validate_render_input(&second_input).unwrap().sha256,
                     ..frozen
                 },
-                render_input_json: input,
+                render_input_json: second_input,
                 render_output_json: output,
                 observed,
             },
@@ -4574,6 +5735,7 @@ mod tests {
             first_observation: PruneObservation {
                 observed_resource_version: "10".into(),
                 observed_generation: 7,
+                barrier_token: "first-barrier".into(),
             },
             second_observation: None,
         });
@@ -4621,6 +5783,141 @@ mod tests {
             },
         )
         .unwrap();
+        let recreated =
+            MachineStateV0::recover_json(&serde_json::to_string(&revalidate.state).unwrap())
+                .unwrap();
+        let restarted = reduce(recreated, EventV0::Start).unwrap();
+        let descriptor_token = match &restarted.commands[0] {
+            CommandV0::RequestDescriptor { token, .. } => token.clone(),
+            command => panic!("recovery skipped descriptor verification: {command:?}"),
+        };
+        let descriptor = reduce(
+            restarted.state,
+            EventV0::DescriptorReady {
+                token: descriptor_token,
+                bundle_digest: "a".repeat(64),
+            },
+        )
+        .unwrap();
+        let informed_state = match descriptor.commands.as_slice() {
+            [] => descriptor.state,
+            [
+                CommandV0::PersistRootStatus {
+                    token,
+                    old_root_resource_version,
+                    ..
+                },
+            ] => {
+                reduce(
+                    descriptor.state,
+                    EventV0::RootStatusPersisted {
+                        token: token.clone(),
+                        old_root_resource_version: old_root_resource_version.clone(),
+                        new_root_resource_version: "recovery-root-rv".into(),
+                        root_uid: "root-uid".into(),
+                    },
+                )
+                .unwrap()
+                .state
+            }
+            commands => panic!("unexpected recovery descriptor commands: {commands:?}"),
+        };
+        let recovery_base = reduce(informed_state, EventV0::InformersReady)
+            .unwrap()
+            .state;
+        assert_eq!(recovery_base.phase, PhaseV0::RevalidatePending);
+        assert!(recovery_base.frozen.is_none());
+        let retried = reduce(
+            recovery_base.clone(),
+            EventV0::Revalidated {
+                frozen: revalidate.state.frozen.clone().unwrap(),
+                render_input_json: input.clone(),
+                render_output_json: output.clone(),
+                observed: observed.clone(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            retried.commands.as_slice(),
+            [CommandV0::Mutate { commands, .. }]
+                if matches!(
+                    commands.as_slice(),
+                    [MutationCommandV0 {
+                        decision: MutationDecision::PreconditionedDelete {
+                            preconditions: MutationIdentity { uid, resource_version },
+                            ..
+                        },
+                        ..
+                    }] if uid == "old-uid" && resource_version == "10"
+                )
+        ));
+        for (uid, resource_version) in [
+            ("replacement-uid", "10"),
+            ("old-uid", "changed-resource-version"),
+        ] {
+            let mut mismatched = observed.clone();
+            mismatched[0].observation = Observation::Existing {
+                identity: MutationIdentity {
+                    uid: uid.into(),
+                    resource_version: resource_version.into(),
+                },
+            };
+            let held = reduce(
+                recovery_base.clone(),
+                EventV0::Revalidated {
+                    frozen: revalidate.state.frozen.clone().unwrap(),
+                    render_input_json: input.clone(),
+                    render_output_json: output.clone(),
+                    observed: mismatched,
+                },
+            )
+            .unwrap();
+            assert!(matches!(held.commands.as_slice(), [CommandV0::Hold { .. }]));
+        }
+        let desired_present_output = serde_json::to_string(&RenderOutputV0 {
+            abi_version: ABI_VERSION_V0.into(),
+            disposition: RenderDisposition::Apply,
+            resources: vec![ResourceDeclaration {
+                logical_id: "old".into(),
+                object: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"namespace": "demo", "name": "old"},
+                    "data": {"desired": "again"}
+                }),
+                readiness: None,
+            }],
+            dependencies: vec![],
+            automations: vec![],
+            diagnostics: vec![],
+        })
+        .unwrap();
+        let invalidated = reduce(
+            recovery_base,
+            EventV0::Revalidated {
+                frozen: revalidate.state.frozen.clone().unwrap(),
+                render_input_json: input.clone(),
+                render_output_json: desired_present_output,
+                observed: observed.clone(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            invalidated.commands.as_slice(),
+            [CommandV0::Persist {
+                operation: PersistOperation {
+                    purpose: PersistPurpose::Invalidate,
+                    ..
+                },
+                ..
+            }]
+        ));
+        assert!(
+            invalidated
+                .commands
+                .iter()
+                .all(|command| !matches!(command, CommandV0::Mutate { .. }))
+        );
         let issued = reduce(
             revalidate.state.clone(),
             EventV0::Revalidated {
@@ -4882,21 +6179,27 @@ mod tests {
     }
 
     #[test]
-    fn recovery_rejects_foreign_or_negative_deletion_generations_before_effects() {
-        for forged_generation in [6, -1] {
-            let mut forged = state();
-            forged.journal.state.deletion = Some(DeletionTransaction {
-                id: "d".repeat(64),
-                root_generation: forged_generation,
-            });
-            let recovered: MachineStateV0 =
-                serde_json::from_str(&serde_json::to_string(&forged).unwrap()).unwrap();
-            assert_eq!(recovered.phase, PhaseV0::Recovery);
-            assert!(matches!(
-                reduce(recovered, EventV0::Start),
-                Err(ReconcileError::Link(_))
-            ));
-        }
+    fn recovery_accepts_immutable_deletion_start_generation_but_rejects_negative() {
+        let mut advanced = state();
+        advanced.journal.state.deletion = Some(DeletionTransaction {
+            id: "d".repeat(64),
+            deletion_start_generation: 6,
+        });
+        let recovered: MachineStateV0 =
+            serde_json::from_str(&serde_json::to_string(&advanced).unwrap()).unwrap();
+        assert!(reduce(recovered, EventV0::Start).is_ok());
+
+        let mut forged = state();
+        forged.journal.state.deletion = Some(DeletionTransaction {
+            id: "d".repeat(64),
+            deletion_start_generation: -1,
+        });
+        let recovered: MachineStateV0 =
+            serde_json::from_str(&serde_json::to_string(&forged).unwrap()).unwrap();
+        assert!(matches!(
+            reduce(recovered, EventV0::Start),
+            Err(ReconcileError::Link(_))
+        ));
     }
 
     #[test]
@@ -4904,7 +6207,7 @@ mod tests {
         let mut machine = state();
         machine.journal.state.deletion = Some(DeletionTransaction {
             id: "d".repeat(64),
-            root_generation: 7,
+            deletion_start_generation: 7,
         });
         machine
             .journal
@@ -5185,8 +6488,16 @@ mod tests {
             expected_resource_version: "10".into(),
         });
         assert_eq!(
-            recover_prepared_result(&machine, &tx, &[observation]).unwrap()[0].outcome,
+            recover_prepared_result(&machine, &tx, &[observation.clone()]).unwrap()[0].outcome,
             ApplyOutcome::AlreadyAbsent
+        );
+        let mut no_prepared_intent = tx;
+        no_prepared_intent.prepared_intents.clear();
+        no_prepared_intent.recovery_claims.clear();
+        assert!(
+            recover_prepared_result(&machine, &no_prepared_intent, &[observation])
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -5615,5 +6926,598 @@ mod tests {
         .unwrap();
         assert_eq!(ready.state.phase, PhaseV0::Ready);
         assert_eq!(ready.state.journal.state.inventory.len(), 2);
+    }
+
+    #[test]
+    fn dependency_reconcile_reenters_ready_without_replacing_root_authority() {
+        let machine = boot_to_render(state());
+        let (frozen, input, output, observed) = rendered(&machine.root, vec![]);
+        let ready = complete_single_apply_to_ready(
+            machine,
+            frozen,
+            input,
+            output,
+            observed,
+            "created-uid",
+            "30",
+        );
+        let root = ready.root.clone();
+        let requested = reduce(
+            ready,
+            EventV0::ReconcileRequested {
+                observation_token: "barrier-2".into(),
+                cache_epoch: "epoch-2".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(requested.state.root, root);
+        assert_eq!(requested.state.phase, PhaseV0::RenderPending);
+        match &requested.commands[0] {
+            CommandV0::RequestRender { preconditions } => {
+                assert_eq!(preconditions.observation_token, "barrier-2");
+                assert_eq!(preconditions.cache_epoch, "epoch-2");
+            }
+            _ => panic!("dependency wakeup must request a fresh render"),
+        }
+    }
+
+    #[test]
+    fn exact_root_refresh_invalidates_same_bundle_and_holds_uid_or_digest_replacement() {
+        let machine = boot_to_render(state());
+        let (frozen, input, output, observed) = rendered(&machine.root, vec![]);
+        let ready = complete_single_apply_to_ready(
+            machine,
+            frozen,
+            input,
+            output,
+            observed,
+            "created-uid",
+            "30",
+        );
+        let mut advanced = ready.root.clone();
+        advanced.generation += 1;
+        advanced.root_resource_version = "31".into();
+        advanced.status.observed_generation = Some(advanced.generation);
+        let refreshed = reduce(
+            ready.clone(),
+            EventV0::RootRefreshed {
+                root: advanced.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(refreshed.state.root, advanced);
+        assert!(matches!(
+            refreshed.commands.as_slice(),
+            [CommandV0::Persist {
+                operation: PersistOperation {
+                    purpose: PersistPurpose::Invalidate,
+                    ..
+                },
+                ..
+            }]
+        ));
+
+        let mut foreign_uid = ready.root.clone();
+        foreign_uid.uid = "replacement-uid".into();
+        assert!(matches!(
+            reduce(ready.clone(), EventV0::RootRefreshed { root: foreign_uid })
+                .unwrap()
+                .commands
+                .as_slice(),
+            [CommandV0::Hold { .. }]
+        ));
+        let mut changed_digest = ready.root.clone();
+        changed_digest.bundle_digest = "b".repeat(64);
+        assert!(matches!(
+            reduce(
+                ready,
+                EventV0::RootRefreshed {
+                    root: changed_digest
+                }
+            )
+            .unwrap()
+            .commands
+            .as_slice(),
+            [CommandV0::Hold { .. }]
+        ));
+    }
+
+    #[test]
+    fn mutation_ack_root_race_uses_effect_free_bounded_generation_closure() {
+        let machine = boot_to_render(state());
+        let (frozen, input, output, observed) = rendered(&machine.root, vec![]);
+        let prepared = reduce(
+            machine,
+            EventV0::Rendered {
+                frozen,
+                render_input_json: input.clone(),
+                render_output_json: output.clone(),
+                observed: observed.clone(),
+            },
+        )
+        .unwrap();
+        let operation = match &prepared.commands[0] {
+            CommandV0::Persist { operation, .. } => operation.clone(),
+            _ => panic!(),
+        };
+        let revalidate = reduce(
+            prepared.state,
+            EventV0::Persisted {
+                token: operation.token,
+                old_state_resource_version: operation.old_state_resource_version,
+                new_state_resource_version: "12".into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .unwrap();
+        let issued = reduce(
+            revalidate.state.clone(),
+            EventV0::Revalidated {
+                frozen: revalidate.state.frozen.clone().unwrap(),
+                render_input_json: input,
+                render_output_json: output,
+                observed,
+            },
+        )
+        .unwrap();
+        let (transaction_id, attempt_token, command) = match &issued.commands[0] {
+            CommandV0::Mutate {
+                transaction_id,
+                attempt_token,
+                commands,
+            } => (
+                transaction_id.clone(),
+                attempt_token.clone(),
+                commands[0].clone(),
+            ),
+            _ => panic!(),
+        };
+        let mut advanced = issued.state.root.clone();
+        advanced.generation = 8;
+        advanced.root_resource_version = "31".into();
+        advanced.status.observed_generation = Some(8);
+        let coalesced = reduce(issued.state, EventV0::RootRefreshed { root: advanced }).unwrap();
+        assert_eq!(coalesced.state.phase, PhaseV0::MutationPending);
+        let closure = reduce(
+            coalesced.state,
+            EventV0::MutationAcknowledged {
+                attempt_token: attempt_token.clone(),
+                transaction_id: transaction_id.clone(),
+                results: vec![ApplyResult {
+                    command_id: command.command_id,
+                    attempt_token,
+                    identity: command.identity,
+                    outcome: ApplyOutcome::Applied,
+                    uid: Some("created-uid".into()),
+                    resource_version: Some("30".into()),
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(closure.state.root.generation, 8);
+        assert!(matches!(
+            closure.commands.as_slice(),
+            [CommandV0::Persist {
+                operation: PersistOperation {
+                    purpose: PersistPurpose::GenerationAdvanceClosure,
+                    ..
+                },
+                ..
+            }]
+        ));
+        assert!(
+            closure
+                .state
+                .journal
+                .state
+                .generation_advance_closure
+                .is_some()
+        );
+
+        // A process recreated from a durably written closure issues only an
+        // effect-free cleanup persist, never the original mutation.
+        let recreated =
+            MachineStateV0::recover_json(&serde_json::to_string(&closure.state).unwrap()).unwrap();
+        let resumed = reduce(recreated, EventV0::Start).unwrap();
+        assert!(matches!(
+            resumed.commands.as_slice(),
+            [CommandV0::Persist {
+                operation: PersistOperation {
+                    purpose: PersistPurpose::Invalidate,
+                    ..
+                },
+                ..
+            }]
+        ));
+
+        // If deletion was observed before the closure write was reloaded, the
+        // same durable acknowledged facts may survive, but normal invalidate
+        // work must not. Recovery first persists the absorbing deletion mode.
+        let mut deleting_closure = closure.state.clone();
+        deleting_closure.root.deleting = true;
+        let recreated =
+            MachineStateV0::recover_json(&serde_json::to_string(&deleting_closure).unwrap())
+                .unwrap();
+        let resumed = reduce(recreated, EventV0::Start).unwrap();
+        assert!(matches!(
+            resumed.commands.as_slice(),
+            [CommandV0::Persist {
+                operation: PersistOperation {
+                    purpose: PersistPurpose::DeletionStart,
+                    ..
+                },
+                ..
+            }]
+        ));
+        assert!(
+            resumed
+                .commands
+                .iter()
+                .all(|command| !matches!(command, CommandV0::Mutate { .. }))
+        );
+
+        let mut rebased = closure.state;
+        for index in 0..MAX_CLOSURE_REBASES {
+            let mut root = rebased.root.clone();
+            root.generation += 1;
+            root.root_resource_version = format!("rebase-{index}");
+            root.status.observed_generation = Some(root.generation);
+            rebased = reduce(rebased, EventV0::RootRefreshed { root })
+                .unwrap()
+                .state;
+        }
+        let mut over_bound = rebased.root.clone();
+        over_bound.generation += 1;
+        over_bound.root_resource_version = "rebase-over-bound".into();
+        assert!(matches!(
+            reduce(rebased, EventV0::RootRefreshed { root: over_bound })
+                .unwrap()
+                .commands
+                .as_slice(),
+            [CommandV0::Hold { .. }]
+        ));
+    }
+
+    #[test]
+    fn deletion_absence_requires_prepared_claim_and_changed_identity_holds() {
+        let mut machine = state();
+        let inventory = InventoryEntry {
+            identity: ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "demo".into(),
+                name: "old".into(),
+            },
+            logical_id: "old".into(),
+            uid: "old-uid".into(),
+            resource_version: "old-rv".into(),
+            bundle_digest: machine.journal.root.bundle_digest.clone(),
+        };
+        machine.journal.state.inventory.push(inventory.clone());
+        machine.journal.state.deletion = Some(DeletionTransaction {
+            id: "d".repeat(64),
+            deletion_start_generation: 7,
+        });
+        machine.phase = PhaseV0::DeletionObservationPending;
+        deletion_prepare(&mut machine, &mut Vec::new()).unwrap();
+        machine.journal.state.pending_persist = None;
+        machine.phase = PhaseV0::DeletionObservationPending;
+
+        let absent = reduce(
+            machine.clone(),
+            EventV0::DeletionRevalidated {
+                observed_inventory: vec![],
+                observed_automation_runs: vec![],
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            absent.commands.as_slice(),
+            [CommandV0::Persist {
+                operation: PersistOperation {
+                    purpose: PersistPurpose::DeletionMutationResult,
+                    ..
+                },
+                ..
+            }]
+        ));
+        assert!(absent.state.journal.state.inventory.is_empty());
+
+        let mut replacement = inventory;
+        replacement.uid = "replacement-uid".into();
+        let held = reduce(
+            machine,
+            EventV0::DeletionRevalidated {
+                observed_inventory: vec![replacement],
+                observed_automation_runs: vec![],
+            },
+        )
+        .unwrap();
+        assert!(matches!(held.commands.as_slice(), [CommandV0::Hold { .. }]));
+    }
+
+    fn root_only_deletion_snapshot(root_finalizer_present: bool) -> RootSnapshotV0 {
+        let root_uid = "root-uid";
+        let linked_state_name = state_name(root_uid).unwrap();
+        RootSnapshotV0 {
+            uid: root_uid.into(),
+            namespace: "demo".into(),
+            generation: 9,
+            bundle_digest: "c".repeat(64),
+            status: WebApplicationStatus {
+                state: Some(StateLink {
+                    root_uid: root_uid.into(),
+                    name: linked_state_name.clone(),
+                    uid: "deleted-state-uid".into(),
+                }),
+                deletion_cleanup_receipt: Some(DeletionCleanupReceipt {
+                    root_uid: root_uid.into(),
+                    deletion_id: "d".repeat(64),
+                    deletion_start_generation: 7,
+                    state_name: linked_state_name.clone(),
+                    state_uid: "deleted-state-uid".into(),
+                    cleanup_token: "e".repeat(64),
+                }),
+                ..WebApplicationStatus::default()
+            },
+            state_name: linked_state_name,
+            state_uid: "deleted-state-uid".into(),
+            state_resource_version: String::new(),
+            root_resource_version: "root-rv-20".into(),
+            root_finalizer_present,
+            state_finalizer_present: false,
+            deleting: true,
+        }
+    }
+
+    #[test]
+    fn root_only_deletion_recovery_is_receipt_bounded_and_process_recreatable() {
+        let machine =
+            MachineStateV0::recover_deleting_root_without_state(root_only_deletion_snapshot(true))
+                .unwrap();
+
+        // A restart before the fresh absence proof reissues only the proof;
+        // it cannot bootstrap or persist a replacement state.
+        let restarted =
+            MachineStateV0::recover_json(&serde_json::to_string(&machine).unwrap()).unwrap();
+        let verify = reduce(restarted, EventV0::Start).unwrap();
+        let (token, preconditions) = match verify.commands.as_slice() {
+            [
+                CommandV0::VerifyOwnedChildrenAbsent {
+                    token,
+                    preconditions,
+                },
+            ] => (token.clone(), preconditions.clone()),
+            commands => panic!("unexpected root-only recovery commands: {commands:?}"),
+        };
+        assert_eq!(preconditions.root_uid, "root-uid");
+        assert_eq!(preconditions.root_resource_version, "root-rv-20");
+        assert_eq!(preconditions.state_uid, "deleted-state-uid");
+        assert!(preconditions.state_resource_version.is_empty());
+
+        let remove = reduce(
+            verify.state,
+            EventV0::OwnedChildrenVerifiedAbsent {
+                token: token.clone(),
+                root_uid: "root-uid".into(),
+                root_generation: 9,
+                root_resource_version: "root-rv-20".into(),
+                state_uid: "deleted-state-uid".into(),
+                state_resource_version: String::new(),
+                cleanup_token: token,
+            },
+        )
+        .unwrap();
+        let remove_token = match remove.commands.as_slice() {
+            [
+                CommandV0::RemoveRootFinalizer {
+                    token,
+                    preconditions,
+                },
+            ] => {
+                assert_eq!(preconditions.root_resource_version, "root-rv-20");
+                token.clone()
+            }
+            commands => panic!("unexpected root-only finalizer commands: {commands:?}"),
+        };
+
+        let prove_root_absent = reduce(
+            remove.state,
+            EventV0::RootFinalizerRemoved {
+                token: remove_token,
+                root_uid: "root-uid".into(),
+                old_root_resource_version: "root-rv-20".into(),
+                new_root_resource_version: "root-rv-21".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            prove_root_absent.commands.as_slice(),
+            [CommandV0::VerifyRootUidAbsent { root_uid, .. }] if root_uid == "root-uid"
+        ));
+
+        // A process recreated after the finalizer write must never write it a
+        // second time. It performs only the exact same-UID absence GET.
+        let restarted =
+            MachineStateV0::recover_json(&serde_json::to_string(&prove_root_absent.state).unwrap())
+                .unwrap();
+        let prove_again = reduce(restarted, EventV0::Start).unwrap();
+        let absence_token = match prove_again.commands.as_slice() {
+            [
+                CommandV0::VerifyRootUidAbsent {
+                    token, root_uid, ..
+                },
+            ] if root_uid == "root-uid" => token.clone(),
+            commands => panic!("unexpected post-finalizer commands: {commands:?}"),
+        };
+        let terminal = reduce(
+            prove_again.state,
+            EventV0::RootUidVerifiedAbsent {
+                token: absence_token,
+                root_uid: "root-uid".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(terminal.state.phase, PhaseV0::Terminal);
+        assert!(terminal.commands.is_empty());
+    }
+
+    #[test]
+    fn root_only_deletion_recovery_holds_on_children_and_rejects_invalid_authority() {
+        let started = reduce(
+            MachineStateV0::recover_deleting_root_without_state(root_only_deletion_snapshot(true))
+                .unwrap(),
+            EventV0::Start,
+        )
+        .unwrap();
+        let token = match &started.commands[0] {
+            CommandV0::VerifyOwnedChildrenAbsent { token, .. } => token.clone(),
+            _ => panic!(),
+        };
+        let held = reduce(
+            started.state,
+            EventV0::OwnedChildrenVerificationFailed {
+                token,
+                reason: "owned child remains present".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(held.commands.as_slice(), [CommandV0::Hold { .. }]));
+
+        let mut nondeleting = root_only_deletion_snapshot(true);
+        nondeleting.deleting = false;
+        assert!(MachineStateV0::recover_deleting_root_without_state(nondeleting).is_err());
+
+        let mut replacement = root_only_deletion_snapshot(true);
+        replacement.uid = "replacement-uid".into();
+        assert!(MachineStateV0::recover_deleting_root_without_state(replacement).is_err());
+
+        let mut mismatched = root_only_deletion_snapshot(true);
+        mismatched
+            .status
+            .deletion_cleanup_receipt
+            .as_mut()
+            .unwrap()
+            .state_uid = "different-state-uid".into();
+        assert!(MachineStateV0::recover_deleting_root_without_state(mismatched).is_err());
+    }
+
+    #[test]
+    fn root_only_deletion_recovery_has_a_strict_event_allowlist() {
+        let started = reduce(
+            MachineStateV0::recover_deleting_root_without_state(root_only_deletion_snapshot(true))
+                .unwrap(),
+            EventV0::Start,
+        )
+        .unwrap();
+        let disallowed = [
+            EventV0::BeginDeletion,
+            EventV0::InformersReady,
+            EventV0::Persisted {
+                token: "persist".into(),
+                old_state_resource_version: String::new(),
+                new_state_resource_version: "forged".into(),
+                state_uid: "deleted-state-uid".into(),
+            },
+            EventV0::MutationFailed {
+                attempt_token: "attempt".into(),
+                transaction_id: "transaction".into(),
+                reason: "forged".into(),
+            },
+            EventV0::StateFinalizerRemoved {
+                token: "state-finalizer".into(),
+                state_uid: "deleted-state-uid".into(),
+                old_state_resource_version: String::new(),
+                new_state_resource_version: "forged".into(),
+            },
+        ];
+        for event in disallowed {
+            let rejected = reduce(started.state.clone(), event).unwrap();
+            assert!(matches!(
+                rejected.commands.as_slice(),
+                [CommandV0::Hold { .. }]
+            ));
+        }
+
+        let duplicate_start = reduce(started.state, EventV0::Start).unwrap();
+        assert!(matches!(
+            duplicate_start.commands.as_slice(),
+            [CommandV0::IgnoredStale { .. }]
+        ));
+    }
+
+    #[test]
+    fn root_only_refresh_reissues_only_under_unchanged_deletion_authority() {
+        let started = reduce(
+            MachineStateV0::recover_deleting_root_without_state(root_only_deletion_snapshot(true))
+                .unwrap(),
+            EventV0::Start,
+        )
+        .unwrap();
+        let mut refreshed_root = started.state.root.clone();
+        refreshed_root.generation += 1;
+        refreshed_root.root_resource_version = "root-rv-21".into();
+        refreshed_root.bundle_digest = "f".repeat(64);
+        let refreshed = reduce(
+            started.state.clone(),
+            EventV0::RootRefreshed {
+                root: refreshed_root,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            refreshed.commands.as_slice(),
+            [CommandV0::VerifyOwnedChildrenAbsent { preconditions, .. }]
+                if preconditions.root_generation == 10
+                    && preconditions.root_resource_version == "root-rv-21"
+        ));
+
+        let mut missing_finalizer = started.state.root.clone();
+        missing_finalizer.root_resource_version = "root-rv-22".into();
+        missing_finalizer.root_finalizer_present = false;
+        assert!(matches!(
+            reduce(
+                started.state.clone(),
+                EventV0::RootRefreshed {
+                    root: missing_finalizer
+                }
+            )
+            .unwrap()
+            .commands
+            .as_slice(),
+            [CommandV0::Hold { .. }]
+        ));
+
+        let mut changed_receipt = started.state.root.clone();
+        changed_receipt.root_resource_version = "root-rv-23".into();
+        changed_receipt
+            .status
+            .deletion_cleanup_receipt
+            .as_mut()
+            .unwrap()
+            .cleanup_token = "a".repeat(64);
+        assert!(matches!(
+            reduce(
+                started.state.clone(),
+                EventV0::RootRefreshed {
+                    root: changed_receipt
+                }
+            )
+            .unwrap()
+            .commands
+            .as_slice(),
+            [CommandV0::Hold { .. }]
+        ));
+
+        let mut nondeleting = started.state.root.clone();
+        nondeleting.root_resource_version = "root-rv-24".into();
+        nondeleting.deleting = false;
+        assert!(matches!(
+            reduce(started.state, EventV0::RootRefreshed { root: nondeleting })
+                .unwrap()
+                .commands
+                .as_slice(),
+            [CommandV0::Hold { .. }]
+        ));
     }
 }

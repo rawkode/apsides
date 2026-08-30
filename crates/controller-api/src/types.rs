@@ -23,6 +23,10 @@ pub const MAX_MESSAGE_BYTES: usize = 1_024;
 pub const MAX_IDENTIFIER_BYTES: usize = 253;
 pub const MAX_DIGEST_BYTES: usize = 128;
 pub const MAX_LIST_ENTRIES: usize = 1_024;
+/// A root refresh may rebase one acknowledgement closure only this many
+/// times.  The bound keeps an unstable root from retaining an old effect
+/// acknowledgement indefinitely.
+pub const MAX_CLOSURE_REBASES: u8 = 4;
 /// The exact Action request frame payload cap in `renderer-protocol`.
 pub const MAX_ACTION_INPUT_CANONICAL_BYTES: usize = 512 * 1024;
 
@@ -188,9 +192,63 @@ pub struct WebApplicationStatus {
     pub cache_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<StateLink>,
+    /// Durable proof that the controller observed all owned children absent
+    /// before removing the internal state finalizer during root deletion.
+    ///
+    /// This intentionally binds the deletion's start generation, rather than
+    /// the current root generation: metadata-only root updates are permitted
+    /// while deletion converges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion_cleanup_receipt: Option<DeletionCleanupReceipt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 6))]
     pub conditions: Vec<RootCondition>,
+}
+
+/// Status-only deletion cleanup receipt.  It is deliberately small and
+/// bounded because it is retained by the authored root after the internal
+/// journal may already have disappeared.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeletionCleanupReceipt {
+    #[schemars(length(min = 1, max = 253))]
+    pub root_uid: String,
+    #[schemars(length(min = 64, max = 64), regex(pattern = "^[0-9a-f]{64}$"))]
+    pub deletion_id: String,
+    pub deletion_start_generation: i64,
+    #[schemars(length(min = 1, max = 63))]
+    pub state_name: String,
+    #[schemars(length(min = 1, max = 253))]
+    pub state_uid: String,
+    #[schemars(length(min = 64, max = 64), regex(pattern = "^[0-9a-f]{64}$"))]
+    pub cleanup_token: String,
+}
+
+impl DeletionCleanupReceipt {
+    /// Validates the durable, status-only deletion receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a receipt is malformed or cannot be correlated
+    /// with its immutable deletion identity.
+    pub fn validate(&self) -> Result<(), SpecValidationError> {
+        non_empty_within(
+            &self.root_uid,
+            "deletionCleanupReceipt.rootUid",
+            MAX_IDENTIFIER_BYTES,
+        )?;
+        raw_sha256(&self.deletion_id, "deletionCleanupReceipt.deletionId")?;
+        if self.deletion_start_generation < 0 {
+            return Err(SpecValidationError::InvalidRootGeneration);
+        }
+        non_empty_within(&self.state_name, "deletionCleanupReceipt.stateName", 63)?;
+        non_empty_within(
+            &self.state_uid,
+            "deletionCleanupReceipt.stateUid",
+            MAX_IDENTIFIER_BYTES,
+        )?;
+        raw_sha256(&self.cleanup_token, "deletionCleanupReceipt.cleanupToken")
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -337,6 +395,11 @@ pub struct StateBody {
     /// cleanup effect may be issued.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion: Option<DeletionTransaction>,
+    /// Persistence-only handoff for an external-effect acknowledgement whose
+    /// original root pins advanced before the acknowledgement facts became
+    /// durable. It deliberately contains no effect payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_advance_closure: Option<GenerationAdvanceClosure>,
     #[serde(default)]
     pub automation: AutomationState,
 }
@@ -375,6 +438,18 @@ impl StateBody {
         }
         if let Some(deletion) = &self.deletion {
             deletion.validate()?;
+        }
+        if let Some(closure) = &self.generation_advance_closure {
+            closure.validate(root_uid)?;
+            if !self
+                .pending_persist
+                .as_ref()
+                .is_some_and(|persist| persist.purpose == PersistPurpose::GenerationAdvanceClosure)
+            {
+                return Err(SpecValidationError::Correlation {
+                    field: "generationAdvanceClosure pending persist purpose",
+                });
+            }
         }
         self.automation.validate()?;
         Ok(())
@@ -450,6 +525,7 @@ pub enum DurablePhase {
     DeletionPrepare,
     DeletionMutationResult,
     DeletionAutomationCleanup,
+    GenerationAdvanceClosure,
 }
 
 /// Why a durable state write is being made.  This is deliberately separate
@@ -468,6 +544,7 @@ pub enum PersistPurpose {
     DeletionPrepare,
     DeletionMutationResult,
     DeletionAutomationCleanup,
+    GenerationAdvanceClosure,
 }
 
 impl PersistPurpose {
@@ -487,6 +564,7 @@ impl PersistPurpose {
             Self::DeletionPrepare => DurablePhase::DeletionPrepare,
             Self::DeletionMutationResult => DurablePhase::DeletionMutationResult,
             Self::DeletionAutomationCleanup => DurablePhase::DeletionAutomationCleanup,
+            Self::GenerationAdvanceClosure => DurablePhase::GenerationAdvanceClosure,
         }
     }
 }
@@ -498,14 +576,104 @@ impl PersistPurpose {
 pub struct DeletionTransaction {
     #[schemars(length(min = 64, max = 64), regex(pattern = "^[0-9a-f]{64}$"))]
     pub id: String,
-    pub root_generation: i64,
+    /// Immutable generation observed when deletion began.  Subsequent
+    /// same-UID root updates must not retarget deletion effects.
+    pub deletion_start_generation: i64,
 }
 
 impl DeletionTransaction {
     fn validate(&self) -> Result<(), SpecValidationError> {
         raw_sha256(&self.id, "deletion.id")?;
-        if self.root_generation < 0 {
+        if self.deletion_start_generation < 0 {
             return Err(SpecValidationError::InvalidRootGeneration);
+        }
+        Ok(())
+    }
+}
+
+/// The accepted-persist class that is being durably rebased across a root
+/// generation advance.  These are exactly the classes whose acknowledged
+/// facts may be retained without reissuing an external effect.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub enum GenerationAdvanceClosurePurpose {
+    MutationResult,
+    AutomationPending,
+    AutomationCompletion,
+    DeletionMutationResult,
+    DeletionAutomationCleanup,
+}
+
+impl GenerationAdvanceClosurePurpose {
+    /// Returns the one durable persistence purpose this closure may preserve.
+    #[must_use]
+    pub const fn persist_purpose(self) -> PersistPurpose {
+        match self {
+            Self::MutationResult => PersistPurpose::MutationResult,
+            Self::AutomationPending => PersistPurpose::AutomationPending,
+            Self::AutomationCompletion => PersistPurpose::AutomationCompletion,
+            Self::DeletionMutationResult => PersistPurpose::DeletionMutationResult,
+            Self::DeletionAutomationCleanup => PersistPurpose::DeletionAutomationCleanup,
+        }
+    }
+}
+
+/// Exact durable proof that acknowledgement facts were accepted under a
+/// previous root snapshot and must be persisted under the current pins.
+///
+/// The closure has no command payload.  It is a persistence-only handoff, so
+/// recovery can never replay the old mutation or automation effect.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GenerationAdvanceClosure {
+    #[schemars(length(min = 1, max = 253))]
+    pub root_uid: String,
+    pub source_generation: i64,
+    #[schemars(length(min = 1, max = 253))]
+    pub source_root_resource_version: String,
+    #[schemars(length(min = 1, max = 253))]
+    pub source_state_uid: String,
+    #[schemars(length(min = 1, max = 253))]
+    pub source_state_resource_version: String,
+    #[schemars(range(min = 0, max = 4))]
+    pub rebase_count: u8,
+    pub purpose: GenerationAdvanceClosurePurpose,
+}
+
+impl GenerationAdvanceClosure {
+    fn validate(&self, root_uid: &str) -> Result<(), SpecValidationError> {
+        non_empty_within(
+            &self.root_uid,
+            "generationAdvanceClosure.rootUid",
+            MAX_IDENTIFIER_BYTES,
+        )?;
+        if self.root_uid != root_uid {
+            return Err(SpecValidationError::Correlation {
+                field: "generationAdvanceClosure root UID",
+            });
+        }
+        if self.source_generation < 0 {
+            return Err(SpecValidationError::InvalidRootGeneration);
+        }
+        for (field, value) in [
+            (
+                "generationAdvanceClosure.sourceRootResourceVersion",
+                self.source_root_resource_version.as_str(),
+            ),
+            (
+                "generationAdvanceClosure.sourceStateUid",
+                self.source_state_uid.as_str(),
+            ),
+            (
+                "generationAdvanceClosure.sourceStateResourceVersion",
+                self.source_state_resource_version.as_str(),
+            ),
+        ] {
+            non_empty_within(value, field, MAX_IDENTIFIER_BYTES)?;
+        }
+        if self.rebase_count > MAX_CLOSURE_REBASES {
+            return Err(SpecValidationError::Correlation {
+                field: "generationAdvanceClosure rebase bound",
+            });
         }
         Ok(())
     }
@@ -989,6 +1157,9 @@ pub struct PruneObservation {
     #[schemars(length(min = 1, max = 253))]
     pub observed_resource_version: String,
     pub observed_generation: i64,
+    /// Exact list/watch/reread barrier which produced this observation.
+    #[schemars(length(min = 1, max = 253))]
+    pub barrier_token: String,
 }
 
 impl PruneCandidate {
@@ -1007,6 +1178,7 @@ impl PruneCandidate {
             if second.observed_generation != self.first_observation.observed_generation
                 || second.observed_resource_version
                     != self.first_observation.observed_resource_version
+                || second.barrier_token == self.first_observation.barrier_token
             {
                 return Err(SpecValidationError::Correlation {
                     field: "pruneCandidate observation correlation",
@@ -1020,6 +1192,7 @@ impl PruneCandidate {
 impl PruneObservation {
     fn validate(&self, field: &'static str) -> Result<(), SpecValidationError> {
         non_empty_within(&self.observed_resource_version, field, MAX_IDENTIFIER_BYTES)?;
+        non_empty_within(&self.barrier_token, field, MAX_IDENTIFIER_BYTES)?;
         if self.observed_generation < 0 {
             return Err(SpecValidationError::InvalidRootGeneration);
         }
@@ -1932,10 +2105,12 @@ mod tests {
             first_observation: PruneObservation {
                 observed_resource_version: "7".into(),
                 observed_generation: 1,
+                barrier_token: "barrier-1".into(),
             },
             second_observation: Some(PruneObservation {
                 observed_resource_version: "7".into(),
                 observed_generation: 1,
+                barrier_token: "barrier-2".into(),
             }),
         });
         assert!(spec.validate().is_ok());
@@ -1996,7 +2171,7 @@ mod tests {
         let mut hostile = serde_json::to_value(&result_spec).unwrap();
         hostile["state"]["deletion"] = serde_json::json!({
             "id": "d".repeat(64),
-            "rootGeneration": -1
+            "deletionStartGeneration": -1
         });
         let hostile: OxideLoopStateSpec = serde_json::from_value(hostile).unwrap();
         assert_eq!(

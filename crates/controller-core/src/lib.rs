@@ -13,5 +13,5 @@ pub use reducer::{
     DesiredObservationV0, EventV0, FrozenInputV0, MachineStateV0, MutationCommandV0,
     PendingAutomationV0, PendingRootStatusV0, PhaseV0, PreconditionsV0, ReconcileError,
     RecoveryProofV0, RootSnapshotV0, RootStatusContinuationV0, RuntimeStateV0, TransitionV0,
-    reduce,
+    automation_source_transition_token, reduce, validate_deleting_root_receipt,
 };

@@ -7,7 +7,16 @@
 //! revalidated bundle store. Deployments that require network isolation must
 //! impose it outside this process (for example, by the container runtime).
 
+#[cfg(unix)]
+use std::os::unix::{
+    ffi::OsStrExt,
+    fs::{FileTypeExt, MetadataExt},
+    net::{UnixListener, UnixStream},
+};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
+    fs::OpenOptions,
     io::{self, Read, Write},
     net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -48,6 +57,8 @@ pub enum WorkerError {
     EvaluatorFailure,
     #[error("renderer evaluator containment cannot be confirmed")]
     ContainmentUncertain,
+    #[error("invalid unix socket path")]
+    InvalidUnixPath,
 }
 
 impl From<io::Error> for WorkerError {
@@ -61,6 +72,8 @@ impl From<io::Error> for WorkerError {
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
     pub bind: SocketAddr,
+    #[cfg(unix)]
+    pub unix_socket: Option<PathBuf>,
     pub bundle_store: PathBuf,
     pub evaluator_binary: PathBuf,
 }
@@ -70,6 +83,8 @@ impl WorkerConfig {
     pub fn new(bind: SocketAddr, bundle_store: PathBuf, evaluator_binary: PathBuf) -> Self {
         Self {
             bind,
+            #[cfg(unix)]
+            unix_socket: None,
             bundle_store,
             evaluator_binary,
         }
@@ -78,8 +93,18 @@ impl WorkerConfig {
 
 /// A one-at-a-time loopback renderer supervisor.
 pub struct Supervisor {
-    listener: TcpListener,
+    listener: Listener,
     config: WorkerConfig,
+    #[cfg(unix)]
+    socket_path: Option<PathBuf>,
+    #[cfg(unix)]
+    socket_identity: Option<UnixSocketIdentity>,
+}
+
+enum Listener {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(UnixListener),
 }
 
 impl Supervisor {
@@ -92,7 +117,35 @@ impl Supervisor {
     pub fn bind(config: WorkerConfig) -> Result<Self, WorkerError> {
         validate_loopback_bind(config.bind)?;
         let listener = TcpListener::bind(config.bind)?;
-        Ok(Self { listener, config })
+        Ok(Self {
+            listener: Listener::Tcp(listener),
+            config,
+            #[cfg(unix)]
+            socket_path: None,
+            #[cfg(unix)]
+            socket_identity: None,
+        })
+    }
+
+    #[cfg(unix)]
+    /// # Errors
+    /// Returns [`WorkerError`] when the path is unsafe, stale ownership cannot be established, or binding fails.
+    pub fn bind_unix(
+        mut config: WorkerConfig,
+        path: impl AsRef<Path>,
+    ) -> Result<Self, WorkerError> {
+        let path = path.as_ref();
+        validate_unix_socket_path(path)?;
+        remove_stale_unix_socket(path)?;
+        let listener = UnixListener::bind(path)?;
+        config.unix_socket = Some(path.to_owned());
+        let identity = snapshot_unix_socket(path)?;
+        Ok(Self {
+            listener: Listener::Unix(listener),
+            config,
+            socket_path: Some(path.to_owned()),
+            socket_identity: Some(identity),
+        })
     }
 
     /// The concrete listener address, including an OS-selected port zero.
@@ -101,7 +154,11 @@ impl Supervisor {
     ///
     /// Returns [`WorkerError::Io`] when the listener address cannot be read.
     pub fn local_addr(&self) -> Result<SocketAddr, WorkerError> {
-        self.listener.local_addr().map_err(Into::into)
+        match &self.listener {
+            Listener::Tcp(listener) => listener.local_addr().map_err(Into::into),
+            #[cfg(unix)]
+            Listener::Unix(_) => Err(WorkerError::Io),
+        }
     }
 
     /// Serve exactly one client connection. A malformed frame, evaluator loss,
@@ -113,10 +170,17 @@ impl Supervisor {
     /// Returns an error for any condition for which continuing would make the
     /// worker's containment or protocol state uncertain.
     pub fn serve_one(&self) -> Result<(), WorkerError> {
-        let (mut stream, peer) = self.listener.accept()?;
-        if peer.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
-            return Err(WorkerError::Protocol);
-        }
+        let mut stream = match &self.listener {
+            Listener::Tcp(listener) => {
+                let (stream, peer) = listener.accept()?;
+                if peer.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
+                    return Err(WorkerError::Protocol);
+                }
+                Transport::Tcp(stream)
+            }
+            #[cfg(unix)]
+            Listener::Unix(listener) => Transport::Unix(listener.accept()?.0),
+        };
         stream.set_nonblocking(true)?;
         let admission_deadline = Instant::now() + MAX_SOCKET_DEADLINE;
         let frame = read_frame(DeadlineStream::new(&mut stream, admission_deadline))
@@ -159,6 +223,16 @@ impl Supervisor {
                 }
             }
         })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        let (Some(path), Some(identity)) = (&self.socket_path, self.socket_identity) else {
+            return;
+        };
+        let _ = quarantine_exact_unix_socket(path, identity, false);
     }
 }
 
@@ -614,19 +688,224 @@ fn remaining(deadline: Instant) -> Result<Duration, WorkerError> {
 /// Applies the remaining absolute request time before every socket operation.
 /// Reconfiguring the timeout on each `Read`/`Write` prevents a drip-feeding
 /// peer from extending its allotted wall-clock duration with partial progress.
+enum Transport {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+impl Read for Transport {
+    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(s) => s.read(b),
+            #[cfg(unix)]
+            Self::Unix(s) => s.read(b),
+        }
+    }
+}
+impl Write for Transport {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(s) => s.write(b),
+            #[cfg(unix)]
+            Self::Unix(s) => s.write(b),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Tcp(s) => s.flush(),
+            #[cfg(unix)]
+            Self::Unix(s) => s.flush(),
+        }
+    }
+}
+impl Transport {
+    fn set_nonblocking(&self, v: bool) -> io::Result<()> {
+        match self {
+            Self::Tcp(s) => s.set_nonblocking(v),
+            #[cfg(unix)]
+            Self::Unix(s) => s.set_nonblocking(v),
+        }
+    }
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        match self {
+            Self::Tcp(s) => s.shutdown(how),
+            #[cfg(unix)]
+            Self::Unix(s) => s.shutdown(how),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UnixSocketIdentity {
+    dev: u64,
+    ino: u64,
+    uid: u32,
+}
+
+#[cfg(unix)]
+fn socket_identity(meta: &std::fs::Metadata) -> Option<UnixSocketIdentity> {
+    (meta.file_type().is_socket() && !meta.file_type().is_symlink()).then_some(UnixSocketIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        uid: meta.uid(),
+    })
+}
+
+#[cfg(unix)]
+fn snapshot_unix_socket(path: &Path) -> Result<UnixSocketIdentity, WorkerError> {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .and_then(|meta| socket_identity(&meta))
+        .ok_or(WorkerError::InvalidUnixPath)
+}
+
+#[cfg(unix)]
+fn is_same_euid_socket(identity: UnixSocketIdentity) -> bool {
+    identity.uid == rustix::process::geteuid().as_raw()
+}
+
+#[cfg(unix)]
+static QUARANTINE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+type StaleSnapshotHook = (
+    std::sync::mpsc::SyncSender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+#[cfg(test)]
+type StaleSnapshotHookSlot = std::sync::OnceLock<std::sync::Mutex<Option<StaleSnapshotHook>>>;
+#[cfg(test)]
+static AFTER_STALE_SNAPSHOT_HOOK: StaleSnapshotHookSlot = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn run_after_stale_snapshot_hook() {
+    let hook = AFTER_STALE_SNAPSHOT_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+    let guard = hook.lock().expect("stale snapshot hook lock");
+    if let Some((ready, continue_bind)) = guard.as_ref() {
+        ready.send(()).expect("stale snapshot hook receiver");
+        continue_bind.recv().expect("stale snapshot hook sender");
+    }
+}
+
+/// Reserve a private same-directory name before moving a stale socket there.
+/// The reservation is deliberately `create_new`: an existing attacker-chosen
+/// name is never reused. The caller owns the replacement of that empty
+/// reservation by `rename`, and only unlinks after a fresh exact identity
+/// check at the quarantine name.
+#[cfg(unix)]
+fn reserve_quarantine_name(path: &Path) -> Result<PathBuf, WorkerError> {
+    let parent = path.parent().ok_or(WorkerError::InvalidUnixPath)?;
+    let stem = path.file_name().ok_or(WorkerError::InvalidUnixPath)?;
+    for _ in 0..32 {
+        let sequence = QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{}.oxideloop-quarantine-{}-{}",
+            stem.to_string_lossy(),
+            std::process::id(),
+            sequence
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(error) if error.kind() != io::ErrorKind::AlreadyExists => {
+                return Err(WorkerError::Io);
+            }
+            Err(_) => {}
+        }
+    }
+    Err(WorkerError::Io)
+}
+
+/// Move an exact socket out of its public name before deleting it. If another
+/// object won the public name before the move, the post-rename identity check
+/// fails and that object is restored when the name remains vacant; otherwise
+/// it stays preserved under the unique quarantine name. In neither case do we
+/// unlink the replacement.
+#[cfg(unix)]
+fn quarantine_exact_unix_socket(
+    path: &Path,
+    expected: UnixSocketIdentity,
+    restore_on_mismatch: bool,
+) -> Result<bool, WorkerError> {
+    let Ok(current) = snapshot_unix_socket(path) else {
+        return Ok(false);
+    };
+    if current != expected {
+        return Ok(false);
+    }
+    #[cfg(test)]
+    run_after_stale_snapshot_hook();
+    let quarantine = reserve_quarantine_name(path)?;
+    if std::fs::rename(path, &quarantine).is_err() {
+        let _ = std::fs::remove_file(&quarantine);
+        return Ok(false);
+    }
+    let quarantined = snapshot_unix_socket(&quarantine).ok();
+    if quarantined == Some(expected) {
+        std::fs::remove_file(&quarantine).map_err(|_| WorkerError::Io)?;
+        return Ok(true);
+    }
+    if restore_on_mismatch && !path.exists() {
+        // If a concurrent creator has already populated `path`, leave the
+        // quarantined replacement intact rather than overwriting or deleting it.
+        let _ = std::fs::rename(&quarantine, path);
+    }
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn remove_stale_unix_socket(path: &Path) -> Result<(), WorkerError> {
+    let identity = match snapshot_unix_socket(path) {
+        Ok(identity) => identity,
+        Err(WorkerError::InvalidUnixPath) if !path.exists() => return Ok(()),
+        Err(_) => return Err(WorkerError::InvalidUnixPath),
+    };
+    if !is_same_euid_socket(identity) {
+        return Err(WorkerError::InvalidUnixPath);
+    }
+    if quarantine_exact_unix_socket(path, identity, true)? {
+        Ok(())
+    } else {
+        Err(WorkerError::InvalidUnixPath)
+    }
+}
+
+#[cfg(unix)]
+fn validate_unix_socket_path(path: &Path) -> Result<(), WorkerError> {
+    if !path.is_absolute()
+        || path.as_os_str().is_empty()
+        || path.as_os_str().as_bytes().contains(&0)
+    {
+        return Err(WorkerError::InvalidUnixPath);
+    }
+    if path.as_os_str().len() > 100 {
+        return Err(WorkerError::InvalidUnixPath);
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && socket_identity(&meta).is_none()
+    {
+        return Err(WorkerError::InvalidUnixPath);
+    }
+    Ok(())
+}
+
 struct DeadlineStream<'a> {
-    stream: &'a mut TcpStream,
+    stream: &'a mut Transport,
     deadline: Instant,
 }
 
 impl<'a> DeadlineStream<'a> {
-    fn new(stream: &'a mut TcpStream, deadline: Instant) -> Self {
+    fn new(stream: &'a mut Transport, deadline: Instant) -> Self {
         Self { stream, deadline }
     }
 
     fn until_ready<T>(
         &mut self,
-        operation: impl FnMut(&mut TcpStream) -> io::Result<T>,
+        operation: impl FnMut(&mut Transport) -> io::Result<T>,
     ) -> io::Result<T> {
         let mut operation = operation;
         loop {
@@ -655,7 +934,7 @@ impl Write for DeadlineStream<'_> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.until_ready(TcpStream::flush)
+        self.until_ready(Transport::flush)
     }
 }
 
@@ -665,4 +944,125 @@ fn timeout_error() -> io::Error {
 
 fn map_protocol_error(_: ProtocolError) -> WorkerError {
     WorkerError::Protocol
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+    use std::{
+        os::unix::{ffi::OsStringExt, fs::FileTypeExt, net::UnixListener},
+        sync::mpsc,
+    };
+
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn config(directory: &Path) -> WorkerConfig {
+        WorkerConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            directory.into(),
+            directory.join("evaluator"),
+        )
+    }
+
+    #[test]
+    fn unix_bind_refuses_malformed_and_non_socket_paths() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        for path in [
+            PathBuf::from("relative.sock"),
+            PathBuf::new(),
+            PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0])),
+            PathBuf::from(format!("/{}", "a".repeat(100))),
+        ] {
+            assert!(matches!(
+                Supervisor::bind_unix(config(directory.path()), path),
+                Err(WorkerError::InvalidUnixPath)
+            ));
+        }
+        for kind in ["regular", "symlink", "directory"] {
+            let path = directory.path().join(kind);
+            match kind {
+                "regular" => std::fs::write(&path, b"regular").unwrap(),
+                "symlink" => std::os::unix::fs::symlink(directory.path(), &path).unwrap(),
+                "directory" => std::fs::create_dir(&path).unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                Supervisor::bind_unix(config(directory.path()), &path),
+                Err(WorkerError::InvalidUnixPath)
+            ));
+        }
+    }
+
+    #[test]
+    fn same_euid_stale_socket_is_replaced_without_a_tcp_listener() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("worker.sock");
+        drop(UnixListener::bind(&path).unwrap());
+        let supervisor = Supervisor::bind_unix(config(directory.path()), &path).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+        assert!(matches!(supervisor.local_addr(), Err(WorkerError::Io)));
+        drop(supervisor);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn foreign_owner_predicate_is_rejected() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
+        let own = rustix::process::geteuid().as_raw();
+        assert!(!is_same_euid_socket(UnixSocketIdentity {
+            dev: 1,
+            ino: 1,
+            uid: own.wrapping_add(1)
+        }));
+    }
+
+    #[test]
+    fn quarantine_mismatch_restores_and_never_deletes_replacement() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("worker.sock");
+        let stale = UnixListener::bind(&path).unwrap();
+        let identity = snapshot_unix_socket(&path).unwrap();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (continue_tx, continue_rx) = mpsc::sync_channel(1);
+        *AFTER_STALE_SNAPSHOT_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap() = Some((ready_tx, continue_rx));
+        let worker_path = path.clone();
+        let worker =
+            thread::spawn(move || quarantine_exact_unix_socket(&worker_path, identity, true));
+        ready_rx.recv().unwrap();
+        drop(stale);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        continue_tx.send(()).unwrap();
+        assert!(!worker.join().unwrap().unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        *AFTER_STALE_SNAPSHOT_HOOK.get().unwrap().lock().unwrap() = None;
+    }
+
+    #[test]
+    fn drop_preserves_a_replacement_socket_inode() {
+        let _test_lock = TEST_LOCK.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("worker.sock");
+        let supervisor = Supervisor::bind_unix(config(directory.path()), &path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let replacement = UnixListener::bind(&path).unwrap();
+        let replacement_inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        drop(supervisor);
+        assert_eq!(
+            std::fs::symlink_metadata(&path).unwrap().ino(),
+            replacement_inode
+        );
+        drop(replacement);
+    }
 }

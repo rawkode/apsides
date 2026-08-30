@@ -671,17 +671,72 @@ spec:
                       cleanup effect may be issued.
                     nullable: true
                     properties:
+                      deletionStartGeneration:
+                        description: |-
+                          Immutable generation observed when deletion began.  Subsequent
+                          same-UID root updates must not retarget deletion effects.
+                        format: int64
+                        type: integer
                       id:
                         maxLength: 64
                         minLength: 64
                         pattern: ^[0-9a-f]{64}$
                         type: string
-                      rootGeneration:
+                    required:
+                    - deletionStartGeneration
+                    - id
+                    type: object
+                  generationAdvanceClosure:
+                    description: |-
+                      Persistence-only handoff for an external-effect acknowledgement whose
+                      original root pins advanced before the acknowledgement facts became
+                      durable. It deliberately contains no effect payload.
+                    nullable: true
+                    properties:
+                      purpose:
+                        description: |-
+                          The accepted-persist class that is being durably rebased across a root
+                          generation advance.  These are exactly the classes whose acknowledged
+                          facts may be retained without reissuing an external effect.
+                        enum:
+                        - MutationResult
+                        - AutomationPending
+                        - AutomationCompletion
+                        - DeletionMutationResult
+                        - DeletionAutomationCleanup
+                        type: string
+                      rebaseCount:
+                        format: uint8
+                        maximum: 4.0
+                        minimum: 0.0
+                        type: integer
+                      rootUid:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      sourceGeneration:
                         format: int64
                         type: integer
+                      sourceRootResourceVersion:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      sourceStateResourceVersion:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      sourceStateUid:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
                     required:
-                    - id
-                    - rootGeneration
+                    - purpose
+                    - rebaseCount
+                    - rootUid
+                    - sourceGeneration
+                    - sourceRootResourceVersion
+                    - sourceStateResourceVersion
+                    - sourceStateUid
                     type: object
                   inventory:
                     items:
@@ -822,6 +877,7 @@ spec:
                         - DeletionPrepare
                         - DeletionMutationResult
                         - DeletionAutomationCleanup
+                        - GenerationAdvanceClosure
                         type: string
                       purpose:
                         description: |-
@@ -840,6 +896,7 @@ spec:
                         - DeletionPrepare
                         - DeletionMutationResult
                         - DeletionAutomationCleanup
+                        - GenerationAdvanceClosure
                         type: string
                       rootGeneration:
                         format: int64
@@ -865,6 +922,11 @@ spec:
                         type: string
                       firstObservation:
                         properties:
+                          barrierToken:
+                            description: Exact list/watch/reread barrier which produced this observation.
+                            maxLength: 253
+                            minLength: 1
+                            type: string
                           observedGeneration:
                             format: int64
                             type: integer
@@ -873,6 +935,7 @@ spec:
                             minLength: 1
                             type: string
                         required:
+                        - barrierToken
                         - observedGeneration
                         - observedResourceVersion
                         type: object
@@ -929,6 +992,11 @@ spec:
                       secondObservation:
                         nullable: true
                         properties:
+                          barrierToken:
+                            description: Exact list/watch/reread barrier which produced this observation.
+                            maxLength: 253
+                            minLength: 1
+                            type: string
                           observedGeneration:
                             format: int64
                             type: integer
@@ -937,6 +1005,7 @@ spec:
                             minLength: 1
                             type: string
                         required:
+                        - barrierToken
                         - observedGeneration
                         - observedResourceVersion
                         type: object
@@ -1083,6 +1152,49 @@ spec:
                   type: object
                 maxItems: 6
                 type: array
+              deletionCleanupReceipt:
+                description: |-
+                  Durable proof that the controller observed all owned children absent
+                  before removing the internal state finalizer during root deletion.
+
+                  This intentionally binds the deletion's start generation, rather than
+                  the current root generation: metadata-only root updates are permitted
+                  while deletion converges.
+                nullable: true
+                properties:
+                  cleanupToken:
+                    maxLength: 64
+                    minLength: 64
+                    pattern: ^[0-9a-f]{64}$
+                    type: string
+                  deletionId:
+                    maxLength: 64
+                    minLength: 64
+                    pattern: ^[0-9a-f]{64}$
+                    type: string
+                  deletionStartGeneration:
+                    format: int64
+                    type: integer
+                  rootUid:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  stateName:
+                    maxLength: 63
+                    minLength: 1
+                    type: string
+                  stateUid:
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                required:
+                - cleanupToken
+                - deletionId
+                - deletionStartGeneration
+                - rootUid
+                - stateName
+                - stateUid
+                type: object
               inputToken:
                 maxLength: 128
                 nullable: true

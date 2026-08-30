@@ -10,6 +10,8 @@ use oxideloop_renderer_protocol::{
     read_frame, write_frame,
 };
 use renderer_client::{RendererClient, RendererClientError};
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
 
 const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -175,4 +177,179 @@ fn slow_drip_response_cannot_extend_the_absolute_client_deadline() {
     ));
     assert!(started.elapsed() < Duration::from_millis(300));
     server.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_roundtrip_response_mismatch_and_disconnect() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("renderer.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let FrameV0::Request(r) = read_frame(&mut s).unwrap() else {
+            panic!()
+        };
+        let response = ResponseV0 {
+            request_id: r.request_id,
+            phase: r.phase,
+            bundle_digest: r.bundle_digest,
+            module_digest: r.module_digest,
+            status: ResponseStatusV0::Recoverable,
+            error_category: Some(ErrorCategoryV0::GuestFailure),
+            payload: vec![],
+        };
+        write_frame(&mut s, &FrameV0::Response(response)).unwrap();
+    });
+    let mut client = RendererClient::new_unix(&path).unwrap();
+    assert!(client.call(&request()).is_ok());
+    server.join().unwrap();
+    std::fs::remove_file(&path).unwrap();
+
+    let mismatch = UnixListener::bind(&path).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = mismatch.accept().unwrap();
+        let FrameV0::Request(mut request) = read_frame(&mut stream).unwrap() else {
+            panic!()
+        };
+        request.request_id.bytes[0] ^= 1;
+        write_frame(
+            &mut stream,
+            &FrameV0::Response(ResponseV0 {
+                request_id: request.request_id,
+                phase: request.phase,
+                bundle_digest: request.bundle_digest,
+                module_digest: request.module_digest,
+                status: ResponseStatusV0::Recoverable,
+                error_category: Some(ErrorCategoryV0::GuestFailure),
+                payload: vec![],
+            }),
+        )
+        .unwrap();
+    });
+    let mut client = RendererClient::new_unix(&path).unwrap();
+    assert!(matches!(
+        client.call(&request()),
+        Err(RendererClientError::RendererLost)
+    ));
+    server.join().unwrap();
+    std::fs::remove_file(&path).unwrap();
+
+    let disconnect = UnixListener::bind(&path).unwrap();
+    let server = thread::spawn(move || drop(disconnect.accept().unwrap().0));
+    let mut client = RendererClient::new_unix(&path).unwrap();
+    assert!(matches!(
+        client.call(&request()),
+        Err(RendererClientError::RendererLost)
+    ));
+    server.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_paths_and_pre_call_replacements_are_rejected() {
+    use std::os::unix::ffi::OsStringExt;
+    let dir = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        RendererClient::new_unix("relative.sock"),
+        Err(RendererClientError::InvalidUnixPath)
+    ));
+    assert!(matches!(
+        RendererClient::new_unix(dir.path()),
+        Err(RendererClientError::InvalidUnixPath)
+    ));
+    assert!(matches!(
+        RendererClient::new_unix(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            vec![b'/', 0]
+        ))),
+        Err(RendererClientError::InvalidUnixPath)
+    ));
+    assert!(matches!(
+        RendererClient::new_unix(format!("/{}", "a".repeat(100))),
+        Err(RendererClientError::InvalidUnixPath)
+    ));
+    for kind in ["regular", "symlink", "directory"] {
+        let path = dir.path().join(format!("{kind}.sock"));
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut client = RendererClient::new_unix(&path).unwrap();
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        match kind {
+            "regular" => std::fs::write(&path, b"not a socket").unwrap(),
+            "symlink" => std::os::unix::fs::symlink(dir.path(), &path).unwrap(),
+            "directory" => std::fs::create_dir(&path).unwrap(),
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            client.call(&request()),
+            Err(RendererClientError::RendererLost)
+        ));
+        if kind == "directory" {
+            std::fs::remove_dir(&path).unwrap();
+        } else {
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+    let trusted_parent = dir.path().join("trusted");
+    let aliased_parent = dir.path().join("aliased");
+    std::fs::create_dir(&trusted_parent).unwrap();
+    std::os::unix::fs::symlink(&trusted_parent, &aliased_parent).unwrap();
+    let socket = trusted_parent.join("renderer.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let mut client = RendererClient::new_unix(aliased_parent.join("renderer.sock")).unwrap();
+    assert!(matches!(
+        client.call(&request()),
+        Err(RendererClientError::RendererLost)
+    ));
+    drop(listener);
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_slow_drip_and_unavailable_connect_are_deadline_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("renderer.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let FrameV0::Request(request) = read_frame(&mut stream).unwrap() else {
+            panic!()
+        };
+        let mut bytes = vec![];
+        write_frame(
+            &mut bytes,
+            &FrameV0::Response(ResponseV0 {
+                request_id: request.request_id,
+                phase: request.phase,
+                bundle_digest: request.bundle_digest,
+                module_digest: request.module_digest,
+                status: ResponseStatusV0::Recoverable,
+                error_category: Some(ErrorCategoryV0::GuestFailure),
+                payload: vec![],
+            }),
+        )
+        .unwrap();
+        for byte in bytes {
+            if stream.write_all(&[byte]).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    });
+    let mut short = request();
+    short.duration_millis = 60;
+    let started = Instant::now();
+    assert!(matches!(
+        RendererClient::new_unix(&path).unwrap().call(&short),
+        Err(RendererClientError::RendererLost)
+    ));
+    assert!(started.elapsed() < Duration::from_millis(300));
+    server.join().unwrap();
+    let missing = dir.path().join("missing.sock");
+    let started = Instant::now();
+    assert!(matches!(
+        RendererClient::new_unix(missing).unwrap().call(&request()),
+        Err(RendererClientError::RendererLost)
+    ));
+    assert!(started.elapsed() < Duration::from_millis(100));
 }

@@ -20,6 +20,7 @@ oxideloop-renderer-abi = { path = "../renderer-abi" }
 oxideloop-renderer-protocol = { path = "../renderer-protocol" }
 renderer-host = { path = "../renderer-host" }
 thiserror = "2"
+rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 serde_json = "1"

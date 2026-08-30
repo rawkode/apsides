@@ -200,6 +200,33 @@ fn descriptor_render_and_action_complete_through_fresh_evaluators() {
     assert!(worker.join().unwrap().is_ok());
 }
 
+#[cfg(unix)]
+#[test]
+fn unix_listener_serves_one_request_and_cleans_its_socket() {
+    let fixture = install_fixture(RENDER_SOURCE);
+    let socket = fixture.store.path().join("renderer.sock");
+    let supervisor = Supervisor::bind_unix(
+        WorkerConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            fixture.store.path().into(),
+            evaluator_binary().into(),
+        ),
+        &socket,
+    )
+    .unwrap();
+    let digest = request(&fixture, PhaseV0::Descriptor, None, String::new(), 1000);
+    let handle = thread::spawn(move || supervisor.serve_one());
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    write_frame(&mut stream, &FrameV0::Request(digest)).unwrap();
+    stream.shutdown(Shutdown::Write).unwrap();
+    assert!(matches!(
+        read_frame(&mut stream).unwrap(),
+        FrameV0::Response(_)
+    ));
+    handle.join().unwrap().unwrap();
+    assert!(!socket.exists());
+}
+
 #[test]
 fn wrong_bundle_module_and_phase_are_opaque_recoverable_outcomes() {
     let fixture = install_fixture(RENDER_SOURCE);
