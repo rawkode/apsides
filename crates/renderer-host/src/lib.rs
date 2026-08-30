@@ -868,7 +868,7 @@ mod tests {
                 "generation": 1,
                 "spec": {}
             },
-            "bundleDigest": "sha256:test-bundle",
+            "bundleDigest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "cacheEpoch": "0",
             "observationToken": "test-token",
             "observations": []
@@ -897,8 +897,13 @@ mod tests {
 
         let action_input = serde_json::json!({
             "abiVersion": "renderer.oxideloop.dev/v0",
+            "bundleDigest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "automationIdentity": "on-ready",
+            "automationVersion": "v1",
+            "actionModuleIdentity": "action.smoke",
+            "actionModuleDigest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "occurrenceId": "occurrence-1",
+            "sourceTransitionId": "transition-1",
             "sourceUid": "source-uid",
             "sourceResourceVersion": "7",
             "eventMetadata": {}
@@ -1017,6 +1022,55 @@ mod tests {
             host.invoke_probe("() => undefined", b"null"),
             RawInvocation::Recoverable(HostError::OutputContract)
         ));
+    }
+
+    #[test]
+    fn source_input_and_output_at_the_exact_configured_caps_are_accepted() {
+        let limits = Limits {
+            max_source_bytes: 512,
+            max_input_bytes: 256,
+            max_output_bytes: 256,
+            ..Limits::default()
+        };
+        let host = RendererHost::new(limits.clone());
+
+        let source_prefix = "() => null/*";
+        let source_suffix = "*/";
+        let exact_source = format!(
+            "{source_prefix}{}{source_suffix}",
+            " ".repeat(limits.max_source_bytes - source_prefix.len() - source_suffix.len())
+        );
+        assert_eq!(exact_source.len(), limits.max_source_bytes);
+        assert_eq!(
+            host.invoke_probe(&exact_source, b"null"),
+            RawInvocation::Completed(b"null".to_vec())
+        );
+
+        let input_prefix = r#"{"data":""#;
+        let input_suffix = r#""}"#;
+        let exact_input = format!(
+            "{input_prefix}{}{input_suffix}",
+            "x".repeat(limits.max_input_bytes - input_prefix.len() - input_suffix.len())
+        );
+        assert_eq!(exact_input.len(), limits.max_input_bytes);
+        assert_eq!(
+            host.invoke_probe("input => input.data", exact_input.as_bytes()),
+            RawInvocation::Completed(
+                format!(
+                    "\"{}\"",
+                    "x".repeat(limits.max_input_bytes - input_prefix.len() - input_suffix.len())
+                )
+                .into_bytes()
+            )
+        );
+
+        let exact_output = format!("() => '{}'", "x".repeat(limits.max_output_bytes - 2));
+        assert_eq!(
+            host.invoke_probe(&exact_output, b"null"),
+            RawInvocation::Completed(
+                format!("\"{}\"", "x".repeat(limits.max_output_bytes - 2)).into_bytes()
+            )
+        );
     }
 
     #[test]

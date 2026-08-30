@@ -238,6 +238,7 @@ fn dependency_probe(args: &[String]) -> Result<(), String> {
         name: "api-service".into(),
         uid: None,
         resource_version: None,
+        observation_token: "test-observation-token".into(),
     }];
     if output.document.dependencies != expected {
         return Err("dependency fixture returned an unexpected graph".into());

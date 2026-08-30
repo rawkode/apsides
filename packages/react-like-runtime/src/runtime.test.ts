@@ -1,5 +1,5 @@
-import { useResource, withHookEnvironment } from "@oxideloop/sdk/hooks";
-import { explicitEmpty, Fragment, jsx, type Element } from "./jsx-runtime.js";
+import { createHookSession, useResource, withHookEnvironment } from "@oxideloop/sdk/hooks";
+import { ExplicitEmpty, explicitEmpty, Fragment, jsx, type Element } from "./jsx-runtime.js";
 import { createRenderer, RenderTreeError } from "./runtime.js";
 
 const element = jsx("Deployment", {
@@ -21,7 +21,7 @@ if (output.resources[0]?.metadata.name !== "api") {
 }
 let outsideRenderRejected = false;
 try {
-  useResource({ apiVersion: "v1", kind: "ConfigMap", name: "settings" });
+  useResource({} as never, { apiVersion: "v1", kind: "ConfigMap", name: "settings" });
 } catch {
   outsideRenderRejected = true;
 }
@@ -31,9 +31,10 @@ if (!outsideRenderRejected) {
 
 const observed = withHookEnvironment(
   {
+    observationToken: "test",
     read: (ref) => ({ ref, value: undefined, present: false }),
   },
-  () => useResource({ apiVersion: "v1", kind: "Service", name: "api" }),
+  (session) => useResource(session, { apiVersion: "v1", kind: "Service", name: "api" }),
 );
 if (observed.present) {
   throw new Error("the tracked hook result must come from the supplied environment");
@@ -52,6 +53,8 @@ for (const unsafe of [
   jsx("Deployment", { kind: "Deployment", metadata: { name: "missing-api-version" } }),
   { type: 7, props: {} } as Element,
   jsx(Fragment, { children: [explicitEmpty(), element] }),
+  jsx("ConfigMap", { apiVersion: "v1", kind: "ConfigMap", metadata: { name: "children" }, children: element }),
+  jsx(ExplicitEmpty, { children: element }),
 ]) {
   let rejected = false;
   try {
@@ -62,4 +65,12 @@ for (const unsafe of [
   if (!rejected) {
     throw new Error("unsafe or ambiguous render trees must fail closed");
   }
+}
+
+const outer = createHookSession({ observationToken: "outer", read: (ref) => ({ ref, value: undefined, present: false }) });
+const inner = createHookSession({ observationToken: "inner", read: (ref) => ({ ref, value: { ...ref, uid: "inner", resourceVersion: "2" } as never, present: true, observation: { uid: "inner", resourceVersion: "2" } }) });
+useResource(outer, { apiVersion: "v1", kind: "ConfigMap", name: "outer" });
+useResource(inner, { apiVersion: "v1", kind: "ConfigMap", name: "inner" });
+if (outer.dependencies[0]?.name !== "outer" || inner.dependencies[0]?.name !== "inner") {
+  throw new Error("nested or concurrent hook sessions must not share dependencies");
 }

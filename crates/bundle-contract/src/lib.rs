@@ -311,6 +311,35 @@ impl BundleStore {
         Self { root }
     }
 
+    /// Reopen a published bundle through this store capability and rescan its
+    /// complete installed file set before returning any executable bytes.
+    ///
+    /// The digest is both the caller's address and the integrity root of the
+    /// install record.  This deliberately does not trust a previous
+    /// [`InstalledBundle`] handle: an evaluator process must independently
+    /// verify the record, manifest, directory shape, and every declared file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError`] when the digest is malformed, the installation
+    /// is absent, or any part of the published directory no longer matches its
+    /// canonical install record.
+    pub fn open_installed(&self, digest: &str) -> Result<InstalledBundle, BundleError> {
+        if !valid_digest(digest) {
+            return Err(BundleError::InvalidContract);
+        }
+        let directory = self
+            .root
+            .open_dir_nofollow(digest)
+            .map_err(|error| map_open_error(&error))?;
+        let record = load_record(&directory)?;
+        if record.bundle_digest != digest {
+            return Err(BundleError::DigestMismatch);
+        }
+        validate_directory_exact(&directory, &record.manifest, true)?;
+        Ok(InstalledBundle::new(directory, record))
+    }
+
     /// Install one directory after validating its complete, exact file set.
     ///
     /// # Errors

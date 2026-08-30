@@ -8,6 +8,47 @@ importers:
 
   .: {}
 
+  packages/bundle-builder:
+    dependencies:
+      '@oxideloop/example-bundle':
+        specifier: workspace:*
+        version: link:../example-bundle
+      '@oxideloop/sdk':
+        specifier: workspace:*
+        version: link:../sdk
+      oxc-transform:
+        specifier: 0.58.0
+        version: 0.58.0
+      rolldown:
+        specifier: 1.0.0-beta.35
+        version: 1.0.0-beta.35(@emnapi/core@1.11.3)(@emnapi/runtime@1.11.3)
+    devDependencies:
+      '@types/node':
+        specifier: 22.15.21
+        version: 22.15.21
+      tsx:
+        specifier: 4.19.2
+        version: 4.19.2
+      typescript:
+        specifier: 5.8.3
+        version: 5.8.3
+
+  packages/example-bundle:
+    dependencies:
+      '@oxideloop/react-like-runtime':
+        specifier: workspace:*
+        version: link:../react-like-runtime
+      '@oxideloop/sdk':
+        specifier: workspace:*
+        version: link:../sdk
+    devDependencies:
+      tsx:
+        specifier: 4.19.2
+        version: 4.19.2
+      typescript:
+        specifier: 5.8.3
+        version: 5.8.3
+
   packages/fixtures:
     dependencies:
       '@oxideloop/react-like-runtime':

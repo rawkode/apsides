@@ -58,6 +58,7 @@ pub enum Dependency {
         name: String,
         uid: Option<String>,
         resource_version: Option<String>,
+        observation_token: String,
     },
     Collection {
         api_version: String,
@@ -65,6 +66,7 @@ pub enum Dependency {
         namespace: String,
         selector: String,
         collection_revision: String,
+        observation_token: String,
     },
 }
 
@@ -89,8 +91,16 @@ pub struct ResourceDeclaration {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AutomationDeclaration {
     pub identity: String,
-    pub source_dependency: String,
-    pub action_module: String,
+    pub version: String,
+    /// The exact observed object that caused this automation. Collections and
+    /// unobserved objects are not valid automation sources.
+    #[ts(type = "Dependency")]
+    pub source_dependency: Dependency,
+    /// The digest-addressed installed bundle that owns this declaration.
+    pub bundle_digest: String,
+    pub action_module_identity: String,
+    pub action_module_digest: String,
+    pub renderer_abi_version: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
@@ -132,8 +142,13 @@ pub struct RenderOutputV0 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ActionInputV0 {
     pub abi_version: String,
+    pub bundle_digest: String,
     pub automation_identity: String,
+    pub automation_version: String,
+    pub action_module_identity: String,
+    pub action_module_digest: String,
     pub occurrence_id: String,
+    pub source_transition_id: String,
     pub source_uid: String,
     pub source_resource_version: String,
     #[ts(type = "JsonValue")]

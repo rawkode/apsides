@@ -101,6 +101,11 @@ fn typescript_declarations() -> String {
     declaration!(ActionOutputV0);
     let _ = output.pop();
     output
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
 }
 
 #[allow(dead_code)]

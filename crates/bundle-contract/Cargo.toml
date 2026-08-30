@@ -19,6 +19,7 @@ thiserror = "2"
 ts-rs = { version = "11", features = ["serde-compat"] }
 
 [dev-dependencies]
+renderer-host = { path = "../renderer-host" }
 tempfile = "3"
 
 [lints]

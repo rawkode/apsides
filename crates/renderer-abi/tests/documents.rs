@@ -1,7 +1,7 @@
 use oxideloop_renderer_abi::{
     AbiError,
     limits::{MAX_RESOURCES, validate_json_limits},
-    parse_validate_action_output, parse_validate_render_output,
+    parse_validate_action_input, parse_validate_action_output, parse_validate_render_output,
 };
 use serde_json::{Value, json};
 
@@ -93,6 +93,7 @@ fn object_dependencies_distinguish_present_and_absent_observations() {
         "name": "api-service",
         "uid": null,
         "resourceVersion": null
+        ,"observationToken": "snapshot-1"
     }]);
     parse_validate_render_output(&absent.to_string()).unwrap();
 
@@ -104,4 +105,61 @@ fn object_dependencies_distinguish_present_and_absent_observations() {
                 .into()
         )
     );
+}
+
+#[test]
+fn automation_and_action_inputs_are_pinned_and_strict() {
+    let mut output: Value = serde_json::from_str(&render_output(&[resource(0)], "apply")).unwrap();
+    output["automations"] = json!([{
+        "identity": "demo.input-changed",
+        "version": "1",
+        "sourceDependency": {
+            "type": "object",
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "namespace": "default",
+            "name": "input",
+            "uid": "input-uid",
+            "resourceVersion": "7"
+            ,"observationToken": "snapshot-1"
+        },
+        "bundleDigest": "a5e0d6e99a2c8512a63f602b31100493013ab284f4dd0bb21d7894e13aa7b9c3",
+        "actionModuleIdentity": "demo.action",
+        "actionModuleDigest": "b5e0d6e99a2c8512a63f602b31100493013ab284f4dd0bb21d7894e13aa7b9c3",
+        "rendererAbiVersion": "renderer.oxideloop.dev/v0"
+    }]);
+    parse_validate_render_output(&output.to_string()).unwrap();
+    output["automations"][0]["rendererAbiVersion"] = json!("renderer.oxideloop.dev/v1");
+    assert!(matches!(
+        parse_validate_render_output(&output.to_string()),
+        Err(AbiError::Contract(_))
+    ));
+    let mut action_input = json!({
+        "abiVersion": "renderer.oxideloop.dev/v0",
+        "bundleDigest": "a5e0d6e99a2c8512a63f602b31100493013ab284f4dd0bb21d7894e13aa7b9c3",
+        "automationIdentity": "demo.input-changed",
+        "automationVersion": "1",
+        "actionModuleIdentity": "demo.action",
+        "actionModuleDigest": "b5e0d6e99a2c8512a63f602b31100493013ab284f4dd0bb21d7894e13aa7b9c3",
+        "occurrenceId": "occ-1",
+        "sourceTransitionId": "transition-1",
+        "sourceUid": "uid-1",
+        "sourceResourceVersion": "3",
+        "eventMetadata": {"reason": "changed"}
+    });
+    parse_validate_action_input(&action_input.to_string()).unwrap();
+    let duplicate = output["automations"][0].clone();
+    output["automations"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate);
+    assert!(matches!(
+        parse_validate_render_output(&output.to_string()),
+        Err(AbiError::Contract(_))
+    ));
+    action_input["bundleDigest"] = json!("sha256:bundle");
+    assert!(matches!(
+        parse_validate_action_input(&action_input.to_string()),
+        Err(AbiError::Contract(_))
+    ));
 }

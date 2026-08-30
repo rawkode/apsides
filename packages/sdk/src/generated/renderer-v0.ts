@@ -8,13 +8,22 @@ export type Observation = { apiVersion: string, kind: string, namespace: string,
 
 export type RenderInputV0 = { abiVersion: string, root: RootProjection, bundleDigest: string, cacheEpoch: string, observationToken: string, observations: Array<Observation>, };
 
-export type Dependency = { "type": "object", apiVersion: string, kind: string, namespace: string, name: string, uid: string | null, resourceVersion: string | null, } | { "type": "collection", apiVersion: string, kind: string, namespace: string, selector: string, collectionRevision: string, };
+export type Dependency = { "type": "object", apiVersion: string, kind: string, namespace: string, name: string, uid: string | null, resourceVersion: string | null, observationToken: string, } | { "type": "collection", apiVersion: string, kind: string, namespace: string, selector: string, collectionRevision: string, observationToken: string, };
 
 export type ReadinessDeclaration = { policy: string, parameters: JsonValue | null, };
 
 export type ResourceDeclaration = { logicalId: string, object: JsonValue, readiness: ReadinessDeclaration | null, };
 
-export type AutomationDeclaration = { identity: string, sourceDependency: string, actionModule: string, };
+export type AutomationDeclaration = { identity: string, version: string,
+/**
+ * The exact observed object that caused this automation. Collections and
+ * unobserved objects are not valid automation sources.
+ */
+sourceDependency: Dependency,
+/**
+ * The digest-addressed installed bundle that owns this declaration.
+ */
+bundleDigest: string, actionModuleIdentity: string, actionModuleDigest: string, rendererAbiVersion: string, };
 
 export type DiagnosticSeverity = "info" | "warning" | "error";
 
@@ -24,7 +33,7 @@ export type RenderDisposition = "apply" | "hold" | "explicitEmpty";
 
 export type RenderOutputV0 = { abiVersion: string, disposition: RenderDisposition, resources: Array<ResourceDeclaration>, dependencies: Array<Dependency>, automations: Array<AutomationDeclaration>, diagnostics: Array<Diagnostic>, };
 
-export type ActionInputV0 = { abiVersion: string, automationIdentity: string, occurrenceId: string, sourceUid: string, sourceResourceVersion: string, eventMetadata: JsonValue, };
+export type ActionInputV0 = { abiVersion: string, bundleDigest: string, automationIdentity: string, automationVersion: string, actionModuleIdentity: string, actionModuleDigest: string, occurrenceId: string, sourceTransitionId: string, sourceUid: string, sourceResourceVersion: string, eventMetadata: JsonValue, };
 
 export type ActionDeclaration = { logicalId: string, kind: string, specification: JsonValue, };
 

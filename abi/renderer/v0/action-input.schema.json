@@ -5,7 +5,19 @@
     "abiVersion": {
       "type": "string"
     },
+    "actionModuleDigest": {
+      "type": "string"
+    },
+    "actionModuleIdentity": {
+      "type": "string"
+    },
     "automationIdentity": {
+      "type": "string"
+    },
+    "automationVersion": {
+      "type": "string"
+    },
+    "bundleDigest": {
       "type": "string"
     },
     "eventMetadata": true,
@@ -15,14 +27,22 @@
     "sourceResourceVersion": {
       "type": "string"
     },
+    "sourceTransitionId": {
+      "type": "string"
+    },
     "sourceUid": {
       "type": "string"
     }
   },
   "required": [
     "abiVersion",
+    "bundleDigest",
     "automationIdentity",
+    "automationVersion",
+    "actionModuleIdentity",
+    "actionModuleDigest",
     "occurrenceId",
+    "sourceTransitionId",
     "sourceUid",
     "sourceResourceVersion",
     "eventMetadata"

@@ -129,6 +129,7 @@ fn validate_render_input(input: &RenderInputV0) -> Result<(), AbiError> {
     ] {
         require_nonempty(field, value)?;
     }
+    require_raw_digest("bundleDigest", &input.bundle_digest)?;
     Ok(())
 }
 
@@ -179,6 +180,44 @@ fn validate_render_output(output: &RenderOutputV0) -> Result<(), AbiError> {
     for dependency in &output.dependencies {
         validate_dependency(dependency)?;
     }
+    let mut automation_identities = std::collections::HashSet::new();
+    for automation in &output.automations {
+        for (field, value) in [
+            ("automation.identity", automation.identity.as_str()),
+            ("automation.version", automation.version.as_str()),
+            ("automation.bundleDigest", automation.bundle_digest.as_str()),
+            (
+                "automation.actionModuleIdentity",
+                automation.action_module_identity.as_str(),
+            ),
+            (
+                "automation.actionModuleDigest",
+                automation.action_module_digest.as_str(),
+            ),
+            (
+                "automation.rendererAbiVersion",
+                automation.renderer_abi_version.as_str(),
+            ),
+        ] {
+            require_nonempty(field, value)?;
+        }
+        if automation.renderer_abi_version != model::ABI_VERSION_V0 {
+            return Err(AbiError::Contract(
+                "automation.rendererAbiVersion must match the renderer ABI".into(),
+            ));
+        }
+        if !automation_identities.insert(automation.identity.as_str()) {
+            return Err(AbiError::Contract(
+                "automation.identity must be unique within a render output".into(),
+            ));
+        }
+        require_raw_digest("automation.bundleDigest", &automation.bundle_digest)?;
+        require_raw_digest(
+            "automation.actionModuleDigest",
+            &automation.action_module_digest,
+        )?;
+        validate_automation_source_dependency(&automation.source_dependency)?;
+    }
     Ok(())
 }
 
@@ -190,11 +229,13 @@ fn validate_dependency(dependency: &model::Dependency) -> Result<(), AbiError> {
             name,
             uid,
             resource_version,
+            observation_token,
             ..
         } => {
             require_nonempty("dependency.apiVersion", api_version)?;
             require_nonempty("dependency.kind", kind)?;
             require_nonempty("dependency.name", name)?;
+            require_nonempty("dependency.observationToken", observation_token)?;
             match (uid, resource_version) {
                 (Some(uid), Some(resource_version)) => {
                     require_nonempty("dependency.uid", uid)?;
@@ -213,11 +254,13 @@ fn validate_dependency(dependency: &model::Dependency) -> Result<(), AbiError> {
             api_version,
             kind,
             collection_revision,
+            observation_token,
             ..
         } => {
             require_nonempty("dependency.apiVersion", api_version)?;
             require_nonempty("dependency.kind", kind)?;
             require_nonempty("dependency.collectionRevision", collection_revision)?;
+            require_nonempty("dependency.observationToken", observation_token)?;
         }
     }
     Ok(())
@@ -226,8 +269,16 @@ fn validate_dependency(dependency: &model::Dependency) -> Result<(), AbiError> {
 fn validate_action_input(input: &ActionInputV0) -> Result<(), AbiError> {
     validate_version(&input.abi_version)?;
     for (field, value) in [
+        ("bundleDigest", input.bundle_digest.as_str()),
         ("automationIdentity", input.automation_identity.as_str()),
+        ("automationVersion", input.automation_version.as_str()),
+        (
+            "actionModuleIdentity",
+            input.action_module_identity.as_str(),
+        ),
+        ("actionModuleDigest", input.action_module_digest.as_str()),
         ("occurrenceId", input.occurrence_id.as_str()),
+        ("sourceTransitionId", input.source_transition_id.as_str()),
         ("sourceUid", input.source_uid.as_str()),
         (
             "sourceResourceVersion",
@@ -236,6 +287,8 @@ fn validate_action_input(input: &ActionInputV0) -> Result<(), AbiError> {
     ] {
         require_nonempty(field, value)?;
     }
+    require_raw_digest("bundleDigest", &input.bundle_digest)?;
+    require_raw_digest("actionModuleDigest", &input.action_module_digest)?;
     Ok(())
 }
 
@@ -280,6 +333,62 @@ fn require_nonempty(field: &str, value: &str) -> Result<(), AbiError> {
         return Err(AbiError::Contract(format!("{field} cannot be empty")));
     }
     Ok(())
+}
+
+fn require_raw_digest(field: &str, value: &str) -> Result<(), AbiError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(AbiError::Contract(format!(
+            "{field} must be a 64-character lowercase hexadecimal SHA-256 digest"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_automation_source_dependency(dependency: &model::Dependency) -> Result<(), AbiError> {
+    match dependency {
+        model::Dependency::Object {
+            api_version,
+            kind,
+            namespace,
+            name,
+            uid: Some(uid),
+            resource_version: Some(resource_version),
+            observation_token,
+        } => {
+            for (field, value) in [
+                (
+                    "automation.sourceDependency.apiVersion",
+                    api_version.as_str(),
+                ),
+                ("automation.sourceDependency.kind", kind.as_str()),
+                ("automation.sourceDependency.namespace", namespace.as_str()),
+                ("automation.sourceDependency.name", name.as_str()),
+                ("automation.sourceDependency.uid", uid.as_str()),
+                (
+                    "automation.sourceDependency.resourceVersion",
+                    resource_version.as_str(),
+                ),
+                (
+                    "automation.sourceDependency.observationToken",
+                    observation_token.as_str(),
+                ),
+            ] {
+                require_nonempty(field, value)?;
+            }
+            Ok(())
+        }
+        model::Dependency::Object { .. } => Err(AbiError::Contract(
+            "automation.sourceDependency must be an observed object with uid and resourceVersion"
+                .into(),
+        )),
+        model::Dependency::Collection { .. } => Err(AbiError::Contract(
+            "automation.sourceDependency must be an object dependency".into(),
+        )),
+    }
 }
 
 fn validate_kubernetes_object(value: &Value) -> Result<(), AbiError> {

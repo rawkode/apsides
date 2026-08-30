@@ -123,6 +123,39 @@ fn install_uses_canonical_digest_and_verified_handles() {
 }
 
 #[test]
+fn reopening_an_install_rescans_the_record_and_exact_file_set() {
+    let source = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    let manifest = manifest();
+    write_bundle(&source, &manifest);
+    let validated = validated(&manifest);
+    let store = BundleStore::new(storage.path()).unwrap();
+    let installed = store.install_directory(source.path(), &validated).unwrap();
+
+    let reopened = store.open_installed(installed.digest()).unwrap();
+    assert_eq!(reopened.digest(), installed.digest());
+    assert_eq!(
+        reopened
+            .open_phase_module(ExecutionPhaseV0::Render, "render.main")
+            .unwrap()
+            .bytes(),
+        b"render"
+    );
+
+    let directory = storage.path().join(installed.digest());
+    make_writable(&directory, 0o700);
+    fs::write(directory.join("unexpected"), b"no").unwrap();
+    assert_eq!(
+        store.open_installed(installed.digest()).unwrap_err(),
+        BundleError::FileSetMismatch
+    );
+    assert_eq!(
+        store.open_installed(&"not-a-digest".repeat(8)).unwrap_err(),
+        BundleError::InvalidContract
+    );
+}
+
+#[test]
 fn existing_install_is_revalidated_before_reuse() {
     let source = TempDir::new().unwrap();
     let storage = TempDir::new().unwrap();

@@ -14,6 +14,7 @@ import type {
 
 export function hookEnvironment(input: RenderInputV0): HookEnvironment {
   return {
+    observationToken: input.observationToken,
     read: <T extends ResourceObject>(ref: ResourceRef): ResourceHandle<T> => {
       const normalizedRef = {
         ...ref,

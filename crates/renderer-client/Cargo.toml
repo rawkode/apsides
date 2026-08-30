@@ -1,0 +1,18 @@
+[package]
+name = "oxideloop-renderer-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "renderer_client"
+
+[dependencies]
+oxideloop-renderer-protocol = { path = "../renderer-protocol" }
+thiserror = "2"
+
+[lints]
+workspace = true

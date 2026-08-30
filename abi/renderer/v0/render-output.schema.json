@@ -3,20 +3,38 @@
     "AutomationDeclaration": {
       "additionalProperties": false,
       "properties": {
-        "actionModule": {
+        "actionModuleDigest": {
+          "type": "string"
+        },
+        "actionModuleIdentity": {
+          "type": "string"
+        },
+        "bundleDigest": {
+          "description": "The digest-addressed installed bundle that owns this declaration.",
           "type": "string"
         },
         "identity": {
           "type": "string"
         },
+        "rendererAbiVersion": {
+          "type": "string"
+        },
         "sourceDependency": {
+          "$ref": "#/$defs/Dependency",
+          "description": "The exact observed object that caused this automation. Collections and\nunobserved objects are not valid automation sources."
+        },
+        "version": {
           "type": "string"
         }
       },
       "required": [
         "identity",
+        "version",
         "sourceDependency",
-        "actionModule"
+        "bundleDigest",
+        "actionModuleIdentity",
+        "actionModuleDigest",
+        "rendererAbiVersion"
       ],
       "type": "object"
     },
@@ -35,6 +53,9 @@
               "type": "string"
             },
             "namespace": {
+              "type": "string"
+            },
+            "observationToken": {
               "type": "string"
             },
             "resourceVersion": {
@@ -59,7 +80,8 @@
             "apiVersion",
             "kind",
             "namespace",
-            "name"
+            "name",
+            "observationToken"
           ],
           "type": "object"
         },
@@ -78,6 +100,9 @@
             "namespace": {
               "type": "string"
             },
+            "observationToken": {
+              "type": "string"
+            },
             "selector": {
               "type": "string"
             },
@@ -92,7 +117,8 @@
             "kind",
             "namespace",
             "selector",
-            "collectionRevision"
+            "collectionRevision",
+            "observationToken"
           ],
           "type": "object"
         }

@@ -1,8 +1,9 @@
 import ReactReconciler from "react-reconciler";
 import type { ReactNode } from "react";
-import { currentDependencies, resetDependencies } from "@oxideloop/sdk/hooks";
+import { createHookSession } from "@oxideloop/sdk/hooks";
+import type { HookSession } from "@oxideloop/sdk/hooks";
 export interface NeutralNode { readonly type: string; props: Record<string, unknown>; readonly children: NeutralNode[]; }
-export interface RendererTrace { readonly events: readonly string[]; readonly dependencies: ReturnType<typeof currentDependencies>; }
+export interface RendererTrace { readonly events: readonly string[]; readonly dependencies: HookSession["dependencies"]; }
 type Container = { children: NeutralNode[]; events: string[] };
 const hostConfig: any = {
   now: () => 0, supportsMutation: true, supportsPersistence: false, supportsHydration: false,
@@ -23,8 +24,16 @@ const hostConfig: any = {
   getPublicInstance: (n: NeutralNode) => n, detachDeletedInstance: () => {}, prepareScopeUpdate: () => {}, getInstanceFromNode: () => null,
 };
 const reconciler = ReactReconciler(hostConfig);
-export function createOxideLoopRoot(): { render(node: ReactNode): void; snapshot(): NeutralNode[]; trace(): RendererTrace } {
+export function createOxideLoopRoot(session?: HookSession): { render(node: ReactNode): void; snapshot(): NeutralNode[]; trace(): RendererTrace } {
   const container: Container = { children: [], events: [] };
+  let hooks = session ?? newSession();
   const root = reconciler.createContainer(container, 0, null, false, null, "oxideloop", (error: unknown) => { throw error; }, null);
-  return { render(node) { resetDependencies(); (reconciler as any).flushSyncFromReconciler(() => reconciler.updateContainer(node, root, null, () => container.events.push("render"))); }, snapshot: () => container.children, trace: () => ({ events: container.events, dependencies: currentDependencies() }) };
+  return { render(node) { if (!session) hooks = newSession(); (reconciler as any).flushSyncFromReconciler(() => reconciler.updateContainer(node, root, null, () => container.events.push("render"))); }, snapshot: () => container.children, trace: () => ({ events: container.events, dependencies: hooks.dependencies }) };
+}
+
+function newSession(): HookSession {
+  return createHookSession({
+    observationToken: "react-renderer-no-observations",
+    read: () => { throw new Error("React renderer requires an explicit HookSession to read resources"); },
+  });
 }
