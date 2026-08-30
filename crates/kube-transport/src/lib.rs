@@ -22,10 +22,12 @@ use std::sync::{
 
 use futures_util::StreamExt;
 use oxideloop_controller_api::{
-    ApplyOutcome, ApplyResult, AutomationRunSpec, ObjectIdentity, OxideLoopStateSpec,
-    ROOT_FINALIZER, STATE_FINALIZER, StateLink, WebApplicationStatus,
+    ApplyOutcome, ApplyResult, AutomationRunCompletionState, AutomationRunSpec,
+    AutomationRunStatus, ObjectIdentity, OxideLoopStateSpec, ROOT_FINALIZER, STATE_FINALIZER,
+    StateLink, WebApplicationStatus,
 };
 use oxideloop_controller_core::{CommandV0, MutationCommandV0, PreconditionsV0};
+use oxideloop_event_planner::{PlannedEventV0, materialize_event, semantically_equal};
 use oxideloop_mutation_model::{HttpMethod, MutationDecision};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -40,6 +42,7 @@ use kube::{
 pub const ROOT_UID_ANNOTATION: &str = "runtime.oxideloop.dev/root-uid";
 pub const TRANSACTION_ID_ANNOTATION: &str = "runtime.oxideloop.dev/transaction-id";
 pub const COMMAND_ID_ANNOTATION: &str = "runtime.oxideloop.dev/command-id";
+const MAX_BUNDLE_IDENTITY_BYTES: usize = 253;
 
 /// The only namespace-scoped resources this transport will address.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -51,12 +54,18 @@ pub enum ResourceKindV0 {
     /// v0 supports only `ClusterIP` Services (including headless `clusterIP:
     /// None`); external and node-port modes are rejected before any request.
     Service,
+    /// Exactly `events.k8s.io/v1` Events. Event update, patch, and delete are
+    /// intentionally unrepresentable in this transport.
+    Event,
 }
 
 /// Exact namespace-scoped RBAC verbs required by the sealed dispatcher.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RequiredRbacV0 {
     pub resource: ResourceKindV0,
+    /// An exact Kubernetes subresource. This is inventory-only: it is never
+    /// accepted by the generic resource/addressing APIs.
+    pub subresource: Option<&'static str>,
     pub verbs: &'static [&'static str],
 }
 /// Returns the complete, read-only P8B RBAC inventory. No event or update verb is required.
@@ -65,23 +74,43 @@ pub const fn required_rbac_v0() -> &'static [RequiredRbacV0] {
     &[
         RequiredRbacV0 {
             resource: ResourceKindV0::WebApplication,
+            subresource: None,
             verbs: &["get", "list", "watch", "patch"],
         },
         RequiredRbacV0 {
+            resource: ResourceKindV0::WebApplication,
+            subresource: Some("status"),
+            verbs: &["patch"],
+        },
+        RequiredRbacV0 {
             resource: ResourceKindV0::OxideLoopState,
+            subresource: None,
             verbs: &["get", "list", "watch", "create", "patch"],
         },
         RequiredRbacV0 {
             resource: ResourceKindV0::AutomationRun,
+            subresource: None,
             verbs: &["get", "list", "watch", "create", "delete"],
         },
         RequiredRbacV0 {
+            resource: ResourceKindV0::AutomationRun,
+            subresource: Some("status"),
+            verbs: &["patch"],
+        },
+        RequiredRbacV0 {
             resource: ResourceKindV0::ConfigMap,
+            subresource: None,
             verbs: &["get", "list", "watch", "create", "patch", "delete"],
         },
         RequiredRbacV0 {
             resource: ResourceKindV0::Service,
+            subresource: None,
             verbs: &["get", "list", "watch", "create", "patch", "delete"],
+        },
+        RequiredRbacV0 {
+            resource: ResourceKindV0::Event,
+            subresource: None,
+            verbs: &["get", "create"],
         },
     ]
 }
@@ -93,6 +122,7 @@ impl ResourceKindV0 {
             Self::WebApplication => "demo.oxideloop.dev/v1alpha1",
             Self::OxideLoopState | Self::AutomationRun => "runtime.oxideloop.dev/v1alpha1",
             Self::ConfigMap | Self::Service => "v1",
+            Self::Event => "events.k8s.io/v1",
         }
     }
 
@@ -104,6 +134,7 @@ impl ResourceKindV0 {
             Self::AutomationRun => "AutomationRun",
             Self::ConfigMap => "ConfigMap",
             Self::Service => "Service",
+            Self::Event => "Event",
         }
     }
 }
@@ -156,6 +187,37 @@ pub struct ObjectMetaV0 {
     pub owner_uids: Vec<String>,
 }
 
+/// Exact bytes and Kubernetes identity returned by the sealed bundle reader.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConfigMapBinaryDataV0 {
+    pub bytes: Vec<u8>,
+    pub uid: String,
+    pub resource_version: String,
+}
+
+/// The sole Event materialization evidence that reaches controller runtime.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EventMaterializationRefV0 {
+    pub name: String,
+    pub uid: String,
+    pub resource_version: String,
+}
+
+/// Exact durable acknowledgement for one `AutomationRun` status completion.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutomationCompletionAckV0 {
+    pub uid: String,
+    pub old_resource_version: String,
+    pub new_resource_version: String,
+    pub attempts: u16,
+    pub materialization_name: String,
+    pub materialization_uid: String,
+    pub completion: AutomationRunCompletionState,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ObjectV0 {
@@ -195,6 +257,8 @@ pub enum TransportErrorV0 {
     ForeignCollision,
     #[error("the API response was lost; live recovery proof is absent")]
     ResponseLost,
+    #[error("bundle ConfigMap binaryData is invalid")]
+    InvalidBundleData,
     #[error("delete/finalizer response is ambiguous and requires manual recovery")]
     ManualRecoveryHold,
     #[error("watch resource version expired (410); invalidate the cache epoch")]
@@ -343,11 +407,6 @@ impl KubeTransportV0 {
             } => {
                 let fence = match self.reread_fence(address, preconditions).await {
                     Ok(fence) => fence,
-                    Err(TransportErrorV0::Stale(_)) => {
-                        return self
-                            .recover_persist(address, state, preconditions, operation)
-                            .await;
-                    }
                     Err(error) => return Err(error),
                 };
                 let mut desired = state_object(&fence.state, state);
@@ -386,17 +445,6 @@ impl KubeTransportV0 {
             } => {
                 let fence = match self.reread_fence(address, preconditions).await {
                     Ok(fence) => fence,
-                    Err(TransportErrorV0::Stale(_)) => {
-                        return self
-                            .recover_root_status(
-                                address,
-                                token,
-                                root_uid,
-                                old_root_resource_version,
-                                status,
-                            )
-                            .await;
-                    }
                     Err(error) => return Err(error),
                 };
                 if fence.root.metadata.uid != *root_uid
@@ -512,6 +560,7 @@ impl KubeTransportV0 {
                 Ok(CommandOutcomeV0::Event(Box::new(
                     oxideloop_controller_core::EventV0::OwnedChildrenVerifiedAbsent {
                         token: token.clone(),
+                        cleanup_token: token.clone(),
                         root_generation: generation(&fence.root)?,
                         root_uid: fence.root.metadata.uid,
                         root_resource_version: fence.root.metadata.resource_version,
@@ -549,6 +598,38 @@ impl KubeTransportV0 {
                         new_root_resource_version: written.metadata.resource_version,
                     },
                 )))
+            }
+            CommandV0::VerifyRootUidAbsent {
+                token,
+                root_uid,
+                preconditions,
+            } => {
+                if root_uid != &preconditions.root_uid {
+                    return Err(TransportErrorV0::ManualRecoveryHold);
+                }
+                let (root_ref, _) = address.references();
+                match self.reread(&root_ref).await? {
+                    None => Ok(CommandOutcomeV0::Event(Box::new(
+                        oxideloop_controller_core::EventV0::RootUidVerifiedAbsent {
+                            token: token.clone(),
+                            root_uid: root_uid.clone(),
+                        },
+                    ))),
+                    Some(observed) if observed.metadata.uid != *root_uid => {
+                        Ok(CommandOutcomeV0::Event(Box::new(
+                            oxideloop_controller_core::EventV0::RootUidVerifiedAbsent {
+                                token: token.clone(),
+                                root_uid: root_uid.clone(),
+                            },
+                        )))
+                    }
+                    Some(observed) => Ok(CommandOutcomeV0::Event(Box::new(
+                        oxideloop_controller_core::EventV0::RootUidAbsenceFailed {
+                            token: token.clone(),
+                            observed_uid: observed.metadata.uid,
+                        },
+                    ))),
+                }
             }
             CommandV0::RequestDescriptor { .. }
             | CommandV0::RequestRender { .. }
@@ -793,7 +874,14 @@ impl KubeTransportV0 {
             } => self
                 .mutation_delete(&reference, preconditions, &fence.target.expect("fenced"))
                 .await
-                .map(|()| result(command, ApplyOutcome::Deleted, None)),
+                .map(|identity| {
+                    result_identity(
+                        command,
+                        ApplyOutcome::Deleted,
+                        Some(identity.uid),
+                        Some(identity.resource_version),
+                    )
+                }),
             _ => {
                 return Ok(CommandOutcomeV0::Event(Box::new(
                     oxideloop_controller_core::EventV0::MutationFailed {
@@ -1063,13 +1151,13 @@ impl KubeTransportV0 {
         reference: &ObjectRefV0,
         expected: &oxideloop_mutation_model::ObjectIdentity,
         target: &ObjectV0,
-    ) -> Result<(), TransportErrorV0> {
+    ) -> Result<oxideloop_mutation_model::ObjectIdentity, TransportErrorV0> {
         if target.metadata.uid != expected.uid
             || target.metadata.resource_version != expected.resource_version
         {
             return Err(TransportErrorV0::Stale("mutation delete pins"));
         }
-        match reference.resource {
+        let result = match reference.resource {
             ResourceKindV0::ConfigMap => {
                 self.delete_config_map(reference, &expected.uid, &expected.resource_version)
                     .await
@@ -1079,8 +1167,12 @@ impl KubeTransportV0 {
                     .await
             }
             _ => Err(TransportErrorV0::UnsupportedTarget),
-        }
-        .map_err(|_| ambiguous_delete_or_finalizer())
+        };
+        result.map_err(|_| ambiguous_delete_or_finalizer())?;
+        // DELETE returns only a Kubernetes Status object. The exact prepared
+        // identity is the authoritative acknowledgement; never infer it by
+        // rereading an object after deletion.
+        Ok(expected.clone())
     }
 
     async fn execute_automation(
@@ -1138,6 +1230,9 @@ impl KubeTransportV0 {
         namespace: &str,
     ) -> Result<ListV0, TransportErrorV0> {
         validate_namespace(namespace)?;
+        if resource == ResourceKindV0::Event {
+            return Err(TransportErrorV0::UnsupportedTarget);
+        }
         let listed = self
             .api(resource, namespace)
             .list(&ListParams::default())
@@ -1171,12 +1266,232 @@ impl KubeTransportV0 {
         reference: &ObjectRefV0,
     ) -> Result<Option<ObjectV0>, TransportErrorV0> {
         validate_reference(reference)?;
+        if reference.resource == ResourceKindV0::Event {
+            return Err(TransportErrorV0::UnsupportedTarget);
+        }
         self.api(reference.resource, &reference.namespace)
             .get_opt(&reference.name)
             .await
             .map_err(map_kube_error)?
             .map(|object| to_domain(reference.resource, &reference.namespace, object))
             .transpose()
+    }
+
+    /// Materializes one deterministic Event, then creates it or accepts only
+    /// an exact semantic recovery at its planned name. Kubernetes object types
+    /// and generic bodies never cross this purpose-named boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ForeignCollision` for a present malformed or mismatching Event,
+    /// and `ResponseLost` when an ambiguous create cannot be proven by a fresh
+    /// exact-name read.
+    pub async fn create_or_exact_recover_event(
+        &self,
+        plan: &PlannedEventV0,
+        controller_supplied_event_time: &str,
+    ) -> Result<EventMaterializationRefV0, TransportErrorV0> {
+        let value = materialize_event(plan, controller_supplied_event_time)
+            .map_err(|error| TransportErrorV0::Other(error.to_string()))?;
+        let reference = ObjectRefV0 {
+            resource: ResourceKindV0::Event,
+            namespace: plan.metadata.namespace.clone(),
+            name: plan.metadata.name.clone(),
+        };
+        validate_reference(&reference)?;
+        if let Some(observed) = self.reread_event(&reference).await? {
+            recover_event(&value, &observed.value)?;
+            return Ok(event_ref(&observed));
+        }
+        let desired = ObjectV0 {
+            reference: reference.clone(),
+            metadata: ObjectMetaV0 {
+                uid: String::new(),
+                resource_version: String::new(),
+                annotations: BTreeMap::new(),
+                owner_uids: vec![],
+            },
+            value,
+        };
+        match self.create_event(&desired).await {
+            Ok(written) => Ok(event_ref(&written)),
+            Err(error)
+                if may_recover_response_loss(&error) || error == TransportErrorV0::Conflict =>
+            {
+                let observed = self
+                    .reread_event(&reference)
+                    .await?
+                    .ok_or(TransportErrorV0::ResponseLost)?;
+                recover_event(&desired.value, &observed.value)?;
+                Ok(event_ref(&observed))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Reads one bundle key from a same-namespace `ConfigMap`. The controller
+    /// namespace is an explicit capability boundary: a cross-namespace
+    /// request is rejected before any Kubernetes call. Only `binaryData` is
+    /// accepted; text `data`, filesystem fallback, and implicit defaults are
+    /// intentionally unavailable.
+    pub async fn read_bundle_binary_data(
+        &self,
+        controller_namespace: &str,
+        requested_namespace: &str,
+        config_map_name: &str,
+        key: &str,
+        max_bytes: usize,
+    ) -> Result<ConfigMapBinaryDataV0, TransportErrorV0> {
+        validate_namespace(controller_namespace)?;
+        validate_namespace(requested_namespace)?;
+        if controller_namespace != requested_namespace
+            || config_map_name.is_empty()
+            || key.is_empty()
+        {
+            return Err(TransportErrorV0::UnsupportedTarget);
+        }
+        if max_bytes == 0 {
+            return Err(TransportErrorV0::InvalidBundleData);
+        }
+        let reference = ObjectRefV0 {
+            resource: ResourceKindV0::ConfigMap,
+            namespace: requested_namespace.into(),
+            name: config_map_name.into(),
+        };
+        let object = self
+            .reread(&reference)
+            .await?
+            .ok_or(TransportErrorV0::InvalidBundleData)?;
+        let response_metadata = object.value.get("metadata").and_then(Value::as_object);
+        if object.reference != reference
+            || object.value.get("apiVersion").and_then(Value::as_str)
+                != Some(ResourceKindV0::ConfigMap.api_version())
+            || object.value.get("kind").and_then(Value::as_str)
+                != Some(ResourceKindV0::ConfigMap.kind())
+            || response_metadata
+                .and_then(|metadata| metadata.get("name"))
+                .and_then(Value::as_str)
+                != Some(reference.name.as_str())
+            || response_metadata
+                .and_then(|metadata| metadata.get("namespace"))
+                .and_then(Value::as_str)
+                != Some(reference.namespace.as_str())
+            || object.metadata.uid.is_empty()
+            || object.metadata.uid.len() > MAX_BUNDLE_IDENTITY_BYTES
+            || object.metadata.resource_version.is_empty()
+            || object.metadata.resource_version.len() > MAX_BUNDLE_IDENTITY_BYTES
+        {
+            return Err(TransportErrorV0::InvalidBundleData);
+        }
+        let binary_data = object
+            .value
+            .get("binaryData")
+            .and_then(Value::as_object)
+            .ok_or(TransportErrorV0::InvalidBundleData)?;
+        if object
+            .value
+            .get("data")
+            .and_then(Value::as_object)
+            .is_some_and(|data| data.contains_key(key))
+        {
+            return Err(TransportErrorV0::InvalidBundleData);
+        }
+        let encoded = binary_data
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or(TransportErrorV0::InvalidBundleData)?;
+        let bytes = decode_base64(encoded, max_bytes)?;
+        Ok(ConfigMapBinaryDataV0 {
+            bytes,
+            uid: object.metadata.uid,
+            resource_version: object.metadata.resource_version,
+        })
+    }
+
+    /// Persists only an exact, validated `AutomationRun` completion on `/status`.
+    /// It never patches or adopts immutable spec fields.
+    pub async fn persist_automation_run_completion(
+        &self,
+        namespace: &str,
+        name: &str,
+        expected_uid: &str,
+        expected_old_resource_version: &str,
+        expected_spec: &AutomationRunSpec,
+        desired_status: &AutomationRunStatus,
+    ) -> Result<AutomationCompletionAckV0, TransportErrorV0> {
+        expected_spec
+            .validate()
+            .map_err(|_| TransportErrorV0::ForeignCollision)?;
+        desired_status
+            .validate()
+            .map_err(|_| TransportErrorV0::ForeignCollision)?;
+        let reference = ObjectRefV0 {
+            resource: ResourceKindV0::AutomationRun,
+            namespace: namespace.into(),
+            name: name.into(),
+        };
+        let observed = self
+            .reread(&reference)
+            .await?
+            .ok_or(TransportErrorV0::ResponseLost)?;
+        let observed_spec: AutomationRunSpec = serde_json::from_value(
+            observed
+                .value
+                .get("spec")
+                .cloned()
+                .ok_or(TransportErrorV0::ForeignCollision)?,
+        )
+        .map_err(|_| TransportErrorV0::ForeignCollision)?;
+        if observed.metadata.uid != expected_uid {
+            return Err(TransportErrorV0::Stale("automation UID"));
+        }
+        if &observed_spec != expected_spec {
+            return Err(TransportErrorV0::ForeignCollision);
+        }
+        if observed.metadata.resource_version != expected_old_resource_version {
+            return completion_recovery(
+                &observed,
+                expected_uid,
+                expected_old_resource_version,
+                expected_spec,
+                desired_status,
+            );
+        }
+        let desired = ObjectV0 {
+            reference,
+            metadata: observed.metadata.clone(),
+            value: serde_json::json!({"apiVersion":"runtime.oxideloop.dev/v1alpha1","kind":"AutomationRun","metadata":{"name":name,"namespace":namespace},"status":desired_status}),
+        };
+        match self
+            .apply_status(
+                &desired,
+                ResourceKindV0::AutomationRun,
+                expected_old_resource_version,
+            )
+            .await
+        {
+            Ok(written) => completion_recovery(
+                &written,
+                expected_uid,
+                expected_old_resource_version,
+                expected_spec,
+                desired_status,
+            ),
+            Err(error) if may_recover_response_loss(&error) => {
+                let recovered = self
+                    .reread(&desired.reference)
+                    .await?
+                    .ok_or(TransportErrorV0::ResponseLost)?;
+                completion_recovery(
+                    &recovered,
+                    expected_uid,
+                    expected_old_resource_version,
+                    expected_spec,
+                    desired_status,
+                )
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Starts an exact-resourceVersion watch for one allowlisted collection.
@@ -1191,6 +1506,9 @@ impl KubeTransportV0 {
         resource_version: &str,
     ) -> Result<WatchHandleV0, TransportErrorV0> {
         validate_namespace(namespace)?;
+        if resource == ResourceKindV0::Event {
+            return Err(TransportErrorV0::UnsupportedTarget);
+        }
         if resource_version.is_empty() {
             return Err(TransportErrorV0::Stale("watch resourceVersion"));
         }
@@ -1265,6 +1583,25 @@ impl KubeTransportV0 {
     /// Creates only core `Service` objects.
     async fn create_service(&self, object: &ObjectV0) -> Result<ObjectV0, TransportErrorV0> {
         self.create(object, ResourceKindV0::Service).await
+    }
+    /// Creates only an already-planned Event; this remains private so callers
+    /// cannot submit an arbitrary Event body.
+    async fn create_event(&self, object: &ObjectV0) -> Result<ObjectV0, TransportErrorV0> {
+        self.create(object, ResourceKindV0::Event).await
+    }
+    /// Reads Events only for the typed create/recovery proof; callers cannot
+    /// obtain an arbitrary Event body through the generic read surface.
+    async fn reread_event(
+        &self,
+        reference: &ObjectRefV0,
+    ) -> Result<Option<ObjectV0>, TransportErrorV0> {
+        require_reference_resource(reference, ResourceKindV0::Event)?;
+        self.api(ResourceKindV0::Event, &reference.namespace)
+            .get_opt(&reference.name)
+            .await
+            .map_err(map_kube_error)?
+            .map(|object| to_domain(ResourceKindV0::Event, &reference.namespace, object))
+            .transpose()
     }
     /// Server-side applies only a `ConfigMap` with the exact expected RV.
     async fn patch_config_map(
@@ -1435,6 +1772,7 @@ fn api_resource(resource: ResourceKindV0) -> ApiResource {
         ResourceKindV0::AutomationRun => ("runtime.oxideloop.dev", "v1alpha1", "automationruns"),
         ResourceKindV0::ConfigMap => ("", "v1", "configmaps"),
         ResourceKindV0::Service => ("", "v1", "services"),
+        ResourceKindV0::Event => ("events.k8s.io", "v1", "events"),
     };
     ApiResource {
         group: group.into(),
@@ -1454,6 +1792,87 @@ fn validate_namespace(namespace: &str) -> Result<(), TransportErrorV0> {
         Err(TransportErrorV0::UnsupportedTarget)
     } else {
         Ok(())
+    }
+}
+
+fn decode_base64(encoded: &str, max_bytes: usize) -> Result<Vec<u8>, TransportErrorV0> {
+    if encoded.is_empty() || !encoded.len().is_multiple_of(4) {
+        return Err(TransportErrorV0::InvalidBundleData);
+    }
+    let max_encoded = max_bytes
+        .saturating_add(2)
+        .checked_div(3)
+        .and_then(|groups| groups.checked_mul(4))
+        .unwrap_or(usize::MAX);
+    if encoded.len() > max_encoded {
+        return Err(TransportErrorV0::InvalidBundleData);
+    }
+
+    let chunks = encoded.as_bytes().as_chunks::<4>().0;
+    let mut decoded_len = 0usize;
+    for (index, chunk) in chunks.iter().enumerate() {
+        let (_, chunk_len) = decode_base64_quartet(*chunk, index + 1 == chunks.len())?;
+        decoded_len = decoded_len
+            .checked_add(chunk_len)
+            .ok_or(TransportErrorV0::InvalidBundleData)?;
+    }
+    if decoded_len == 0 || decoded_len > max_bytes {
+        return Err(TransportErrorV0::InvalidBundleData);
+    }
+
+    let mut output = Vec::with_capacity(decoded_len);
+    for (index, chunk) in chunks.iter().enumerate() {
+        let ([a, b, c, d], chunk_len) = decode_base64_quartet(*chunk, index + 1 == chunks.len())?;
+        output.push((a << 2) | (b >> 4));
+        if chunk_len >= 2 {
+            output.push((b << 4) | (c >> 2));
+        }
+        if chunk_len == 3 {
+            output.push((c << 6) | d);
+        }
+    }
+    Ok(output)
+}
+
+fn decode_base64_quartet(chunk: [u8; 4], last: bool) -> Result<([u8; 4], usize), TransportErrorV0> {
+    let pad2 = chunk[2] == b'=';
+    let pad3 = chunk[3] == b'=';
+    if chunk[0] == b'=' || chunk[1] == b'=' || pad2 && !pad3 || pad3 && !last {
+        return Err(TransportErrorV0::InvalidBundleData);
+    }
+    let a = decode_base64_char(chunk[0]).ok_or(TransportErrorV0::InvalidBundleData)?;
+    let b = decode_base64_char(chunk[1]).ok_or(TransportErrorV0::InvalidBundleData)?;
+    let c = if pad2 {
+        0
+    } else {
+        decode_base64_char(chunk[2]).ok_or(TransportErrorV0::InvalidBundleData)?
+    };
+    let d = if pad3 {
+        0
+    } else {
+        decode_base64_char(chunk[3]).ok_or(TransportErrorV0::InvalidBundleData)?
+    };
+    if (pad2 && b & 0x0f != 0) || (pad3 && !pad2 && c & 0x03 != 0) {
+        return Err(TransportErrorV0::InvalidBundleData);
+    }
+    let decoded_len = if pad2 {
+        1
+    } else if pad3 {
+        2
+    } else {
+        3
+    };
+    Ok(([a, b, c, d], decoded_len))
+}
+
+const fn decode_base64_char(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
     }
 }
 fn validate_address(address: &RootAddressV0) -> Result<(), TransportErrorV0> {
@@ -1532,6 +1951,72 @@ fn map_kube_error(error: impl std::fmt::Display) -> TransportErrorV0 {
     } else {
         TransportErrorV0::Other(message)
     }
+}
+
+fn recover_event(expected: &Value, observed: &Value) -> Result<(), TransportErrorV0> {
+    match semantically_equal(expected, observed) {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(TransportErrorV0::ForeignCollision),
+    }
+}
+
+fn event_ref(object: &ObjectV0) -> EventMaterializationRefV0 {
+    EventMaterializationRefV0 {
+        name: object.reference.name.clone(),
+        uid: object.metadata.uid.clone(),
+        resource_version: object.metadata.resource_version.clone(),
+    }
+}
+
+fn completion_recovery(
+    object: &ObjectV0,
+    expected_uid: &str,
+    old_rv: &str,
+    expected_spec: &AutomationRunSpec,
+    desired: &AutomationRunStatus,
+) -> Result<AutomationCompletionAckV0, TransportErrorV0> {
+    if object.metadata.uid != expected_uid || object.metadata.resource_version == old_rv {
+        return Err(TransportErrorV0::Stale("automation completion pins"));
+    }
+    let spec: AutomationRunSpec = serde_json::from_value(
+        object
+            .value
+            .get("spec")
+            .cloned()
+            .ok_or(TransportErrorV0::ForeignCollision)?,
+    )
+    .map_err(|_| TransportErrorV0::ForeignCollision)?;
+    if &spec != expected_spec {
+        return Err(TransportErrorV0::ForeignCollision);
+    }
+    let status: AutomationRunStatus = serde_json::from_value(
+        object
+            .value
+            .get("status")
+            .cloned()
+            .ok_or(TransportErrorV0::ForeignCollision)?,
+    )
+    .map_err(|_| TransportErrorV0::ForeignCollision)?;
+    if &status != desired {
+        return Err(TransportErrorV0::ForeignCollision);
+    }
+    let completion = status
+        .completion
+        .ok_or(TransportErrorV0::ForeignCollision)?
+        .state;
+    Ok(AutomationCompletionAckV0 {
+        uid: object.metadata.uid.clone(),
+        old_resource_version: old_rv.into(),
+        new_resource_version: object.metadata.resource_version.clone(),
+        attempts: status.attempts,
+        materialization_name: status
+            .materialization_name
+            .ok_or(TransportErrorV0::ForeignCollision)?,
+        materialization_uid: status
+            .materialization_uid
+            .ok_or(TransportErrorV0::ForeignCollision)?,
+        completion,
+    })
 }
 
 fn inject_resource_version(
@@ -1702,13 +2187,26 @@ fn result(
     outcome: ApplyOutcome,
     object: Option<ObjectV0>,
 ) -> ApplyResult {
+    result_identity(
+        command,
+        outcome,
+        object.as_ref().map(|o| o.metadata.uid.clone()),
+        object.map(|o| o.metadata.resource_version),
+    )
+}
+fn result_identity(
+    command: &MutationCommandV0,
+    outcome: ApplyOutcome,
+    uid: Option<String>,
+    resource_version: Option<String>,
+) -> ApplyResult {
     ApplyResult {
         command_id: command.command_id.clone(),
         attempt_token: command.attempt_token.clone(),
         identity: command.identity.clone(),
         outcome,
-        uid: object.as_ref().map(|o| o.metadata.uid.clone()),
-        resource_version: object.as_ref().map(|o| o.metadata.resource_version.clone()),
+        uid,
+        resource_version,
     }
 }
 fn bootstrap_state(
@@ -2599,31 +3097,125 @@ mod tests {
     }
 
     #[test]
+    fn base64_decode_allocates_exact_bounded_output() {
+        let one = decode_base64("AA==", 1).expect("one byte");
+        assert_eq!(one, vec![0]);
+        assert_eq!(one.capacity(), 1);
+        let three = decode_base64("AAH/", 3).expect("three bytes");
+        assert_eq!(three, vec![0, 1, 255]);
+        assert_eq!(three.capacity(), 3);
+        assert_eq!(
+            decode_base64("AAE=", 1),
+            Err(TransportErrorV0::InvalidBundleData)
+        );
+    }
+
+    #[test]
     fn rbac_inventory_is_exact_and_excludes_event_update_and_cluster_scope() {
         assert_eq!(
             required_rbac_v0(),
             &[
                 RequiredRbacV0 {
                     resource: ResourceKindV0::WebApplication,
+                    subresource: None,
                     verbs: &["get", "list", "watch", "patch"]
                 },
                 RequiredRbacV0 {
+                    resource: ResourceKindV0::WebApplication,
+                    subresource: Some("status"),
+                    verbs: &["patch"]
+                },
+                RequiredRbacV0 {
                     resource: ResourceKindV0::OxideLoopState,
+                    subresource: None,
                     verbs: &["get", "list", "watch", "create", "patch"]
                 },
                 RequiredRbacV0 {
                     resource: ResourceKindV0::AutomationRun,
+                    subresource: None,
                     verbs: &["get", "list", "watch", "create", "delete"]
                 },
                 RequiredRbacV0 {
+                    resource: ResourceKindV0::AutomationRun,
+                    subresource: Some("status"),
+                    verbs: &["patch"]
+                },
+                RequiredRbacV0 {
                     resource: ResourceKindV0::ConfigMap,
+                    subresource: None,
                     verbs: &["get", "list", "watch", "create", "patch", "delete"]
                 },
                 RequiredRbacV0 {
                     resource: ResourceKindV0::Service,
+                    subresource: None,
                     verbs: &["get", "list", "watch", "create", "patch", "delete"]
                 },
+                RequiredRbacV0 {
+                    resource: ResourceKindV0::Event,
+                    subresource: None,
+                    verbs: &["get", "create"]
+                },
             ]
+        );
+        let inventory = required_rbac_v0();
+        assert!(inventory.iter().any(|entry| {
+            entry.resource == ResourceKindV0::WebApplication
+                && entry.subresource == Some("status")
+                && entry.verbs == ["patch"]
+        }));
+        let event = inventory
+            .iter()
+            .find(|entry| entry.resource == ResourceKindV0::Event)
+            .expect("event inventory");
+        assert_eq!(event.verbs, ["get", "create"]);
+        assert!(
+            !event
+                .verbs
+                .iter()
+                .any(|verb| { matches!(*verb, "list" | "watch" | "update" | "patch" | "delete") })
+        );
+    }
+
+    #[test]
+    fn event_target_is_exact_and_recovery_never_adopts_a_foreign_body() {
+        assert_eq!(ResourceKindV0::Event.api_version(), "events.k8s.io/v1");
+        assert_eq!(ResourceKindV0::Event.kind(), "Event");
+        let plan = oxideloop_event_planner::PlannedEventV0 {
+            api_version: "events.k8s.io/v1".into(),
+            kind: "Event".into(),
+            metadata: oxideloop_event_planner::EventMetadata {
+                name: "event".into(),
+                namespace: "ns".into(),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+                owner_references: vec![],
+            },
+            action: "act".into(),
+            reason: "reason".into(),
+            note: "note".into(),
+            event_type: "Normal".into(),
+            reporting_controller: "controller".into(),
+            reporting_instance: "instance".into(),
+            regarding: oxideloop_event_planner::EventRegarding {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                name: "source".into(),
+                uid: "uid".into(),
+                resource_version: "1".into(),
+            },
+        };
+        let expected = materialize_event(&plan, "2026-01-01T00:00:00Z").unwrap();
+        // A caller cannot forge a plan: missing planner-authenticated metadata
+        // is a collision even if the rest of the Event looks plausible.
+        assert_eq!(
+            recover_event(&expected, &expected),
+            Err(TransportErrorV0::ForeignCollision)
+        );
+        let foreign = json!({"apiVersion":"events.k8s.io/v1","kind":"Event"});
+        assert_eq!(
+            recover_event(&expected, &foreign),
+            Err(TransportErrorV0::ForeignCollision)
         );
     }
 
