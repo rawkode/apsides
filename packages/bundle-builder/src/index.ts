@@ -1,44 +1,39 @@
 import { createHash } from "node:crypto";
-import { access, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, lstat, mkdtemp, open, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { transform } from "oxc-transform";
 import { rolldown } from "rolldown";
 
+import { encodeBundleArchive } from "./archive.js";
+
+export { encodeBundleArchive } from "./archive.js";
+export type { BundleArchiveEntries, BundleArchiveEntryName } from "./archive.js";
+
 export interface BundleOptions {
   readonly rootDir: string;
-  /** The installable directory; it will contain only manifest-declared files. */
-  readonly outDir: string;
-  /** Metadata is deliberately kept outside the exact BundleStore file set. */
-  readonly metadataDir?: string;
   readonly compilerVersion?: string;
   readonly bundlerVersion?: string;
 }
 export interface FileIntegrity { readonly path: string; readonly length: number; readonly sha256: string; }
 export interface BundleIntegrityManifestV0 { readonly manifestVersion: string; readonly compiler: { identity: string; version: string }; readonly bundler: { identity: string; version: string }; readonly rendererAbiVersion: string; readonly descriptor: FileIntegrity; readonly renderModules: Array<FileIntegrity & { identity: string }>; readonly actionModules: Array<FileIntegrity & { identity: string }>; readonly sourceMaps: FileIntegrity[]; readonly phaseModules: Array<{ phase: string; moduleIdentity: string }>; }
-export interface BuiltBundle { readonly bundleDigest: string; readonly manifest: BundleIntegrityManifestV0; readonly metadataDir: string; }
+export interface BuiltBundle { readonly bundleDigest: string; readonly manifest: BundleIntegrityManifestV0; readonly archiveBytes: Buffer; }
 
 const ABI = "renderer.oxideloop.dev/v0";
 const RENDER_IDENTITY = "demo.web-application.render";
 const ACTION_IDENTITY = "demo.web-application.input-changed";
 
 /**
- * Build an exact installable file set in an isolated staging directory.
- * `bundleDigest` is raw SHA-256 hex, matching BundleStore's address format.
+ * Build in a private staging directory and return one archive snapshot. Local
+ * execution trusts this process and its private staging; the untrusted
+ * boundary is the archive bytes later consumed by Rust.
  */
 export async function buildBundle(options: BundleOptions): Promise<BuiltBundle> {
-  const outDir = resolve(options.outDir);
   const rootDir = resolve(options.rootDir);
   const workspaceRoot = await findWorkspaceRoot(rootDir);
-  const metadataDir = resolve(options.metadataDir ?? join(dirname(outDir), `.${basename(outDir)}-metadata`));
-  validateBuildPaths(rootDir, outDir, metadataDir);
-  const lockDirs = await acquirePublicationLocks([outDir, metadataDir]);
+  await validateAuthoredSources(rootDir);
   let staging: string | undefined;
-  let metadataPublished = false;
   try {
-    await validateFilesystemAuthority(rootDir, outDir, metadataDir);
-    await assertAbsent(outDir, "output directory");
-    await assertAbsent(metadataDir, "metadata directory");
     staging = await mkdtemp(join(tmpdir(), "oxideloop-bundle-"));
     const actionPath = join(staging, "action.callable.js");
     await bundle(join(rootDir, "action.ts"), actionPath, "OxideLoopAction", "action", workspaceRoot, rootDir);
@@ -77,27 +72,22 @@ export async function buildBundle(options: BundleOptions): Promise<BuiltBundle> 
     };
     const manifestBytes = canonical(manifest);
     const bundleDigest = hash(manifestBytes);
-    await writeMetadata(metadataDir, bundleDigest, manifest, manifestBytes);
-    metadataPublished = true;
-    await mkdir(dirname(outDir), { recursive: true });
-    await rename(staging, outDir);
-    return { bundleDigest, manifest, metadataDir };
-  } catch (error) {
-    if (staging) await rm(staging, { recursive: true, force: true });
-    if (metadataPublished) await rm(metadataDir, { recursive: true, force: true });
-    throw error;
+    const installBytes = canonical({ bundleDigest, manifest });
+    const archiveBytes = encodeBundleArchive({
+      "action.callable.js": await readOwnedStagingFile(actionPath),
+      "bundle-install.json": Buffer.from(installBytes, "utf8"),
+      "descriptor.json": await readOwnedStagingFile(descriptorPath),
+      "integrity-manifest.json": Buffer.from(manifestBytes, "utf8"),
+      "render.callable.js": await readOwnedStagingFile(renderPath),
+    });
+    return { bundleDigest, manifest, archiveBytes: Buffer.from(archiveBytes) };
   } finally {
-    await Promise.all(lockDirs.map((lockDir) => rm(lockDir, { recursive: true, force: true })));
+    if (staging) await rm(staging, { recursive: true, force: true });
   }
 }
 
-async function validateFilesystemAuthority(rootDir: string, outDir: string, metadataDir: string): Promise<void> {
+async function validateAuthoredSources(rootDir: string): Promise<void> {
   const realRoot = await realpath(rootDir);
-  for (const candidate of [outDir, metadataDir]) {
-    const parent = await nearestExistingParent(candidate);
-    if (parent === realRoot || parent.startsWith(`${realRoot}/`)) throw new Error("publication path resolves inside authored rootDir");
-    await rejectSymlinkComponents(candidate);
-  }
   for (const entry of [join(rootDir, "action.ts"), join(rootDir, "render.tsx")]) {
     const info = await lstat(entry);
     if (info.isSymbolicLink()) throw new Error(`authored entrypoint is a symlink: ${entry}`);
@@ -106,54 +96,6 @@ async function validateFilesystemAuthority(rootDir: string, outDir: string, meta
   }
 }
 
-async function nearestExistingParent(path: string): Promise<string> {
-  let candidate = path;
-  while (true) {
-    try { return await realpath(candidate); } catch {
-      const parent = dirname(candidate);
-      if (parent === candidate) throw new Error(`no existing parent for ${path}`);
-      candidate = parent;
-    }
-  }
-}
-
-async function rejectSymlinkComponents(path: string): Promise<void> {
-  let cursor = "/";
-  for (const component of path.split("/").filter(Boolean)) {
-    cursor = join(cursor, component);
-    try { if ((await lstat(cursor)).isSymbolicLink()) throw new Error(`symlink path component: ${cursor}`); } catch (error) {
-      if (error instanceof Error && error.message.startsWith("symlink")) throw error;
-      break;
-    }
-  }
-}
-
-async function acquirePublicationLocks(paths: readonly string[]): Promise<readonly string[]> {
-  const locks = [...new Set(paths.map((path) => join(dirname(path), `.${basename(path)}.publish-lock`)))].sort(compareUtf16);
-  const acquired: string[] = [];
-  try {
-    for (const lock of locks) {
-      await mkdir(dirname(lock), { recursive: true });
-      await mkdir(lock);
-      acquired.push(lock);
-    }
-    return acquired;
-  } catch {
-    await Promise.all(acquired.map((lock) => rm(lock, { recursive: true, force: true })));
-    throw new Error("bundle publication is already owned");
-  }
-}
-
-function validateBuildPaths(rootDir: string, outDir: string, metadataDir: string): void {
-  for (const [label, path] of [["output directory", outDir], ["metadata directory", metadataDir]] as const) {
-    if (path === rootDir || path.startsWith(`${rootDir}/`) || rootDir.startsWith(`${path}/`)) {
-      throw new Error(`${label} must not overlap authored rootDir`);
-    }
-  }
-  if (outDir === metadataDir || outDir.startsWith(`${metadataDir}/`) || metadataDir.startsWith(`${outDir}/`)) {
-    throw new Error("output directory and metadata directory must not overlap");
-  }
-}
 
 async function bundle(
   input: string,
@@ -276,19 +218,19 @@ async function resolveSourceImport(sourceDirectory: string, specifier: string): 
   throw new Error(`cannot resolve authored relative import ${specifier}`);
 }
 
-async function writeMetadata(metadataDir: string, bundleDigest: string, manifest: BundleIntegrityManifestV0, manifestBytes: string): Promise<void> {
-  await assertAbsent(metadataDir, "metadata directory");
-  await mkdir(metadataDir, { recursive: true });
-  await writeFile(join(metadataDir, "integrity-manifest.json"), `${manifestBytes}\n`, "utf8");
-  await writeFile(join(metadataDir, "bundle-install.json"), `${canonical({ bundleDigest, manifest })}\n`, "utf8");
-}
-
-async function assertAbsent(path: string, label: string): Promise<void> {
+async function readOwnedStagingFile(path: string): Promise<Buffer> {
+  const handle = await open(path, "r");
   try {
-    await stat(path);
-    throw new Error(`${label} already exists: ${path}`);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    const before = await handle.stat();
+    if (!before.isFile() || before.size > 128 * 1024) throw new Error(`generated archive source is invalid: ${path}`);
+    const bytes = await handle.readFile();
+    const after = await handle.stat();
+    if (!after.isFile() || before.size !== after.size || bytes.length !== before.size) {
+      throw new Error(`generated archive source changed while reading: ${path}`);
+    }
+    return bytes;
+  } finally {
+    await handle.close();
   }
 }
 

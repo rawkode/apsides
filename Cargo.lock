@@ -1884,6 +1884,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxideloop-bundle-archive"
+version = "0.0.0"
+dependencies = [
+ "oxideloop-bundle-contract",
+ "oxideloop-renderer-abi",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "oxideloop-bundle-contract"
 version = "0.0.0"
 dependencies = [
