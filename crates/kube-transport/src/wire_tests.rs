@@ -16,7 +16,10 @@ use oxideloop_controller_api::{
     AutomationRunCompletion, AutomationRunCompletionState, AutomationRunSpec, AutomationRunStatus,
     ObjectIdentity, ProgramBundleReference, automation_run_name,
 };
-use oxideloop_controller_core::{CommandV0, MutationCommandV0, PreconditionsV0};
+use oxideloop_controller_core::{
+    CommandV0, MutationCommandV0, PreconditionsV0, root_finalizer_command_token,
+    root_only_owned_children_verify_token,
+};
 use oxideloop_event_planner::{
     ObjectIdentity as PlannerObjectIdentity, ObjectRef as PlannerObjectRef, RunCorrelationV0,
     materialize_event, plan_event,
@@ -1037,7 +1040,9 @@ async fn stale_delete_target_is_non_mutating_and_not_response_loss_recovery() {
 #[tokio::test]
 async fn root_only_verify_uses_receipt_state_identity_and_empty_state_rv() {
     let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
-    let token = "c".repeat(64);
+    let token =
+        root_only_owned_children_verify_token(&"d".repeat(64), 3, "root-uid", 3, "9", "state-uid");
+    let receipt_cleanup_token = "d".repeat(64);
     let state_path = format!(
         "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/{state_name}"
     );
@@ -1047,7 +1052,13 @@ async fn root_only_verify_uses_receipt_state_identity_and_empty_state_rv() {
             path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a",
             content_type: None,
             body: None,
-            response: response(root_only_json("9", 3, &state_name, "state-uid", &token)),
+            response: response(root_only_json(
+                "9",
+                3,
+                &state_name,
+                "state-uid",
+                &receipt_cleanup_token,
+            )),
         },
         Expected {
             method: Method::GET,
@@ -1107,7 +1118,7 @@ async fn root_only_verify_uses_receipt_state_identity_and_empty_state_rv() {
                 state_uid: ref actual_state_uid,
                 state_resource_version: ref state_rv,
             } if actual_token == &token
-                && actual_cleanup == &token
+                && actual_cleanup == &receipt_cleanup_token
                 && root_uid == "root-uid"
                 && root_rv == "9"
                 && actual_state_uid == "state-uid"
@@ -1119,11 +1130,12 @@ async fn root_only_verify_uses_receipt_state_identity_and_empty_state_rv() {
 #[tokio::test]
 async fn root_only_remove_rechecks_children_before_exact_finalizer_patch() {
     let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
-    let token = "c".repeat(64);
+    let token = root_finalizer_command_token("root-uid", "9", "state-uid", "");
+    let receipt_cleanup_token = "d".repeat(64);
     let state_path = format!(
         "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/{state_name}"
     );
-    let root = root_only_json("9", 3, &state_name, "state-uid", &token);
+    let root = root_only_json("9", 3, &state_name, "state-uid", &receipt_cleanup_token);
     let patch = json!([
         {"op":"test","path":"/metadata/uid","value":"root-uid"},
         {"op":"test","path":"/metadata/resourceVersion","value":"9"},
@@ -1213,9 +1225,54 @@ async fn root_only_remove_rechecks_children_before_exact_finalizer_patch() {
 }
 
 #[tokio::test]
+async fn root_only_current_command_tokens_are_checked_independently_of_the_receipt() {
+    let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
+    let receipt_cleanup_token = "e".repeat(64);
+    let commands = [
+        CommandV0::VerifyOwnedChildrenAbsent {
+            token: receipt_cleanup_token.clone(),
+            preconditions: root_only_preconditions("9", 3, "state-uid"),
+        },
+        CommandV0::RemoveRootFinalizer {
+            token: receipt_cleanup_token.clone(),
+            preconditions: root_only_preconditions("9", 3, "state-uid"),
+        },
+    ];
+    for command in commands {
+        let (transport, api) = ScriptedApi::transport([Expected {
+            method: Method::GET,
+            path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a",
+            content_type: None,
+            body: None,
+            response: response(root_only_json(
+                "9",
+                3,
+                &state_name,
+                "state-uid",
+                &receipt_cleanup_token,
+            )),
+        }]);
+        assert_eq!(
+            transport
+                .dispatch(
+                    &RootAddressV0 {
+                        namespace: "tenant-a".into(),
+                        name: "app-a".into(),
+                        state_name: state_name.clone(),
+                    },
+                    &command,
+                )
+                .await,
+            Err(TransportErrorV0::ManualRecoveryHold)
+        );
+        api.assert_drained();
+    }
+}
+
+#[tokio::test]
 async fn root_only_remove_holds_for_state_or_child_reappearance_without_patch() {
     let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
-    let token = "c".repeat(64);
+    let token = root_finalizer_command_token("root-uid", "9", "state-uid", "");
     let state_path = format!(
         "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/{state_name}"
     );
@@ -1316,7 +1373,7 @@ async fn root_only_remove_holds_for_state_or_child_reappearance_without_patch() 
 #[tokio::test]
 async fn root_only_validation_failures_never_issue_state_or_patch_requests() {
     let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
-    let token = "c".repeat(64);
+    let token = root_finalizer_command_token("root-uid", "9", "state-uid", "");
     let stale_rv = root_only_json("10", 3, &state_name, "state-uid", &token);
     let mut not_deleting = root_only_json("9", 3, &state_name, "state-uid", &token);
     not_deleting["metadata"]
@@ -1332,7 +1389,6 @@ async fn root_only_validation_failures_never_issue_state_or_patch_requests() {
     receipt_root_mismatch["status"]["deletionCleanupReceipt"]["rootUid"] = json!("other-root");
     let wrong_state_name = root_only_json("9", 3, "wrong-state", "state-uid", &token);
     let wrong_state_uid = root_only_json("9", 3, &state_name, "other-state", &token);
-    let wrong_token = root_only_json("9", 3, &state_name, "state-uid", &"d".repeat(64));
     let mut no_finalizer = root_only_json("9", 3, &state_name, "state-uid", &token);
     no_finalizer["metadata"]["finalizers"] = json!([]);
     let mut wrong_root_kind = root_only_json("9", 3, &state_name, "state-uid", &token);
@@ -1348,7 +1404,6 @@ async fn root_only_validation_failures_never_issue_state_or_patch_requests() {
         receipt_root_mismatch,
         wrong_state_name,
         wrong_state_uid,
-        wrong_token,
         no_finalizer,
         wrong_root_kind,
         wrong_root_name,

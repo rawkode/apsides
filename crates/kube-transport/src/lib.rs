@@ -31,7 +31,10 @@ use oxideloop_controller_api::{
     OxideLoopStateSpec, ROOT_FINALIZER, STATE_FINALIZER, StateLink, WebApplicationStatus,
     validate_automation_run_name,
 };
-use oxideloop_controller_core::{CommandV0, MutationCommandV0, PreconditionsV0};
+use oxideloop_controller_core::{
+    CommandV0, MutationCommandV0, PreconditionsV0, root_finalizer_command_token,
+    root_only_owned_children_verify_token,
+};
 use oxideloop_event_planner::{PlannedEventV0, materialize_event, semantically_equal};
 use oxideloop_mutation_model::{HttpMethod, MutationDecision};
 use serde::{Deserialize, Serialize};
@@ -499,6 +502,15 @@ pub struct KubeTransportV0 {
     client: Client,
     #[cfg(any(test, feature = "test-support"))]
     test_watches: Arc<Mutex<VecDeque<WatchHandleV0>>>,
+}
+
+/// Root-only recovery permits exactly two state-absence follow-up effects.
+/// Their tokens are separate from the durable receipt proof and are checked
+/// against fresh root/state pins before any child list or finalizer write.
+#[derive(Clone, Copy)]
+enum RootOnlyCleanupCommandV0 {
+    VerifyOwnedChildrenAbsent,
+    RemoveRootFinalizer,
 }
 
 /// Opaque watch stream with no Kubernetes stream or event in its public API.
@@ -1846,6 +1858,7 @@ impl KubeTransportV0 {
         address: &RootAddressV0,
         token: &str,
         preconditions: &PreconditionsV0,
+        command: RootOnlyCleanupCommandV0,
     ) -> Result<(ObjectV0, DeletionCleanupReceipt), TransportErrorV0> {
         if preconditions.state_resource_version.is_empty() {
             // This branch is valid only for the deletion sentinel. All values
@@ -1905,14 +1918,35 @@ impl KubeTransportV0 {
                 && link.name == receipt.state_name
                 && link.uid == receipt.state_uid
         });
+        let root_generation = generation(&root)?;
         if receipt.root_uid != root.metadata.uid
             || receipt.state_name != expected_state_name
             || receipt.state_name != address.state_name
             || receipt.state_uid != preconditions.state_uid
-            || receipt.cleanup_token != token
-            || receipt.deletion_start_generation > preconditions.root_generation
+            || receipt.deletion_start_generation > root_generation
             || !state_link_matches
         {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        let expected_token = match command {
+            RootOnlyCleanupCommandV0::VerifyOwnedChildrenAbsent => {
+                root_only_owned_children_verify_token(
+                    &receipt.deletion_id,
+                    receipt.deletion_start_generation,
+                    &root.metadata.uid,
+                    root_generation,
+                    &root.metadata.resource_version,
+                    &receipt.state_uid,
+                )
+            }
+            RootOnlyCleanupCommandV0::RemoveRootFinalizer => root_finalizer_command_token(
+                &root.metadata.uid,
+                &root.metadata.resource_version,
+                &receipt.state_uid,
+                "",
+            ),
+        };
+        if token != expected_token {
             return Err(TransportErrorV0::ManualRecoveryHold);
         }
         let state_ref = ObjectRefV0 {
@@ -1933,7 +1967,12 @@ impl KubeTransportV0 {
         preconditions: &PreconditionsV0,
     ) -> Result<CommandOutcomeV0, TransportErrorV0> {
         let (root, receipt) = self
-            .root_only_cleanup_fence(address, token, preconditions)
+            .root_only_cleanup_fence(
+                address,
+                token,
+                preconditions,
+                RootOnlyCleanupCommandV0::VerifyOwnedChildrenAbsent,
+            )
             .await?;
         for resource in [
             ResourceKindV0::ConfigMap,
@@ -1958,7 +1997,10 @@ impl KubeTransportV0 {
         Ok(CommandOutcomeV0::Event(Box::new(
             oxideloop_controller_core::EventV0::OwnedChildrenVerifiedAbsent {
                 token: token.into(),
-                cleanup_token: token.into(),
+                // The receipt proves cleanup that completed before the
+                // linked state disappeared. It is distinct from this fresh,
+                // deterministic VerifyOwnedChildrenAbsent command token.
+                cleanup_token: receipt.cleanup_token,
                 root_generation: generation(&root)?,
                 root_uid: root.metadata.uid,
                 root_resource_version: root.metadata.resource_version,
@@ -1975,7 +2017,12 @@ impl KubeTransportV0 {
         preconditions: &PreconditionsV0,
     ) -> Result<CommandOutcomeV0, TransportErrorV0> {
         let (root, receipt) = self
-            .root_only_cleanup_fence(address, token, preconditions)
+            .root_only_cleanup_fence(
+                address,
+                token,
+                preconditions,
+                RootOnlyCleanupCommandV0::RemoveRootFinalizer,
+            )
             .await?;
         for resource in [
             ResourceKindV0::ConfigMap,

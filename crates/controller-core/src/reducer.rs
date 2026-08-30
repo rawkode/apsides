@@ -387,6 +387,16 @@ impl MachineStateV0 {
         &self.journal
     }
 
+    /// Whether this machine was reconstructed solely from a deleting root's
+    /// durable cleanup receipt after its linked state object was confirmed
+    /// absent. Such a machine has authority only for root-only deletion
+    /// completion; adapters must discard any normal reconciliation caches
+    /// before replacing an active actor with it.
+    #[must_use]
+    pub const fn is_root_only_deletion_recovery(&self) -> bool {
+        self.root_only_deletion_recovery
+    }
+
     /// Current reducer phase. A deserialized state always reports Recovery.
     #[must_use]
     pub const fn phase(&self) -> PhaseV0 {
@@ -3045,6 +3055,16 @@ fn deletion_advance(
 
 fn owned_children_token(state: &MachineStateV0) -> Option<String> {
     state.journal.state.deletion.as_ref().map(|deletion| {
+        if state.root_only_deletion_recovery {
+            return root_only_owned_children_verify_token(
+                &deletion.id,
+                deletion.deletion_start_generation,
+                &state.root.uid,
+                state.root.generation,
+                &state.root.root_resource_version,
+                &state.root.state_uid,
+            );
+        }
         let finalizer_barrier_stage = if state.root.state_finalizer_present {
             "before-state-finalizer"
         } else {
@@ -3064,6 +3084,32 @@ fn owned_children_token(state: &MachineStateV0) -> Option<String> {
     })
 }
 
+/// Deterministic token for a fresh owned-child proof after a deleting root's
+/// linked state object has already been confirmed absent. The durable receipt
+/// is an input to this command, but its `cleanupToken` is proof of earlier
+/// work and is deliberately not reused as this token.
+#[must_use]
+pub fn root_only_owned_children_verify_token(
+    deletion_id: &str,
+    deletion_start_generation: i64,
+    root_uid: &str,
+    root_generation: i64,
+    root_resource_version: &str,
+    state_uid: &str,
+) -> String {
+    hash(&[
+        "verify-owned-children-absent/v0",
+        "before-root-finalizer",
+        deletion_id,
+        &deletion_start_generation.to_string(),
+        root_uid,
+        &root_generation.to_string(),
+        root_resource_version,
+        state_uid,
+        "",
+    ])
+}
+
 fn owned_children_verified(
     state: &mut MachineStateV0,
     token: &str,
@@ -3075,6 +3121,22 @@ fn owned_children_verified(
     cleanup_token: &str,
     commands: &mut Vec<CommandV0>,
 ) {
+    // A receipt-bound recovery is proving that earlier cleanup still holds;
+    // its receipt token is deliberately not the token of this new
+    // verification command. Normal deletion writes the fresh verification
+    // token into the receipt immediately below, so its acknowledgement still
+    // requires the two values to agree.
+    let receipt_cleanup_token = state
+        .root
+        .status
+        .deletion_cleanup_receipt
+        .as_ref()
+        .map(|receipt| receipt.cleanup_token.as_str());
+    let expected_cleanup_token = if state.root_only_deletion_recovery {
+        receipt_cleanup_token
+    } else {
+        Some(token)
+    };
     if state.phase != PhaseV0::OwnedChildrenVerifyPending
         || owned_children_token(state).as_deref() != Some(token)
         || root_uid != state.root.uid
@@ -3082,7 +3144,7 @@ fn owned_children_verified(
         || root_resource_version != state.root.root_resource_version
         || state_uid != state.root.state_uid
         || state_resource_version != state.root.state_resource_version
-        || cleanup_token != token
+        || expected_cleanup_token != Some(cleanup_token)
     {
         stale(
             commands,
@@ -3138,12 +3200,30 @@ fn state_finalizer_token(state: &MachineStateV0) -> String {
 }
 
 fn root_finalizer_token(state: &MachineStateV0) -> String {
-    hash(&[
-        "root-finalizer/v0",
+    root_finalizer_command_token(
         &state.root.uid,
         &state.root.root_resource_version,
         &state.root.state_uid,
         &state.root.state_resource_version,
+    )
+}
+
+/// Deterministic token for the exact root-finalizer removal command. Adapters
+/// recompute it from freshly reread pins before issuing the irreversible
+/// finalizer write.
+#[must_use]
+pub fn root_finalizer_command_token(
+    root_uid: &str,
+    root_resource_version: &str,
+    state_uid: &str,
+    state_resource_version: &str,
+) -> String {
+    hash(&[
+        "root-finalizer/v0",
+        root_uid,
+        root_resource_version,
+        state_uid,
+        state_resource_version,
     ])
 }
 
@@ -7770,6 +7850,7 @@ mod tests {
         assert_eq!(preconditions.root_resource_version, "root-rv-20");
         assert_eq!(preconditions.state_uid, "deleted-state-uid");
         assert!(preconditions.state_resource_version.is_empty());
+        assert_ne!(token, "e".repeat(64));
 
         let remove = reduce(
             verify.state,
@@ -7780,7 +7861,10 @@ mod tests {
                 root_resource_version: "root-rv-20".into(),
                 state_uid: "deleted-state-uid".into(),
                 state_resource_version: String::new(),
-                cleanup_token: token,
+                // This is proof of the cleanup that occurred before the
+                // linked state disappeared, not this verification command's
+                // freshly exported token.
+                cleanup_token: "e".repeat(64),
             },
         )
         .unwrap();
@@ -7792,6 +7876,7 @@ mod tests {
                 },
             ] => {
                 assert_eq!(preconditions.root_resource_version, "root-rv-20");
+                assert_ne!(token, &"e".repeat(64));
                 token.clone()
             }
             commands => panic!("unexpected root-only finalizer commands: {commands:?}"),

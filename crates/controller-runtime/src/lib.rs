@@ -1555,7 +1555,7 @@ impl RootActorV0 {
                 },
             ) => {
                 token == event_token
-                    && token == cleanup_token
+                    && (self.state.is_root_only_deletion_recovery() || token == cleanup_token)
                     && root_uid == &preconditions.root_uid
                     && root_generation == &preconditions.root_generation
                     && root_resource_version == &preconditions.root_resource_version
@@ -5123,7 +5123,7 @@ mod tests {
                 root_resource_version: verify_pins.root_resource_version,
                 state_uid: verify_pins.state_uid,
                 state_resource_version: verify_pins.state_resource_version,
-                cleanup_token: verify_token,
+                cleanup_token: "e".repeat(64),
             })
             .unwrap();
         let (finalizer_token, old_root_rv) = match actor.next_command().unwrap().unwrap() {

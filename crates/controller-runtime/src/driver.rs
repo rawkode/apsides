@@ -171,10 +171,29 @@ impl ControllerDriverV0 {
 
             // Root observations are coalesced before any new command.  A
             // changed UID is never adopted; the active actor enters Hold.
-            if drain_root_watch(&mut root_watch, active, &self.transport, &self.config).await? {
-                let (watch, fresh) = establish_root_barrier(&self.transport, &self.config).await?;
-                root_watch = watch;
-                refresh_actor_from_machine(active, fresh)?;
+            match drain_root_watch(&mut root_watch, active, &self.transport, &self.config).await? {
+                RootWatchDrainV0::Current => {}
+                RootWatchDrainV0::RootOnlyRecovery => {
+                    clear_root_only_recovery_ephemera(
+                        &mut fixed_point,
+                        &mut automation_watch,
+                        &mut automation_candidates,
+                    );
+                    continue;
+                }
+                RootWatchDrainV0::Invalidated => {
+                    let (watch, fresh) =
+                        establish_root_barrier(&self.transport, &self.config).await?;
+                    root_watch = watch;
+                    if refresh_actor_from_machine(active, fresh)? {
+                        clear_root_only_recovery_ephemera(
+                            &mut fixed_point,
+                            &mut automation_watch,
+                            &mut automation_candidates,
+                        );
+                        continue;
+                    }
+                }
             }
             automation_candidates.retain(|candidate| candidate.matches(active));
             if matches!(active.mode(), ModeV0::Terminal) {
@@ -240,6 +259,7 @@ impl ControllerDriverV0 {
                         &mut root_watch,
                         &mut fixed_point,
                         &mut automation_watch,
+                        &mut automation_candidates,
                         buffered,
                     )
                     .await?;
@@ -266,6 +286,7 @@ impl ControllerDriverV0 {
                         &mut root_watch,
                         &mut fixed_point,
                         &mut automation_watch,
+                        &mut automation_candidates,
                         buffered,
                     )
                     .await?;
@@ -328,6 +349,7 @@ impl ControllerDriverV0 {
                             &mut root_watch,
                             &mut fixed_point,
                             &mut automation_watch,
+                            &mut automation_candidates,
                             buffered,
                         )
                         .await?;
@@ -380,6 +402,7 @@ impl ControllerDriverV0 {
                                 &mut root_watch,
                                 &mut fixed_point,
                                 &mut automation_watch,
+                                &mut automation_candidates,
                                 buffered,
                             )
                             .await?;
@@ -399,6 +422,7 @@ impl ControllerDriverV0 {
                                 &mut root_watch,
                                 &mut fixed_point,
                                 &mut automation_watch,
+                                &mut automation_candidates,
                                 buffered,
                             )
                             .await?;
@@ -441,7 +465,13 @@ impl ControllerDriverV0 {
                             // the owned command.  Preserve its durable state,
                             // discard only stale observation authority, and
                             // let the actor issue the exact rebased command.
-                            active.recover_stale_preflight(fresh.root().clone());
+                            if recover_stale_command_actor(active, &fresh) {
+                                clear_root_only_recovery_ephemera(
+                                    &mut fixed_point,
+                                    &mut automation_watch,
+                                    &mut automation_candidates,
+                                );
+                            }
                             continue;
                         }
                         Err(error) => return Err(error),
@@ -461,6 +491,7 @@ impl ControllerDriverV0 {
                         &mut root_watch,
                         &mut fixed_point,
                         &mut automation_watch,
+                        &mut automation_candidates,
                         buffered,
                     )
                     .await?;
@@ -569,63 +600,80 @@ impl ControllerDriverV0 {
                     // wait for either the exact root or a genuine dependency
                     // transition.  Automation changes are handled on the next
                     // quiescent pass after a root/dependency wakeup.
-                    let port = fixed_point.as_mut();
-                    tokio::select! {
-                        root = root_watch.next_event() => {
-                            match root {
-                                Ok(event) if watch_targets_root(&event, &self.config.root_name) => {
-                                    refresh_actor_from_transport(active, &self.transport, &self.config).await?;
-                                }
-                                Ok(_) => {}
-                                Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
-                                    active.watch_invalidated();
-                                    let (watch, fresh) = establish_root_barrier(&self.transport, &self.config).await?;
-                                    root_watch = watch;
-                                    refresh_actor_from_machine(active, fresh)?;
-                                }
-                                Err(error) => return Err(error.into()),
-                            }
-                        }
-                        change = async {
-                            match port {
-                                Some(port) => port.await_buffered_retained_watch().await,
-                                None => std::future::pending::<Result<
-                                    BufferedRetainedWatchV0,
-                                    RuntimeErrorV0,
-                                >>().await,
-                            }
-                        } => {
-                            match change {
-                                Ok(record) => {
-                                    let port = fixed_point.as_mut().ok_or_else(|| {
-                                        RuntimeErrorV0::Hold("retained port disappeared".into())
-                                    })?;
-                                    match port.apply_buffered_retained_watch(active, record)? {
-                                        RetainedWatchCoordinationV0::ReconcileScheduled
-                                        | RetainedWatchCoordinationV0::DuplicateIgnored
-                                        | RetainedWatchCoordinationV0::RestartRequired => {}
+                    let mut root_only_recovery = false;
+                    {
+                        let port = fixed_point.as_mut();
+                        tokio::select! {
+                            root = root_watch.next_event() => {
+                                match root {
+                                    Ok(event) if watch_targets_root(&event, &self.config.root_name) => {
+                                        root_only_recovery = refresh_actor_from_transport(
+                                            active,
+                                            &self.transport,
+                                            &self.config,
+                                        ).await?;
                                     }
+                                    Ok(_) => {}
+                                    Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
+                                        active.watch_invalidated();
+                                        let (watch, fresh) = establish_root_barrier(
+                                            &self.transport,
+                                            &self.config,
+                                        ).await?;
+                                        root_watch = watch;
+                                        root_only_recovery = refresh_actor_from_machine(active, fresh)?;
+                                    }
+                                    Err(error) => return Err(error.into()),
                                 }
-                                Err(error) => return Err(error),
+                            }
+                            change = async {
+                                match port {
+                                    Some(port) => port.await_buffered_retained_watch().await,
+                                    None => std::future::pending::<Result<
+                                        BufferedRetainedWatchV0,
+                                        RuntimeErrorV0,
+                                    >>().await,
+                                }
+                            } => {
+                                match change {
+                                    Ok(record) => {
+                                        let port = fixed_point.as_mut().ok_or_else(|| {
+                                            RuntimeErrorV0::Hold("retained port disappeared".into())
+                                        })?;
+                                        match port.apply_buffered_retained_watch(active, record)? {
+                                            RetainedWatchCoordinationV0::ReconcileScheduled
+                                            | RetainedWatchCoordinationV0::DuplicateIgnored
+                                            | RetainedWatchCoordinationV0::RestartRequired => {}
+                                        }
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            run = async {
+                                match automation_watch.as_mut() {
+                                    Some(watch) => watch.next_change().await,
+                                    None => std::future::pending::<Result<
+                                        oxideloop_kube_transport::ValidatedAutomationRunV0,
+                                        TransportErrorV0,
+                                    >>().await,
+                                }
+                            } => {
+                                match run {
+                                    Ok(_) => {}
+                                    Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
+                                        automation_watch = None;
+                                    }
+                                    Err(error) => return Err(error.into()),
+                                }
                             }
                         }
-                        run = async {
-                            match automation_watch.as_mut() {
-                                Some(watch) => watch.next_change().await,
-                                None => std::future::pending::<Result<
-                                    oxideloop_kube_transport::ValidatedAutomationRunV0,
-                                    TransportErrorV0,
-                                >>().await,
-                            }
-                        } => {
-                            match run {
-                                Ok(_) => {}
-                                Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
-                                    automation_watch = None;
-                                }
-                                Err(error) => return Err(error.into()),
-                            }
-                        }
+                    }
+                    if root_only_recovery {
+                        clear_root_only_recovery_ephemera(
+                            &mut fixed_point,
+                            &mut automation_watch,
+                            &mut automation_candidates,
+                        );
                     }
                 }
             }
@@ -1107,6 +1155,7 @@ async fn apply_buffered_watches<R>(
     root_watch: &mut WatchHandleV0,
     fixed_point: &mut Option<KubeFixedPointPortV0<'_, R>>,
     automation_watch: &mut Option<AutomationRunObservationBarrierV0>,
+    automation_candidates: &mut VecDeque<QueuedAutomationV0>,
     buffered: BufferedCommandWatchesV0,
 ) -> Result<(), RuntimeErrorV0> {
     // The effect acknowledgement has already reduced when this helper is
@@ -1118,14 +1167,14 @@ async fn apply_buffered_watches<R>(
         actor.hold(fault.clone());
         return Err(RuntimeErrorV0::Hold(fault));
     }
-    match buffered.root {
+    let root_only_recovery = match buffered.root {
         Some(BufferedRootWatchV0::RestartRequired) => {
             actor.watch_invalidated();
             let (watch, fresh) = establish_root_barrier(transport, config).await?;
             *root_watch = watch;
             // LIST→WATCH→GET closes the restart gap before any root authority
             // is reduced. `refresh` rejects a same-name replacement UID.
-            refresh_actor_from_machine(actor, fresh)?;
+            refresh_actor_from_machine(actor, fresh)?
         }
         Some(BufferedRootWatchV0::Observed {
             uid,
@@ -1140,9 +1189,13 @@ async fn apply_buffered_watches<R>(
                     "root watch record lacks an exact UID/resourceVersion".into(),
                 ));
             }
-            refresh_after_buffered_root_watch(actor, transport, config, &uid, deleted).await?;
+            refresh_after_buffered_root_watch(actor, transport, config, &uid, deleted).await?
         }
-        None => {}
+        None => false,
+    };
+    if root_only_recovery {
+        clear_root_only_recovery_ephemera(fixed_point, automation_watch, automation_candidates);
+        return Ok(());
     }
     if let Some(record) = buffered.dependency
         && let Some(port) = fixed_point.as_mut()
@@ -1186,7 +1239,7 @@ async fn refresh_after_buffered_root_watch(
     config: &DriverConfigV0,
     watched_uid: &str,
     deleted: bool,
-) -> Result<(), RuntimeErrorV0> {
+) -> Result<bool, RuntimeErrorV0> {
     if deleted && watched_uid == actor.state().root().uid {
         return match load_machine_from_transport(transport, &config.namespace, &config.root_name)
             .await?
@@ -1202,7 +1255,7 @@ async fn refresh_after_buffered_root_watch(
                     "nominated root name was replaced by a different UID; refusing adoption".into(),
                 ))
             }
-            None if actor.state().root().deleting => Ok(()),
+            None if actor.state().root().deleting => Ok(false),
             None => Err(RuntimeErrorV0::Hold(
                 "nominated root disappeared without its finalizer protocol".into(),
             )),
@@ -1245,27 +1298,38 @@ async fn drain_root_watch(
     actor: &mut RootActorV0,
     transport: &KubeTransportV0,
     config: &DriverConfigV0,
-) -> Result<bool, RuntimeErrorV0> {
+) -> Result<RootWatchDrainV0, RuntimeErrorV0> {
     loop {
         match watch.try_next_event() {
             Ok(Some(event)) if watch_targets_root(&event, &config.root_name) => {
-                refresh_actor_from_transport(actor, transport, config).await?;
+                if refresh_actor_from_transport(actor, transport, config).await? {
+                    return Ok(RootWatchDrainV0::RootOnlyRecovery);
+                }
             }
-            Ok(Some(_) | None) => return Ok(false),
+            Ok(Some(_) | None) => return Ok(RootWatchDrainV0::Current),
             Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
                 actor.watch_invalidated();
-                return Ok(true);
+                return Ok(RootWatchDrainV0::Invalidated);
             }
             Err(error) => return Err(error.into()),
         }
     }
 }
 
+/// The exact root stream may either leave the current actor authoritative,
+/// require a new list/watch/GET epoch, or reveal that its linked state has
+/// vanished and only receipt-bounded deletion authority remains.
+enum RootWatchDrainV0 {
+    Current,
+    Invalidated,
+    RootOnlyRecovery,
+}
+
 async fn refresh_actor_from_transport(
     actor: &mut RootActorV0,
     transport: &KubeTransportV0,
     config: &DriverConfigV0,
-) -> Result<(), RuntimeErrorV0> {
+) -> Result<bool, RuntimeErrorV0> {
     let fresh =
         load_machine_from_transport(transport, &config.namespace, &config.root_name).await?;
     refresh_actor_from_machine(actor, fresh)
@@ -1274,11 +1338,14 @@ async fn refresh_actor_from_transport(
 fn refresh_actor_from_machine(
     actor: &mut RootActorV0,
     fresh: Option<MachineStateV0>,
-) -> Result<(), RuntimeErrorV0> {
+) -> Result<bool, RuntimeErrorV0> {
     match fresh {
         Some(fresh) if fresh.root().uid == actor.state().root().uid => {
+            if replace_actor_with_root_only_recovery(actor, &fresh) {
+                return Ok(true);
+            }
             actor.root_observed(fresh.root().clone());
-            Ok(())
+            Ok(false)
         }
         Some(_) => {
             actor.hold(
@@ -1288,7 +1355,7 @@ fn refresh_actor_from_machine(
                 "nominated root name was replaced by a different UID; refusing adoption".into(),
             ))
         }
-        None if actor.state().root().deleting => Ok(()),
+        None if actor.state().root().deleting => Ok(false),
         None => {
             actor.hold("nominated root disappeared without its finalizer protocol".into());
             Err(RuntimeErrorV0::Hold(
@@ -1296,6 +1363,49 @@ fn refresh_actor_from_machine(
             ))
         }
     }
+}
+
+/// Installs only a same-UID receipt-bounded recovery. The fresh machine was
+/// built through the loader's exact root/state rereads; it therefore replaces
+/// normal actor state instead of attempting to rebase stale state-backed
+/// commands across a deleted journal object.
+fn replace_actor_with_root_only_recovery(actor: &mut RootActorV0, fresh: &MachineStateV0) -> bool {
+    if fresh.root().uid == actor.state().root().uid
+        && fresh.root().deleting
+        && fresh.is_root_only_deletion_recovery()
+        && !actor.state().is_root_only_deletion_recovery()
+    {
+        *actor = start_actor(fresh.clone());
+        true
+    } else {
+        false
+    }
+}
+
+/// A stale preflight cannot rebase an owned state-backed command over an
+/// absent state object. Receipt-bounded recovery starts a new restricted actor
+/// instead; all other same-UID stale roots retain the ordinary rebase path.
+fn recover_stale_command_actor(actor: &mut RootActorV0, fresh: &MachineStateV0) -> bool {
+    if replace_actor_with_root_only_recovery(actor, fresh) {
+        true
+    } else {
+        actor.recover_stale_preflight(fresh.root().clone());
+        false
+    }
+}
+
+/// Receipt-bound recovery invalidates all normal reconciliation authority.
+/// The replacement actor can issue only root-only deletion commands, so no
+/// retained dependency, pending `AutomationRun`, descriptor-derived port, or
+/// ephemeral automation candidate may survive the state disappearance.
+fn clear_root_only_recovery_ephemera<R>(
+    fixed_point: &mut Option<KubeFixedPointPortV0<'_, R>>,
+    automation_watch: &mut Option<AutomationRunObservationBarrierV0>,
+    automation_candidates: &mut VecDeque<QueuedAutomationV0>,
+) {
+    *fixed_point = None;
+    *automation_watch = None;
+    automation_candidates.clear();
 }
 
 fn watch_targets_root(event: &WatchEventV0, root_name: &str) -> bool {
@@ -1683,6 +1793,65 @@ mod tests {
             })
             .expect("bootstrap actor"),
         )
+    }
+
+    fn receipt_bounded_root_only_machine() -> MachineStateV0 {
+        let mut root = automation_candidate_actor().state().root().clone();
+        let state_name = oxideloop_controller_api::state_name(&root.uid)
+            .expect("deterministic deleted-state name");
+        root.deleting = true;
+        root.root_finalizer_present = true;
+        root.state_name.clear();
+        root.state_uid.clear();
+        root.state_resource_version.clear();
+        root.state_finalizer_present = false;
+        root.status = WebApplicationStatus {
+            deletion_cleanup_receipt: Some(oxideloop_controller_api::DeletionCleanupReceipt {
+                root_uid: root.uid.clone(),
+                deletion_id: "d".repeat(64),
+                deletion_start_generation: root.generation,
+                state_name,
+                state_uid: "deleted-state-uid".into(),
+                cleanup_token: "e".repeat(64),
+            }),
+            ..WebApplicationStatus::default()
+        };
+        MachineStateV0::recover_deleting_root_without_state(root)
+            .expect("receipt-bounded root-only recovery")
+    }
+
+    #[test]
+    fn root_refresh_replaces_a_same_uid_state_disappearance_with_root_only_recovery() {
+        let mut actor = automation_candidate_actor();
+        actor.start();
+        assert!(
+            refresh_actor_from_machine(&mut actor, Some(receipt_bounded_root_only_machine()),)
+                .expect("same UID root refresh")
+        );
+        assert!(actor.state().is_root_only_deletion_recovery());
+        assert!(matches!(
+            actor.next_command(),
+            Ok(Some(CommandV0::VerifyOwnedChildrenAbsent { preconditions, .. }))
+                if preconditions.state_resource_version.is_empty()
+                    && preconditions.state_uid == "deleted-state-uid"
+        ));
+    }
+
+    #[test]
+    fn stale_command_replaces_a_same_uid_state_disappearance_with_root_only_recovery() {
+        let mut actor = automation_candidate_actor();
+        actor.start();
+        assert!(recover_stale_command_actor(
+            &mut actor,
+            &receipt_bounded_root_only_machine(),
+        ));
+        assert!(actor.state().is_root_only_deletion_recovery());
+        assert!(matches!(
+            actor.next_command(),
+            Ok(Some(CommandV0::VerifyOwnedChildrenAbsent { preconditions, .. }))
+                if preconditions.state_resource_version.is_empty()
+                    && preconditions.state_uid == "deleted-state-uid"
+        ));
     }
 
     fn final_automation_input(actor: &RootActorV0) -> RenderInputV0 {
