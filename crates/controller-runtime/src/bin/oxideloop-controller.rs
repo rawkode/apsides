@@ -1,25 +1,17 @@
-//! v0 single-replica controller entrypoint.
+//! v0 production single-root controller entrypoint.
 //!
-//! All operational authority is explicit command-line input.  In particular,
-//! production renderer traffic is Unix-domain only; TCP and environment based
-//! configuration are intentionally not accepted here.
+//! The process has one explicit root authority boundary. Bundle bytes come
+//! only from the root's same-namespace `spec.program` `ConfigMap` reference.
 
 use std::{path::PathBuf, process::ExitCode};
 
-use oxideloop_bundle_contract::BundleStore;
-use oxideloop_controller_runtime::{
-    ActorKeyV0, BundleRuntimeV0, FileArchiveSourceV0, RootActorV0, RuntimeErrorV0,
-    load_machine_from_transport,
-};
-use oxideloop_kube_transport::KubeTransportV0;
-use renderer_client::RendererClient;
+use oxideloop_controller_runtime::{ControllerDriverV0, DriverConfigV0, RuntimeErrorV0};
 
 #[derive(Debug)]
 struct Args {
     namespace: String,
     root_name: String,
-    archive: PathBuf,
-    store: PathBuf,
+    bundle_store: PathBuf,
     renderer_socket: PathBuf,
     #[cfg(feature = "test-failpoints")]
     failpoint_socket: Option<PathBuf>,
@@ -28,11 +20,11 @@ struct Args {
 fn usage() -> &'static str {
     #[cfg(feature = "test-failpoints")]
     {
-        "usage: oxideloop-controller --namespace NS --root-name NAME --bundle-archive FILE --bundle-store DIR --renderer-unix-socket SOCKET [--failpoint-unix-socket SOCKET]"
+        "usage: oxideloop-controller --namespace NS --root-name NAME --bundle-store DIR --renderer-unix-socket SOCKET [--failpoint-unix-socket SOCKET]"
     }
     #[cfg(not(feature = "test-failpoints"))]
     {
-        "usage: oxideloop-controller --namespace NS --root-name NAME --bundle-archive FILE --bundle-store DIR --renderer-unix-socket SOCKET"
+        "usage: oxideloop-controller --namespace NS --root-name NAME --bundle-store DIR --renderer-unix-socket SOCKET"
     }
 }
 
@@ -44,8 +36,7 @@ fn parse_args_from(values: impl IntoIterator<Item = String>) -> Result<Args, Str
     let mut values = values.into_iter();
     let mut namespace = None;
     let mut root_name = None;
-    let mut archive = None;
-    let mut store = None;
+    let mut bundle_store = None;
     let mut renderer_socket = None;
     #[cfg(feature = "test-failpoints")]
     let mut failpoint_socket = None;
@@ -56,8 +47,7 @@ fn parse_args_from(values: impl IntoIterator<Item = String>) -> Result<Args, Str
         match flag.as_str() {
             "--namespace" => namespace = Some(value),
             "--root-name" => root_name = Some(value),
-            "--bundle-archive" => archive = Some(PathBuf::from(value)),
-            "--bundle-store" => store = Some(PathBuf::from(value)),
+            "--bundle-store" => bundle_store = Some(PathBuf::from(value)),
             "--renderer-unix-socket" => renderer_socket = Some(PathBuf::from(value)),
             #[cfg(feature = "test-failpoints")]
             "--failpoint-unix-socket" => failpoint_socket = Some(PathBuf::from(value)),
@@ -67,8 +57,7 @@ fn parse_args_from(values: impl IntoIterator<Item = String>) -> Result<Args, Str
     let args = Args {
         namespace: namespace.ok_or("--namespace is required")?,
         root_name: root_name.ok_or("--root-name is required")?,
-        archive: archive.ok_or("--bundle-archive is required")?,
-        store: store.ok_or("--bundle-store is required")?,
+        bundle_store: bundle_store.ok_or("--bundle-store is required")?,
         renderer_socket: renderer_socket.ok_or("--renderer-unix-socket is required")?,
         #[cfg(feature = "test-failpoints")]
         failpoint_socket,
@@ -99,57 +88,29 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    // Constructing the Unix client here is intentional: no TCP renderer route
-    // is reachable from the controller binary.  The retained client is used by
-    // the render/action driver once the reducer requests those effects.
-    if let Err(error) = RendererClient::new_unix(&args.renderer_socket) {
-        eprintln!("invalid renderer Unix socket: {error}");
-        return ExitCode::from(2);
-    }
-    let transport = match KubeTransportV0::in_cluster().await {
-        Ok(transport) => transport,
+    let config = DriverConfigV0 {
+        namespace: args.namespace,
+        root_name: args.root_name,
+        bundle_store: args.bundle_store,
+        renderer_unix_socket: args.renderer_socket,
+        #[cfg(feature = "test-failpoints")]
+        failpoint_unix_socket: args.failpoint_socket,
+    };
+    let driver = match ControllerDriverV0::in_cluster(config).await {
+        Ok(driver) => driver,
         Err(error) => {
-            eprintln!("in-cluster Kubernetes client unavailable: {error}");
+            eprintln!("controller setup failed: {error}");
             return ExitCode::from(1);
         }
     };
-    let machine =
-        match load_machine_from_transport(&transport, &args.namespace, &args.root_name).await {
-            Ok(Some(machine)) => machine,
-            Ok(None) => return ExitCode::SUCCESS, // root is terminal only after its finalizer protocol; no absent-root write exists.
-            Err(error) => {
-                eprintln!("root load held: {error}");
-                return ExitCode::from(1);
-            }
-        };
-    // Keep archive/store authority explicit even when this initial pass only
-    // reaches bootstrap.  This also validates the configured local store.
-    let _runtime = match BundleStore::new(&args.store) {
-        Ok(store) => BundleRuntimeV0::new(store),
-        Err(error) => {
-            eprintln!("bundle store unavailable: {error}");
-            return ExitCode::from(1);
-        }
-    };
-    let _archive = FileArchiveSourceV0::new(args.archive);
-    let mut actor = RootActorV0::new(machine);
-    actor.start();
-    // A full retained watch/reconcile loop is intentionally owned by the
-    // runtime library; this binary establishes the production adapters and
-    // enters reconciliation without any ambient controls.
-    let _key = ActorKeyV0(format!("{}/{}", args.namespace, args.root_name));
-    #[cfg(feature = "test-failpoints")]
-    if let Some(socket) = args.failpoint_socket {
-        let _ = socket;
-    }
-    match actor.next_command() {
-        Ok(Some(_) | None) => ExitCode::SUCCESS,
-        Err(RuntimeErrorV0::Hold(reason)) => {
-            eprintln!("controller hold: {reason}");
-            ExitCode::from(1)
+    match Box::pin(driver.run()).await {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(RuntimeErrorV0::InjectedCrash(point)) => {
+            eprintln!("injected crash at {point:?}");
+            ExitCode::from(75)
         }
         Err(error) => {
-            eprintln!("controller error: {error}");
+            eprintln!("controller stopped: {error}");
             ExitCode::from(1)
         }
     }
@@ -158,45 +119,31 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn parser_rejects_tcp_and_missing_required_arguments() {
-        // Parsing itself is exercised by the binary's argument shape; Unix
-        // validation is deliberately a separate renderer-client contract.
-        assert!(usage().contains("renderer-unix-socket"));
-    }
 
-    #[cfg(not(feature = "test-failpoints"))]
     #[test]
-    fn default_parser_and_usage_reject_the_debug_only_socket_flag() {
-        assert!(!usage().contains("failpoint-unix-socket"));
-        assert!(matches!(
-            parse_args_from(["--failpoint-unix-socket".into(), "/tmp/failpoint.sock".into()]),
-            Err(error) if error == "unknown argument --failpoint-unix-socket"
-        ));
-    }
-
-    #[cfg(feature = "test-failpoints")]
-    #[test]
-    fn debug_feature_parser_and_usage_accept_the_failpoint_socket_flag() {
-        assert!(usage().contains("failpoint-unix-socket"));
+    fn default_parser_accepts_only_the_production_surface() {
+        assert!(!usage().contains("bundle-archive"));
         let args = parse_args_from([
             "--namespace".into(),
             "ns".into(),
             "--root-name".into(),
             "root".into(),
-            "--bundle-archive".into(),
-            "/tmp/archive".into(),
             "--bundle-store".into(),
             "/tmp/store".into(),
             "--renderer-unix-socket".into(),
             "/tmp/renderer.sock".into(),
-            "--failpoint-unix-socket".into(),
-            "/tmp/failpoint.sock".into(),
         ])
-        .expect("debug flag accepted");
-        assert_eq!(
-            args.failpoint_socket,
-            Some(PathBuf::from("/tmp/failpoint.sock"))
-        );
+        .expect("production arguments accepted");
+        assert_eq!(args.namespace, "ns");
+        assert_eq!(args.root_name, "root");
+    }
+
+    #[cfg(not(feature = "test-failpoints"))]
+    #[test]
+    fn default_parser_rejects_debug_only_failpoint_socket() {
+        assert!(matches!(
+            parse_args_from(["--failpoint-unix-socket".into(), "/tmp/f.sock".into()]),
+            Err(error) if error == "unknown argument --failpoint-unix-socket"
+        ));
     }
 }

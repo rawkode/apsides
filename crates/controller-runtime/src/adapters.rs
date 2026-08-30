@@ -29,10 +29,11 @@ use renderer_client::RendererClient;
 
 use crate::{
     AutomationPortV0, BarrierV0, CompletedObservationFenceV0, CompletedObservationSessionV0,
-    FixedPointPortV0, FixedPointResultV0, GenuineChangeV0, ObservationBarrierV0, RendererPortV0,
-    RootActorV0, RuntimeErrorV0, ValidatedDeletionObservationV0, ValidatedRenderObservationV0,
-    canonical_render_input, completed_observation_fence_token, deterministic_request_id,
-    establish_dependencies_async, normalize_dependencies, reconcile_fixed_point, renderer_request,
+    DeletionCommandCapabilityV0, FixedPointPortV0, FixedPointResultV0, GenuineChangeV0,
+    ObservationBarrierV0, RenderCommandCapabilityV0, RendererPortV0, RootActorV0, RuntimeErrorV0,
+    ValidatedDeletionObservationV0, ValidatedRenderObservationV0, canonical_render_input,
+    completed_observation_fence_token, deterministic_request_id, establish_dependencies_async,
+    normalize_dependencies, reconcile_fixed_point, renderer_request,
 };
 
 /// Renderer port for an explicitly configured Unix socket. Each call owns a
@@ -143,6 +144,15 @@ pub struct KubeDeletionObservationPortV0<'a> {
     address: RootAddressV0,
 }
 
+/// A sealed result of an actor-free deletion list/reread operation.  It is
+/// deliberately consumed only through the same adapter, which re-enters the
+/// actor's owned-command validation after the future has completed.
+pub(crate) struct DeletionObservationCompletionV0 {
+    capability: DeletionCommandCapabilityV0,
+    observed_inventory: Vec<InventoryEntry>,
+    observed_automation_runs: Vec<AutomationRunCleanupV0>,
+}
+
 impl<'a> KubeDeletionObservationPortV0<'a> {
     #[must_use]
     pub fn new(transport: &'a KubeTransportV0, address: RootAddressV0) -> Self {
@@ -153,43 +163,67 @@ impl<'a> KubeDeletionObservationPortV0<'a> {
         &self,
         actor: &RootActorV0,
     ) -> Result<ValidatedDeletionObservationV0, RuntimeErrorV0> {
-        let (preconditions, request_token) = actor.deletion_observation_request()?;
+        let completion = self
+            .observe_for_capability(actor.issue_deletion_capability()?)
+            .await?;
+        Self::consume_completion(actor, completion)
+    }
+
+    /// Executes the sealed deletion observation fence without borrowing the
+    /// actor.  The returned completion cannot be fabricated by a driver.
+    pub(crate) async fn observe_for_capability(
+        &self,
+        capability: DeletionCommandCapabilityV0,
+    ) -> Result<DeletionObservationCompletionV0, RuntimeErrorV0> {
         let snapshot = self
             .transport
-            .observe_deletion_revalidation(&self.address, &preconditions)
+            .observe_deletion_revalidation(&self.address, capability.preconditions())
             .await
             .map_err(RuntimeErrorV0::Discovery)?;
         let root = ObjectRefV0 {
             resource: ResourceKindV0::WebApplication,
-            namespace: actor.state().root().namespace.clone(),
-            name: actor.state().root().name.clone(),
+            namespace: capability.root().namespace.clone(),
+            name: capability.root().name.clone(),
         };
         if snapshot.root.reference != root
-            || snapshot.root.metadata.uid != actor.state().root().uid
-            || snapshot.state.metadata.uid != actor.state().root().state_uid
+            || snapshot.root.metadata.uid != capability.root().uid
+            || snapshot.state.metadata.uid != capability.root().state_uid
         {
             return Err(RuntimeErrorV0::Hold(
                 "deletion observation transport fence does not match the actor root".into(),
             ));
         }
-        let durable = &actor.state().journal().state;
         let observed_inventory = deletion_inventory_observations(
             &snapshot.inventory,
             &root,
-            &actor.state().root().uid,
-            &durable.inventory,
+            &capability.root().uid,
+            &capability.durable().inventory,
         )?;
         let observed_automation_runs = deletion_automation_observations(
             &snapshot.automation_runs,
             &root,
-            &actor.state().root().uid,
-            durable,
+            &capability.root().uid,
+            capability.durable(),
         )?;
-        actor.validated_deletion_observation(
-            preconditions,
-            request_token,
+        Ok(DeletionObservationCompletionV0 {
+            capability,
             observed_inventory,
             observed_automation_runs,
+        })
+    }
+
+    /// Re-enters the actor only after the actor-free future completed.  This
+    /// is the sole conversion from the sealed completion to an acknowledgement
+    /// capability accepted by `RootActorV0`.
+    pub(crate) fn consume_completion(
+        actor: &RootActorV0,
+        completion: DeletionObservationCompletionV0,
+    ) -> Result<ValidatedDeletionObservationV0, RuntimeErrorV0> {
+        actor.validated_deletion_observation(
+            completion.capability.preconditions().clone(),
+            completion.capability.request_token().into(),
+            completion.observed_inventory,
+            completion.observed_automation_runs,
         )
     }
 }
@@ -319,6 +353,66 @@ pub enum RetainedWatchCoordinationV0 {
     RestartRequired,
 }
 
+/// An actor-free retained-watch delivery.  The concrete port mints this only
+/// after it has coalesced its authenticated final snapshot.  Its provenance is
+/// private: the driver may retain it while an owned command is executing, but
+/// can apply it only through the same concrete port after that command's
+/// acknowledgement has reduced.
+#[derive(Clone, Debug)]
+pub(crate) enum BufferedRetainedWatchV0 {
+    Change {
+        port_identity: u64,
+        barrier: BarrierV0,
+        change: GenuineChangeV0,
+    },
+    RestartRequired {
+        port_identity: u64,
+        barrier: BarrierV0,
+    },
+}
+
+/// The renderer/discovery half of one fixed-point pass.  It is obtained only
+/// by consuming a concrete [`KubeFixedPointPortV0`] and deliberately contains
+/// no reference to `RootActorV0`: an owned `RequestRender` can therefore stay
+/// pinned while the driver continues to receive root, run, and old-retained
+/// dependency records.
+///
+/// This is crate-private orchestration plumbing, not a second controller
+/// replica boundary.  The single production driver reunites it with its
+/// companion collector before it can acknowledge a render observation.
+pub(crate) struct RenderExecutionPortV0<'a, R> {
+    transport: Option<&'a KubeTransportV0>,
+    renderer: R,
+    descriptor: BundleDescriptorV0,
+    barrier: BarrierV0,
+    fence_sequence: u64,
+    identity: u64,
+    next_retained_incarnation: u64,
+    retained: Option<RetainedObservationBarrierV0>,
+    #[cfg(test)]
+    test_barrier: Option<ObservationBarrierV0>,
+}
+
+/// The retained-watch half of a split fixed-point port.  It owns the concrete
+/// watch handles from the last stable render and can only yield a sealed
+/// record tied to the original port identity and barrier.
+pub(crate) struct RetainedWatchCollectorV0 {
+    identity: u64,
+    barrier: BarrierV0,
+    retained: Option<RetainedObservationBarrierV0>,
+}
+
+/// A one-shot, opaque proof that an execution port and retained collector
+/// came from the same concrete fixed-point port.  Its fields stay private so
+/// neither a driver nor a test double can fabricate a cross-port reunion.
+pub(crate) struct RenderReunionCapabilityV0 {
+    identity: u64,
+    barrier: BarrierV0,
+    // A non-Copy seal makes reunion consumption explicit even though the
+    // identity/barrier pins themselves are scalar values.
+    _one_shot: Box<()>,
+}
+
 /// Final-fence completion cannot silently ignore a buffered watch change. A
 /// caller receives either the completed fence or an adapter-authenticated
 /// instruction to reconcile/restart; it cannot choose which outcome applies.
@@ -350,6 +444,106 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
             #[cfg(test)]
             test_barrier: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn identity(&self) -> u64 {
+        self.identity
+    }
+
+    /// Consumes the concrete port into two actor-free halves.  The execution
+    /// half may perform renderer/discovery I/O while the collector owns the
+    /// previously retained Kubernetes watches.  Only
+    /// [`Self::reunite_after_render`] accepts the matching opaque capability.
+    pub(crate) fn split_for_render(
+        self,
+    ) -> (
+        RenderExecutionPortV0<'a, R>,
+        RetainedWatchCollectorV0,
+        RenderReunionCapabilityV0,
+    ) {
+        let Self {
+            transport,
+            renderer,
+            descriptor,
+            barrier,
+            fence_sequence,
+            identity,
+            next_retained_incarnation,
+            retained,
+            #[cfg(test)]
+            test_barrier,
+        } = self;
+        (
+            RenderExecutionPortV0 {
+                transport,
+                renderer,
+                descriptor,
+                barrier,
+                fence_sequence,
+                identity,
+                next_retained_incarnation,
+                retained: None,
+                #[cfg(test)]
+                test_barrier,
+            },
+            RetainedWatchCollectorV0 {
+                identity,
+                barrier,
+                retained,
+            },
+            RenderReunionCapabilityV0 {
+                identity,
+                barrier,
+                _one_shot: Box::new(()),
+            },
+        )
+    }
+
+    /// Reassembles exactly the two halves produced by `split_for_render`.
+    /// A mismatch is a stale/fabricated orchestration path, so no retained
+    /// watch is carried forward and no completed fence can be minted.
+    pub(crate) fn reunite_after_render(
+        execution: RenderExecutionPortV0<'a, R>,
+        collector: RetainedWatchCollectorV0,
+        reunion: RenderReunionCapabilityV0,
+    ) -> Result<Self, RuntimeErrorV0> {
+        let RetainedWatchCollectorV0 {
+            identity: collector_identity,
+            barrier: collector_barrier,
+            retained: _old_retained,
+        } = collector;
+        let RenderReunionCapabilityV0 {
+            identity: reunion_identity,
+            barrier: reunion_barrier,
+            _one_shot: one_shot,
+        } = reunion;
+        drop(one_shot);
+        if execution.identity != reunion_identity
+            || collector_identity != reunion_identity
+            || execution.barrier != reunion_barrier
+            || collector_barrier != reunion_barrier
+        {
+            return Err(RuntimeErrorV0::Hold(
+                "render split halves do not match their concrete fixed-point port".into(),
+            ));
+        }
+        Ok(Self {
+            transport: execution.transport,
+            renderer: execution.renderer,
+            descriptor: execution.descriptor,
+            barrier: execution.barrier,
+            fence_sequence: execution.fence_sequence,
+            identity: execution.identity,
+            next_retained_incarnation: execution.next_retained_incarnation,
+            // The newly established barrier belongs to this completed render
+            // pass. The old collector is intentionally consumed here rather
+            // than cloned or merged; any authenticated old change was
+            // separately buffered and must supersede before a final fence.
+            retained: execution.retained,
+            #[cfg(test)]
+            test_barrier: execution.test_barrier,
+        })
     }
 
     #[cfg(test)]
@@ -421,35 +615,109 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
         &mut self,
         actor: &mut RootActorV0,
     ) -> Result<RetainedWatchCoordinationV0, RuntimeErrorV0> {
-        if self.barrier != actor.barrier()
-            || self
-                .retained
-                .as_ref()
-                .is_some_and(|retained| retained.barrier.generation != self.barrier)
+        if self.barrier != actor.barrier() {
+            self.retained = None;
+            self.barrier = actor.barrier();
+            return Ok(RetainedWatchCoordinationV0::RestartRequired);
+        }
+        let record = self.await_buffered_retained_watch().await?;
+        self.apply_buffered_retained_watch(actor, record)
+    }
+
+    /// Waits for a retained transition without borrowing the root actor.  A
+    /// driver pins this future beside an owned effect and merely accumulates
+    /// its result; dropping neither the effect nor actor authority is needed
+    /// to observe a concurrent dependency transition.
+    pub(crate) async fn await_buffered_retained_watch(
+        &mut self,
+    ) -> Result<BufferedRetainedWatchV0, RuntimeErrorV0> {
+        if self
+            .retained
+            .as_ref()
+            .is_none_or(|retained| retained.barrier.generation != self.barrier)
+        {
+            return Ok(BufferedRetainedWatchV0::RestartRequired {
+                port_identity: self.identity,
+                barrier: self.barrier,
+            });
+        }
+        let retained = self.retained.as_mut().expect("checked retained barrier");
+        let changed = match retained.drain_buffered_events() {
+            Ok(changed) => changed,
+            Err(RuntimeErrorV0::Discovery(
+                oxideloop_kube_transport::TransportErrorV0::WatchGone
+                | oxideloop_kube_transport::TransportErrorV0::WatchOverflow,
+            )) => {
+                return Ok(BufferedRetainedWatchV0::RestartRequired {
+                    port_identity: self.identity,
+                    barrier: self.barrier,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        if !changed {
+            match retained.await_change().await {
+                Ok(()) => {}
+                Err(RuntimeErrorV0::Discovery(
+                    oxideloop_kube_transport::TransportErrorV0::WatchGone
+                    | oxideloop_kube_transport::TransportErrorV0::WatchOverflow,
+                )) => {
+                    return Ok(BufferedRetainedWatchV0::RestartRequired {
+                        port_identity: self.identity,
+                        barrier: self.barrier,
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(BufferedRetainedWatchV0::Change {
+            port_identity: self.identity,
+            barrier: self.barrier,
+            change: GenuineChangeV0::from_observations(
+                &retained.observations(),
+                retained.barrier.generation,
+                retained.incarnation,
+            )?,
+        })
+    }
+
+    /// Applies one retained record only after an owned command has completed.
+    /// Mismatched port identity, barrier, or incarnation is stale observation
+    /// data and therefore restarts/drops observation authority without
+    /// releasing or reconstructing any effect.
+    pub(crate) fn apply_buffered_retained_watch(
+        &mut self,
+        actor: &mut RootActorV0,
+        record: BufferedRetainedWatchV0,
+    ) -> Result<RetainedWatchCoordinationV0, RuntimeErrorV0> {
+        let (port_identity, record_barrier) = match &record {
+            BufferedRetainedWatchV0::Change {
+                port_identity,
+                barrier,
+                ..
+            }
+            | BufferedRetainedWatchV0::RestartRequired {
+                port_identity,
+                barrier,
+            } => (*port_identity, *barrier),
+        };
+        if port_identity != self.identity
+            || record_barrier != self.barrier
+            || self.barrier != actor.barrier()
         {
             self.retained = None;
             self.barrier = actor.barrier();
             return Ok(RetainedWatchCoordinationV0::RestartRequired);
         }
-        let change = async {
-            let retained = self.retained.as_mut().ok_or_else(|| {
-                RuntimeErrorV0::Hold("no retained dependency barrier is available".into())
-            })?;
-            if !retained.drain_buffered_events()? {
-                retained.await_change().await?;
+        let outcome = match record {
+            BufferedRetainedWatchV0::Change { change, .. } => {
+                coordinate_retained_watch_result(actor, self.barrier, Ok(change))?
             }
-            GenuineChangeV0::from_observations(
-                &retained.observations(),
-                retained.barrier.generation,
-                retained.incarnation,
-            )
-        }
-        .await;
-        let outcome = coordinate_retained_watch_result(actor, self.barrier, change)?;
-        // A genuine change advances the actor barrier even when its delivery
-        // is deferred behind a durable command.  The old retained handle is
-        // therefore no longer authoritative and must not supply a later
-        // payload under its superseded incarnation.
+            BufferedRetainedWatchV0::RestartRequired { .. } => {
+                actor.watch_invalidated();
+                RetainedWatchCoordinationV0::RestartRequired
+            }
+        };
         if outcome == RetainedWatchCoordinationV0::RestartRequired
             || self.barrier != actor.barrier()
         {
@@ -698,6 +966,166 @@ impl<R: RendererPortV0> FixedPointPortV0 for KubeFixedPointPortV0<'_, R> {
             self.retained = None;
         }
         self.barrier = barrier;
+    }
+}
+
+impl<R> RenderExecutionPortV0<'_, R> {
+    /// Executes a render/discovery pass from the actor-issued capability.  It
+    /// has no actor reference; only the matching reunited concrete port can
+    /// later turn the returned provenance into a final fence.
+    pub(crate) async fn reconcile_for_capability(
+        &mut self,
+        capability: RenderCommandCapabilityV0,
+    ) -> Result<FixedPointResultV0, RuntimeErrorV0>
+    where
+        R: RendererPortV0,
+    {
+        if capability.port_identity() != self.identity {
+            return Err(RuntimeErrorV0::Hold(
+                "render capability port identity mismatch".into(),
+            ));
+        }
+        let mut result = reconcile_fixed_point(self, capability.input().clone()).await?;
+        let retained = self.retained.as_ref().ok_or_else(|| {
+            RuntimeErrorV0::Hold("fixed-point result has no retained observation barrier".into())
+        })?;
+        if retained.barrier.generation != self.barrier {
+            return Err(RuntimeErrorV0::Hold(
+                "render capability retained barrier changed".into(),
+            ));
+        }
+        result.provenance = Some(capability.complete(retained.incarnation));
+        Ok(result)
+    }
+}
+
+#[async_trait]
+impl<R: RendererPortV0> FixedPointPortV0 for RenderExecutionPortV0<'_, R> {
+    async fn render(&mut self, input: &RenderInputV0) -> Result<RenderOutputV0, RuntimeErrorV0> {
+        let payload = canonical_render_input(input)?;
+        let hash = oxideloop_renderer_abi::sha256_hex(&payload);
+        let request = renderer_request(
+            PhaseV0::Render,
+            deterministic_request_id(&hash)?,
+            &input.bundle_digest,
+            Some(self.descriptor.render_module.digest.clone()),
+            payload,
+        )?;
+        let response = self.renderer.call(&request).await?;
+        let payload = crate::renderer_payload(&response, &request)?;
+        let text = std::str::from_utf8(&payload).map_err(|_| RuntimeErrorV0::RendererAbi)?;
+        Ok(oxideloop_renderer_abi::parse_validate_render_output(text)
+            .map_err(|_| RuntimeErrorV0::RendererAbi)?
+            .document)
+    }
+
+    async fn observe_after_barrier(
+        &mut self,
+        dependencies: &[oxideloop_renderer_abi::model::Dependency],
+    ) -> Result<Vec<Observation>, RuntimeErrorV0> {
+        #[cfg(test)]
+        let barrier = if let Some(barrier) = self.test_barrier.take() {
+            if normalize_dependencies(dependencies)? != barrier.dependencies {
+                return Err(RuntimeErrorV0::Hold(
+                    "test fixed-point barrier dependencies do not match render output".into(),
+                ));
+            }
+            barrier
+        } else {
+            let transport = self.transport.ok_or_else(|| {
+                RuntimeErrorV0::Hold(
+                    "test-only fixed-point port cannot establish dependencies".into(),
+                )
+            })?;
+            establish_dependencies_async(transport, dependencies, self.barrier).await?
+        };
+        #[cfg(not(test))]
+        let barrier = {
+            let transport = self.transport.ok_or_else(|| {
+                RuntimeErrorV0::Hold(
+                    "test-only fixed-point port cannot establish dependencies".into(),
+                )
+            })?;
+            establish_dependencies_async(transport, dependencies, self.barrier).await?
+        };
+        self.next_retained_incarnation = self
+            .next_retained_incarnation
+            .checked_add(1)
+            .ok_or_else(|| RuntimeErrorV0::Hold("retained barrier incarnation overflow".into()))?;
+        let mut retained =
+            RetainedObservationBarrierV0::with_incarnation(barrier, self.next_retained_incarnation);
+        retained.drain_buffered_events()?;
+        let observations = retained.observations();
+        self.retained = Some(retained);
+        Ok(observations)
+    }
+
+    fn watch_invalidated(&mut self, barrier: BarrierV0) {
+        self.retained = None;
+        self.barrier = barrier;
+    }
+
+    fn set_barrier(&mut self, barrier: BarrierV0) {
+        if self.barrier != barrier {
+            self.retained = None;
+        }
+        self.barrier = barrier;
+    }
+}
+
+impl RetainedWatchCollectorV0 {
+    /// Receives exactly one sealed old-barrier dependency record without an
+    /// actor borrow.  A render with no prior stable dependencies has nothing
+    /// to collect, so it remains pending rather than manufacturing a restart.
+    pub(crate) async fn await_buffered_retained_watch(
+        &mut self,
+    ) -> Result<BufferedRetainedWatchV0, RuntimeErrorV0> {
+        let Some(retained) = self.retained.as_mut() else {
+            return std::future::pending().await;
+        };
+        if retained.barrier.generation != self.barrier {
+            return Ok(BufferedRetainedWatchV0::RestartRequired {
+                port_identity: self.identity,
+                barrier: self.barrier,
+            });
+        }
+        let changed = match retained.drain_buffered_events() {
+            Ok(changed) => changed,
+            Err(RuntimeErrorV0::Discovery(
+                oxideloop_kube_transport::TransportErrorV0::WatchGone
+                | oxideloop_kube_transport::TransportErrorV0::WatchOverflow,
+            )) => {
+                return Ok(BufferedRetainedWatchV0::RestartRequired {
+                    port_identity: self.identity,
+                    barrier: self.barrier,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        if !changed {
+            match retained.await_change().await {
+                Ok(()) => {}
+                Err(RuntimeErrorV0::Discovery(
+                    oxideloop_kube_transport::TransportErrorV0::WatchGone
+                    | oxideloop_kube_transport::TransportErrorV0::WatchOverflow,
+                )) => {
+                    return Ok(BufferedRetainedWatchV0::RestartRequired {
+                        port_identity: self.identity,
+                        barrier: self.barrier,
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(BufferedRetainedWatchV0::Change {
+            port_identity: self.identity,
+            barrier: self.barrier,
+            change: GenuineChangeV0::from_observations(
+                &retained.observations(),
+                retained.barrier.generation,
+                retained.incarnation,
+            )?,
+        })
     }
 }
 
@@ -1257,7 +1685,13 @@ fn deletion_object_identity(object: &ObjectV0) -> Result<ObjectIdentity, Runtime
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
 
     use oxideloop_controller_api::{
         InventoryEntry, OxideLoopStateSpec, ProgramBundleReference, PruneCandidate,
@@ -1291,6 +1725,33 @@ mod tests {
     #[async_trait]
     impl RendererPortV0 for StableRendererV0 {
         async fn call(&mut self, request: &RequestV0) -> Result<ResponseV0, RuntimeErrorV0> {
+            Ok(ResponseV0 {
+                request_id: request.request_id,
+                phase: request.phase,
+                bundle_digest: request.bundle_digest.clone(),
+                module_digest: request.module_digest.clone(),
+                status: oxideloop_renderer_protocol::ResponseStatusV0::Ok,
+                error_category: None,
+                payload: serde_json::to_vec(&self.output).expect("test output serializes"),
+            })
+        }
+    }
+
+    struct BlockingRendererV0 {
+        output: RenderOutputV0,
+        started: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    #[async_trait]
+    impl RendererPortV0 for BlockingRendererV0 {
+        async fn call(&mut self, request: &RequestV0) -> Result<ResponseV0, RuntimeErrorV0> {
+            self.started.store(true, Ordering::SeqCst);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(release) = self.release.take() {
+                let _ = release.await;
+            }
             Ok(ResponseV0 {
                 request_id: request.request_id,
                 phase: request.phase,
@@ -1863,6 +2324,132 @@ mod tests {
             },
         );
         collections
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn split_render_collects_old_dependency_changes_without_cancelling_the_future() {
+        let barrier = BarrierV0 {
+            generation: 9,
+            cache_epoch: 4,
+        };
+        let dependencies = vec![Dependency::Collection {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: "ns".into(),
+            selector: String::new(),
+            collection_revision: "collection-rv".into(),
+            observation_token: "global-token".into(),
+        }];
+        for event in [
+            Ok(WatchEventV0::Modified(object(
+                "config",
+                "uid-1",
+                "modified-rv",
+            ))),
+            Ok(WatchEventV0::Deleted(object(
+                "config",
+                "uid-1",
+                "deleted-rv",
+            ))),
+            Err(TransportErrorV0::WatchGone),
+            Err(TransportErrorV0::WatchOverflow),
+        ] {
+            let template = fixed_final_result(dependencies.clone());
+            let (watch_sender, old_watch) =
+                oxideloop_kube_transport::WatchHandleV0::test_channel(1);
+            let old_observation = ObservationBarrierV0 {
+                generation: barrier,
+                dependencies: normalize_dependencies(&dependencies).expect("test dependencies"),
+                collections: retained_collections(),
+                objects: vec![],
+                watches: vec![old_watch],
+            };
+            let new_observation = ObservationBarrierV0 {
+                generation: barrier,
+                dependencies: normalize_dependencies(&dependencies).expect("test dependencies"),
+                collections: retained_collections(),
+                objects: vec![],
+                watches: vec![],
+            };
+            let started = Arc::new(AtomicBool::new(false));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
+            let mut port = KubeFixedPointPortV0::fixed_point_for_test(
+                BlockingRendererV0 {
+                    output: template.output.clone(),
+                    started: Arc::clone(&started),
+                    calls: Arc::clone(&calls),
+                    release: Some(release_receiver),
+                },
+                test_descriptor(),
+                barrier,
+                new_observation,
+            );
+            port.next_retained_incarnation = 1;
+            port.retained = Some(RetainedObservationBarrierV0::with_incarnation(
+                old_observation,
+                1,
+            ));
+            let mut actor = fenced_actor(vec![], None);
+            actor.barrier = barrier;
+            owned_render(&mut actor, template.input());
+            let capability = actor
+                .issue_render_capability(template.input.clone(), port.identity())
+                .expect("owned request pins split render capability");
+            let (mut execution, mut collector, reunion) = port.split_for_render();
+            let collect = async {
+                while !started.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                watch_sender
+                    .try_send(event)
+                    .expect("old retained watch records while renderer is pending");
+                let record = collector
+                    .await_buffered_retained_watch()
+                    .await
+                    .expect("collector returns one sealed record");
+                release_sender
+                    .send(())
+                    .expect("blocked renderer is still owned exactly once");
+                record
+            };
+            let (render, record) =
+                tokio::join!(execution.reconcile_for_capability(capability), collect,);
+            let _render = render.expect("the original render future completes after release");
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            let mut port =
+                KubeFixedPointPortV0::reunite_after_render(execution, collector, reunion)
+                    .expect("only matching split halves reunite");
+            let outcome = port
+                .apply_buffered_retained_watch(&mut actor, record)
+                .expect("old record is applied only after the future resolved");
+            assert!(matches!(
+                outcome,
+                RetainedWatchCoordinationV0::ReconcileScheduled
+                    | RetainedWatchCoordinationV0::RestartRequired
+            ));
+            assert!(
+                !actor.owns_render_request(),
+                "a collected change supersedes the completed no-effect render before a fence"
+            );
+        }
+    }
+
+    #[test]
+    fn split_reunion_rejects_cross_port_halves() {
+        let barrier = BarrierV0 {
+            generation: 1,
+            cache_epoch: 0,
+        };
+        let first = KubeFixedPointPortV0::<()>::observation_only_for_test(barrier);
+        let second = KubeFixedPointPortV0::<()>::observation_only_for_test(barrier);
+        let (execution, _, reunion) = first.split_for_render();
+        let (_, collector, _) = second.split_for_render();
+        assert!(matches!(
+            KubeFixedPointPortV0::reunite_after_render(execution, collector, reunion),
+            Err(RuntimeErrorV0::Hold(_))
+        ));
     }
 
     #[tokio::test]

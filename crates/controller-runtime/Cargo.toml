@@ -27,7 +27,8 @@ thiserror = "2"
 async-trait = "0.1"
 futures-util = "0.3"
 rustix = { version = "1", optional = true, features = ["event", "fs", "process"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+time = { version = "0.3", features = ["formatting"] }
 
 [dev-dependencies]
 oxideloop-kube-transport = { path = "../kube-transport", features = ["test-support"] }

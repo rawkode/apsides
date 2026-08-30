@@ -6,14 +6,17 @@
 compile_error!("the test-failpoints feature is only available in debug builds");
 
 mod adapters;
+mod driver;
 mod engine;
 #[cfg(feature = "test-failpoints")]
 pub mod failpoint_uds;
+pub(crate) use adapters::{BufferedRetainedWatchV0, RetainedWatchCollectorV0};
 pub use adapters::{
     CompletedObservationFenceOutcomeV0, KubeAutomationObservationPortV0, KubeAutomationPortV0,
     KubeDeletionObservationPortV0, KubeFixedPointPortV0, RetainedWatchCoordinationV0,
     UnixRendererPortV0, desired_observation,
 };
+pub use driver::{ControllerDriverV0, DriverConfigV0, DriverExitV0};
 pub use engine::reconcile_with_watch_restarts;
 
 use async_trait::async_trait;
@@ -54,7 +57,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 pub const MAX_DISCOVERY_PASSES: u8 = 8;
-const MAX_SEQUENCING_RETRIES: u8 = 4;
+pub(crate) const MAX_SEQUENCING_RETRIES: u8 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct ActorKeyV0(pub String);
@@ -195,6 +198,57 @@ pub struct ValidatedDeletionObservationV0 {
     observed_automation_runs: Vec<AutomationRunCleanupV0>,
 }
 
+/// One-shot descriptor authority captured from an owned `RequestDescriptor`.
+/// The asynchronous ConfigMap/archive operation never needs to borrow the
+/// actor after this value is issued.
+#[derive(Clone, Debug)]
+pub(crate) struct DescriptorCommandCapabilityV0 {
+    token: String,
+    preconditions: PreconditionsV0,
+    program: oxideloop_controller_api::ProgramBundleReference,
+    bundle_digest: String,
+}
+
+impl DescriptorCommandCapabilityV0 {
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+    pub(crate) fn preconditions(&self) -> &PreconditionsV0 {
+        &self.preconditions
+    }
+    pub(crate) fn program(&self) -> &oxideloop_controller_api::ProgramBundleReference {
+        &self.program
+    }
+    pub(crate) fn bundle_digest(&self) -> &str {
+        &self.bundle_digest
+    }
+}
+
+/// Exact deletion authority captured before the actor-free list/reread
+/// future begins.  It carries only authenticated root/state/journal pins.
+#[derive(Clone, Debug)]
+pub(crate) struct DeletionCommandCapabilityV0 {
+    preconditions: PreconditionsV0,
+    request_token: String,
+    root: RootSnapshotV0,
+    durable: oxideloop_controller_api::StateBody,
+}
+
+impl DeletionCommandCapabilityV0 {
+    pub(crate) fn preconditions(&self) -> &PreconditionsV0 {
+        &self.preconditions
+    }
+    pub(crate) fn request_token(&self) -> &str {
+        &self.request_token
+    }
+    pub(crate) fn root(&self) -> &RootSnapshotV0 {
+        &self.root
+    }
+    pub(crate) fn durable(&self) -> &oxideloop_controller_api::StateBody {
+        &self.durable
+    }
+}
+
 /// Opaque acknowledgement authority for one exact owned render command.  It
 /// is minted only after the concrete Kubernetes fixed-point port has consumed
 /// its one-shot provenance and completed the full retained-observation fence.
@@ -264,6 +318,28 @@ impl FixedPointProvenanceSeedV0 {
             seed: self,
             retained_incarnation,
         }
+    }
+}
+
+/// One-shot render authority captured before an actor-free fixed-point future
+/// starts. The concrete port identity is pinned so another port cannot turn a
+/// renderer result into an acknowledgement.
+#[derive(Debug)]
+pub(crate) struct RenderCommandCapabilityV0 {
+    input: RenderInputV0,
+    seed: FixedPointProvenanceSeedV0,
+    port_identity: u64,
+}
+
+impl RenderCommandCapabilityV0 {
+    pub(crate) fn input(&self) -> &RenderInputV0 {
+        &self.input
+    }
+    pub(crate) fn port_identity(&self) -> u64 {
+        self.port_identity
+    }
+    pub(crate) fn complete(self, incarnation: u64) -> FixedPointProvenanceV0 {
+        self.seed.complete(incarnation)
     }
 }
 
@@ -812,11 +888,70 @@ impl RootActorV0 {
         ))
     }
 
+    /// Captures an exact descriptor capability before an actor-free archive
+    /// read/install future is pinned by the driver.
+    pub(crate) fn issue_descriptor_capability(
+        &self,
+    ) -> Result<DescriptorCommandCapabilityV0, RuntimeErrorV0> {
+        let Some(CommandV0::RequestDescriptor {
+            token,
+            preconditions,
+        }) = self.owned_in_flight.as_ref()
+        else {
+            return Err(RuntimeErrorV0::Hold(
+                "descriptor capability has no owned request".into(),
+            ));
+        };
+        let root = self.state.root();
+        if !preconditions_match_root(preconditions, root) {
+            return Err(RuntimeErrorV0::Hold(
+                "descriptor capability root pins are stale".into(),
+            ));
+        }
+        Ok(DescriptorCommandCapabilityV0 {
+            token: token.clone(),
+            preconditions: preconditions.clone(),
+            program: root.spec.program.clone(),
+            bundle_digest: root.bundle_digest.clone(),
+        })
+    }
+
+    /// Captures the root/state/deletion journal fence before an actor-free
+    /// deletion list/reread future is pinned by the driver.
+    pub(crate) fn issue_deletion_capability(
+        &self,
+    ) -> Result<DeletionCommandCapabilityV0, RuntimeErrorV0> {
+        let (preconditions, request_token) = self.deletion_observation_request()?;
+        Ok(DeletionCommandCapabilityV0 {
+            preconditions,
+            request_token,
+            root: self.state.root().clone(),
+            durable: self.state.journal().state.clone(),
+        })
+    }
+
     /// Captures the exact fixed-point input currently being evaluated by the
     /// engine. This is crate-private so a production driver cannot mint a
     /// completion pin independently of the fixed-point loop.
     pub(crate) fn bind_fixed_point_input(&mut self, input: &RenderInputV0) {
         self.active_render_input = Some((self.barrier, input.clone()));
+    }
+
+    /// Captures the only render provenance capability before the renderer and
+    /// retained-discovery future starts. It is intentionally crate-private:
+    /// production callers must use the concrete fixed-point adapter.
+    pub(crate) fn issue_render_capability(
+        &mut self,
+        input: RenderInputV0,
+        port_identity: u64,
+    ) -> Result<RenderCommandCapabilityV0, RuntimeErrorV0> {
+        let seed = self.begin_fixed_point_provenance(&input, port_identity)?;
+        self.bind_fixed_point_input(&input);
+        Ok(RenderCommandCapabilityV0 {
+            input,
+            seed,
+            port_identity,
+        })
     }
     /// Starts the actor without exposing its internal event queue to a driver.
     /// Effect acknowledgements remain checked by [`Self::acknowledge`], while
@@ -1046,7 +1181,24 @@ impl RootActorV0 {
         // retained observation barrier.
         self.drop_superseded_observation_queue();
         self.enqueue(EventV0::RootRefreshed { root });
+        // A render/fixed-point pass has no Kubernetes mutation authority.  A
+        // newer exact root snapshot observed after its actor-free future has
+        // resolved must supersede that stale pass instead of leaving an
+        // acknowledgement slot that can never match the new root pins.
+        if matches!(self.owned_in_flight, Some(CommandV0::RequestRender { .. })) {
+            self.in_flight = false;
+            self.owned_in_flight = None;
+            self.commands.clear();
+        }
         true
+    }
+
+    /// True only while the exact observation-only render request captured by
+    /// a concrete fixed-point capability is still acknowledgement-eligible.
+    /// The driver uses this after applying buffered root/dependency records;
+    /// it never turns a raw renderer result into a capability.
+    pub(crate) fn owns_render_request(&self) -> bool {
+        self.in_flight && matches!(self.owned_in_flight, Some(CommandV0::RequestRender { .. }))
     }
     pub fn next_command(&mut self) -> Result<Option<CommandV0>, RuntimeErrorV0> {
         if let ModeV0::Hold(reason) = &self.mode {
@@ -1190,6 +1342,63 @@ impl RootActorV0 {
             ));
         }
         self.accept_acknowledgement(observation.event)
+    }
+
+    /// Queues one authenticated pending-run completion in the same priority
+    /// lane as a transport acknowledgement. A completion is not an ordinary
+    /// watch event: it must exactly match the durable pending occurrence, its
+    /// immutable canonical spec, and the old resourceVersion captured when
+    /// the run was ensured. This makes completion reduce before a concurrent
+    /// root closure/rebase.
+    pub(crate) fn acknowledge_automation_completion(
+        &mut self,
+        event: EventV0,
+    ) -> Result<(), RuntimeErrorV0> {
+        let EventV0::AutomationCompleted {
+            spec,
+            occurrence_id,
+            name,
+            uid,
+            old_resource_version,
+            ..
+        } = &event
+        else {
+            return Err(RuntimeErrorV0::Hold(
+                "automation completion priority path accepts only a completion".into(),
+            ));
+        };
+        let pending = self
+            .state
+            .journal()
+            .state
+            .automation
+            .pending
+            .iter()
+            .find(|pending| pending.occurrence_id == *occurrence_id)
+            .ok_or_else(|| RuntimeErrorV0::Hold("completion has no durable pending run".into()))?;
+        let canonical =
+            oxideloop_renderer_abi::canonical_bytes(&serde_json::to_value(spec).map_err(|_| {
+                RuntimeErrorV0::Hold("automation completion spec cannot be canonicalized".into())
+            })?)
+            .map_err(|_| {
+                RuntimeErrorV0::Hold("automation completion spec cannot be canonicalized".into())
+            })?;
+        if spec.root_uid != self.state.root().uid
+            || pending.run_name != *name
+            || pending.run_uid != *uid
+            || pending.run_resource_version != *old_resource_version
+            || pending.spec_hash != oxideloop_renderer_abi::sha256_hex(&canonical)
+        {
+            return Err(RuntimeErrorV0::Hold(
+                "automation completion does not match durable pending pins".into(),
+            ));
+        }
+        if self.priority_ack.replace(event).is_some() {
+            return Err(RuntimeErrorV0::Hold(
+                "multiple priority acknowledgements attempted to occupy the priority slot".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn accept_acknowledgement(&mut self, event: EventV0) -> Result<(), RuntimeErrorV0> {
@@ -3518,6 +3727,45 @@ mod tests {
         )
     }
 
+    #[test]
+    fn authenticated_automation_completion_has_priority_over_a_coalesced_root_refresh() {
+        let (machine, completion) = automation_completion_pending();
+        let mut actor = RootActorV0::new(machine);
+        let mut refreshed = actor.state().root().clone();
+        refreshed.root_resource_version = "root-rv-after-completion".into();
+        assert!(actor.root_observed(refreshed));
+
+        actor
+            .acknowledge_automation_completion(completion)
+            .expect("the exact durable pending run is accepted into priority acknowledgement");
+        let _ = actor
+            .next_command()
+            .expect("completion reduces before the queued root closure");
+        assert!(
+            actor.state().journal().state.automation.pending.is_empty(),
+            "completion must reduce before root refresh can replace its continuation"
+        );
+        assert_eq!(
+            actor.state().journal().state.automation.completions.len(),
+            1,
+            "the accepted completion is durable before root closure/rebase"
+        );
+    }
+
+    #[test]
+    fn priority_automation_completion_rejects_a_foreign_run_pin() {
+        let (machine, mut completion) = automation_completion_pending();
+        let mut actor = RootActorV0::new(machine);
+        let EventV0::AutomationCompleted { uid, .. } = &mut completion else {
+            panic!("fixture must create an automation completion");
+        };
+        *uid = "foreign-run-uid".into();
+        assert!(matches!(
+            actor.acknowledge_automation_completion(completion),
+            Err(RuntimeErrorV0::Hold(_))
+        ));
+    }
+
     fn deleting_machine(
         inventory: Vec<InventoryEntry>,
         automation_pending: Vec<AutomationPending>,
@@ -5285,6 +5533,32 @@ mod tests {
         ));
         assert_ne!(actor.state().root().generation, root_a.generation);
         assert_eq!(actor.state().root().generation, root_b.generation);
+    }
+
+    #[test]
+    fn root_refresh_after_a_completed_render_future_releases_only_that_no_effect_slot() {
+        let mut actor = informers_pending_actor();
+        let barrier = actor.barrier();
+        actor.informers_ready(barrier);
+        assert!(matches!(
+            actor.next_command(),
+            Ok(Some(CommandV0::RequestRender { .. }))
+        ));
+        assert!(actor.owns_render_request());
+
+        let current = actor.state().root().clone();
+        let updated = advanced_root(&actor.state, current.generation + 1, "render-race");
+        assert!(actor.root_observed(updated.clone()));
+        assert!(
+            !actor.owns_render_request(),
+            "the old render result cannot remain acknowledgement-eligible after root closure"
+        );
+        assert!(matches!(
+            actor.next_command(),
+            Ok(Some(CommandV0::Persist { ref preconditions, .. }))
+                if preconditions.root_uid == updated.uid
+                    && preconditions.root_generation == updated.generation
+        ));
     }
 
     #[test]

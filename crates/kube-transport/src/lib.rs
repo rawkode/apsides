@@ -15,6 +15,10 @@
 )]
 
 use std::collections::BTreeMap;
+#[cfg(any(test, feature = "test-support"))]
+use std::collections::VecDeque;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::Mutex;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -493,6 +497,8 @@ pub trait DiscoveryPortV0 {
 #[derive(Clone)]
 pub struct KubeTransportV0 {
     client: Client,
+    #[cfg(any(test, feature = "test-support"))]
+    test_watches: Arc<Mutex<VecDeque<WatchHandleV0>>>,
 }
 
 /// Opaque watch stream with no Kubernetes stream or event in its public API.
@@ -627,6 +633,25 @@ impl AutomationRunObservationBarrierV0 {
         self.current = validated;
         Ok(true)
     }
+
+    /// Builds a retained pending-run watch only for runtime tests, while
+    /// still passing the supplied current object through the same shared
+    /// validator used by LIST, WATCH, and GET in production.  Production
+    /// code has no construction path around `observe_pending_automation_run`.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_from_authenticated(
+        expectation: AutomationRunExpectationV0,
+        current: ObjectV0,
+        watch: WatchHandleV0,
+    ) -> Result<Self, TransportErrorV0> {
+        let current = validate_automation_run_get(Some(current), &expectation)?;
+        Ok(Self {
+            expectation,
+            watch,
+            current,
+        })
+    }
 }
 
 impl KubeTransportV0 {
@@ -639,7 +664,11 @@ impl KubeTransportV0 {
     pub async fn in_cluster() -> Result<Self, TransportErrorV0> {
         let config = std::future::ready(Config::incluster().map_err(map_kube_error)).await?;
         let client = Client::try_from(config).map_err(map_kube_error)?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            #[cfg(any(test, feature = "test-support"))]
+            test_watches: Arc::new(Mutex::new(VecDeque::new())),
+        })
     }
 
     /// Builds a transport around an in-memory Kubernetes client for external
@@ -649,7 +678,21 @@ impl KubeTransportV0 {
     #[doc(hidden)]
     #[must_use]
     pub fn test_from_client(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            test_watches: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    /// Queues one opaque watch for the next test-only `watch_from` call.
+    /// The production transport cannot inject events or bypass list/watch
+    /// resource-version fencing.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn test_push_watch(&self, watch: WatchHandleV0) {
+        if let Ok(mut watches) = self.test_watches.lock() {
+            watches.push_back(watch);
+        }
     }
 
     fn api(&self, resource: ResourceKindV0, namespace: &str) -> Api<DynamicObject> {
@@ -2067,6 +2110,12 @@ impl KubeTransportV0 {
         if resource_version.is_empty() {
             return Err(TransportErrorV0::Stale("watch resourceVersion"));
         }
+        #[cfg(any(test, feature = "test-support"))]
+        if let Ok(mut watches) = self.test_watches.lock()
+            && let Some(watch) = watches.pop_front()
+        {
+            return Ok(watch);
+        }
         let stream = self
             .api(resource, namespace)
             .watch(&kube::api::WatchParams::default(), resource_version)
@@ -3045,7 +3094,12 @@ fn bootstrap_state(
     root: &ObjectV0,
     token: &str,
 ) -> Result<ObjectV0, TransportErrorV0> {
-    let value = serde_json::json!({"apiVersion":ResourceKindV0::OxideLoopState.api_version(),"kind":ResourceKindV0::OxideLoopState.kind(),"metadata":{"name":reference.name,"namespace":reference.namespace,"finalizers":[STATE_FINALIZER],"annotations":{ROOT_UID_ANNOTATION:root.metadata.uid,TRANSACTION_ID_ANNOTATION:token,COMMAND_ID_ANNOTATION:token},"ownerReferences":[{"apiVersion":ResourceKindV0::WebApplication.api_version(),"kind":ResourceKindV0::WebApplication.kind(),"name":root.reference.name,"uid":root.metadata.uid,"controller":true,"blockOwnerDeletion":false}]},"spec":state});
+    // State creation carries only the metadata permitted by the constrained
+    // create path.  The state finalizer is an intentionally separate fenced
+    // bootstrap step (`ensure_finalizer`), so a real API server cannot reject
+    // the initial object for metadata smuggling and the resumable sequence
+    // remains observable/recoverable one write at a time.
+    let value = serde_json::json!({"apiVersion":ResourceKindV0::OxideLoopState.api_version(),"kind":ResourceKindV0::OxideLoopState.kind(),"metadata":{"name":reference.name,"namespace":reference.namespace,"annotations":{ROOT_UID_ANNOTATION:root.metadata.uid,TRANSACTION_ID_ANNOTATION:token,COMMAND_ID_ANNOTATION:token},"ownerReferences":[{"apiVersion":ResourceKindV0::WebApplication.api_version(),"kind":ResourceKindV0::WebApplication.kind(),"name":root.reference.name,"uid":root.metadata.uid,"controller":true,"blockOwnerDeletion":false}]},"spec":state});
     Ok(ObjectV0 {
         reference: reference.clone(),
         metadata: ObjectMetaV0 {
