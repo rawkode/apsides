@@ -295,6 +295,58 @@ fn object_json(kind: ResourceKindV0, name: &str, uid: &str, rv: &str) -> Value {
     })
 }
 
+fn collection_json(items: Value) -> Value {
+    json!({"apiVersion":"v1", "kind":"List", "metadata":{"resourceVersion":"list-rv"}, "items":items})
+}
+
+fn root_only_preconditions(
+    root_rv: &str,
+    root_generation: i64,
+    state_uid: &str,
+) -> PreconditionsV0 {
+    PreconditionsV0 {
+        root_uid: "root-uid".into(),
+        root_generation,
+        root_resource_version: root_rv.into(),
+        state_uid: state_uid.into(),
+        state_resource_version: String::new(),
+        observation_token: "o".into(),
+        cache_epoch: "e".into(),
+    }
+}
+
+fn root_only_json(
+    root_rv: &str,
+    generation: i64,
+    state_name: &str,
+    receipt_state_uid: &str,
+    cleanup_token: &str,
+) -> Value {
+    json!({
+        "apiVersion":"demo.oxideloop.dev/v1alpha1",
+        "kind":"WebApplication",
+        "metadata":{
+            "name":"app-a",
+            "namespace":"tenant-a",
+            "uid":"root-uid",
+            "resourceVersion":root_rv,
+            "generation":generation,
+            "deletionTimestamp":"2026-01-01T00:00:00Z",
+            "finalizers":[ROOT_FINALIZER]
+        },
+        "status":{
+            "deletionCleanupReceipt":{
+                "rootUid":"root-uid",
+                "deletionId":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "deletionStartGeneration":generation,
+                "stateName":state_name,
+                "stateUid":receipt_state_uid,
+                "cleanupToken":cleanup_token
+            }
+        }
+    })
+}
+
 fn desired(kind: ResourceKindV0, name: &str, rv: &str) -> ObjectV0 {
     ObjectV0 {
         reference: ObjectRefV0 {
@@ -724,6 +776,453 @@ async fn stale_delete_target_is_non_mutating_and_not_response_loss_recovery() {
             .await,
         Err(TransportErrorV0::Stale("mutation delete pins"))
     );
+    api.assert_drained();
+}
+
+#[tokio::test]
+async fn root_only_verify_uses_receipt_state_identity_and_empty_state_rv() {
+    let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
+    let token = "c".repeat(64);
+    let state_path = format!(
+        "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/{state_name}"
+    );
+    let (transport, api) = ScriptedApi::transport([
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a",
+            content_type: None,
+            body: None,
+            response: response(root_only_json("9", 3, &state_name, "state-uid", &token)),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: Box::leak(state_path.into_boxed_str()),
+            content_type: None,
+            body: None,
+            response: status(
+                StatusCode::NOT_FOUND,
+                json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}),
+            ),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: "/api/v1/namespaces/tenant-a/configmaps?",
+            content_type: None,
+            body: None,
+            response: response(collection_json(json!([]))),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: "/api/v1/namespaces/tenant-a/services?",
+            content_type: None,
+            body: None,
+            response: response(collection_json(json!([]))),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/automationruns?",
+            content_type: None,
+            body: None,
+            response: response(collection_json(json!([]))),
+        },
+    ]);
+    let outcome = transport
+        .dispatch(
+            &RootAddressV0 {
+                namespace: "tenant-a".into(),
+                name: "app-a".into(),
+                state_name,
+            },
+            &CommandV0::VerifyOwnedChildrenAbsent {
+                token: token.clone(),
+                preconditions: root_only_preconditions("9", 3, "state-uid"),
+            },
+        )
+        .await
+        .expect("root-only verify");
+    assert!(matches!(
+        outcome,
+        super::CommandOutcomeV0::Event(event)
+            if matches!(*event, oxideloop_controller_core::EventV0::OwnedChildrenVerifiedAbsent {
+                token: ref actual_token,
+                cleanup_token: ref actual_cleanup,
+                root_generation: 3,
+                ref root_uid,
+                root_resource_version: ref root_rv,
+                state_uid: ref actual_state_uid,
+                state_resource_version: ref state_rv,
+            } if actual_token == &token
+                && actual_cleanup == &token
+                && root_uid == "root-uid"
+                && root_rv == "9"
+                && actual_state_uid == "state-uid"
+                && state_rv.is_empty())
+    ));
+    api.assert_drained();
+}
+
+#[tokio::test]
+async fn root_only_remove_rechecks_children_before_exact_finalizer_patch() {
+    let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
+    let token = "c".repeat(64);
+    let state_path = format!(
+        "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/{state_name}"
+    );
+    let root = root_only_json("9", 3, &state_name, "state-uid", &token);
+    let patch = json!([
+        {"op":"test","path":"/metadata/uid","value":"root-uid"},
+        {"op":"test","path":"/metadata/resourceVersion","value":"9"},
+        {"op":"test","path":"/metadata/finalizers/0","value":ROOT_FINALIZER},
+        {"op":"remove","path":"/metadata/finalizers/0"}
+    ]);
+    let (transport, api) = ScriptedApi::transport([
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a",
+            content_type: None,
+            body: None,
+            response: response(root),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: Box::leak(state_path.into_boxed_str()),
+            content_type: None,
+            body: None,
+            response: status(
+                StatusCode::NOT_FOUND,
+                json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}),
+            ),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: "/api/v1/namespaces/tenant-a/configmaps?",
+            content_type: None,
+            body: None,
+            response: response(collection_json(json!([]))),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: "/api/v1/namespaces/tenant-a/services?",
+            content_type: None,
+            body: None,
+            response: response(collection_json(json!([]))),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/automationruns?",
+            content_type: None,
+            body: None,
+            response: response(collection_json(json!([]))),
+        },
+        Expected {
+            method: Method::PATCH,
+            path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a?",
+            content_type: Some("application/json-patch+json"),
+            body: Some(patch),
+            response: response(object_json(
+                ResourceKindV0::WebApplication,
+                "app-a",
+                "root-uid",
+                "10",
+            )),
+        },
+    ]);
+    let outcome = transport
+        .dispatch(
+            &RootAddressV0 {
+                namespace: "tenant-a".into(),
+                name: "app-a".into(),
+                state_name,
+            },
+            &CommandV0::RemoveRootFinalizer {
+                token: token.clone(),
+                preconditions: root_only_preconditions("9", 3, "state-uid"),
+            },
+        )
+        .await
+        .expect("root-only remove");
+    assert!(matches!(
+        outcome,
+        super::CommandOutcomeV0::Event(event)
+            if matches!(&*event, oxideloop_controller_core::EventV0::RootFinalizerRemoved {
+                token: actual_token,
+                root_uid,
+                old_root_resource_version,
+                new_root_resource_version,
+            } if actual_token == &token
+                && root_uid == "root-uid"
+                && old_root_resource_version == "9"
+                && new_root_resource_version == "10")
+    ));
+    api.assert_drained();
+}
+
+#[tokio::test]
+async fn root_only_remove_holds_for_state_or_child_reappearance_without_patch() {
+    let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
+    let token = "c".repeat(64);
+    let state_path = format!(
+        "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/{state_name}"
+    );
+    let root = root_only_json("9", 3, &state_name, "state-uid", &token);
+    let absent = || {
+        status(
+            StatusCode::NOT_FOUND,
+            json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}),
+        )
+    };
+    let state_object = object_json(
+        ResourceKindV0::OxideLoopState,
+        &state_name,
+        "state-uid",
+        "21",
+    );
+    let (transport, api) = ScriptedApi::transport([
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a",
+            content_type: None,
+            body: None,
+            response: response(root.clone()),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: Box::leak(state_path.clone().into_boxed_str()),
+            content_type: None,
+            body: None,
+            response: response(state_object),
+        },
+    ]);
+    assert_eq!(
+        transport
+            .dispatch(
+                &RootAddressV0 {
+                    namespace: "tenant-a".into(),
+                    name: "app-a".into(),
+                    state_name: state_name.clone(),
+                },
+                &CommandV0::RemoveRootFinalizer {
+                    token: token.clone(),
+                    preconditions: root_only_preconditions("9", 3, "state-uid"),
+                },
+            )
+            .await,
+        Err(TransportErrorV0::ManualRecoveryHold)
+    );
+    api.assert_drained();
+
+    let owned_child = json!({
+        "apiVersion":"v1",
+        "kind":"ConfigMap",
+        "metadata":{"name":"child","uid":"child-uid","resourceVersion":"1","ownerReferences":[{"uid":"root-uid"}]}
+    });
+    let (transport, api) = ScriptedApi::transport([
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a",
+            content_type: None,
+            body: None,
+            response: response(root),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: Box::leak(state_path.into_boxed_str()),
+            content_type: None,
+            body: None,
+            response: absent(),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: "/api/v1/namespaces/tenant-a/configmaps?",
+            content_type: None,
+            body: None,
+            response: response(collection_json(json!([owned_child]))),
+        },
+    ]);
+    assert_eq!(
+        transport
+            .dispatch(
+                &RootAddressV0 {
+                    namespace: "tenant-a".into(),
+                    name: "app-a".into(),
+                    state_name,
+                },
+                &CommandV0::RemoveRootFinalizer {
+                    token,
+                    preconditions: root_only_preconditions("9", 3, "state-uid"),
+                },
+            )
+            .await,
+        Err(TransportErrorV0::ManualRecoveryHold)
+    );
+    api.assert_drained();
+}
+
+#[tokio::test]
+async fn root_only_validation_failures_never_issue_state_or_patch_requests() {
+    let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
+    let token = "c".repeat(64);
+    let stale_rv = root_only_json("10", 3, &state_name, "state-uid", &token);
+    let mut not_deleting = root_only_json("9", 3, &state_name, "state-uid", &token);
+    not_deleting["metadata"]
+        .as_object_mut()
+        .expect("metadata")
+        .remove("deletionTimestamp");
+    let mut no_receipt = root_only_json("9", 3, &state_name, "state-uid", &token);
+    no_receipt["status"]
+        .as_object_mut()
+        .expect("status")
+        .remove("deletionCleanupReceipt");
+    let mut receipt_root_mismatch = root_only_json("9", 3, &state_name, "state-uid", &token);
+    receipt_root_mismatch["status"]["deletionCleanupReceipt"]["rootUid"] = json!("other-root");
+    let wrong_state_name = root_only_json("9", 3, "wrong-state", "state-uid", &token);
+    let wrong_state_uid = root_only_json("9", 3, &state_name, "other-state", &token);
+    let wrong_token = root_only_json("9", 3, &state_name, "state-uid", &"d".repeat(64));
+    let mut no_finalizer = root_only_json("9", 3, &state_name, "state-uid", &token);
+    no_finalizer["metadata"]["finalizers"] = json!([]);
+    let mut wrong_root_kind = root_only_json("9", 3, &state_name, "state-uid", &token);
+    wrong_root_kind["kind"] = json!("Service");
+    let mut wrong_root_name = root_only_json("9", 3, &state_name, "state-uid", &token);
+    wrong_root_name["metadata"]["name"] = json!("other");
+    let mut wrong_root_namespace = root_only_json("9", 3, &state_name, "state-uid", &token);
+    wrong_root_namespace["metadata"]["namespace"] = json!("tenant-b");
+    let cases = [
+        stale_rv,
+        not_deleting,
+        no_receipt,
+        receipt_root_mismatch,
+        wrong_state_name,
+        wrong_state_uid,
+        wrong_token,
+        no_finalizer,
+        wrong_root_kind,
+        wrong_root_name,
+        wrong_root_namespace,
+    ];
+    for root in cases {
+        let (transport, api) = ScriptedApi::transport([Expected {
+            method: Method::GET,
+            path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a",
+            content_type: None,
+            body: None,
+            response: response(root),
+        }]);
+        assert_eq!(
+            transport
+                .dispatch(
+                    &RootAddressV0 {
+                        namespace: "tenant-a".into(),
+                        name: "app-a".into(),
+                        state_name: state_name.clone(),
+                    },
+                    &CommandV0::RemoveRootFinalizer {
+                        token: token.clone(),
+                        preconditions: root_only_preconditions("9", 3, "state-uid"),
+                    },
+                )
+                .await,
+            Err(TransportErrorV0::ManualRecoveryHold)
+        );
+        api.assert_drained();
+    }
+}
+
+#[tokio::test]
+async fn empty_state_rv_on_unrelated_effect_is_held_without_a_request() {
+    let (transport, api) = ScriptedApi::transport([]);
+    assert_eq!(
+        transport
+            .dispatch(
+                &RootAddressV0 {
+                    namespace: "tenant-a".into(),
+                    name: "app-a".into(),
+                    state_name: "state-a".into(),
+                },
+                &CommandV0::RemoveStateFinalizer {
+                    token: "token".into(),
+                    preconditions: root_only_preconditions("9", 3, "state-uid"),
+                },
+            )
+            .await,
+        Err(TransportErrorV0::ManualRecoveryHold)
+    );
+    api.assert_drained();
+}
+
+#[tokio::test]
+async fn empty_state_rv_on_automation_effects_is_held_without_requests() {
+    let commands = [
+        CommandV0::EnsureAutomationRun {
+            token: "token".into(),
+            name: "run-a".into(),
+            spec: automation_spec(),
+            preconditions: root_only_preconditions("9", 3, "state-uid"),
+        },
+        CommandV0::DeleteAutomationRun {
+            token: "token".into(),
+            occurrence_id: "occurrence-1".into(),
+            name: "run-a".into(),
+            uid: "run-uid".into(),
+            resource_version: "4".into(),
+            preconditions: root_only_preconditions("9", 3, "state-uid"),
+        },
+    ];
+
+    for command in commands {
+        let (transport, api) = ScriptedApi::transport([]);
+        assert_eq!(
+            transport
+                .dispatch(
+                    &RootAddressV0 {
+                        namespace: "tenant-a".into(),
+                        name: "app-a".into(),
+                        state_name: "state-a".into(),
+                    },
+                    &command,
+                )
+                .await,
+            Err(TransportErrorV0::ManualRecoveryHold)
+        );
+        api.assert_drained();
+    }
+}
+
+#[tokio::test]
+async fn root_absence_terminal_check_allows_empty_state_rv_sentinel() {
+    let token = "c".repeat(64);
+    let (transport, api) = ScriptedApi::transport([Expected {
+        method: Method::GET,
+        path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a",
+        content_type: None,
+        body: None,
+        response: status(
+            StatusCode::NOT_FOUND,
+            json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}),
+        ),
+    }]);
+    let outcome = transport
+        .dispatch(
+            &RootAddressV0 {
+                namespace: "tenant-a".into(),
+                name: "app-a".into(),
+                state_name: "ignored-for-terminal-check".into(),
+            },
+            &CommandV0::VerifyRootUidAbsent {
+                token: token.clone(),
+                root_uid: "root-uid".into(),
+                preconditions: root_only_preconditions("9", 3, "state-uid"),
+            },
+        )
+        .await
+        .expect("terminal absence check");
+    assert!(matches!(
+        outcome,
+        super::CommandOutcomeV0::Event(event)
+            if matches!(&*event, oxideloop_controller_core::EventV0::RootUidVerifiedAbsent {
+                token: actual_token,
+                root_uid: actual_uid,
+            } if actual_token == &token && actual_uid == "root-uid")
+    ));
     api.assert_drained();
 }
 

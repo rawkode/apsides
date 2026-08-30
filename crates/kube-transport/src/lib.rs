@@ -23,8 +23,8 @@ use std::sync::{
 use futures_util::StreamExt;
 use oxideloop_controller_api::{
     ApplyOutcome, ApplyResult, AutomationRunCompletionState, AutomationRunSpec,
-    AutomationRunStatus, ObjectIdentity, OxideLoopStateSpec, ROOT_FINALIZER, STATE_FINALIZER,
-    StateLink, WebApplicationStatus,
+    AutomationRunStatus, DeletionCleanupReceipt, ObjectIdentity, OxideLoopStateSpec,
+    ROOT_FINALIZER, STATE_FINALIZER, StateLink, WebApplicationStatus,
 };
 use oxideloop_controller_core::{CommandV0, MutationCommandV0, PreconditionsV0};
 use oxideloop_event_planner::{PlannedEventV0, materialize_event, semantically_equal};
@@ -380,6 +380,25 @@ impl KubeTransportV0 {
         command: &CommandV0,
     ) -> Result<CommandOutcomeV0, TransportErrorV0> {
         validate_address(address)?;
+        if empty_state_resource_version_sentinel(command) {
+            return match command {
+                CommandV0::VerifyOwnedChildrenAbsent {
+                    token,
+                    preconditions,
+                } => {
+                    self.verify_root_only_cleanup(address, token, preconditions)
+                        .await
+                }
+                CommandV0::RemoveRootFinalizer {
+                    token,
+                    preconditions,
+                } => {
+                    self.remove_root_only_finalizer(address, token, preconditions)
+                        .await
+                }
+                _ => Err(TransportErrorV0::ManualRecoveryHold),
+            };
+        }
         match command {
             CommandV0::EnsureBootstrap {
                 token,
@@ -1406,6 +1425,171 @@ impl KubeTransportV0 {
             uid: object.metadata.uid,
             resource_version: object.metadata.resource_version,
         })
+    }
+
+    async fn root_only_cleanup_fence(
+        &self,
+        address: &RootAddressV0,
+        token: &str,
+        preconditions: &PreconditionsV0,
+    ) -> Result<(ObjectV0, DeletionCleanupReceipt), TransportErrorV0> {
+        if preconditions.state_resource_version.is_empty() {
+            // This branch is valid only for the deletion sentinel. All values
+            // below are re-read from Kubernetes; none are cache authority.
+        } else {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        let (root_ref, _) = address.references();
+        let root = self
+            .reread(&root_ref)
+            .await?
+            .ok_or(TransportErrorV0::ManualRecoveryHold)?;
+        let root_metadata = root.value.get("metadata").and_then(Value::as_object);
+        if root.reference != root_ref
+            || root.value.get("apiVersion").and_then(Value::as_str)
+                != Some(ResourceKindV0::WebApplication.api_version())
+            || root.value.get("kind").and_then(Value::as_str)
+                != Some(ResourceKindV0::WebApplication.kind())
+            || root_metadata
+                .and_then(|metadata| metadata.get("name"))
+                .and_then(Value::as_str)
+                != Some(address.name.as_str())
+            || root_metadata
+                .and_then(|metadata| metadata.get("namespace"))
+                .and_then(Value::as_str)
+                != Some(address.namespace.as_str())
+            || root.metadata.uid != preconditions.root_uid
+            || root.metadata.resource_version != preconditions.root_resource_version
+            || generation(&root)? != preconditions.root_generation
+            || !has_finalizer(&root, ROOT_FINALIZER)
+            || root
+                .value
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        let status = serde_json::from_value::<WebApplicationStatus>(
+            root.value
+                .get("status")
+                .cloned()
+                .ok_or(TransportErrorV0::ManualRecoveryHold)?,
+        )
+        .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+        let receipt = status
+            .deletion_cleanup_receipt
+            .clone()
+            .ok_or(TransportErrorV0::ManualRecoveryHold)?;
+        receipt
+            .validate()
+            .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+        let expected_state_name = oxideloop_controller_api::state_name(&root.metadata.uid)
+            .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+        let state_link_matches = status.state.as_ref().is_none_or(|link| {
+            link.root_uid == root.metadata.uid
+                && link.name == receipt.state_name
+                && link.uid == receipt.state_uid
+        });
+        if receipt.root_uid != root.metadata.uid
+            || receipt.state_name != expected_state_name
+            || receipt.state_name != address.state_name
+            || receipt.state_uid != preconditions.state_uid
+            || receipt.cleanup_token != token
+            || receipt.deletion_start_generation > preconditions.root_generation
+            || !state_link_matches
+        {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        let state_ref = ObjectRefV0 {
+            resource: ResourceKindV0::OxideLoopState,
+            namespace: address.namespace.clone(),
+            name: receipt.state_name.clone(),
+        };
+        if self.reread(&state_ref).await?.is_some() {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        Ok((root, receipt))
+    }
+
+    async fn verify_root_only_cleanup(
+        &self,
+        address: &RootAddressV0,
+        token: &str,
+        preconditions: &PreconditionsV0,
+    ) -> Result<CommandOutcomeV0, TransportErrorV0> {
+        let (root, receipt) = self
+            .root_only_cleanup_fence(address, token, preconditions)
+            .await?;
+        for resource in [
+            ResourceKindV0::ConfigMap,
+            ResourceKindV0::Service,
+            ResourceKindV0::AutomationRun,
+        ] {
+            if self
+                .list_exact(resource, &address.namespace)
+                .await?
+                .items
+                .into_iter()
+                .any(|item| owned_by(&item, &root.metadata.uid))
+            {
+                return Ok(CommandOutcomeV0::Event(Box::new(
+                    oxideloop_controller_core::EventV0::OwnedChildrenVerificationFailed {
+                        token: token.into(),
+                        reason: "owned child remains present".into(),
+                    },
+                )));
+            }
+        }
+        Ok(CommandOutcomeV0::Event(Box::new(
+            oxideloop_controller_core::EventV0::OwnedChildrenVerifiedAbsent {
+                token: token.into(),
+                cleanup_token: token.into(),
+                root_generation: generation(&root)?,
+                root_uid: root.metadata.uid,
+                root_resource_version: root.metadata.resource_version,
+                state_uid: receipt.state_uid,
+                state_resource_version: String::new(),
+            },
+        )))
+    }
+
+    async fn remove_root_only_finalizer(
+        &self,
+        address: &RootAddressV0,
+        token: &str,
+        preconditions: &PreconditionsV0,
+    ) -> Result<CommandOutcomeV0, TransportErrorV0> {
+        let (root, receipt) = self
+            .root_only_cleanup_fence(address, token, preconditions)
+            .await?;
+        for resource in [
+            ResourceKindV0::ConfigMap,
+            ResourceKindV0::Service,
+            ResourceKindV0::AutomationRun,
+        ] {
+            if self
+                .list_exact(resource, &address.namespace)
+                .await?
+                .items
+                .into_iter()
+                .any(|item| owned_by(&item, &root.metadata.uid))
+            {
+                return Err(TransportErrorV0::ManualRecoveryHold);
+            }
+        }
+        let written = self
+            .remove_finalizer(&root, ROOT_FINALIZER)
+            .await
+            .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+        Ok(CommandOutcomeV0::Event(Box::new(
+            oxideloop_controller_core::EventV0::RootFinalizerRemoved {
+                token: token.into(),
+                root_uid: receipt.root_uid,
+                old_root_resource_version: root.metadata.resource_version,
+                new_root_resource_version: written.metadata.resource_version,
+            },
+        )))
     }
 
     /// Persists only an exact, validated `AutomationRun` completion on `/status`.
@@ -2630,6 +2814,28 @@ fn may_recover_response_loss(error: &TransportErrorV0) -> bool {
 #[must_use]
 pub const fn ambiguous_delete_or_finalizer() -> TransportErrorV0 {
     TransportErrorV0::ManualRecoveryHold
+}
+
+fn empty_state_resource_version_sentinel(command: &CommandV0) -> bool {
+    let preconditions = match command {
+        CommandV0::Persist { preconditions, .. }
+        | CommandV0::PersistRootStatus { preconditions, .. }
+        | CommandV0::RequestDescriptor { preconditions, .. }
+        | CommandV0::RequestRender { preconditions }
+        | CommandV0::RequestDeletionObservation { preconditions }
+        | CommandV0::EnsureAutomationRun { preconditions, .. }
+        | CommandV0::DeleteAutomationRun { preconditions, .. }
+        | CommandV0::VerifyOwnedChildrenAbsent { preconditions, .. }
+        | CommandV0::RemoveStateFinalizer { preconditions, .. }
+        | CommandV0::RemoveRootFinalizer { preconditions, .. } => Some(preconditions),
+        CommandV0::Mutate { commands, .. } => {
+            return commands
+                .iter()
+                .any(|command| command.preconditions.state_resource_version.is_empty());
+        }
+        _ => None,
+    };
+    preconditions.is_some_and(|value| value.state_resource_version.is_empty())
 }
 
 /// Commands that change Kubernetes state must be fenced; non-Kubernetes core
