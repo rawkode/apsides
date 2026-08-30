@@ -1,0 +1,9 @@
+.git
+.jj
+.agents
+.codex
+target
+node_modules
+dist
+coverage
+*.log

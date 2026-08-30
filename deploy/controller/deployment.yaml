@@ -1,0 +1,145 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oxideloop-controller
+  labels:
+    app.kubernetes.io/name: oxideloop
+    app.kubernetes.io/component: controller
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: oxideloop
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oxideloop
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: oxideloop-controller
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: bundle-store
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: renderer-uds
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: controller-kube-api
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
+        - name: renderer-tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+      containers:
+        - name: controller
+          image: ghcr.io/oxideloop/oxideloop:production
+          imagePullPolicy: IfNotPresent
+          args:
+            - --namespace
+            - $(POD_NAMESPACE)
+            - --root-name
+            - $(ROOT_NAME)
+            - --bundle-store
+            - /var/lib/oxideloop/bundles
+            - --renderer-unix-socket
+            - /run/oxideloop/renderer/renderer.sock
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: ROOT_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: oxideloop-controller-config
+                  key: rootName
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: bundle-store
+              mountPath: /var/lib/oxideloop/bundles
+              readOnly: false
+            - name: renderer-uds
+              mountPath: /run/oxideloop/renderer
+              readOnly: true
+            - name: controller-kube-api
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+        - name: renderer
+          image: ghcr.io/oxideloop/oxideloop:production
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/renderer-worker"]
+          args:
+            - --listen-unix
+            - /run/oxideloop/renderer/renderer.sock
+            - --store-root
+            - /var/lib/oxideloop/bundles
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: bundle-store
+              mountPath: /var/lib/oxideloop/bundles
+              readOnly: true
+            - name: renderer-uds
+              mountPath: /run/oxideloop/renderer
+              readOnly: false
+            - name: renderer-tmp
+              mountPath: /tmp
+              readOnly: false

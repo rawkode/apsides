@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oxideloop-controller
+  labels:
+    oxideloop.dev/environment: e2e-only
+  annotations:
+    oxideloop.dev/non-production: "true"
+spec:
+  template:
+    metadata:
+      labels:
+        oxideloop.dev/environment: e2e-only
+    spec:
+      volumes:
+        - name: failpoint-control
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+      initContainers:
+        - name: prepare-failpoint-directory
+          image: ghcr.io/oxideloop/oxideloop:e2e-failpoints
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/busybox", "sh", "-ceu"]
+          args:
+            - >-
+              /bin/busybox mkdir -p /run/oxideloop/failpoints/control &&
+              /bin/busybox chmod 0700 /run/oxideloop/failpoints/control &&
+              test "$$(/bin/busybox stat -c %u /run/oxideloop/failpoints/control)" = 65532 &&
+              test "$$(/bin/busybox stat -c %a /run/oxideloop/failpoints/control)" = 700
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+          volumeMounts:
+            - name: failpoint-control
+              mountPath: /run/oxideloop/failpoints
+              readOnly: false
+      containers:
+        - name: controller
+          image: ghcr.io/oxideloop/oxideloop:e2e-failpoints
+          imagePullPolicy: IfNotPresent
+          args:
+            - --namespace
+            - $(POD_NAMESPACE)
+            - --root-name
+            - $(ROOT_NAME)
+            - --bundle-store
+            - /var/lib/oxideloop/bundles
+            - --renderer-unix-socket
+            - /run/oxideloop/renderer/renderer.sock
+            - --failpoint-unix-socket
+            - /run/oxideloop/failpoints/control.sock
+          volumeMounts:
+            - name: failpoint-control
+              mountPath: /run/oxideloop/failpoints
+              subPath: control
+              readOnly: false
+        - name: renderer
+          image: ghcr.io/oxideloop/oxideloop:production

@@ -1,0 +1,29 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: oxideloop-controller
+rules:
+  - apiGroups: [demo.oxideloop.dev]
+    resources: [webapplications]
+    verbs: [get, list, watch, patch]
+  - apiGroups: [demo.oxideloop.dev]
+    resources: [webapplications/status]
+    verbs: [patch]
+  - apiGroups: [runtime.oxideloop.dev]
+    resources: [oxideloopstates]
+    verbs: [get, list, watch, create, patch]
+  - apiGroups: [runtime.oxideloop.dev]
+    resources: [automationruns]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [runtime.oxideloop.dev]
+    resources: [automationruns/status]
+    verbs: [patch]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch, create, patch, delete]
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get, list, watch, create, patch, delete]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [get, create]
