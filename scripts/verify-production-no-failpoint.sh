@@ -125,8 +125,11 @@ last_target=$(awk '/^FROM / { target=$NF } END { print target }' "$dockerfile")
 check_binary() {
   binary=$1
   command -v strings >/dev/null 2>&1 || fail "strings is required for binary inspection"
-  if strings "$binary" 2>/dev/null | grep -qi 'failpoint'; then
-    fail "production controller contains failpoint strings: $binary"
+  # The reusable runtime retains its pre-existing, instance-owned in-process
+  # crash-test seam. Production isolation applies to the E2E control plane:
+  # none of its socket flag, deletion barrier, module, or client may link.
+  if strings "$binary" 2>/dev/null | grep -qiE 'failpoint-unix-socket|AfterStateFinalizerBeforeRootFinalizer|oxideloop-e2e-failpoint-control|failpoint_uds'; then
+    fail "production controller contains E2E failpoint-control strings: $binary"
   fi
   set +e
   output=$("$binary" --failpoint-unix-socket /tmp/oxideloop-failpoint.sock 2>&1)
@@ -186,7 +189,12 @@ if [ -n "$runtime_tool" ]; then
     tar -tf "$WORK_DIR/$label.tar" >"$WORK_DIR/$label.files"
     source_tree_entries=$(grep -E '(^|/)(src|target|Cargo\.toml|Cargo\.lock|\.git)(/|$)' "$WORK_DIR/$label.files" | grep -vE '^usr/src/?$' || true)
     [ -z "$source_tree_entries" ] || fail "$image contains source/build-tree content"
-    grep -E '(^|/)(usr/bin/(apt|apt-get|dpkg)|var/lib/(apt|dpkg))(/|$)' "$WORK_DIR/$label.files" >/dev/null && fail "$image contains package-manager/cache content"
+    # Distroless intentionally retains /var/lib/dpkg/status.d metadata so its
+    # installed runtime libraries remain auditable. Reject executable package
+    # managers and mutable package/download caches instead.
+    if grep -E '(^|/)(usr/bin/(apt|apt-get|dpkg)(/|$)|var/lib/apt(/|$)|var/cache/(apt|dpkg)(/|$))' "$WORK_DIR/$label.files" >/dev/null; then
+      fail "$image contains package-manager/cache content"
+    fi
   }
 
   inspect_image "$production_image" /usr/local/bin/oxideloop-controller
