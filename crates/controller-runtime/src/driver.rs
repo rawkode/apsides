@@ -39,9 +39,9 @@ use crate::failpoint_uds::{DeletionBarrierV0, FailpointControlV0};
 use crate::{
     BufferedRetainedWatchV0, CompletedObservationFenceOutcomeV0, FailpointsV0, FixedPointPortV0,
     KubeAutomationObservationPortV0, KubeAutomationPortV0, KubeDeletionObservationPortV0,
-    KubeFixedPointPortV0, MAX_SEQUENCING_RETRIES, ModeV0, RetainedWatchCollectorV0,
-    RetainedWatchCoordinationV0, RootActorV0, RuntimeErrorV0, UnixRendererPortV0,
-    dispatch_transport_command, drive_automation, load_machine_from_transport,
+    KubeFixedPointPortV0, MAX_SEQUENCING_RETRIES, ModeV0, RenderExecutionOutcomeV0,
+    RetainedWatchCollectorV0, RetainedWatchCoordinationV0, RootActorV0, RuntimeErrorV0,
+    UnixRendererPortV0, dispatch_transport_command, drive_automation, load_machine_from_transport,
 };
 #[cfg(feature = "test-failpoints")]
 use oxideloop_kube_transport::ObjectV0;
@@ -412,7 +412,7 @@ impl ControllerDriverV0 {
                     // the collector owns every retained pre-render watch;
                     // neither borrows the actor and neither can be cloned.
                     let (mut execution, mut retained, reunion) = port.split_for_render();
-                    let collected = collect_render_while_observing(
+                    let (execution_result, mut buffered) = collect_render_while_observing(
                         execution.reconcile_for_capability(capability),
                         &mut root_watch,
                         &mut retained,
@@ -427,16 +427,84 @@ impl ControllerDriverV0 {
                     let reunited =
                         KubeFixedPointPortV0::reunite_after_render(execution, retained, reunion)?;
                     fixed_point = Some(reunited);
-                    let (mut result, mut buffered) = match collected {
-                        Ok(result) => result,
-                        Err(RuntimeErrorV0::Discovery(
-                            TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow,
-                        )) => {
-                            active.watch_invalidated();
+                    let outcome = match execution_result {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            if let Some(pre_finalization) =
+                                buffered.take_root_dependency_pre_finalization()
+                            {
+                                apply_buffered_watches(
+                                    active,
+                                    &self.transport,
+                                    &self.config,
+                                    &mut root_watch,
+                                    &mut fixed_point,
+                                    &mut automation_watch,
+                                    &mut automation_candidates,
+                                    pre_finalization,
+                                )
+                                .await?;
+                                if !active.owns_render_request() {
+                                    continue;
+                                }
+                            }
+                            apply_buffered_watches(
+                                active,
+                                &self.transport,
+                                &self.config,
+                                &mut root_watch,
+                                &mut fixed_point,
+                                &mut automation_watch,
+                                &mut automation_candidates,
+                                buffered,
+                            )
+                            .await?;
+                            match error {
+                                RuntimeErrorV0::Discovery(
+                                    TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow,
+                                ) => {
+                                    active.watch_invalidated();
+                                    continue;
+                                }
+                                error => return Err(error),
+                            }
+                        }
+                    };
+                    let mut result = match outcome {
+                        RenderExecutionOutcomeV0::Stable(result) => *result,
+                        RenderExecutionOutcomeV0::CoverageChanged(outcome) => {
+                            let _ = consume_coverage_changed_after_reunion(
+                                active,
+                                &self.transport,
+                                &self.config,
+                                &mut root_watch,
+                                &mut fixed_point,
+                                &mut automation_watch,
+                                &mut automation_candidates,
+                                buffered,
+                                outcome,
+                            )
+                            .await?;
                             continue;
                         }
-                        Err(error) => return Err(error),
                     };
+                    if let Some(pre_finalization) = buffered.take_root_dependency_pre_finalization()
+                    {
+                        apply_buffered_watches(
+                            active,
+                            &self.transport,
+                            &self.config,
+                            &mut root_watch,
+                            &mut fixed_point,
+                            &mut automation_watch,
+                            &mut automation_candidates,
+                            pre_finalization,
+                        )
+                        .await?;
+                        if !active.owns_render_request() {
+                            continue;
+                        }
+                    }
                     fixed_point
                         .as_ref()
                         .ok_or_else(|| {
@@ -446,36 +514,6 @@ impl ControllerDriverV0 {
                             )
                         })?
                         .bind_completed_fixed_point_input(active, &result)?;
-                    // Root and old-retained records can only be reduced now
-                    // that the no-effect render future/capability path has
-                    // resolved. A genuine change supersedes the render and
-                    // deliberately prevents any fabricated fence.
-                    if buffered.root.is_some() || buffered.dependency.is_some() {
-                        let automation = buffered.automation.take();
-                        apply_buffered_watches(
-                            active,
-                            &self.transport,
-                            &self.config,
-                            &mut root_watch,
-                            &mut fixed_point,
-                            &mut automation_watch,
-                            &mut automation_candidates,
-                            buffered,
-                        )
-                        .await?;
-                        if !active.owns_render_request() {
-                            continue;
-                        }
-                        buffered = BufferedCommandWatchesV0 {
-                            root: None,
-                            dependency: None,
-                            automation,
-                            root_faulted: false,
-                            dependency_faulted: false,
-                            automation_faulted: false,
-                            fault: None,
-                        };
-                    }
                     let port = fixed_point.as_mut().ok_or_else(|| {
                         RuntimeErrorV0::Hold("reunited render port disappeared".into())
                     })?;
@@ -859,6 +897,46 @@ impl ControllerDriverV0 {
     }
 }
 
+/// Resolves a sealed D-projection mismatch only after every completion-edge
+/// root/dependency record has been reduced. A buffered supersession therefore
+/// makes the opaque outcome stale instead of letting it mint another change.
+#[allow(clippy::too_many_arguments)]
+async fn consume_coverage_changed_after_reunion<R>(
+    actor: &mut RootActorV0,
+    transport: &KubeTransportV0,
+    config: &DriverConfigV0,
+    root_watch: &mut WatchHandleV0,
+    fixed_point: &mut Option<KubeFixedPointPortV0<'_, R>>,
+    automation_watch: &mut Option<AutomationRunObservationBarrierV0>,
+    automation_candidates: &mut VecDeque<QueuedAutomationV0>,
+    buffered: BufferedCommandWatchesV0,
+    outcome: crate::CoverageChangedV0,
+) -> Result<bool, RuntimeErrorV0> {
+    apply_buffered_watches(
+        actor,
+        transport,
+        config,
+        root_watch,
+        fixed_point,
+        automation_watch,
+        automation_candidates,
+        buffered,
+    )
+    .await?;
+    if !actor.owns_render_request() {
+        return Ok(false);
+    }
+    fixed_point
+        .as_mut()
+        .ok_or_else(|| {
+            RuntimeErrorV0::Hold(
+                "reunited render port disappeared before coverage-change consumption".into(),
+            )
+        })?
+        .consume_coverage_change(actor, outcome)?;
+    Ok(true)
+}
+
 /// Watch records accumulated while one exact Kubernetes command future owns
 /// the process.  None of these records is reducer authority on its own: they
 /// are applied only after `effect` has acknowledged successfully.
@@ -870,6 +948,80 @@ struct BufferedCommandWatchesV0 {
     dependency_faulted: bool,
     automation_faulted: bool,
     fault: Option<String>,
+}
+
+impl BufferedCommandWatchesV0 {
+    /// Detaches every root/old-D fact and fault that must be reduced before a
+    /// renderer result may replace its speculative input or mint a fence.
+    /// Automation delivery remains buffered for its existing post-ack path.
+    fn take_root_dependency_pre_finalization(&mut self) -> Option<Self> {
+        if self.root.is_none()
+            && self.dependency.is_none()
+            && !self.root_faulted
+            && !self.dependency_faulted
+        {
+            return None;
+        }
+        let root_faulted = std::mem::take(&mut self.root_faulted);
+        let dependency_faulted = std::mem::take(&mut self.dependency_faulted);
+        let fault = if root_faulted || dependency_faulted {
+            self.fault.take()
+        } else {
+            None
+        };
+        Some(Self {
+            root: self.root.take(),
+            dependency: self.dependency.take(),
+            automation: None,
+            root_faulted,
+            dependency_faulted,
+            automation_faulted: false,
+            fault,
+        })
+    }
+}
+
+fn drain_completion_edge<R>(
+    root_watch: &mut WatchHandleV0,
+    fixed_point: &mut Option<KubeFixedPointPortV0<'_, R>>,
+    root_name: &str,
+    buffered: &mut BufferedCommandWatchesV0,
+) {
+    while !buffered.root_faulted
+        && !matches!(buffered.root, Some(BufferedRootWatchV0::RestartRequired))
+    {
+        match root_watch.try_next_event() {
+            Ok(Some(event)) if watch_targets_root(&event, root_name) => {
+                buffered.root = buffered_root_watch(event);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
+                buffered.root = Some(BufferedRootWatchV0::RestartRequired);
+            }
+            Err(error) => {
+                buffered.root_faulted = true;
+                buffered
+                    .fault
+                    .get_or_insert_with(|| format!("root watch failed: {error}"));
+            }
+        }
+    }
+    if !buffered.dependency_faulted
+        && buffered.dependency.is_none()
+        && let Some(port) = fixed_point.as_mut()
+    {
+        match port.drain_ready_retained_watch() {
+            Ok(Some(record)) => buffered.dependency = Some(record),
+            Ok(None) => {}
+            Err(error) => {
+                buffered.dependency_faulted = true;
+                buffered
+                    .fault
+                    .get_or_insert_with(|| format!("dependency watch failed: {error}"));
+            }
+        }
+    }
 }
 
 /// A final-render declaration that has passed the renderer ABI plus the
@@ -1168,6 +1320,7 @@ where
     loop {
         tokio::select! {
             result = &mut effect => {
+                drain_completion_edge(root_watch, fixed_point, root_name, &mut buffered);
                 return Ok((result?, buffered));
             }
             root = async {
@@ -1250,7 +1403,7 @@ async fn collect_render_while_observing<T, F>(
     retained: &mut RetainedWatchCollectorV0,
     automation_watch: &mut Option<AutomationRunObservationBarrierV0>,
     root_name: &str,
-) -> Result<(T, BufferedCommandWatchesV0), RuntimeErrorV0>
+) -> (Result<T, RuntimeErrorV0>, BufferedCommandWatchesV0)
 where
     F: Future<Output = Result<T, RuntimeErrorV0>>,
 {
@@ -1266,7 +1419,10 @@ where
     };
     loop {
         tokio::select! {
-            result = &mut effect => return Ok((result?, buffered)),
+            result = &mut effect => {
+                drain_render_completion_edge(root_watch, retained, root_name, &mut buffered);
+                return (result, buffered);
+            },
             root = async {
                 if buffered.root_faulted
                     || matches!(buffered.root, Some(BufferedRootWatchV0::RestartRequired))
@@ -1320,6 +1476,46 @@ where
                     buffered.automation_faulted = true;
                     buffered.fault.get_or_insert_with(|| format!("AutomationRun watch failed: {error}"));
                 }
+            }
+        }
+    }
+}
+
+fn drain_render_completion_edge(
+    root_watch: &mut WatchHandleV0,
+    retained: &mut RetainedWatchCollectorV0,
+    root_name: &str,
+    buffered: &mut BufferedCommandWatchesV0,
+) {
+    while !buffered.root_faulted
+        && !matches!(buffered.root, Some(BufferedRootWatchV0::RestartRequired))
+    {
+        match root_watch.try_next_event() {
+            Ok(Some(event)) if watch_targets_root(&event, root_name) => {
+                buffered.root = buffered_root_watch(event);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
+                buffered.root = Some(BufferedRootWatchV0::RestartRequired);
+            }
+            Err(error) => {
+                buffered.root_faulted = true;
+                buffered
+                    .fault
+                    .get_or_insert_with(|| format!("root watch failed: {error}"));
+            }
+        }
+    }
+    if !buffered.dependency_faulted && buffered.dependency.is_none() {
+        match retained.drain_ready_retained_watch() {
+            Ok(Some(record)) => buffered.dependency = Some(record),
+            Ok(None) => {}
+            Err(error) => {
+                buffered.dependency_faulted = true;
+                buffered
+                    .fault
+                    .get_or_insert_with(|| format!("dependency watch failed: {error}"));
             }
         }
     }
@@ -1966,8 +2162,9 @@ mod tests {
     };
     use oxideloop_controller_api::{
         AutomationPending, AutomationRunCompletion, AutomationRunCompletionState,
-        AutomationRunSpec, AutomationRunStatus, ObjectIdentity, WebApplicationSpec,
-        WebApplicationStatus, automation_run_name,
+        AutomationRunSpec, AutomationRunStatus, ObjectIdentity, OxideLoopStateSpec, RootBinding,
+        STATE_VERSION_V1, StateBody, StateLink, WebApplicationSpec, WebApplicationStatus,
+        automation_run_name, bootstrap_id, state_name,
     };
     use oxideloop_controller_core::RootSnapshotV0;
     use oxideloop_kube_transport::{ObjectMetaV0, ObjectV0};
@@ -2322,6 +2519,91 @@ mod tests {
             })
             .expect("bootstrap actor"),
         )
+    }
+
+    fn render_ready_actor_for_coverage_test() -> RootActorV0 {
+        let root_uid = ROOT_UID;
+        let state_name = state_name(root_uid).expect("state name");
+        let machine = MachineStateV0::new(
+            RootSnapshotV0 {
+                uid: root_uid.into(),
+                namespace: "ns".into(),
+                name: "root".into(),
+                generation: 1,
+                spec: WebApplicationSpec {
+                    message: "coverage race".into(),
+                    expose: false,
+                    program: ProgramBundleReference {
+                        config_map_name: "bundle".into(),
+                        key: "program.mjs".into(),
+                        digest: BUNDLE_DIGEST.into(),
+                    },
+                },
+                bundle_digest: BUNDLE_DIGEST.into(),
+                status: WebApplicationStatus {
+                    state: Some(StateLink {
+                        root_uid: root_uid.into(),
+                        name: state_name.clone(),
+                        uid: "state-uid".into(),
+                    }),
+                    ..WebApplicationStatus::default()
+                },
+                state_name,
+                state_uid: "state-uid".into(),
+                state_resource_version: "state-rv".into(),
+                root_resource_version: "root-rv".into(),
+                root_finalizer_present: true,
+                state_finalizer_present: true,
+                deleting: false,
+            },
+            OxideLoopStateSpec {
+                state_version: STATE_VERSION_V1,
+                root: RootBinding {
+                    uid: root_uid.into(),
+                    bootstrap_id: bootstrap_id(root_uid).expect("bootstrap id"),
+                    bundle_digest: BUNDLE_DIGEST.into(),
+                },
+                state: StateBody::default(),
+            },
+        )
+        .expect("valid coverage-race state");
+        let mut actor = RootActorV0::new(machine);
+        actor.start();
+        let CommandV0::RequestDescriptor { token, .. } = actor
+            .next_command()
+            .expect("descriptor lookup")
+            .expect("descriptor command")
+        else {
+            panic!("ready actor must request a descriptor");
+        };
+        actor
+            .acknowledge(EventV0::DescriptorReady {
+                token,
+                bundle_digest: BUNDLE_DIGEST.into(),
+            })
+            .expect("descriptor acknowledgement");
+        let CommandV0::PersistRootStatus {
+            token,
+            old_root_resource_version,
+            root_uid,
+            ..
+        } = actor
+            .next_command()
+            .expect("status lookup")
+            .expect("status command")
+        else {
+            panic!("ready actor must persist descriptor status");
+        };
+        actor
+            .acknowledge(EventV0::RootStatusPersisted {
+                token,
+                old_root_resource_version,
+                new_root_resource_version: "root-rv-after-descriptor".into(),
+                root_uid,
+            })
+            .expect("descriptor status acknowledgement");
+        assert!(actor.next_command().expect("informer transition").is_none());
+        actor
     }
 
     fn receipt_bounded_root_only_machine() -> MachineStateV0 {
@@ -3398,6 +3680,452 @@ mod tests {
             buffered.automation,
             Some(BufferedAutomationWatchV0::Changed(ref run)) if run.resource_version() == "32"
         ));
+    }
+
+    #[tokio::test]
+    async fn render_completion_edge_drains_simultaneously_ready_root_and_old_dependency() {
+        let barrier = crate::BarrierV0 {
+            generation: 4,
+            cache_epoch: 1,
+        };
+        let (root_sender, mut root_watch) = WatchHandleV0::test_channel(3);
+        let (dependency_sender, dependency_watch) = WatchHandleV0::test_channel(2);
+        let mut unrelated_root = root_event("8");
+        unrelated_root.reference.name = "unrelated".into();
+        root_sender
+            .try_send(Ok(WatchEventV0::Modified(unrelated_root)))
+            .expect("ready unrelated root event");
+        root_sender
+            .try_send(Ok(WatchEventV0::Modified(root_event("9"))))
+            .expect("ready root event");
+        dependency_sender
+            .try_send(Ok(WatchEventV0::Modified(dependency_event("8"))))
+            .expect("ready old dependency event");
+        let retained = crate::ObservationBarrierV0 {
+            generation: barrier,
+            dependencies: vec![Dependency::Collection {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                selector: String::new(),
+                collection_revision: "collection-rv".into(),
+                observation_token: "token".into(),
+            }],
+            collections: BTreeMap::new(),
+            objects: vec![],
+            watches: vec![dependency_watch],
+        };
+        let port = KubeFixedPointPortV0::<()>::retained_for_test(barrier, retained);
+        let (_, mut collector, _) = port.split_for_render();
+        let mut automation_watch = None;
+
+        let (result, buffered) = collect_render_while_observing(
+            async { Ok::<_, RuntimeErrorV0>(()) },
+            &mut root_watch,
+            &mut collector,
+            &mut automation_watch,
+            "root",
+        )
+        .await;
+        result.expect("ready command is retained once");
+
+        assert!(matches!(
+            buffered.root,
+            Some(BufferedRootWatchV0::Observed { ref uid, deleted: false, .. }) if uid == ROOT_UID
+        ));
+        assert!(matches!(
+            buffered.dependency,
+            Some(BufferedRetainedWatchV0::Change { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn render_error_completion_preserves_ready_root_and_old_d_facts() {
+        for terminal in [TransportErrorV0::WatchGone, TransportErrorV0::WatchOverflow] {
+            let barrier = crate::BarrierV0 {
+                generation: 4,
+                cache_epoch: 1,
+            };
+            let (root_sender, mut root_watch) = WatchHandleV0::test_channel(2);
+            let (dependency_sender, dependency_watch) = WatchHandleV0::test_channel(1);
+            root_sender
+                .try_send(Ok(WatchEventV0::Modified(root_event("9"))))
+                .expect("ready managed-root event");
+            dependency_sender
+                .try_send(Ok(WatchEventV0::Modified(dependency_event("8"))))
+                .expect("ready old-D event");
+            let retained = crate::ObservationBarrierV0 {
+                generation: barrier,
+                dependencies: vec![Dependency::Collection {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: "ns".into(),
+                    selector: String::new(),
+                    collection_revision: "collection-rv".into(),
+                    observation_token: "token".into(),
+                }],
+                collections: BTreeMap::new(),
+                objects: vec![],
+                watches: vec![dependency_watch],
+            };
+            let port = KubeFixedPointPortV0::<()>::retained_for_test(barrier, retained);
+            let (_, mut collector, _) = port.split_for_render();
+            let mut automation_watch = None;
+
+            let (result, buffered) = collect_render_while_observing(
+                async move { Err::<(), _>(RuntimeErrorV0::Discovery(terminal)) },
+                &mut root_watch,
+                &mut collector,
+                &mut automation_watch,
+                "root",
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(RuntimeErrorV0::Discovery(
+                    TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow
+                ))
+            ));
+            assert!(matches!(
+                buffered.root,
+                Some(BufferedRootWatchV0::Observed { ref uid, .. }) if uid == ROOT_UID
+            ));
+            assert!(matches!(
+                buffered.dependency,
+                Some(BufferedRetainedWatchV0::Change { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_edge_skips_unrelated_root_records_until_the_target_record() {
+        for target in [
+            WatchEventV0::Modified(root_event("9")),
+            WatchEventV0::Deleted(root_event("10")),
+        ] {
+            let (sender, mut root_watch) = WatchHandleV0::test_channel(3);
+            let mut unrelated = root_event("8");
+            unrelated.reference.name = "unrelated".into();
+            sender
+                .try_send(Ok(WatchEventV0::Modified(unrelated)))
+                .expect("unrelated root record is queued first");
+            sender
+                .try_send(Ok(target))
+                .expect("target root record is queued");
+            let mut fixed_point: Option<KubeFixedPointPortV0<'_, ()>> = None;
+            let mut automation_watch = None;
+            let ((), buffered) = collect_while_observing(
+                async { Ok::<_, RuntimeErrorV0>(()) },
+                &mut root_watch,
+                &mut fixed_point,
+                &mut automation_watch,
+                "root",
+            )
+            .await
+            .expect("completion edge drains through unrelated root data");
+            assert!(matches!(
+                buffered.root,
+                Some(BufferedRootWatchV0::Observed { ref uid, .. }) if uid == ROOT_UID
+            ));
+        }
+    }
+
+    fn coverage_change_driver_fixture() -> (
+        RootActorV0,
+        KubeFixedPointPortV0<'static, ()>,
+        crate::CoverageChangedV0,
+        crate::GenuineChangeV0,
+        Vec<u8>,
+    ) {
+        let mut actor = render_ready_actor_for_coverage_test();
+        let barrier = actor.barrier();
+        let dependency = Dependency::Object {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: "ns".into(),
+            name: "dependency".into(),
+            uid: Some("dependency-uid".into()),
+            resource_version: Some("1".into()),
+            observation_token: "coverage-token".into(),
+        };
+        let object = dependency_event("1");
+        let observation = Observation {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: "ns".into(),
+            name: "dependency".into(),
+            uid: "dependency-uid".into(),
+            resource_version: "1".into(),
+            value: object.value.clone(),
+        };
+        let retained = crate::ObservationBarrierV0 {
+            generation: barrier,
+            dependencies: vec![dependency],
+            collections: BTreeMap::new(),
+            objects: vec![(object.reference.clone(), Some(object))],
+            watches: vec![],
+        };
+        let port = KubeFixedPointPortV0::<()>::retained_for_test(barrier, retained);
+        let root = actor.state().root().clone();
+        let input = RenderInputV0 {
+            abi_version: ABI_VERSION_V0.into(),
+            root: RootProjection {
+                api_version: "demo.oxideloop.dev/v1alpha1".into(),
+                kind: "WebApplication".into(),
+                namespace: root.namespace.clone(),
+                name: root.name.clone(),
+                uid: root.uid.clone(),
+                generation: u64::try_from(root.generation).expect("nonnegative generation"),
+                spec: serde_json::to_value(&root.spec).expect("root spec"),
+            },
+            bundle_digest: root.bundle_digest.clone(),
+            cache_epoch: barrier.cache_epoch.to_string(),
+            observation_token: "coverage-token".into(),
+            observations: vec![],
+        };
+        actor.in_flight = true;
+        actor.owned_in_flight = Some(CommandV0::RequestRender {
+            preconditions: PreconditionsV0 {
+                root_uid: root.uid,
+                root_generation: root.generation,
+                root_resource_version: root.root_resource_version,
+                state_uid: root.state_uid,
+                state_resource_version: root.state_resource_version,
+                observation_token: input.observation_token.clone(),
+                cache_epoch: input.cache_epoch.clone(),
+            },
+        });
+        let _capability = actor
+            .issue_render_capability(input.clone(), port.identity())
+            .expect("actor seals the render capability");
+        let initial_pin = crate::canonical_render_input(&input).expect("canonical active pin");
+        let expected = crate::GenuineChangeV0::from_observations(&[observation], barrier, 1)
+            .expect("canonical retained D projection");
+        let buffered = crate::GenuineChangeV0::from_observations(
+            &[Observation {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                name: "dependency".into(),
+                uid: "dependency-uid".into(),
+                resource_version: "2".into(),
+                value: dependency_event("2").value,
+            }],
+            barrier,
+            1,
+        )
+        .expect("canonical buffered D projection");
+        let outcome = crate::CoverageChangedV0::new(port.identity(), barrier, 1, expected);
+        (actor, port, outcome, buffered, initial_pin)
+    }
+
+    fn empty_command_buffers() -> BufferedCommandWatchesV0 {
+        BufferedCommandWatchesV0 {
+            root: None,
+            dependency: None,
+            automation: None,
+            root_faulted: false,
+            dependency_faulted: false,
+            automation_faulted: false,
+            fault: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn coverage_change_reunion_reduces_old_d_before_consuming_the_sealed_outcome() {
+        let unexpected_calls = Arc::new(AtomicUsize::new(0));
+        let recorded_calls = Arc::clone(&unexpected_calls);
+        let service = service_fn(move |_request: Request<Body>| {
+            recorded_calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(500)
+                        .body(Body::from(Vec::<u8>::new()))
+                        .expect("unexpected response"),
+                )
+            }
+        });
+        let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
+        let config = DriverConfigV0 {
+            namespace: "ns".into(),
+            root_name: "root".into(),
+            bundle_store: PathBuf::from("/unused/coverage-race-bundles"),
+            renderer_unix_socket: PathBuf::from("/unused/coverage-race.sock"),
+            #[cfg(feature = "test-failpoints")]
+            failpoint_unix_socket: None,
+        };
+        let (_root_sender, mut root_watch) = WatchHandleV0::test_channel(1);
+        let mut automation_watch = None;
+        let mut automation_candidates = VecDeque::new();
+
+        let (mut actor, port, outcome, buffered_change, initial_pin) =
+            coverage_change_driver_fixture();
+        let initial_barrier = actor.barrier();
+        let port_identity = port.identity();
+        let mut fixed_point = Some(port);
+        let mut buffered = empty_command_buffers();
+        buffered.dependency = Some(BufferedRetainedWatchV0::Change {
+            port_identity,
+            barrier: initial_barrier,
+            change: buffered_change,
+        });
+        assert!(
+            !consume_coverage_changed_after_reunion(
+                &mut actor,
+                &transport,
+                &config,
+                &mut root_watch,
+                &mut fixed_point,
+                &mut automation_watch,
+                &mut automation_candidates,
+                buffered,
+                outcome,
+            )
+            .await
+            .expect("buffered old-D supersedes before coverage consumption")
+        );
+        assert_eq!(unexpected_calls.load(Ordering::SeqCst), 0);
+        assert!(!actor.owns_render_request());
+        assert_eq!(actor.barrier().generation, initial_barrier.generation + 1);
+        assert!(actor.active_render_input.is_none());
+        assert!(actor.render_provenance_request.is_none());
+        assert!(fixed_point.is_some());
+        assert_ne!(
+            actor
+                .active_render_input
+                .as_ref()
+                .map(|(_, input)| crate::canonical_render_input(input).expect("active pin")),
+            Some(initial_pin),
+            "no completed renderer input replaced the superseded speculative pin"
+        );
+
+        let (mut actor, port, outcome, _buffered_change, _initial_pin) =
+            coverage_change_driver_fixture();
+        let initial_barrier = actor.barrier();
+        let mut fixed_point = Some(port);
+        assert!(
+            consume_coverage_changed_after_reunion(
+                &mut actor,
+                &transport,
+                &config,
+                &mut root_watch,
+                &mut fixed_point,
+                &mut automation_watch,
+                &mut automation_candidates,
+                empty_command_buffers(),
+                outcome,
+            )
+            .await
+            .expect("the exact reunited port consumes its own sealed mismatch")
+        );
+        assert!(!actor.owns_render_request());
+        assert_eq!(actor.barrier().generation, initial_barrier.generation + 1);
+        assert!(actor.active_render_input.is_none());
+        assert!(actor.render_provenance_request.is_none());
+    }
+
+    #[tokio::test]
+    async fn root_or_old_d_fault_is_reduced_before_render_binding_or_fencing() {
+        for dependency_fault in [false, true] {
+            let service = service_fn(move |_request: Request<Body>| async move {
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(500)
+                        .body(Body::from(Vec::<u8>::new()))
+                        .expect("unexpected response"),
+                )
+            });
+            let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
+            let config = DriverConfigV0 {
+                namespace: "ns".into(),
+                root_name: "root".into(),
+                bundle_store: PathBuf::from("/unused/pre-finalization-bundles"),
+                renderer_unix_socket: PathBuf::from("/unused/pre-finalization.sock"),
+                #[cfg(feature = "test-failpoints")]
+                failpoint_unix_socket: None,
+            };
+            let (_root_sender, mut root_watch) = WatchHandleV0::test_channel(1);
+            let mut automation_watch = None;
+            let mut automation_candidates = VecDeque::new();
+            let (mut actor, port, _outcome, _buffered_change, _initial_pin) =
+                coverage_change_driver_fixture();
+            let mut fixed_point = Some(port);
+            let mut buffered = empty_command_buffers();
+            buffered.root_faulted = !dependency_fault;
+            buffered.dependency_faulted = dependency_fault;
+            buffered.fault = Some(if dependency_fault {
+                "dependency watch failed: test fault".into()
+            } else {
+                "root watch failed: test fault".into()
+            });
+            let pre_finalization = buffered
+                .take_root_dependency_pre_finalization()
+                .expect("fatal observation fault is a pre-finalization fact");
+            assert!(matches!(
+                apply_buffered_watches(
+                    &mut actor,
+                    &transport,
+                    &config,
+                    &mut root_watch,
+                    &mut fixed_point,
+                    &mut automation_watch,
+                    &mut automation_candidates,
+                    pre_finalization,
+                )
+                .await,
+                Err(RuntimeErrorV0::Hold(_))
+            ));
+            assert!(!actor.owns_render_request());
+            assert!(actor.active_render_input.is_none());
+            assert!(actor.render_provenance_request.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn render_completion_edge_turns_old_dependency_terminal_watches_into_restart() {
+        for terminal in [TransportErrorV0::WatchGone, TransportErrorV0::WatchOverflow] {
+            let barrier = crate::BarrierV0 {
+                generation: 4,
+                cache_epoch: 1,
+            };
+            let (_root_sender, mut root_watch) = WatchHandleV0::test_channel(1);
+            let (dependency_sender, dependency_watch) = WatchHandleV0::test_channel(1);
+            dependency_sender
+                .try_send(Err(terminal))
+                .expect("ready old dependency terminal event");
+            let retained = crate::ObservationBarrierV0 {
+                generation: barrier,
+                dependencies: vec![Dependency::Collection {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: "ns".into(),
+                    selector: String::new(),
+                    collection_revision: "collection-rv".into(),
+                    observation_token: "token".into(),
+                }],
+                collections: BTreeMap::new(),
+                objects: vec![],
+                watches: vec![dependency_watch],
+            };
+            let port = KubeFixedPointPortV0::<()>::retained_for_test(barrier, retained);
+            let (_, mut collector, _) = port.split_for_render();
+            let mut automation_watch = None;
+
+            let (result, buffered) = collect_render_while_observing(
+                async { Ok::<_, RuntimeErrorV0>(()) },
+                &mut root_watch,
+                &mut collector,
+                &mut automation_watch,
+                "root",
+            )
+            .await;
+            result.expect("owned effect completes before restart is applied");
+            assert!(matches!(
+                buffered.dependency,
+                Some(BufferedRetainedWatchV0::RestartRequired { .. })
+            ));
+        }
     }
 
     #[tokio::test]

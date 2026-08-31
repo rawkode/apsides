@@ -24,18 +24,19 @@ use oxideloop_mutation_model::{
 };
 use oxideloop_renderer_abi::{
     RenderInputV0,
-    model::{Observation, RenderOutputV0},
+    model::{Dependency, Observation, RenderOutputV0},
 };
 use oxideloop_renderer_protocol::{PhaseV0, RequestV0, ResponseV0};
 use renderer_client::RendererClient;
 
 use crate::{
     AutomationPortV0, BarrierV0, CompletedObservationFenceV0, CompletedObservationSessionV0,
-    DeletionCommandCapabilityV0, FixedPointPortV0, FixedPointResultV0, GenuineChangeV0,
-    ObservationBarrierV0, RenderCommandCapabilityV0, RendererPortV0, RootActorV0, RuntimeErrorV0,
-    ValidatedDeletionObservationV0, ValidatedRenderObservationV0, canonical_render_input,
-    completed_observation_fence_token, deterministic_request_id, establish_dependencies_async,
-    normalize_dependencies, reconcile_fixed_point, renderer_request,
+    CoverageChangedV0, DeletionCommandCapabilityV0, FixedPointPortV0, FixedPointResultV0,
+    GenuineChangeV0, ObservationBarrierV0, RenderCommandCapabilityV0, RendererPortV0, RootActorV0,
+    RuntimeErrorV0, ValidatedDeletionObservationV0, ValidatedRenderObservationV0,
+    canonical_render_input, completed_observation_fence_token, deterministic_request_id,
+    establish_dependencies_async, normalize_dependencies, reconcile_fixed_point,
+    renderer_dependency_plan, renderer_request, resource,
 };
 
 /// Renderer port for an explicitly configured Unix socket. Each call owns a
@@ -333,6 +334,7 @@ pub struct KubeFixedPointPortV0<'a, R> {
     pub barrier: BarrierV0,
     fence_sequence: u64,
     identity: u64,
+    root_namespace: Option<String>,
     next_retained_incarnation: u64,
     retained: Option<RetainedObservationBarrierV0>,
     #[cfg(test)]
@@ -389,10 +391,16 @@ pub(crate) struct RenderExecutionPortV0<'a, R> {
     barrier: BarrierV0,
     fence_sequence: u64,
     identity: u64,
+    root_namespace: Option<String>,
     next_retained_incarnation: u64,
     retained: Option<RetainedObservationBarrierV0>,
     #[cfg(test)]
     test_barrier: Option<ObservationBarrierV0>,
+}
+
+pub(crate) enum RenderExecutionOutcomeV0 {
+    Stable(Box<FixedPointResultV0>),
+    CoverageChanged(CoverageChangedV0),
 }
 
 /// The retained-watch half of a split fixed-point port.  It owns the concrete
@@ -441,6 +449,7 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
             barrier,
             fence_sequence: 0,
             identity: next_fixed_point_port_identity(),
+            root_namespace: None,
             next_retained_incarnation: 0,
             retained: None,
             #[cfg(test)]
@@ -505,6 +514,7 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
             barrier,
             fence_sequence,
             identity,
+            root_namespace,
             next_retained_incarnation,
             retained,
             #[cfg(test)]
@@ -518,6 +528,7 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
                 barrier,
                 fence_sequence,
                 identity,
+                root_namespace,
                 next_retained_incarnation,
                 retained: None,
                 #[cfg(test)]
@@ -571,6 +582,7 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
             barrier: execution.barrier,
             fence_sequence: execution.fence_sequence,
             identity: execution.identity,
+            root_namespace: execution.root_namespace,
             next_retained_incarnation: execution.next_retained_incarnation,
             // The newly established barrier belongs to this completed render
             // pass. The old collector is intentionally consumed here rather
@@ -599,6 +611,7 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
             barrier,
             fence_sequence: 0,
             identity: next_fixed_point_port_identity(),
+            root_namespace: None,
             next_retained_incarnation: 0,
             retained: None,
             test_barrier: None,
@@ -636,6 +649,7 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
             barrier,
             fence_sequence: 0,
             identity: next_fixed_point_port_identity(),
+            root_namespace: None,
             next_retained_incarnation: 0,
             retained: None,
             test_barrier: Some(observation),
@@ -763,50 +777,6 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
         Ok(outcome)
     }
 
-    /// The only completion-eligible fixed-point entrypoint. It captures an
-    /// actor-owned `RequestRender` capability before discovery, then binds the
-    /// completed result to this concrete port and its final retained barrier
-    /// incarnation. Generic fixed-point helpers intentionally cannot attach
-    /// this provenance.
-    pub async fn reconcile_for_actor(
-        &mut self,
-        actor: &mut RootActorV0,
-        input: RenderInputV0,
-    ) -> Result<FixedPointResultV0, RuntimeErrorV0>
-    where
-        R: RendererPortV0,
-    {
-        let capability = actor.issue_render_capability(input, self.identity)?;
-        let mut result = match reconcile_fixed_point(self, capability.input().clone()).await {
-            Ok(result) => result,
-            Err(RuntimeErrorV0::Discovery(
-                error @ (oxideloop_kube_transport::TransportErrorV0::WatchGone
-                | oxideloop_kube_transport::TransportErrorV0::WatchOverflow),
-            )) => {
-                // The provenance was consumed while starting this pass.  A
-                // terminal watch error cannot leave that RequestRender slot
-                // in flight: invalidate the actor and make it establish a
-                // fresh informer barrier before another render.
-                actor.watch_invalidated();
-                self.retained = None;
-                self.barrier = actor.barrier();
-                return Err(RuntimeErrorV0::Discovery(error));
-            }
-            Err(error) => return Err(error),
-        };
-        let retained = self.retained.as_ref().ok_or_else(|| {
-            RuntimeErrorV0::Hold("fixed-point result has no retained observation barrier".into())
-        })?;
-        if retained.barrier.generation != actor.barrier() || self.barrier != actor.barrier() {
-            return Err(RuntimeErrorV0::Hold(
-                "fixed-point result retained barrier is no longer current".into(),
-            ));
-        }
-        result.provenance = Some(capability.complete(retained.incarnation));
-        self.bind_completed_fixed_point_input(actor, &result)?;
-        Ok(result)
-    }
-
     /// Installs only the final input returned by this reunited concrete port.
     /// The actor verifies its sealed provenance before replacing the
     /// speculative input it pinned when the render capability was issued.
@@ -823,6 +793,17 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
         if self.barrier != actor.barrier() || retained.barrier.generation != self.barrier {
             return Err(RuntimeErrorV0::Hold(
                 "completed fixed-point input retained barrier is not current".into(),
+            ));
+        }
+        let provenance = result.provenance.as_ref().ok_or_else(|| {
+            RuntimeErrorV0::Hold(
+                "completed fixed-point input has no sealed provenance capability".into(),
+            )
+        })?;
+        if retained.coverage_dependencies != provenance.coverage_dependencies {
+            return Err(RuntimeErrorV0::Hold(
+                "completed fixed-point input retained coverage does not match sealed provenance"
+                    .into(),
             ));
         }
         actor.bind_completed_fixed_point_input(
@@ -896,7 +877,7 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
                 }
             }
             Ok(false) => {
-                if final_result.input.observations != retained.observations() {
+                if final_result.input.observations != retained.renderer_observations() {
                     return Err(RuntimeErrorV0::Hold(
                         "final fixed-point input observations differ from the drained retained snapshot"
                             .into(),
@@ -922,6 +903,57 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
             }
             Err(error) => Err(error),
         }
+    }
+}
+
+/// Test-only convenience that exercises the exact production completion
+/// authority: issue an actor capability, split the concrete port, execute,
+/// drain the old collector, reunite, consume a sealed coverage change if one
+/// was minted, and bind only a reunited stable result.  Tests deliberately do
+/// not have a second direct reconciliation implementation.
+#[cfg(test)]
+pub(crate) async fn reconcile_split_for_test<'a, R: RendererPortV0>(
+    actor: &mut RootActorV0,
+    port: KubeFixedPointPortV0<'a, R>,
+    input: RenderInputV0,
+) -> Result<(KubeFixedPointPortV0<'a, R>, FixedPointResultV0), RuntimeErrorV0> {
+    let capability = actor.issue_render_capability(input, port.identity())?;
+    let (mut execution, mut collector, reunion) = port.split_for_render();
+    let outcome = execution.reconcile_for_capability(capability).await;
+    let buffered = collector.drain_ready_retained_watch()?;
+    let mut port = KubeFixedPointPortV0::reunite_after_render(execution, collector, reunion)?;
+    if let Some(record) = buffered {
+        port.apply_buffered_retained_watch(actor, record)?;
+        if !actor.owns_render_request() {
+            return Err(RuntimeErrorV0::Hold(
+                "test split render was superseded by a retained watch".into(),
+            ));
+        }
+    }
+    match outcome {
+        Ok(RenderExecutionOutcomeV0::Stable(result)) => {
+            let result = *result;
+            port.bind_completed_fixed_point_input(actor, &result)?;
+            Ok((port, result))
+        }
+        Ok(RenderExecutionOutcomeV0::CoverageChanged(change)) => {
+            port.consume_coverage_change(actor, change)?;
+            Err(RuntimeErrorV0::Hold(
+                "final coverage changed the renderer dependency projection".into(),
+            ))
+        }
+        Err(RuntimeErrorV0::Discovery(
+            error @ (oxideloop_kube_transport::TransportErrorV0::WatchGone
+            | oxideloop_kube_transport::TransportErrorV0::WatchOverflow),
+        )) => {
+            actor.watch_invalidated();
+            // The reunited port owns no current fixed-point result after a
+            // terminal establishment fault, so drop its retained authority.
+            port.retained = None;
+            port.barrier = actor.barrier();
+            Err(RuntimeErrorV0::Discovery(error))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -975,9 +1007,15 @@ impl<R: RendererPortV0> FixedPointPortV0 for KubeFixedPointPortV0<'_, R> {
         &mut self,
         dependencies: &[oxideloop_renderer_abi::model::Dependency],
     ) -> Result<Vec<Observation>, RuntimeErrorV0> {
+        let namespace = self.root_namespace.as_deref().ok_or_else(|| {
+            RuntimeErrorV0::Hold(
+                "renderer dependency plan lacks an authorized root namespace".into(),
+            )
+        })?;
+        let dependencies = renderer_dependency_plan(dependencies, namespace)?;
         #[cfg(test)]
         let barrier = if let Some(barrier) = self.test_barrier.take() {
-            if normalize_dependencies(dependencies)? != barrier.dependencies {
+            if dependencies != barrier.dependencies {
                 return Err(RuntimeErrorV0::Hold(
                     "test fixed-point barrier dependencies do not match render output".into(),
                 ));
@@ -989,7 +1027,7 @@ impl<R: RendererPortV0> FixedPointPortV0 for KubeFixedPointPortV0<'_, R> {
                     "test-only fixed-point port cannot establish dependencies".into(),
                 )
             })?;
-            establish_dependencies_async(transport, dependencies, self.barrier).await?
+            establish_dependencies_async(transport, &dependencies, self.barrier).await?
         };
         #[cfg(not(test))]
         let barrier = {
@@ -998,7 +1036,7 @@ impl<R: RendererPortV0> FixedPointPortV0 for KubeFixedPointPortV0<'_, R> {
                     "test-only fixed-point port cannot establish dependencies".into(),
                 )
             })?;
-            establish_dependencies_async(transport, dependencies, self.barrier).await?
+            establish_dependencies_async(transport, &dependencies, self.barrier).await?
         };
         self.next_retained_incarnation = self
             .next_retained_incarnation
@@ -1031,6 +1069,83 @@ impl<R: RendererPortV0> FixedPointPortV0 for KubeFixedPointPortV0<'_, R> {
     }
 }
 
+impl<R> KubeFixedPointPortV0<'_, R> {
+    /// Consumes the only coverage-change authority minted by this concrete
+    /// port.  Split execution cannot route a raw fingerprint into the actor:
+    /// reunion must prove the port, barrier, retained U incarnation, and
+    /// current D-only projection still match before supersession.
+    pub(crate) fn consume_coverage_change(
+        &mut self,
+        actor: &mut RootActorV0,
+        outcome: CoverageChangedV0,
+    ) -> Result<RetainedWatchCoordinationV0, RuntimeErrorV0> {
+        let Some(retained) = self.retained.as_ref() else {
+            return Err(RuntimeErrorV0::Hold(
+                "coverage-change outcome has no current retained union barrier".into(),
+            ));
+        };
+        let expected = GenuineChangeV0::from_observations(
+            &retained.renderer_observations(),
+            self.barrier,
+            retained.incarnation,
+        )?;
+        if outcome.port_identity != self.identity
+            || outcome.barrier != self.barrier
+            || self.barrier != actor.barrier()
+            || outcome.retained_incarnation != retained.incarnation
+            || outcome.change != expected
+        {
+            return Err(RuntimeErrorV0::Hold(
+                "coverage-change outcome does not belong to the current retained union barrier"
+                    .into(),
+            ));
+        }
+        let result = coordinate_retained_watch_result(actor, self.barrier, Ok(outcome.change))?;
+        if result == RetainedWatchCoordinationV0::RestartRequired || self.barrier != actor.barrier()
+        {
+            self.retained = None;
+            self.barrier = actor.barrier();
+        }
+        Ok(result)
+    }
+
+    /// Drains records already queued by the retained watches without waiting.
+    /// This is the completion-edge counterpart to the asynchronous collector.
+    pub(crate) fn drain_ready_retained_watch(
+        &mut self,
+    ) -> Result<Option<BufferedRetainedWatchV0>, RuntimeErrorV0> {
+        let Some(retained) = self.retained.as_mut() else {
+            return Ok(None);
+        };
+        if retained.barrier.generation != self.barrier {
+            return Ok(Some(BufferedRetainedWatchV0::RestartRequired {
+                port_identity: self.identity,
+                barrier: self.barrier,
+            }));
+        }
+        match retained.drain_buffered_events() {
+            Ok(false) => Ok(None),
+            Ok(true) => Ok(Some(BufferedRetainedWatchV0::Change {
+                port_identity: self.identity,
+                barrier: self.barrier,
+                change: GenuineChangeV0::from_observations(
+                    &retained.observations(),
+                    retained.barrier.generation,
+                    retained.incarnation,
+                )?,
+            })),
+            Err(RuntimeErrorV0::Discovery(
+                oxideloop_kube_transport::TransportErrorV0::WatchGone
+                | oxideloop_kube_transport::TransportErrorV0::WatchOverflow,
+            )) => Ok(Some(BufferedRetainedWatchV0::RestartRequired {
+                port_identity: self.identity,
+                barrier: self.barrier,
+            })),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 impl<R> RenderExecutionPortV0<'_, R> {
     /// Executes a render/discovery pass from the actor-issued capability.  It
     /// has no actor reference; only the matching reunited concrete port can
@@ -1038,7 +1153,7 @@ impl<R> RenderExecutionPortV0<'_, R> {
     pub(crate) async fn reconcile_for_capability(
         &mut self,
         capability: RenderCommandCapabilityV0,
-    ) -> Result<FixedPointResultV0, RuntimeErrorV0>
+    ) -> Result<RenderExecutionOutcomeV0, RuntimeErrorV0>
     where
         R: RendererPortV0,
     {
@@ -1047,7 +1162,10 @@ impl<R> RenderExecutionPortV0<'_, R> {
                 "render capability port identity mismatch".into(),
             ));
         }
+        self.root_namespace = Some(capability.root_namespace().into());
         let mut result = reconcile_fixed_point(self, capability.input().clone()).await?;
+        let (coverage, coverage_hash) = capability.coverage_plan(result.output())?;
+        self.replace_with_union(&result, coverage.clone()).await?;
         let retained = self.retained.as_ref().ok_or_else(|| {
             RuntimeErrorV0::Hold("fixed-point result has no retained observation barrier".into())
         })?;
@@ -1056,9 +1174,86 @@ impl<R> RenderExecutionPortV0<'_, R> {
                 "render capability retained barrier changed".into(),
             ));
         }
-        result.provenance = Some(capability.complete(retained.incarnation));
-        Ok(result)
+        if result.input.observations != retained.renderer_observations() {
+            return Ok(RenderExecutionOutcomeV0::CoverageChanged(
+                CoverageChangedV0::new(
+                    self.identity,
+                    self.barrier,
+                    retained.incarnation,
+                    GenuineChangeV0::from_observations(
+                        &retained.renderer_observations(),
+                        self.barrier,
+                        retained.incarnation,
+                    )?,
+                ),
+            ));
+        }
+        result.provenance =
+            Some(capability.complete(retained.incarnation, coverage, coverage_hash));
+        Ok(RenderExecutionOutcomeV0::Stable(Box::new(result)))
     }
+
+    async fn replace_with_union(
+        &mut self,
+        result: &FixedPointResultV0,
+        coverage: Vec<Dependency>,
+    ) -> Result<(), RuntimeErrorV0> {
+        if self.transport.is_none() {
+            let retained = self.retained.as_mut().ok_or_else(|| {
+                RuntimeErrorV0::Hold(
+                    "fixed-point result has no retained observation barrier".into(),
+                )
+            })?;
+            let renderer_dependencies = normalize_dependencies(result.dependencies())?;
+            let coverage_dependencies = normalize_dependencies(&coverage)?;
+            let mut union = renderer_dependencies.clone();
+            union.extend(coverage_dependencies.clone());
+            retained.barrier.dependencies = normalize_dependencies(&union)?;
+            retained.renderer_dependencies = renderer_dependencies;
+            retained.coverage_dependencies = coverage_dependencies;
+            return Ok(());
+        }
+        let transport = self.transport.expect("none handled above");
+        self.next_retained_incarnation = self
+            .next_retained_incarnation
+            .checked_add(1)
+            .ok_or_else(|| RuntimeErrorV0::Hold("retained barrier incarnation overflow".into()))?;
+        self.retained = Some(
+            establish_union_retained(
+                transport,
+                result.dependencies(),
+                coverage,
+                self.barrier,
+                self.next_retained_incarnation,
+            )
+            .await?,
+        );
+        Ok(())
+    }
+}
+
+async fn establish_union_retained(
+    transport: &KubeTransportV0,
+    renderer_dependencies: &[Dependency],
+    coverage_dependencies: Vec<Dependency>,
+    barrier: BarrierV0,
+    incarnation: u64,
+) -> Result<RetainedObservationBarrierV0, RuntimeErrorV0> {
+    let renderer_dependencies = normalize_dependencies(renderer_dependencies)?;
+    let coverage_dependencies = normalize_dependencies(&coverage_dependencies)?;
+    let mut union = renderer_dependencies.clone();
+    union.extend(coverage_dependencies.clone());
+    let union = normalize_dependencies(&union)?;
+    let barrier = establish_dependencies_async(transport, &union, barrier).await?;
+    let mut retained = RetainedObservationBarrierV0::with_union(
+        barrier,
+        incarnation,
+        renderer_dependencies,
+        coverage_dependencies,
+    );
+    // Any ready event after the reread belongs to this new coverage barrier.
+    retained.drain_buffered_events()?;
+    Ok(retained)
 }
 
 #[async_trait]
@@ -1085,9 +1280,15 @@ impl<R: RendererPortV0> FixedPointPortV0 for RenderExecutionPortV0<'_, R> {
         &mut self,
         dependencies: &[oxideloop_renderer_abi::model::Dependency],
     ) -> Result<Vec<Observation>, RuntimeErrorV0> {
+        let namespace = self.root_namespace.as_deref().ok_or_else(|| {
+            RuntimeErrorV0::Hold(
+                "renderer dependency plan lacks an authorized root namespace".into(),
+            )
+        })?;
+        let dependencies = renderer_dependency_plan(dependencies, namespace)?;
         #[cfg(test)]
         let barrier = if let Some(barrier) = self.test_barrier.take() {
-            if normalize_dependencies(dependencies)? != barrier.dependencies {
+            if dependencies != barrier.dependencies {
                 return Err(RuntimeErrorV0::Hold(
                     "test fixed-point barrier dependencies do not match render output".into(),
                 ));
@@ -1099,7 +1300,7 @@ impl<R: RendererPortV0> FixedPointPortV0 for RenderExecutionPortV0<'_, R> {
                     "test-only fixed-point port cannot establish dependencies".into(),
                 )
             })?;
-            establish_dependencies_async(transport, dependencies, self.barrier).await?
+            establish_dependencies_async(transport, &dependencies, self.barrier).await?
         };
         #[cfg(not(test))]
         let barrier = {
@@ -1108,7 +1309,7 @@ impl<R: RendererPortV0> FixedPointPortV0 for RenderExecutionPortV0<'_, R> {
                     "test-only fixed-point port cannot establish dependencies".into(),
                 )
             })?;
-            establish_dependencies_async(transport, dependencies, self.barrier).await?
+            establish_dependencies_async(transport, &dependencies, self.barrier).await?
         };
         self.next_retained_incarnation = self
             .next_retained_incarnation
@@ -1136,23 +1337,63 @@ impl<R: RendererPortV0> FixedPointPortV0 for RenderExecutionPortV0<'_, R> {
 }
 
 impl RetainedWatchCollectorV0 {
+    /// Drains only records already available from the split port's old
+    /// retained barrier.  The driver uses this at the command-completion edge
+    /// before it reunites the execution half, so a simultaneously-ready old
+    /// watch can never be discarded as though the command were still current.
+    pub(crate) fn drain_ready_retained_watch(
+        &mut self,
+    ) -> Result<Option<BufferedRetainedWatchV0>, RuntimeErrorV0> {
+        let Some(retained) = self.retained.as_mut() else {
+            return Ok(None);
+        };
+        if retained.barrier.generation != self.barrier {
+            return Ok(Some(BufferedRetainedWatchV0::RestartRequired {
+                port_identity: self.identity,
+                barrier: self.barrier,
+            }));
+        }
+        let changed = match retained.drain_buffered_events() {
+            Ok(changed) => changed,
+            Err(RuntimeErrorV0::Discovery(
+                oxideloop_kube_transport::TransportErrorV0::WatchGone
+                | oxideloop_kube_transport::TransportErrorV0::WatchOverflow,
+            )) => {
+                return Ok(Some(BufferedRetainedWatchV0::RestartRequired {
+                    port_identity: self.identity,
+                    barrier: self.barrier,
+                }));
+            }
+            Err(error) => return Err(error),
+        };
+        if !changed {
+            return Ok(None);
+        }
+        Ok(Some(BufferedRetainedWatchV0::Change {
+            port_identity: self.identity,
+            barrier: self.barrier,
+            change: GenuineChangeV0::from_observations(
+                &retained.observations(),
+                retained.barrier.generation,
+                retained.incarnation,
+            )?,
+        }))
+    }
+
     /// Receives exactly one sealed old-barrier dependency record without an
     /// actor borrow.  A render with no prior stable dependencies has nothing
     /// to collect, so it remains pending rather than manufacturing a restart.
     pub(crate) async fn await_buffered_retained_watch(
         &mut self,
     ) -> Result<BufferedRetainedWatchV0, RuntimeErrorV0> {
+        if let Some(record) = self.drain_ready_retained_watch()? {
+            return Ok(record);
+        }
         let Some(retained) = self.retained.as_mut() else {
             return std::future::pending().await;
         };
-        if retained.barrier.generation != self.barrier {
-            return Ok(BufferedRetainedWatchV0::RestartRequired {
-                port_identity: self.identity,
-                barrier: self.barrier,
-            });
-        }
-        let changed = match retained.drain_buffered_events() {
-            Ok(changed) => changed,
+        match retained.await_change().await {
+            Ok(()) => {}
             Err(RuntimeErrorV0::Discovery(
                 oxideloop_kube_transport::TransportErrorV0::WatchGone
                 | oxideloop_kube_transport::TransportErrorV0::WatchOverflow,
@@ -1163,30 +1404,11 @@ impl RetainedWatchCollectorV0 {
                 });
             }
             Err(error) => return Err(error),
-        };
-        if !changed {
-            match retained.await_change().await {
-                Ok(()) => {}
-                Err(RuntimeErrorV0::Discovery(
-                    oxideloop_kube_transport::TransportErrorV0::WatchGone
-                    | oxideloop_kube_transport::TransportErrorV0::WatchOverflow,
-                )) => {
-                    return Ok(BufferedRetainedWatchV0::RestartRequired {
-                        port_identity: self.identity,
-                        barrier: self.barrier,
-                    });
-                }
-                Err(error) => return Err(error),
-            }
         }
-        Ok(BufferedRetainedWatchV0::Change {
-            port_identity: self.identity,
-            barrier: self.barrier,
-            change: GenuineChangeV0::from_observations(
-                &retained.observations(),
-                retained.barrier.generation,
-                retained.incarnation,
-            )?,
+        self.drain_ready_retained_watch()?.ok_or_else(|| {
+            RuntimeErrorV0::Hold(
+                "retained watch woke without producing a retained observation result".into(),
+            )
         })
     }
 }
@@ -1206,6 +1428,8 @@ struct RetainedObservationBarrierV0 {
     barrier: ObservationBarrierV0,
     incarnation: u64,
     latest: BTreeMap<ObservationKeyV0, CoalescedWatchStateV0>,
+    renderer_dependencies: Vec<Dependency>,
+    coverage_dependencies: Vec<Dependency>,
 }
 
 impl RetainedObservationBarrierV0 {
@@ -1215,10 +1439,28 @@ impl RetainedObservationBarrierV0 {
     }
 
     fn with_incarnation(barrier: ObservationBarrierV0, incarnation: u64) -> Self {
+        let renderer_dependencies = barrier.dependencies.clone();
         Self {
             barrier,
             incarnation,
             latest: BTreeMap::new(),
+            renderer_dependencies,
+            coverage_dependencies: Vec::new(),
+        }
+    }
+
+    fn with_union(
+        barrier: ObservationBarrierV0,
+        incarnation: u64,
+        renderer_dependencies: Vec<Dependency>,
+        coverage_dependencies: Vec<Dependency>,
+    ) -> Self {
+        Self {
+            barrier,
+            incarnation,
+            latest: BTreeMap::new(),
+            renderer_dependencies,
+            coverage_dependencies,
         }
     }
 
@@ -1260,6 +1502,15 @@ impl RetainedObservationBarrierV0 {
     }
 
     fn record(&mut self, event: WatchEventV0) -> bool {
+        let reference = match &event {
+            WatchEventV0::Added(object)
+            | WatchEventV0::Modified(object)
+            | WatchEventV0::Deleted(object) => &object.reference,
+            WatchEventV0::Bookmark { .. } => return false,
+        };
+        if !self.tracks(reference) {
+            return false;
+        }
         match event {
             WatchEventV0::Added(object) | WatchEventV0::Modified(object) => {
                 let key = observation_key(&object.reference);
@@ -1305,9 +1556,33 @@ impl RetainedObservationBarrierV0 {
     }
 
     fn present_identity(&self, key: &ObservationKeyV0) -> Option<(String, String)> {
-        self.final_objects()
-            .get(key)
-            .and_then(Option::as_ref)
+        if let Some(state) = self.latest.get(key) {
+            return match state {
+                CoalescedWatchStateV0::Present(object) => Some((
+                    object.metadata.uid.clone(),
+                    object.metadata.resource_version.clone(),
+                )),
+                CoalescedWatchStateV0::Tombstone(_) => None,
+            };
+        }
+        let reference = reference_from_observation_key(key);
+        if let Some(object) = self
+            .barrier
+            .objects
+            .iter()
+            .find_map(|(candidate, object)| (candidate == &reference).then_some(object.as_ref()))
+            .flatten()
+        {
+            return Some((
+                object.metadata.uid.clone(),
+                object.metadata.resource_version.clone(),
+            ));
+        }
+        self.barrier
+            .collections
+            .values()
+            .flat_map(|list| &list.items)
+            .find(|object| observation_key(&object.reference) == *key)
             .map(|object| {
                 (
                     object.metadata.uid.clone(),
@@ -1332,6 +1607,49 @@ impl RetainedObservationBarrierV0 {
         observations
     }
 
+    fn renderer_observations(&self) -> Vec<Observation> {
+        let mut observations = self
+            .renderer_final_objects()
+            .into_iter()
+            .map(|(key, object)| match object {
+                Some(object) => renderer_observation(object),
+                None => absent_observation(&reference_from_observation_key(&key)),
+            })
+            .collect::<Vec<_>>();
+        observations.sort_by(observation_sort_key);
+        observations
+    }
+
+    fn dependencies_cover(dependencies: &[Dependency], reference: &ObjectRefV0) -> bool {
+        dependencies.iter().any(|dependency| match dependency {
+            Dependency::Collection {
+                api_version,
+                kind,
+                namespace,
+                ..
+            } => {
+                resource(api_version, kind).ok() == Some(reference.resource)
+                    && namespace == &reference.namespace
+            }
+            Dependency::Object {
+                api_version,
+                kind,
+                namespace,
+                name,
+                ..
+            } => {
+                resource(api_version, kind).ok() == Some(reference.resource)
+                    && namespace == &reference.namespace
+                    && name == &reference.name
+            }
+        })
+    }
+
+    fn tracks(&self, reference: &ObjectRefV0) -> bool {
+        Self::dependencies_cover(&self.renderer_dependencies, reference)
+            || Self::dependencies_cover(&self.coverage_dependencies, reference)
+    }
+
     fn final_objects(&self) -> BTreeMap<ObservationKeyV0, Option<ObjectV0>> {
         let mut final_objects = BTreeMap::new();
         for list in self.barrier.collections.values() {
@@ -1353,6 +1671,45 @@ impl RetainedObservationBarrierV0 {
             }
         }
         final_objects
+    }
+
+    /// Reconstruct the renderer's D view without allowing C's exact
+    /// desired/inventory reads to overwrite a collection member or invent an
+    /// absent object. The union map remains authoritative only for fencing.
+    fn renderer_final_objects(&self) -> BTreeMap<ObservationKeyV0, Option<ObjectV0>> {
+        let mut objects = BTreeMap::new();
+        for list in self.barrier.collections.values() {
+            for object in &list.items {
+                if Self::dependencies_cover(&self.renderer_dependencies, &object.reference) {
+                    objects.insert(observation_key(&object.reference), Some(object.clone()));
+                }
+            }
+        }
+        for (reference, object) in &self.barrier.objects {
+            if self.renderer_dependencies.iter().any(|dependency| {
+                matches!(dependency,
+                    Dependency::Object { api_version, kind, namespace, name, .. }
+                        if resource(api_version, kind).ok() == Some(reference.resource)
+                            && namespace == &reference.namespace && name == &reference.name
+                )
+            }) {
+                objects.insert(observation_key(reference), object.clone());
+            }
+        }
+        for (key, state) in &self.latest {
+            let reference = reference_from_observation_key(key);
+            if !Self::dependencies_cover(&self.renderer_dependencies, &reference) {
+                continue;
+            }
+            objects.insert(
+                key.clone(),
+                match state {
+                    CoalescedWatchStateV0::Present(object) => Some(object.clone()),
+                    CoalescedWatchStateV0::Tombstone(_) => None,
+                },
+            );
+        }
+        objects
     }
 
     fn covers(&self, reference: &ObjectRefV0) -> bool {
@@ -1437,13 +1794,20 @@ impl RetainedObservationBarrierV0 {
                     .into(),
             ));
         }
-        let dependencies = normalize_dependencies(&session.dependencies)?;
-        if dependencies != self.barrier.dependencies {
+        let renderer_dependencies = normalize_dependencies(&session.dependencies)?;
+        let coverage_dependencies = normalize_dependencies(&session.coverage_dependencies)?;
+        let mut requested_dependencies = renderer_dependencies.clone();
+        requested_dependencies.extend(coverage_dependencies.clone());
+        let dependencies = normalize_dependencies(&requested_dependencies)?;
+        if renderer_dependencies != self.renderer_dependencies
+            || coverage_dependencies != self.coverage_dependencies
+            || dependencies != self.barrier.dependencies
+        {
             return Err(RuntimeErrorV0::Hold(
                 "completed observation fence dependencies do not match the retained barrier".into(),
             ));
         }
-        let renderer_observations = self.observations();
+        let renderer_observations = self.renderer_observations();
         let desired_observations = self.desired_observations(
             &session.root,
             &session.root_uid,
@@ -1747,6 +2111,7 @@ fn deletion_object_identity(object: &ObjectV0) -> Result<ObjectIdentity, Runtime
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::{
         collections::BTreeMap,
         sync::{
@@ -1755,6 +2120,8 @@ mod tests {
         },
     };
 
+    use http::{Request, Response};
+    use kube::{Client, client::Body};
     use oxideloop_controller_api::{
         InventoryEntry, OxideLoopStateSpec, ProgramBundleReference, PruneCandidate,
         PruneObservation, RootBinding, STATE_VERSION_V1, StateBody, StateLink, WebApplicationSpec,
@@ -1768,6 +2135,7 @@ mod tests {
         Dependency, RenderDisposition, ResourceDeclaration, RootProjection,
     };
     use serde_json::json;
+    use tower::service_fn;
 
     use crate::FixedPointResultV0;
 
@@ -1856,6 +2224,26 @@ mod tests {
                 "kind": "ConfigMap",
                 "metadata": {"name": name, "namespace": "ns"},
                 "data": {"rv": resource_version},
+            }),
+        }
+    }
+
+    fn service_object(name: &str, uid: &str, resource_version: &str) -> ObjectV0 {
+        ObjectV0 {
+            reference: ObjectRefV0 {
+                resource: ResourceKindV0::Service,
+                namespace: "ns".into(),
+                name: name.into(),
+            },
+            metadata: ObjectMetaV0 {
+                uid: uid.into(),
+                resource_version: resource_version.into(),
+                annotations: BTreeMap::new(),
+                owner_uids: vec!["root-uid".into()],
+            },
+            value: json!({
+                "apiVersion": "v1", "kind": "Service",
+                "metadata": {"name": name, "namespace": "ns"}
             }),
         }
     }
@@ -2043,31 +2431,42 @@ mod tests {
 
     fn arm_completed_fence(
         actor: &mut RootActorV0,
-        port: &KubeFixedPointPortV0<'_, ()>,
+        port: &mut KubeFixedPointPortV0<'_, ()>,
         result: &mut FixedPointResultV0,
     ) {
         result.input.observations = port
             .retained
             .as_ref()
             .expect("test retained barrier")
-            .observations();
+            .renderer_observations();
         owned_render(actor, result.input());
         let capability = actor
             .issue_render_capability(result.input.clone(), port.identity)
             .expect("test render request pins exact input");
-        result.provenance = Some(
-            capability.complete(
-                port.retained
-                    .as_ref()
-                    .expect("test retained barrier")
-                    .incarnation,
-            ),
-        );
+        let (coverage, coverage_hash) = capability
+            .coverage_plan(result.output())
+            .expect("test final coverage is valid");
+        let retained = port.retained.as_mut().expect("test retained barrier");
+        let mut union = retained.renderer_dependencies.clone();
+        union.extend(coverage.clone());
+        retained.barrier.dependencies =
+            normalize_dependencies(&union).expect("test union normalizes");
+        retained.coverage_dependencies = coverage.clone();
+        let incarnation = retained.incarnation;
+        result.provenance = Some(capability.complete(incarnation, coverage, coverage_hash));
         port.bind_completed_fixed_point_input(actor, result)
             .expect("test final input is sealed by the concrete port");
     }
 
     fn retained_with(object: ObjectV0) -> RetainedObservationBarrierV0 {
+        let dependencies = vec![Dependency::Collection {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: "ns".into(),
+            selector: String::new(),
+            collection_revision: "1".into(),
+            observation_token: "test-token".into(),
+        }];
         let mut collections = BTreeMap::new();
         collections.insert(
             (ResourceKindV0::ConfigMap, "ns".into()),
@@ -2081,11 +2480,166 @@ mod tests {
                 generation: 1,
                 cache_epoch: 4,
             },
-            dependencies: vec![],
+            dependencies,
             collections,
             objects: vec![],
             watches: vec![],
         })
+    }
+
+    #[test]
+    fn union_coverage_tracks_only_exact_c_names_and_keeps_renderer_projection_d_only() {
+        let d = vec![Dependency::Collection {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: "ns".into(),
+            selector: String::new(),
+            collection_revision: "rv".into(),
+            observation_token: "t".into(),
+        }];
+        let c = vec![Dependency::Object {
+            api_version: "v1".into(),
+            kind: "Service".into(),
+            namespace: "ns".into(),
+            name: "managed".into(),
+            uid: None,
+            resource_version: None,
+            observation_token: "t".into(),
+        }];
+        let mut collections = retained_collections();
+        collections.insert(
+            (ResourceKindV0::Service, "ns".into()),
+            ListV0 {
+                items: vec![service_object("managed", "service-uid", "1")],
+                resource_version: "1".into(),
+            },
+        );
+        let mut union = d.clone();
+        union.extend(c.clone());
+        let mut retained = RetainedObservationBarrierV0::with_union(
+            ObservationBarrierV0 {
+                generation: BarrierV0 {
+                    generation: 9,
+                    cache_epoch: 1,
+                },
+                dependencies: normalize_dependencies(&union).unwrap(),
+                collections,
+                objects: vec![],
+                watches: vec![],
+            },
+            7,
+            d,
+            c,
+        );
+        assert_eq!(retained.renderer_observations().len(), 1);
+        assert!(!retained.record(WatchEventV0::Modified(service_object(
+            "unrelated",
+            "other",
+            "2"
+        ))));
+        assert!(retained.record(WatchEventV0::Modified(service_object(
+            "managed",
+            "service-uid",
+            "2"
+        ))));
+        assert!(retained.record(WatchEventV0::Deleted(service_object(
+            "managed",
+            "service-uid",
+            "3"
+        ))));
+        assert!(retained.record(WatchEventV0::Added(service_object(
+            "managed",
+            "replacement",
+            "4"
+        ))));
+        assert_eq!(retained.renderer_observations().len(), 1);
+    }
+
+    #[test]
+    fn renderer_projection_keeps_d_origin_separate_from_exact_c_reads() {
+        let barrier = BarrierV0 {
+            generation: 9,
+            cache_epoch: 1,
+        };
+        let collection_d = vec![Dependency::Collection {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: "ns".into(),
+            selector: String::new(),
+            collection_revision: "rv".into(),
+            observation_token: "t".into(),
+        }];
+        let exact = reference("config");
+        let exact_c = vec![Dependency::Object {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: "ns".into(),
+            name: "config".into(),
+            uid: None,
+            resource_version: None,
+            observation_token: "t".into(),
+        }];
+        let union = |items: Vec<ObjectV0>, object_read: Option<ObjectV0>| {
+            let mut collections = BTreeMap::new();
+            collections.insert(
+                (ResourceKindV0::ConfigMap, "ns".into()),
+                ListV0 {
+                    items,
+                    resource_version: "rv".into(),
+                },
+            );
+            let mut dependencies = collection_d.clone();
+            dependencies.extend(exact_c.clone());
+            RetainedObservationBarrierV0::with_union(
+                ObservationBarrierV0 {
+                    generation: barrier,
+                    dependencies: normalize_dependencies(&dependencies).unwrap(),
+                    collections,
+                    objects: vec![(exact.clone(), object_read)],
+                    watches: vec![],
+                },
+                1,
+                collection_d.clone(),
+                exact_c.clone(),
+            )
+        };
+
+        let absent_c = union(vec![], None);
+        assert!(
+            absent_c.renderer_observations().is_empty(),
+            "a C-only exact absence cannot invent D collection membership"
+        );
+
+        let present = object("config", "config-uid", "1");
+        let mut present_then_deleted = union(vec![present.clone()], None);
+        let projected = present_then_deleted.renderer_observations();
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].uid, "config-uid");
+        assert!(present_then_deleted.record(WatchEventV0::Deleted(object(
+            "config",
+            "config-uid",
+            "2"
+        ))));
+        let tombstone = present_then_deleted.renderer_observations();
+        assert_eq!(tombstone.len(), 1);
+        assert!(tombstone[0].value.is_null());
+
+        let exact_d = exact_c.clone();
+        let retained = RetainedObservationBarrierV0::with_union(
+            ObservationBarrierV0 {
+                generation: barrier,
+                dependencies: exact_d.clone(),
+                collections: BTreeMap::new(),
+                objects: vec![(exact, None)],
+                watches: vec![],
+            },
+            2,
+            exact_d,
+            vec![],
+        );
+        let projected = retained.renderer_observations();
+        assert_eq!(projected.len(), 1);
+        assert!(projected[0].value.is_null());
     }
 
     #[test]
@@ -2330,7 +2884,7 @@ mod tests {
         actor.barrier = barrier;
         let mut uncovered_port = KubeFixedPointPortV0::<()>::observation_only_for_test(barrier);
         uncovered_port.retained = Some(uncovered);
-        arm_completed_fence(&mut actor, &uncovered_port, &mut final_result);
+        arm_completed_fence(&mut actor, &mut uncovered_port, &mut final_result);
         assert!(matches!(
             uncovered_port.complete_observation_fence(&mut actor, &mut final_result),
             Err(RuntimeErrorV0::Hold(_))
@@ -2359,7 +2913,7 @@ mod tests {
         let mut first_result = fixed_final_result(dependencies.clone());
         let mut first_actor = fenced_actor(vec![inventory.clone()], None);
         first_actor.barrier = barrier;
-        arm_completed_fence(&mut first_actor, &port, &mut first_result);
+        arm_completed_fence(&mut first_actor, &mut port, &mut first_result);
         let CompletedObservationFenceOutcomeV0::Completed(first) = port
             .complete_observation_fence(&mut first_actor, &mut first_result)
             .expect("the real completion path drains and covers desired plus inventory")
@@ -2382,7 +2936,7 @@ mod tests {
         let mut second_result = fixed_final_result(dependencies.clone());
         let mut second_actor = fenced_actor(vec![inventory.clone()], None);
         second_actor.barrier = barrier;
-        arm_completed_fence(&mut second_actor, &port, &mut second_result);
+        arm_completed_fence(&mut second_actor, &mut port, &mut second_result);
         let CompletedObservationFenceOutcomeV0::Completed(second) = port
             .complete_observation_fence(&mut second_actor, &mut second_result)
             .expect("an unchanged snapshot still completes a distinct fence")
@@ -2421,7 +2975,7 @@ mod tests {
         let mut restarted_port = KubeFixedPointPortV0::<()>::observation_only_for_test(barrier);
         restarted_port.retained = Some(restarted);
         let mut restart_result = fixed_final_result(dependencies);
-        arm_completed_fence(&mut restart_actor, &restarted_port, &mut restart_result);
+        arm_completed_fence(&mut restart_actor, &mut restarted_port, &mut restart_result);
         let CompletedObservationFenceOutcomeV0::Completed(after_restart) = restarted_port
             .complete_observation_fence(&mut restart_actor, &mut restart_result)
             .expect("a durable first prune token is skipped after restart")
@@ -2461,6 +3015,16 @@ mod tests {
         KubeFixedPointPortV0<'static, StableRendererV0>,
         FixedPointResultV0,
     ) {
+        split_result_with_discovered_observations_and_inventory(vec![]).await
+    }
+
+    async fn split_result_with_discovered_observations_and_inventory(
+        inventory: Vec<InventoryEntry>,
+    ) -> (
+        RootActorV0,
+        KubeFixedPointPortV0<'static, StableRendererV0>,
+        FixedPointResultV0,
+    ) {
         let barrier = BarrierV0 {
             generation: 9,
             cache_epoch: 4,
@@ -2481,7 +3045,7 @@ mod tests {
             objects: vec![],
             watches: vec![],
         };
-        let mut actor = fenced_actor(vec![], None);
+        let mut actor = fenced_actor(inventory, None);
         actor.barrier = barrier;
         owned_render(&mut actor, template.input());
         let port = KubeFixedPointPortV0::fixed_point_for_test(
@@ -2500,13 +3064,458 @@ mod tests {
             .reconcile_for_capability(capability)
             .await
             .expect("split path reaches a stable fixed point");
+        let RenderExecutionOutcomeV0::Stable(result) = result else {
+            panic!("split test fixture must stabilize its D projection");
+        };
         let port = KubeFixedPointPortV0::reunite_after_render(execution, collector, reunion)
             .expect("matching split halves reunite");
         assert!(
             !result.input().observations.is_empty(),
             "the test must exercise the final discovered-observations handoff"
         );
-        (actor, port, result)
+        (actor, port, *result)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn union_observation_uses_real_transport_once_per_parent_and_exact_rereads() {
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&paths);
+        let service = service_fn(move |request: Request<Body>| {
+            let recorded = Arc::clone(&recorded);
+            async move {
+                let path = request.uri().path().to_owned();
+                recorded.lock().expect("path lock").push(path.clone());
+                let body = if path.ends_with("/configmaps") {
+                    json!({"apiVersion":"v1","kind":"ConfigMapList","metadata":{"resourceVersion":"cm-list"},"items":[]})
+                } else if path.ends_with("/services") {
+                    json!({"apiVersion":"v1","kind":"ServiceList","metadata":{"resourceVersion":"svc-list"},"items":[]})
+                } else if path.ends_with("/configmaps/removed") {
+                    json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"removed","namespace":"ns","uid":"cm-uid","resourceVersion":"cm-rv"}})
+                } else if path.ends_with("/services/managed") {
+                    json!({"apiVersion":"v1","kind":"Service","metadata":{"name":"managed","namespace":"ns","uid":"svc-uid","resourceVersion":"svc-rv"}})
+                } else {
+                    panic!("unexpected U request {path}");
+                };
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .header(http::header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_vec(&body).expect("wire JSON")))
+                        .expect("wire response"),
+                )
+            }
+        });
+        let transport = oxideloop_kube_transport::KubeTransportV0::test_from_client(Client::new(
+            service, "default",
+        ));
+        let mut watch_senders = Vec::new();
+        for _ in 0..2 {
+            let (sender, watch) = oxideloop_kube_transport::WatchHandleV0::test_channel(1);
+            watch_senders.push(sender);
+            transport.test_push_watch(watch);
+        }
+        let d = vec![Dependency::Collection {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: "ns".into(),
+            selector: String::new(),
+            collection_revision: "d".into(),
+            observation_token: "t".into(),
+        }];
+        let c = vec![
+            Dependency::Object {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                name: "removed".into(),
+                uid: None,
+                resource_version: None,
+                observation_token: "t".into(),
+            },
+            Dependency::Object {
+                api_version: "v1".into(),
+                kind: "Service".into(),
+                namespace: "ns".into(),
+                name: "managed".into(),
+                uid: None,
+                resource_version: None,
+                observation_token: "t".into(),
+            },
+        ];
+        let retained = establish_union_retained(
+            &transport,
+            &d,
+            c,
+            BarrierV0 {
+                generation: 7,
+                cache_epoch: 1,
+            },
+            41,
+        )
+        .await
+        .expect("real U barrier");
+        assert_eq!(retained.incarnation, 41);
+        assert_eq!(
+            retained.renderer_dependencies,
+            normalize_dependencies(&d).unwrap()
+        );
+        assert_eq!(retained.coverage_dependencies.len(), 2);
+        assert_eq!(watch_senders.len(), 2);
+        assert!(
+            retained
+                .renderer_observations()
+                .iter()
+                .all(|observation| observation.kind != "Service")
+        );
+        assert_eq!(
+            retained
+                .barrier
+                .objects
+                .iter()
+                .map(|(reference, _)| reference.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["removed", "managed"]
+        );
+        assert_eq!(
+            paths.lock().unwrap().as_slice(),
+            [
+                "/api/v1/namespaces/ns/configmaps",
+                "/api/v1/namespaces/ns/services",
+                "/api/v1/namespaces/ns/configmaps",
+                "/api/v1/namespaces/ns/services",
+                "/api/v1/namespaces/ns/configmaps/removed",
+                "/api/v1/namespaces/ns/services/managed",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn actor_capability_builds_real_union_from_desired_and_inventory_without_d_leakage() {
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&paths);
+        let service = service_fn(move |request: Request<Body>| {
+            let recorded = Arc::clone(&recorded);
+            async move {
+                let path = request.uri().path().to_owned();
+                recorded.lock().expect("path lock").push(path.clone());
+                if path.ends_with("/configmaps") {
+                    return Ok::<_, std::convert::Infallible>(
+                        Response::builder()
+                            .header(http::header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                serde_json::to_vec(&json!({
+                                    "apiVersion":"v1",
+                                    "kind":"ConfigMapList",
+                                    "metadata":{"resourceVersion":"cm-list"},
+                                    "items":[]
+                                }))
+                                .expect("ConfigMap list"),
+                            ))
+                            .expect("ConfigMap response"),
+                    );
+                }
+                if path.ends_with("/services") {
+                    return Ok::<_, std::convert::Infallible>(
+                        Response::builder()
+                            .header(http::header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                serde_json::to_vec(&json!({
+                                    "apiVersion":"v1",
+                                    "kind":"ServiceList",
+                                    "metadata":{"resourceVersion":"svc-list"},
+                                    "items":[]
+                                }))
+                                .expect("Service list"),
+                            ))
+                            .expect("Service response"),
+                    );
+                }
+                if path.ends_with("/configmaps/removed") || path.ends_with("/services/managed") {
+                    return Ok::<_, std::convert::Infallible>(
+                        Response::builder()
+                            .status(404)
+                            .header(http::header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                serde_json::to_vec(&json!({
+                                    "apiVersion":"v1",
+                                    "kind":"Status",
+                                    "status":"Failure",
+                                    "reason":"NotFound",
+                                    "code":404
+                                }))
+                                .expect("not found"),
+                            ))
+                            .expect("not-found response"),
+                    );
+                }
+                panic!("unexpected capability U request {path}");
+            }
+        });
+        let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
+        let mut watch_senders = Vec::new();
+        for _ in 0..3 {
+            let (sender, watch) = oxideloop_kube_transport::WatchHandleV0::test_channel(1);
+            watch_senders.push(sender);
+            transport.test_push_watch(watch);
+        }
+
+        let d = vec![Dependency::Collection {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: "ns".into(),
+            selector: String::new(),
+            collection_revision: "d".into(),
+            observation_token: "global-token".into(),
+        }];
+        let inventory = InventoryEntry {
+            identity: ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                name: "removed".into(),
+            },
+            logical_id: "removed".into(),
+            uid: "removed-uid".into(),
+            resource_version: "removed-rv".into(),
+            bundle_digest: "a".repeat(64),
+        };
+        let mut template = fixed_final_result(d.clone());
+        template.output.resources = vec![ResourceDeclaration {
+            logical_id: "managed".into(),
+            object: json!({
+                "apiVersion":"v1",
+                "kind":"Service",
+                "metadata":{"name":"managed","namespace":"ns"},
+                "spec":{"selector":{"app":"demo"},"ports":[{"port":80}]}
+            }),
+            readiness: None,
+        }];
+        let mut actor = fenced_actor(vec![inventory], None);
+        actor.barrier = BarrierV0 {
+            generation: 9,
+            cache_epoch: 4,
+        };
+        owned_render(&mut actor, template.input());
+        let port = KubeFixedPointPortV0::new(
+            &transport,
+            StableRendererV0 {
+                output: template.output.clone(),
+            },
+            test_descriptor(),
+            actor.barrier(),
+        );
+        let capability = actor
+            .issue_render_capability(template.input.clone(), port.identity())
+            .expect("actor issues the only C-authoritative capability");
+        let (mut execution, collector, reunion) = port.split_for_render();
+        let outcome = execution
+            .reconcile_for_capability(capability)
+            .await
+            .expect("full D then U production execution");
+        let RenderExecutionOutcomeV0::Stable(result) = outcome else {
+            panic!("C-only absences must not force a D coverage restart");
+        };
+        assert!(result.input().observations.is_empty());
+        let retained = execution.retained.as_ref().expect("production U retained");
+        assert_eq!(retained.incarnation, 2);
+        assert!(retained.renderer_observations().is_empty());
+        assert_eq!(retained.coverage_dependencies.len(), 2);
+        assert!(retained.coverage_dependencies.iter().any(|dependency| matches!(dependency,
+            Dependency::Object { kind, name, .. } if kind == "ConfigMap" && name == "removed"
+        )));
+        assert!(
+            retained
+                .coverage_dependencies
+                .iter()
+                .any(|dependency| matches!(dependency,
+                    Dependency::Object { kind, name, .. } if kind == "Service" && name == "managed"
+                ))
+        );
+        assert_eq!(retained.barrier.watches.len(), 2);
+        let _port = KubeFixedPointPortV0::reunite_after_render(execution, collector, reunion)
+            .expect("full capability path reunites");
+        assert_eq!(watch_senders.len(), 3);
+        assert_eq!(
+            paths.lock().unwrap().as_slice(),
+            [
+                "/api/v1/namespaces/ns/configmaps",
+                "/api/v1/namespaces/ns/configmaps",
+                "/api/v1/namespaces/ns/configmaps",
+                "/api/v1/namespaces/ns/services",
+                "/api/v1/namespaces/ns/configmaps",
+                "/api/v1/namespaces/ns/services",
+                "/api/v1/namespaces/ns/configmaps/removed",
+                "/api/v1/namespaces/ns/services/managed",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn invalid_d_or_c_stops_production_execution_before_disallowed_io() {
+        let invalid_d = [
+            Dependency::Object {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "foreign".into(),
+                name: "x".into(),
+                uid: None,
+                resource_version: None,
+                observation_token: "global-token".into(),
+            },
+            Dependency::Object {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                name: String::new(),
+                uid: None,
+                resource_version: None,
+                observation_token: "global-token".into(),
+            },
+            Dependency::Object {
+                api_version: "v1".into(),
+                kind: "Secret".into(),
+                namespace: "ns".into(),
+                name: "x".into(),
+                uid: None,
+                resource_version: None,
+                observation_token: "global-token".into(),
+            },
+        ];
+        for dependency in invalid_d {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let recorded = Arc::clone(&calls);
+            let service = service_fn(move |_request: Request<Body>| {
+                recorded.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    Ok::<_, std::convert::Infallible>(
+                        Response::builder()
+                            .status(500)
+                            .body(Body::from(Vec::<u8>::new()))
+                            .expect("unexpected response"),
+                    )
+                }
+            });
+            let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
+            let mut template = fixed_final_result(vec![dependency]);
+            template.output.resources.clear();
+            let mut actor = fenced_actor(vec![], None);
+            actor.barrier = BarrierV0 {
+                generation: 9,
+                cache_epoch: 4,
+            };
+            owned_render(&mut actor, template.input());
+            let port = KubeFixedPointPortV0::new(
+                &transport,
+                StableRendererV0 {
+                    output: template.output,
+                },
+                test_descriptor(),
+                actor.barrier(),
+            );
+            let capability = actor
+                .issue_render_capability(template.input, port.identity())
+                .expect("invalid D remains actor-scoped data until execution");
+            let (mut execution, _collector, _reunion) = port.split_for_render();
+            assert!(
+                execution
+                    .reconcile_for_capability(capability)
+                    .await
+                    .is_err(),
+                "invalid D must stop production execution"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+
+        let invalid_inventory = [
+            ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "foreign".into(),
+                name: "foreign".into(),
+            },
+            ObjectIdentity {
+                api_version: "runtime.oxideloop.dev/v1alpha1".into(),
+                kind: "AutomationRun".into(),
+                namespace: "ns".into(),
+                name: "unsupported".into(),
+            },
+        ];
+        for identity in invalid_inventory {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let recorded = Arc::clone(&calls);
+            let service = service_fn(move |request: Request<Body>| {
+                let recorded = Arc::clone(&recorded);
+                async move {
+                    recorded.fetch_add(1, Ordering::SeqCst);
+                    assert!(request.uri().path().ends_with("/configmaps"));
+                    Ok::<_, std::convert::Infallible>(
+                        Response::builder()
+                            .header(http::header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                serde_json::to_vec(&json!({
+                                    "apiVersion":"v1",
+                                    "kind":"ConfigMapList",
+                                    "metadata":{"resourceVersion":"d-list"},
+                                    "items":[]
+                                }))
+                                .expect("D list"),
+                            ))
+                            .expect("D response"),
+                    )
+                }
+            });
+            let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
+            let (watch_sender, watch) = oxideloop_kube_transport::WatchHandleV0::test_channel(1);
+            transport.test_push_watch(watch);
+            let d = vec![Dependency::Collection {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                selector: String::new(),
+                collection_revision: "d".into(),
+                observation_token: "global-token".into(),
+            }];
+            let template = fixed_final_result(d);
+            let mut actor = fenced_actor(vec![], None);
+            actor.barrier = BarrierV0 {
+                generation: 9,
+                cache_epoch: 4,
+            };
+            owned_render(&mut actor, template.input());
+            let port = KubeFixedPointPortV0::new(
+                &transport,
+                StableRendererV0 {
+                    output: template.output,
+                },
+                test_descriptor(),
+                actor.barrier(),
+            );
+            let mut capability = actor
+                .issue_render_capability(template.input, port.identity())
+                .expect("actor issues capability before the adversarial C mutation");
+            capability.seed.inventory = vec![InventoryEntry {
+                identity,
+                logical_id: "invalid".into(),
+                uid: "invalid-uid".into(),
+                resource_version: "invalid-rv".into(),
+                bundle_digest: "a".repeat(64),
+            }];
+            capability.seed.inventory_hash =
+                crate::inventory_hash(&capability.seed.inventory).expect("inventory hash");
+            let (mut execution, _collector, _reunion) = port.split_for_render();
+            assert!(matches!(
+                execution.reconcile_for_capability(capability).await,
+                Err(RuntimeErrorV0::Hold(_))
+            ));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "only the valid D LIST/re-LIST may run before invalid C rejection"
+            );
+            drop(watch_sender);
+        }
     }
 
     #[tokio::test]
@@ -2610,6 +3619,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_inventory_mutations_reject_binding_and_fencing_without_changing_the_pin() {
+        let entry = InventoryEntry {
+            identity: ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                name: "config".into(),
+            },
+            logical_id: "config".into(),
+            uid: "config-uid".into(),
+            resource_version: "config-rv".into(),
+            bundle_digest: "a".repeat(64),
+        };
+        let mutations: [fn(&mut InventoryEntry); 4] = [
+            |entry| entry.uid = "other-uid".into(),
+            |entry| entry.resource_version = "other-rv".into(),
+            |entry| entry.logical_id = "other-logical-id".into(),
+            |entry| entry.bundle_digest = "b".repeat(64),
+        ];
+        for mutate in mutations {
+            let (mut actor, mut port, mut result) =
+                split_result_with_discovered_observations_and_inventory(vec![entry.clone()]).await;
+            let initial = active_pin_bytes(&actor);
+            let mut changed = entry.clone();
+            mutate(&mut changed);
+            actor
+                .replace_durable_inventory_for_test(vec![changed])
+                .expect("test inventory remains a valid durable state");
+            assert!(matches!(
+                port.bind_completed_fixed_point_input(&mut actor, &result),
+                Err(RuntimeErrorV0::Hold(_))
+            ));
+            assert_eq!(active_pin_bytes(&actor), initial);
+            assert!(matches!(
+                port.complete_observation_fence(&mut actor, &mut result),
+                Err(RuntimeErrorV0::Hold(_))
+            ));
+            assert_eq!(active_pin_bytes(&actor), initial);
+        }
+    }
+
+    #[tokio::test]
+    async fn sealed_coverage_change_rejects_stale_or_forged_authority_and_supersedes_once() {
+        let (mut actor, mut port, _result) = split_result_with_discovered_observations().await;
+        let (incarnation, expected) = {
+            let retained = port
+                .retained
+                .as_ref()
+                .expect("split result retains the U barrier");
+            (
+                retained.incarnation,
+                GenuineChangeV0::from_observations(
+                    &retained.renderer_observations(),
+                    port.barrier,
+                    retained.incarnation,
+                )
+                .expect("canonical D projection"),
+            )
+        };
+        let initial = active_pin_bytes(&actor);
+        let stale_barrier = BarrierV0 {
+            generation: port.barrier.generation + 1,
+            cache_epoch: port.barrier.cache_epoch,
+        };
+        let cases = [
+            CoverageChangedV0::new(
+                port.identity + 1,
+                port.barrier,
+                incarnation,
+                expected.clone(),
+            ),
+            CoverageChangedV0::new(port.identity, stale_barrier, incarnation, expected.clone()),
+            CoverageChangedV0::new(
+                port.identity,
+                port.barrier,
+                incarnation + 1,
+                expected.clone(),
+            ),
+            CoverageChangedV0::new(
+                port.identity,
+                port.barrier,
+                incarnation,
+                GenuineChangeV0::from_observations(&[], port.barrier, incarnation)
+                    .expect("different canonical projection"),
+            ),
+        ];
+        for outcome in cases {
+            assert!(matches!(
+                port.consume_coverage_change(&mut actor, outcome),
+                Err(RuntimeErrorV0::Hold(_))
+            ));
+            assert_eq!(active_pin_bytes(&actor), initial);
+        }
+
+        let outcome = CoverageChangedV0::new(port.identity, port.barrier, incarnation, expected);
+        let before = actor.barrier();
+        assert_eq!(
+            port.consume_coverage_change(&mut actor, outcome)
+                .expect("the port consumes its own exact sealed outcome"),
+            RetainedWatchCoordinationV0::ReconcileScheduled
+        );
+        assert_eq!(actor.barrier().generation, before.generation + 1);
+        assert!(!actor.owns_render_request());
+    }
+
+    #[tokio::test]
     async fn sealed_final_input_handoff_rejects_cross_port_or_incarnation_and_root_change() {
         let (mut actor, port, result) = split_result_with_discovered_observations().await;
         let initial = active_pin_bytes(&actor);
@@ -2620,6 +3735,39 @@ mod tests {
             Err(RuntimeErrorV0::Hold(_))
         ));
         assert_eq!(active_pin_bytes(&actor), initial);
+
+        let coverage_mutators: [fn(&mut Vec<Dependency>); 2] = [
+            |coverage| {
+                coverage.clear();
+            },
+            |coverage| {
+                coverage.push(Dependency::Object {
+                    api_version: "v1".into(),
+                    kind: "Service".into(),
+                    namespace: "ns".into(),
+                    name: "extra".into(),
+                    uid: None,
+                    resource_version: None,
+                    observation_token: "global-token".into(),
+                });
+            },
+        ];
+        for mutate_coverage in coverage_mutators {
+            let (mut actor, mut port, result) = split_result_with_discovered_observations().await;
+            let initial = active_pin_bytes(&actor);
+            mutate_coverage(
+                &mut port
+                    .retained
+                    .as_mut()
+                    .expect("split result retains union coverage")
+                    .coverage_dependencies,
+            );
+            assert!(matches!(
+                port.bind_completed_fixed_point_input(&mut actor, &result),
+                Err(RuntimeErrorV0::Hold(_))
+            ));
+            assert_eq!(active_pin_bytes(&actor), initial);
+        }
 
         let mut port = port;
         port.retained = Some(empty_retained(actor.barrier(), 2));
@@ -2833,7 +3981,7 @@ mod tests {
         let mut actor = fenced_actor(vec![], None);
         actor.barrier = barrier;
         owned_render(&mut actor, template.input());
-        let mut port = KubeFixedPointPortV0::fixed_point_for_test(
+        let port = KubeFixedPointPortV0::fixed_point_for_test(
             StableRendererV0 {
                 output: template.output.clone(),
             },
@@ -2841,10 +3989,10 @@ mod tests {
             barrier,
             observation,
         );
-        let mut result = port
-            .reconcile_for_actor(&mut actor, template.input.clone())
-            .await
-            .expect("only the concrete port can attach provenance");
+        let (mut port, mut result) =
+            reconcile_split_for_test(&mut actor, port, template.input.clone())
+                .await
+                .expect("only the concrete port can attach provenance");
         assert!(
             !result.input().observations.is_empty(),
             "direct reconciliation must bind the same discovered final input"
@@ -2895,17 +4043,22 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn buffered_final_watch_change_or_invalidation_never_mints_a_fence() {
+    async fn buffered_c_only_union_watch_change_or_invalidation_never_mints_a_fence() {
         for event in [
-            Ok(WatchEventV0::Modified(object(
-                "config",
-                "uid-1",
+            Ok(WatchEventV0::Modified(service_object(
+                "managed",
+                "service-uid",
                 "changed-rv",
             ))),
-            Ok(WatchEventV0::Deleted(object(
-                "config",
-                "uid-1",
+            Ok(WatchEventV0::Deleted(service_object(
+                "managed",
+                "service-uid",
                 "deleted-rv",
+            ))),
+            Ok(WatchEventV0::Added(service_object(
+                "managed",
+                "replacement-uid",
+                "replacement-rv",
             ))),
             Err(TransportErrorV0::WatchGone),
             Err(TransportErrorV0::WatchOverflow),
@@ -2922,7 +4075,16 @@ mod tests {
                 collection_revision: "collection-rv".into(),
                 observation_token: "global-token".into(),
             }];
-            let template = fixed_final_result(dependencies.clone());
+            let mut template = fixed_final_result(dependencies.clone());
+            template.output.resources[0] = ResourceDeclaration {
+                logical_id: "managed-service".into(),
+                object: json!({
+                    "apiVersion": "v1",
+                    "kind": "Service",
+                    "metadata": {"name": "managed", "namespace": "ns"},
+                }),
+                readiness: None,
+            };
             let (sender, watch) = oxideloop_kube_transport::WatchHandleV0::test_channel(1);
             let observation = ObservationBarrierV0 {
                 generation: barrier,
@@ -2933,8 +4095,7 @@ mod tests {
             };
             let mut actor = fenced_actor(vec![], None);
             actor.barrier = barrier;
-            owned_render(&mut actor, template.input());
-            let mut port = KubeFixedPointPortV0::fixed_point_for_test(
+            let port = KubeFixedPointPortV0::fixed_point_for_test(
                 StableRendererV0 {
                     output: template.output.clone(),
                 },
@@ -2942,10 +4103,25 @@ mod tests {
                 barrier,
                 observation,
             );
-            let mut result = port
-                .reconcile_for_actor(&mut actor, template.input.clone())
-                .await
-                .expect("concrete test fixed point completes before the race");
+            template.input.observations =
+                vec![renderer_observation(object("config", "uid-1", "z-old-rv"))];
+            owned_render(&mut actor, template.input());
+            let (mut port, mut result) =
+                reconcile_split_for_test(&mut actor, port, template.input.clone())
+                    .await
+                    .expect("concrete test fixed point completes before the race");
+            port.retained
+                .as_mut()
+                .expect("test union retained barrier")
+                .barrier
+                .collections
+                .insert(
+                    (ResourceKindV0::Service, "ns".into()),
+                    ListV0 {
+                        items: vec![service_object("managed", "service-uid", "initial-rv")],
+                        resource_version: "initial-rv".into(),
+                    },
+                );
             sender.try_send(event).expect("buffer final watch event");
             let outcome = port
                 .complete_observation_fence(&mut actor, &mut result)
@@ -2984,7 +4160,7 @@ mod tests {
                 objects: vec![],
                 watches: vec![],
             };
-            let mut retry_port = KubeFixedPointPortV0::fixed_point_for_test(
+            let retry_port = KubeFixedPointPortV0::fixed_point_for_test(
                 StableRendererV0 {
                     output: template.output.clone(),
                 },
@@ -2992,10 +4168,25 @@ mod tests {
                 actor.barrier(),
                 retry_observation,
             );
-            let mut retry = retry_port
-                .reconcile_for_actor(&mut actor, retry_input)
-                .await
-                .expect("fresh fixed point after buffered watch event");
+            retry_input.observations =
+                vec![renderer_observation(object("config", "uid-1", "z-old-rv"))];
+            let (mut retry_port, mut retry) =
+                reconcile_split_for_test(&mut actor, retry_port, retry_input)
+                    .await
+                    .expect("fresh fixed point after buffered watch event");
+            retry_port
+                .retained
+                .as_mut()
+                .expect("test retry union retained barrier")
+                .barrier
+                .collections
+                .insert(
+                    (ResourceKindV0::Service, "ns".into()),
+                    ListV0 {
+                        items: vec![service_object("managed", "service-uid", "retry-rv")],
+                        resource_version: "retry-rv".into(),
+                    },
+                );
             let CompletedObservationFenceOutcomeV0::Completed(capability) = retry_port
                 .complete_observation_fence(&mut actor, &mut retry)
                 .expect("fresh full fence after buffered watch event")
@@ -3038,7 +4229,7 @@ mod tests {
             let mut actor = fenced_actor(vec![], None);
             actor.barrier = barrier;
             owned_render(&mut actor, template.input());
-            let mut port = KubeFixedPointPortV0::fixed_point_for_test(
+            let port = KubeFixedPointPortV0::fixed_point_for_test(
                 StableRendererV0 {
                     output: template.output.clone(),
                 },
@@ -3054,8 +4245,7 @@ mod tests {
                 },
             );
             assert!(matches!(
-                port.reconcile_for_actor(&mut actor, template.input.clone())
-                    .await,
+                reconcile_split_for_test(&mut actor, port, template.input.clone()).await,
                 Err(RuntimeErrorV0::Discovery(
                     TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow
                 ))
@@ -3064,7 +4254,6 @@ mod tests {
                 !actor.in_flight,
                 "watch invalidation must consume RequestRender"
             );
-            assert!(!port.has_retained_observation_barrier());
             actor.informers_ready(actor.barrier());
             let CommandV0::RequestRender { preconditions } = actor
                 .next_command()
@@ -3076,7 +4265,7 @@ mod tests {
             let mut retry_input = template.input.clone();
             retry_input.observation_token = preconditions.observation_token;
             retry_input.cache_epoch = preconditions.cache_epoch;
-            let mut retry_port = KubeFixedPointPortV0::fixed_point_for_test(
+            let retry_port = KubeFixedPointPortV0::fixed_point_for_test(
                 StableRendererV0 {
                     output: template.output.clone(),
                 },
@@ -3091,10 +4280,10 @@ mod tests {
                     watches: vec![],
                 },
             );
-            let mut retry = retry_port
-                .reconcile_for_actor(&mut actor, retry_input)
-                .await
-                .expect("fresh fixed point after initial invalidation");
+            let (mut retry_port, mut retry) =
+                reconcile_split_for_test(&mut actor, retry_port, retry_input)
+                    .await
+                    .expect("fresh fixed point after initial invalidation");
             let CompletedObservationFenceOutcomeV0::Completed(capability) = retry_port
                 .complete_observation_fence(&mut actor, &mut retry)
                 .expect("fresh full fence after initial invalidation")
@@ -3197,7 +4386,14 @@ mod tests {
         let first = RetainedObservationBarrierV0::with_incarnation(
             ObservationBarrierV0 {
                 generation: barrier_one,
-                dependencies: vec![],
+                dependencies: vec![Dependency::Collection {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: "ns".into(),
+                    selector: String::new(),
+                    collection_revision: "first".into(),
+                    observation_token: "first".into(),
+                }],
                 collections: retained_collections(),
                 objects: vec![],
                 watches: vec![],
@@ -3215,7 +4411,14 @@ mod tests {
         let mut second = RetainedObservationBarrierV0::with_incarnation(
             ObservationBarrierV0 {
                 generation: actor.barrier(),
-                dependencies: vec![],
+                dependencies: vec![Dependency::Collection {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: "ns".into(),
+                    selector: String::new(),
+                    collection_revision: "second".into(),
+                    observation_token: "second".into(),
+                }],
                 collections: {
                     let mut collections = BTreeMap::new();
                     collections.insert(
@@ -3278,7 +4481,7 @@ mod tests {
             let mut port = KubeFixedPointPortV0::<()>::observation_only_for_test(barrier);
             port.retained = Some(retained);
             let mut invalid_result = fixed_final_result(vec![]);
-            arm_completed_fence(&mut actor, &port, &mut invalid_result);
+            arm_completed_fence(&mut actor, &mut port, &mut invalid_result);
             mismatch(&mut invalid_result);
             assert!(matches!(
                 port.complete_observation_fence(&mut actor, &mut invalid_result),
@@ -3301,7 +4504,7 @@ mod tests {
         let mut actor = fenced_actor(vec![], None);
         actor.barrier = barrier;
         let mut replacement_result = fixed_final_result(vec![]);
-        arm_completed_fence(&mut actor, &port, &mut replacement_result);
+        arm_completed_fence(&mut actor, &mut port, &mut replacement_result);
         let replacement_barrier = BarrierV0 {
             generation: 10,
             cache_epoch: 4,
@@ -3336,7 +4539,7 @@ mod tests {
         let mut source_port = KubeFixedPointPortV0::<()>::observation_only_for_test(barrier);
         source_port.retained = Some(empty_retained(barrier, 1));
         let mut cross_port_result = fixed_final_result(vec![]);
-        arm_completed_fence(&mut source_actor, &source_port, &mut cross_port_result);
+        arm_completed_fence(&mut source_actor, &mut source_port, &mut cross_port_result);
         let mut other_port = KubeFixedPointPortV0::<()>::observation_only_for_test(barrier);
         other_port.retained = Some(empty_retained(barrier, 1));
         assert!(matches!(
@@ -3351,7 +4554,7 @@ mod tests {
         let mut old_incarnation_result = fixed_final_result(vec![]);
         arm_completed_fence(
             &mut incarnation_actor,
-            &incarnation_port,
+            &mut incarnation_port,
             &mut old_incarnation_result,
         );
         incarnation_port.retained = Some(empty_retained(barrier, 2));

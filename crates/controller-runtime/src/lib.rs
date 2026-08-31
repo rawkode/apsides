@@ -10,7 +10,9 @@ mod driver;
 mod engine;
 #[cfg(feature = "test-failpoints")]
 pub mod failpoint_uds;
-pub(crate) use adapters::{BufferedRetainedWatchV0, RetainedWatchCollectorV0};
+pub(crate) use adapters::{
+    BufferedRetainedWatchV0, RenderExecutionOutcomeV0, RetainedWatchCollectorV0,
+};
 pub use adapters::{
     CompletedObservationFenceOutcomeV0, KubeAutomationObservationPortV0, KubeAutomationPortV0,
     KubeDeletionObservationPortV0, KubeFixedPointPortV0, RetainedWatchCoordinationV0,
@@ -118,6 +120,17 @@ pub struct GenuineChangeV0 {
     barrier: BarrierV0,
     retained_incarnation: u64,
     fingerprint: String,
+}
+
+/// An opaque fixed-point result whose final D projection differs from the
+/// renderer input.  It is minted only by a concrete retained port and must be
+/// consumed by that same port after split execution has reunited.
+#[derive(Clone, Debug)]
+pub(crate) struct CoverageChangedV0 {
+    port_identity: u64,
+    barrier: BarrierV0,
+    retained_incarnation: u64,
+    change: GenuineChangeV0,
 }
 
 /// An authenticated retained-watch transition that arrived while a durable
@@ -305,19 +318,30 @@ struct FixedPointProvenanceSeedV0 {
     bundle_digest: String,
     barrier: BarrierV0,
     port_identity: u64,
+    inventory: Vec<InventoryEntry>,
+    inventory_hash: String,
 }
 
 #[derive(Debug)]
 struct FixedPointProvenanceV0 {
     seed: FixedPointProvenanceSeedV0,
     retained_incarnation: u64,
+    coverage_dependencies: Vec<Dependency>,
+    coverage_hash: String,
 }
 
 impl FixedPointProvenanceSeedV0 {
-    fn complete(self, retained_incarnation: u64) -> FixedPointProvenanceV0 {
+    fn complete(
+        self,
+        retained_incarnation: u64,
+        coverage_dependencies: Vec<Dependency>,
+        coverage_hash: String,
+    ) -> FixedPointProvenanceV0 {
         FixedPointProvenanceV0 {
             seed: self,
             retained_incarnation,
+            coverage_dependencies,
+            coverage_hash,
         }
     }
 }
@@ -339,8 +363,28 @@ impl RenderCommandCapabilityV0 {
     pub(crate) fn port_identity(&self) -> u64 {
         self.port_identity
     }
-    pub(crate) fn complete(self, incarnation: u64) -> FixedPointProvenanceV0 {
-        self.seed.complete(incarnation)
+    pub(crate) fn root_namespace(&self) -> &str {
+        &self.seed.root_namespace
+    }
+    pub(crate) fn coverage_plan(
+        &self,
+        output: &RenderOutputV0,
+    ) -> Result<(Vec<Dependency>, String), RuntimeErrorV0> {
+        coverage_dependencies(
+            output,
+            &self.seed.root_namespace,
+            &self.seed.preconditions.observation_token,
+            &self.seed.inventory,
+        )
+    }
+    pub(crate) fn complete(
+        self,
+        incarnation: u64,
+        coverage_dependencies: Vec<Dependency>,
+        coverage_hash: String,
+    ) -> FixedPointProvenanceV0 {
+        self.seed
+            .complete(incarnation, coverage_dependencies, coverage_hash)
     }
 }
 
@@ -367,6 +411,22 @@ impl GenuineChangeV0 {
             retained_incarnation,
             fingerprint: oxideloop_renderer_abi::sha256_hex(&canonical),
         })
+    }
+}
+
+impl CoverageChangedV0 {
+    pub(crate) fn new(
+        port_identity: u64,
+        barrier: BarrierV0,
+        retained_incarnation: u64,
+        change: GenuineChangeV0,
+    ) -> Self {
+        Self {
+            port_identity,
+            barrier,
+            retained_incarnation,
+            change,
+        }
     }
 }
 
@@ -610,6 +670,20 @@ impl RootActorV0 {
         &self.state
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_durable_inventory_for_test(
+        &mut self,
+        inventory: Vec<InventoryEntry>,
+    ) -> Result<(), RuntimeErrorV0> {
+        let root = self.state.root().clone();
+        let mut journal = self.state.journal().clone();
+        journal.state.inventory = inventory;
+        self.state = MachineStateV0::recover(root, journal).map_err(|_| {
+            RuntimeErrorV0::Hold("test durable inventory replacement is invalid".into())
+        })?;
+        Ok(())
+    }
+
     /// Seals the only completion inputs accepted by the retained-observation
     /// adapter. The final render result came from the fixed-point loop (its
     /// fields have no public constructor), while inventory and already-used
@@ -679,6 +753,21 @@ impl RootActorV0 {
         let desired_identities =
             desired_resource_identities(&final_result.output, &root_snapshot.namespace)?;
         let durable = &self.state.journal().state;
+        let (coverage_dependencies, coverage_hash) = coverage_dependencies(
+            &final_result.output,
+            &root_snapshot.namespace,
+            &provenance.seed.preconditions.observation_token,
+            &durable.inventory,
+        )?;
+        if provenance.seed.inventory_hash != inventory_hash(&durable.inventory)?
+            || provenance.coverage_dependencies != coverage_dependencies
+            || provenance.coverage_hash != coverage_hash
+        {
+            return Err(RuntimeErrorV0::Hold(
+                "completed observation session final coverage does not match current durable inventory"
+                    .into(),
+            ));
+        }
         let durable_prune_tokens = durable
             .prune_candidate
             .iter()
@@ -699,6 +788,7 @@ impl RootActorV0 {
             },
             root_uid: root_snapshot.uid.clone(),
             dependencies: final_result.dependencies.clone(),
+            coverage_dependencies,
             desired_identities,
             durable_inventory: durable.inventory.clone(),
             durable_prune_tokens,
@@ -750,6 +840,8 @@ impl RootActorV0 {
             bundle_digest: root.bundle_digest.clone(),
             barrier: self.barrier,
             port_identity,
+            inventory: self.state.journal().state.inventory.clone(),
+            inventory_hash: inventory_hash(&self.state.journal().state.inventory)?,
         };
         self.render_provenance_request = Some(request_id);
         Ok(seed)
@@ -977,6 +1069,14 @@ impl RootActorV0 {
                 })
         };
         let active_hash = input_hash(active_input)?;
+        let current_inventory = &self.state.journal().state.inventory;
+        let (current_coverage, current_coverage_hash) = coverage_dependencies(
+            &final_result.output,
+            &root.namespace,
+            &preconditions.observation_token,
+            current_inventory,
+        )?;
+        let current_inventory_hash = inventory_hash(current_inventory)?;
         let mut final_with_initial_observations = final_result.input.clone();
         final_with_initial_observations
             .observations
@@ -996,6 +1096,9 @@ impl RootActorV0 {
             || provenance.seed.barrier != self.barrier
             || provenance.seed.port_identity != port_identity
             || provenance.retained_incarnation != retained_incarnation
+            || provenance.seed.inventory_hash != current_inventory_hash
+            || provenance.coverage_dependencies != current_coverage
+            || provenance.coverage_hash != current_coverage_hash
             || root.name != provenance.seed.root_name
             || root.namespace != provenance.seed.root_namespace
             || root.uid != provenance.seed.root_uid
@@ -1989,6 +2092,129 @@ fn desired_resource_identities(
     Ok(identities.into_values().collect())
 }
 
+/// Controller-owned final-fence coverage. Renderer declarations remain the
+/// only observations visible to the renderer; desired and durable inventory
+/// names are added solely to the post-render Kubernetes fence.
+pub(crate) fn coverage_dependencies(
+    output: &RenderOutputV0,
+    root_namespace: &str,
+    observation_token: &str,
+    inventory: &[InventoryEntry],
+) -> Result<(Vec<Dependency>, String), RuntimeErrorV0> {
+    let mut identities = BTreeMap::new();
+    for identity in desired_resource_identities(output, root_namespace)?
+        .into_iter()
+        .chain(inventory.iter().map(|entry| entry.identity.clone()))
+    {
+        if identity.namespace.is_empty()
+            || identity.name.is_empty()
+            || identity.namespace != root_namespace
+            || !matches!(
+                (identity.api_version.as_str(), identity.kind.as_str()),
+                ("v1", "ConfigMap" | "Service")
+            )
+        {
+            return Err(RuntimeErrorV0::Hold(
+                "final observation coverage has an invalid or unauthorized identity".into(),
+            ));
+        }
+        // This validates the supported GVK/name shape before any coverage I/O.
+        let _ = resource(&identity.api_version, &identity.kind)?;
+        identities.insert(
+            (
+                identity.api_version.clone(),
+                identity.kind.clone(),
+                identity.namespace.clone(),
+                identity.name.clone(),
+            ),
+            identity,
+        );
+    }
+    let dependencies = identities
+        .into_values()
+        .map(|identity| Dependency::Object {
+            api_version: identity.api_version,
+            kind: identity.kind,
+            namespace: identity.namespace,
+            name: identity.name,
+            uid: None,
+            resource_version: None,
+            observation_token: observation_token.into(),
+        })
+        .collect::<Vec<_>>();
+    let normalized = normalize_dependencies(&dependencies)?;
+    let canonical = oxideloop_renderer_abi::canonical_bytes(
+        &serde_json::to_value(&normalized).map_err(|_| RuntimeErrorV0::RendererAbi)?,
+    )
+    .map_err(|_| RuntimeErrorV0::RendererAbi)?;
+    Ok((normalized, oxideloop_renderer_abi::sha256_hex(&canonical)))
+}
+
+pub(crate) fn renderer_dependency_plan(
+    dependencies: &[Dependency],
+    root_namespace: &str,
+) -> Result<Vec<Dependency>, RuntimeErrorV0> {
+    let dependencies = normalize_dependencies(dependencies)?;
+    for dependency in &dependencies {
+        let (api_version, kind, namespace, name) = match dependency {
+            Dependency::Collection {
+                api_version,
+                kind,
+                namespace,
+                ..
+            } => (api_version, kind, namespace, None),
+            Dependency::Object {
+                api_version,
+                kind,
+                namespace,
+                name,
+                ..
+            } => (api_version, kind, namespace, Some(name)),
+        };
+        if namespace.is_empty() || namespace != root_namespace || name.is_some_and(String::is_empty)
+        {
+            return Err(RuntimeErrorV0::Hold(
+                "renderer dependency escapes or lacks the authorized root namespace".into(),
+            ));
+        }
+        let _ = resource(api_version, kind)?;
+    }
+    Ok(dependencies)
+}
+
+fn inventory_hash(inventory: &[InventoryEntry]) -> Result<String, RuntimeErrorV0> {
+    let mut canonical_inventory = inventory.to_vec();
+    canonical_inventory.sort_by(|left, right| {
+        (
+            &left.identity.api_version,
+            &left.identity.kind,
+            &left.identity.namespace,
+            &left.identity.name,
+            &left.logical_id,
+            &left.uid,
+            &left.resource_version,
+            &left.bundle_digest,
+        )
+            .cmp(&(
+                &right.identity.api_version,
+                &right.identity.kind,
+                &right.identity.namespace,
+                &right.identity.name,
+                &right.logical_id,
+                &right.uid,
+                &right.resource_version,
+                &right.bundle_digest,
+            ))
+    });
+    let canonical = oxideloop_renderer_abi::canonical_bytes(
+        &serde_json::to_value(canonical_inventory).map_err(|_| {
+            RuntimeErrorV0::Hold("durable inventory cannot be canonicalized".into())
+        })?,
+    )
+    .map_err(|_| RuntimeErrorV0::Hold("durable inventory cannot be canonicalized".into()))?;
+    Ok(oxideloop_renderer_abi::sha256_hex(&canonical))
+}
+
 #[derive(Default)]
 pub struct ControllerRuntimeV0 {
     actors: BTreeMap<ActorKeyV0, RootActorV0>,
@@ -2669,6 +2895,7 @@ struct CompletedObservationSessionV0 {
     root: ObjectRefV0,
     root_uid: String,
     dependencies: Vec<Dependency>,
+    coverage_dependencies: Vec<Dependency>,
     desired_identities: Vec<ObjectIdentity>,
     durable_inventory: Vec<InventoryEntry>,
     durable_prune_tokens: Vec<String>,
@@ -5930,7 +6157,14 @@ mod tests {
             first_barrier,
             ObservationBarrierV0 {
                 generation: first_barrier,
-                dependencies: vec![],
+                dependencies: vec![Dependency::Collection {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: "ns".into(),
+                    selector: String::new(),
+                    collection_revision: "list-rv-1".into(),
+                    observation_token: "retained-test".into(),
+                }],
                 collections,
                 objects: vec![],
                 watches: vec![first_watch],
@@ -5976,7 +6210,14 @@ mod tests {
             second_barrier,
             ObservationBarrierV0 {
                 generation: second_barrier,
-                dependencies: vec![],
+                dependencies: vec![Dependency::Collection {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: "ns".into(),
+                    selector: String::new(),
+                    collection_revision: "list-rv-2".into(),
+                    observation_token: "retained-test".into(),
+                }],
                 collections: second_collections,
                 objects: vec![],
                 watches: vec![second_watch],
@@ -6020,7 +6261,7 @@ mod tests {
         assert_eq!(preconditions.observation_token, latest_token);
         let input = deferred_render_input(&actor, &preconditions);
         let retry_barrier = actor.barrier();
-        let mut retry_port = KubeFixedPointPortV0::fixed_point_for_test(
+        let retry_port = KubeFixedPointPortV0::fixed_point_for_test(
             DeferredStableRendererV0 {
                 output: deferred_render_output(),
             },
@@ -6034,10 +6275,10 @@ mod tests {
                 watches: vec![],
             },
         );
-        let mut result = retry_port
-            .reconcile_for_actor(&mut actor, input)
-            .await
-            .expect("fresh concrete fixed-point retry succeeds");
+        let (mut retry_port, mut result) =
+            crate::adapters::reconcile_split_for_test(&mut actor, retry_port, input)
+                .await
+                .expect("fresh concrete fixed-point retry succeeds");
         let CompletedObservationFenceOutcomeV0::Completed(capability) = retry_port
             .complete_observation_fence(&mut actor, &mut result)
             .expect("fresh fixed point completes a full fence")
@@ -6081,7 +6322,14 @@ mod tests {
             barrier,
             ObservationBarrierV0 {
                 generation: barrier,
-                dependencies: vec![],
+                dependencies: vec![Dependency::Collection {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: "ns".into(),
+                    selector: String::new(),
+                    collection_revision: "list-rv-1".into(),
+                    observation_token: "retained-test".into(),
+                }],
                 collections,
                 objects: vec![],
                 watches: vec![watch],
@@ -6166,6 +6414,149 @@ mod tests {
             port.calls,
             ["L:ConfigMap:ns", "W:ConfigMap:ns:7", "R:another", "R:gone"]
         );
+    }
+
+    #[test]
+    fn final_coverage_is_root_scoped_deduplicated_and_validated_before_discovery() {
+        let service = |name: &str| ResourceDeclaration {
+            logical_id: format!("service-{name}"),
+            object: serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {"name": name, "namespace": "ns"},
+            }),
+            readiness: None,
+        };
+        let config = ResourceDeclaration {
+            logical_id: "config".into(),
+            object: serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "config", "namespace": "ns"},
+            }),
+            readiness: None,
+        };
+        let mut output = RenderOutputV0 {
+            abi_version: ABI_VERSION_V0.into(),
+            disposition: RenderDisposition::Apply,
+            resources: vec![config, service("managed")],
+            dependencies: vec![],
+            automations: vec![],
+            diagnostics: vec![],
+        };
+        let inventory = vec![
+            InventoryEntry {
+                identity: ObjectIdentity {
+                    api_version: "v1".into(),
+                    kind: "Service".into(),
+                    namespace: "ns".into(),
+                    name: "managed".into(),
+                },
+                logical_id: "managed-old".into(),
+                uid: "managed-uid".into(),
+                resource_version: "managed-rv".into(),
+                bundle_digest: "a".repeat(64),
+            },
+            InventoryEntry {
+                identity: ObjectIdentity {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: "ns".into(),
+                    name: "removed".into(),
+                },
+                logical_id: "removed".into(),
+                uid: "removed-uid".into(),
+                resource_version: "removed-rv".into(),
+                bundle_digest: "a".repeat(64),
+            },
+        ];
+        let (coverage, _) = coverage_dependencies(&output, "ns", "token", &inventory)
+            .expect("desired and durable inventory coverage is valid");
+        assert_eq!(
+            coverage.len(),
+            3,
+            "desired/inventory overlap is deduplicated"
+        );
+        assert!(coverage.iter().any(|dependency| matches!(dependency,
+            Dependency::Object { kind, name, .. } if kind == "ConfigMap" && name == "removed"
+        )));
+
+        output.resources.push(service("managed"));
+        assert!(coverage_dependencies(&output, "ns", "token", &inventory).is_err());
+        output.resources.pop();
+        output.resources[0].object["metadata"]["namespace"] = serde_json::json!("foreign");
+        assert!(coverage_dependencies(&output, "ns", "token", &inventory).is_err());
+        output.resources[0].object["metadata"]["namespace"] = serde_json::json!("ns");
+        output.resources[0].object["kind"] = serde_json::json!("Secret");
+        assert!(coverage_dependencies(&output, "ns", "token", &inventory).is_err());
+        output.resources[0].object["kind"] = serde_json::json!("ConfigMap");
+        output.resources[0].object["metadata"]
+            .as_object_mut()
+            .expect("metadata")
+            .remove("name");
+        assert!(coverage_dependencies(&output, "ns", "token", &inventory).is_err());
+    }
+
+    #[test]
+    fn durable_inventory_hash_is_permutation_stable_but_field_sensitive() {
+        let entry = |name: &str, uid: &str| InventoryEntry {
+            identity: ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                name: name.into(),
+            },
+            logical_id: name.into(),
+            uid: uid.into(),
+            resource_version: format!("{uid}-rv"),
+            bundle_digest: "a".repeat(64),
+        };
+        let first = entry("first", "uid-a");
+        let second = entry("second", "uid-b");
+        let forward = inventory_hash(&[first.clone(), second.clone()]).expect("canonical hash");
+        let reverse = inventory_hash(&[second.clone(), first.clone()]).expect("canonical hash");
+        assert_eq!(forward, reverse);
+        let mut changed = second;
+        changed.resource_version = "changed-rv".into();
+        assert_ne!(
+            forward,
+            inventory_hash(&[first, changed]).expect("canonical hash"),
+            "the stable ordering must not hide durable field changes"
+        );
+    }
+
+    #[test]
+    fn renderer_dependency_plan_rejects_invalid_d_before_transport_is_available() {
+        let invalid = [
+            Dependency::Collection {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "foreign".into(),
+                selector: String::new(),
+                collection_revision: "rv".into(),
+                observation_token: "t".into(),
+            },
+            Dependency::Object {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                name: String::new(),
+                uid: None,
+                resource_version: None,
+                observation_token: "t".into(),
+            },
+            Dependency::Collection {
+                api_version: "v1".into(),
+                kind: "Secret".into(),
+                namespace: "ns".into(),
+                selector: String::new(),
+                collection_revision: "rv".into(),
+                observation_token: "t".into(),
+            },
+        ];
+        for dependency in invalid {
+            assert!(renderer_dependency_plan(&[dependency], "ns").is_err());
+        }
     }
 
     #[test]
