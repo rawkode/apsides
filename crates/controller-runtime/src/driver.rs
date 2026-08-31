@@ -3364,7 +3364,8 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn driver_run_bootstraps_through_self_watches_then_reaches_renderer() {
+    async fn driver_run_consumes_exact_status_self_watches_without_repersisting_then_reaches_renderer()
+     {
         // Use the reducer's exact bootstrap output as the scripted API's
         // state response. This keeps the composition test focused on the
         // driver's list/watch/run sequencing rather than duplicating the
@@ -3618,9 +3619,9 @@ mod tests {
             wire.requests
                 .iter()
                 .filter(|request| request == &"PATCH /apis/demo.oxideloop.dev/v1alpha1/namespaces/ns/webapplications/root/status")
-                .count(),
+            .count(),
             2,
-            "bootstrap and descriptor verification each persist root status once"
+            "bootstrap and descriptor verification each persist root status once; their exact buffered self-watches must not rotate the token and re-persist status"
         );
         assert_eq!(
             wire.root_statuses.len(),

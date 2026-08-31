@@ -417,6 +417,15 @@ impl MachineStateV0 {
         &self.journal
     }
 
+    /// Returns the one exact root-status operation awaiting its correlated
+    /// acknowledgement. This is runtime-only authority and is absent after
+    /// recovery; callers may inspect it to classify an owned status self-echo
+    /// but cannot recreate or issue it.
+    #[must_use]
+    pub fn pending_root_status(&self) -> Option<&PendingRootStatusV0> {
+        self.runtime.pending_root_status.as_ref()
+    }
+
     /// Whether this machine was reconstructed solely from a deleting root's
     /// durable cleanup receipt after its linked state object was confirmed
     /// absent. Such a machine has authority only for root-only deletion

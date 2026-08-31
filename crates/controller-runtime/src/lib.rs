@@ -1346,20 +1346,39 @@ impl RootActorV0 {
             return Ok(());
         };
         let Some((sealed_barrier, sealed_input)) = self.active_render_input.as_ref() else {
-            // A 410/overflow has intentionally consumed this active input and
-            // installed an authenticated invalidation seed. The regular
-            // invalidation delivery below owns that replacement.
+            // A completed render clears its runtime-only fixed-point input
+            // before it persists root status. An ordinary exact status
+            // acknowledgement may therefore continue its status-pinned
+            // render without an active input. If a retained change crossed
+            // that status write, the deferred barrier is itself the sealed
+            // replacement authority; consume only the new RequestRender.
+            // A 410/overflow also intentionally clears this input and has
+            // its own authenticated invalidation delivery below.
             if self.latched_invalidation_seed.is_some() {
                 return Ok(());
             }
-            self.hold(
-                "durable revalidation lost its sealed fixed-point input before barrier supersession"
-                    .into(),
-            );
-            return Err(RuntimeErrorV0::Hold(
-                "durable revalidation lost its sealed fixed-point input before barrier supersession"
-                    .into(),
-            ));
+            let Some(deferred) = self.deferred_genuine_change.as_ref() else {
+                return Ok(());
+            };
+            if deferred.target_barrier != self.barrier
+                || deferred.cache_epoch != self.barrier.cache_epoch.to_string()
+                || deferred.change.fingerprint.is_empty()
+            {
+                self.hold(
+                    "deferred root-status revalidation does not match the current barrier".into(),
+                );
+                return Err(RuntimeErrorV0::Hold(
+                    "deferred root-status revalidation does not match the current barrier".into(),
+                ));
+            }
+            let observation_token = deferred.observation_token.clone();
+            if !self.supersede_observation_only(observation_token) {
+                return Err(RuntimeErrorV0::Hold(
+                    "root-status revalidation could not be superseded by the authenticated retained change"
+                        .into(),
+                ));
+            }
+            return Ok(());
         };
         if *sealed_barrier == self.barrier {
             if preconditions.observation_token != sealed_input.observation_token
@@ -1507,6 +1526,18 @@ impl RootActorV0 {
             root.root_finalizer_present,
             root.state_finalizer_present,
         );
+        // The driver acknowledges an owned root-status write before it drains
+        // the root watch.  In that narrow interval the watch's exact echo is
+        // already authenticated by the queued acknowledgement, but the
+        // reducer has not yet installed its new root RV/status.  Do not turn
+        // that self-echo into a new barrier: doing so derives a new input
+        // token, writes that token to status, and loops forever on its own
+        // next self-echo.  A changed state pin, spec, or status does not match
+        // this complete expected snapshot and remains an ordinary refresh.
+        if self.is_pending_root_status_echo(&root) {
+            self.last_root_observation = Some(fingerprint);
+            return false;
+        }
         // An exact API echo can arrive after its owned acknowledgement has
         // already reduced, including while the first render is in flight.
         // Record it for later duplicate suppression, but it has no new root
@@ -1542,6 +1573,30 @@ impl RootActorV0 {
             self.commands.clear();
         }
         true
+    }
+
+    fn is_pending_root_status_echo(&self, observed: &RootSnapshotV0) -> bool {
+        let Some(EventV0::RootStatusPersisted {
+            token,
+            new_root_resource_version,
+            root_uid,
+            ..
+        }) = self.priority_ack.as_ref()
+        else {
+            return false;
+        };
+        let Some(pending) = self.state.pending_root_status() else {
+            return false;
+        };
+        if token != &pending.token || root_uid != &self.state.root().uid {
+            return false;
+        }
+        let mut expected = self.state.root().clone();
+        expected
+            .root_resource_version
+            .clone_from(new_root_resource_version);
+        expected.status.clone_from(&pending.status);
+        observed == &expected
     }
 
     /// True only while the exact observation-only render request captured by
@@ -6204,6 +6259,94 @@ mod tests {
     }
 
     #[test]
+    fn acknowledged_root_status_echo_is_consumed_without_rotating_its_input_token() {
+        let (mut actor, status) = render_status_pending_actor();
+        let CommandV0::PersistRootStatus {
+            token,
+            old_root_resource_version,
+            status: persisted_status,
+            ..
+        } = &status
+        else {
+            panic!("render status helper returned a non-status command");
+        };
+        let old_token = persisted_status
+            .input_token
+            .clone()
+            .expect("status-pinned render has an observation token");
+        let old_barrier = actor.barrier();
+        let mut echo = actor.state().root().clone();
+        echo.root_resource_version = "root-rv-after-status".into();
+        echo.status = persisted_status.clone();
+
+        // This is the production driver ordering: the exact transport event
+        // occupies the priority slot before its concurrently buffered watch
+        // is reread and offered to the actor.
+        actor
+            .acknowledge(EventV0::RootStatusPersisted {
+                token: token.clone(),
+                old_root_resource_version: old_root_resource_version.clone(),
+                new_root_resource_version: "root-rv-after-status".into(),
+                root_uid: actor.state().root().uid.clone(),
+            })
+            .expect("root status acknowledgement remains reducer authority");
+        assert!(
+            !actor.root_observed(echo),
+            "the exact acknowledged self-echo must not manufacture another root barrier"
+        );
+        assert_eq!(actor.barrier(), old_barrier);
+
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("status acknowledgement reduces")
+            .expect("the exact status-pinned render remains live")
+        else {
+            panic!("acknowledged root-status echo did not retain its exact render continuation");
+        };
+        assert_eq!(preconditions.observation_token, old_token);
+        assert_eq!(
+            preconditions.cache_epoch,
+            old_barrier.cache_epoch.to_string()
+        );
+        actor
+            .issue_render_capability(
+                trusted_render_input(&actor, &preconditions.observation_token),
+                1,
+            )
+            .expect("the acknowledged status token remains eligible for one exact render");
+    }
+
+    #[test]
+    fn acknowledged_root_status_echo_never_swallows_an_independent_root_change() {
+        let (mut actor, status) = render_status_pending_actor();
+        let CommandV0::PersistRootStatus {
+            token,
+            old_root_resource_version,
+            status: persisted_status,
+            ..
+        } = &status
+        else {
+            panic!("render status helper returned a non-status command");
+        };
+        actor
+            .acknowledge(EventV0::RootStatusPersisted {
+                token: token.clone(),
+                old_root_resource_version: old_root_resource_version.clone(),
+                new_root_resource_version: "root-rv-after-status".into(),
+                root_uid: actor.state().root().uid.clone(),
+            })
+            .expect("root status acknowledgement remains reducer authority");
+        let mut independent = actor.state().root().clone();
+        independent.root_resource_version = "root-rv-after-status".into();
+        independent.status = persisted_status.clone();
+        independent.spec.message = "independent root change".into();
+        assert!(
+            actor.root_observed(independent),
+            "only the complete exact self-echo is suppressible"
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn genuine_change_during_mutation_result_persist_preserves_the_accepted_result() {
         let (machine, mutation_ack) = mutation_pending();
@@ -6723,6 +6866,156 @@ mod tests {
             preconditions.cache_epoch,
             fresh_barrier.cache_epoch.to_string()
         );
+    }
+
+    #[test]
+    fn state_rv_root_echo_after_prepare_ack_reseals_revalidation() {
+        let (mut actor, prepare) = actor_with_prepared_apply_persist();
+        // The driver accepts the exact Persisted event before it drains the
+        // root watch that was buffered by the PATCH/reread window.
+        actor
+            .acknowledge(persisted_event(&prepare, "state-rv-after-prepare"))
+            .expect("prepare acknowledgement remains durable authority");
+        let mut echoed_root = actor.state().root().clone();
+        // `acknowledge` has not reduced yet, so its public root pin remains
+        // old until the next actor turn; the loader's reread is already new.
+        echoed_root.state_resource_version = "state-rv-after-prepare".into();
+        assert!(
+            actor.root_observed(echoed_root),
+            "the loader's post-write root reread observes the new linked-state RV after acknowledge but before priority reduction"
+        );
+        let fresh_barrier = actor.barrier();
+        assert!(
+            actor
+                .next_command()
+                .expect("correlated state-RV root echo reseals instead of issuing old pins")
+                .is_none()
+        );
+        assert_eq!(actor.state().phase(), PhaseV0::InformersPending);
+
+        actor.informers_ready(fresh_barrier);
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("fresh informer readiness reduces")
+            .expect("fresh barrier requests revalidation")
+        else {
+            panic!("correlated state-RV echo did not request a revalidation render");
+        };
+        assert_eq!(
+            preconditions.state_resource_version,
+            "state-rv-after-prepare"
+        );
+        assert_eq!(
+            preconditions.cache_epoch,
+            fresh_barrier.cache_epoch.to_string()
+        );
+        actor
+            .issue_render_capability(
+                trusted_render_input(&actor, &preconditions.observation_token),
+                1,
+            )
+            .expect("fresh state-RV barrier reaches the fixed-point capability");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn recovered_prepare_persisted_revalidates_then_requires_dispatch_authorization_before_mutation()
+     {
+        let (mut actor, prepare) = actor_with_prepared_apply_persist();
+        // This is the same `Persisted` event produced by exact timeout
+        // recovery: it advances only the durable State RV and still has to
+        // pass a fresh rendered observation before it can authorize a write.
+        actor
+            .acknowledge(persisted_event(&prepare, "state-rv-after-timeout-recovery"))
+            .expect("recovered Prepare acknowledgement remains durable authority");
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("recovered Prepare acknowledgement reduces")
+            .expect("recovered Prepare requires revalidation")
+        else {
+            panic!("recovered Prepare did not request revalidation");
+        };
+        actor
+            .issue_render_capability(
+                trusted_render_input(&actor, &preconditions.observation_token),
+                1,
+            )
+            .expect("fresh revalidation owns an exact capability");
+        let (frozen, input, _, _) = prune_render_documents(
+            actor.state().root(),
+            &preconditions.state_resource_version,
+            &preconditions.observation_token,
+            &preconditions.cache_epoch,
+        );
+        let output = serde_json::to_string(&RenderOutputV0 {
+            abi_version: ABI_VERSION_V0.into(),
+            disposition: RenderDisposition::Apply,
+            resources: vec![ResourceDeclaration {
+                logical_id: "managed-new".into(),
+                object: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "managed-new", "namespace": "ns"},
+                    "data": {"value": "new"}
+                }),
+                readiness: None,
+            }],
+            dependencies: vec![],
+            automations: vec![],
+            diagnostics: vec![],
+        })
+        .expect("same desired output serializes");
+        let observed = vec![DesiredObservationV0 {
+            identity: oxideloop_controller_api::ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                name: "managed-new".into(),
+            },
+            observation: Observation::Absent,
+            qualification: BackendQualification::BuiltInTested {
+                kubernetes_minor: "1.36".into(),
+                gvr: "configmaps".into(),
+            },
+            recovery_proof: None,
+            deletion_recovery_proof: None,
+        }];
+        actor
+            .accept_acknowledgement(EventV0::Revalidated {
+                frozen,
+                render_input_json: input,
+                render_output_json: output,
+                observed,
+            })
+            .expect("revalidated output remains reducer authority");
+        let authorization = actor
+            .next_command()
+            .expect("revalidation reduces")
+            .expect("dispatch authorization must persist before mutation");
+        assert!(
+            matches!(
+                &authorization,
+                CommandV0::Persist { operation, .. }
+                    if operation.purpose == PersistPurpose::DispatchAuthorization
+            ),
+            "expected DispatchAuthorization persist, got {authorization:?}"
+        );
+        assert!(
+            !matches!(&authorization, CommandV0::Mutate { .. }),
+            "the recovered Prepare path must not issue a mutation before dispatch authorization persists"
+        );
+        actor
+            .acknowledge(persisted_event(
+                &authorization,
+                "state-rv-after-dispatch-authorization",
+            ))
+            .expect("dispatch authorization acknowledgement is exact");
+        assert!(matches!(
+            actor
+                .next_command()
+                .expect("authorized continuation reduces"),
+            Some(CommandV0::Mutate { .. })
+        ));
     }
 
     #[test]

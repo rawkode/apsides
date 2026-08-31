@@ -7,7 +7,11 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     convert::Infallible,
-    sync::{Arc, Mutex, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 
 use http::{Method, Request, Response, StatusCode};
@@ -696,6 +700,16 @@ fn persist_command() -> CommandV0 {
     }
 }
 
+fn mutation_result_persist_command() -> CommandV0 {
+    let mut command = persist_command();
+    let CommandV0::Persist { operation, .. } = &mut command else {
+        unreachable!("persist command shape is fixed");
+    };
+    operation.purpose = PersistPurpose::MutationResult;
+    operation.phase = DurablePhase::MutationResult;
+    command
+}
+
 fn persist_state_patch_body(state: &OxideLoopStateSpec) -> Value {
     json!({
         "apiVersion":"runtime.oxideloop.dev/v1alpha1", "kind":"OxideLoopState",
@@ -760,6 +774,67 @@ fn state_force_script(recovery: Value) -> Vec<Expected> {
             response: response(recovery),
         },
     ]
+}
+
+/// A state PATCH whose server side may have applied but whose response never
+/// arrives. The transport must make one PATCH, then prove the exact operation
+/// with its recovery GET; the scripted service remains able to accept that
+/// independent GET after the timed-out request future is dropped.
+fn timed_out_state_persist_transport(
+    recovery: Value,
+    hang_recovery_get: bool,
+) -> (KubeTransportV0, Arc<AtomicUsize>) {
+    let (root, state, _) = force_fence_objects();
+    let patches = Arc::new(AtomicUsize::new(0));
+    let patch_count = Arc::clone(&patches);
+    let recovery = Arc::new(recovery);
+    let service = service_fn(move |request: Request<Body>| {
+        let patch_count = Arc::clone(&patch_count);
+        let recovery = Arc::clone(&recovery);
+        let root = root.clone();
+        let state = state.clone();
+        async move {
+            let method = request.method().clone();
+            let path = request
+                .uri()
+                .path_and_query()
+                .expect("request URI")
+                .as_str()
+                .to_owned();
+            if method == Method::GET
+                && path
+                    == "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a"
+            {
+                return Ok::<_, Infallible>(response(root));
+            }
+            if method == Method::GET
+                && path
+                    == "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/state-a"
+            {
+                let value = if patch_count.load(Ordering::SeqCst) == 0 {
+                    state
+                } else {
+                    if hang_recovery_get {
+                        return std::future::pending::<Result<Response<Body>, Infallible>>().await;
+                    }
+                    (*recovery).clone()
+                };
+                return Ok(response(value));
+            }
+            if method == Method::PATCH
+                && path
+                    == "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/state-a?&force=true&fieldManager=oxideloop-controller"
+            {
+                patch_count.fetch_add(1, Ordering::SeqCst);
+                return std::future::pending::<Result<Response<Body>, Infallible>>().await;
+            }
+            panic!("unexpected timeout-recovery request {method} {path}");
+        }
+    });
+    (
+        KubeTransportV0::test_from_client(Client::new(service, "default")),
+        patches,
+    )
 }
 
 fn root_status_force_script(recovery: Value) -> Vec<Expected> {
@@ -1945,6 +2020,129 @@ async fn persist_state_409_rereads_once_and_requires_an_exact_advanced_proof() {
         Err(TransportErrorV0::ManualRecoveryHold)
     );
     api.assert_drained();
+}
+
+#[tokio::test]
+async fn timed_out_state_persist_proves_once_or_fails_closed_without_replay() {
+    let address = RootAddressV0 {
+        namespace: "tenant-a".into(),
+        name: "app-a".into(),
+        state_name: "state-a".into(),
+    };
+    let (_, mut exact, _) = force_fence_objects();
+    exact["metadata"]["resourceVersion"] = json!("5");
+    exact["metadata"]["annotations"][TRANSACTION_ID_ANNOTATION] = json!("a".repeat(64));
+    exact["metadata"]["annotations"][COMMAND_ID_ANNOTATION] = json!("a".repeat(64));
+    exact["spec"] = serde_json::to_value(persisted_state()).expect("persisted spec serializes");
+    let (transport, patches) = timed_out_state_persist_transport(exact, false);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        transport.dispatch(&address, &persist_command()),
+    )
+    .await
+    .expect("the bounded state PATCH reaches recovery")
+    .expect("exact recovery proof becomes Persisted");
+    assert!(matches!(
+        outcome,
+        super::CommandOutcomeV0::Event(event)
+            if matches!(event.as_ref(), oxideloop_controller_core::EventV0::Persisted { .. })
+    ));
+    assert_eq!(
+        patches.load(Ordering::SeqCst),
+        1,
+        "a timed-out durable PATCH is never replayed"
+    );
+
+    for recovery in [
+        force_fence_objects().1,
+        {
+            let (_, mut foreign, _) = force_fence_objects();
+            foreign["metadata"]["resourceVersion"] = json!("5");
+            foreign["metadata"]["uid"] = json!("foreign-state-uid");
+            foreign
+        },
+        {
+            let (_, mut divergent, _) = force_fence_objects();
+            divergent["metadata"]["resourceVersion"] = json!("5");
+            divergent["metadata"]["annotations"][TRANSACTION_ID_ANNOTATION] = json!("a".repeat(64));
+            divergent["metadata"]["annotations"][COMMAND_ID_ANNOTATION] = json!("a".repeat(64));
+            divergent["spec"] = json!({"divergent": true});
+            divergent
+        },
+    ] {
+        let (transport, patches) = timed_out_state_persist_transport(recovery, false);
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                transport.dispatch(&address, &persist_command()),
+            )
+            .await
+            .expect("the bounded state PATCH reaches fail-closed recovery"),
+            Err(TransportErrorV0::ManualRecoveryHold)
+        );
+        assert_eq!(
+            patches.load(Ordering::SeqCst),
+            1,
+            "unchanged, foreign, or divergent recovery evidence cannot trigger a second PATCH"
+        );
+    }
+}
+
+#[tokio::test]
+async fn timed_out_state_persist_hanging_recovery_get_holds_without_replay() {
+    let address = RootAddressV0 {
+        namespace: "tenant-a".into(),
+        name: "app-a".into(),
+        state_name: "state-a".into(),
+    };
+    let (_, recovery, _) = force_fence_objects();
+    let (transport, patches) = timed_out_state_persist_transport(recovery, true);
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            transport.dispatch(&address, &persist_command()),
+        )
+        .await
+        .expect("bounded recovery GET cannot pin dispatch"),
+        Err(TransportErrorV0::ManualRecoveryHold)
+    );
+    assert_eq!(
+        patches.load(Ordering::SeqCst),
+        1,
+        "a recovery-GET timeout must not replay the ambiguous state PATCH"
+    );
+}
+
+#[tokio::test]
+async fn timed_out_mutation_result_persist_recovers_once_without_replaying_patch() {
+    let address = RootAddressV0 {
+        namespace: "tenant-a".into(),
+        name: "app-a".into(),
+        state_name: "state-a".into(),
+    };
+    let (_, mut exact, _) = force_fence_objects();
+    exact["metadata"]["resourceVersion"] = json!("5");
+    exact["metadata"]["annotations"][TRANSACTION_ID_ANNOTATION] = json!("a".repeat(64));
+    exact["metadata"]["annotations"][COMMAND_ID_ANNOTATION] = json!("a".repeat(64));
+    exact["spec"] = serde_json::to_value(persisted_state()).expect("persisted spec serializes");
+    let (transport, patches) = timed_out_state_persist_transport(exact, false);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        transport.dispatch(&address, &mutation_result_persist_command()),
+    )
+    .await
+    .expect("the bounded MutationResult PATCH reaches recovery")
+    .expect("exact MutationResult recovery proof becomes Persisted");
+    assert!(matches!(
+        outcome,
+        super::CommandOutcomeV0::Event(event)
+            if matches!(event.as_ref(), oxideloop_controller_core::EventV0::Persisted { .. })
+    ));
+    assert_eq!(
+        patches.load(Ordering::SeqCst),
+        1,
+        "a timed-out MutationResult PATCH is never replayed"
+    );
 }
 
 #[tokio::test]

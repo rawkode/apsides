@@ -14,7 +14,6 @@
     clippy::unnecessary_wraps
 )]
 
-use std::collections::BTreeMap;
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::VecDeque;
 #[cfg(any(test, feature = "test-support"))]
@@ -23,6 +22,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::{collections::BTreeMap, time::Duration};
 
 use futures_util::StreamExt;
 use oxideloop_controller_api::{
@@ -56,6 +56,14 @@ pub const ROOT_UID_ANNOTATION: &str = "runtime.oxideloop.dev/root-uid";
 pub const TRANSACTION_ID_ANNOTATION: &str = "runtime.oxideloop.dev/transaction-id";
 pub const COMMAND_ID_ANNOTATION: &str = "runtime.oxideloop.dev/command-id";
 const MAX_BUNDLE_IDENTITY_BYTES: usize = 253;
+// State persistence is the durable journal effect boundary. A write response
+// can be lost after the API has applied the patch, so it may not pin the actor
+// forever and it may not be retried. The timeout leads to an exact GET proof,
+// never a second PATCH. Watches intentionally have no deadline here.
+#[cfg(not(test))]
+const STATE_PERSIST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const STATE_PERSIST_RESPONSE_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// The only namespace-scoped resources this transport will address.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -827,19 +835,29 @@ impl KubeTransportV0 {
                     &fence.root.metadata.uid,
                     &operation.token,
                 )?;
-                let written = match self
-                    .patch_state(&desired, &preconditions.state_resource_version, true)
-                    .await
+                let written = match tokio::time::timeout(
+                    STATE_PERSIST_RESPONSE_TIMEOUT,
+                    self.patch_state(&desired, &preconditions.state_resource_version, true),
+                )
+                .await
                 {
-                    Ok(written) => written,
-                    Err(error)
+                    Ok(Ok(written)) => written,
+                    // The request was issued exactly once. A timeout is as
+                    // ambiguous as a truncated response, so prove the patch
+                    // by an exact reread rather than replaying it.
+                    Err(_) => {
+                        return self
+                            .recover_persist(address, state, preconditions, operation)
+                            .await;
+                    }
+                    Ok(Err(error))
                         if may_recover_response_loss(&error) || is_state_write_conflict(&error) =>
                     {
                         return self
                             .recover_persist(address, state, preconditions, operation)
                             .await;
                     }
-                    Err(error) => return Err(error),
+                    Ok(Err(error)) => return Err(error),
                 };
                 Ok(CommandOutcomeV0::Event(Box::new(
                     oxideloop_controller_core::EventV0::Persisted {
@@ -1071,10 +1089,11 @@ impl KubeTransportV0 {
         operation: &oxideloop_controller_api::PersistOperation,
     ) -> Result<CommandOutcomeV0, TransportErrorV0> {
         let (root_ref, state_ref) = address.references();
-        let observed = self
-            .reread(&state_ref)
-            .await?
-            .ok_or(TransportErrorV0::ManualRecoveryHold)?;
+        let observed =
+            tokio::time::timeout(STATE_PERSIST_RESPONSE_TIMEOUT, self.reread(&state_ref))
+                .await
+                .map_err(|_| TransportErrorV0::ManualRecoveryHold)??
+                .ok_or(TransportErrorV0::ManualRecoveryHold)?;
         if observed.metadata.uid != preconditions.state_uid
             || observed.metadata.resource_version == preconditions.state_resource_version
             || !has_finalizer(&observed, STATE_FINALIZER)
