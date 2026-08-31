@@ -776,8 +776,8 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
     where
         R: RendererPortV0,
     {
-        let provenance = actor.begin_fixed_point_provenance(&input, self.identity)?;
-        let mut result = match reconcile_fixed_point(self, input).await {
+        let capability = actor.issue_render_capability(input, self.identity)?;
+        let mut result = match reconcile_fixed_point(self, capability.input().clone()).await {
             Ok(result) => result,
             Err(RuntimeErrorV0::Discovery(
                 error @ (oxideloop_kube_transport::TransportErrorV0::WatchGone
@@ -802,9 +802,35 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
                 "fixed-point result retained barrier is no longer current".into(),
             ));
         }
-        actor.bind_fixed_point_input(result.input());
-        result.provenance = Some(provenance.complete(retained.incarnation));
+        result.provenance = Some(capability.complete(retained.incarnation));
+        self.bind_completed_fixed_point_input(actor, &result)?;
         Ok(result)
+    }
+
+    /// Installs only the final input returned by this reunited concrete port.
+    /// The actor verifies its sealed provenance before replacing the
+    /// speculative input it pinned when the render capability was issued.
+    pub(crate) fn bind_completed_fixed_point_input(
+        &self,
+        actor: &mut RootActorV0,
+        result: &FixedPointResultV0,
+    ) -> Result<(), RuntimeErrorV0> {
+        let retained = self.retained.as_ref().ok_or_else(|| {
+            RuntimeErrorV0::Hold(
+                "completed fixed-point input has no retained observation barrier".into(),
+            )
+        })?;
+        if self.barrier != actor.barrier() || retained.barrier.generation != self.barrier {
+            return Err(RuntimeErrorV0::Hold(
+                "completed fixed-point input retained barrier is not current".into(),
+            ));
+        }
+        actor.bind_completed_fixed_point_input(
+            result,
+            self.identity,
+            self.barrier,
+            retained.incarnation,
+        )
     }
 
     #[must_use]
@@ -2025,19 +2051,20 @@ mod tests {
             .as_ref()
             .expect("test retained barrier")
             .observations();
-        actor.bind_fixed_point_input(result.input());
         owned_render(actor, result.input());
-        let seed = actor
-            .begin_fixed_point_provenance(result.input(), port.identity)
+        let capability = actor
+            .issue_render_capability(result.input.clone(), port.identity)
             .expect("test render request pins exact input");
         result.provenance = Some(
-            seed.complete(
+            capability.complete(
                 port.retained
                     .as_ref()
                     .expect("test retained barrier")
                     .incarnation,
             ),
         );
+        port.bind_completed_fixed_point_input(actor, result)
+            .expect("test final input is sealed by the concrete port");
     }
 
     fn retained_with(object: ObjectV0) -> RetainedObservationBarrierV0 {
@@ -2418,6 +2445,243 @@ mod tests {
         collections
     }
 
+    fn active_pin_bytes(actor: &RootActorV0) -> Vec<u8> {
+        canonical_render_input(
+            &actor
+                .active_render_input
+                .as_ref()
+                .expect("test actor has an active render pin")
+                .1,
+        )
+        .expect("active test input is canonical")
+    }
+
+    async fn split_result_with_discovered_observations() -> (
+        RootActorV0,
+        KubeFixedPointPortV0<'static, StableRendererV0>,
+        FixedPointResultV0,
+    ) {
+        let barrier = BarrierV0 {
+            generation: 9,
+            cache_epoch: 4,
+        };
+        let dependencies = vec![Dependency::Collection {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: "ns".into(),
+            selector: String::new(),
+            collection_revision: "collection-rv".into(),
+            observation_token: "global-token".into(),
+        }];
+        let template = fixed_final_result(dependencies.clone());
+        let observation = ObservationBarrierV0 {
+            generation: barrier,
+            dependencies: normalize_dependencies(&dependencies).expect("test dependencies"),
+            collections: retained_collections(),
+            objects: vec![],
+            watches: vec![],
+        };
+        let mut actor = fenced_actor(vec![], None);
+        actor.barrier = barrier;
+        owned_render(&mut actor, template.input());
+        let port = KubeFixedPointPortV0::fixed_point_for_test(
+            StableRendererV0 {
+                output: template.output,
+            },
+            test_descriptor(),
+            barrier,
+            observation,
+        );
+        let capability = actor
+            .issue_render_capability(template.input, port.identity())
+            .expect("split path seals its speculative input");
+        let (mut execution, collector, reunion) = port.split_for_render();
+        let result = execution
+            .reconcile_for_capability(capability)
+            .await
+            .expect("split path reaches a stable fixed point");
+        let port = KubeFixedPointPortV0::reunite_after_render(execution, collector, reunion)
+            .expect("matching split halves reunite");
+        assert!(
+            !result.input().observations.is_empty(),
+            "the test must exercise the final discovered-observations handoff"
+        );
+        (actor, port, result)
+    }
+
+    #[tokio::test]
+    async fn split_final_input_handoff_is_sealed_and_replaces_only_observations() {
+        let (mut actor, mut port, mut result) = split_result_with_discovered_observations().await;
+        let initial = active_pin_bytes(&actor);
+        let cloned = result.clone();
+        assert!(matches!(
+            port.bind_completed_fixed_point_input(&mut actor, &cloned),
+            Err(RuntimeErrorV0::Hold(_))
+        ));
+        assert_eq!(active_pin_bytes(&actor), initial);
+
+        port.bind_completed_fixed_point_input(&mut actor, &result)
+            .expect("the reunited port binds its own sealed final input");
+        assert_ne!(active_pin_bytes(&actor), initial);
+        assert_eq!(
+            active_pin_bytes(&actor),
+            canonical_render_input(result.input()).unwrap()
+        );
+        let CompletedObservationFenceOutcomeV0::Completed(capability) = port
+            .complete_observation_fence(&mut actor, &mut result)
+            .expect("bound final input completes the retained fence")
+        else {
+            panic!("split fixed point must mint a render acknowledgement");
+        };
+        actor
+            .acknowledge_render_observation(*capability)
+            .expect("split fence acknowledgement remains authorized");
+    }
+
+    #[tokio::test]
+    async fn sealed_final_input_handoff_rejects_replacements_without_mutating_the_pin() {
+        let mutators: [fn(&mut FixedPointResultV0); 5] = [
+            |result| result.input.abi_version = "other-abi".into(),
+            |result| result.input.root.name = "other-root".into(),
+            |result| result.input.observation_token = "other-token".into(),
+            |result| result.input.cache_epoch = "other-epoch".into(),
+            |result| result.input.root.spec = json!({"message":"other"}),
+        ];
+        for mutate in mutators {
+            let (mut actor, port, mut result) = split_result_with_discovered_observations().await;
+            let initial = active_pin_bytes(&actor);
+            mutate(&mut result);
+            assert!(matches!(
+                port.bind_completed_fixed_point_input(&mut actor, &result),
+                Err(RuntimeErrorV0::Hold(_))
+            ));
+            assert_eq!(active_pin_bytes(&actor), initial);
+        }
+
+        let (mut actor, port, mut result) = split_result_with_discovered_observations().await;
+        let initial = active_pin_bytes(&actor);
+        result
+            .provenance
+            .as_mut()
+            .expect("split result has sealed provenance")
+            .seed
+            .initial_input_hash = "0".repeat(64);
+        assert!(matches!(
+            port.bind_completed_fixed_point_input(&mut actor, &result),
+            Err(RuntimeErrorV0::Hold(_))
+        ));
+        assert_eq!(active_pin_bytes(&actor), initial);
+
+        let (mut actor, port, mut result) = split_result_with_discovered_observations().await;
+        let initial = active_pin_bytes(&actor);
+        let forged_request_id = "forged-fixed-point-request-id".to_owned();
+        result
+            .provenance
+            .as_mut()
+            .expect("split result has sealed provenance")
+            .seed
+            .request_id = forged_request_id.clone();
+        actor.render_provenance_request = Some(forged_request_id);
+        assert!(matches!(
+            port.bind_completed_fixed_point_input(&mut actor, &result),
+            Err(RuntimeErrorV0::Hold(_))
+        ));
+        assert_eq!(active_pin_bytes(&actor), initial);
+
+        let (mut actor, port, result) = split_result_with_discovered_observations().await;
+        actor.active_render_input = None;
+        assert!(matches!(
+            port.bind_completed_fixed_point_input(&mut actor, &result),
+            Err(RuntimeErrorV0::Hold(_))
+        ));
+
+        let (mut actor, port, result) = split_result_with_discovered_observations().await;
+        let initial = active_pin_bytes(&actor);
+        let mut replacement = result.input().clone();
+        replacement.observation_token = "replacement".into();
+        actor.active_render_input = Some((actor.barrier(), replacement));
+        let replacement_bytes = active_pin_bytes(&actor);
+        assert!(matches!(
+            port.bind_completed_fixed_point_input(&mut actor, &result),
+            Err(RuntimeErrorV0::Hold(_))
+        ));
+        assert_ne!(replacement_bytes, initial);
+        assert_eq!(active_pin_bytes(&actor), replacement_bytes);
+    }
+
+    #[tokio::test]
+    async fn sealed_final_input_handoff_rejects_cross_port_or_incarnation_and_root_change() {
+        let (mut actor, port, result) = split_result_with_discovered_observations().await;
+        let initial = active_pin_bytes(&actor);
+        let mut other = KubeFixedPointPortV0::<()>::observation_only_for_test(actor.barrier());
+        other.retained = Some(empty_retained(actor.barrier(), 1));
+        assert!(matches!(
+            other.bind_completed_fixed_point_input(&mut actor, &result),
+            Err(RuntimeErrorV0::Hold(_))
+        ));
+        assert_eq!(active_pin_bytes(&actor), initial);
+
+        let mut port = port;
+        port.retained = Some(empty_retained(actor.barrier(), 2));
+        assert!(matches!(
+            port.bind_completed_fixed_point_input(&mut actor, &result),
+            Err(RuntimeErrorV0::Hold(_))
+        ));
+        assert_eq!(active_pin_bytes(&actor), initial);
+
+        let (mut actor, mut port, mut result) = split_result_with_discovered_observations().await;
+        port.bind_completed_fixed_point_input(&mut actor, &result)
+            .expect("sealed final input binds before a genuine root change");
+        let mut changed = actor.state().root().clone();
+        changed.root_resource_version = "root-rv-after-final-bind".into();
+        assert!(actor.root_observed(changed));
+        assert_eq!(
+            port.complete_observation_fence(&mut actor, &mut result)
+                .expect("genuine root change restarts rather than completing"),
+            CompletedObservationFenceOutcomeV0::RestartRequired
+        );
+
+        let (mut actor, mut port, result) = split_result_with_discovered_observations().await;
+        port.bind_completed_fixed_point_input(&mut actor, &result)
+            .expect("sealed final input binds before a genuine dependency change");
+        let change = {
+            let retained = port
+                .retained
+                .as_mut()
+                .expect("split port retains its dependency barrier");
+            assert!(
+                retained.record(WatchEventV0::Modified(object(
+                    "config",
+                    "uid-1",
+                    "changed-rv"
+                ))),
+                "a post-bind dependency modification is buffered"
+            );
+            GenuineChangeV0::from_observations(
+                &retained.observations(),
+                retained.barrier.generation,
+                retained.incarnation,
+            )
+            .expect("buffered dependency change is canonical")
+        };
+        assert_eq!(
+            port.apply_buffered_retained_watch(
+                &mut actor,
+                BufferedRetainedWatchV0::Change {
+                    port_identity: port.identity(),
+                    barrier: port.barrier,
+                    change,
+                },
+            )
+            .expect("genuine dependency delivery is coordinated"),
+            RetainedWatchCoordinationV0::ReconcileScheduled
+        );
+        assert!(
+            !actor.owns_render_request(),
+            "a buffered genuine dependency change blocks completion of the bound render"
+        );
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn split_render_collects_old_dependency_changes_without_cancelling_the_future() {
@@ -2581,6 +2845,14 @@ mod tests {
             .reconcile_for_actor(&mut actor, template.input.clone())
             .await
             .expect("only the concrete port can attach provenance");
+        assert!(
+            !result.input().observations.is_empty(),
+            "direct reconciliation must bind the same discovered final input"
+        );
+        assert_eq!(
+            active_pin_bytes(&actor),
+            canonical_render_input(result.input()).expect("final direct input is canonical")
+        );
         let CompletedObservationFenceOutcomeV0::Completed(capability) = port
             .complete_observation_fence(&mut actor, &mut result)
             .expect("concrete port completes the full observation fence")
@@ -2611,8 +2883,10 @@ mod tests {
             .as_ref()
             .expect("test retained")
             .observations();
-        generic_actor.bind_fixed_point_input(generic.input());
         owned_render(&mut generic_actor, generic.input());
+        let _capability = generic_actor
+            .issue_render_capability(generic.input.clone(), generic_port.identity())
+            .expect("generic test pins a speculative input");
         assert!(matches!(
             generic_port.complete_observation_fence(&mut generic_actor, &mut generic),
             Err(RuntimeErrorV0::Hold(_))

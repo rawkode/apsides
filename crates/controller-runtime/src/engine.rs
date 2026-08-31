@@ -18,7 +18,6 @@ pub async fn reconcile_with_watch_restarts<P: FixedPointPortV0>(
     loop {
         port.set_barrier(actor.barrier());
         input.cache_epoch = actor.barrier().cache_epoch.to_string();
-        actor.bind_fixed_point_input(&input);
         match reconcile_fixed_point(port, input.clone()).await {
             Err(RuntimeErrorV0::Discovery(
                 TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow,
@@ -30,12 +29,7 @@ pub async fn reconcile_with_watch_restarts<P: FixedPointPortV0>(
                 input.observation_token =
                     observation_token_for_barrier(&input.observation_token, actor.barrier());
             }
-            result => {
-                if let Ok(final_result) = &result {
-                    actor.bind_fixed_point_input(final_result.input());
-                }
-                return result;
-            }
+            result => return result,
         }
     }
 }

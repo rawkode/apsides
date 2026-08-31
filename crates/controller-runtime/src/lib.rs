@@ -296,6 +296,7 @@ impl ValidatedRenderObservationV0 {
 struct FixedPointProvenanceSeedV0 {
     request_id: String,
     preconditions: PreconditionsV0,
+    initial_input_hash: String,
     root_name: String,
     root_namespace: String,
     root_uid: String,
@@ -740,6 +741,7 @@ impl RootActorV0 {
         let seed = FixedPointProvenanceSeedV0 {
             request_id: request_id.clone(),
             preconditions: preconditions.clone(),
+            initial_input_hash: oxideloop_renderer_abi::sha256_hex(&canonical_render_input(input)?),
             root_name: root.name.clone(),
             root_namespace: root.namespace.clone(),
             root_uid: root.uid.clone(),
@@ -932,11 +934,88 @@ impl RootActorV0 {
         })
     }
 
-    /// Captures the exact fixed-point input currently being evaluated by the
-    /// engine. This is crate-private so a production driver cannot mint a
-    /// completion pin independently of the fixed-point loop.
-    pub(crate) fn bind_fixed_point_input(&mut self, input: &RenderInputV0) {
-        self.active_render_input = Some((self.barrier, input.clone()));
+    /// Replaces the speculative fixed-point input only after the concrete port
+    /// has completed the actor-issued capability. Every validation precedes
+    /// mutation so a malformed or superseded result leaves the active pin
+    /// intact for the ordinary stale-result path.
+    fn bind_completed_fixed_point_input(
+        &mut self,
+        final_result: &FixedPointResultV0,
+        port_identity: u64,
+        port_barrier: BarrierV0,
+        retained_incarnation: u64,
+    ) -> Result<(), RuntimeErrorV0> {
+        let provenance = final_result.provenance.as_ref().ok_or_else(|| {
+            RuntimeErrorV0::Hold(
+                "completed fixed-point input has no sealed provenance capability".into(),
+            )
+        })?;
+        let Some(CommandV0::RequestRender { preconditions }) = self.owned_in_flight.as_ref() else {
+            return Err(RuntimeErrorV0::Hold(
+                "completed fixed-point input has no owned RequestRender command".into(),
+            ));
+        };
+        let (active_barrier, active_input) =
+            self.active_render_input.as_ref().ok_or_else(|| {
+                RuntimeErrorV0::Hold(
+                    "completed fixed-point input has no speculative active input pin".into(),
+                )
+            })?;
+        let root = self.state.root();
+        let root_spec = serde_json::to_value(&root.spec).map_err(|_| {
+            RuntimeErrorV0::Hold(
+                "completed fixed-point input root spec cannot be canonicalized".into(),
+            )
+        })?;
+        let input_hash = |input: &RenderInputV0| {
+            canonical_render_input(input)
+                .map(|canonical| oxideloop_renderer_abi::sha256_hex(&canonical))
+                .map_err(|_| {
+                    RuntimeErrorV0::Hold(
+                        "completed fixed-point input cannot be canonicalized".into(),
+                    )
+                })
+        };
+        let active_hash = input_hash(active_input)?;
+        let mut final_with_initial_observations = final_result.input.clone();
+        final_with_initial_observations
+            .observations
+            .clone_from(&active_input.observations);
+        let only_observations_changed =
+            input_hash(&final_with_initial_observations)? == provenance.seed.initial_input_hash;
+        if !matches!(self.mode, ModeV0::Running)
+            || !self.in_flight
+            || *active_barrier != self.barrier
+            || port_barrier != self.barrier
+            || active_hash != provenance.seed.initial_input_hash
+            || provenance.seed.request_id != fixed_point_request_id(preconditions)
+            || self.render_provenance_request.as_deref()
+                != Some(provenance.seed.request_id.as_str())
+            || preconditions != &provenance.seed.preconditions
+            || !preconditions_match_root(preconditions, root)
+            || provenance.seed.barrier != self.barrier
+            || provenance.seed.port_identity != port_identity
+            || provenance.retained_incarnation != retained_incarnation
+            || root.name != provenance.seed.root_name
+            || root.namespace != provenance.seed.root_namespace
+            || root.uid != provenance.seed.root_uid
+            || root.generation != provenance.seed.root_generation
+            || root_spec != provenance.seed.root_spec
+            || root.bundle_digest != provenance.seed.bundle_digest
+            || final_result.input.abi_version != oxideloop_renderer_abi::model::ABI_VERSION_V0
+            || !render_input_matches_root_and_barrier(&final_result.input, root, self.barrier)
+            || final_result.input.root.spec != root_spec
+            || final_result.input.bundle_digest != root.bundle_digest
+            || final_result.input.observation_token != preconditions.observation_token
+            || final_result.input.cache_epoch != preconditions.cache_epoch
+            || !only_observations_changed
+        {
+            return Err(RuntimeErrorV0::Hold(
+                "completed fixed-point input does not match the sealed render capability".into(),
+            ));
+        }
+        self.active_render_input = Some((self.barrier, final_result.input.clone()));
+        Ok(())
     }
 
     /// Captures the only render provenance capability before the renderer and
@@ -948,7 +1027,10 @@ impl RootActorV0 {
         port_identity: u64,
     ) -> Result<RenderCommandCapabilityV0, RuntimeErrorV0> {
         let seed = self.begin_fixed_point_provenance(&input, port_identity)?;
-        self.bind_fixed_point_input(&input);
+        // The initial canonical input remains pinned until the reunited
+        // concrete port proves the final fixed-point result differs only in
+        // discovered observations.
+        self.active_render_input = Some((self.barrier, input.clone()));
         Ok(RenderCommandCapabilityV0 {
             input,
             seed,

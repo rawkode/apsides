@@ -437,6 +437,15 @@ impl ControllerDriverV0 {
                         }
                         Err(error) => return Err(error),
                     };
+                    fixed_point
+                        .as_ref()
+                        .ok_or_else(|| {
+                            RuntimeErrorV0::Hold(
+                                "reunited render port disappeared before final input binding"
+                                    .into(),
+                            )
+                        })?
+                        .bind_completed_fixed_point_input(active, &result)?;
                     // Root and old-retained records can only be reduced now
                     // that the no-effect render future/capability path has
                     // resolved. A genuine change supersedes the render and
