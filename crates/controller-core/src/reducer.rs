@@ -168,6 +168,10 @@ pub struct PendingRootStatusV0 {
     pub old_resource_version: String,
     pub status: WebApplicationStatus,
     pub continuation: RootStatusContinuationV0,
+    /// Exact render observation identity sealed by the completed render. This
+    /// is deliberately skipped by recovery with the rest of runtime state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_input: Option<RootStatusContinuationPayloadV0>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -183,6 +187,13 @@ pub enum RootStatusContinuationV0 {
     Informers,
     Render,
     DeletionStateFinalizer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RootStatusContinuationPayloadV0 {
+    pub observation_token: String,
+    pub cache_epoch: String,
 }
 
 /// Validated root-plus-durable-journal state for the pure reducer.
@@ -864,6 +875,7 @@ pub fn reduce(mut state: MachineStateV0, event: EventV0) -> Result<TransitionV0,
                     &mut state,
                     status,
                     RootStatusContinuationV0::Render,
+                    Some(&frozen),
                     &mut commands,
                 ) {
                     // The status acknowledgement must land before this render can
@@ -1723,7 +1735,13 @@ fn descriptor_ready(
     }
     state.runtime.pending_descriptor_token = None;
     let status = root_status_for(&state.root, None, true);
-    if !queue_root_status(state, status, RootStatusContinuationV0::Informers, commands) {
+    if !queue_root_status(
+        state,
+        status,
+        RootStatusContinuationV0::Informers,
+        None,
+        commands,
+    ) {
         state.phase = PhaseV0::InformersPending;
     }
 }
@@ -1753,6 +1771,7 @@ fn queue_root_status(
     state: &mut MachineStateV0,
     status: WebApplicationStatus,
     continuation: RootStatusContinuationV0,
+    frozen: Option<&FrozenInputV0>,
     commands: &mut Vec<CommandV0>,
 ) -> bool {
     if status == state.root.status {
@@ -1778,6 +1797,10 @@ fn queue_root_status(
         old_resource_version: state.root.root_resource_version.clone(),
         status: status.clone(),
         continuation,
+        render_input: frozen.map(|frozen| RootStatusContinuationPayloadV0 {
+            observation_token: frozen.observation_token.clone(),
+            cache_epoch: frozen.cache_epoch.clone(),
+        }),
     });
     state.phase = PhaseV0::RootStatusPersistPending;
     commands.push(CommandV0::PersistRootStatus {
@@ -1819,6 +1842,17 @@ fn root_status_ack(
         );
         return;
     }
+    let render_input = pending.render_input.as_ref();
+    if render_input.is_some() != matches!(pending.continuation, RootStatusContinuationV0::Render)
+        || matches!(pending.continuation, RootStatusContinuationV0::Render)
+            && !valid_render_continuation(render_input, &pending.status)
+    {
+        state.phase = PhaseV0::Hold;
+        commands.push(CommandV0::Hold {
+            reason: "root status continuation payload is invalid or mismatched".into(),
+        });
+        return;
+    }
     state.root.root_resource_version = new.into();
     state.root.status = pending.status;
     state.runtime.pending_root_status = None;
@@ -1826,9 +1860,13 @@ fn root_status_ack(
         RootStatusContinuationV0::Informers => state.phase = PhaseV0::InformersPending,
         RootStatusContinuationV0::Render => {
             state.phase = PhaseV0::RenderPending;
-            commands.push(CommandV0::RequestRender {
-                preconditions: pins(&state.root),
-            });
+            let mut preconditions = pins(&state.root);
+            let payload = render_input.expect("validated render continuation payload");
+            preconditions
+                .observation_token
+                .clone_from(&payload.observation_token);
+            preconditions.cache_epoch.clone_from(&payload.cache_epoch);
+            commands.push(CommandV0::RequestRender { preconditions });
         }
         RootStatusContinuationV0::DeletionStateFinalizer => {
             state.phase = PhaseV0::StateFinalizerPending;
@@ -1838,6 +1876,29 @@ fn root_status_ack(
             });
         }
     }
+}
+
+fn valid_render_continuation(
+    payload: Option<&RootStatusContinuationPayloadV0>,
+    pending_status: &WebApplicationStatus,
+) -> bool {
+    let Some(payload) = payload else { return false };
+    let Some(status_token) = pending_status.input_token.as_deref() else {
+        return false;
+    };
+    let Some(status_epoch) = pending_status.cache_epoch else {
+        return false;
+    };
+    !payload.observation_token.is_empty()
+        && payload.observation_token.len() <= MAX_IDENTIFIER_BYTES
+        && !payload.cache_epoch.is_empty()
+        && payload.cache_epoch.len() <= MAX_IDENTIFIER_BYTES
+        && payload
+            .cache_epoch
+            .parse::<u64>()
+            .is_ok_and(|epoch| epoch.to_string() == payload.cache_epoch)
+        && payload.observation_token == status_token
+        && payload.cache_epoch.parse::<u64>().ok() == Some(status_epoch)
 }
 
 fn begin_deletion(mut state: MachineStateV0) -> Result<TransitionV0, ReconcileError> {
@@ -3172,6 +3233,7 @@ fn owned_children_verified(
             state,
             status,
             RootStatusContinuationV0::DeletionStateFinalizer,
+            None,
             commands,
         ) {
             state.phase = PhaseV0::StateFinalizerPending;
@@ -5473,6 +5535,56 @@ mod tests {
                 _ => unreachable!(),
             }
         );
+    }
+
+    #[test]
+    fn render_status_continuation_requires_exact_canonical_payload() {
+        let machine = boot_to_render(state());
+        let (mut frozen, input, output, observed) = rendered(&machine.root, vec![]);
+        frozen.cache_epoch = "1".into();
+        let issued = reduce(
+            machine,
+            EventV0::Rendered {
+                frozen,
+                render_input_json: input,
+                render_output_json: output,
+                observed,
+            },
+        )
+        .unwrap();
+        let (token, old) = match &issued.commands[0] {
+            CommandV0::PersistRootStatus {
+                token,
+                old_root_resource_version,
+                ..
+            } => (token.clone(), old_root_resource_version.clone()),
+            _ => panic!("render must queue root status"),
+        };
+        let mutators: [fn(&mut PendingRootStatusV0); 3] = [
+            |pending| pending.render_input = None,
+            |pending| pending.render_input.as_mut().unwrap().observation_token = "other".into(),
+            |pending| pending.render_input.as_mut().unwrap().cache_epoch = "01".into(),
+        ];
+        for mutate in mutators {
+            let mut state = issued.state.clone();
+            mutate(state.runtime.pending_root_status.as_mut().unwrap());
+            let held = reduce(
+                state,
+                EventV0::RootStatusPersisted {
+                    token: token.clone(),
+                    old_root_resource_version: old.clone(),
+                    new_root_resource_version: "22".into(),
+                    root_uid: "root-uid".into(),
+                },
+            )
+            .unwrap();
+            assert_eq!(held.state.phase, PhaseV0::Hold);
+            assert!(
+                held.commands
+                    .iter()
+                    .all(|command| !matches!(command, CommandV0::RequestRender { .. }))
+            );
+        }
     }
 
     #[test]

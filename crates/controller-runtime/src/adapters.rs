@@ -435,6 +435,11 @@ pub enum CompletedObservationFenceOutcomeV0 {
 }
 
 impl<'a, R> KubeFixedPointPortV0<'a, R> {
+    pub(crate) fn invalidate_to_barrier(&mut self, barrier: BarrierV0) {
+        self.retained = None;
+        self.barrier = barrier;
+    }
+
     #[must_use]
     pub fn new(
         transport: &'a KubeTransportV0,
@@ -2710,6 +2715,24 @@ mod tests {
             retained_port.admit_initial_informer_readiness(&mut retained_actor),
             Err(RuntimeErrorV0::Hold(_))
         ));
+
+        // A terminal discovery restart can reunite an old retained port
+        // before the actor reaches InformersPending again. The production
+        // driver must clear that authority before admitting the replacement
+        // observation barrier.
+        let mut restarted_actor = fenced_actor(vec![], None);
+        let mut restarted_port =
+            KubeFixedPointPortV0::<()>::observation_only_for_test(restarted_actor.barrier());
+        restarted_port.retained = Some(retained_with(object("config", "uid-1", "1")));
+        restarted_actor.watch_invalidated();
+        restarted_port.invalidate_to_barrier(restarted_actor.barrier());
+        assert!(
+            restarted_port
+                .admit_initial_informer_readiness(&mut restarted_actor)
+                .expect("invalidated retained port admits the replacement barrier")
+        );
+        assert_eq!(restarted_port.barrier, restarted_actor.barrier());
+        assert!(restarted_port.retained.is_none());
     }
 
     #[test]
@@ -3423,6 +3446,63 @@ mod tests {
                 && observed.identity.name == "foreign"
                 && matches!(observed.observation, CoreObservation::Existing { .. })
         }));
+        let observation_token = result.input().observation_token.clone();
+        let cache_epoch = result.input().cache_epoch.clone();
+        actor
+            .acknowledge_render_observation(*observation)
+            .expect("completed render observation is acknowledged by the actor");
+        let status = actor
+            .next_command()
+            .expect("render acknowledgement must queue root status")
+            .expect("root status continuation command");
+        let (status_token, old_root_resource_version, acknowledged_status) = match status {
+            CommandV0::PersistRootStatus {
+                token,
+                old_root_resource_version,
+                status,
+                ..
+            } => {
+                assert_eq!(
+                    status.input_token.as_deref(),
+                    Some(observation_token.as_str())
+                );
+                assert_eq!(status.cache_epoch, cache_epoch.parse::<u64>().ok());
+                (token, old_root_resource_version, status)
+            }
+            other => panic!("expected render status continuation, got {other:?}"),
+        };
+        let mut acknowledged_root = actor.state().root().clone();
+        acknowledged_root.root_resource_version = "root-rv-after-render".into();
+        acknowledged_root.status = acknowledged_status;
+        actor
+            .acknowledge(EventV0::RootStatusPersisted {
+                token: status_token,
+                old_root_resource_version,
+                new_root_resource_version: "root-rv-after-render".into(),
+                root_uid: "root-uid".into(),
+            })
+            .expect("exact root status acknowledgement");
+        assert!(actor.root_observed(acknowledged_root));
+        let follow_up = actor
+            .next_command()
+            .expect("status acknowledgement must queue follow-up render")
+            .expect("follow-up render command");
+        let follow_up_preconditions = match follow_up {
+            CommandV0::RequestRender { preconditions } => preconditions,
+            other => panic!("expected follow-up render, got {other:?}"),
+        };
+        assert_eq!(
+            follow_up_preconditions.root_resource_version,
+            "root-rv-after-render"
+        );
+        assert_eq!(follow_up_preconditions.observation_token, observation_token);
+        assert_eq!(follow_up_preconditions.cache_epoch, cache_epoch);
+        let mut follow_up_input = template.input.clone();
+        follow_up_input.observation_token = follow_up_preconditions.observation_token.clone();
+        follow_up_input.cache_epoch = follow_up_preconditions.cache_epoch.clone();
+        actor
+            .issue_render_capability(follow_up_input, port.identity())
+            .expect("follow-up render capability remains issuable after status continuation");
         assert_eq!(watch_senders.len(), 3);
         assert_eq!(
             paths.lock().unwrap().as_slice(),

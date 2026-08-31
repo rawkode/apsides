@@ -145,6 +145,16 @@ struct DeferredGenuineChangeV0 {
     cache_epoch: String,
 }
 
+/// A watch invalidation that has already superseded an observation-only
+/// continuation. If another root/watch rebarrier arrives before admission,
+/// the final token must still be derived from `original_seed`, exactly once.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingInvalidationObservationV0 {
+    barrier: BarrierV0,
+    original_seed: String,
+    derived_token: String,
+}
+
 /// A readiness acknowledgement is valid only for the exact root snapshot and
 /// retained cache barrier that admitted it. Keeping the full root snapshot is
 /// intentionally conservative: any changed root pin drops the signal rather
@@ -632,6 +642,11 @@ pub struct RootActorV0 {
     /// cancel that command; delivery is deferred until the actor is quiescent
     /// and `Ready`.
     deferred_genuine_change: Option<DeferredGenuineChangeV0>,
+    latched_invalidation_seed: Option<String>,
+    /// A watch-invalidation supersession has already minted this exact token.
+    /// The following informer admission must transport it unchanged rather
+    /// than deriving a second token from the freshly superseded one.
+    pending_invalidation_observation: Option<PendingInvalidationObservationV0>,
     last_root_observation: Option<RootObservationFingerprintV0>,
     active_render_input: Option<(BarrierV0, RenderInputV0)>,
     render_provenance_request: Option<String>,
@@ -655,6 +670,8 @@ impl RootActorV0 {
             commands: VecDeque::new(),
             last_dependency_observation: None,
             deferred_genuine_change: None,
+            latched_invalidation_seed: None,
+            pending_invalidation_observation: None,
             last_root_observation: None,
             active_render_input: None,
             render_provenance_request: None,
@@ -1307,6 +1324,46 @@ impl RootActorV0 {
                 ))
     }
 
+    fn try_deliver_latched_invalidation(&mut self) -> Result<(), RuntimeErrorV0> {
+        if self.state.root().deleting
+            || matches!(self.state.phase(), PhaseV0::Hold | PhaseV0::Terminal)
+            || matches!(self.mode, ModeV0::Hold(_) | ModeV0::Terminal)
+        {
+            self.latched_invalidation_seed = None;
+            self.pending_invalidation_observation = None;
+            return Ok(());
+        }
+        let Some(seed) = self.latched_invalidation_seed.clone() else {
+            return Ok(());
+        };
+        let token = observation_token_for_barrier(&seed, self.barrier);
+        match self.state.phase() {
+            PhaseV0::InformersPending | PhaseV0::RenderPending | PhaseV0::RevalidatePending
+                if self.can_supersede_observation_only() =>
+            {
+                if self.supersede_observation_only(token) {
+                    self.pending_invalidation_observation =
+                        Some(PendingInvalidationObservationV0 {
+                            barrier: self.barrier,
+                            derived_token: observation_token_for_barrier(&seed, self.barrier),
+                            original_seed: seed,
+                        });
+                    self.latched_invalidation_seed = None;
+                }
+            }
+            PhaseV0::Ready if !self.in_flight && self.owned_in_flight.is_none() => {
+                self.reduce_event(EventV0::ReconcileRequested {
+                    cause: InternalReconcileCauseV0::DependencyWatch,
+                    observation_token: token,
+                    cache_epoch: self.barrier.cache_epoch.to_string(),
+                })?;
+                self.latched_invalidation_seed = None;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Atomically consumes only a no-effect render/informer continuation and
     /// returns the reducer to `InformersPending` with authenticated pins. A
     /// durable effect is never cancelled by a retained watch event.
@@ -1368,6 +1425,11 @@ impl RootActorV0 {
             return false;
         }
         self.last_root_observation = Some(fingerprint);
+        if let Some(pending) = self.pending_invalidation_observation.take() {
+            // A genuine same-UID root refresh crossed the barrier before
+            // informer admission; re-latch its original trusted seed.
+            self.latched_invalidation_seed = Some(pending.original_seed);
+        }
         self.barrier.generation = self.barrier.generation.saturating_add(1);
         self.active_render_input = None;
         self.render_provenance_request = None;
@@ -1443,6 +1505,7 @@ impl RootActorV0 {
             self.terminal_root_deleted();
             return Ok(None);
         }
+        self.try_deliver_latched_invalidation()?;
         self.deliver_deferred_genuine_change()?;
         if let Some(command) = self.commands.pop_front() {
             self.in_flight = true;
@@ -1873,13 +1936,22 @@ impl RootActorV0 {
                 "initial informer readiness does not match the current actor barrier".into(),
             ));
         }
-        let prior_token = self
-            .active_render_input
-            .as_ref()
-            .map(|(_, input)| input.observation_token.as_str())
-            .or(self.state.root().status.input_token.as_deref())
-            .unwrap_or(self.state.root().uid.as_str());
-        let observation_token = observation_token_for_barrier(prior_token, candidate);
+        let observation_token = self
+            .pending_invalidation_observation
+            .take()
+            .filter(|pending| pending.barrier == candidate)
+            .map_or_else(
+                || {
+                    let prior_token = self
+                        .active_render_input
+                        .as_ref()
+                        .map(|(_, input)| input.observation_token.as_str())
+                        .or(self.state.root().status.input_token.as_deref())
+                        .unwrap_or(self.state.root().uid.as_str());
+                    observation_token_for_barrier(prior_token, candidate)
+                },
+                |pending| pending.derived_token,
+            );
         if !self.supersede_observation_only(observation_token) {
             return Err(RuntimeErrorV0::Hold(
                 "initial informer observation could not be sealed".into(),
@@ -1893,29 +1965,42 @@ impl RootActorV0 {
     }
     pub(crate) fn watch_invalidated(&mut self) {
         let prior_token = self
-            .active_render_input
-            .as_ref()
-            .map(|(_, input)| input.observation_token.clone())
+            .latched_invalidation_seed
+            .clone()
+            .or_else(|| {
+                self.pending_invalidation_observation
+                    .as_ref()
+                    .map(|pending| pending.original_seed.clone())
+            })
+            .or_else(|| {
+                self.active_render_input
+                    .as_ref()
+                    .map(|(_, input)| input.observation_token.clone())
+            })
             .or_else(|| self.state.root().status.input_token.clone())
             .unwrap_or_else(|| self.state.root().uid.clone());
+        if self.latched_invalidation_seed.is_none() {
+            self.latched_invalidation_seed = Some(prior_token);
+        }
+        self.pending_invalidation_observation = None;
         self.barrier.cache_epoch += 1;
         self.barrier.generation += 1;
         self.pending_informer_readiness = None;
         self.observation_events.clear();
         self.last_dependency_observation = None;
         self.deferred_genuine_change = None;
-        let observation_token = observation_token_for_barrier(&prior_token, self.barrier);
-        if self.can_supersede_observation_only() {
-            let _ = self.supersede_observation_only(observation_token);
-        } else {
-            self.active_render_input = None;
-            self.render_provenance_request = None;
+        self.active_render_input = None;
+        self.render_provenance_request = None;
+        if let Err(error) = self.try_deliver_latched_invalidation() {
+            self.hold(error.to_string());
         }
         // A 410 only invalidates observation state. In-flight durable effects,
         // their acknowledgements, and command ownership remain intact.
     }
     pub fn hold(&mut self, reason: String) {
         self.mode = ModeV0::Hold(reason);
+        self.latched_invalidation_seed = None;
+        self.pending_invalidation_observation = None;
         self.core_events.clear();
         self.priority_ack = None;
         self.pending_root_refresh = None;
@@ -1930,6 +2015,8 @@ impl RootActorV0 {
     }
     pub fn terminal_root_deleted(&mut self) {
         self.mode = ModeV0::Terminal;
+        self.latched_invalidation_seed = None;
+        self.pending_invalidation_observation = None;
         self.core_events.clear();
         self.priority_ack = None;
         self.pending_root_refresh = None;
@@ -3827,6 +3914,52 @@ mod tests {
         );
         assert_eq!(actor.state().phase(), PhaseV0::InformersPending);
         actor
+    }
+
+    fn trusted_render_input(actor: &RootActorV0, observation_token: &str) -> RenderInputV0 {
+        let (_, input, _, _) = prune_render_documents(
+            actor.state().root(),
+            &actor.state().root().state_resource_version,
+            observation_token,
+            &actor.barrier().cache_epoch.to_string(),
+        );
+        serde_json::from_str(&input).expect("trusted test render input")
+    }
+
+    fn render_status_pending_actor() -> (RootActorV0, CommandV0) {
+        let mut actor = informers_pending_actor();
+        let barrier = actor.barrier();
+        actor
+            .prepare_initial_informer_observation(barrier)
+            .expect("sealed informer observation");
+        actor.informers_ready(barrier);
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("informer readiness reduces")
+            .expect("initial render command")
+        else {
+            panic!("informer readiness did not issue render");
+        };
+        let (frozen, input, output, observed) = prune_render_documents(
+            actor.state().root(),
+            &preconditions.state_resource_version,
+            &preconditions.observation_token,
+            &preconditions.cache_epoch,
+        );
+        actor
+            .accept_acknowledgement(EventV0::Rendered {
+                frozen,
+                render_input_json: input,
+                render_output_json: output,
+                observed,
+            })
+            .expect("render acknowledgement");
+        let status = actor
+            .next_command()
+            .expect("render acknowledgement reduces")
+            .expect("render status continuation");
+        assert!(matches!(status, CommandV0::PersistRootStatus { .. }));
+        (actor, status)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -6121,6 +6254,326 @@ mod tests {
         assert!(actor.observation_events.is_empty());
         assert!(actor.pending_root_refresh.is_some());
         assert!(actor.deferred_genuine_change.is_none());
+    }
+
+    #[test]
+    fn ready_watch_invalidation_immediately_reissues_an_authenticated_render() {
+        // A quiescent root has no priority acknowledgement to carry this
+        // restart.  The actor must therefore perform the authenticated
+        // Ready -> ReconcileRequested transition itself, with a token derived
+        // from the trusted input and its new barrier.
+        for terminal in ["WatchGone", "WatchOverflow"] {
+            let mut actor = RootActorV0::new(ready_machine());
+            let original_seed = format!("trusted-ready-seed-{terminal}");
+            actor.active_render_input = Some((
+                actor.barrier(),
+                trusted_render_input(&actor, &original_seed),
+            ));
+            let old_barrier = actor.barrier();
+
+            actor.watch_invalidated();
+
+            let current = actor.barrier();
+            assert!(current.cache_epoch > old_barrier.cache_epoch, "{terminal}");
+            assert!(
+                actor.latched_invalidation_seed.is_none(),
+                "{terminal} must be delivered immediately from Ready"
+            );
+            let CommandV0::RequestRender { preconditions } = actor
+                .next_command()
+                .expect("ready invalidation reduction")
+                .expect("ready invalidation requests a fresh render")
+            else {
+                panic!("{terminal} did not request render");
+            };
+            assert_eq!(preconditions.cache_epoch, current.cache_epoch.to_string());
+            assert_eq!(
+                preconditions.observation_token,
+                observation_token_for_barrier(&original_seed, current),
+                "{terminal} must not reuse the stale render authority"
+            );
+            assert_ne!(
+                preconditions.observation_token, original_seed,
+                "{terminal} must derive, rather than replay, the seed"
+            );
+        }
+    }
+
+    #[test]
+    fn invalidation_latch_survives_durable_chain_and_uses_the_final_barrier() {
+        // The watch can fail after an owned mutation acknowledgement is
+        // queued but before it reduces.  A second failure may occur while the
+        // resulting durable state write is outstanding.  Neither may release
+        // a stale render; the original trusted seed survives until an
+        // observation-only replacement can consume it.
+        let (machine, mutation_ack) = mutation_pending();
+        let mut actor = RootActorV0::new(machine);
+        let original_seed = "trusted-mutation-seed".to_owned();
+        actor.active_render_input = Some((
+            actor.barrier(),
+            trusted_render_input(&actor, &original_seed),
+        ));
+
+        actor.watch_invalidated();
+        let first_barrier = actor.barrier();
+        actor.watch_invalidated();
+        let final_barrier = actor.barrier();
+        assert!(final_barrier.cache_epoch > first_barrier.cache_epoch);
+        assert_eq!(
+            actor.latched_invalidation_seed.as_deref(),
+            Some(original_seed.as_str()),
+            "a repeated invalidation must retain the original trusted seed"
+        );
+
+        actor.priority_ack = Some(mutation_ack);
+        let persist = actor
+            .next_command()
+            .expect("mutation acknowledgement reduces")
+            .expect("mutation acknowledgement remains durable");
+        assert!(matches!(persist, CommandV0::Persist { .. }));
+        assert_eq!(
+            actor.latched_invalidation_seed.as_deref(),
+            Some(original_seed.as_str()),
+            "a non-observation durable continuation must not consume the latch"
+        );
+
+        actor
+            .acknowledge(persisted_event(&persist, "state-rv-after-latched-mutation"))
+            .expect("durable persistence acknowledgement");
+        let next = actor
+            .next_command()
+            .expect("persistence acknowledgement reduces");
+        assert!(
+            !matches!(next, Some(CommandV0::RequestRender { .. })),
+            "the old mutation-era render must never be issued after invalidation"
+        );
+        assert!(
+            actor.latched_invalidation_seed.is_none()
+                || actor.latched_invalidation_seed.as_deref() == Some(original_seed.as_str()),
+            "only observation supersession, deletion, Hold, or Terminal may clear the latch"
+        );
+        assert!(
+            actor.barrier().cache_epoch >= final_barrier.cache_epoch,
+            "the final continuation must remain at the newest invalidation barrier"
+        );
+    }
+
+    #[test]
+    fn deleting_root_discards_an_invalidation_latch() {
+        let mut actor = RootActorV0::new(deleting_machine(vec![], vec![]));
+        actor.active_render_input = Some((
+            actor.barrier(),
+            trusted_render_input(&actor, "trusted-deleting-seed"),
+        ));
+
+        actor.watch_invalidated();
+
+        assert!(actor.latched_invalidation_seed.is_none());
+        assert!(actor.active_render_input.is_none());
+    }
+
+    #[test]
+    fn post_supersession_invalidation_preserves_the_original_active_seed() {
+        let mut actor = informers_pending_actor();
+        let original_seed = "active-token-not-status-token".to_owned();
+        actor.active_render_input = Some((
+            actor.barrier(),
+            trusted_render_input(&actor, &original_seed),
+        ));
+
+        actor.watch_invalidated();
+        let first = actor.barrier();
+        assert_eq!(
+            actor
+                .pending_invalidation_observation
+                .as_ref()
+                .map(|pending| pending.original_seed.as_str()),
+            Some(original_seed.as_str())
+        );
+        actor.watch_invalidated();
+        let final_barrier = actor.barrier();
+        assert!(final_barrier.cache_epoch > first.cache_epoch);
+        assert_eq!(
+            actor.pending_invalidation_observation.as_ref(),
+            Some(&PendingInvalidationObservationV0 {
+                barrier: final_barrier,
+                original_seed: original_seed.clone(),
+                derived_token: observation_token_for_barrier(&original_seed, final_barrier),
+            })
+        );
+
+        actor
+            .prepare_initial_informer_observation(final_barrier)
+            .expect("final-barrier informer admission");
+        actor.informers_ready(final_barrier);
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("admission reduces")
+            .expect("fresh render")
+        else {
+            panic!("admission did not issue render");
+        };
+        assert_eq!(
+            preconditions.observation_token,
+            observation_token_for_barrier(&original_seed, final_barrier)
+        );
+    }
+
+    #[test]
+    fn genuine_root_refresh_after_supersession_reuses_the_original_active_seed() {
+        let mut actor = informers_pending_actor();
+        let original_seed = "active-token-not-status-token".to_owned();
+        actor.active_render_input = Some((
+            actor.barrier(),
+            trusted_render_input(&actor, &original_seed),
+        ));
+        actor.watch_invalidated();
+
+        let mut fresh_root = actor.state().root().clone();
+        fresh_root.root_resource_version = "root-rv-after-supersession".into();
+        assert!(actor.root_observed(fresh_root));
+        let root_refresh_persist = actor
+            .next_command()
+            .expect("root refresh reduces")
+            .expect("root refresh durable continuation");
+        assert!(matches!(root_refresh_persist, CommandV0::Persist { .. }));
+        actor
+            .acknowledge(persisted_event(
+                &root_refresh_persist,
+                "state-rv-after-supersession-root-refresh",
+            ))
+            .expect("root refresh persistence acknowledgement");
+        assert!(
+            actor
+                .next_command()
+                .expect("root refresh continuation reduces")
+                .is_none()
+        );
+        let final_barrier = actor.barrier();
+        assert_eq!(
+            actor.pending_invalidation_observation.as_ref(),
+            Some(&PendingInvalidationObservationV0 {
+                barrier: final_barrier,
+                original_seed: original_seed.clone(),
+                derived_token: observation_token_for_barrier(&original_seed, final_barrier),
+            })
+        );
+
+        actor
+            .prepare_initial_informer_observation(final_barrier)
+            .expect("root-refresh final informer admission");
+        actor.informers_ready(final_barrier);
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("root-refresh admission reduces")
+            .expect("root-refresh fresh render")
+        else {
+            panic!("root-refresh admission did not issue render");
+        };
+        assert_eq!(
+            preconditions.observation_token,
+            observation_token_for_barrier(&original_seed, final_barrier)
+        );
+    }
+
+    #[test]
+    fn terminal_watch_before_render_status_ack_never_reissues_the_stale_render() {
+        // Both root and retained 410/overflow are converted by the driver to
+        // this authenticated actor invalidation.  The root self-echo is
+        // deliberately queued after the status acknowledgement so the fresh
+        // continuation must use its RV and the final barrier, not the command
+        // that was active when the status write began.
+        for source in ["root", "retained"] {
+            for terminal in ["WatchGone", "WatchOverflow"] {
+                let (mut actor, status) = render_status_pending_actor();
+                let CommandV0::PersistRootStatus {
+                    token,
+                    old_root_resource_version,
+                    ..
+                } = status
+                else {
+                    unreachable!("fixture asserted status command");
+                };
+                actor
+                    .acknowledge(EventV0::RootStatusPersisted {
+                        token,
+                        old_root_resource_version,
+                        new_root_resource_version: format!(
+                            "root-rv-status-ack-{source}-{terminal}"
+                        ),
+                        root_uid: "root-uid".into(),
+                    })
+                    .expect("status acknowledgement is priority queued");
+
+                actor.watch_invalidated();
+                let original_seed = actor
+                    .latched_invalidation_seed
+                    .clone()
+                    .expect("terminal watch seals the active trusted seed");
+                let mut echoed_root = actor.state().root().clone();
+                echoed_root.root_resource_version =
+                    format!("root-rv-self-echo-{source}-{terminal}");
+                assert!(actor.root_observed(echoed_root));
+                let invalidate_persist = actor
+                    .next_command()
+                    .expect("status acknowledgement and root echo reduce");
+                assert!(
+                    matches!(invalidate_persist, Some(CommandV0::Persist { .. })),
+                    "{source}/{terminal} must preserve the ordinary durable invalidation chain"
+                );
+                let invalidate_persist = invalidate_persist.expect("checked above");
+                actor
+                    .acknowledge(persisted_event(
+                        &invalidate_persist,
+                        &format!("state-rv-invalidate-{source}-{terminal}"),
+                    ))
+                    .expect("ordinary invalidation persistence acknowledgement");
+                let final_barrier = actor.barrier();
+                let next = actor
+                    .next_command()
+                    .expect("ordinary invalidation continuation reduces");
+                assert!(
+                    next.is_none(),
+                    "{source}/{terminal} must supersede, never issue the stale render: {next:?}"
+                );
+                assert_eq!(actor.state().phase(), PhaseV0::InformersPending);
+                assert!(actor.active_render_input.is_none());
+                assert_eq!(
+                    actor.pending_invalidation_observation.as_ref(),
+                    Some(&PendingInvalidationObservationV0 {
+                        barrier: final_barrier,
+                        original_seed: original_seed.clone(),
+                        derived_token: observation_token_for_barrier(&original_seed, final_barrier),
+                    }),
+                    "{source}/{terminal} must retain the one-shot authenticated admission token"
+                );
+
+                actor
+                    .prepare_initial_informer_observation(final_barrier)
+                    .expect("fresh informer admission after terminal watch");
+                actor.informers_ready(final_barrier);
+                let CommandV0::RequestRender { preconditions } = actor
+                    .next_command()
+                    .expect("fresh informer readiness reduces")
+                    .expect("fresh render command")
+                else {
+                    panic!("{source}/{terminal} did not issue the fresh render");
+                };
+                assert_eq!(
+                    preconditions.root_resource_version,
+                    format!("root-rv-self-echo-{source}-{terminal}")
+                );
+                assert_eq!(
+                    preconditions.cache_epoch,
+                    final_barrier.cache_epoch.to_string()
+                );
+                assert_eq!(
+                    preconditions.observation_token,
+                    observation_token_for_barrier(&original_seed, final_barrier),
+                    "{source}/{terminal} must derive from the original trusted status seed"
+                );
+            }
+        }
     }
 
     #[tokio::test]

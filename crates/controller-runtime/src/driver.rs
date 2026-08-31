@@ -272,6 +272,7 @@ impl ControllerDriverV0 {
 
             // Root observations are coalesced before any new command.  A
             // changed UID is never adopted; the active actor enters Hold.
+            let root_barrier_before_drain = active.barrier();
             match drain_root_watch(&mut root_watch, active, &self.transport, &self.config).await? {
                 RootWatchDrainV0::Current => {}
                 RootWatchDrainV0::RootOnlyRecovery => {
@@ -295,6 +296,13 @@ impl ControllerDriverV0 {
                         continue;
                     }
                 }
+            }
+            if active.barrier() != root_barrier_before_drain
+                && let Some(port) = fixed_point.as_mut()
+            {
+                // Root list/watch/GET authority changed.  No retained
+                // dependency snapshot from the prior root barrier may survive.
+                port.invalidate_to_barrier(active.barrier());
             }
             automation_candidates.retain(|candidate| candidate.matches(active));
             if matches!(active.mode(), ModeV0::Terminal) {
@@ -464,6 +472,13 @@ impl ControllerDriverV0 {
                                     TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow,
                                 ) => {
                                     active.watch_invalidated();
+                                    if let Some(port) = fixed_point.as_mut() {
+                                        // Reuniting after a failed discovery retains the old
+                                        // handles. The actor's terminal-watch restart advanced
+                                        // its authority, so they cannot gate the next initial
+                                        // informer admission.
+                                        port.invalidate_to_barrier(active.barrier());
+                                    }
                                     continue;
                                 }
                                 error => return Err(error),
@@ -840,12 +855,19 @@ impl ControllerDriverV0 {
                             QuiescentWakeV0::FailpointPoll => {}
                             QuiescentWakeV0::Root(root) => match root {
                                 Ok(event) if watch_targets_root(&event, &self.config.root_name) => {
+                                    let prior_barrier = active.barrier();
                                     root_only_recovery = refresh_actor_from_transport(
                                         active,
                                         &self.transport,
                                         &self.config,
                                     )
                                     .await?;
+                                    if !root_only_recovery
+                                        && active.barrier() != prior_barrier
+                                        && let Some(port) = fixed_point.as_mut()
+                                    {
+                                        port.invalidate_to_barrier(active.barrier());
+                                    }
                                 }
                                 Ok(_) => {}
                                 Err(
@@ -857,6 +879,10 @@ impl ControllerDriverV0 {
                                             .await?;
                                     root_watch = watch;
                                     root_only_recovery = refresh_actor_from_machine(active, fresh)?;
+                                    if !root_only_recovery && let Some(port) = fixed_point.as_mut()
+                                    {
+                                        port.invalidate_to_barrier(active.barrier());
+                                    }
                                 }
                                 Err(error) => return Err(error.into()),
                             },
@@ -1541,6 +1567,7 @@ async fn apply_buffered_watches<R>(
         actor.hold(fault.clone());
         return Err(RuntimeErrorV0::Hold(fault));
     }
+    let root_barrier_before = actor.barrier();
     let root_only_recovery = match buffered.root {
         Some(BufferedRootWatchV0::RestartRequired) => {
             actor.watch_invalidated();
@@ -1571,7 +1598,14 @@ async fn apply_buffered_watches<R>(
         clear_root_only_recovery_ephemera(fixed_point, automation_watch, automation_candidates);
         return Ok(());
     }
-    if let Some(record) = buffered.dependency
+    let root_rebarriered = actor.barrier() != root_barrier_before;
+    if root_rebarriered && let Some(port) = fixed_point.as_mut() {
+        // The fresh root reread may itself advance the actor barrier.  Align
+        // only after that reread so InformersPending never inherits U handles.
+        port.invalidate_to_barrier(actor.barrier());
+    }
+    if !root_rebarriered
+        && let Some(record) = buffered.dependency
         && let Some(port) = fixed_point.as_mut()
     {
         let _ = port.apply_buffered_retained_watch(actor, record)?;
@@ -1680,7 +1714,12 @@ async fn drain_root_watch(
                     return Ok(RootWatchDrainV0::RootOnlyRecovery);
                 }
             }
-            Ok(Some(_) | None) => return Ok(RootWatchDrainV0::Current),
+            // Unrelated objects share the collection watch. They cannot end
+            // the pre-command drain: a managed update or terminal watch
+            // result queued immediately behind one must be observed before a
+            // command can be selected under stale root authority.
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(RootWatchDrainV0::Current),
             Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
                 actor.watch_invalidated();
                 return Ok(RootWatchDrainV0::Invalidated);
@@ -3475,6 +3514,97 @@ mod tests {
             .expect("list/watch/get root barrier");
         assert_eq!(machine.expect("root reread").root().uid, ROOT_UID);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    fn drain_root_json(resource_version: &str) -> serde_json::Value {
+        json!({
+            "apiVersion":"demo.oxideloop.dev/v1alpha1",
+            "kind":"WebApplication",
+            "metadata": {
+                "name":"root", "namespace":"ns", "uid":ROOT_UID,
+                "resourceVersion":resource_version, "generation":1, "finalizers":[]
+            },
+            "spec": {
+                "message":"drain root", "expose":false,
+                "program": {"configMapName":"bundle", "key":"program.mjs", "digest":BUNDLE_DIGEST}
+            }
+        })
+    }
+
+    fn drain_root_config() -> DriverConfigV0 {
+        DriverConfigV0 {
+            namespace: "ns".into(),
+            root_name: "root".into(),
+            bundle_store: std::env::temp_dir().join("unused-drain-root-store"),
+            renderer_unix_socket: "/tmp/renderer.sock".into(),
+            #[cfg(feature = "test-failpoints")]
+            failpoint_unix_socket: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_root_watch_skips_unrelated_records_before_managed_update_or_delete() {
+        for event in [
+            WatchEventV0::Modified(root_event("managed-modified")),
+            WatchEventV0::Deleted(root_event("managed-deleted")),
+        ] {
+            let service = service_fn(move |request: Request<Body>| async move {
+                assert!(request.uri().path().ends_with("/webapplications/root"));
+                Ok::<_, Infallible>(wire_json(drain_root_json("root-rv-after-drain")))
+            });
+            let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
+            let (sender, mut watch) = WatchHandleV0::test_channel(3);
+            let mut unrelated = root_event("unrelated");
+            unrelated.reference.name = "not-the-root".into();
+            sender
+                .try_send(Ok(WatchEventV0::Modified(unrelated)))
+                .expect("unrelated root collection record");
+            sender.try_send(Ok(event)).expect("managed root record");
+            let mut actor = automation_candidate_actor();
+            let before = actor.barrier();
+
+            assert!(matches!(
+                drain_root_watch(&mut watch, &mut actor, &transport, &drain_root_config())
+                    .await
+                    .expect("managed root record is drained"),
+                RootWatchDrainV0::Current
+            ));
+            assert!(
+                actor.barrier().generation > before.generation,
+                "the managed record behind an unrelated record must refresh root authority"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_root_watch_skips_unrelated_records_before_terminal_restart() {
+        for terminal in [TransportErrorV0::WatchGone, TransportErrorV0::WatchOverflow] {
+            let service = service_fn(move |_request: Request<Body>| async move {
+                panic!("terminal root drain must not reread before restart handling");
+                #[allow(unreachable_code)]
+                Ok::<_, Infallible>(Response::new(Body::empty()))
+            });
+            let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
+            let (sender, mut watch) = WatchHandleV0::test_channel(3);
+            let mut unrelated = root_event("unrelated");
+            unrelated.reference.name = "not-the-root".into();
+            sender
+                .try_send(Ok(WatchEventV0::Modified(unrelated)))
+                .expect("unrelated root collection record");
+            sender
+                .try_send(Err(terminal))
+                .expect("terminal root record");
+            let mut actor = automation_candidate_actor();
+            let before = actor.barrier();
+
+            assert!(matches!(
+                drain_root_watch(&mut watch, &mut actor, &transport, &drain_root_config())
+                    .await
+                    .expect("terminal root record is drained"),
+                RootWatchDrainV0::Invalidated
+            ));
+            assert!(actor.barrier().cache_epoch > before.cache_epoch);
+        }
     }
 
     #[test]
