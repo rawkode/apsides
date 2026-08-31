@@ -304,34 +304,82 @@ ctx apply -f "$WORK/bundle-configmap.yaml"
 
 PRODUCTION_IMAGE="oxideloop-e2e:production-$RUN_ID"
 FAILPOINT_IMAGE="oxideloop-e2e:failpoints-$RUN_ID"
-# Disable provenance attestations for this local load so each tag names one
-# platform manifest and the exact digest kind/containerd reports is comparable
-# to Docker's local image identity.
+# Disable provenance attestations so each local tag resolves to one platform
+# manifest. Docker inspect then exposes both that manifest digest and its
+# config digest; Kubernetes reports the latter in container status.
 docker build --provenance=false --target production -t "$PRODUCTION_IMAGE" .
 docker build --provenance=false --target e2e-failpoints -t "$FAILPOINT_IMAGE" .
-PRODUCTION_IMAGE_ID=$(docker image inspect "$PRODUCTION_IMAGE" --format '{{.Id}}')
-FAILPOINT_IMAGE_ID=$(docker image inspect "$FAILPOINT_IMAGE" --format '{{.Id}}')
+atomic_capture docker-image-production.inspect.json docker image inspect "$PRODUCTION_IMAGE" || die 'failed to capture production Docker inspect JSON'
+atomic_capture docker-image-failpoints.inspect.json docker image inspect "$FAILPOINT_IMAGE" || die 'failed to capture failpoint Docker inspect JSON'
+image_identity_from_inspect() {
+  tag=$1; inspect_file=$2
+  jq -ec --arg tag "$tag" '
+    def digest($field):
+      if type == "string" and test("^sha256:[0-9a-f]{64}$") then . else error($field + " must be an exact lowercase sha256 digest") end;
+    def variant($field):
+      if . == null then null elif type == "string" and length > 0 then . else error($field + " must be null or a nonempty string") end;
+    def platform($field):
+      (if has("variant") then .variant else null end) as $variant |
+      if type == "object" and (.os | type == "string" and length > 0) and (.architecture | type == "string" and length > 0) then {os:.os,architecture:.architecture,variant:($variant | variant($field + ".variant"))} else error($field + " must include os and architecture") end;
+    def single_platform_manifest($field):
+      if . == "application/vnd.docker.distribution.manifest.v2+json" or . == "application/vnd.oci.image.manifest.v1+json" then . else error($field + " must be a Docker v2 or OCI single-platform image manifest") end;
+    def positive_integer($field):
+      if type == "number" and . > 0 and floor == . then . else error($field + " must be a positive integer") end;
+    if type != "array" or length != 1 then error("Docker inspect must return exactly one image") else .[0] end |
+    . as $image |
+    (if $image | has("RepoTags") then $image.RepoTags else [] end) as $repo_tags |
+    if ($repo_tags | type != "array" or index($tag) == null) then error("Docker inspect does not retain the exact requested tag") else . end |
+    ($image.Id | digest("Docker inspect Id")) as $id |
+    (if $image | has("Descriptor") then $image.Descriptor else null end) as $descriptor |
+    if $descriptor == null or ($descriptor | type == "object") then . else error("Docker inspect Descriptor must be an object or null") end |
+    ($image.Os | if type == "string" and length > 0 then . else error("Docker inspect Os is missing") end) as $os |
+    ($image.Architecture | if type == "string" and length > 0 then . else error("Docker inspect Architecture is missing") end) as $architecture |
+    (($image | if has("Variant") then .Variant else null end) | variant("Docker inspect Variant")) as $inspect_variant |
+    ({os:$os,architecture:$architecture,variant:$inspect_variant}) as $inspect_platform |
+    (if $descriptor == null then null else ($descriptor.digest | digest("Descriptor.digest")) end) as $manifest |
+    (if $descriptor == null then null else ($descriptor.mediaType | single_platform_manifest("Descriptor.mediaType")) end) as $manifest_media_type |
+    (if $descriptor == null then null else ($descriptor.size | positive_integer("Descriptor.size")) end) as $manifest_size |
+    (if $descriptor == null then null elif ($descriptor | has("platform")) then $descriptor.platform else null end) as $descriptor_platform |
+    (if $descriptor_platform == null then $inspect_platform else ($descriptor_platform | platform("Descriptor.platform")) end) as $platform |
+    if $platform != $inspect_platform then error("Descriptor platform differs from Docker inspect platform") else . end |
+    (if $descriptor == null then null elif ($descriptor | has("annotations")) then $descriptor.annotations else null end) as $annotations |
+    if $annotations == null or ($annotations | type == "object") then . else error("Descriptor.annotations must be an object or null") end |
+    (if $annotations == null then null elif ($annotations | has("config.digest")) then $annotations["config.digest"] else null end) as $annotated_config |
+    if ($descriptor != null and $annotated_config != null and $id != $manifest) then error("Docker inspect Id and Descriptor.digest disagree") else . end |
+    (if $annotated_config != null then {digest:($annotated_config | digest("Descriptor.annotations.config.digest")),source:"Descriptor.annotations.config.digest"}
+     elif $descriptor == null then {digest:$id,source:"Id (legacy descriptor unavailable)"}
+     elif $id != $manifest then {digest:$id,source:"Id (descriptor annotation unavailable)"}
+     else error("Docker inspect cannot prove a config digest distinct from its manifest digest") end) as $config |
+    if ($manifest != null and $config.digest == $manifest) then error("Docker config and manifest digests must be distinct") else . end |
+    {tag:$tag,inspectId:$id,manifestDigest:$manifest,manifestMediaType:$manifest_media_type,manifestSize:$manifest_size,configDigest:$config.digest,configDigestSource:$config.source,platform:$platform}
+  ' "$inspect_file"
+}
+PRODUCTION_IMAGE_IDENTITY=$(image_identity_from_inspect "$PRODUCTION_IMAGE" "$EVIDENCE/docker-image-production.inspect.json") || die 'production Docker inspect identity is invalid'
+FAILPOINT_IMAGE_IDENTITY=$(image_identity_from_inspect "$FAILPOINT_IMAGE" "$EVIDENCE/docker-image-failpoints.inspect.json") || die 'failpoint Docker inspect identity is invalid'
+PRODUCTION_CONFIG_DIGEST=$(printf '%s' "$PRODUCTION_IMAGE_IDENTITY" | jq -er '.configDigest')
+FAILPOINT_CONFIG_DIGEST=$(printf '%s' "$FAILPOINT_IMAGE_IDENTITY" | jq -er '.configDigest')
 kind load docker-image --name "$CLUSTER_NAME" "$PRODUCTION_IMAGE" "$FAILPOINT_IMAGE"
 kubectl kustomize deploy/e2e | sed -e "s#ghcr.io/oxideloop/oxideloop:production#$PRODUCTION_IMAGE#g" -e "s#ghcr.io/oxideloop/oxideloop:e2e-failpoints#$FAILPOINT_IMAGE#g" | ctx apply -n "$NAMESPACE" -f -
 ctx rollout status deployment/oxideloop-controller -n "$NAMESPACE" --timeout="${TIMEOUT}s"
-normalize_image_id() {
-  printf '%s' "$1" | sed -E 's#^[[:alnum:]+.-]+://##; s#^.*@##; s#^.*(sha256:)#\1#'
-}
-NORMALIZED_PRODUCTION_IMAGE_ID=$(normalize_image_id "$PRODUCTION_IMAGE_ID")
-NORMALIZED_FAILPOINT_IMAGE_ID=$(normalize_image_id "$FAILPOINT_IMAGE_ID")
-POD_IMAGE_IDENTITIES=$(ctx get pod -n "$NAMESPACE" -l app.kubernetes.io/component=controller -o json | jq -ec --arg controllerImage "$FAILPOINT_IMAGE" --arg rendererImage "$PRODUCTION_IMAGE" --arg controllerId "$NORMALIZED_FAILPOINT_IMAGE_ID" --arg rendererId "$NORMALIZED_PRODUCTION_IMAGE_ID" '
+pod_image_identities_from_json() {
+  pod_file=$1; controller_image=$2; renderer_image=$3; controller_config=$4; renderer_config=$5
+  jq -ec --arg controllerImage "$controller_image" --arg rendererImage "$renderer_image" --arg controllerConfig "$controller_config" --arg rendererConfig "$renderer_config" '
+  def runtime_digest:
+    if type != "string" then error("container imageID is missing") else sub("^[A-Za-z0-9+.-]+://"; "") end |
+    if test("^sha256:[0-9a-f]{64}$") then .
+    elif test("^[^@]+@sha256:[0-9a-f]{64}$") then sub("^[^@]+@"; "")
+    else error("container imageID is not an exact sha256 digest") end;
   [.items[] | select(.metadata.deletionTimestamp == null)] as $pods |
   if ($pods | length) != 1 then error("expected exactly one live controller pod") else $pods[0] end |
   . as $pod |
-  ([.spec.containers[] | select(.name == "controller" or .name == "renderer") | {name,image}] | sort_by(.name)) as $declared |
-  ([.status.containerStatuses[] | select(.name == "controller" or .name == "renderer") | {name,image,imageID:(.imageID | sub("^[A-Za-z0-9+.-]+://"; "") | if contains("@") then split("@")[-1] else . end | if contains("sha256:") then sub("^.*(sha256:)"; "sha256:") else . end)}] | sort_by(.name)) as $observed |
-  if $declared != [{name:"controller",image:$controllerImage},{name:"renderer",image:$rendererImage}] then error("controller and renderer declarations differ from loaded tags")
-  elif ($observed | length) != 2 then error("controller and renderer status identities are incomplete")
-  elif ($observed | any(.[]; .name == "controller" and .imageID == $controllerId) | not) then error("controller image identity differs from loaded failpoint image")
-  elif ($observed | any(.[]; .name == "renderer" and .imageID == $rendererId) | not) then error("renderer image identity differs from loaded production image")
-  else {pod:{name:$pod.metadata.name,uid:$pod.metadata.uid},expected:{controller:{tag:$controllerImage,imageID:$controllerId},renderer:{tag:$rendererImage,imageID:$rendererId}},observed:$observed} end
-') || die 'controller and renderer image identity proof failed'
-jq -n --arg production "$NORMALIZED_PRODUCTION_IMAGE_ID" --arg failpoints "$NORMALIZED_FAILPOINT_IMAGE_ID" --arg node "$NODE_IMAGE" --argjson pod "$POD_IMAGE_IDENTITIES" '{production:$production,failpoints:$failpoints,nodeImage:$node,podIdentity:$pod}' >"$EVIDENCE/image-ids.json"
+  (["controller", "renderer"] | map(. as $name | {name:$name,declaredImage:([$pod.spec.containers[] | select(.name == $name) | .image] | if length == 1 then .[0] else error("controller container declaration is ambiguous") end),observedImage:([$pod.status.containerStatuses[] | select(.name == $name) | .image] | if length == 1 then .[0] else error("controller container status is ambiguous") end),configDigest:([$pod.status.containerStatuses[] | select(.name == $name) | .imageID | runtime_digest] | if length == 1 then .[0] else error("controller container imageID is ambiguous") end)})) as $observed |
+  if $observed != [{name:"controller",declaredImage:$controllerImage,observedImage:$controllerImage,configDigest:$controllerConfig},{name:"renderer",declaredImage:$rendererImage,observedImage:$rendererImage,configDigest:$rendererConfig}] then error("controller and renderer runtime config digests differ from their exact Docker inspect identities")
+  else {pod:{name:$pod.metadata.name,uid:$pod.metadata.uid},expected:{controller:{tag:$controllerImage,configDigest:$controllerConfig},renderer:{tag:$rendererImage,configDigest:$rendererConfig}},observed:$observed} end
+  ' "$pod_file"
+}
+atomic_capture controller-pod-images.json ctx get pod -n "$NAMESPACE" -l app.kubernetes.io/component=controller -o json || die 'failed to capture controller pod image JSON'
+POD_IMAGE_IDENTITIES=$(pod_image_identities_from_json "$EVIDENCE/controller-pod-images.json" "$FAILPOINT_IMAGE" "$PRODUCTION_IMAGE" "$FAILPOINT_CONFIG_DIGEST" "$PRODUCTION_CONFIG_DIGEST") || die 'controller and renderer image identity proof failed'
+jq -n --arg node "$NODE_IMAGE" --argjson production "$PRODUCTION_IMAGE_IDENTITY" --argjson failpoints "$FAILPOINT_IMAGE_IDENTITY" --argjson pod "$POD_IMAGE_IDENTITIES" '{nodeImage:$node,production:$production,failpoints:$failpoints,podIdentity:$pod}' >"$EVIDENCE/image-ids.json"
 
 # Foreign desired-name collision proves default-deny adoption before bootstrap.
 ctx create configmap root-config -n "$NAMESPACE" --from-literal=foreign=true
