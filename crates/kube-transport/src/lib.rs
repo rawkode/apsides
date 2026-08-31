@@ -16,13 +16,14 @@
 
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::VecDeque;
-#[cfg(any(test, feature = "test-support"))]
-use std::sync::Mutex;
 use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::{Duration, Instant},
+};
 
 use futures_util::StreamExt;
 use oxideloop_controller_api::{
@@ -33,7 +34,7 @@ use oxideloop_controller_api::{
     validate_automation_run_name,
 };
 use oxideloop_controller_core::{
-    CommandV0, MutationCommandV0, PreconditionsV0, root_finalizer_command_token,
+    CommandV0, MutationCommandV0, PreconditionsV0, RootSnapshotV0, root_finalizer_command_token,
     root_only_owned_children_verify_token,
 };
 #[cfg(test)]
@@ -45,6 +46,7 @@ use oxideloop_mutation_model::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use tokio::sync::watch;
 
 use kube::{
     Api, Client, Config,
@@ -56,14 +58,1080 @@ pub const ROOT_UID_ANNOTATION: &str = "runtime.oxideloop.dev/root-uid";
 pub const TRANSACTION_ID_ANNOTATION: &str = "runtime.oxideloop.dev/transaction-id";
 pub const COMMAND_ID_ANNOTATION: &str = "runtime.oxideloop.dev/command-id";
 const MAX_BUNDLE_IDENTITY_BYTES: usize = 253;
-// State persistence is the durable journal effect boundary. A write response
-// can be lost after the API has applied the patch, so it may not pin the actor
-// forever and it may not be retried. The timeout leads to an exact GET proof,
-// never a second PATCH. Watches intentionally have no deadline here.
 #[cfg(not(test))]
-const STATE_PERSIST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+const OPERATION_DEADLINE: Duration = Duration::from_secs(15);
 #[cfg(test)]
-const STATE_PERSIST_RESPONSE_TIMEOUT: Duration = Duration::from_millis(50);
+const OPERATION_DEADLINE: Duration = Duration::from_millis(100);
+#[cfg(not(test))]
+const WRITE_RESPONSE_DEADLINE: Duration = Duration::from_secs(12);
+#[cfg(test)]
+const WRITE_RESPONSE_DEADLINE: Duration = Duration::from_millis(85);
+#[cfg(not(test))]
+const PREWRITE_DEADLINE: Duration = Duration::from_secs(9);
+#[cfg(test)]
+const PREWRITE_DEADLINE: Duration = Duration::from_millis(75);
+#[cfg(not(test))]
+const ATTEMPT_PREWRITE_CUTOFF: Duration = Duration::from_secs(7);
+#[cfg(test)]
+const ATTEMPT_PREWRITE_CUTOFF: Duration = Duration::from_millis(50);
+const MAX_PREWRITE_RETRIES: u8 = 4;
+
+/// Immutable, transport-minted timing authority for one logical Kubernetes
+/// command. Its deadlines are intentionally opaque outside this crate: a
+/// caller may carry it into a collector session but cannot lengthen or reset
+/// any deadline.
+#[derive(Clone, Debug)]
+pub struct OperationBudgetV0 {
+    inner: Arc<OperationBudgetInnerV0>,
+}
+
+#[derive(Debug)]
+struct OperationBudgetInnerV0 {
+    attempt_prewrite_cutoffs: Box<[Instant]>,
+    prewrite_deadline: Instant,
+    write_response_deadline: Instant,
+    operation_deadline: Instant,
+    max_prewrite_retries: u8,
+}
+
+impl OperationBudgetV0 {
+    fn production() -> Self {
+        Self::from_durations(
+            ATTEMPT_PREWRITE_CUTOFF,
+            PREWRITE_DEADLINE,
+            WRITE_RESPONSE_DEADLINE,
+            OPERATION_DEADLINE,
+            MAX_PREWRITE_RETRIES,
+        )
+        .expect("production operation budget is ordered")
+    }
+
+    fn from_durations(
+        attempt_prewrite_cutoff: Duration,
+        prewrite_deadline: Duration,
+        write_response_deadline: Duration,
+        operation_deadline: Duration,
+        max_prewrite_retries: u8,
+    ) -> Result<Self, &'static str> {
+        if !(attempt_prewrite_cutoff < prewrite_deadline
+            && prewrite_deadline < write_response_deadline
+            && write_response_deadline < operation_deadline)
+        {
+            return Err("operation deadlines must be strictly ordered");
+        }
+        let now = Instant::now();
+        // The retry schedule is frozen with the outer budget.  A pre-write
+        // retry may move only to the next slot; it never creates a new
+        // operation deadline.
+        let retry_slots = usize::from(max_prewrite_retries) + 1;
+        let remaining = prewrite_deadline
+            .checked_sub(attempt_prewrite_cutoff)
+            .expect("validated strictly ordered prewrite cutoffs");
+        let step = remaining / u32::try_from(retry_slots).expect("retry slots fit u32");
+        let attempt_prewrite_cutoffs = (0..retry_slots)
+            .map(|slot| {
+                now + attempt_prewrite_cutoff + step * u32::try_from(slot).expect("slot fits u32")
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Ok(Self {
+            inner: Arc::new(OperationBudgetInnerV0 {
+                attempt_prewrite_cutoffs,
+                prewrite_deadline: now + prewrite_deadline,
+                write_response_deadline: now + write_response_deadline,
+                operation_deadline: now + operation_deadline,
+                max_prewrite_retries,
+            }),
+        })
+    }
+
+    fn is_strictly_ordered(&self) -> bool {
+        let inner = &self.inner;
+        inner
+            .attempt_prewrite_cutoffs
+            .iter()
+            .all(|cutoff| *cutoff < inner.prewrite_deadline)
+            && inner.prewrite_deadline < inner.write_response_deadline
+            && inner.write_response_deadline < inner.operation_deadline
+    }
+
+    fn max_prewrite_retries(&self) -> u8 {
+        self.inner.max_prewrite_retries
+    }
+
+    fn prewrite_cutoff(&self, epoch: u32) -> Option<Instant> {
+        self.inner
+            .attempt_prewrite_cutoffs
+            .get(usize::try_from(epoch).ok()?)
+            .copied()
+    }
+
+    #[cfg(test)]
+    fn test_shortened(
+        attempt_prewrite_cutoff: Duration,
+        prewrite_deadline: Duration,
+        write_response_deadline: Duration,
+        operation_deadline: Duration,
+        max_prewrite_retries: u8,
+    ) -> Result<Self, &'static str> {
+        Self::from_durations(
+            attempt_prewrite_cutoff,
+            prewrite_deadline,
+            write_response_deadline,
+            operation_deadline,
+            max_prewrite_retries,
+        )
+    }
+}
+
+/// Collector-visible phase of a transport command before its first write has
+/// been polled. The only legal transitions are one-way and atomically
+/// arbitrated between the collector and transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrewriteGateStateV0 {
+    PreWrite,
+    RootAuthPending,
+    Invalidated,
+    WritePolled,
+    Proven,
+    AmbiguousHeld,
+    BootstrapPhasePending,
+}
+
+/// Provenance for a deadline on a finite Kubernetes request. Retained watch
+/// reads are deliberately absent: only opening a watch is finite.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FiniteIoStageV0 {
+    ReadOnly,
+    WatchOpen,
+    PreWrite,
+    WriteResponse,
+    RecoveryProof,
+}
+
+#[derive(Clone, Debug)]
+pub struct PrewriteGateV0 {
+    state: Arc<AtomicU64>,
+    /// Versioned phase publication closes the state-read/wait-registration
+    /// race. Unlike a broadcast-only `Notify`, a subscriber observes a
+    /// transition that happened after it subscribed even if it starts waiting
+    /// slightly later.
+    wake: watch::Sender<u64>,
+}
+
+impl PrewriteGateV0 {
+    const PREWRITE: u8 = 0;
+    const ROOT_AUTH_PENDING: u8 = 1;
+    const INVALIDATED: u8 = 2;
+    const WRITE_POLLED: u8 = 3;
+    const PROVEN: u8 = 4;
+    const AMBIGUOUS_HELD: u8 = 5;
+    const BOOTSTRAP_PHASE_PENDING: u8 = 6;
+
+    fn new() -> Self {
+        let (wake, _wake_observer) = watch::channel(0_u64);
+        Self {
+            state: Arc::new(AtomicU64::new(Self::encode(0, Self::PREWRITE))),
+            wake,
+        }
+    }
+
+    /// Records an already-authenticated observation change while the command
+    /// remains unpolled. Raw root watch records deliberately do not call this
+    /// method: T2 authenticates them by an exact root reload so self-echoes
+    /// cannot cancel a command.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn invalidate_authenticated_change(&self) -> bool {
+        self.transition_current(Self::PREWRITE, Self::INVALIDATED)
+    }
+
+    #[doc(hidden)]
+    pub fn try_mark_write_polled(&self) -> Result<(), PrewriteGateStateV0> {
+        self.transition_current(Self::PREWRITE, Self::WRITE_POLLED)
+            .then_some(())
+            .ok_or_else(|| self.state())
+    }
+
+    #[must_use]
+    pub fn state(&self) -> PrewriteGateStateV0 {
+        Self::decode(Self::phase(self.state.load(Ordering::Acquire)))
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn epoch(&self) -> u32 {
+        Self::decode_epoch(self.state.load(Ordering::Acquire))
+    }
+
+    /// Reserves the current epoch while the runtime authenticates a root
+    /// watch record.  A write cannot win this intermediate state.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn begin_root_authentication(&self) -> Option<u32> {
+        let observed = self.state.load(Ordering::Acquire);
+        let phase = Self::phase(observed);
+        let transitioned = matches!(phase, Self::PREWRITE | Self::BOOTSTRAP_PHASE_PENDING)
+            && self
+                .state
+                .compare_exchange(
+                    observed,
+                    Self::encode(Self::decode_epoch(observed), Self::ROOT_AUTH_PENDING),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok();
+        if transitioned {
+            self.notify_transition();
+            Some(Self::decode_epoch(observed))
+        } else {
+            None
+        }
+    }
+
+    /// A confirmed root change closes the current epoch permanently.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn invalidate_root_authentication(&self, epoch: u32) -> bool {
+        self.transition_epoch(epoch, Self::ROOT_AUTH_PENDING, Self::INVALIDATED)
+    }
+
+    /// An exact self echo starts a *new* fixed attempt epoch. It never
+    /// reopens the old state or resets the outer deadline.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn restart_after_exact_self_echo(&self, epoch: u32, max_epoch: u32) -> bool {
+        if epoch >= max_epoch {
+            return false;
+        }
+        let transitioned = self
+            .state
+            .compare_exchange(
+                Self::encode(epoch, Self::ROOT_AUTH_PENDING),
+                // An owned bootstrap echo never opens the next prewrite
+                // epoch directly.  The collector must first drain and
+                // authenticate anything that arrived during the exact-root
+                // reload before the restarted command can poll its next
+                // subwrite.
+                Self::encode(epoch + 1, Self::BOOTSTRAP_PHASE_PENDING),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if transitioned {
+            self.notify_transition();
+        }
+        transitioned
+    }
+
+    /// A duplicate of an already-consumed bootstrap metadata echo is stale
+    /// transport noise, not new root authority.  Re-open only the current
+    /// epoch's phase barrier: unlike the first echo, it must not mint another
+    /// retry epoch or another opportunity to poll a root-status write.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn resume_after_duplicate_owned_root_echo(&self, epoch: u32) -> bool {
+        self.transition_epoch(
+            epoch,
+            Self::ROOT_AUTH_PENDING,
+            Self::BOOTSTRAP_PHASE_PENDING,
+        )
+    }
+
+    #[doc(hidden)]
+    pub async fn wait_for_bootstrap_phase_pending(&self) {
+        loop {
+            // Subscribe before inspecting the state. `changed()` is retained
+            // by this receiver, so the following phase read and wait form one
+            // lossless observation cycle.
+            let mut notified = self.wake.subscribe();
+            if self.state() == PrewriteGateStateV0::BootstrapPhasePending {
+                return;
+            }
+            let _ = notified.changed().await;
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn seal_bootstrap_phase(&self) -> bool {
+        self.transition_current(Self::BOOTSTRAP_PHASE_PENDING, Self::PREWRITE)
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn invalidate_bootstrap_phase(&self) -> bool {
+        self.transition_current(Self::BOOTSTRAP_PHASE_PENDING, Self::INVALIDATED)
+    }
+
+    fn notify_transition(&self) {
+        let next = (*self.wake.borrow()).wrapping_add(1);
+        self.wake.send_replace(next);
+    }
+
+    fn transition_current(&self, from: u8, to: u8) -> bool {
+        let observed = self.state.load(Ordering::Acquire);
+        let transitioned = Self::phase(observed) == from
+            && self
+                .state
+                .compare_exchange(
+                    observed,
+                    Self::encode(Self::decode_epoch(observed), to),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok();
+        if transitioned {
+            self.notify_transition();
+        }
+        transitioned
+    }
+
+    fn transition_epoch(&self, epoch: u32, from: u8, to: u8) -> bool {
+        let transitioned = self
+            .state
+            .compare_exchange(
+                Self::encode(epoch, from),
+                Self::encode(epoch, to),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if transitioned {
+            self.notify_transition();
+        }
+        transitioned
+    }
+
+    const fn encode(epoch: u32, phase: u8) -> u64 {
+        ((epoch as u64) << 8) | phase as u64
+    }
+
+    fn decode_epoch(value: u64) -> u32 {
+        u32::try_from(value >> 8).expect("operation epoch is packed into 32 bits")
+    }
+
+    fn phase(value: u64) -> u8 {
+        u8::try_from(value & 0xff).expect("operation phase is packed into 8 bits")
+    }
+
+    fn decode(state: u8) -> PrewriteGateStateV0 {
+        match state {
+            Self::PREWRITE => PrewriteGateStateV0::PreWrite,
+            Self::ROOT_AUTH_PENDING => PrewriteGateStateV0::RootAuthPending,
+            Self::INVALIDATED => PrewriteGateStateV0::Invalidated,
+            Self::WRITE_POLLED => PrewriteGateStateV0::WritePolled,
+            Self::PROVEN => PrewriteGateStateV0::Proven,
+            Self::AMBIGUOUS_HELD => PrewriteGateStateV0::AmbiguousHeld,
+            Self::BOOTSTRAP_PHASE_PENDING => PrewriteGateStateV0::BootstrapPhasePending,
+            _ => unreachable!("prewrite gate state is sealed"),
+        }
+    }
+}
+
+/// Opaque transport session carried by the exact pinned command future and
+/// its collector. Bootstrap and direct transport callers receive the same
+/// operation-owned session but have no collector that can invalidate it.
+#[derive(Clone, Debug)]
+pub struct OperationSessionV0 {
+    budget: OperationBudgetV0,
+    gate: PrewriteGateV0,
+    bootstrap: Arc<Mutex<BootstrapAuthorityV0>>,
+    collector_bound: bool,
+    #[cfg(test)]
+    bootstrap_phase_wait_hook: Option<Arc<BootstrapPhaseWaitHookV0>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct BootstrapPhaseWaitHookV0 {
+    state_read: AtomicBool,
+    release: Arc<tokio::sync::Barrier>,
+}
+
+/// The only root-write sequence whose individual writes may advance one
+/// operation session.  Keeping the phase explicit makes an old root watch
+/// echo distinguishable from a real root transition without granting a
+/// generic "status changed" exemption to bootstrap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BootstrapRootPhaseV0 {
+    StatePost,
+    StateFinalizer,
+    RootMetadata,
+    RootStateLink,
+    Complete,
+}
+
+#[derive(Debug)]
+struct BootstrapRootEchoV0 {
+    uid: String,
+    namespace: String,
+    name: String,
+    generation: i64,
+    spec: oxideloop_controller_api::WebApplicationSpec,
+    status: WebApplicationStatus,
+    resource_version: String,
+    root_finalizer_present: bool,
+    deleting: bool,
+}
+
+#[derive(Debug)]
+struct BootstrapOwnedRootEchoV0 {
+    echo: BootstrapRootEchoV0,
+    /// Keep the actual metadata-patch response, not merely its status-shaped
+    /// projection.  `RootStateLink` may proceed only from this exact response;
+    /// an annotation, finalizer, status, or State-link modification changes
+    /// the object and therefore cannot inherit root authority.
+    response: ObjectV0,
+    phase: BootstrapRootPhaseV0,
+    epoch: u32,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BootstrapRootEchoAuthenticationV0 {
+    ExactFirstUse,
+    ExactDuplicate,
+    GenuineOrAmbiguous,
+}
+
+impl BootstrapRootEchoV0 {
+    fn from_root(root: &ObjectV0) -> Result<Self, TransportErrorV0> {
+        Ok(Self {
+            uid: root.metadata.uid.clone(),
+            namespace: root.reference.namespace.clone(),
+            name: root.reference.name.clone(),
+            generation: generation(root)?,
+            spec: serde_json::from_value(
+                root.value
+                    .get("spec")
+                    .cloned()
+                    .ok_or(TransportErrorV0::Stale("bootstrap root spec"))?,
+            )
+            .map_err(|_| TransportErrorV0::Stale("bootstrap root spec"))?,
+            status: serde_json::from_value(
+                root.value
+                    .get("status")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            )
+            .map_err(|_| TransportErrorV0::Stale("bootstrap root status"))?,
+            resource_version: root.metadata.resource_version.clone(),
+            root_finalizer_present: has_finalizer(root, ROOT_FINALIZER),
+            deleting: root
+                .value
+                .pointer("/metadata/deletionTimestamp")
+                .is_some_and(|value| value.as_str().is_some_and(|value| !value.is_empty())),
+        })
+    }
+
+    fn matches_snapshot(&self, fresh: &RootSnapshotV0) -> bool {
+        fresh.uid == self.uid
+            && fresh.namespace == self.namespace
+            && fresh.name == self.name
+            && fresh.generation == self.generation
+            && fresh.spec == self.spec
+            && fresh.status == self.status
+            && fresh.root_resource_version == self.resource_version
+            && fresh.root_finalizer_present == self.root_finalizer_present
+            && fresh.deleting == self.deleting
+    }
+}
+
+#[derive(Debug)]
+struct BootstrapFrozenRootV0 {
+    uid: String,
+    namespace: String,
+    name: String,
+    generation: i64,
+    spec: oxideloop_controller_api::WebApplicationSpec,
+    deleting: bool,
+}
+
+impl BootstrapFrozenRootV0 {
+    fn from_root(root: &ObjectV0) -> Result<Self, TransportErrorV0> {
+        let echo = BootstrapRootEchoV0::from_root(root)?;
+        Ok(Self {
+            uid: echo.uid,
+            namespace: echo.namespace,
+            name: echo.name,
+            generation: echo.generation,
+            spec: echo.spec,
+            deleting: echo.deleting,
+        })
+    }
+
+    fn matches(&self, root: &ObjectV0) -> Result<bool, TransportErrorV0> {
+        let current = BootstrapRootEchoV0::from_root(root)?;
+        Ok(current.uid == self.uid
+            && current.namespace == self.namespace
+            && current.name == self.name
+            && current.generation == self.generation
+            && current.spec == self.spec
+            && current.deleting == self.deleting)
+    }
+}
+
+#[derive(Debug)]
+struct BootstrapAuthorityV0 {
+    active: bool,
+    phase: Option<BootstrapRootPhaseV0>,
+    frozen_root: Option<BootstrapFrozenRootV0>,
+    /// A root response can become a watch record at the next subwrite
+    /// boundary.  Only this exact response is safe to consume there.
+    exact_owned_root_echo: Option<BootstrapOwnedRootEchoV0>,
+    /// The first exact metadata echo is consumed atomically.  Retain its
+    /// identity only to discard a duplicate delivery without granting a
+    /// second restart or reusing it for a later phase.
+    consumed_owned_root_echo: Option<BootstrapOwnedRootEchoV0>,
+    /// Kubernetes assigned this UID in a direct State CREATE response within
+    /// this exact operation. It is the sole exception to the normal
+    /// no-adoption rule when an owned root echo restarts bootstrap before the
+    /// root State-link has been written.
+    issued_state: Option<(ObjectRefV0, String)>,
+}
+
+impl BootstrapAuthorityV0 {
+    fn new() -> Self {
+        Self {
+            active: false,
+            phase: None,
+            frozen_root: None,
+            exact_owned_root_echo: None,
+            consumed_owned_root_echo: None,
+            issued_state: None,
+        }
+    }
+}
+
+/// Exclusive, non-cloneable authority to poll one frozen write in one exact
+/// operation epoch.  It is deliberately private: callers may carry a session
+/// but cannot manufacture or reuse a subwrite lease.
+#[derive(Debug)]
+struct SubwritePermitV0 {
+    gate: PrewriteGateV0,
+    epoch: u32,
+    bootstrap: bool,
+    bootstrap_collected: bool,
+}
+
+impl OperationSessionV0 {
+    fn production(collector_bound: bool) -> Self {
+        let budget = OperationBudgetV0::production();
+        debug_assert!(budget.is_strictly_ordered());
+        Self {
+            budget,
+            gate: PrewriteGateV0::new(),
+            bootstrap: Arc::new(Mutex::new(BootstrapAuthorityV0::new())),
+            collector_bound,
+            #[cfg(test)]
+            bootstrap_phase_wait_hook: None,
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn prewrite_gate(&self) -> &PrewriteGateV0 {
+        &self.gate
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn budget(&self) -> &OperationBudgetV0 {
+        &self.budget
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn max_prewrite_retries(&self) -> u8 {
+        self.budget.max_prewrite_retries()
+    }
+
+    /// Tests identity of the opaque session minted for one pinned collector
+    /// future.  This is intentionally stronger than comparing deadlines or
+    /// gate state: a later operation may have identical policy but never the
+    /// authority to consume this operation's no-write capability.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn matches_exact_session(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.budget.inner, &other.budget.inner)
+            && Arc::ptr_eq(&self.gate.state, &other.gate.state)
+            && Arc::ptr_eq(&self.bootstrap, &other.bootstrap)
+            && self.collector_bound == other.collector_bound
+    }
+
+    fn begin_bootstrap_sequence(&self) -> Result<(), TransportErrorV0> {
+        let mut authority = self
+            .bootstrap
+            .lock()
+            .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+        // A collector may authenticate one exact owned root echo by
+        // restarting the *same* frozen EnsureBootstrap command.  That is not
+        // a second bootstrap owner and must retain, rather than reset, its
+        // phase witness.
+        authority.active = true;
+        Ok(())
+    }
+
+    fn is_bootstrap_sequence(&self) -> bool {
+        self.bootstrap
+            .lock()
+            .is_ok_and(|authority| authority.active)
+    }
+
+    async fn wait_for_bootstrap_phase_authority(&self) -> Result<(), TransportErrorV0> {
+        if !self.is_bootstrap_sequence() || !self.collector_bound {
+            return Ok(());
+        }
+        loop {
+            // Register first.  A phase seal/authentication transition between
+            // the old state read and `notified()` was otherwise a lost wake
+            // that could leave a bootstrap preflight asleep forever.
+            // Register the versioned phase observer before reading state.
+            // A seal/authentication transition in the old lost-wake window is
+            // retained by `changed()` and forces this loop to re-read state.
+            let mut notified = self.gate.wake.subscribe();
+            let state = self.gate.state();
+            #[cfg(test)]
+            if let Some(hook) = self.bootstrap_phase_wait_hook.as_ref()
+                && !hook.state_read.swap(true, Ordering::AcqRel)
+            {
+                hook.release.wait().await;
+            }
+            match state {
+                PrewriteGateStateV0::PreWrite => return Ok(()),
+                PrewriteGateStateV0::Invalidated => {
+                    return Err(TransportErrorV0::PreWriteInvalidated);
+                }
+                PrewriteGateStateV0::BootstrapPhasePending
+                | PrewriteGateStateV0::RootAuthPending => {
+                    let _ = notified.changed().await;
+                }
+                PrewriteGateStateV0::WritePolled
+                | PrewriteGateStateV0::Proven
+                | PrewriteGateStateV0::AmbiguousHeld => {
+                    return Err(TransportErrorV0::ManualRecoveryHold);
+                }
+            }
+        }
+    }
+
+    /// Installs a phase-local root authority immediately after the exact
+    /// root preflight that protects a bootstrap subwrite.  Any UID, spec,
+    /// generation, deletion, namespace, or name change is rejected before a
+    /// later phase can reach its write lease.
+    fn begin_bootstrap_root_phase(
+        &self,
+        phase: BootstrapRootPhaseV0,
+        root: &ObjectV0,
+    ) -> Result<(), TransportErrorV0> {
+        let mut authority = self
+            .bootstrap
+            .lock()
+            .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+        if !authority.active {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        match authority.frozen_root.as_ref() {
+            Some(frozen) if !frozen.matches(root)? => {
+                return Err(TransportErrorV0::Stale("bootstrap root authority"));
+            }
+            Some(_) => {}
+            None => authority.frozen_root = Some(BootstrapFrozenRootV0::from_root(root)?),
+        }
+        authority.phase = Some(phase);
+        // A phase must never accept an echo from a future or unrelated root
+        // write.  The immediately preceding direct root response is retained
+        // only when moving into the next root-writing phase.
+        if !matches!(
+            phase,
+            BootstrapRootPhaseV0::RootStateLink | BootstrapRootPhaseV0::Complete
+        ) {
+            authority.exact_owned_root_echo = None;
+            authority.consumed_owned_root_echo = None;
+        }
+        Ok(())
+    }
+
+    fn record_bootstrap_owned_root_echo(
+        &self,
+        root: &ObjectV0,
+        next_phase: BootstrapRootPhaseV0,
+    ) -> Result<(), TransportErrorV0> {
+        let mut authority = self
+            .bootstrap
+            .lock()
+            .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+        if !authority.active {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        authority.exact_owned_root_echo = Some(BootstrapOwnedRootEchoV0 {
+            echo: BootstrapRootEchoV0::from_root(root)?,
+            response: root.clone(),
+            phase: next_phase,
+            epoch: self.gate.epoch(),
+        });
+        authority.consumed_owned_root_echo = None;
+        authority.phase = Some(next_phase);
+        Ok(())
+    }
+
+    fn record_bootstrap_issued_state(&self, state: &ObjectV0) -> Result<(), TransportErrorV0> {
+        if state.metadata.uid.is_empty() {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        let mut authority = self
+            .bootstrap
+            .lock()
+            .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+        if !authority.active || authority.issued_state.is_some() {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        authority.issued_state = Some((state.reference.clone(), state.metadata.uid.clone()));
+        Ok(())
+    }
+
+    fn bootstrap_issued_state_matches(&self, state: &ObjectV0) -> bool {
+        self.bootstrap.lock().is_ok_and(|authority| {
+            authority.active
+                && authority
+                    .issued_state
+                    .as_ref()
+                    .is_some_and(|(reference, uid)| {
+                        reference == &state.reference && uid == &state.metadata.uid
+                    })
+        })
+    }
+
+    /// Atomically consumes the one exact root response that bootstrap has
+    /// proven for the supplied phase epoch. A duplicate delivery of that
+    /// response is explicitly identified, but can never reopen another epoch.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn authenticate_bootstrap_root_echo(
+        &self,
+        fresh: &RootSnapshotV0,
+        epoch: u32,
+    ) -> BootstrapRootEchoAuthenticationV0 {
+        let Ok(mut authority) = self.bootstrap.lock() else {
+            return BootstrapRootEchoAuthenticationV0::GenuineOrAmbiguous;
+        };
+        if !authority.active || authority.phase != Some(BootstrapRootPhaseV0::RootStateLink) {
+            return BootstrapRootEchoAuthenticationV0::GenuineOrAmbiguous;
+        }
+        if authority
+            .exact_owned_root_echo
+            .as_ref()
+            .is_some_and(|echo| {
+                echo.phase == BootstrapRootPhaseV0::RootStateLink
+                    && echo.epoch == epoch
+                    && echo.echo.matches_snapshot(fresh)
+            })
+        {
+            let echo = authority
+                .exact_owned_root_echo
+                .take()
+                .expect("exact root echo was just observed");
+            authority.consumed_owned_root_echo = Some(echo);
+            return BootstrapRootEchoAuthenticationV0::ExactFirstUse;
+        }
+        if authority
+            .consumed_owned_root_echo
+            .as_ref()
+            .is_some_and(|echo| {
+                echo.phase == BootstrapRootPhaseV0::RootStateLink
+                    && echo.echo.matches_snapshot(fresh)
+            })
+        {
+            BootstrapRootEchoAuthenticationV0::ExactDuplicate
+        } else {
+            BootstrapRootEchoAuthenticationV0::GenuineOrAmbiguous
+        }
+    }
+
+    fn require_exact_root_metadata_response(
+        &self,
+        root: &ObjectV0,
+    ) -> Result<(), TransportErrorV0> {
+        let authority = self
+            .bootstrap
+            .lock()
+            .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+        if !authority.active || authority.phase != Some(BootstrapRootPhaseV0::RootStateLink) {
+            return Err(TransportErrorV0::Stale("bootstrap root metadata authority"));
+        }
+        let exact = authority
+            .exact_owned_root_echo
+            .as_ref()
+            .or(authority.consumed_owned_root_echo.as_ref());
+        if exact.is_some_and(|echo| {
+            echo.phase == BootstrapRootPhaseV0::RootStateLink && echo.response == *root
+        }) {
+            Ok(())
+        } else {
+            Err(TransportErrorV0::Stale("bootstrap root metadata response"))
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn bootstrap_phase_is_complete(&self) -> bool {
+        self.bootstrap.lock().is_ok_and(|authority| {
+            authority.active && authority.phase == Some(BootstrapRootPhaseV0::Complete)
+        })
+    }
+
+    /// The State-link/status patch is bootstrap's final subwrite.  Mark that
+    /// fact immediately after its write lease is claimed, rather than after
+    /// its response is decoded: a root event in the response window may be
+    /// buffered, but it cannot revoke this already-polled final write or
+    /// manufacture another bootstrap subwrite.
+    fn mark_bootstrap_final_write_polled(&self) -> Result<(), TransportErrorV0> {
+        let mut authority = self
+            .bootstrap
+            .lock()
+            .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+        if !authority.active || authority.phase != Some(BootstrapRootPhaseV0::RootStateLink) {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        authority.phase = Some(BootstrapRootPhaseV0::Complete);
+        Ok(())
+    }
+
+    fn retry_prewrite_epoch(&self) -> Result<u32, TransportErrorV0> {
+        let epoch = self.gate.epoch();
+        let max_epoch = u32::from(self.budget.max_prewrite_retries());
+        let state = self.gate.state();
+        if state == PrewriteGateStateV0::Invalidated {
+            return Err(TransportErrorV0::PreWriteInvalidated);
+        }
+        if epoch >= max_epoch || state != PrewriteGateStateV0::PreWrite {
+            return Err(TransportErrorV0::FiniteIoDeadline(
+                FiniteIoStageV0::PreWrite,
+            ));
+        }
+        self.gate
+            .state
+            .compare_exchange(
+                PrewriteGateV0::encode(epoch, PrewriteGateV0::PREWRITE),
+                PrewriteGateV0::encode(epoch + 1, PrewriteGateV0::PREWRITE),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| {
+                self.gate.notify_transition();
+                epoch + 1
+            })
+            .map_err(|_| TransportErrorV0::PreWriteInvalidated)
+    }
+
+    fn prove_bootstrap_after_exact_proof(&self) -> Result<(), TransportErrorV0> {
+        if !self.is_bootstrap_sequence() {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        let epoch = self.gate.epoch();
+        if self.bootstrap_phase_is_complete() {
+            return self
+                .gate
+                .transition_epoch(
+                    epoch,
+                    PrewriteGateV0::AMBIGUOUS_HELD,
+                    PrewriteGateV0::PROVEN,
+                )
+                .then_some(())
+                .ok_or(TransportErrorV0::ManualRecoveryHold);
+        }
+        let next_epoch = epoch
+            .checked_add(1)
+            .ok_or(TransportErrorV0::ManualRecoveryHold)?;
+        if self.budget.prewrite_cutoff(next_epoch).is_none() {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        self.gate
+            .state
+            .compare_exchange(
+                PrewriteGateV0::encode(epoch, PrewriteGateV0::AMBIGUOUS_HELD),
+                PrewriteGateV0::encode(
+                    next_epoch,
+                    if self.collector_bound {
+                        PrewriteGateV0::BOOTSTRAP_PHASE_PENDING
+                    } else {
+                        PrewriteGateV0::PREWRITE
+                    },
+                ),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| self.gate.notify_transition())
+            .map_err(|_| TransportErrorV0::ManualRecoveryHold)
+    }
+
+    /// A response-loss proof is acknowledgement authority only when it closes
+    /// the exact epoch whose write permit became ambiguous.  A later epoch,
+    /// an already-proven direct response, or a timed-out proof is never
+    /// interchangeable with that permit.
+    fn prove_exact_response_loss_recovery(&self) -> Result<(), TransportErrorV0> {
+        if self.is_bootstrap_sequence() {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        let epoch = self.gate.epoch();
+        self.gate
+            .state
+            .compare_exchange(
+                PrewriteGateV0::encode(epoch, PrewriteGateV0::AMBIGUOUS_HELD),
+                PrewriteGateV0::encode(epoch, PrewriteGateV0::PROVEN),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| TransportErrorV0::ManualRecoveryHold)
+    }
+}
+
+impl OperationBudgetV0 {
+    fn deadline_for(&self, stage: FiniteIoStageV0) -> Instant {
+        match stage {
+            FiniteIoStageV0::ReadOnly
+            | FiniteIoStageV0::WatchOpen
+            | FiniteIoStageV0::RecoveryProof => self.inner.operation_deadline,
+            // `PreWrite` is resolved through the session's current fixed
+            // attempt epoch, never this aggregate deadline directly.
+            FiniteIoStageV0::PreWrite => self.inner.prewrite_deadline,
+            FiniteIoStageV0::WriteResponse => self.inner.write_response_deadline,
+        }
+    }
+
+    fn remaining(&self, stage: FiniteIoStageV0) -> Result<Duration, TransportErrorV0> {
+        self.deadline_for(stage)
+            .checked_duration_since(Instant::now())
+            .ok_or(TransportErrorV0::FiniteIoDeadline(stage))
+    }
+
+    fn has_response_proof_reserve(&self) -> bool {
+        let now = Instant::now();
+        now < self.inner.write_response_deadline
+            && self.inner.write_response_deadline < self.inner.operation_deadline
+    }
+}
+
+async fn within_operation<T>(
+    operation: &OperationSessionV0,
+    stage: FiniteIoStageV0,
+    future: impl std::future::Future<Output = Result<T, TransportErrorV0>>,
+) -> Result<T, TransportErrorV0> {
+    let remaining = if stage == FiniteIoStageV0::PreWrite {
+        operation
+            .budget
+            .prewrite_cutoff(operation.gate.epoch())
+            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+            .ok_or(TransportErrorV0::FiniteIoDeadline(
+                FiniteIoStageV0::PreWrite,
+            ))?
+    } else {
+        operation.budget.remaining(stage)?
+    };
+    tokio::time::timeout(remaining, future)
+        .await
+        .map_err(|_| TransportErrorV0::FiniteIoDeadline(stage))?
+}
+
+fn claim_first_write(operation: &OperationSessionV0) -> Result<SubwritePermitV0, TransportErrorV0> {
+    let epoch = operation.gate.epoch();
+    if operation
+        .budget
+        .prewrite_cutoff(epoch)
+        .is_none_or(|cutoff| Instant::now() >= cutoff)
+        || !operation.budget.has_response_proof_reserve()
+    {
+        return Err(TransportErrorV0::FiniteIoDeadline(
+            FiniteIoStageV0::PreWrite,
+        ));
+    }
+    operation
+        .prewrite_gate()
+        .try_mark_write_polled()
+        .map_err(|state| match state {
+            PrewriteGateStateV0::Invalidated => TransportErrorV0::PreWriteInvalidated,
+            PrewriteGateStateV0::PreWrite
+            | PrewriteGateStateV0::RootAuthPending
+            | PrewriteGateStateV0::WritePolled
+            | PrewriteGateStateV0::Proven
+            | PrewriteGateStateV0::AmbiguousHeld
+            | PrewriteGateStateV0::BootstrapPhasePending => TransportErrorV0::ManualRecoveryHold,
+        })?;
+    Ok(SubwritePermitV0 {
+        gate: operation.gate.clone(),
+        epoch,
+        bootstrap: operation.is_bootstrap_sequence(),
+        bootstrap_collected: operation.collector_bound,
+    })
+}
+
+impl SubwritePermitV0 {
+    fn prove(self) -> Result<(), TransportErrorV0> {
+        if self.bootstrap {
+            let next_epoch = self
+                .epoch
+                .checked_add(1)
+                .ok_or(TransportErrorV0::ManualRecoveryHold)?;
+            let next_phase = if self.bootstrap_collected {
+                PrewriteGateV0::BOOTSTRAP_PHASE_PENDING
+            } else {
+                PrewriteGateV0::PREWRITE
+            };
+            self.gate
+                .state
+                .compare_exchange(
+                    PrewriteGateV0::encode(self.epoch, PrewriteGateV0::WRITE_POLLED),
+                    PrewriteGateV0::encode(next_epoch, next_phase),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map(|_| self.gate.notify_transition())
+                .map_err(|_| TransportErrorV0::ManualRecoveryHold)
+        } else {
+            self.gate
+                .transition_epoch(
+                    self.epoch,
+                    PrewriteGateV0::WRITE_POLLED,
+                    PrewriteGateV0::PROVEN,
+                )
+                .then_some(())
+                .ok_or(TransportErrorV0::ManualRecoveryHold)
+        }
+    }
+
+    /// Bootstrap's State-link is the one terminal root subwrite.  It proves
+    /// the same write epoch directly instead of creating an unusable N+1
+    /// phase slot.  A second claim therefore sees `Proven`, never a reopened
+    /// prewrite state.
+    fn prove_bootstrap_final(self) -> Result<(), TransportErrorV0> {
+        if !self.bootstrap {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        self.gate
+            .transition_epoch(
+                self.epoch,
+                PrewriteGateV0::WRITE_POLLED,
+                PrewriteGateV0::PROVEN,
+            )
+            .then_some(())
+            .ok_or(TransportErrorV0::ManualRecoveryHold)
+    }
+}
+
+impl Drop for SubwritePermitV0 {
+    fn drop(&mut self) {
+        // A permit is consumed by `prove` only after a direct response or an
+        // exact bootstrap proof. Any other exit happened after the write was
+        // polled and therefore remains explicitly ambiguous.
+        let _ = self.gate.transition_epoch(
+            self.epoch,
+            PrewriteGateV0::WRITE_POLLED,
+            PrewriteGateV0::AMBIGUOUS_HELD,
+        );
+    }
+}
 
 /// The only namespace-scoped resources this transport will address.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -476,6 +1544,96 @@ pub struct DeletionObservationSnapshotV0 {
     pub automation_runs: Vec<ObjectV0>,
 }
 
+const DELETION_BARRIER_LIVE: u8 = 0;
+const DELETION_BARRIER_INVALIDATED: u8 = 1;
+const DELETION_BARRIER_SEALED: u8 = 2;
+
+/// A private point-in-time seal shared by deletion watch pumps and their
+/// consumer.  A delivered relevant record wins before publication; a consumer
+/// that loses `Live -> Sealed` has no acknowledgement capability.
+#[derive(Clone)]
+struct DeletionBarrierGateV0(Arc<AtomicU8>);
+
+impl DeletionBarrierGateV0 {
+    fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(DELETION_BARRIER_LIVE)))
+    }
+
+    #[must_use]
+    fn invalidate(&self) -> bool {
+        self.0
+            .compare_exchange(
+                DELETION_BARRIER_LIVE,
+                DELETION_BARRIER_INVALIDATED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn is_live(&self) -> bool {
+        self.0.load(Ordering::Acquire) == DELETION_BARRIER_LIVE
+    }
+
+    fn seal(&self) -> bool {
+        self.0
+            .compare_exchange(
+                DELETION_BARRIER_LIVE,
+                DELETION_BARRIER_SEALED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+/// Filters only facts which intersect the exact deletion authority. Unrelated
+/// namespace churn remains outside this point-in-time snapshot.
+#[derive(Clone)]
+struct DeletionWatchFilterV0 {
+    gate: DeletionBarrierGateV0,
+    root_uid: String,
+    root_name: String,
+    state_name: String,
+    tracked_names: Arc<Mutex<BTreeMap<ResourceKindV0, BTreeSet<String>>>>,
+}
+
+impl DeletionWatchFilterV0 {
+    fn relevant(
+        &self,
+        resource: ResourceKindV0,
+        event: &Result<WatchEventV0, TransportErrorV0>,
+    ) -> bool {
+        let Ok(event) = event else {
+            return true;
+        };
+        let object = match event {
+            WatchEventV0::Added(object)
+            | WatchEventV0::Modified(object)
+            | WatchEventV0::Deleted(object) => object,
+            WatchEventV0::Bookmark { .. } => return false,
+        };
+        match resource {
+            ResourceKindV0::WebApplication => object.reference.name == self.root_name,
+            ResourceKindV0::OxideLoopState => object.reference.name == self.state_name,
+            ResourceKindV0::ConfigMap | ResourceKindV0::Service | ResourceKindV0::AutomationRun => {
+                object
+                    .metadata
+                    .owner_uids
+                    .iter()
+                    .any(|uid| uid == &self.root_uid)
+                    || self
+                        .tracked_names
+                        .lock()
+                        .expect("deletion filter lock")
+                        .get(&resource)
+                        .is_some_and(|names| names.contains(&object.reference.name))
+            }
+            ResourceKindV0::Event => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum WatchEventV0 {
@@ -499,6 +1657,12 @@ pub enum TransportErrorV0 {
     ForeignCollision,
     #[error("the API response was lost; live recovery proof is absent")]
     ResponseLost,
+    #[error("finite Kubernetes I/O deadline expired at {0:?}")]
+    FiniteIoDeadline(FiniteIoStageV0),
+    #[error("unpolled prewrite request failed and may retry in its fixed epoch schedule: {0}")]
+    PreWriteRetryable(String),
+    #[error("an authenticated observation invalidated the command before its first write poll")]
+    PreWriteInvalidated,
     #[error("bundle ConfigMap binaryData is invalid")]
     InvalidBundleData,
     #[error("delete/finalizer response is ambiguous and requires manual recovery")]
@@ -577,12 +1741,18 @@ pub struct WatchHandleV0 {
     events: tokio::sync::mpsc::Receiver<Result<WatchEventV0, TransportErrorV0>>,
     overflowed: Arc<AtomicBool>,
     terminal: Option<TransportErrorV0>,
+    pump_abort: Option<tokio::task::AbortHandle>,
+    // Test-injected handles do not have a kube stream pump.  Keep the same
+    // invalidation edge at the handle boundary so the production deletion
+    // barrier is exercised with the only substituted component being its I/O
+    // source.
+    deletion_filter: Option<(ResourceKindV0, DeletionWatchFilterV0)>,
 }
 
 impl WatchHandleV0 {
     /// Test-only watch injection. This is feature-gated and unavailable from
     /// the production transport capability surface.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn test_channel(
         capacity: usize,
@@ -597,8 +1767,41 @@ impl WatchHandleV0 {
                 events,
                 overflowed: Arc::new(AtomicBool::new(false)),
                 terminal: None,
+                pump_abort: None,
+                deletion_filter: None,
             },
         )
+    }
+
+    /// Marks a scripted retained stream as overflowed. This is deliberately
+    /// test-only; production overflow is set only by the bounded pump.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_mark_overflow(&self) {
+        self.overflowed.store(true, Ordering::Release);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn install_deletion_filter(&mut self, resource: ResourceKindV0, filter: DeletionWatchFilterV0) {
+        self.deletion_filter = Some((resource, filter));
+    }
+
+    fn invalidate_deletion_filter(&self, event: &Result<WatchEventV0, TransportErrorV0>) {
+        if self
+            .deletion_filter
+            .as_ref()
+            .is_some_and(|(resource, filter)| filter.relevant(*resource, event))
+        {
+            // Real kube pumps perform this CAS before enqueueing.  A scripted
+            // handle has no pump, so it performs the identical CAS before the
+            // barrier consumer receives the injected record.
+            let _ = self
+                .deletion_filter
+                .as_ref()
+                .expect("checked deletion filter")
+                .1
+                .gate
+                .invalidate();
+        }
     }
 
     /// Reads the next event. A 410 or an upstream error is mapped to a domain
@@ -621,6 +1824,7 @@ impl WatchHandleV0 {
         if let Err(error) = &event {
             self.terminal = Some(error.clone());
         }
+        self.invalidate_deletion_filter(&event);
         event
     }
 
@@ -640,6 +1844,7 @@ impl WatchHandleV0 {
                 if let Err(error) = &event {
                     self.terminal = Some(error.clone());
                 }
+                self.invalidate_deletion_filter(&event);
                 event.map(Some)
             }
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(None),
@@ -647,6 +1852,14 @@ impl WatchHandleV0 {
                 self.terminal = Some(TransportErrorV0::WatchGone);
                 Err(TransportErrorV0::WatchGone)
             }
+        }
+    }
+}
+
+impl Drop for WatchHandleV0 {
+    fn drop(&mut self) {
+        if let Some(abort) = self.pump_abort.take() {
+            abort.abort();
         }
     }
 }
@@ -726,6 +1939,24 @@ impl AutomationRunObservationBarrierV0 {
 }
 
 impl KubeTransportV0 {
+    /// Mints one opaque, immutable operation budget and its private
+    /// pre-write cancellation gate.  The caller may carry this session only
+    /// while it owns one sealed command future; deadline construction remains
+    /// transport authority.
+    #[must_use]
+    pub fn begin_operation_session(&self) -> OperationSessionV0 {
+        OperationSessionV0::production(false)
+    }
+
+    /// Mints the private session used only by the runtime's pinned command
+    /// collector. Its gate may be invalidated by authenticated buffered
+    /// observations before the first write poll.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn begin_collected_operation_session(&self) -> OperationSessionV0 {
+        OperationSessionV0::production(true)
+    }
+
     /// Creates a client using only the in-cluster service-account configuration.
     ///
     /// # Errors
@@ -779,6 +2010,49 @@ impl KubeTransportV0 {
         address: &RootAddressV0,
         command: &CommandV0,
     ) -> Result<CommandOutcomeV0, TransportErrorV0> {
+        self.dispatch_in_operation(address, command, &self.begin_operation_session())
+            .await
+    }
+
+    /// Executes one sealed command under one transport-minted operation
+    /// session.  Only the runtime's pinned collector receives this entry
+    /// point; direct callers use [`Self::dispatch`] and get a noninvalidating
+    /// operation-owned session.
+    pub async fn dispatch_in_operation(
+        &self,
+        address: &RootAddressV0,
+        command: &CommandV0,
+        session: &OperationSessionV0,
+    ) -> Result<CommandOutcomeV0, TransportErrorV0> {
+        if matches!(command, CommandV0::EnsureBootstrap { .. }) {
+            session.begin_bootstrap_sequence()?;
+        }
+        loop {
+            match self
+                .dispatch_once_in_operation(address, command, session)
+                .await
+            {
+                Err(
+                    TransportErrorV0::FiniteIoDeadline(FiniteIoStageV0::PreWrite)
+                    | TransportErrorV0::PreWriteRetryable(_),
+                ) => {
+                    // The command has not reached `WritePolled`; retry only
+                    // its original frozen request under the next budget slot.
+                    // This loop remains inside the caller's pinned future, so
+                    // the watch collector keeps every buffered fact.
+                    session.retry_prewrite_epoch()?;
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+
+    async fn dispatch_once_in_operation(
+        &self,
+        address: &RootAddressV0,
+        command: &CommandV0,
+        session: &OperationSessionV0,
+    ) -> Result<CommandOutcomeV0, TransportErrorV0> {
         validate_address(address)?;
         if empty_state_resource_version_sentinel(command) {
             return match command {
@@ -786,14 +2060,14 @@ impl KubeTransportV0 {
                     token,
                     preconditions,
                 } => {
-                    self.verify_root_only_cleanup(address, token, preconditions)
+                    self.verify_root_only_cleanup(address, token, preconditions, session)
                         .await
                 }
                 CommandV0::RemoveRootFinalizer {
                     token,
                     preconditions,
                 } => {
-                    self.remove_root_only_finalizer(address, token, preconditions)
+                    self.remove_root_only_finalizer(address, token, preconditions, session)
                         .await
                 }
                 _ => Err(TransportErrorV0::ManualRecoveryHold),
@@ -816,6 +2090,7 @@ impl KubeTransportV0 {
                     *root_generation,
                     root_resource_version,
                     state_name,
+                    session,
                 )
                 .await
             }
@@ -824,7 +2099,10 @@ impl KubeTransportV0 {
                 preconditions,
                 operation,
             } => {
-                let fence = match self.reread_fence(address, preconditions).await {
+                let fence = match self
+                    .reread_fence_in_operation(address, preconditions, session)
+                    .await
+                {
                     Ok(fence) => fence,
                     Err(error) => return Err(error),
                 };
@@ -835,29 +2113,33 @@ impl KubeTransportV0 {
                     &fence.root.metadata.uid,
                     &operation.token,
                 )?;
-                let written = match tokio::time::timeout(
-                    STATE_PERSIST_RESPONSE_TIMEOUT,
-                    self.patch_state(&desired, &preconditions.state_resource_version, true),
-                )
-                .await
+                let written = match self
+                    .apply(
+                        &desired,
+                        ResourceKindV0::OxideLoopState,
+                        &preconditions.state_resource_version,
+                        true,
+                        session,
+                    )
+                    .await
                 {
-                    Ok(Ok(written)) => written,
+                    Ok(written) => written,
                     // The request was issued exactly once. A timeout is as
                     // ambiguous as a truncated response, so prove the patch
                     // by an exact reread rather than replaying it.
-                    Err(_) => {
+                    Err(TransportErrorV0::FiniteIoDeadline(FiniteIoStageV0::WriteResponse)) => {
                         return self
-                            .recover_persist(address, state, preconditions, operation)
+                            .recover_persist(address, state, preconditions, operation, session)
                             .await;
                     }
-                    Ok(Err(error))
+                    Err(error)
                         if may_recover_response_loss(&error) || is_state_write_conflict(&error) =>
                     {
                         return self
-                            .recover_persist(address, state, preconditions, operation)
+                            .recover_persist(address, state, preconditions, operation, session)
                             .await;
                     }
-                    Ok(Err(error)) => return Err(error),
+                    Err(error) => return Err(error),
                 };
                 Ok(CommandOutcomeV0::Event(Box::new(
                     oxideloop_controller_core::EventV0::Persisted {
@@ -875,7 +2157,10 @@ impl KubeTransportV0 {
                 preconditions,
                 status,
             } => {
-                let fence = match self.reread_fence(address, preconditions).await {
+                let fence = match self
+                    .reread_fence_in_operation(address, preconditions, session)
+                    .await
+                {
                     Ok(fence) => fence,
                     Err(error) => return Err(error),
                 };
@@ -893,21 +2178,32 @@ impl KubeTransportV0 {
                 )?;
                 let desired = root_status_object(&fence.root, status);
                 let written = match self
-                    .patch_web_application_status(&desired, old_root_resource_version, true)
+                    .apply_status(
+                        &desired,
+                        ResourceKindV0::WebApplication,
+                        old_root_resource_version,
+                        true,
+                        session,
+                    )
                     .await
                 {
                     Ok(written) => written,
                     Err(error)
-                        if may_recover_response_loss(&error)
+                        if matches!(
+                            error,
+                            TransportErrorV0::FiniteIoDeadline(FiniteIoStageV0::WriteResponse)
+                        ) || may_recover_response_loss(&error)
                             || is_root_status_write_conflict(&error) =>
                     {
                         return self
-                            .recover_root_status(
+                            .recover_root_status_in_operation(
                                 address,
                                 token,
                                 root_uid,
                                 old_root_resource_version,
                                 status,
+                                session,
+                                true,
                             )
                             .await;
                     }
@@ -932,8 +2228,14 @@ impl KubeTransportV0 {
                 attempt_token,
                 commands,
             } => {
-                self.execute_mutation(address, transaction_id, attempt_token, &commands[0])
-                    .await
+                self.execute_mutation(
+                    address,
+                    transaction_id,
+                    attempt_token,
+                    &commands[0],
+                    session,
+                )
+                .await
             }
             CommandV0::EnsureAutomationRun {
                 token,
@@ -941,7 +2243,7 @@ impl KubeTransportV0 {
                 spec,
                 preconditions,
             } => {
-                self.execute_automation(address, token, name, spec, preconditions)
+                self.execute_automation(address, token, name, spec, preconditions, session)
                     .await
             }
             CommandV0::DeleteAutomationRun {
@@ -952,7 +2254,9 @@ impl KubeTransportV0 {
                 resource_version,
                 preconditions,
             } => {
-                let _fence = self.reread_fence(address, preconditions).await?;
+                let _fence = self
+                    .reread_fence_in_operation(address, preconditions, session)
+                    .await?;
                 let reference = ObjectRefV0 {
                     resource: ResourceKindV0::AutomationRun,
                     namespace: address.namespace.clone(),
@@ -961,9 +2265,15 @@ impl KubeTransportV0 {
                 if reference.namespace != address.namespace {
                     return Err(TransportErrorV0::UnsupportedTarget);
                 }
-                self.delete_automation_run(&reference, uid, resource_version)
-                    .await
-                    .map_err(|_| ambiguous_delete_or_finalizer())?;
+                self.delete(
+                    &reference,
+                    ResourceKindV0::AutomationRun,
+                    uid,
+                    resource_version,
+                    session,
+                )
+                .await
+                .map_err(|_| ambiguous_delete_or_finalizer())?;
                 Ok(CommandOutcomeV0::Event(Box::new(
                     oxideloop_controller_core::EventV0::AutomationRunDeleted {
                         token: token.clone(),
@@ -978,14 +2288,16 @@ impl KubeTransportV0 {
                 token,
                 preconditions,
             } => {
-                let fence = self.reread_fence(address, preconditions).await?;
+                let fence = self
+                    .reread_fence_in_operation(address, preconditions, session)
+                    .await?;
                 for resource in [
                     ResourceKindV0::ConfigMap,
                     ResourceKindV0::Service,
                     ResourceKindV0::AutomationRun,
                 ] {
                     if self
-                        .list_exact(resource, &address.namespace)
+                        .list_exact_in_operation(resource, &address.namespace, session)
                         .await?
                         .items
                         .into_iter()
@@ -1015,8 +2327,13 @@ impl KubeTransportV0 {
                 token,
                 preconditions,
             } => {
-                let fence = self.reread_fence(address, preconditions).await?;
-                let written = self.remove_finalizer(&fence.state, STATE_FINALIZER).await?;
+                let fence = self
+                    .reread_fence_in_operation(address, preconditions, session)
+                    .await?;
+                let written = self
+                    .remove_finalizer_in_operation(&fence.state, STATE_FINALIZER, session)
+                    .await
+                    .map_err(|_| ambiguous_delete_or_finalizer())?;
                 Ok(CommandOutcomeV0::Event(Box::new(
                     oxideloop_controller_core::EventV0::StateFinalizerRemoved {
                         token: token.clone(),
@@ -1030,8 +2347,13 @@ impl KubeTransportV0 {
                 token,
                 preconditions,
             } => {
-                let fence = self.reread_fence(address, preconditions).await?;
-                let written = self.remove_finalizer(&fence.root, ROOT_FINALIZER).await?;
+                let fence = self
+                    .reread_fence_in_operation(address, preconditions, session)
+                    .await?;
+                let written = self
+                    .remove_finalizer_in_operation(&fence.root, ROOT_FINALIZER, session)
+                    .await
+                    .map_err(|_| ambiguous_delete_or_finalizer())?;
                 Ok(CommandOutcomeV0::Event(Box::new(
                     oxideloop_controller_core::EventV0::RootFinalizerRemoved {
                         token: token.clone(),
@@ -1050,7 +2372,7 @@ impl KubeTransportV0 {
                     return Err(TransportErrorV0::ManualRecoveryHold);
                 }
                 let (root_ref, _) = address.references();
-                match self.reread(&root_ref).await? {
+                match self.reread_in_operation(&root_ref, session).await? {
                     None => Ok(CommandOutcomeV0::Event(Box::new(
                         oxideloop_controller_core::EventV0::RootUidVerifiedAbsent {
                             token: token.clone(),
@@ -1087,13 +2409,14 @@ impl KubeTransportV0 {
         state: &OxideLoopStateSpec,
         preconditions: &PreconditionsV0,
         operation: &oxideloop_controller_api::PersistOperation,
+        session: &OperationSessionV0,
     ) -> Result<CommandOutcomeV0, TransportErrorV0> {
         let (root_ref, state_ref) = address.references();
-        let observed =
-            tokio::time::timeout(STATE_PERSIST_RESPONSE_TIMEOUT, self.reread(&state_ref))
-                .await
-                .map_err(|_| TransportErrorV0::ManualRecoveryHold)??
-                .ok_or(TransportErrorV0::ManualRecoveryHold)?;
+        let observed = self
+            .recovery_reread(&state_ref, session)
+            .await
+            .map_err(|_| TransportErrorV0::ManualRecoveryHold)?
+            .ok_or(TransportErrorV0::ManualRecoveryHold)?;
         if observed.metadata.uid != preconditions.state_uid
             || observed.metadata.resource_version == preconditions.state_resource_version
             || !has_finalizer(&observed, STATE_FINALIZER)
@@ -1112,6 +2435,7 @@ impl KubeTransportV0 {
         {
             return Err(TransportErrorV0::ManualRecoveryHold);
         }
+        session.prove_exact_response_loss_recovery()?;
         Ok(CommandOutcomeV0::Event(Box::new(
             oxideloop_controller_core::EventV0::Persisted {
                 token: operation.token.clone(),
@@ -1122,6 +2446,7 @@ impl KubeTransportV0 {
         )))
     }
 
+    #[cfg(test)]
     async fn recover_root_status(
         &self,
         address: &RootAddressV0,
@@ -1130,10 +2455,28 @@ impl KubeTransportV0 {
         old_rv: &str,
         status: &WebApplicationStatus,
     ) -> Result<CommandOutcomeV0, TransportErrorV0> {
+        let session = self.begin_operation_session();
+        self.recover_root_status_in_operation(
+            address, token, root_uid, old_rv, status, &session, false,
+        )
+        .await
+    }
+
+    async fn recover_root_status_in_operation(
+        &self,
+        address: &RootAddressV0,
+        token: &str,
+        root_uid: &str,
+        old_rv: &str,
+        status: &WebApplicationStatus,
+        session: &OperationSessionV0,
+        prove_ambiguous_write: bool,
+    ) -> Result<CommandOutcomeV0, TransportErrorV0> {
         let (root_ref, _) = address.references();
         let observed = self
-            .reread(&root_ref)
-            .await?
+            .recovery_reread(&root_ref, session)
+            .await
+            .map_err(|_| TransportErrorV0::ManualRecoveryHold)?
             .ok_or(TransportErrorV0::ManualRecoveryHold)?;
         let intended =
             serde_json::to_value(status).map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
@@ -1155,6 +2498,9 @@ impl KubeTransportV0 {
         {
             return Err(TransportErrorV0::ManualRecoveryHold);
         }
+        if prove_ambiguous_write {
+            session.prove_exact_response_loss_recovery()?;
+        }
         Ok(CommandOutcomeV0::Event(Box::new(
             oxideloop_controller_core::EventV0::RootStatusPersisted {
                 token: token.into(),
@@ -1163,6 +2509,62 @@ impl KubeTransportV0 {
                 root_uid: root_uid.into(),
             },
         )))
+    }
+
+    /// Re-opens the root preflight immediately before one bootstrap subwrite.
+    /// This is intentionally not shared with the initial discovery read: a
+    /// State POST cannot inherit root authority from a read that happened
+    /// before its state existence probe, and later patches cannot inherit it
+    /// from an earlier bootstrap phase.
+    async fn bootstrap_root_preflight(
+        &self,
+        root_ref: &ObjectRefV0,
+        root_uid: &str,
+        root_generation: i64,
+        root_rv: &str,
+        token: &str,
+        phase: BootstrapRootPhaseV0,
+        session: &OperationSessionV0,
+    ) -> Result<ObjectV0, TransportErrorV0> {
+        session.wait_for_bootstrap_phase_authority().await?;
+        let root = self
+            .reread_prewrite_in_operation(root_ref, session)
+            .await?
+            .ok_or(TransportErrorV0::Stale("root absent"))?;
+        if root.metadata.uid != root_uid
+            || generation(&root)? != root_generation
+            || root
+                .value
+                .pointer("/metadata/deletionTimestamp")
+                .is_some_and(|value| value.as_str().is_some_and(|value| !value.is_empty()))
+            || (root.metadata.resource_version != root_rv
+                && !has_bootstrap_root_metadata(&root, token))
+        {
+            let _ = session.prewrite_gate().invalidate_authenticated_change();
+            return Err(TransportErrorV0::PreWriteInvalidated);
+        }
+        if let Err(error) = session.begin_bootstrap_root_phase(phase, &root) {
+            if matches!(error, TransportErrorV0::Stale(_)) {
+                let _ = session.prewrite_gate().invalidate_authenticated_change();
+                return Err(TransportErrorV0::PreWriteInvalidated);
+            }
+            return Err(error);
+        }
+        // RootStateLink is justified by the exact response to our metadata
+        // patch, not by the broad "bootstrap annotations exist" predicate.
+        // The latter is sufficient only to recognize durable bootstrap state;
+        // it cannot authorize a status write after a status/finalizer/link or
+        // annotation change raced the next phase.
+        if phase == BootstrapRootPhaseV0::RootStateLink
+            && let Err(error) = session.require_exact_root_metadata_response(&root)
+        {
+            if matches!(error, TransportErrorV0::Stale(_)) {
+                let _ = session.prewrite_gate().invalidate_authenticated_change();
+                return Err(TransportErrorV0::PreWriteInvalidated);
+            }
+            return Err(error);
+        }
+        Ok(root)
     }
 
     async fn execute_bootstrap(
@@ -1174,64 +2576,203 @@ impl KubeTransportV0 {
         root_generation: i64,
         root_rv: &str,
         state_name: &str,
+        session: &OperationSessionV0,
     ) -> Result<CommandOutcomeV0, TransportErrorV0> {
         if address.state_name != state_name {
             return Err(TransportErrorV0::IdentityMismatch);
         }
         let (root_ref, state_ref) = address.references();
-        let root = self
-            .reread(&root_ref)
+        let initial_root = self
+            .reread_prewrite_in_operation(&root_ref, session)
             .await?
             .ok_or(TransportErrorV0::Stale("root absent"))?;
-        if root.metadata.uid != root_uid
-            || generation(&root)? != root_generation
-            || (root.metadata.resource_version != root_rv
-                && !has_bootstrap_root_metadata(&root, token))
+        if initial_root.metadata.uid != root_uid
+            || generation(&initial_root)? != root_generation
+            || initial_root
+                .value
+                .pointer("/metadata/deletionTimestamp")
+                .is_some_and(|value| value.as_str().is_some_and(|value| !value.is_empty()))
+            || (initial_root.metadata.resource_version != root_rv
+                && !has_bootstrap_root_metadata(&initial_root, token))
         {
             return Err(TransportErrorV0::Stale("bootstrap root pins"));
         }
-        let desired = bootstrap_state(&state_ref, state, &root, token)?;
         // A pre-existing same-name state has no create witness. It is safe to
         // continue only when the root already durably links this exact UID;
         // otherwise this is a collision, never an adoption candidate.
-        let mut state = match self.reread(&state_ref).await? {
-            None => match self.create_state(&desired).await {
-                Ok(created) => created,
-                Err(error) if may_recover_response_loss(&error) => {
-                    return Err(TransportErrorV0::ResponseLost);
+        let mut state = match self
+            .reread_prewrite_in_operation(&state_ref, session)
+            .await?
+        {
+            None => {
+                // The state existence read is intentionally *before* this
+                // root fence.  The POST gets no root resource-version
+                // precondition, so its only valid authority is this immediate
+                // epoch-bound root preflight plus the shared write lease.
+                let root = self
+                    .bootstrap_root_preflight(
+                        &root_ref,
+                        root_uid,
+                        root_generation,
+                        root_rv,
+                        token,
+                        BootstrapRootPhaseV0::StatePost,
+                        session,
+                    )
+                    .await?;
+                let desired = bootstrap_state(&state_ref, state, &root, token)?;
+                match self.create_state_in_operation(&desired, session).await {
+                    Ok(created) => {
+                        let created =
+                            recover_bootstrap_state(Some(created), &desired, &root, token)?;
+                        session.record_bootstrap_issued_state(&created)?;
+                        created
+                    }
+                    // Kubernetes assigns the State UID.  Once the CREATE response
+                    // is lost there is no client-held issued UID to bind a later
+                    // same-name object to this command.  In particular, a raw
+                    // reread of that name would be adoption, not proof.  A later
+                    // bootstrap invocation may resume only through the normal
+                    // pre-existing-state path below, after the root durably links
+                    // that exact State UID.
+                    Err(error) if bootstrap_write_response_lost(&error) => {
+                        return Err(TransportErrorV0::ManualRecoveryHold);
+                    }
+                    Err(TransportErrorV0::Conflict(ConflictProvenanceV0::Write {
+                        operation: WriteOperationV0::Create,
+                        resource: ResourceKindV0::OxideLoopState,
+                    })) => {
+                        return Err(TransportErrorV0::ForeignCollision);
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(TransportErrorV0::Conflict(ConflictProvenanceV0::Write {
-                    operation: WriteOperationV0::Create,
-                    resource: ResourceKindV0::OxideLoopState,
-                })) => {
-                    return Err(TransportErrorV0::ForeignCollision);
-                }
-                Err(error) => return Err(error),
-            },
+            }
             Some(observed) => {
-                if !has_state_link(&root, &observed) {
+                if !has_state_link(&initial_root, &observed)
+                    && !session.bootstrap_issued_state_matches(&observed)
+                {
                     return Err(TransportErrorV0::ForeignCollision);
                 }
-                recover_bootstrap_state(Some(observed), &desired, &root, token)?
+                let desired = bootstrap_state(&state_ref, state, &initial_root, token)?;
+                recover_bootstrap_state(Some(observed), &desired, &initial_root, token)?
             }
         };
         if !has_finalizer(&state, STATE_FINALIZER) {
-            state = self.ensure_finalizer(&state, STATE_FINALIZER).await?;
+            self.bootstrap_root_preflight(
+                &root_ref,
+                root_uid,
+                root_generation,
+                root_rv,
+                token,
+                BootstrapRootPhaseV0::StateFinalizer,
+                session,
+            )
+            .await?;
+            let before = state.clone();
+            state = match self
+                .ensure_finalizer(&before, STATE_FINALIZER, session)
+                .await
+            {
+                Ok(written) if bootstrap_state_finalizer_proof(&written, &before) => written,
+                Err(error) if bootstrap_write_response_lost(&error) => {
+                    let proof = self.bootstrap_recovery_get(&state_ref, session).await?;
+                    if bootstrap_state_finalizer_proof(&proof, &before) {
+                        session.prove_bootstrap_after_exact_proof()?;
+                        proof
+                    } else {
+                        return Err(TransportErrorV0::ManualRecoveryHold);
+                    }
+                }
+                Ok(_) | Err(_) => return Err(TransportErrorV0::ManualRecoveryHold),
+            };
         }
+        let root = self
+            .reread_prewrite_in_operation(&root_ref, session)
+            .await?
+            .ok_or(TransportErrorV0::Stale("root absent"))?;
         let root = if has_bootstrap_root_metadata(&root, token) {
             root
         } else {
-            self.bootstrap_root_metadata(&root, token).await?
+            let before = self
+                .bootstrap_root_preflight(
+                    &root_ref,
+                    root_uid,
+                    root_generation,
+                    root_rv,
+                    token,
+                    BootstrapRootPhaseV0::RootMetadata,
+                    session,
+                )
+                .await?;
+            match self.bootstrap_root_metadata(&before, token, session).await {
+                Ok(written) if bootstrap_root_metadata_proof(&written, &before, token) => {
+                    session.record_bootstrap_owned_root_echo(
+                        &written,
+                        BootstrapRootPhaseV0::RootStateLink,
+                    )?;
+                    written
+                }
+                Err(error) if bootstrap_write_response_lost(&error) => {
+                    let proof = self.bootstrap_recovery_get(&root_ref, session).await?;
+                    if bootstrap_root_metadata_proof(&proof, &before, token) {
+                        session.prove_bootstrap_after_exact_proof()?;
+                        session.record_bootstrap_owned_root_echo(
+                            &proof,
+                            BootstrapRootPhaseV0::RootStateLink,
+                        )?;
+                        proof
+                    } else {
+                        return Err(TransportErrorV0::ManualRecoveryHold);
+                    }
+                }
+                Ok(_) | Err(_) => return Err(TransportErrorV0::ManualRecoveryHold),
+            }
         };
         if !has_state_link(&root, &state) {
-            self.bootstrap_root_status(&root, &state).await?;
+            let before = self
+                .bootstrap_root_preflight(
+                    &root_ref,
+                    root_uid,
+                    root_generation,
+                    root_rv,
+                    token,
+                    BootstrapRootPhaseV0::RootStateLink,
+                    session,
+                )
+                .await?;
+            let linked = match self.bootstrap_root_status(&before, &state, session).await {
+                Ok(written) if bootstrap_root_link_proof(&written, &before, &state) => {
+                    session.record_bootstrap_owned_root_echo(
+                        &written,
+                        BootstrapRootPhaseV0::Complete,
+                    )?;
+                    written
+                }
+                Err(error) if bootstrap_write_response_lost(&error) => {
+                    let proof = self.bootstrap_recovery_get(&root_ref, session).await?;
+                    if bootstrap_root_link_proof(&proof, &before, &state) {
+                        session.prove_bootstrap_after_exact_proof()?;
+                        session.record_bootstrap_owned_root_echo(
+                            &proof,
+                            BootstrapRootPhaseV0::Complete,
+                        )?;
+                        proof
+                    } else {
+                        return Err(TransportErrorV0::ManualRecoveryHold);
+                    }
+                }
+                Ok(_) | Err(_) => return Err(TransportErrorV0::ManualRecoveryHold),
+            };
+            if !has_state_link(&linked, &state) {
+                return Err(TransportErrorV0::ManualRecoveryHold);
+            }
         }
         let final_state = self
-            .reread(&state_ref)
+            .reread_in_operation(&state_ref, session)
             .await?
             .ok_or(TransportErrorV0::ManualRecoveryHold)?;
         let final_root = self
-            .reread(&root_ref)
+            .reread_in_operation(&root_ref, session)
             .await?
             .ok_or(TransportErrorV0::ManualRecoveryHold)?;
         if final_state.metadata.uid != state.metadata.uid
@@ -1260,12 +2801,27 @@ impl KubeTransportV0 {
         )))
     }
 
+    /// Uses the one raw, budget-consuming post-write proof GET.  Bootstrap
+    /// deliberately never delegates this to a public reread helper: that
+    /// would mint a new operation window after an ambiguous write.
+    async fn bootstrap_recovery_get(
+        &self,
+        reference: &ObjectRefV0,
+        session: &OperationSessionV0,
+    ) -> Result<ObjectV0, TransportErrorV0> {
+        self.recovery_reread(reference, session)
+            .await
+            .map_err(|_| TransportErrorV0::ManualRecoveryHold)?
+            .ok_or(TransportErrorV0::ManualRecoveryHold)
+    }
+
     async fn execute_mutation(
         &self,
         address: &RootAddressV0,
         transaction_id: &str,
         attempt_token: &str,
         command: &MutationCommandV0,
+        session: &OperationSessionV0,
     ) -> Result<CommandOutcomeV0, TransportErrorV0> {
         let reference = reference_from_identity(&command.identity)?;
         if reference.namespace != address.namespace {
@@ -1294,7 +2850,12 @@ impl KubeTransportV0 {
             _ => Some(reference.clone()),
         };
         let fence = self
-            .reread_fence_with_target(address, &command.preconditions, target.as_ref())
+            .reread_fence_with_target_in_operation(
+                address,
+                &command.preconditions,
+                target.as_ref(),
+                session,
+            )
             .await?;
         // Reject stale target identity claims before the final State gate. No
         // authorization read is needed when the command is already known to
@@ -1347,6 +2908,7 @@ impl KubeTransportV0 {
                 transaction_id,
                 attempt_token,
                 command,
+                session,
             )
             .await?;
         }
@@ -1355,7 +2917,14 @@ impl KubeTransportV0 {
                 method: HttpMethod::Post,
                 body,
             } => self
-                .mutation_create(&reference, body, &fence.root, transaction_id, command)
+                .mutation_create(
+                    &reference,
+                    body,
+                    &fence.root,
+                    transaction_id,
+                    command,
+                    session,
+                )
                 .await
                 .map(|o| result(command, ApplyOutcome::Applied, Some(o))),
             MutationDecision::ConditionalApply {
@@ -1383,6 +2952,7 @@ impl KubeTransportV0 {
                             transaction_id,
                             command,
                             &fence.target.expect("fenced"),
+                            session,
                         )
                         .await
                     {
@@ -1402,7 +2972,12 @@ impl KubeTransportV0 {
                 method: HttpMethod::Delete,
                 preconditions,
             } => self
-                .mutation_delete(&reference, preconditions, &fence.target.expect("fenced"))
+                .mutation_delete(
+                    &reference,
+                    preconditions,
+                    &fence.target.expect("fenced"),
+                    session,
+                )
                 .await
                 .map(|identity| {
                     result_identity(
@@ -1438,18 +3013,19 @@ impl KubeTransportV0 {
         )))
     }
 
-    async fn reread_fence(
+    async fn reread_fence_in_operation(
         &self,
         address: &RootAddressV0,
         preconditions: &PreconditionsV0,
+        session: &OperationSessionV0,
     ) -> Result<EffectFenceV0, TransportErrorV0> {
         let (root_ref, state_ref) = address.references();
         let root = self
-            .reread(&root_ref)
+            .reread_prewrite_in_operation(&root_ref, session)
             .await?
             .ok_or(TransportErrorV0::Stale("root absent"))?;
         let state = self
-            .reread(&state_ref)
+            .reread_prewrite_in_operation(&state_ref, session)
             .await?
             .ok_or(TransportErrorV0::Stale("state absent"))?;
         let fence = EffectFenceV0 {
@@ -1461,24 +3037,38 @@ impl KubeTransportV0 {
         Ok(fence)
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     async fn reread_fence_with_target(
         &self,
         address: &RootAddressV0,
         preconditions: &PreconditionsV0,
         target: Option<&ObjectRefV0>,
     ) -> Result<EffectFenceV0, TransportErrorV0> {
+        let session = self.begin_operation_session();
+        self.reread_fence_with_target_in_operation(address, preconditions, target, &session)
+            .await
+    }
+
+    async fn reread_fence_with_target_in_operation(
+        &self,
+        address: &RootAddressV0,
+        preconditions: &PreconditionsV0,
+        target: Option<&ObjectRefV0>,
+        session: &OperationSessionV0,
+    ) -> Result<EffectFenceV0, TransportErrorV0> {
         let (root_ref, state_ref) = address.references();
         let root = self
-            .reread(&root_ref)
+            .reread_prewrite_in_operation(&root_ref, session)
             .await?
             .ok_or(TransportErrorV0::Stale("root absent"))?;
         let state = self
-            .reread(&state_ref)
+            .reread_prewrite_in_operation(&state_ref, session)
             .await?
             .ok_or(TransportErrorV0::Stale("state absent"))?;
         let target = match target {
             Some(reference) => Some(
-                self.reread(reference)
+                self.reread_prewrite_in_operation(reference, session)
                     .await?
                     .ok_or(TransportErrorV0::Stale("target absent"))?,
             ),
@@ -1505,10 +3095,11 @@ impl KubeTransportV0 {
         transaction_id: &str,
         attempt_token: &str,
         command: &MutationCommandV0,
+        session: &OperationSessionV0,
     ) -> Result<(), TransportErrorV0> {
         let (_, state_ref) = address.references();
         let state = self
-            .reread(&state_ref)
+            .reread_prewrite_in_operation(&state_ref, session)
             .await?
             .ok_or(TransportErrorV0::ManualRecoveryHold)?;
         validate_dispatch_authority(
@@ -1526,145 +3117,181 @@ impl KubeTransportV0 {
         &self,
         object: &ObjectV0,
         finalizer: &str,
+        operation: &OperationSessionV0,
     ) -> Result<ObjectV0, TransportErrorV0> {
         if has_finalizer(object, finalizer) {
             return Ok(object.clone());
         }
-        let operation = if object.value.pointer("/metadata/finalizers").is_some() {
+        let patch_operation = if object.value.pointer("/metadata/finalizers").is_some() {
             serde_json::json!({"op":"add","path":"/metadata/finalizers/-","value":finalizer})
         } else {
             serde_json::json!({"op":"add","path":"/metadata/finalizers","value":[finalizer]})
         };
-        let patch = serde_json::json!([{"op":"test","path":"/metadata/resourceVersion","value":object.metadata.resource_version},operation]);
-        self.api(object.reference.resource, &object.reference.namespace)
-            .patch(
-                &object.reference.name,
-                &PatchParams::default(),
-                &Patch::<Value>::Json(
-                    serde_json::from_value::<json_patch::Patch>(patch)
-                        .map_err(|e| TransportErrorV0::Other(e.to_string()))?,
-                ),
-            )
-            .await
-            .map_err(|error| {
-                map_write_error(
-                    error,
-                    WriteOperationV0::JsonPatch,
-                    object.reference.resource,
+        let patch = serde_json::json!([{"op":"test","path":"/metadata/resourceVersion","value":object.metadata.resource_version},patch_operation]);
+        let patch = serde_json::from_value::<json_patch::Patch>(patch)
+            .map_err(|e| TransportErrorV0::Other(e.to_string()))?;
+        let permit = claim_first_write(operation)?;
+        let written = within_operation(operation, FiniteIoStageV0::WriteResponse, async {
+            let patch_params = bootstrap_controller_patch_params();
+            self.api(object.reference.resource, &object.reference.namespace)
+                .patch(
+                    &object.reference.name,
+                    &patch_params,
+                    &Patch::<Value>::Json(patch),
                 )
-            })
-            .and_then(|o| to_domain(object.reference.resource, &object.reference.namespace, o))
+                .await
+                .map_err(|error| {
+                    map_write_error(
+                        error,
+                        WriteOperationV0::JsonPatch,
+                        object.reference.resource,
+                    )
+                })
+        })
+        .await?;
+        let written = to_domain(
+            object.reference.resource,
+            &object.reference.namespace,
+            written,
+        )?;
+        permit.prove()?;
+        Ok(written)
     }
 
+    #[cfg(test)]
     async fn remove_finalizer(
         &self,
         object: &ObjectV0,
         finalizer: &str,
     ) -> Result<ObjectV0, TransportErrorV0> {
+        let operation = self.begin_operation_session();
+        self.remove_finalizer_in_operation(object, finalizer, &operation)
+            .await
+    }
+
+    async fn remove_finalizer_in_operation(
+        &self,
+        object: &ObjectV0,
+        finalizer: &str,
+        operation: &OperationSessionV0,
+    ) -> Result<ObjectV0, TransportErrorV0> {
         let Some(index) = finalizer_index(object, finalizer) else {
             return Err(TransportErrorV0::ManualRecoveryHold);
         };
         let patch = serde_json::json!([{"op":"test","path":"/metadata/uid","value":object.metadata.uid},{"op":"test","path":"/metadata/resourceVersion","value":object.metadata.resource_version},{"op":"test","path":format!("/metadata/finalizers/{index}"),"value":finalizer},{"op":"remove","path":format!("/metadata/finalizers/{index}")}]);
-        self.api(object.reference.resource, &object.reference.namespace)
-            .patch(
-                &object.reference.name,
-                &PatchParams::default(),
-                &Patch::<Value>::Json(
-                    serde_json::from_value::<json_patch::Patch>(patch)
-                        .map_err(|_| ambiguous_delete_or_finalizer())?,
-                ),
-            )
-            .await
-            .map_err(|_| ambiguous_delete_or_finalizer())
-            .and_then(|o| {
-                to_domain(object.reference.resource, &object.reference.namespace, o)
-                    .map_err(|_| ambiguous_delete_or_finalizer())
-            })
+        let patch = serde_json::from_value::<json_patch::Patch>(patch)
+            .map_err(|_| ambiguous_delete_or_finalizer())?;
+        let permit = claim_first_write(operation)?;
+        let written = within_operation(operation, FiniteIoStageV0::WriteResponse, async {
+            self.api(object.reference.resource, &object.reference.namespace)
+                .patch(
+                    &object.reference.name,
+                    &PatchParams::default(),
+                    &Patch::<Value>::Json(patch),
+                )
+                .await
+                .map_err(|_| ambiguous_delete_or_finalizer())
+        })
+        .await?;
+        let written = to_domain(
+            object.reference.resource,
+            &object.reference.namespace,
+            written,
+        )
+        .map_err(|_| ambiguous_delete_or_finalizer())?;
+        permit.prove()?;
+        Ok(written)
     }
 
     async fn bootstrap_root_metadata(
         &self,
         root: &ObjectV0,
         token: &str,
+        operation: &OperationSessionV0,
     ) -> Result<ObjectV0, TransportErrorV0> {
-        let mut annotations = root.metadata.annotations.clone();
-        annotations.insert(ROOT_UID_ANNOTATION.into(), root.metadata.uid.clone());
-        annotations.insert(TRANSACTION_ID_ANNOTATION.into(), token.into());
-        annotations.insert(COMMAND_ID_ANNOTATION.into(), token.into());
-        let mut finalizers = root
-            .value
-            .pointer("/metadata/finalizers")
-            .and_then(Value::as_array)
+        let expected = bootstrap_root_metadata_expected_value(root, token)
+            .ok_or(TransportErrorV0::Stale("bootstrap root metadata"))?;
+        let annotations = expected
+            .pointer("/metadata/annotations")
             .cloned()
-            .unwrap_or_default();
-        if !finalizers
-            .iter()
-            .any(|v| v.as_str() == Some(ROOT_FINALIZER))
-        {
-            finalizers.push(Value::String(ROOT_FINALIZER.into()));
-        }
+            .ok_or(TransportErrorV0::Stale("bootstrap root annotations"))?;
+        let finalizers = expected
+            .pointer("/metadata/finalizers")
+            .cloned()
+            .ok_or(TransportErrorV0::Stale("bootstrap root finalizers"))?;
         let patch = serde_json::json!([
           {"op":"test","path":"/metadata/uid","value":root.metadata.uid},
           {"op":"test","path":"/metadata/resourceVersion","value":root.metadata.resource_version},
           {"op":"add","path":"/metadata/annotations","value":annotations},
           {"op":"add","path":"/metadata/finalizers","value":finalizers}
         ]);
-        self.json_patch(root, patch).await
+        self.json_patch(root, patch, operation).await
     }
     async fn bootstrap_root_status(
         &self,
         root: &ObjectV0,
         state: &ObjectV0,
+        operation: &OperationSessionV0,
     ) -> Result<ObjectV0, TransportErrorV0> {
         let body = serde_json::json!({"metadata":{"resourceVersion":root.metadata.resource_version},"status":{"state":StateLink { root_uid:root.metadata.uid.clone(), name:state.reference.name.clone(), uid:state.metadata.uid.clone() }}});
-        let written = self
-            .api(ResourceKindV0::WebApplication, &root.reference.namespace)
-            .patch_status(
-                &root.reference.name,
-                &PatchParams::default(),
-                &Patch::Merge(&body),
-            )
-            .await
-            .map_err(|error| {
-                map_write_error(
-                    error,
-                    WriteOperationV0::MergeStatus,
-                    ResourceKindV0::WebApplication,
-                )
-            })?;
-        to_domain(
+        let permit = claim_first_write(operation)?;
+        operation.mark_bootstrap_final_write_polled()?;
+        let written = within_operation(operation, FiniteIoStageV0::WriteResponse, async {
+            let patch_params = bootstrap_controller_patch_params();
+            self.api(ResourceKindV0::WebApplication, &root.reference.namespace)
+                .patch_status(&root.reference.name, &patch_params, &Patch::Merge(&body))
+                .await
+                .map_err(|error| {
+                    map_write_error(
+                        error,
+                        WriteOperationV0::MergeStatus,
+                        ResourceKindV0::WebApplication,
+                    )
+                })
+        })
+        .await?;
+        let written = to_domain(
             ResourceKindV0::WebApplication,
             &root.reference.namespace,
             written,
-        )
+        )?;
+        permit.prove_bootstrap_final()?;
+        Ok(written)
     }
     async fn json_patch(
         &self,
         object: &ObjectV0,
         patch: Value,
+        operation: &OperationSessionV0,
     ) -> Result<ObjectV0, TransportErrorV0> {
         let patch = serde_json::from_value::<json_patch::Patch>(patch)
             .map_err(|e| TransportErrorV0::Other(e.to_string()))?;
-        let written = self
-            .api(object.reference.resource, &object.reference.namespace)
-            .patch(
-                &object.reference.name,
-                &PatchParams::default(),
-                &Patch::<Value>::Json(patch),
-            )
-            .await
-            .map_err(|error| {
-                map_write_error(
-                    error,
-                    WriteOperationV0::JsonPatch,
-                    object.reference.resource,
+        let permit = claim_first_write(operation)?;
+        let written = within_operation(operation, FiniteIoStageV0::WriteResponse, async {
+            let patch_params = bootstrap_controller_patch_params();
+            self.api(object.reference.resource, &object.reference.namespace)
+                .patch(
+                    &object.reference.name,
+                    &patch_params,
+                    &Patch::<Value>::Json(patch),
                 )
-            })?;
-        to_domain(
+                .await
+                .map_err(|error| {
+                    map_write_error(
+                        error,
+                        WriteOperationV0::JsonPatch,
+                        object.reference.resource,
+                    )
+                })
+        })
+        .await?;
+        let written = to_domain(
             object.reference.resource,
             &object.reference.namespace,
             written,
-        )
+        )?;
+        permit.prove()?;
+        Ok(written)
     }
 
     async fn mutation_create(
@@ -1674,18 +3301,26 @@ impl KubeTransportV0 {
         root: &ObjectV0,
         tx: &str,
         command: &MutationCommandV0,
+        session: &OperationSessionV0,
     ) -> Result<ObjectV0, TransportErrorV0> {
         let desired = owned_mutation_object(reference, body, root, tx, command)?;
         let created = match reference.resource {
-            ResourceKindV0::ConfigMap => self.create_config_map(&desired).await,
-            ResourceKindV0::Service => self.create_service(&desired).await,
+            ResourceKindV0::ConfigMap => {
+                self.create_config_map_in_operation(&desired, session).await
+            }
+            ResourceKindV0::Service => self.create_service_in_operation(&desired, session).await,
             _ => return Err(TransportErrorV0::UnsupportedTarget),
         };
         // A POST response is the sole initial witness for an unpinned create.
         // A same-name reread after response loss cannot distinguish our write
         // from a foreign object (or a replay), so fail closed without a read.
         created.map_err(|error| {
-            if may_recover_response_loss(&error) {
+            if may_recover_response_loss(&error)
+                || matches!(
+                    error,
+                    TransportErrorV0::FiniteIoDeadline(FiniteIoStageV0::WriteResponse)
+                )
+            {
                 TransportErrorV0::ResponseLost
             } else {
                 error
@@ -1700,41 +3335,73 @@ impl KubeTransportV0 {
         tx: &str,
         command: &MutationCommandV0,
         target: &ObjectV0,
+        session: &OperationSessionV0,
     ) -> Result<ObjectV0, TransportErrorV0> {
         let mut desired = owned_mutation_object(reference, body, root, tx, command)?;
         desired.metadata = target.metadata.clone();
         let applied = match reference.resource {
             ResourceKindV0::ConfigMap => {
-                self.patch_config_map(&desired, &target.metadata.resource_version, true)
-                    .await
+                self.apply(
+                    &desired,
+                    ResourceKindV0::ConfigMap,
+                    &target.metadata.resource_version,
+                    true,
+                    session,
+                )
+                .await
             }
             ResourceKindV0::Service => {
-                self.patch_service(&desired, &target.metadata.resource_version, true)
-                    .await
+                self.apply(
+                    &desired,
+                    ResourceKindV0::Service,
+                    &target.metadata.resource_version,
+                    true,
+                    session,
+                )
+                .await
             }
             _ => return Err(TransportErrorV0::UnsupportedTarget),
         };
         match applied {
             Ok(o) => Ok(o),
             Err(error) if is_child_apply_write_conflict(&error, reference.resource) => {
-                recover_dropped_write_exact(
-                    self.reread(reference).await?.as_ref(),
+                let recovered = recover_dropped_write_exact(
+                    self.recovery_reread(reference, session)
+                        .await
+                        .map_err(|_| TransportErrorV0::ManualRecoveryHold)?
+                        .as_ref(),
                     &desired,
                     root,
                     Some(&target.metadata.uid),
                     tx,
                     &command.command_id,
                 )
-                .map_err(|_| TransportErrorV0::ManualRecoveryHold)
+                .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+                session.prove_exact_response_loss_recovery()?;
+                Ok(recovered)
             }
-            Err(error) if may_recover_response_loss(&error) => recover_dropped_write_exact(
-                self.reread(reference).await?.as_ref(),
-                &desired,
-                root,
-                Some(&target.metadata.uid),
-                tx,
-                &command.command_id,
-            ),
+            Err(error)
+                if may_recover_response_loss(&error)
+                    || matches!(
+                        error,
+                        TransportErrorV0::FiniteIoDeadline(FiniteIoStageV0::WriteResponse)
+                    ) =>
+            {
+                let recovered = recover_dropped_write_exact(
+                    self.recovery_reread(reference, session)
+                        .await
+                        .map_err(|_| TransportErrorV0::ManualRecoveryHold)?
+                        .as_ref(),
+                    &desired,
+                    root,
+                    Some(&target.metadata.uid),
+                    tx,
+                    &command.command_id,
+                )
+                .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+                session.prove_exact_response_loss_recovery()?;
+                Ok(recovered)
+            }
             Err(e) => Err(e),
         }
     }
@@ -1743,6 +3410,7 @@ impl KubeTransportV0 {
         reference: &ObjectRefV0,
         expected: &oxideloop_mutation_model::ObjectIdentity,
         target: &ObjectV0,
+        session: &OperationSessionV0,
     ) -> Result<oxideloop_mutation_model::ObjectIdentity, TransportErrorV0> {
         if target.metadata.uid != expected.uid
             || target.metadata.resource_version != expected.resource_version
@@ -1751,12 +3419,24 @@ impl KubeTransportV0 {
         }
         let result = match reference.resource {
             ResourceKindV0::ConfigMap => {
-                self.delete_config_map(reference, &expected.uid, &expected.resource_version)
-                    .await
+                self.delete(
+                    reference,
+                    ResourceKindV0::ConfigMap,
+                    &expected.uid,
+                    &expected.resource_version,
+                    session,
+                )
+                .await
             }
             ResourceKindV0::Service => {
-                self.delete_service(reference, &expected.uid, &expected.resource_version)
-                    .await
+                self.delete(
+                    reference,
+                    ResourceKindV0::Service,
+                    &expected.uid,
+                    &expected.resource_version,
+                    session,
+                )
+                .await
             }
             _ => Err(TransportErrorV0::UnsupportedTarget),
         };
@@ -1774,8 +3454,11 @@ impl KubeTransportV0 {
         name: &str,
         spec: &AutomationRunSpec,
         preconditions: &PreconditionsV0,
+        session: &OperationSessionV0,
     ) -> Result<CommandOutcomeV0, TransportErrorV0> {
-        let fence = self.reread_fence(address, preconditions).await?;
+        let fence = self
+            .reread_fence_in_operation(address, preconditions, session)
+            .await?;
         if spec.root_uid != fence.root.metadata.uid {
             return Err(TransportErrorV0::Stale("automation root UID"));
         }
@@ -1785,14 +3468,26 @@ impl KubeTransportV0 {
             name: name.into(),
         };
         let desired = automation_object(&reference, spec, &fence.root, token)?;
-        let run = match self.reread(&reference).await? {
+        let run = match self
+            .reread_prewrite_in_operation(&reference, session)
+            .await?
+        {
             // EnsureAutomationRun is intentionally unpinned. A same-name
             // object therefore has no durable UID witness and is always a
             // collision, even when its semantic body looks identical.
             Some(_) => return Err(TransportErrorV0::ForeignCollision),
-            None => match self.create_automation_run(&desired).await {
+            None => match self
+                .create_automation_run_in_operation(&desired, session)
+                .await
+            {
                 Ok(o) => o,
-                Err(error) if may_recover_response_loss(&error) => {
+                Err(error)
+                    if may_recover_response_loss(&error)
+                        || matches!(
+                            error,
+                            TransportErrorV0::FiniteIoDeadline(FiniteIoStageV0::WriteResponse)
+                        ) =>
+                {
                     return Err(TransportErrorV0::ResponseLost);
                 }
                 Err(TransportErrorV0::Conflict(ConflictProvenanceV0::Write {
@@ -1825,15 +3520,74 @@ impl KubeTransportV0 {
         resource: ResourceKindV0,
         namespace: &str,
     ) -> Result<ListV0, TransportErrorV0> {
+        let operation = self.begin_operation_session();
+        self.list_exact_in_operation(resource, namespace, &operation)
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn list_exact_in_operation(
+        &self,
+        resource: ResourceKindV0,
+        namespace: &str,
+        operation: &OperationSessionV0,
+    ) -> Result<ListV0, TransportErrorV0> {
         validate_namespace(namespace)?;
         if resource == ResourceKindV0::Event {
             return Err(TransportErrorV0::UnsupportedTarget);
         }
-        let listed = self
-            .api(resource, namespace)
-            .list(&ListParams::default())
-            .await
-            .map_err(|error| map_read_error(error, ReadOperationV0::List, resource))?;
+        let listed = within_operation(operation, FiniteIoStageV0::ReadOnly, async {
+            self.api(resource, namespace)
+                .list(&ListParams::default())
+                .await
+                .map_err(|error| map_read_error(error, ReadOperationV0::List, resource))
+        })
+        .await?;
+        let resource_version =
+            listed
+                .metadata
+                .resource_version
+                .clone()
+                .ok_or(TransportErrorV0::Other(
+                    "list response lacks resourceVersion".into(),
+                ))?;
+        let items = listed
+            .into_iter()
+            .map(|object| to_domain(resource, namespace, object))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ListV0 {
+            items,
+            resource_version,
+        })
+    }
+
+    /// A child inventory read immediately preceding a destructive root-only
+    /// action is part of that action's prewrite fence, not a free-standing
+    /// observation.  It shares the exact operation epoch and cannot outlive
+    /// the write lease it is intended to justify.
+    async fn list_exact_prewrite_in_operation(
+        &self,
+        resource: ResourceKindV0,
+        namespace: &str,
+        operation: &OperationSessionV0,
+    ) -> Result<ListV0, TransportErrorV0> {
+        validate_namespace(namespace)?;
+        if resource == ResourceKindV0::Event {
+            return Err(TransportErrorV0::UnsupportedTarget);
+        }
+        let listed = within_operation(operation, FiniteIoStageV0::PreWrite, async {
+            self.api(resource, namespace)
+                .list(&ListParams::default())
+                .await
+                .map_err(|error| map_read_error(error, ReadOperationV0::List, resource))
+        })
+        .await;
+        let listed = match listed {
+            Err(TransportErrorV0::Other(message)) => {
+                return Err(TransportErrorV0::PreWriteRetryable(message));
+            }
+            other => other,
+        }?;
         let resource_version =
             listed
                 .metadata
@@ -1864,8 +3618,100 @@ impl KubeTransportV0 {
         address: &RootAddressV0,
         preconditions: &PreconditionsV0,
     ) -> Result<DeletionObservationSnapshotV0, TransportErrorV0> {
+        let operation = self.begin_operation_session();
+        self.observe_deletion_revalidation_in_operation(address, preconditions, &operation)
+            .await
+    }
+
+    /// The deletion fence is one logical authority acquisition.  Its fence,
+    /// every list, and every exact child reread therefore share a single
+    /// immutable budget rather than each reopening a fresh read window.
+    #[doc(hidden)]
+    pub async fn observe_deletion_revalidation_in_operation(
+        &self,
+        address: &RootAddressV0,
+        preconditions: &PreconditionsV0,
+        operation: &OperationSessionV0,
+    ) -> Result<DeletionObservationSnapshotV0, TransportErrorV0> {
         validate_address(address)?;
-        let fence = self.reread_fence(address, preconditions).await?;
+        let gate = DeletionBarrierGateV0::new();
+        let tracked_names = Arc::new(Mutex::new(
+            BTreeMap::<ResourceKindV0, BTreeSet<String>>::new(),
+        ));
+        let filter = DeletionWatchFilterV0 {
+            gate: gate.clone(),
+            root_uid: preconditions.root_uid.clone(),
+            root_name: address.name.clone(),
+            state_name: address.state_name.clone(),
+            tracked_names: Arc::clone(&tracked_names),
+        };
+        let resources = [
+            ResourceKindV0::WebApplication,
+            ResourceKindV0::OxideLoopState,
+            ResourceKindV0::ConfigMap,
+            ResourceKindV0::Service,
+            ResourceKindV0::AutomationRun,
+        ];
+        let mut watches = Vec::new();
+        #[cfg(any(test, feature = "test-support"))]
+        let scripted_live_watches = self
+            .test_watches
+            .lock()
+            .is_ok_and(|watches| !watches.is_empty());
+        #[cfg(not(any(test, feature = "test-support")))]
+        let scripted_live_watches = true;
+        if scripted_live_watches {
+            // LIST -> exact-RV watch-open for every authority source. The
+            // pump owns the Live -> Invalidated CAS before it can publish a
+            // relevant record; later closing reads establish the snapshot.
+            let mut initial = BTreeMap::new();
+            for resource in resources {
+                let list = self
+                    .list_exact_in_operation(resource, &address.namespace, operation)
+                    .await?;
+                if matches!(
+                    resource,
+                    ResourceKindV0::ConfigMap
+                        | ResourceKindV0::Service
+                        | ResourceKindV0::AutomationRun
+                ) {
+                    let mut names = tracked_names.lock().expect("deletion filter lock");
+                    names.entry(resource).or_default().extend(
+                        list.items
+                            .iter()
+                            .filter(|object| {
+                                has_exact_canonical_owner(
+                                    object,
+                                    &ObjectRefV0 {
+                                        resource: ResourceKindV0::WebApplication,
+                                        namespace: address.namespace.clone(),
+                                        name: address.name.clone(),
+                                    },
+                                    &preconditions.root_uid,
+                                )
+                            })
+                            .map(|object| object.reference.name.clone()),
+                    );
+                }
+                initial.insert(resource, list);
+            }
+            for resource in resources {
+                let list = initial.get(&resource).expect("initial list exists");
+                watches.push(
+                    self.watch_from_in_operation_with_deletion_filter(
+                        resource,
+                        &address.namespace,
+                        &list.resource_version,
+                        operation,
+                        Some(filter.clone()),
+                    )
+                    .await?,
+                );
+            }
+        }
+        let fence = self
+            .reread_fence_in_operation(address, preconditions, operation)
+            .await?;
         let generation = fence
             .root
             .value
@@ -1886,7 +3732,27 @@ impl KubeTransportV0 {
 
         let mut inventory = Vec::new();
         for resource in [ResourceKindV0::ConfigMap, ResourceKindV0::Service] {
-            let listed = self.list_exact(resource, &address.namespace).await?;
+            let listed = self
+                .list_exact_in_operation(resource, &address.namespace, operation)
+                .await?;
+            tracked_names
+                .lock()
+                .expect("deletion filter lock")
+                .entry(resource)
+                .or_default()
+                .extend(
+                    listed
+                        .items
+                        .iter()
+                        .filter(|object| {
+                            has_exact_canonical_owner(
+                                object,
+                                &fence.root.reference,
+                                &fence.root.metadata.uid,
+                            )
+                        })
+                        .map(|object| object.reference.name.clone()),
+                );
             for object in listed.items {
                 if !has_exact_canonical_owner(
                     &object,
@@ -1895,7 +3761,10 @@ impl KubeTransportV0 {
                 ) {
                     continue;
                 }
-                match self.reread(&object.reference).await? {
+                match self
+                    .reread_in_operation(&object.reference, operation)
+                    .await?
+                {
                     None => {}
                     Some(reread)
                         if reread.metadata.uid == object.metadata.uid
@@ -1911,14 +3780,35 @@ impl KubeTransportV0 {
 
         let mut automation_runs = Vec::new();
         let listed = self
-            .list_exact(ResourceKindV0::AutomationRun, &address.namespace)
+            .list_exact_in_operation(ResourceKindV0::AutomationRun, &address.namespace, operation)
             .await?;
+        tracked_names
+            .lock()
+            .expect("deletion filter lock")
+            .entry(ResourceKindV0::AutomationRun)
+            .or_default()
+            .extend(
+                listed
+                    .items
+                    .iter()
+                    .filter(|object| {
+                        has_exact_canonical_owner(
+                            object,
+                            &fence.root.reference,
+                            &fence.root.metadata.uid,
+                        )
+                    })
+                    .map(|object| object.reference.name.clone()),
+            );
         for object in listed.items {
             if !has_exact_canonical_owner(&object, &fence.root.reference, &fence.root.metadata.uid)
             {
                 continue;
             }
-            match self.reread(&object.reference).await? {
+            match self
+                .reread_in_operation(&object.reference, operation)
+                .await?
+            {
                 None => {}
                 Some(reread)
                     if reread.metadata.uid == object.metadata.uid
@@ -1928,6 +3818,18 @@ impl KubeTransportV0 {
                 }
                 Some(_) => return Err(TransportErrorV0::Stale("deletion AutomationRun identity")),
             }
+        }
+        // Drain only records already delivered by the stream pumps, then
+        // linearize this explicitly point-in-time authority. A later record
+        // is not claimed by this snapshot and is re-fenced by the next
+        // durable deletion command.
+        for watch in &mut watches {
+            while watch.try_next_event()?.is_some() {}
+        }
+        if !gate.is_live() || !gate.seal() {
+            return Err(TransportErrorV0::Stale(
+                "deletion observation watch changed",
+            ));
         }
         Ok(DeletionObservationSnapshotV0 {
             root: fence.root,
@@ -1946,16 +3848,83 @@ impl KubeTransportV0 {
         &self,
         reference: &ObjectRefV0,
     ) -> Result<Option<ObjectV0>, TransportErrorV0> {
+        let operation = self.begin_operation_session();
+        self.reread_in_operation(reference, &operation).await
+    }
+
+    #[doc(hidden)]
+    pub async fn reread_in_operation(
+        &self,
+        reference: &ObjectRefV0,
+        operation: &OperationSessionV0,
+    ) -> Result<Option<ObjectV0>, TransportErrorV0> {
         validate_reference(reference)?;
         if reference.resource == ResourceKindV0::Event {
             return Err(TransportErrorV0::UnsupportedTarget);
         }
-        self.api(reference.resource, &reference.namespace)
-            .get_opt(&reference.name)
-            .await
-            .map_err(|error| map_read_error(error, ReadOperationV0::Get, reference.resource))?
+        within_operation(operation, FiniteIoStageV0::ReadOnly, async {
+            self.api(reference.resource, &reference.namespace)
+                .get_opt(&reference.name)
+                .await
+                .map_err(|error| map_read_error(error, ReadOperationV0::Get, reference.resource))
+        })
+        .await?
+        .map(|object| to_domain(reference.resource, &reference.namespace, object))
+        .transpose()
+    }
+
+    /// Exact write preflight reads use the current frozen prewrite attempt
+    /// cutoff.  They cannot consume the later recovery-proof window before a
+    /// first write has been authorized.
+    #[doc(hidden)]
+    pub async fn reread_prewrite_in_operation(
+        &self,
+        reference: &ObjectRefV0,
+        operation: &OperationSessionV0,
+    ) -> Result<Option<ObjectV0>, TransportErrorV0> {
+        validate_reference(reference)?;
+        if reference.resource == ResourceKindV0::Event {
+            return Err(TransportErrorV0::UnsupportedTarget);
+        }
+        let result = within_operation(operation, FiniteIoStageV0::PreWrite, async {
+            self.api(reference.resource, &reference.namespace)
+                .get_opt(&reference.name)
+                .await
+                .map_err(|error| map_read_error(error, ReadOperationV0::Get, reference.resource))
+        })
+        .await;
+        let result = match result {
+            Err(TransportErrorV0::Other(message)) => {
+                return Err(TransportErrorV0::PreWriteRetryable(message));
+            }
+            other => other,
+        }?;
+        result
             .map(|object| to_domain(reference.resource, &reference.namespace, object))
             .transpose()
+    }
+
+    /// Performs the one post-write proof read without delegating to a public
+    /// helper, so it consumes the original operation budget and cannot mint a
+    /// fresh deadline or authority session.
+    async fn recovery_reread(
+        &self,
+        reference: &ObjectRefV0,
+        operation: &OperationSessionV0,
+    ) -> Result<Option<ObjectV0>, TransportErrorV0> {
+        validate_reference(reference)?;
+        if reference.resource == ResourceKindV0::Event {
+            return Err(TransportErrorV0::UnsupportedTarget);
+        }
+        within_operation(operation, FiniteIoStageV0::RecoveryProof, async {
+            self.api(reference.resource, &reference.namespace)
+                .get_opt(&reference.name)
+                .await
+                .map_err(|error| map_read_error(error, ReadOperationV0::Get, reference.resource))
+        })
+        .await?
+        .map(|object| to_domain(reference.resource, &reference.namespace, object))
+        .transpose()
     }
 
     /// Materializes one deterministic Event, then creates it. A planned name
@@ -1972,6 +3941,35 @@ impl KubeTransportV0 {
         plan: &PlannedEventV0,
         controller_supplied_event_time: &str,
     ) -> Result<EventMaterializationRefV0, TransportErrorV0> {
+        let operation = self.begin_operation_session();
+        for _ in 0..=operation.max_prewrite_retries() {
+            match self
+                .create_event_in_operation_session(plan, controller_supplied_event_time, &operation)
+                .await
+            {
+                Err(
+                    TransportErrorV0::FiniteIoDeadline(FiniteIoStageV0::PreWrite)
+                    | TransportErrorV0::PreWriteRetryable(_),
+                ) => {
+                    operation.retry_prewrite_epoch()?;
+                }
+                result => return result,
+            }
+        }
+        Err(TransportErrorV0::FiniteIoDeadline(
+            FiniteIoStageV0::PreWrite,
+        ))
+    }
+
+    /// Event materialization is deliberately one read plus one POST under one
+    /// session. A post-response timeout is terminal: Events have no durable
+    /// UID witness, so this path must never reread, adopt, or replay.
+    async fn create_event_in_operation_session(
+        &self,
+        plan: &PlannedEventV0,
+        controller_supplied_event_time: &str,
+        operation: &OperationSessionV0,
+    ) -> Result<EventMaterializationRefV0, TransportErrorV0> {
         let value = materialize_event(plan, controller_supplied_event_time)
             .map_err(|error| TransportErrorV0::Other(error.to_string()))?;
         let reference = ObjectRefV0 {
@@ -1980,7 +3978,11 @@ impl KubeTransportV0 {
             name: plan.metadata.name.clone(),
         };
         validate_reference(&reference)?;
-        if self.reread_event(&reference).await?.is_some() {
+        if self
+            .reread_event_in_operation(&reference, operation)
+            .await?
+            .is_some()
+        {
             return Err(TransportErrorV0::ForeignCollision);
         }
         let desired = ObjectV0 {
@@ -1993,11 +3995,15 @@ impl KubeTransportV0 {
             },
             value,
         };
-        self.create_event(&desired)
+        self.create_event_in_operation(&desired, operation)
             .await
             .map(|written| event_ref(&written))
             .map_err(|error| {
                 if may_recover_response_loss(&error)
+                    || matches!(
+                        error,
+                        TransportErrorV0::FiniteIoDeadline(FiniteIoStageV0::WriteResponse)
+                    )
                     || matches!(
                         error,
                         TransportErrorV0::Conflict(ConflictProvenanceV0::Write {
@@ -2108,6 +4114,7 @@ impl KubeTransportV0 {
         token: &str,
         preconditions: &PreconditionsV0,
         command: RootOnlyCleanupCommandV0,
+        session: &OperationSessionV0,
     ) -> Result<(ObjectV0, DeletionCleanupReceipt), TransportErrorV0> {
         if preconditions.state_resource_version.is_empty() {
             // This branch is valid only for the deletion sentinel. All values
@@ -2117,7 +4124,7 @@ impl KubeTransportV0 {
         }
         let (root_ref, _) = address.references();
         let root = self
-            .reread(&root_ref)
+            .reread_prewrite_in_operation(&root_ref, session)
             .await?
             .ok_or(TransportErrorV0::ManualRecoveryHold)?;
         let root_metadata = root.value.get("metadata").and_then(Value::as_object);
@@ -2203,7 +4210,11 @@ impl KubeTransportV0 {
             namespace: address.namespace.clone(),
             name: receipt.state_name.clone(),
         };
-        if self.reread(&state_ref).await?.is_some() {
+        if self
+            .reread_prewrite_in_operation(&state_ref, session)
+            .await?
+            .is_some()
+        {
             return Err(TransportErrorV0::ManualRecoveryHold);
         }
         Ok((root, receipt))
@@ -2214,6 +4225,7 @@ impl KubeTransportV0 {
         address: &RootAddressV0,
         token: &str,
         preconditions: &PreconditionsV0,
+        session: &OperationSessionV0,
     ) -> Result<CommandOutcomeV0, TransportErrorV0> {
         let (root, receipt) = self
             .root_only_cleanup_fence(
@@ -2221,6 +4233,7 @@ impl KubeTransportV0 {
                 token,
                 preconditions,
                 RootOnlyCleanupCommandV0::VerifyOwnedChildrenAbsent,
+                session,
             )
             .await?;
         for resource in [
@@ -2229,7 +4242,7 @@ impl KubeTransportV0 {
             ResourceKindV0::AutomationRun,
         ] {
             if self
-                .list_exact(resource, &address.namespace)
+                .list_exact_prewrite_in_operation(resource, &address.namespace, session)
                 .await?
                 .items
                 .into_iter()
@@ -2264,6 +4277,7 @@ impl KubeTransportV0 {
         address: &RootAddressV0,
         token: &str,
         preconditions: &PreconditionsV0,
+        session: &OperationSessionV0,
     ) -> Result<CommandOutcomeV0, TransportErrorV0> {
         let (root, receipt) = self
             .root_only_cleanup_fence(
@@ -2271,6 +4285,7 @@ impl KubeTransportV0 {
                 token,
                 preconditions,
                 RootOnlyCleanupCommandV0::RemoveRootFinalizer,
+                session,
             )
             .await?;
         for resource in [
@@ -2279,7 +4294,7 @@ impl KubeTransportV0 {
             ResourceKindV0::AutomationRun,
         ] {
             if self
-                .list_exact(resource, &address.namespace)
+                .list_exact_prewrite_in_operation(resource, &address.namespace, session)
                 .await?
                 .items
                 .into_iter()
@@ -2289,7 +4304,7 @@ impl KubeTransportV0 {
             }
         }
         let written = self
-            .remove_finalizer(&root, ROOT_FINALIZER)
+            .remove_finalizer_in_operation(&root, ROOT_FINALIZER, session)
             .await
             .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
         Ok(CommandOutcomeV0::Event(Box::new(
@@ -2313,6 +4328,7 @@ impl KubeTransportV0 {
         expected_spec: &AutomationRunSpec,
         desired_status: &AutomationRunStatus,
     ) -> Result<AutomationCompletionAckV0, TransportErrorV0> {
+        let operation = self.begin_operation_session();
         expected_spec
             .validate()
             .map_err(|_| TransportErrorV0::ForeignCollision)?;
@@ -2324,8 +4340,43 @@ impl KubeTransportV0 {
             namespace: namespace.into(),
             name: name.into(),
         };
+        for _ in 0..=operation.max_prewrite_retries() {
+            match self
+                .persist_automation_run_completion_in_operation(
+                    &reference,
+                    expected_uid,
+                    expected_old_resource_version,
+                    expected_spec,
+                    desired_status,
+                    &operation,
+                )
+                .await
+            {
+                Err(
+                    TransportErrorV0::FiniteIoDeadline(FiniteIoStageV0::PreWrite)
+                    | TransportErrorV0::PreWriteRetryable(_),
+                ) => {
+                    operation.retry_prewrite_epoch()?;
+                }
+                result => return result,
+            }
+        }
+        Err(TransportErrorV0::FiniteIoDeadline(
+            FiniteIoStageV0::PreWrite,
+        ))
+    }
+
+    async fn persist_automation_run_completion_in_operation(
+        &self,
+        reference: &ObjectRefV0,
+        expected_uid: &str,
+        expected_old_resource_version: &str,
+        expected_spec: &AutomationRunSpec,
+        desired_status: &AutomationRunStatus,
+        operation: &OperationSessionV0,
+    ) -> Result<AutomationCompletionAckV0, TransportErrorV0> {
         let observed = self
-            .reread(&reference)
+            .reread_prewrite_in_operation(reference, operation)
             .await?
             .ok_or(TransportErrorV0::ResponseLost)?;
         let observed_spec: AutomationRunSpec = serde_json::from_value(
@@ -2352,9 +4403,9 @@ impl KubeTransportV0 {
             );
         }
         let desired = ObjectV0 {
-            reference,
+            reference: reference.clone(),
             metadata: observed.metadata.clone(),
-            value: serde_json::json!({"apiVersion":"runtime.oxideloop.dev/v1alpha1","kind":"AutomationRun","metadata":{"name":name,"namespace":namespace},"status":desired_status}),
+            value: serde_json::json!({"apiVersion":"runtime.oxideloop.dev/v1alpha1","kind":"AutomationRun","metadata":{"name":reference.name,"namespace":reference.namespace},"status":desired_status}),
         };
         match self
             .apply_status(
@@ -2362,6 +4413,7 @@ impl KubeTransportV0 {
                 ResourceKindV0::AutomationRun,
                 expected_old_resource_version,
                 false,
+                operation,
             )
             .await
         {
@@ -2372,18 +4424,39 @@ impl KubeTransportV0 {
                 expected_spec,
                 desired_status,
             ),
-            Err(error) if may_recover_response_loss(&error) => {
+            Err(TransportErrorV0::FiniteIoDeadline(FiniteIoStageV0::WriteResponse)) => {
                 let recovered = self
-                    .reread(&desired.reference)
-                    .await?
-                    .ok_or(TransportErrorV0::ResponseLost)?;
-                completion_recovery(
+                    .recovery_reread(&desired.reference, operation)
+                    .await
+                    .map_err(|_| TransportErrorV0::ManualRecoveryHold)?
+                    .ok_or(TransportErrorV0::ManualRecoveryHold)?;
+                let ack = completion_recovery(
                     &recovered,
                     expected_uid,
                     expected_old_resource_version,
                     expected_spec,
                     desired_status,
                 )
+                .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+                operation.prove_exact_response_loss_recovery()?;
+                Ok(ack)
+            }
+            Err(error) if may_recover_response_loss(&error) => {
+                let recovered = self
+                    .recovery_reread(&desired.reference, operation)
+                    .await
+                    .map_err(|_| TransportErrorV0::ManualRecoveryHold)?
+                    .ok_or(TransportErrorV0::ManualRecoveryHold)?;
+                let ack = completion_recovery(
+                    &recovered,
+                    expected_uid,
+                    expected_old_resource_version,
+                    expected_spec,
+                    desired_status,
+                )
+                .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+                operation.prove_exact_response_loss_recovery()?;
+                Ok(ack)
             }
             Err(error) => Err(error),
         }
@@ -2400,6 +4473,37 @@ impl KubeTransportV0 {
         namespace: &str,
         resource_version: &str,
     ) -> Result<WatchHandleV0, TransportErrorV0> {
+        let operation = self.begin_operation_session();
+        self.watch_from_in_operation(resource, namespace, resource_version, &operation)
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn watch_from_in_operation(
+        &self,
+        resource: ResourceKindV0,
+        namespace: &str,
+        resource_version: &str,
+        operation: &OperationSessionV0,
+    ) -> Result<WatchHandleV0, TransportErrorV0> {
+        self.watch_from_in_operation_with_deletion_filter(
+            resource,
+            namespace,
+            resource_version,
+            operation,
+            None,
+        )
+        .await
+    }
+
+    async fn watch_from_in_operation_with_deletion_filter(
+        &self,
+        resource: ResourceKindV0,
+        namespace: &str,
+        resource_version: &str,
+        operation: &OperationSessionV0,
+        deletion_filter: Option<DeletionWatchFilterV0>,
+    ) -> Result<WatchHandleV0, TransportErrorV0> {
         validate_namespace(namespace)?;
         if resource == ResourceKindV0::Event {
             return Err(TransportErrorV0::UnsupportedTarget);
@@ -2409,15 +4513,20 @@ impl KubeTransportV0 {
         }
         #[cfg(any(test, feature = "test-support"))]
         if let Ok(mut watches) = self.test_watches.lock()
-            && let Some(watch) = watches.pop_front()
+            && let Some(mut watch) = watches.pop_front()
         {
+            if let Some(filter) = deletion_filter {
+                watch.install_deletion_filter(resource, filter);
+            }
             return Ok(watch);
         }
-        let stream = self
-            .api(resource, namespace)
-            .watch(&kube::api::WatchParams::default(), resource_version)
-            .await
-            .map_err(|error| map_watch_open_error(error, resource))?;
+        let stream = within_operation(operation, FiniteIoStageV0::WatchOpen, async {
+            self.api(resource, namespace)
+                .watch(&kube::api::WatchParams::default(), resource_version)
+                .await
+                .map_err(|error| map_watch_open_error(error, resource))
+        })
+        .await?;
         let namespace = namespace.to_owned();
         let events = stream.map(move |event| match event {
             Ok(kube::api::WatchEvent::Added(object)) => {
@@ -2456,9 +4565,21 @@ impl KubeTransportV0 {
         let (sender, receiver) = tokio::sync::mpsc::channel(64);
         let overflowed = Arc::new(AtomicBool::new(false));
         let overflow_signal = Arc::clone(&overflowed);
-        tokio::spawn(async move {
+        let pump = tokio::spawn(async move {
             futures_util::pin_mut!(events);
             while let Some(event) = events.next().await {
+                if deletion_filter
+                    .as_ref()
+                    .is_some_and(|filter| filter.relevant(resource, &event))
+                {
+                    // The invalidation CAS precedes publication. A consumer
+                    // may seal only while this gate remains Live.
+                    let _ = deletion_filter
+                        .as_ref()
+                        .expect("checked deletion filter")
+                        .gate
+                        .invalidate();
+                }
                 if sender.try_send(event).is_err() {
                     overflow_signal.store(true, Ordering::Release);
                     break;
@@ -2469,6 +4590,8 @@ impl KubeTransportV0 {
             events: receiver,
             overflowed,
             terminal: None,
+            pump_abort: Some(pump.abort_handle()),
+            deletion_filter: None,
         })
     }
 
@@ -2482,15 +4605,21 @@ impl KubeTransportV0 {
         expectation: AutomationRunExpectationV0,
     ) -> Result<AutomationRunObservationBarrierV0, TransportErrorV0> {
         validate_automation_expectation(&expectation)?;
+        let operation = self.begin_operation_session();
         let list = self
-            .list_exact(ResourceKindV0::AutomationRun, &expectation.root.namespace)
+            .list_exact_in_operation(
+                ResourceKindV0::AutomationRun,
+                &expectation.root.namespace,
+                &operation,
+            )
             .await?;
         let _ = validate_automation_run_list(&list, &expectation)?;
         let watch = self
-            .watch_from(
+            .watch_from_in_operation(
                 ResourceKindV0::AutomationRun,
                 &expectation.root.namespace,
                 &list.resource_version,
+                &operation,
             )
             .await?;
         let reference = ObjectRefV0 {
@@ -2498,7 +4627,10 @@ impl KubeTransportV0 {
             namespace: expectation.root.namespace.clone(),
             name: expectation.run_name.clone(),
         };
-        let current = validate_automation_run_get(self.reread(&reference).await?, &expectation)?;
+        let current = validate_automation_run_get(
+            self.reread_in_operation(&reference, &operation).await?,
+            &expectation,
+        )?;
         let mut barrier = AutomationRunObservationBarrierV0 {
             expectation,
             watch,
@@ -2512,131 +4644,223 @@ impl KubeTransportV0 {
     }
 
     /// Creates only `OxideLoopState` objects.
+    #[cfg(test)]
+    #[allow(dead_code)]
     async fn create_state(&self, object: &ObjectV0) -> Result<ObjectV0, TransportErrorV0> {
-        self.create(object, ResourceKindV0::OxideLoopState).await
+        let operation = self.begin_operation_session();
+        self.create_state_in_operation(object, &operation).await
+    }
+    async fn create_state_in_operation(
+        &self,
+        object: &ObjectV0,
+        operation: &OperationSessionV0,
+    ) -> Result<ObjectV0, TransportErrorV0> {
+        self.create(object, ResourceKindV0::OxideLoopState, operation)
+            .await
     }
     /// Creates only `AutomationRun` objects.
+    #[cfg(test)]
+    #[allow(dead_code)]
     async fn create_automation_run(&self, object: &ObjectV0) -> Result<ObjectV0, TransportErrorV0> {
-        self.create(object, ResourceKindV0::AutomationRun).await
+        let operation = self.begin_operation_session();
+        self.create_automation_run_in_operation(object, &operation)
+            .await
+    }
+    async fn create_automation_run_in_operation(
+        &self,
+        object: &ObjectV0,
+        operation: &OperationSessionV0,
+    ) -> Result<ObjectV0, TransportErrorV0> {
+        self.create(object, ResourceKindV0::AutomationRun, operation)
+            .await
     }
     /// Creates only core `ConfigMap` objects.
+    #[cfg(test)]
+    #[allow(dead_code)]
     async fn create_config_map(&self, object: &ObjectV0) -> Result<ObjectV0, TransportErrorV0> {
-        self.create(object, ResourceKindV0::ConfigMap).await
+        let operation = self.begin_operation_session();
+        self.create_config_map_in_operation(object, &operation)
+            .await
+    }
+    async fn create_config_map_in_operation(
+        &self,
+        object: &ObjectV0,
+        operation: &OperationSessionV0,
+    ) -> Result<ObjectV0, TransportErrorV0> {
+        self.create(object, ResourceKindV0::ConfigMap, operation)
+            .await
     }
     /// Creates only core `Service` objects.
+    #[cfg(test)]
+    #[allow(dead_code)]
     async fn create_service(&self, object: &ObjectV0) -> Result<ObjectV0, TransportErrorV0> {
-        self.create(object, ResourceKindV0::Service).await
+        let operation = self.begin_operation_session();
+        self.create_service_in_operation(object, &operation).await
+    }
+    async fn create_service_in_operation(
+        &self,
+        object: &ObjectV0,
+        operation: &OperationSessionV0,
+    ) -> Result<ObjectV0, TransportErrorV0> {
+        self.create(object, ResourceKindV0::Service, operation)
+            .await
     }
     /// Creates only an already-planned Event; this remains private so callers
     /// cannot submit an arbitrary Event body.
-    async fn create_event(&self, object: &ObjectV0) -> Result<ObjectV0, TransportErrorV0> {
-        self.create(object, ResourceKindV0::Event).await
+    async fn create_event_in_operation(
+        &self,
+        object: &ObjectV0,
+        operation: &OperationSessionV0,
+    ) -> Result<ObjectV0, TransportErrorV0> {
+        self.create(object, ResourceKindV0::Event, operation).await
     }
     /// Reads Events only for the typed create/recovery proof; callers cannot
     /// obtain an arbitrary Event body through the generic read surface.
-    async fn reread_event(
+    async fn reread_event_in_operation(
         &self,
         reference: &ObjectRefV0,
+        operation: &OperationSessionV0,
     ) -> Result<Option<ObjectV0>, TransportErrorV0> {
         require_reference_resource(reference, ResourceKindV0::Event)?;
-        self.api(ResourceKindV0::Event, &reference.namespace)
-            .get_opt(&reference.name)
-            .await
-            .map_err(|error| map_read_error(error, ReadOperationV0::Get, ResourceKindV0::Event))?
+        let result = within_operation(operation, FiniteIoStageV0::PreWrite, async {
+            self.api(ResourceKindV0::Event, &reference.namespace)
+                .get_opt(&reference.name)
+                .await
+                .map_err(|error| map_read_error(error, ReadOperationV0::Get, ResourceKindV0::Event))
+        })
+        .await;
+        let result = match result {
+            Err(TransportErrorV0::Other(message)) => {
+                return Err(TransportErrorV0::PreWriteRetryable(message));
+            }
+            other => other,
+        }?;
+        result
             .map(|object| to_domain(ResourceKindV0::Event, &reference.namespace, object))
             .transpose()
     }
     /// Server-side applies only a `ConfigMap` with the exact expected RV.
+    #[cfg(test)]
+    #[allow(dead_code)]
     async fn patch_config_map(
         &self,
         object: &ObjectV0,
         expected_rv: &str,
         force_authorized: bool,
     ) -> Result<ObjectV0, TransportErrorV0> {
+        let operation = self.begin_operation_session();
         self.apply(
             object,
             ResourceKindV0::ConfigMap,
             expected_rv,
             force_authorized,
+            &operation,
         )
         .await
     }
     /// Server-side applies only a `Service` with the exact expected RV.
+    #[cfg(test)]
+    #[allow(dead_code)]
     async fn patch_service(
         &self,
         object: &ObjectV0,
         expected_rv: &str,
         force_authorized: bool,
     ) -> Result<ObjectV0, TransportErrorV0> {
+        let operation = self.begin_operation_session();
         self.apply(
             object,
             ResourceKindV0::Service,
             expected_rv,
             force_authorized,
+            &operation,
         )
         .await
     }
     /// Patches only an `OxideLoopState` with the exact expected RV.
+    #[cfg(test)]
+    #[allow(dead_code)]
     async fn patch_state(
         &self,
         object: &ObjectV0,
         expected_rv: &str,
         force_authorized: bool,
     ) -> Result<ObjectV0, TransportErrorV0> {
+        let operation = self.begin_operation_session();
         self.apply(
             object,
             ResourceKindV0::OxideLoopState,
             expected_rv,
             force_authorized,
+            &operation,
         )
         .await
     }
 
     /// Server-side applies only an `AutomationRun` with the exact expected RV.
     /// Server-side applies only the root status with the exact old RV.
+    #[cfg(test)]
+    #[allow(dead_code)]
     async fn patch_web_application_status(
         &self,
         object: &ObjectV0,
         expected_rv: &str,
         force_authorized: bool,
     ) -> Result<ObjectV0, TransportErrorV0> {
+        let operation = self.begin_operation_session();
         self.apply_status(
             object,
             ResourceKindV0::WebApplication,
             expected_rv,
             force_authorized,
+            &operation,
         )
         .await
     }
 
     /// Deletes only an `AutomationRun` with UID and RV preconditions.
+    #[cfg(test)]
+    #[allow(dead_code)]
     async fn delete_automation_run(
         &self,
         reference: &ObjectRefV0,
         uid: &str,
         rv: &str,
     ) -> Result<(), TransportErrorV0> {
-        self.delete(reference, ResourceKindV0::AutomationRun, uid, rv)
-            .await
+        let operation = self.begin_operation_session();
+        self.delete(
+            reference,
+            ResourceKindV0::AutomationRun,
+            uid,
+            rv,
+            &operation,
+        )
+        .await
     }
     /// Deletes only a core `ConfigMap` with UID and RV preconditions.
+    #[cfg(test)]
+    #[allow(dead_code)]
     async fn delete_config_map(
         &self,
         reference: &ObjectRefV0,
         uid: &str,
         rv: &str,
     ) -> Result<(), TransportErrorV0> {
-        self.delete(reference, ResourceKindV0::ConfigMap, uid, rv)
+        let operation = self.begin_operation_session();
+        self.delete(reference, ResourceKindV0::ConfigMap, uid, rv, &operation)
             .await
     }
     /// Deletes only a core `Service` with UID and RV preconditions.
+    #[cfg(test)]
+    #[allow(dead_code)]
     async fn delete_service(
         &self,
         reference: &ObjectRefV0,
         uid: &str,
         rv: &str,
     ) -> Result<(), TransportErrorV0> {
-        self.delete(reference, ResourceKindV0::Service, uid, rv)
+        let operation = self.begin_operation_session();
+        self.delete(reference, ResourceKindV0::Service, uid, rv, &operation)
             .await
     }
 
@@ -2644,17 +4868,23 @@ impl KubeTransportV0 {
         &self,
         object: &ObjectV0,
         expected: ResourceKindV0,
+        operation: &OperationSessionV0,
     ) -> Result<ObjectV0, TransportErrorV0> {
         require_resource(object, expected)?;
         validate_desired_object(&object.value, &object.reference)?;
         let dynamic: DynamicObject = serde_json::from_value(object.value.clone())
             .map_err(|error| TransportErrorV0::Other(error.to_string()))?;
-        let written = self
-            .api(expected, &object.reference.namespace)
-            .create(&kube::api::PostParams::default(), &dynamic)
-            .await
-            .map_err(|error| map_write_error(error, WriteOperationV0::Create, expected))?;
-        to_domain(expected, &object.reference.namespace, written)
+        let permit = claim_first_write(operation)?;
+        let written = within_operation(operation, FiniteIoStageV0::WriteResponse, async {
+            self.api(expected, &object.reference.namespace)
+                .create(&kube::api::PostParams::default(), &dynamic)
+                .await
+                .map_err(|error| map_write_error(error, WriteOperationV0::Create, expected))
+        })
+        .await?;
+        let written = to_domain(expected, &object.reference.namespace, written)?;
+        permit.prove()?;
+        Ok(written)
     }
 
     async fn apply(
@@ -2663,6 +4893,7 @@ impl KubeTransportV0 {
         expected: ResourceKindV0,
         expected_rv: &str,
         force: bool,
+        operation: &OperationSessionV0,
     ) -> Result<ObjectV0, TransportErrorV0> {
         require_resource(object, expected)?;
         validate_desired_object(&object.value, &object.reference)?;
@@ -2676,12 +4907,17 @@ impl KubeTransportV0 {
         };
         let mut body = object.value.clone();
         inject_resource_version(&mut body, expected_rv)?;
-        let written = self
-            .api(expected, &object.reference.namespace)
-            .patch(&object.reference.name, &params, &Patch::Apply(&body))
-            .await
-            .map_err(|error| map_write_error(error, WriteOperationV0::Apply, expected))?;
-        to_domain(expected, &object.reference.namespace, written)
+        let permit = claim_first_write(operation)?;
+        let written = within_operation(operation, FiniteIoStageV0::WriteResponse, async {
+            self.api(expected, &object.reference.namespace)
+                .patch(&object.reference.name, &params, &Patch::Apply(&body))
+                .await
+                .map_err(|error| map_write_error(error, WriteOperationV0::Apply, expected))
+        })
+        .await?;
+        let written = to_domain(expected, &object.reference.namespace, written)?;
+        permit.prove()?;
+        Ok(written)
     }
 
     async fn apply_status(
@@ -2690,6 +4926,7 @@ impl KubeTransportV0 {
         expected: ResourceKindV0,
         expected_rv: &str,
         force_authorized: bool,
+        operation: &OperationSessionV0,
     ) -> Result<ObjectV0, TransportErrorV0> {
         require_resource(object, expected)?;
         validate_desired_object(&object.value, &object.reference)?;
@@ -2698,20 +4935,25 @@ impl KubeTransportV0 {
         }
         let mut body = object.value.clone();
         inject_resource_version(&mut body, expected_rv)?;
-        let written = self
-            .api(expected, &object.reference.namespace)
-            .patch_status(
-                &object.reference.name,
-                &if force_authorized {
-                    PatchParams::apply("oxideloop-controller").force()
-                } else {
-                    PatchParams::apply("oxideloop-controller")
-                },
-                &Patch::Apply(&body),
-            )
-            .await
-            .map_err(|error| map_write_error(error, WriteOperationV0::ApplyStatus, expected))?;
-        to_domain(expected, &object.reference.namespace, written)
+        let permit = claim_first_write(operation)?;
+        let written = within_operation(operation, FiniteIoStageV0::WriteResponse, async {
+            self.api(expected, &object.reference.namespace)
+                .patch_status(
+                    &object.reference.name,
+                    &if force_authorized {
+                        PatchParams::apply("oxideloop-controller").force()
+                    } else {
+                        PatchParams::apply("oxideloop-controller")
+                    },
+                    &Patch::Apply(&body),
+                )
+                .await
+                .map_err(|error| map_write_error(error, WriteOperationV0::ApplyStatus, expected))
+        })
+        .await?;
+        let written = to_domain(expected, &object.reference.namespace, written)?;
+        permit.prove()?;
+        Ok(written)
     }
 
     async fn delete(
@@ -2720,6 +4962,7 @@ impl KubeTransportV0 {
         expected: ResourceKindV0,
         uid: &str,
         rv: &str,
+        operation: &OperationSessionV0,
     ) -> Result<(), TransportErrorV0> {
         require_reference_resource(reference, expected)?;
         let params = DeleteParams {
@@ -2729,10 +4972,15 @@ impl KubeTransportV0 {
             }),
             ..DeleteParams::default()
         };
-        self.api(expected, &reference.namespace)
-            .delete(&reference.name, &params)
-            .await
-            .map_err(|error| map_write_error(error, WriteOperationV0::Delete, expected))?;
+        let permit = claim_first_write(operation)?;
+        within_operation(operation, FiniteIoStageV0::WriteResponse, async {
+            self.api(expected, &reference.namespace)
+                .delete(&reference.name, &params)
+                .await
+                .map_err(|error| map_write_error(error, WriteOperationV0::Delete, expected))
+        })
+        .await?;
+        permit.prove()?;
         Ok(())
     }
 }
@@ -3694,6 +5942,137 @@ fn has_bootstrap_root_metadata(root: &ObjectV0, token: &str) -> bool {
             .get(COMMAND_ID_ANNOTATION)
             .is_some_and(|v| v == token)
 }
+
+/// A bootstrap write is recoverable only when its response may have been
+/// applied.  The caller must immediately perform the phase-specific exact
+/// proof; this predicate never authorizes a retry.
+fn bootstrap_write_response_lost(error: &TransportErrorV0) -> bool {
+    matches!(
+        error,
+        TransportErrorV0::FiniteIoDeadline(FiniteIoStageV0::WriteResponse)
+    ) || may_recover_response_loss(error)
+}
+
+/// Kubernetes may advance `resourceVersion` and rewrite `managedFields` for
+/// any bootstrap patch response. Those are the only server-owned differences
+/// excluded from bootstrap response proofs; every other raw field must match
+/// the phase-specific transform exactly.
+fn bootstrap_response_projection(value: &Value) -> Value {
+    let mut value = value.clone();
+    if let Some(metadata) = value
+        .pointer_mut("/metadata")
+        .and_then(Value::as_object_mut)
+    {
+        metadata.remove("resourceVersion");
+        metadata.remove("managedFields");
+    }
+    value
+}
+
+fn bootstrap_controller_patch_params() -> PatchParams {
+    PatchParams {
+        field_manager: Some(CONTROLLER_FIELD_MANAGER.into()),
+        ..PatchParams::default()
+    }
+}
+
+fn bootstrap_state_finalizer_proof(observed: &ObjectV0, before: &ObjectV0) -> bool {
+    if observed.reference != before.reference || observed.metadata.uid != before.metadata.uid {
+        return false;
+    }
+    let mut expected = bootstrap_response_projection(&before.value);
+    let Some(metadata) = expected
+        .pointer_mut("/metadata")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    let finalizers = metadata
+        .entry("finalizers")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(finalizers) = finalizers.as_array_mut() else {
+        return false;
+    };
+    if !finalizers
+        .iter()
+        .any(|finalizer| finalizer.as_str() == Some(STATE_FINALIZER))
+    {
+        finalizers.push(Value::String(STATE_FINALIZER.into()));
+    }
+    has_finalizer(observed, STATE_FINALIZER)
+        && bootstrap_response_projection(&observed.value) == expected
+}
+
+fn bootstrap_root_metadata_proof(observed: &ObjectV0, before: &ObjectV0, token: &str) -> bool {
+    if observed.reference != before.reference || observed.metadata.uid != before.metadata.uid {
+        return false;
+    }
+    let Some(expected) = bootstrap_root_metadata_expected_value(before, token) else {
+        return false;
+    };
+
+    bootstrap_response_projection(&observed.value) == bootstrap_response_projection(&expected)
+}
+
+/// Builds the complete raw object shape intended by the bootstrap metadata
+/// JSON patch. Keeping this shared with the request construction prevents a
+/// response-loss proof from recognizing a broader transform than the write
+/// that actually became ambiguous.
+fn bootstrap_root_metadata_expected_value(before: &ObjectV0, token: &str) -> Option<Value> {
+    let mut expected = before.value.clone();
+    let metadata = expected
+        .pointer_mut("/metadata")
+        .and_then(Value::as_object_mut)?;
+
+    let mut annotations = before.metadata.annotations.clone();
+    annotations.insert(ROOT_UID_ANNOTATION.into(), before.metadata.uid.clone());
+    annotations.insert(TRANSACTION_ID_ANNOTATION.into(), token.into());
+    annotations.insert(COMMAND_ID_ANNOTATION.into(), token.into());
+    let annotations = serde_json::to_value(annotations).ok()?;
+    metadata.insert("annotations".into(), annotations);
+
+    let mut finalizers = before
+        .value
+        .pointer("/metadata/finalizers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !finalizers
+        .iter()
+        .any(|finalizer| finalizer.as_str() == Some(ROOT_FINALIZER))
+    {
+        finalizers.push(Value::String(ROOT_FINALIZER.into()));
+    }
+    metadata.insert("finalizers".into(), Value::Array(finalizers));
+
+    Some(expected)
+}
+
+fn bootstrap_root_link_proof(observed: &ObjectV0, before: &ObjectV0, state: &ObjectV0) -> bool {
+    if observed.reference != before.reference || observed.metadata.uid != before.metadata.uid {
+        return false;
+    }
+    let mut expected = bootstrap_response_projection(&before.value);
+    let Some(root) = expected.as_object_mut() else {
+        return false;
+    };
+    let status = root
+        .entry("status")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let Some(status) = status.as_object_mut() else {
+        return false;
+    };
+    status.insert(
+        "state".into(),
+        serde_json::to_value(StateLink {
+            root_uid: before.metadata.uid.clone(),
+            name: state.reference.name.clone(),
+            uid: state.metadata.uid.clone(),
+        })
+        .expect("StateLink serialization is infallible"),
+    );
+    has_state_link(observed, state) && bootstrap_response_projection(&observed.value) == expected
+}
 fn reference_from_identity(identity: &ObjectIdentity) -> Result<ObjectRefV0, TransportErrorV0> {
     let resource = match (identity.api_version.as_str(), identity.kind.as_str()) {
         ("v1", "ConfigMap") => ResourceKindV0::ConfigMap,
@@ -4287,6 +6666,984 @@ mod tests {
 
     struct FakePort(Vec<ObjectV0>);
 
+    fn test_session(
+        attempt_cutoff: Duration,
+        prewrite: Duration,
+        response: Duration,
+        outer: Duration,
+        retries: u8,
+    ) -> OperationSessionV0 {
+        OperationSessionV0 {
+            budget: OperationBudgetV0::test_shortened(
+                attempt_cutoff,
+                prewrite,
+                response,
+                outer,
+                retries,
+            )
+            .expect("ordered test session"),
+            gate: PrewriteGateV0::new(),
+            bootstrap: Arc::new(Mutex::new(BootstrapAuthorityV0::new())),
+            collector_bound: false,
+            bootstrap_phase_wait_hook: None,
+        }
+    }
+
+    fn bootstrap_authority_root(resource_version: &str) -> ObjectV0 {
+        let annotations = BTreeMap::from([
+            (ROOT_UID_ANNOTATION.into(), "root-uid".into()),
+            (TRANSACTION_ID_ANNOTATION.into(), "bootstrap-token".into()),
+            (COMMAND_ID_ANNOTATION.into(), "bootstrap-token".into()),
+        ]);
+        ObjectV0 {
+            reference: ObjectRefV0 {
+                resource: ResourceKindV0::WebApplication,
+                namespace: "ns".into(),
+                name: "app".into(),
+            },
+            metadata: ObjectMetaV0 {
+                uid: "root-uid".into(),
+                resource_version: resource_version.into(),
+                annotations: annotations.clone(),
+                owner_uids: vec![],
+            },
+            value: json!({
+                "apiVersion":"demo.oxideloop.dev/v1alpha1",
+                "kind":"WebApplication",
+                "metadata":{
+                    "name":"app", "namespace":"ns", "uid":"root-uid",
+                    "resourceVersion":resource_version, "generation":1,
+                    "annotations":annotations, "finalizers":[ROOT_FINALIZER],
+                },
+                "spec":{
+                    "message":"bootstrap authority", "expose":false,
+                    "program":{"configMapName":"bundle", "key":"program.mjs", "digest":"0000000000000000000000000000000000000000000000000000000000000000"}
+                },
+                "status":{},
+            }),
+        }
+    }
+
+    fn bootstrap_authority_snapshot(root: &ObjectV0) -> RootSnapshotV0 {
+        RootSnapshotV0 {
+            uid: root.metadata.uid.clone(),
+            namespace: root.reference.namespace.clone(),
+            name: root.reference.name.clone(),
+            generation: generation(root).expect("fixture generation"),
+            spec: serde_json::from_value(root.value["spec"].clone()).expect("fixture root spec"),
+            bundle_digest: "0".repeat(64),
+            status: WebApplicationStatus::default(),
+            state_name: "state".into(),
+            state_uid: "state-uid".into(),
+            state_resource_version: "state-rv".into(),
+            root_resource_version: root.metadata.resource_version.clone(),
+            root_finalizer_present: true,
+            state_finalizer_present: true,
+            deleting: false,
+        }
+    }
+
+    #[test]
+    fn operation_budget_is_strict_and_test_shortening_cannot_relax_it() {
+        let production = OperationBudgetV0::production();
+        assert!(production.is_strictly_ordered());
+        assert_eq!(production.max_prewrite_retries(), MAX_PREWRITE_RETRIES);
+
+        assert!(
+            OperationBudgetV0::test_shortened(
+                Duration::from_millis(4),
+                Duration::from_millis(3),
+                Duration::from_millis(5),
+                Duration::from_millis(6),
+                1,
+            )
+            .is_err()
+        );
+        let shortened = OperationBudgetV0::test_shortened(
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            Duration::from_millis(3),
+            Duration::from_millis(4),
+            1,
+        )
+        .expect("test-only policy is still strictly ordered");
+        assert!(shortened.is_strictly_ordered());
+    }
+
+    #[test]
+    fn prewrite_gate_has_one_irreversible_winner() {
+        let gate = PrewriteGateV0::new();
+        assert_eq!(gate.state(), PrewriteGateStateV0::PreWrite);
+        assert!(gate.invalidate_authenticated_change());
+        assert_eq!(gate.state(), PrewriteGateStateV0::Invalidated);
+        assert_eq!(
+            gate.try_mark_write_polled(),
+            Err(PrewriteGateStateV0::Invalidated)
+        );
+
+        let gate = PrewriteGateV0::new();
+        assert_eq!(gate.try_mark_write_polled(), Ok(()));
+        assert_eq!(gate.state(), PrewriteGateStateV0::WritePolled);
+        assert!(!gate.invalidate_authenticated_change());
+    }
+
+    #[test]
+    fn exact_response_loss_proof_closes_only_the_ambiguous_write_epoch() {
+        let session = test_session(
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            Duration::from_millis(30),
+            Duration::from_millis(40),
+            1,
+        );
+        assert!(matches!(
+            session.prove_exact_response_loss_recovery(),
+            Err(TransportErrorV0::ManualRecoveryHold)
+        ));
+        let permit = claim_first_write(&session).expect("one write lease");
+        drop(permit);
+        assert_eq!(session.gate.state(), PrewriteGateStateV0::AmbiguousHeld);
+        session
+            .prove_exact_response_loss_recovery()
+            .expect("exact proof closes its own epoch");
+        assert_eq!(session.gate.state(), PrewriteGateStateV0::Proven);
+        assert!(matches!(
+            session.prove_exact_response_loss_recovery(),
+            Err(TransportErrorV0::ManualRecoveryHold)
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_current_attempt_cutoff_cannot_poll_a_write() {
+        let session = test_session(
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+            Duration::from_millis(30),
+            0,
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert!(matches!(
+            claim_first_write(&session),
+            Err(TransportErrorV0::FiniteIoDeadline(
+                FiniteIoStageV0::PreWrite
+            ))
+        ));
+        assert_eq!(session.gate.state(), PrewriteGateStateV0::PreWrite);
+    }
+
+    #[tokio::test]
+    async fn prewrite_attempts_are_bounded_and_retry_without_resetting_the_outer_session() {
+        let session = test_session(
+            Duration::from_millis(2),
+            Duration::from_millis(20),
+            Duration::from_millis(30),
+            Duration::from_millis(40),
+            2,
+        );
+        let original = session.clone();
+        assert_eq!(
+            within_operation::<()>(&session, FiniteIoStageV0::PreWrite, std::future::pending())
+                .await,
+            Err(TransportErrorV0::FiniteIoDeadline(
+                FiniteIoStageV0::PreWrite
+            ))
+        );
+        assert_eq!(session.retry_prewrite_epoch(), Ok(1));
+        assert!(session.matches_exact_session(&original));
+        assert_eq!(session.gate.epoch(), 1);
+        assert_eq!(
+            within_operation::<()>(&session, FiniteIoStageV0::PreWrite, std::future::pending())
+                .await,
+            Err(TransportErrorV0::FiniteIoDeadline(
+                FiniteIoStageV0::PreWrite
+            ))
+        );
+        assert_eq!(session.retry_prewrite_epoch(), Ok(2));
+        assert_eq!(
+            session.retry_prewrite_epoch(),
+            Err(TransportErrorV0::FiniteIoDeadline(
+                FiniteIoStageV0::PreWrite
+            ))
+        );
+    }
+
+    #[test]
+    fn stale_epochs_and_concurrent_session_clones_cannot_poll_a_second_write() {
+        let session = test_session(
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            Duration::from_millis(30),
+            Duration::from_millis(40),
+            2,
+        );
+        let stale = SubwritePermitV0 {
+            gate: session.gate.clone(),
+            epoch: 0,
+            bootstrap: false,
+            bootstrap_collected: false,
+        };
+        assert_eq!(session.retry_prewrite_epoch(), Ok(1));
+        assert!(matches!(
+            stale.prove(),
+            Err(TransportErrorV0::ManualRecoveryHold)
+        ));
+
+        let session = test_session(
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            Duration::from_millis(30),
+            Duration::from_millis(40),
+            1,
+        );
+        let clone = session.clone();
+        let permit = claim_first_write(&session).expect("first clone owns the only write lease");
+        assert!(matches!(
+            claim_first_write(&clone),
+            Err(TransportErrorV0::ManualRecoveryHold)
+        ));
+        assert!(matches!(
+            session.retry_prewrite_epoch(),
+            Err(TransportErrorV0::FiniteIoDeadline(
+                FiniteIoStageV0::PreWrite
+            ))
+        ));
+        drop(permit);
+        assert_eq!(session.gate.state(), PrewriteGateStateV0::AmbiguousHeld);
+    }
+
+    #[test]
+    fn bootstrap_advances_only_after_direct_or_exact_proven_subwrites() {
+        let session = test_session(
+            Duration::from_millis(5),
+            Duration::from_millis(30),
+            Duration::from_millis(40),
+            Duration::from_millis(50),
+            4,
+        );
+        session
+            .begin_bootstrap_sequence()
+            .expect("first bootstrap owner");
+        let direct = claim_first_write(&session).expect("first bootstrap subwrite");
+        direct.prove().expect("direct response proves subwrite");
+        assert_eq!(session.gate.state(), PrewriteGateStateV0::PreWrite);
+        assert_eq!(session.gate.epoch(), 1);
+
+        let ambiguous = claim_first_write(&session).expect("second bootstrap subwrite");
+        drop(ambiguous);
+        assert_eq!(session.gate.state(), PrewriteGateStateV0::AmbiguousHeld);
+        assert!(matches!(
+            claim_first_write(&session),
+            Err(TransportErrorV0::ManualRecoveryHold)
+        ));
+        session
+            .prove_bootstrap_after_exact_proof()
+            .expect("only an exact recovery proof may advance bootstrap");
+        assert_eq!(session.gate.state(), PrewriteGateStateV0::PreWrite);
+        assert_eq!(session.gate.epoch(), 2);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_phase_wait_registers_before_the_state_read_window() {
+        let mut session = test_session(
+            Duration::from_millis(5),
+            Duration::from_millis(30),
+            Duration::from_millis(40),
+            Duration::from_millis(50),
+            2,
+        );
+        session.collector_bound = true;
+        session
+            .begin_bootstrap_sequence()
+            .expect("bootstrap authority begins");
+        session.gate.state.store(
+            PrewriteGateV0::encode(0, PrewriteGateV0::BOOTSTRAP_PHASE_PENDING),
+            Ordering::Release,
+        );
+        let hook = Arc::new(BootstrapPhaseWaitHookV0 {
+            state_read: AtomicBool::new(false),
+            release: Arc::new(tokio::sync::Barrier::new(2)),
+        });
+        session.bootstrap_phase_wait_hook = Some(Arc::clone(&hook));
+        let waiting = tokio::spawn({
+            let session = session.clone();
+            async move { session.wait_for_bootstrap_phase_authority().await }
+        });
+        while !hook.state_read.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        // This transition occupies the old implementation's lost-wake gap:
+        // it occurred after the state read but before that implementation
+        // registered its waiter.  The fixed implementation registered first,
+        // so the parked preflight completes once released.
+        assert!(session.prewrite_gate().seal_bootstrap_phase());
+        hook.release.wait().await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(20), waiting)
+                .await
+                .expect("phase waiter must not lose the seal wake")
+                .expect("phase waiter task joins"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn bootstrap_metadata_echo_is_single_use_phase_epoch_and_raw_response_bound() {
+        let session = test_session(
+            Duration::from_millis(5),
+            Duration::from_millis(30),
+            Duration::from_millis(40),
+            Duration::from_millis(50),
+            3,
+        );
+        let root = bootstrap_authority_root("2");
+        let fresh = bootstrap_authority_snapshot(&root);
+        session
+            .begin_bootstrap_sequence()
+            .expect("bootstrap authority begins");
+        session
+            .begin_bootstrap_root_phase(BootstrapRootPhaseV0::RootMetadata, &root)
+            .expect("metadata preflight freezes root");
+        session
+            .record_bootstrap_owned_root_echo(&root, BootstrapRootPhaseV0::RootStateLink)
+            .expect("metadata response is recorded for State-link");
+
+        assert_eq!(
+            session.authenticate_bootstrap_root_echo(&fresh, 1),
+            BootstrapRootEchoAuthenticationV0::GenuineOrAmbiguous,
+            "an otherwise exact response belongs only to its recorded epoch"
+        );
+        assert_eq!(
+            session.authenticate_bootstrap_root_echo(&fresh, 0),
+            BootstrapRootEchoAuthenticationV0::ExactFirstUse
+        );
+        assert_eq!(
+            session.authenticate_bootstrap_root_echo(&fresh, 1),
+            BootstrapRootEchoAuthenticationV0::ExactDuplicate,
+            "a duplicate delivery cannot consume a second restart"
+        );
+        session
+            .require_exact_root_metadata_response(&root)
+            .expect("the exact recorded metadata response authorizes State-link");
+
+        for label in ["status", "State-link", "finalizer", "annotation"] {
+            let mut changed = root.clone();
+            match label {
+                "status" => changed.value["status"]["observedGeneration"] = json!(1),
+                "State-link" => {
+                    changed.value["status"]["state"] =
+                        json!({"rootUid":"root-uid","name":"state","uid":"state-uid"});
+                }
+                "finalizer" => {
+                    changed.value["metadata"]["finalizers"] = json!([ROOT_FINALIZER, "foreign"]);
+                }
+                "annotation" => {
+                    changed
+                        .metadata
+                        .annotations
+                        .insert("foreign".into(), "changed".into());
+                    changed.value["metadata"]["annotations"]["foreign"] = json!("changed");
+                }
+                _ => unreachable!("test mutations are exhaustive"),
+            }
+            assert!(
+                matches!(
+                    session.require_exact_root_metadata_response(&changed),
+                    Err(TransportErrorV0::Stale(_))
+                ),
+                "a {label} change must reject the RootStateLink preflight"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_nonfinal_recovery_waits_for_phase_and_final_epoch_closes_once() {
+        let root = bootstrap_authority_root("2");
+        let mut nonfinal = test_session(
+            Duration::from_millis(5),
+            Duration::from_millis(30),
+            Duration::from_millis(40),
+            Duration::from_millis(50),
+            3,
+        );
+        nonfinal.collector_bound = true;
+        nonfinal
+            .begin_bootstrap_sequence()
+            .expect("bootstrap authority begins");
+        nonfinal
+            .begin_bootstrap_root_phase(BootstrapRootPhaseV0::StateFinalizer, &root)
+            .expect("nonfinal phase freezes root");
+        let ambiguous = claim_first_write(&nonfinal).expect("nonfinal write polled");
+        drop(ambiguous);
+        nonfinal
+            .prove_bootstrap_after_exact_proof()
+            .expect("exact nonfinal recovery advances only to a phase barrier");
+        assert_eq!(
+            nonfinal.gate.state(),
+            PrewriteGateStateV0::BootstrapPhasePending
+        );
+        assert!(matches!(
+            claim_first_write(&nonfinal),
+            Err(TransportErrorV0::ManualRecoveryHold)
+        ));
+
+        let terminal = test_session(
+            Duration::from_millis(5),
+            Duration::from_millis(30),
+            Duration::from_millis(40),
+            Duration::from_millis(50),
+            3,
+        );
+        terminal
+            .begin_bootstrap_sequence()
+            .expect("terminal bootstrap authority begins");
+        terminal
+            .begin_bootstrap_root_phase(BootstrapRootPhaseV0::RootStateLink, &root)
+            .expect("terminal phase freezes root");
+        let direct = claim_first_write(&terminal).expect("final write polled");
+        terminal
+            .mark_bootstrap_final_write_polled()
+            .expect("terminal phase marks after its poll");
+        direct
+            .prove_bootstrap_final()
+            .expect("direct final response proves its same epoch");
+        assert_eq!(terminal.gate.state(), PrewriteGateStateV0::Proven);
+        assert!(matches!(
+            claim_first_write(&terminal),
+            Err(TransportErrorV0::ManualRecoveryHold)
+        ));
+
+        let recovered = test_session(
+            Duration::from_millis(5),
+            Duration::from_millis(30),
+            Duration::from_millis(40),
+            Duration::from_millis(50),
+            3,
+        );
+        recovered
+            .begin_bootstrap_sequence()
+            .expect("recovery bootstrap authority begins");
+        recovered
+            .begin_bootstrap_root_phase(BootstrapRootPhaseV0::RootStateLink, &root)
+            .expect("recovery final phase freezes root");
+        let ambiguous = claim_first_write(&recovered).expect("final response is ambiguous");
+        recovered
+            .mark_bootstrap_final_write_polled()
+            .expect("final response loss is terminal");
+        drop(ambiguous);
+        recovered
+            .prove_bootstrap_after_exact_proof()
+            .expect("exact final recovery proves its matching epoch");
+        assert_eq!(recovered.gate.state(), PrewriteGateStateV0::Proven);
+        assert!(matches!(
+            recovered.prove_bootstrap_after_exact_proof(),
+            Err(TransportErrorV0::ManualRecoveryHold)
+        ));
+        assert!(matches!(
+            claim_first_write(&recovered),
+            Err(TransportErrorV0::ManualRecoveryHold)
+        ));
+    }
+
+    #[test]
+    fn bootstrap_metadata_self_echo_then_final_response_loss_proves_the_last_epoch() {
+        let session = test_session(
+            Duration::from_millis(5),
+            Duration::from_millis(30),
+            Duration::from_millis(40),
+            Duration::from_millis(50),
+            3,
+        );
+        let root = bootstrap_authority_root("2");
+        let fresh = bootstrap_authority_snapshot(&root);
+        session
+            .begin_bootstrap_sequence()
+            .expect("bootstrap authority begins");
+        session
+            .begin_bootstrap_root_phase(BootstrapRootPhaseV0::RootMetadata, &root)
+            .expect("metadata phase freezes root");
+        session
+            .record_bootstrap_owned_root_echo(&root, BootstrapRootPhaseV0::RootStateLink)
+            .expect("metadata response is retained");
+        let metadata_epoch = session
+            .gate
+            .begin_root_authentication()
+            .expect("metadata echo owns its authentication epoch");
+        assert_eq!(
+            session.authenticate_bootstrap_root_echo(&fresh, metadata_epoch),
+            BootstrapRootEchoAuthenticationV0::ExactFirstUse
+        );
+        assert!(
+            session
+                .gate
+                .restart_after_exact_self_echo(metadata_epoch, 3)
+        );
+        assert_eq!(
+            session.gate.state(),
+            PrewriteGateStateV0::BootstrapPhasePending
+        );
+        assert!(session.gate.seal_bootstrap_phase());
+        session
+            .begin_bootstrap_root_phase(BootstrapRootPhaseV0::RootStateLink, &root)
+            .expect("the consumed metadata response still authorizes its next phase");
+        session
+            .require_exact_root_metadata_response(&root)
+            .expect("State-link uses the exact metadata response");
+
+        let final_write = claim_first_write(&session).expect("terminal write polls once");
+        session
+            .mark_bootstrap_final_write_polled()
+            .expect("terminal phase is marked before its response returns");
+        drop(final_write);
+        session
+            .prove_bootstrap_after_exact_proof()
+            .expect("exact final response-loss recovery proves the same last epoch");
+        assert_eq!(session.gate.epoch(), 1);
+        assert_eq!(session.gate.state(), PrewriteGateStateV0::Proven);
+        assert!(matches!(
+            claim_first_write(&session),
+            Err(TransportErrorV0::ManualRecoveryHold)
+        ));
+    }
+
+    #[test]
+    fn bootstrap_ambiguous_write_proofs_are_phase_frozen_and_state_needs_a_root_link() {
+        let root_ref = ObjectRefV0 {
+            resource: ResourceKindV0::WebApplication,
+            namespace: "ns".into(),
+            name: "app".into(),
+        };
+        let state_ref = ObjectRefV0 {
+            resource: ResourceKindV0::OxideLoopState,
+            namespace: "ns".into(),
+            name: "state".into(),
+        };
+        let mut root_before = ObjectV0 {
+            reference: root_ref.clone(),
+            metadata: ObjectMetaV0 {
+                uid: "root-uid".into(),
+                resource_version: "1".into(),
+                annotations: BTreeMap::new(),
+                owner_uids: vec![],
+            },
+            value: json!({"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication","metadata":{"name":"app","namespace":"ns","uid":"root-uid","resourceVersion":"1","generation":1,"annotations":{},"finalizers":[]},"spec":{"program":{"digest":"bundle"}},"status":{}}),
+        };
+        let mut state_before = ObjectV0 {
+            reference: state_ref.clone(),
+            metadata: ObjectMetaV0 {
+                uid: "state-uid".into(),
+                resource_version: "2".into(),
+                annotations: BTreeMap::from([
+                    (ROOT_UID_ANNOTATION.into(), "root-uid".into()),
+                    (TRANSACTION_ID_ANNOTATION.into(), "bootstrap-token".into()),
+                    (COMMAND_ID_ANNOTATION.into(), "bootstrap-token".into()),
+                ]),
+                owner_uids: vec!["root-uid".into()],
+            },
+            value: json!({"apiVersion":"runtime.oxideloop.dev/v1alpha1","kind":"OxideLoopState","metadata":{"name":"state","namespace":"ns","uid":"state-uid","resourceVersion":"2","annotations":{ROOT_UID_ANNOTATION:"root-uid",TRANSACTION_ID_ANNOTATION:"bootstrap-token",COMMAND_ID_ANNOTATION:"bootstrap-token"},"ownerReferences":[{"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication","name":"app","uid":"root-uid","controller":true,"blockOwnerDeletion":false}]},"spec":{"stateVersion":1}}),
+        };
+
+        // A State CREATE response loss has no client-held issued UID. An
+        // unlinked same-name object is therefore never a resume candidate.
+        assert!(!has_state_link(&root_before, &state_before));
+
+        root_before.value["metadata"]["managedFields"] = json!([{
+            "manager":"kubectl-client-side-apply",
+            "operation":"Apply",
+            "apiVersion":"demo.oxideloop.dev/v1alpha1",
+            "fieldsType":"FieldsV1",
+            "fieldsV1":{"f:spec":{}},
+        }]);
+        state_before.value["metadata"]["managedFields"] = json!([{
+            "manager":"kubectl-client-side-apply",
+            "operation":"Apply",
+            "apiVersion":"runtime.oxideloop.dev/v1alpha1",
+            "fieldsType":"FieldsV1",
+            "fieldsV1":{"f:spec":{}},
+        }]);
+
+        let mut state_after_finalizer = state_before.clone();
+        state_after_finalizer.metadata.resource_version = "3".into();
+        state_after_finalizer.value["metadata"]["resourceVersion"] = json!("3");
+        state_after_finalizer.value["metadata"]["finalizers"] = json!([STATE_FINALIZER]);
+        state_after_finalizer.value["metadata"]["managedFields"] = json!([{
+            "manager":"oxideloop-controller",
+            "operation":"Update",
+            "apiVersion":"runtime.oxideloop.dev/v1alpha1",
+            "fieldsType":"FieldsV1",
+            "fieldsV1":{"f:metadata":{"f:finalizers":{}}},
+        }]);
+        assert!(bootstrap_state_finalizer_proof(
+            &state_after_finalizer,
+            &state_before
+        ));
+        state_after_finalizer.value["spec"]["unexpected"] = json!(true);
+        assert!(!bootstrap_state_finalizer_proof(
+            &state_after_finalizer,
+            &state_before
+        ));
+
+        let mut root_after_metadata = root_before.clone();
+        root_after_metadata.metadata.resource_version = "2".into();
+        root_after_metadata.metadata.annotations = BTreeMap::from([
+            (ROOT_UID_ANNOTATION.into(), "root-uid".into()),
+            (TRANSACTION_ID_ANNOTATION.into(), "bootstrap-token".into()),
+            (COMMAND_ID_ANNOTATION.into(), "bootstrap-token".into()),
+        ]);
+        root_after_metadata.value["metadata"]["resourceVersion"] = json!("2");
+        root_after_metadata.value["metadata"]["annotations"] = json!({ROOT_UID_ANNOTATION:"root-uid",TRANSACTION_ID_ANNOTATION:"bootstrap-token",COMMAND_ID_ANNOTATION:"bootstrap-token"});
+        root_after_metadata.value["metadata"]["finalizers"] = json!([ROOT_FINALIZER]);
+        root_after_metadata.value["metadata"]["managedFields"] = json!([{
+            "manager":"oxideloop-controller",
+            "operation":"Update",
+            "apiVersion":"demo.oxideloop.dev/v1alpha1",
+            "fieldsType":"FieldsV1",
+            "fieldsV1":{"f:metadata":{"f:annotations":{},"f:finalizers":{}}},
+        }]);
+        assert!(bootstrap_root_metadata_proof(
+            &root_after_metadata,
+            &root_before,
+            "bootstrap-token"
+        ));
+        for changed_field in [
+            "spec",
+            "annotation",
+            "finalizer",
+            "label",
+            "owner",
+            "deletion metadata",
+            "status",
+            "identity",
+        ] {
+            let mut root_with_unexpected_metadata = root_after_metadata.clone();
+            match changed_field {
+                "spec" => root_with_unexpected_metadata.value["spec"]["unexpected"] = json!(true),
+                "annotation" => {
+                    root_with_unexpected_metadata
+                        .metadata
+                        .annotations
+                        .insert("foreign".into(), "changed".into());
+                    root_with_unexpected_metadata.value["metadata"]["annotations"]["foreign"] =
+                        json!("changed");
+                }
+                "finalizer" => {
+                    root_with_unexpected_metadata.value["metadata"]["finalizers"] =
+                        json!([ROOT_FINALIZER, "foreign"]);
+                }
+                "label" => {
+                    root_with_unexpected_metadata.value["metadata"]["labels"] =
+                        json!({"foreign":"changed"});
+                }
+                "owner" => {
+                    root_with_unexpected_metadata.value["metadata"]["ownerReferences"] = json!([{
+                        "apiVersion":"v1", "kind":"ConfigMap", "name":"foreign",
+                        "uid":"foreign-uid",
+                    }]);
+                }
+                "deletion metadata" => {
+                    root_with_unexpected_metadata.value["metadata"]["deletionTimestamp"] =
+                        json!("2026-08-31T00:00:00Z");
+                }
+                "status" => {
+                    root_with_unexpected_metadata.value["status"]["observedGeneration"] = json!(1);
+                }
+                "identity" => {
+                    root_with_unexpected_metadata.metadata.uid = "foreign-root-uid".into();
+                    root_with_unexpected_metadata.value["metadata"]["uid"] =
+                        json!("foreign-root-uid");
+                }
+                _ => unreachable!("metadata mutation fixture is exhaustive"),
+            }
+            assert!(
+                !bootstrap_root_metadata_proof(
+                    &root_with_unexpected_metadata,
+                    &root_before,
+                    "bootstrap-token"
+                ),
+                "{changed_field} is not part of the intended metadata patch"
+            );
+        }
+
+        let mut root_after_link = root_after_metadata.clone();
+        root_after_link.metadata.resource_version = "3".into();
+        root_after_link.value["metadata"]["resourceVersion"] = json!("3");
+        root_after_link.value["metadata"]["managedFields"] = json!([{
+            "manager":"oxideloop-controller",
+            "operation":"Update",
+            "apiVersion":"demo.oxideloop.dev/v1alpha1",
+            "subresource":"status",
+            "fieldsType":"FieldsV1",
+            "fieldsV1":{"f:status":{"f:state":{}}},
+        }]);
+        root_after_link.value["status"]["state"] =
+            json!({"rootUid":"root-uid","name":"state","uid":"state-uid"});
+        assert!(bootstrap_root_link_proof(
+            &root_after_link,
+            &root_after_metadata,
+            &state_before
+        ));
+        assert!(has_state_link(&root_after_link, &state_before));
+        root_after_link.value["status"]["state"]["uid"] = json!("foreign-state");
+        assert!(!bootstrap_root_link_proof(
+            &root_after_link,
+            &root_after_metadata,
+            &state_before
+        ));
+    }
+
+    #[tokio::test]
+    async fn finite_io_deadlines_keep_provenance_and_prewrite_never_polls_after_invalidation() {
+        let budget = OperationBudgetV0::test_shortened(
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            Duration::from_millis(3),
+            Duration::from_millis(4),
+            1,
+        )
+        .expect("ordered test budget");
+        let session = OperationSessionV0 {
+            budget,
+            gate: PrewriteGateV0::new(),
+            bootstrap: Arc::new(Mutex::new(BootstrapAuthorityV0::new())),
+            collector_bound: false,
+            bootstrap_phase_wait_hook: None,
+        };
+        assert!(session.prewrite_gate().invalidate_authenticated_change());
+        assert!(matches!(
+            claim_first_write(&session),
+            Err(TransportErrorV0::PreWriteInvalidated)
+        ));
+
+        let budget = OperationBudgetV0::test_shortened(
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            Duration::from_millis(3),
+            Duration::from_millis(4),
+            1,
+        )
+        .expect("ordered test budget");
+        let session = OperationSessionV0 {
+            budget,
+            gate: PrewriteGateV0::new(),
+            bootstrap: Arc::new(Mutex::new(BootstrapAuthorityV0::new())),
+            collector_bound: false,
+            bootstrap_phase_wait_hook: None,
+        };
+        assert_eq!(
+            within_operation::<()>(&session, FiniteIoStageV0::WatchOpen, std::future::pending(),)
+                .await,
+            Err(TransportErrorV0::FiniteIoDeadline(
+                FiniteIoStageV0::WatchOpen
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_partial_watch_barrier_aborts_every_pump() {
+        let make_watch = || {
+            let (_sender, receiver) = tokio::sync::mpsc::channel(1);
+            let pump = tokio::spawn(std::future::pending::<()>());
+            let abort = pump.abort_handle();
+            (
+                WatchHandleV0 {
+                    events: receiver,
+                    overflowed: Arc::new(AtomicBool::new(false)),
+                    terminal: None,
+                    pump_abort: Some(abort),
+                    deletion_filter: None,
+                },
+                pump,
+            )
+        };
+        let (first_watch, first_pump) = make_watch();
+        let (second_watch, second_pump) = make_watch();
+        drop((first_watch, second_watch));
+        assert!(first_pump.await.expect_err("pump aborted").is_cancelled());
+        assert!(second_pump.await.expect_err("pump aborted").is_cancelled());
+    }
+
+    #[test]
+    fn deletion_watch_filter_invalidates_only_deletion_authority_sources() {
+        let gate = DeletionBarrierGateV0::new();
+        let tracked_names = Arc::new(Mutex::new(BTreeMap::from([(
+            ResourceKindV0::ConfigMap,
+            BTreeSet::from(["tracked".to_owned()]),
+        )])));
+        let filter = DeletionWatchFilterV0 {
+            gate: gate.clone(),
+            root_uid: "root-uid".into(),
+            root_name: "root".into(),
+            state_name: "state".into(),
+            tracked_names,
+        };
+        let event = |resource: ResourceKindV0, name: &str, owner_uids: Vec<String>| {
+            Ok(WatchEventV0::Modified(ObjectV0 {
+                reference: ObjectRefV0 {
+                    resource,
+                    namespace: "ns".into(),
+                    name: name.into(),
+                },
+                metadata: ObjectMetaV0 {
+                    uid: "candidate-uid".into(),
+                    resource_version: "candidate-rv".into(),
+                    annotations: BTreeMap::new(),
+                    owner_uids,
+                },
+                value: json!({}),
+            }))
+        };
+        assert!(
+            !filter.relevant(
+                ResourceKindV0::ConfigMap,
+                &event(ResourceKindV0::ConfigMap, "unrelated", vec![])
+            ),
+            "proven unrelated namespace churn is ignored"
+        );
+        assert!(filter.relevant(
+            ResourceKindV0::ConfigMap,
+            &event(ResourceKindV0::ConfigMap, "tracked", vec![])
+        ));
+        assert!(filter.relevant(
+            ResourceKindV0::Service,
+            &event(ResourceKindV0::Service, "owned", vec!["root-uid".into()])
+        ));
+        assert!(filter.relevant(
+            ResourceKindV0::AutomationRun,
+            &event(
+                ResourceKindV0::AutomationRun,
+                "owned-run",
+                vec!["root-uid".into()]
+            )
+        ));
+        assert!(filter.relevant(
+            ResourceKindV0::WebApplication,
+            &event(ResourceKindV0::WebApplication, "root", vec![])
+        ));
+        assert!(filter.relevant(
+            ResourceKindV0::OxideLoopState,
+            &event(ResourceKindV0::OxideLoopState, "state", vec![])
+        ));
+        assert!(filter.relevant(ResourceKindV0::Service, &Err(TransportErrorV0::WatchGone)));
+        assert!(gate.invalidate(), "the first relevant record wins Live");
+        assert!(
+            !gate.is_live(),
+            "the first relevant record wins the Live -> Invalidated CAS"
+        );
+        assert!(
+            !gate.seal(),
+            "consumer cannot acknowledge after losing Live"
+        );
+    }
+
+    #[test]
+    fn deletion_barrier_quiet_snapshot_seals_once() {
+        let gate = DeletionBarrierGateV0::new();
+        assert!(gate.is_live());
+        assert!(gate.seal());
+        assert!(!gate.is_live());
+        assert!(
+            !gate.seal(),
+            "a second consumer cannot seal the same snapshot"
+        );
+    }
+
+    #[test]
+    fn deletion_barrier_pump_invalidation_and_consumer_seal_have_one_winner() {
+        // The pump's only authority edge is `invalidate`; race it against the
+        // consumer's final `seal` on the exact shared gate. Whichever CAS
+        // wins permanently excludes the other capability.
+        for _ in 0..128 {
+            let gate = DeletionBarrierGateV0::new();
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let pump_gate = gate.clone();
+            let pump_start = Arc::clone(&start);
+            let pump = std::thread::spawn(move || {
+                pump_start.wait();
+                pump_gate.invalidate()
+            });
+            start.wait();
+            let sealed = gate.seal();
+            let invalidated = pump.join().expect("pump thread joins");
+            assert_ne!(
+                invalidated, sealed,
+                "only one Live transition may mint authority"
+            );
+            if invalidated {
+                assert!(
+                    !gate.seal(),
+                    "invalidation winner has no snapshot capability"
+                );
+            } else {
+                assert!(sealed, "a lost pump CAS implies the consumer sealed first");
+                assert!(
+                    !gate.invalidate(),
+                    "a later event is outside the sealed point-in-time capability"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_deletion_barrier_session_stops_before_any_later_request() {
+        use std::{convert::Infallible, sync::atomic::AtomicUsize};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service_calls = Arc::clone(&calls);
+        let service = tower::service_fn(move |_request| {
+            let service_calls = Arc::clone(&service_calls);
+            async move {
+                service_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Infallible>(http::Response::new(kube::client::Body::empty()))
+            }
+        });
+        let transport = KubeTransportV0::test_from_client(kube::Client::new(service, "default"));
+        let mut senders = Vec::new();
+        for _ in 0..5 {
+            let (sender, watch) = WatchHandleV0::test_channel(1);
+            transport.test_push_watch(watch);
+            senders.push(sender);
+        }
+        let session = test_session(
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            Duration::from_millis(3),
+            Duration::from_millis(4),
+            0,
+        );
+        tokio::time::sleep(Duration::from_millis(8)).await;
+        let result = transport
+            .observe_deletion_revalidation_in_operation(
+                &RootAddressV0 {
+                    namespace: "ns".into(),
+                    name: "root".into(),
+                    state_name: "state".into(),
+                },
+                &PreconditionsV0 {
+                    root_uid: "root-uid".into(),
+                    root_generation: 1,
+                    root_resource_version: "root-rv".into(),
+                    state_uid: "state-uid".into(),
+                    state_resource_version: "state-rv".into(),
+                    observation_token: "token".into(),
+                    cache_epoch: "epoch".into(),
+                },
+                &session,
+            )
+            .await;
+        assert_eq!(
+            result,
+            Err(TransportErrorV0::FiniteIoDeadline(
+                FiniteIoStageV0::ReadOnly
+            ))
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the one exhausted barrier budget must stop before its initial LIST and every later stage"
+        );
+        drop(senders);
+    }
+
     impl DiscoveryPortV0 for FakePort {
         fn list_exact(&mut self, _: ResourceKindV0, _: &str) -> Result<ListV0, TransportErrorV0> {
             Ok(ListV0 {
@@ -4668,6 +8025,8 @@ mod tests {
                 events: receiver,
                 overflowed: Arc::new(AtomicBool::new(false)),
                 terminal: None,
+                pump_abort: None,
+                deletion_filter: None,
             };
             assert_eq!(watch.next_event().await, Err(error.clone()));
             assert_eq!(watch.next_event().await, Err(error));

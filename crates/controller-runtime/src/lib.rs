@@ -44,8 +44,8 @@ use oxideloop_event_planner::{
     semantically_equal,
 };
 use oxideloop_kube_transport::{
-    DiscoveryPortV0, KubeTransportV0, ListV0, ObjectRefV0, ResourceKindV0, TransportErrorV0,
-    WatchEventV0, WatchHandleV0,
+    BootstrapRootEchoAuthenticationV0, DiscoveryPortV0, KubeTransportV0, ListV0, ObjectRefV0,
+    OperationSessionV0, ResourceKindV0, TransportErrorV0, WatchEventV0, WatchHandleV0,
 };
 use oxideloop_renderer_abi::{
     model::{ActionInputV0, ActionOutputV0, Dependency, RenderInputV0, RenderOutputV0},
@@ -658,6 +658,81 @@ pub struct RootActorV0 {
     active_render_input: Option<(BarrierV0, RenderInputV0)>,
     render_provenance_request: Option<String>,
 }
+
+/// Immutable root authority captured immediately before a collected command
+/// starts its Kubernetes preflight.  It is intentionally runtime-only: a
+/// watch record must pass a fresh root plus linked-State reread before it can
+/// either consume the one owned status echo or invalidate that command.
+#[derive(Clone, Debug)]
+pub(crate) enum PrewriteRootWitnessV0 {
+    PendingStatus {
+        root: Box<RootSnapshotV0>,
+        pending_status: Box<Option<WebApplicationStatus>>,
+    },
+    /// Bootstrap owns a multi-write root authority sequence. Its dynamic
+    /// phase witness lives in the transport session, preventing a status
+    /// shape from being mistaken for an owned bootstrap echo.
+    Bootstrap { operation: OperationSessionV0 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrewriteRootAuthenticationV0 {
+    ExactOwnedStatusEcho,
+    DuplicateOwnedBootstrapEcho,
+    GenuineOrAmbiguous,
+}
+
+impl PrewriteRootWitnessV0 {
+    /// Only a complete expected status snapshot can consume a root-watch
+    /// record.  The status token was authored by the reducer, so a matching
+    /// status plus unchanged immutable root/state pins is an owned echo; any
+    /// other fresh snapshot is deliberately treated as new authority.
+    pub(crate) fn authenticate(
+        &self,
+        fresh: &RootSnapshotV0,
+        epoch: u32,
+    ) -> PrewriteRootAuthenticationV0 {
+        match self {
+            Self::Bootstrap { operation } => {
+                match operation.authenticate_bootstrap_root_echo(fresh, epoch) {
+                    BootstrapRootEchoAuthenticationV0::ExactFirstUse => {
+                        PrewriteRootAuthenticationV0::ExactOwnedStatusEcho
+                    }
+                    BootstrapRootEchoAuthenticationV0::ExactDuplicate => {
+                        PrewriteRootAuthenticationV0::DuplicateOwnedBootstrapEcho
+                    }
+                    BootstrapRootEchoAuthenticationV0::GenuineOrAmbiguous => {
+                        PrewriteRootAuthenticationV0::GenuineOrAmbiguous
+                    }
+                }
+            }
+            Self::PendingStatus {
+                root,
+                pending_status,
+            } => {
+                let Some(status) = pending_status.as_ref() else {
+                    return PrewriteRootAuthenticationV0::GenuineOrAmbiguous;
+                };
+                if fresh.root_resource_version == root.root_resource_version
+                    || fresh.status != *status
+                {
+                    return PrewriteRootAuthenticationV0::GenuineOrAmbiguous;
+                }
+                let mut expected = (**root).clone();
+                expected
+                    .root_resource_version
+                    .clone_from(&fresh.root_resource_version);
+                expected.status.clone_from(status);
+                if fresh == &expected {
+                    PrewriteRootAuthenticationV0::ExactOwnedStatusEcho
+                } else {
+                    PrewriteRootAuthenticationV0::GenuineOrAmbiguous
+                }
+            }
+        }
+    }
+}
+
 impl RootActorV0 {
     pub fn new(state: MachineStateV0) -> Self {
         Self {
@@ -690,6 +765,24 @@ impl RootActorV0 {
     pub fn mode(&self) -> &ModeV0 {
         &self.mode
     }
+
+    /// Captures the only root self-echo which a collected command may safely
+    /// recognize.  This does not grant acknowledgement authority and is
+    /// unavailable after recovery because skipped runtime pending state is
+    /// absent there.
+    pub(crate) fn prewrite_root_witness(&self) -> PrewriteRootWitnessV0 {
+        let pending_status = self.state.pending_root_status().and_then(|pending| {
+            (pending.old_resource_version == self.state.root().root_resource_version
+                && pending.status.last_status_persist_token.as_deref()
+                    == Some(pending.token.as_str()))
+            .then(|| pending.status.clone())
+        });
+        PrewriteRootWitnessV0::PendingStatus {
+            root: Box::new(self.state.root().clone()),
+            pending_status: Box::new(pending_status),
+        }
+    }
+
     pub fn state(&self) -> &MachineStateV0 {
         &self.state
     }
@@ -1729,6 +1822,28 @@ impl RootActorV0 {
         self.accept_acknowledgement(event)
     }
 
+    /// Releases the actor-local ownership of an exact command which the
+    /// transport proves it did not poll for a write.  This is deliberately
+    /// not an acknowledgement: it cannot advance reducer state, fabricate a
+    /// mutation result, or authorize a retry.  The driver must immediately
+    /// reduce its retained authenticated facts and then either establish an
+    /// independently safe supersession or fail closed before selecting work.
+    pub(crate) fn release_unpolled_command(
+        &mut self,
+        command: &CommandV0,
+    ) -> Result<(), RuntimeErrorV0> {
+        if !self.in_flight || self.owned_in_flight.as_ref() != Some(command) {
+            self.hold("unpolled-command release did not match owned command".into());
+            return Err(RuntimeErrorV0::Hold(
+                "unpolled-command release did not match owned command".into(),
+            ));
+        }
+        self.in_flight = false;
+        self.owned_in_flight = None;
+        self.render_provenance_request = None;
+        Ok(())
+    }
+
     /// Consumes a sealed deletion observation minted by the exact
     /// list/reread adapter. There is intentionally no `EventV0` overload for
     /// this acknowledgement.
@@ -2618,6 +2733,46 @@ impl LoaderRereadPortV0 for KubeTransportV0 {
     }
 }
 
+/// A loader-local view of a transport session.  Root and linked-State reads
+/// are one logical authority acquisition, so they must consume the same
+/// immutable deadline rather than letting each GET mint a fresh one.
+struct OperationLoaderRereadPortV0<'a> {
+    transport: &'a KubeTransportV0,
+    operation: &'a OperationSessionV0,
+}
+
+/// The root-authentication fence is a write preflight, rather than ordinary
+/// loader authority.  It therefore consumes the current immutable prewrite
+/// attempt cutoff and cannot silently borrow the later proof window.
+struct PrewriteOperationLoaderRereadPortV0<'a> {
+    transport: &'a KubeTransportV0,
+    operation: &'a OperationSessionV0,
+}
+
+#[async_trait]
+impl LoaderRereadPortV0 for PrewriteOperationLoaderRereadPortV0<'_> {
+    async fn reread_object(
+        &self,
+        reference: &ObjectRefV0,
+    ) -> Result<Option<oxideloop_kube_transport::ObjectV0>, TransportErrorV0> {
+        self.transport
+            .reread_prewrite_in_operation(reference, self.operation)
+            .await
+    }
+}
+
+#[async_trait]
+impl LoaderRereadPortV0 for OperationLoaderRereadPortV0<'_> {
+    async fn reread_object(
+        &self,
+        reference: &ObjectRefV0,
+    ) -> Result<Option<oxideloop_kube_transport::ObjectV0>, TransportErrorV0> {
+        self.transport
+            .reread_in_operation(reference, self.operation)
+            .await
+    }
+}
+
 async fn recover_unlinked_deleting_root<P: LoaderRereadPortV0>(
     transport: &P,
     namespace: &str,
@@ -2745,7 +2900,7 @@ fn install_linked_state_pins(
 /// write preflight. The state journal is deliberately not deserialized here:
 /// accepted acknowledgement facts remain in the actor's in-memory journal and
 /// are rebased by the reducer under these fresh pins.
-async fn fresh_root_snapshot_from_transport<P: LoaderRereadPortV0>(
+async fn fresh_root_snapshot_from_reader<P: LoaderRereadPortV0>(
     transport: &P,
     namespace: &str,
     name: &str,
@@ -2800,6 +2955,46 @@ async fn fresh_root_snapshot_from_transport<P: LoaderRereadPortV0>(
     Ok(snapshot)
 }
 
+/// Acquires the root and any linked State pins under one finite read budget.
+/// This path is used after a stale write preflight; independent GET budgets
+/// would otherwise let a partial preflight outlive its authority window.
+async fn fresh_root_snapshot_from_transport(
+    transport: &KubeTransportV0,
+    namespace: &str,
+    name: &str,
+) -> Result<RootSnapshotV0, RuntimeErrorV0> {
+    let operation = transport.begin_operation_session();
+    fresh_root_snapshot_from_reader(
+        &OperationLoaderRereadPortV0 {
+            transport,
+            operation: &operation,
+        },
+        namespace,
+        name,
+    )
+    .await
+}
+
+/// Re-reads an exact root and linked State as one prewrite authentication
+/// fence.  The caller owns the operation session and must never convert this
+/// read into a reducer acknowledgement.
+pub(crate) async fn fresh_root_snapshot_from_transport_prewrite_in_operation(
+    transport: &KubeTransportV0,
+    namespace: &str,
+    name: &str,
+    operation: &OperationSessionV0,
+) -> Result<RootSnapshotV0, RuntimeErrorV0> {
+    fresh_root_snapshot_from_reader(
+        &PrewriteOperationLoaderRereadPortV0 {
+            transport,
+            operation,
+        },
+        namespace,
+        name,
+    )
+    .await
+}
+
 /// Loads exactly one root and, if linked, its immutable journal.  Raw DTOs are
 /// checked before serde accepts their typed fields, preventing a malformed
 /// object from becoming reducer authority. An absent state bootstraps only a
@@ -2810,7 +3005,28 @@ pub async fn load_machine_from_transport(
     namespace: &str,
     name: &str,
 ) -> Result<Option<MachineStateV0>, RuntimeErrorV0> {
-    load_machine_from_reader(transport, namespace, name).await
+    let operation = transport.begin_operation_session();
+    load_machine_from_transport_in_operation(transport, namespace, name, &operation).await
+}
+
+/// Loads a root and its linked State under the caller's already-minted
+/// operation session.  The driver uses this only when this load is one stage
+/// of a larger list/watch/GET barrier.
+pub(crate) async fn load_machine_from_transport_in_operation(
+    transport: &KubeTransportV0,
+    namespace: &str,
+    name: &str,
+    operation: &OperationSessionV0,
+) -> Result<Option<MachineStateV0>, RuntimeErrorV0> {
+    load_machine_from_reader(
+        &OperationLoaderRereadPortV0 {
+            transport,
+            operation,
+        },
+        namespace,
+        name,
+    )
+    .await
 }
 
 async fn load_machine_from_reader<P: LoaderRereadPortV0>(
@@ -2891,8 +3107,30 @@ pub async fn dispatch_transport_command(
     address: &oxideloop_kube_transport::RootAddressV0,
     command: &CommandV0,
 ) -> Result<Option<EventV0>, RuntimeErrorV0> {
+    dispatch_transport_command_in_operation(
+        transport,
+        address,
+        command,
+        &transport.begin_operation_session(),
+    )
+    .await
+}
+
+/// Executes the caller-owned sealed command using the exact operation session
+/// shared with the watch collector. The session remains transport-minted and
+/// opaque; T2 uses it to arbitrate the first write poll without reconstructing
+/// a command or its budget.
+pub async fn dispatch_transport_command_in_operation(
+    transport: &KubeTransportV0,
+    address: &oxideloop_kube_transport::RootAddressV0,
+    command: &CommandV0,
+    operation: &OperationSessionV0,
+) -> Result<Option<EventV0>, RuntimeErrorV0> {
     validate_transport_command_shape(command)?;
-    match transport.dispatch(address, command).await? {
+    match transport
+        .dispatch_in_operation(address, command, operation)
+        .await?
+    {
         oxideloop_kube_transport::CommandOutcomeV0::Event(event) => Ok(Some(*event)),
         // Bootstrap is a deliberately resumable multi-write effect.  Retain
         // command ownership and retry it rather than acknowledging early.
@@ -3406,11 +3644,17 @@ pub async fn establish_dependencies_async(
     }
     let mut collections = BTreeMap::new();
     let mut watches = Vec::new();
+    // One immutable transport budget owns the entire LIST -> WATCH -> closing
+    // LIST -> exact GET barrier.  Individual helpers must not mint fresh
+    // deadlines between fence stages.
+    let operation = transport.begin_operation_session();
     // LIST -> exact-RV WATCH for every collection, including object parents.
     for (kind, namespace) in &requested {
-        let list = transport.list_exact(*kind, namespace).await?;
+        let list = transport
+            .list_exact_in_operation(*kind, namespace, &operation)
+            .await?;
         let watch = transport
-            .watch_from(*kind, namespace, &list.resource_version)
+            .watch_from_in_operation(*kind, namespace, &list.resource_version, &operation)
             .await?;
         collections.insert((*kind, namespace.clone()), list);
         watches.push(watch);
@@ -3421,12 +3665,14 @@ pub async fn establish_dependencies_async(
     for (kind, namespace) in &requested {
         reread_collections.insert(
             (*kind, namespace.clone()),
-            transport.list_exact(*kind, namespace).await?,
+            transport
+                .list_exact_in_operation(*kind, namespace, &operation)
+                .await?,
         );
     }
     let mut observed_objects = Vec::new();
     for object in objects {
-        let observed = transport.reread(&object).await?;
+        let observed = transport.reread_in_operation(&object, &operation).await?;
         observed_objects.push((object, observed));
     }
     Ok(ObservationBarrierV0 {
@@ -3687,6 +3933,7 @@ mod tests {
 
     use super::*;
     use http::{Method, Request, Response};
+    use http_body_util::BodyExt;
     use kube::{Client, client::Body};
     use oxideloop_controller_api::{
         ApplyOutcome, ApplyResult, AutomationPending, DeletionTransaction,
@@ -3719,6 +3966,16 @@ mod tests {
     }
     use oxideloop_renderer_abi::parse_validate_render_input;
     use tower::service_fn;
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn wire_response(value: Value) -> Response<Body> {
+        Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&value).expect("wire response serializes"),
+            ))
+            .expect("wire response")
+    }
 
     #[derive(Default)]
     struct LoaderPort {
@@ -4140,6 +4397,27 @@ mod tests {
             })
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn unpolled_release_is_exact_and_never_fabricates_an_acknowledgement() {
+        let mut actor = actor();
+        actor.start();
+        let command = actor
+            .next_command()
+            .expect("bootstrap command")
+            .expect("owned bootstrap command");
+        actor
+            .release_unpolled_command(&command)
+            .expect("exact owned command releases");
+        assert!(!actor.in_flight);
+        assert!(actor.owned_in_flight.is_none());
+        assert!(actor.priority_ack.is_none());
+        assert!(actor.core_events.is_empty());
+        assert!(matches!(
+            actor.release_unpolled_command(&command),
+            Err(RuntimeErrorV0::Hold(_))
+        ));
     }
 
     fn linked_machine() -> MachineStateV0 {
@@ -6347,6 +6625,29 @@ mod tests {
     }
 
     #[test]
+    fn prewrite_root_witness_accepts_only_the_exact_owned_status_echo() {
+        let (actor, command) = render_status_pending_actor();
+        let CommandV0::PersistRootStatus { status, .. } = command else {
+            panic!("fixture must retain an owned root-status write");
+        };
+        let witness = actor.prewrite_root_witness();
+        let mut exact = actor.state().root().clone();
+        exact.root_resource_version = "root-rv-after-owned-status".into();
+        exact.status = status;
+        assert_eq!(
+            witness.authenticate(&exact, 0),
+            PrewriteRootAuthenticationV0::ExactOwnedStatusEcho
+        );
+
+        let mut changed = exact;
+        changed.spec.message = "independent edit".into();
+        assert_eq!(
+            witness.authenticate(&changed, 0),
+            PrewriteRootAuthenticationV0::GenuineOrAmbiguous
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn genuine_change_during_mutation_result_persist_preserves_the_accepted_result() {
         let (machine, mutation_ack) = mutation_pending();
@@ -7016,6 +7317,363 @@ mod tests {
                 .expect("authorized continuation reduces"),
             Some(CommandV0::Mutate { .. })
         ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn recovered_prepared_not_issued_uses_real_state_authorization_before_one_child_write() {
+        let (prepared_actor, _prepare) = actor_with_prepared_apply_persist();
+        let serialized = serde_json::to_string(prepared_actor.state()).expect("durable state JSON");
+        let recovered = MachineStateV0::recover_json(&serialized).expect("recover prepared state");
+        assert_eq!(recovered.phase(), PhaseV0::Recovery);
+        let loader = loader_port_for_machine(&recovered, &recovered.root().state_resource_version);
+        let mut root_wire = loader.objects[0].value.clone();
+        root_wire["metadata"]["annotations"] = serde_json::json!({
+            oxideloop_kube_transport::ROOT_UID_ANNOTATION: recovered.root().uid,
+        });
+        let root_wire = Arc::new(Mutex::new(root_wire));
+        let state_wire = loader.objects[1].value.clone();
+        let child_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = Arc::new(Mutex::new(state_wire));
+        let service = service_fn({
+            let root_wire = Arc::clone(&root_wire);
+            let state = Arc::clone(&state);
+            let child_writes = Arc::clone(&child_writes);
+            let state_writes = Arc::clone(&state_writes);
+            move |request: Request<Body>| {
+                let root_wire = Arc::clone(&root_wire);
+                let state = Arc::clone(&state);
+                let child_writes = Arc::clone(&child_writes);
+                let state_writes = Arc::clone(&state_writes);
+                async move {
+                    let method = request.method().clone();
+                    let path = request.uri().path().to_owned();
+                    if method == Method::GET && path.ends_with("/webapplications/demo") {
+                        Ok::<_, Infallible>(wire_response(
+                            root_wire.lock().expect("root lock").clone(),
+                        ))
+                    } else if method == Method::PATCH
+                        && path.ends_with("/webapplications/demo/status")
+                    {
+                        let body = request
+                            .into_body()
+                            .collect()
+                            .await
+                            .expect("root-status body");
+                        let body: Value =
+                            serde_json::from_slice(&body.to_bytes()).expect("root-status JSON");
+                        let mut current = root_wire.lock().expect("root lock");
+                        current["status"] = body["status"].clone();
+                        current["metadata"]["resourceVersion"] =
+                            Value::String("root-rv-live-status".into());
+                        Ok(wire_response(current.clone()))
+                    } else if method == Method::GET && path.contains("/oxideloopstates/") {
+                        Ok(wire_response(state.lock().expect("state lock").clone()))
+                    } else if method == Method::PATCH && path.contains("/oxideloopstates/") {
+                        let body = request
+                            .into_body()
+                            .collect()
+                            .await
+                            .expect("state patch body");
+                        let body: Value =
+                            serde_json::from_slice(&body.to_bytes()).expect("state patch JSON");
+                        let write =
+                            state_writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        let mut current = state.lock().expect("state lock");
+                        current["spec"] = body["spec"].clone();
+                        current["metadata"]["annotations"] =
+                            body["metadata"]["annotations"].clone();
+                        current["metadata"]["resourceVersion"] =
+                            Value::String(format!("state-rv-live-{write}"));
+                        Ok(wire_response(current.clone()))
+                    } else if method == Method::POST && path.ends_with("/configmaps") {
+                        let body = request
+                            .into_body()
+                            .collect()
+                            .await
+                            .expect("child create body");
+                        let mut child: Value =
+                            serde_json::from_slice(&body.to_bytes()).expect("child create JSON");
+                        child["metadata"]["uid"] = Value::String("managed-new-uid".into());
+                        child["metadata"]["resourceVersion"] =
+                            Value::String("managed-new-rv".into());
+                        child_writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(wire_response(child))
+                    } else {
+                        panic!("unexpected recovery transport request {method} {path}");
+                    }
+                }
+            }
+        });
+        let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
+        let address = oxideloop_kube_transport::RootAddressV0 {
+            namespace: recovered.root().namespace.clone(),
+            name: recovered.root().name.clone(),
+            state_name: recovered.root().state_name.clone(),
+        };
+        let mut actor = RootActorV0::new(recovered);
+        actor.start();
+        let CommandV0::RequestDescriptor { token, .. } = actor
+            .next_command()
+            .expect("recovered descriptor request")
+            .expect("descriptor command")
+        else {
+            panic!("recovered prepared state skipped descriptor");
+        };
+        actor
+            .acknowledge(EventV0::DescriptorReady {
+                token,
+                bundle_digest: "a".repeat(64),
+            })
+            .expect("descriptor acknowledgement");
+        assert!(actor.next_command().expect("descriptor reduces").is_none());
+        let barrier = actor.barrier();
+        actor
+            .prepare_initial_informer_observation(barrier)
+            .expect("recovered informer observation");
+        actor.informers_ready(barrier);
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("recovered informer readiness")
+            .expect("recovered revalidation request")
+        else {
+            panic!("recovered state did not request a render");
+        };
+        actor
+            .issue_render_capability(
+                trusted_render_input(&actor, &preconditions.observation_token),
+                1,
+            )
+            .expect("recovered revalidation is capability-bound");
+        let (frozen, input, _empty, _observed) = prune_render_documents(
+            actor.state().root(),
+            &preconditions.state_resource_version,
+            &preconditions.observation_token,
+            &preconditions.cache_epoch,
+        );
+        let apply_output = serde_json::to_string(&RenderOutputV0 {
+            abi_version: ABI_VERSION_V0.into(),
+            disposition: RenderDisposition::Apply,
+            resources: vec![ResourceDeclaration {
+                logical_id: "managed-new".into(),
+                object: serde_json::json!({
+                    "apiVersion":"v1", "kind":"ConfigMap",
+                    "metadata":{"namespace":"ns", "name":"managed-new"},
+                    "data":{"value":"recovered"},
+                }),
+                readiness: None,
+            }],
+            dependencies: vec![],
+            automations: vec![],
+            diagnostics: vec![],
+        })
+        .expect("apply output serializes");
+        let observed_absent = vec![DesiredObservationV0 {
+            identity: ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                name: "managed-new".into(),
+            },
+            observation: Observation::Absent,
+            qualification: BackendQualification::BuiltInTested {
+                kubernetes_minor: "1.36".into(),
+                gvr: "configmaps".into(),
+            },
+            recovery_proof: None,
+            deletion_recovery_proof: None,
+        }];
+        actor
+            .accept_acknowledgement(EventV0::Revalidated {
+                frozen,
+                render_input_json: input,
+                render_output_json: apply_output.clone(),
+                observed: observed_absent.clone(),
+            })
+            .expect("recovered revalidation acknowledgement");
+        let invalidate = actor
+            .next_command()
+            .expect("prepared invalidation reduces")
+            .expect("PreparedNotIssued must persist invalidation");
+        assert!(matches!(
+            invalidate,
+            CommandV0::Persist { ref operation, .. }
+                if operation.purpose == PersistPurpose::Invalidate
+        ));
+        let invalidate_ack = dispatch_transport_command(&transport, &address, &invalidate)
+            .await
+            .expect("real invalidation persistence")
+            .expect("invalidation acknowledgement");
+        actor
+            .acknowledge(invalidate_ack)
+            .expect("invalidation acknowledgement reduces");
+
+        let CommandV0::RequestDescriptor { token, .. } = actor
+            .next_command()
+            .expect("descriptor after invalidation")
+            .expect("descriptor command after invalidation")
+        else {
+            panic!("invalidation did not re-enter descriptor phase");
+        };
+        actor
+            .acknowledge(EventV0::DescriptorReady {
+                token,
+                bundle_digest: "a".repeat(64),
+            })
+            .expect("replanned descriptor acknowledgement");
+        assert!(actor.next_command().expect("descriptor reduces").is_none());
+        let barrier = actor.barrier();
+        actor
+            .prepare_initial_informer_observation(barrier)
+            .expect("replanned informer observation");
+        actor.informers_ready(barrier);
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("replanned informer readiness")
+            .expect("replanned render request")
+        else {
+            panic!("replanned state did not request render");
+        };
+        actor
+            .issue_render_capability(
+                trusted_render_input(&actor, &preconditions.observation_token),
+                1,
+            )
+            .expect("replanned render is capability-bound");
+        let (frozen, input, _empty, _) = prune_render_documents(
+            actor.state().root(),
+            &preconditions.state_resource_version,
+            &preconditions.observation_token,
+            &preconditions.cache_epoch,
+        );
+        actor
+            .accept_acknowledgement(EventV0::Rendered {
+                frozen,
+                render_input_json: input,
+                render_output_json: apply_output.clone(),
+                observed: observed_absent.clone(),
+            })
+            .expect("replanned render acknowledgement");
+        let status = actor
+            .next_command()
+            .expect("replanned render reduces")
+            .expect("replanned root-status persistence");
+        assert!(matches!(status, CommandV0::PersistRootStatus { .. }));
+        let status_ack = dispatch_transport_command(&transport, &address, &status)
+            .await
+            .expect("real root-status persistence")
+            .expect("root-status acknowledgement");
+        actor
+            .acknowledge(status_ack)
+            .expect("root-status acknowledgement reduces");
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("status-pinned render request")
+            .expect("status acknowledgement must repeat render")
+        else {
+            panic!("root-status acknowledgement skipped the pinned render");
+        };
+        actor
+            .issue_render_capability(
+                trusted_render_input(&actor, &preconditions.observation_token),
+                1,
+            )
+            .expect("status-pinned render is capability-bound");
+        let (frozen, input, _empty, _) = prune_render_documents(
+            actor.state().root(),
+            &preconditions.state_resource_version,
+            &preconditions.observation_token,
+            &preconditions.cache_epoch,
+        );
+        actor
+            .accept_acknowledgement(EventV0::Rendered {
+                frozen,
+                render_input_json: input,
+                render_output_json: apply_output.clone(),
+                observed: observed_absent.clone(),
+            })
+            .expect("status-pinned render acknowledgement");
+        let prepare = actor
+            .next_command()
+            .expect("status-pinned render reduces")
+            .expect("fresh Prepare persistence");
+        assert!(
+            matches!(
+                prepare,
+                CommandV0::Persist { ref operation, .. }
+                    if operation.purpose == PersistPurpose::Prepare
+            ),
+            "expected fresh Prepare persistence, got {prepare:?}"
+        );
+        let prepare_ack = dispatch_transport_command(&transport, &address, &prepare)
+            .await
+            .expect("real Prepare persistence")
+            .expect("Prepare acknowledgement");
+        actor
+            .acknowledge(prepare_ack)
+            .expect("Prepare acknowledgement reduces");
+
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("Prepare revalidation request")
+            .expect("Prepare must revalidate")
+        else {
+            panic!("Prepare acknowledgement skipped revalidation");
+        };
+        actor
+            .issue_render_capability(
+                trusted_render_input(&actor, &preconditions.observation_token),
+                1,
+            )
+            .expect("post-Prepare revalidation is capability-bound");
+        let (frozen, input, _empty, _) = prune_render_documents(
+            actor.state().root(),
+            &preconditions.state_resource_version,
+            &preconditions.observation_token,
+            &preconditions.cache_epoch,
+        );
+        actor
+            .accept_acknowledgement(EventV0::Revalidated {
+                frozen,
+                render_input_json: input,
+                render_output_json: apply_output,
+                observed: observed_absent,
+            })
+            .expect("post-Prepare revalidation acknowledgement");
+        let authorization = actor
+            .next_command()
+            .expect("revalidation reduces")
+            .expect("DispatchAuthorization persistence");
+        assert!(matches!(
+            authorization,
+            CommandV0::Persist { ref operation, .. }
+                if operation.purpose == PersistPurpose::DispatchAuthorization
+        ));
+        let authorization_ack = dispatch_transport_command(&transport, &address, &authorization)
+            .await
+            .expect("real DispatchAuthorization persistence")
+            .expect("DispatchAuthorization acknowledgement");
+        assert_eq!(
+            child_writes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no child write exists before the durable authorization acknowledgement"
+        );
+        actor
+            .acknowledge(authorization_ack)
+            .expect("DispatchAuthorization acknowledgement reduces");
+        let mutation = actor
+            .next_command()
+            .expect("authorized continuation reduces")
+            .expect("exact child mutation");
+        assert!(matches!(mutation, CommandV0::Mutate { ref commands, .. } if commands.len() == 1));
+        let mutation_ack = dispatch_transport_command(&transport, &address, &mutation)
+            .await
+            .expect("authorized child dispatch")
+            .expect("child acknowledgement");
+        assert!(matches!(mutation_ack, EventV0::MutationAcknowledged { .. }));
+        assert_eq!(child_writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(state_writes.load(std::sync::atomic::Ordering::SeqCst) >= 3);
     }
 
     #[test]

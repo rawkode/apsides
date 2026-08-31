@@ -536,7 +536,7 @@ fn force_fence_script(child: Value) -> Vec<Expected> {
             path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/state-a",
             content_type: None,
             body: None,
-            response: response(state),
+            response: response(state.clone()),
         },
         Expected {
             method: Method::GET,
@@ -829,6 +829,67 @@ fn timed_out_state_persist_transport(
                 return std::future::pending::<Result<Response<Body>, Infallible>>().await;
             }
             panic!("unexpected timeout-recovery request {method} {path}");
+        }
+    });
+    (
+        KubeTransportV0::test_from_client(Client::new(service, "default")),
+        patches,
+    )
+}
+
+/// A status PATCH whose response never arrives after the server may have
+/// applied it.  The next exact GET is the sole proof attempt under the same
+/// short test operation budget; a second PATCH would be a protocol failure.
+fn timed_out_automation_completion_transport(
+    spec: AutomationRunSpec,
+    desired: AutomationRunStatus,
+    recovery: Value,
+) -> (KubeTransportV0, Arc<AtomicUsize>) {
+    let patches = Arc::new(AtomicUsize::new(0));
+    let patch_count = Arc::clone(&patches);
+    let recovery = Arc::new(recovery);
+    let initial = automation_response(&spec, &AutomationRunStatus::default(), "4");
+    let service = service_fn(move |request: Request<Body>| {
+        let patch_count = Arc::clone(&patch_count);
+        let recovery = Arc::clone(&recovery);
+        let initial = initial.clone();
+        let desired = desired.clone();
+        async move {
+            let method = request.method().clone();
+            let path = request
+                .uri()
+                .path_and_query()
+                .expect("request URI")
+                .as_str()
+                .to_owned();
+            if method == Method::GET
+                && path
+                    == "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/automationruns/run-a"
+            {
+                return Ok::<_, Infallible>(response(if patch_count.load(Ordering::SeqCst) == 0 {
+                    initial
+                } else {
+                    (*recovery).clone()
+                }));
+            }
+            if method == Method::PATCH
+                && path
+                    == "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/automationruns/run-a/status?&fieldManager=oxideloop-controller"
+            {
+                let bytes = request
+                    .into_body()
+                    .collect_bytes()
+                    .await
+                    .expect("status body bytes");
+                let body = serde_json::from_slice::<Value>(&bytes).expect("status body");
+                assert_eq!(
+                    body.get("status"),
+                    Some(&serde_json::to_value(&desired).expect("status value"))
+                );
+                patch_count.fetch_add(1, Ordering::SeqCst);
+                return std::future::pending::<Result<Response<Body>, Infallible>>().await;
+            }
+            panic!("unexpected automation timeout request {method} {path}");
         }
     });
     (
@@ -1199,6 +1260,355 @@ async fn watch_open_and_stream_conflicts_retain_stage_and_resource() {
 }
 
 #[tokio::test]
+async fn deletion_barrier_scripted_live_root_watch_invalidates_before_seal() {
+    // This keeps the real deletion acquisition/seal algorithm intact.  Only
+    // the five retained watch sources are injected, so no test-only
+    // no-stream path is exercised.
+    let address = RootAddressV0 {
+        namespace: "tenant-a".into(),
+        name: "app-a".into(),
+        state_name: "state-a".into(),
+    };
+    let preconditions = PreconditionsV0 {
+        root_uid: "root-uid".into(),
+        root_generation: 3,
+        root_resource_version: "root-rv".into(),
+        state_uid: "state-uid".into(),
+        state_resource_version: "state-rv".into(),
+        observation_token: "token".into(),
+        cache_epoch: "epoch".into(),
+    };
+    let root = json!({
+        "apiVersion":"demo.oxideloop.dev/v1alpha1", "kind":"WebApplication",
+        "metadata":{"name":"app-a", "namespace":"tenant-a", "uid":"root-uid",
+          "resourceVersion":"root-rv", "generation":3,
+          "deletionTimestamp":"2026-01-01T00:00:00Z"}
+    });
+    let state = json!({
+        "apiVersion":"runtime.oxideloop.dev/v1alpha1", "kind":"OxideLoopState",
+        "metadata":{"name":"state-a", "namespace":"tenant-a", "uid":"state-uid",
+          "resourceVersion":"state-rv"}
+    });
+    let empty = || collection_json(json!([]));
+    let scripted = |initial_config: Value, closing_config: Value| {
+        ScriptedApi::transport([
+            Expected {
+                method: Method::GET,
+                path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications?",
+                content_type: None,
+                body: None,
+                response: response(empty()),
+            },
+            Expected {
+                method: Method::GET,
+                path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates?",
+                content_type: None,
+                body: None,
+                response: response(empty()),
+            },
+            Expected {
+                method: Method::GET,
+                path_and_query: "/api/v1/namespaces/tenant-a/configmaps?",
+                content_type: None,
+                body: None,
+                response: response(initial_config),
+            },
+            Expected {
+                method: Method::GET,
+                path_and_query: "/api/v1/namespaces/tenant-a/services?",
+                content_type: None,
+                body: None,
+                response: response(empty()),
+            },
+            Expected {
+                method: Method::GET,
+                path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/automationruns?",
+                content_type: None,
+                body: None,
+                response: response(empty()),
+            },
+            Expected {
+                method: Method::GET,
+                path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a",
+                content_type: None,
+                body: None,
+                response: response(root.clone()),
+            },
+            Expected {
+                method: Method::GET,
+                path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/state-a",
+                content_type: None,
+                body: None,
+                response: response(state.clone()),
+            },
+            Expected {
+                method: Method::GET,
+                path_and_query: "/api/v1/namespaces/tenant-a/configmaps?",
+                content_type: None,
+                body: None,
+                response: response(closing_config),
+            },
+            Expected {
+                method: Method::GET,
+                path_and_query: "/api/v1/namespaces/tenant-a/services?",
+                content_type: None,
+                body: None,
+                response: response(empty()),
+            },
+            Expected {
+                method: Method::GET,
+                path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/automationruns?",
+                content_type: None,
+                body: None,
+                response: response(empty()),
+            },
+        ])
+    };
+    let (transport, api) = scripted(empty(), empty());
+    let mut senders = Vec::new();
+    for _ in 0..5 {
+        let (sender, watch) = WatchHandleV0::test_channel(1);
+        transport.test_push_watch(watch);
+        senders.push(sender);
+    }
+    let watched_root = ObjectV0 {
+        reference: ObjectRefV0 {
+            resource: ResourceKindV0::WebApplication,
+            namespace: "tenant-a".into(),
+            name: "app-a".into(),
+        },
+        metadata: ObjectMetaV0 {
+            uid: "root-uid".into(),
+            resource_version: "new-root-rv".into(),
+            annotations: BTreeMap::new(),
+            owner_uids: vec![],
+        },
+        value: root.clone(),
+    };
+    senders[0]
+        .send(Ok(WatchEventV0::Modified(watched_root)))
+        .await
+        .expect("scripted root event is buffered");
+    assert_eq!(
+        transport
+            .observe_deletion_revalidation(&address, &preconditions)
+            .await,
+        Err(TransportErrorV0::Stale(
+            "deletion observation watch changed"
+        ))
+    );
+    api.assert_drained();
+
+    // All root and linked-State changes are authoritative deletion inputs.
+    // The filter intentionally does not try to interpret individual fields:
+    // a UID/RV/link/receipt/finalizer/owner change must all win Live before a
+    // point-in-time snapshot can be sealed.
+    for (label, slot, object) in [
+        (
+            "root UID",
+            0,
+            ObjectV0 {
+                reference: ObjectRefV0 {
+                    resource: ResourceKindV0::WebApplication,
+                    namespace: "tenant-a".into(),
+                    name: "app-a".into(),
+                },
+                metadata: ObjectMetaV0 {
+                    uid: "replacement-root".into(),
+                    resource_version: "root-rv".into(),
+                    annotations: BTreeMap::new(),
+                    owner_uids: vec![],
+                },
+                value: root.clone(),
+            },
+        ),
+        (
+            "root RV/finalizer/receipt/link",
+            0,
+            ObjectV0 {
+                reference: ObjectRefV0 {
+                    resource: ResourceKindV0::WebApplication,
+                    namespace: "tenant-a".into(),
+                    name: "app-a".into(),
+                },
+                metadata: ObjectMetaV0 {
+                    uid: "root-uid".into(),
+                    resource_version: "changed-rv".into(),
+                    annotations: BTreeMap::new(),
+                    owner_uids: vec![],
+                },
+                value: root.clone(),
+            },
+        ),
+        (
+            "State UID/RV/owner/finalizer",
+            1,
+            ObjectV0 {
+                reference: ObjectRefV0 {
+                    resource: ResourceKindV0::OxideLoopState,
+                    namespace: "tenant-a".into(),
+                    name: "state-a".into(),
+                },
+                metadata: ObjectMetaV0 {
+                    uid: "replacement-state".into(),
+                    resource_version: "changed-state-rv".into(),
+                    annotations: BTreeMap::new(),
+                    owner_uids: vec!["other-root".into()],
+                },
+                value: state.clone(),
+            },
+        ),
+    ] {
+        let (transport, api) = scripted(empty(), empty());
+        let mut senders = Vec::new();
+        for _ in 0..5 {
+            let (sender, watch) = WatchHandleV0::test_channel(1);
+            transport.test_push_watch(watch);
+            senders.push(sender);
+        }
+        senders[slot]
+            .send(Ok(WatchEventV0::Modified(object)))
+            .await
+            .expect("authoritative scripted watch event is buffered");
+        assert_eq!(
+            transport
+                .observe_deletion_revalidation(&address, &preconditions)
+                .await,
+            Err(TransportErrorV0::Stale(
+                "deletion observation watch changed"
+            )),
+            "{label} must prevent a deletion snapshot seal"
+        );
+        api.assert_drained();
+    }
+
+    for terminal in [
+        TransportErrorV0::WatchGone,
+        TransportErrorV0::WatchOverflow,
+        TransportErrorV0::Other("scripted terminal".into()),
+    ] {
+        let (transport, api) = scripted(empty(), empty());
+        let mut senders = Vec::new();
+        for _ in 0..5 {
+            let (sender, watch) = WatchHandleV0::test_channel(1);
+            transport.test_push_watch(watch);
+            senders.push(sender);
+        }
+        senders[4]
+            .send(Err(terminal.clone()))
+            .await
+            .expect("terminal scripted watch record is buffered");
+        assert_eq!(
+            transport
+                .observe_deletion_revalidation(&address, &preconditions)
+                .await,
+            Err(terminal),
+            "terminal watch must fail before any deletion acknowledgement"
+        );
+        api.assert_drained();
+    }
+
+    let (overflow_transport, overflow_api) = scripted(empty(), empty());
+    let mut overflow_senders = Vec::new();
+    for index in 0..5 {
+        let (sender, watch) = WatchHandleV0::test_channel(1);
+        if index == 3 {
+            watch.test_mark_overflow();
+        }
+        overflow_transport.test_push_watch(watch);
+        overflow_senders.push(sender);
+    }
+    assert_eq!(
+        overflow_transport
+            .observe_deletion_revalidation(&address, &preconditions)
+            .await,
+        Err(TransportErrorV0::WatchOverflow)
+    );
+    drop(overflow_senders);
+    overflow_api.assert_drained();
+
+    let (eof_transport, eof_api) = scripted(empty(), empty());
+    let mut eof_senders = Vec::new();
+    for index in 0..5 {
+        let (sender, watch) = WatchHandleV0::test_channel(1);
+        eof_transport.test_push_watch(watch);
+        if index != 2 {
+            eof_senders.push(sender);
+        }
+        // The ConfigMap sender is deliberately dropped: EOF is terminal.
+    }
+    assert_eq!(
+        eof_transport
+            .observe_deletion_revalidation(&address, &preconditions)
+            .await,
+        Err(TransportErrorV0::WatchGone)
+    );
+    drop(eof_senders);
+    eof_api.assert_drained();
+
+    let tracked = json!({
+        "apiVersion":"v1", "kind":"ConfigMap",
+        "metadata":{"name":"tracked", "namespace":"tenant-a", "uid":"tracked-old",
+          "resourceVersion":"tracked-rv", "ownerReferences":[{
+            "apiVersion":"demo.oxideloop.dev/v1alpha1", "kind":"WebApplication",
+            "name":"app-a", "uid":"root-uid", "controller":true,
+            "blockOwnerDeletion":false
+          }]}
+    });
+    let (tracked_transport, tracked_api) = scripted(collection_json(json!([tracked])), empty());
+    let mut tracked_senders = Vec::new();
+    for _ in 0..5 {
+        let (sender, watch) = WatchHandleV0::test_channel(1);
+        tracked_transport.test_push_watch(watch);
+        tracked_senders.push(sender);
+    }
+    let replacement = ObjectV0 {
+        reference: ObjectRefV0 {
+            resource: ResourceKindV0::ConfigMap,
+            namespace: "tenant-a".into(),
+            name: "tracked".into(),
+        },
+        metadata: ObjectMetaV0 {
+            uid: "foreign-replacement".into(),
+            resource_version: "replacement-rv".into(),
+            annotations: BTreeMap::new(),
+            owner_uids: vec![],
+        },
+        value: json!({}),
+    };
+    tracked_senders[2]
+        .send(Ok(WatchEventV0::Modified(replacement)))
+        .await
+        .expect("tracked replacement is buffered");
+    assert_eq!(
+        tracked_transport
+            .observe_deletion_revalidation(&address, &preconditions)
+            .await,
+        Err(TransportErrorV0::Stale(
+            "deletion observation watch changed"
+        )),
+        "a same-name replacement cannot be treated as a quiet deletion snapshot"
+    );
+    tracked_api.assert_drained();
+
+    let (quiet_transport, quiet_api) = scripted(empty(), empty());
+    let mut quiet_senders = Vec::new();
+    for _ in 0..5 {
+        let (sender, watch) = WatchHandleV0::test_channel(1);
+        quiet_transport.test_push_watch(watch);
+        quiet_senders.push(sender);
+    }
+    let sealed = quiet_transport
+        .observe_deletion_revalidation(&address, &preconditions)
+        .await
+        .expect("quiet exact scripted barrier seals");
+    assert_eq!(sealed.root.metadata.uid, "root-uid");
+    assert_eq!(sealed.state.metadata.uid, "state-uid");
+    drop(quiet_senders);
+    quiet_api.assert_drained();
+}
+
+#[tokio::test]
 async fn root_status_conflict_recovery_distinguishes_ack_stale_and_hold() {
     let status = WebApplicationStatus {
         last_status_persist_token: Some("token".into()),
@@ -1327,6 +1737,8 @@ async fn terminal_watch_error_is_latched_and_never_releases_a_queued_event() {
         events: receiver,
         overflowed: Arc::new(AtomicBool::new(false)),
         terminal: None,
+        pump_abort: None,
+        deletion_filter: None,
     };
     assert!(matches!(
         watch.next_event().await,
@@ -1477,6 +1889,8 @@ async fn pending_automation_list_watch_reread_retains_a_race_completion() {
             events: receiver,
             overflowed: Arc::new(AtomicBool::new(false)),
             terminal: None,
+            pump_abort: None,
+            deletion_filter: None,
         },
         current,
     };
@@ -2960,6 +3374,110 @@ async fn event_create_rejects_preexisting_name_and_uses_only_get_or_post() {
 }
 
 #[tokio::test]
+async fn event_prewrite_failure_reuses_its_frozen_request_in_the_next_epoch() {
+    let plan = generated_event_plan();
+    let path = format!(
+        "/apis/events.k8s.io/v1/namespaces/tenant-a/events/{}",
+        plan.metadata.name
+    );
+    let desired = materialize_event(&plan, "2026-01-01T00:00:00Z").expect("event body");
+    let missing = || {
+        status(
+            StatusCode::NOT_FOUND,
+            json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}),
+        )
+    };
+    let (transport, api) = ScriptedApi::transport([
+        // A pre-write GET failure is retryable only inside the original
+        // operation.  The following exact GET and POST prove the retry did
+        // not mint or alter the generated Event request.
+        Expected {
+            method: Method::GET,
+            path_and_query: Box::leak(path.clone().into_boxed_str()),
+            content_type: None,
+            body: None,
+            response: status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"kind":"Status","apiVersion":"v1","status":"Failure","code":500}),
+            ),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: Box::leak(path.into_boxed_str()),
+            content_type: None,
+            body: None,
+            response: missing(),
+        },
+        Expected {
+            method: Method::POST,
+            path_and_query: "/apis/events.k8s.io/v1/namespaces/tenant-a/events?",
+            content_type: Some("application/json"),
+            body: Some(desired),
+            response: response(event_response(&plan, "event-uid", "9")),
+        },
+    ]);
+
+    assert_eq!(
+        transport
+            .create_or_exact_recover_event(&plan, "2026-01-01T00:00:00Z")
+            .await
+            .expect("one retry retains the Event request")
+            .resource_version,
+        "9"
+    );
+    api.assert_drained();
+}
+
+#[tokio::test]
+async fn collected_event_invalidation_during_preflight_prevents_a_post() {
+    let plan = generated_event_plan();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let gate = Arc::new(Mutex::new(None::<super::PrewriteGateV0>));
+    let service_gate = Arc::clone(&gate);
+    let service = service_fn(move |request: Request<Body>| {
+        let seen = Arc::clone(&seen);
+        let service_gate = Arc::clone(&service_gate);
+        async move {
+            assert_eq!(
+                seen.fetch_add(1, Ordering::SeqCst),
+                0,
+                "no retry GET or POST"
+            );
+            assert_eq!(request.method(), Method::GET);
+            assert!(
+                service_gate
+                    .lock()
+                    .expect("gate lock")
+                    .as_ref()
+                    .expect("collector gate installed")
+                    .invalidate_authenticated_change(),
+                "the buffered fact must win before retry"
+            );
+            Ok::<_, Infallible>(status(
+                StatusCode::NOT_FOUND,
+                json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}),
+            ))
+        }
+    });
+    let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
+    let operation = transport.begin_collected_operation_session();
+    *gate.lock().expect("gate lock") = Some(operation.prewrite_gate().clone());
+
+    assert_eq!(
+        transport
+            .create_event_in_operation_session(&plan, "2026-01-01T00:00:00Z", &operation)
+            .await,
+        Err(TransportErrorV0::PreWriteInvalidated)
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the fact prevents the POST"
+    );
+}
+
+#[tokio::test]
 async fn event_lost_create_never_adopts_a_reread() {
     let plan = generated_event_plan();
     let path = format!(
@@ -3075,6 +3593,44 @@ async fn generic_event_reads_and_watches_are_rejected_without_a_wire_request() {
 }
 
 #[tokio::test]
+async fn timed_out_event_post_is_terminal_without_a_proof_get_or_replay() {
+    let plan = generated_event_plan();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&requests);
+    let service = service_fn(move |request: Request<Body>| {
+        let seen = Arc::clone(&seen);
+        async move {
+            let ordinal = seen.fetch_add(1, Ordering::SeqCst);
+            let method = request.method().clone();
+            if ordinal == 0 {
+                assert_eq!(method, Method::GET);
+                return Ok::<_, Infallible>(status(
+                    StatusCode::NOT_FOUND,
+                    json!({"kind":"Status","apiVersion":"v1","reason":"NotFound","code":404}),
+                ));
+            }
+            assert_eq!(
+                ordinal, 1,
+                "a timed-out Event POST must not reread or replay"
+            );
+            assert_eq!(method, Method::POST);
+            std::future::pending::<Result<Response<Body>, Infallible>>().await
+        }
+    });
+    let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            transport.create_or_exact_recover_event(&plan, "2026-01-01T00:00:00Z"),
+        )
+        .await
+        .expect("bounded Event POST timeout returns"),
+        Err(TransportErrorV0::ResponseLost)
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn automation_completion_uses_only_status_patch_with_an_exact_recovery_proof() {
     let spec = automation_spec();
     let desired_status = completion_status();
@@ -3114,6 +3670,62 @@ async fn automation_completion_uses_only_status_patch_with_an_exact_recovery_pro
         .expect("status persisted");
     assert_eq!(ack.new_resource_version, "5");
     assert_eq!(ack.completion, AutomationRunCompletionState::Succeeded);
+    api.assert_drained();
+}
+
+#[tokio::test]
+async fn automation_prewrite_failure_reuses_one_frozen_completion_patch() {
+    let spec = automation_spec();
+    let desired_status = completion_status();
+    let observed = automation_response(&spec, &AutomationRunStatus::default(), "4");
+    let completed = automation_response(&spec, &desired_status, "5");
+    let patch_body = json!({
+        "apiVersion":"runtime.oxideloop.dev/v1alpha1", "kind":"AutomationRun",
+        "metadata":{"name":"run-a", "namespace":"tenant-a", "resourceVersion":"4"},
+        "status": desired_status,
+    });
+    let (transport, api) = ScriptedApi::transport([
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/automationruns/run-a",
+            content_type: None,
+            body: None,
+            response: status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"kind":"Status","apiVersion":"v1","status":"Failure","code":500}),
+            ),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/automationruns/run-a",
+            content_type: None,
+            body: None,
+            response: response(observed),
+        },
+        Expected {
+            method: Method::PATCH,
+            path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/automationruns/run-a/status?&fieldManager=oxideloop-controller",
+            content_type: Some("application/apply-patch+yaml"),
+            body: Some(patch_body),
+            response: response(completed),
+        },
+    ]);
+
+    assert_eq!(
+        transport
+            .persist_automation_run_completion(
+                "tenant-a",
+                "run-a",
+                "run-uid",
+                "4",
+                &spec,
+                &desired_status,
+            )
+            .await
+            .expect("one retry retains the completion patch")
+            .new_resource_version,
+        "5"
+    );
     api.assert_drained();
 }
 
@@ -3200,9 +3812,71 @@ async fn automation_completion_lost_response_never_adopts_divergent_status_or_sp
                 &desired_status
             )
             .await,
-        Err(TransportErrorV0::Stale("automation completion pins"))
+        Err(TransportErrorV0::ManualRecoveryHold)
     );
     api.assert_drained();
+}
+
+#[tokio::test]
+async fn timed_out_automation_completion_proves_once_or_holds_without_a_second_patch() {
+    let spec = automation_spec();
+    let desired_status = completion_status();
+    let exact = automation_response(&spec, &desired_status, "5");
+    let (transport, patches) =
+        timed_out_automation_completion_transport(spec.clone(), desired_status.clone(), exact);
+    let ack = tokio::time::timeout(
+        Duration::from_secs(1),
+        transport.persist_automation_run_completion(
+            "tenant-a",
+            "run-a",
+            "run-uid",
+            "4",
+            &spec,
+            &desired_status,
+        ),
+    )
+    .await
+    .expect("bounded status response timeout reaches its one proof GET")
+    .expect("exact post-write status proves completion");
+    assert_eq!(ack.new_resource_version, "5");
+    assert_eq!(patches.load(Ordering::SeqCst), 1);
+
+    for recovery in [
+        automation_response(&spec, &AutomationRunStatus::default(), "4"),
+        {
+            let mut foreign = automation_response(&spec, &desired_status, "5");
+            foreign["metadata"]["uid"] = json!("foreign-run");
+            foreign
+        },
+        {
+            let mut divergent = automation_response(&spec, &desired_status, "5");
+            divergent["status"]["attempts"] = json!(99);
+            divergent
+        },
+    ] {
+        let (transport, patches) = timed_out_automation_completion_transport(
+            spec.clone(),
+            desired_status.clone(),
+            recovery,
+        );
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                transport.persist_automation_run_completion(
+                    "tenant-a",
+                    "run-a",
+                    "run-uid",
+                    "4",
+                    &spec,
+                    &desired_status,
+                ),
+            )
+            .await
+            .expect("bounded status response timeout reaches fail-closed proof"),
+            Err(TransportErrorV0::ManualRecoveryHold)
+        ));
+        assert_eq!(patches.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[tokio::test]
