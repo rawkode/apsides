@@ -293,6 +293,32 @@ production_inspect_line=$(rg -n -F 'docker-image-production.inspect.json' "$ROOT
 kind_load_line=$(rg -n -F 'kind load docker-image --name "$CLUSTER_NAME"' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 [ "$production_inspect_line" -lt "$kind_load_line" ] || { echo 'Docker inspect must be captured before kind loads the tag' >&2; exit 1; }
 
+recovery_delete_line=$(rg -n -F 'ctx delete configmap root-config -n "$NAMESPACE"' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+recovery_annotate_line=$(rg -n -F 'ctx annotate webapplication root -n "$NAMESPACE"' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+recovery_config_wait_line=$(rg -n -F "wait_json 'recreated root ConfigMap ownership'" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+recovery_direct_assert_line=$(rg -n -F 'managed ConfigMap owner reference' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+[ "$recovery_delete_line" -lt "$recovery_annotate_line" ] && [ "$recovery_annotate_line" -lt "$recovery_config_wait_line" ] && [ "$recovery_config_wait_line" -lt "$recovery_direct_assert_line" ] || { echo 'recovery must delete, annotate, wait for exact ConfigMap ownership, then directly assert it' >&2; exit 1; }
+recovery_wait_line=$(sed -n "${recovery_config_wait_line}p" "$ROOT/scripts/run-kind-e2e.sh")
+assert_recovery_wait_contains() { printf '%s\n' "$recovery_wait_line" | grep -Fq "$1" || { echo "recovery ownership wait is missing: $1" >&2; exit 1; }; }
+for recovery_owner_field in \
+  'apiVersion:"demo.oxideloop.dev/v1alpha1"' \
+  'kind:"WebApplication"' \
+  'name:"root"' \
+  'uid:$rootUid' \
+  'controller:true' \
+  'blockOwnerDeletion:false' \
+  'ownerReferences[]?] == ['; do
+  assert_recovery_wait_contains "$recovery_owner_field"
+done
+recovery_annotate_to_wait=$(sed -n "${recovery_annotate_line},${recovery_config_wait_line}p" "$ROOT/scripts/run-kind-e2e.sh")
+if printf '%s\n' "$recovery_annotate_to_wait" | grep -Eq 'wait_json .*webapplication/root'; then
+  echo 'root status wait occurs before exact ConfigMap ownership recovery wait' >&2
+  exit 1
+fi
+assert_not_contains "wait_json 'root current render status and durable link'"
+assert_contains 'configmap/root-config --arg rootUid "$ROOT_UID"'
+assert_contains 'collision recovery reused the foreign ConfigMap UID'
+
 # These source-level assertions intentionally reject the regressions that a
 # command fake cannot model: empty successful captures, list-index crash
 # checks, vacuous image checks, and count-only automation/deletion evidence.

@@ -148,8 +148,8 @@ trap cleanup EXIT
 
 ctx() { kubectl --request-timeout="${KUBECTL_TIMEOUT}s" --context "kind-$CLUSTER_NAME" "$@"; }
 wait_json() {
-  description=$1; filter=$2; elapsed=0
-  while ! ctx get "$3" -n "$NAMESPACE" -o json 2>/dev/null | jq -e "$filter" >/dev/null; do
+  description=$1; filter=$2; resource=$3; shift 3; elapsed=0
+  while ! ctx get "$resource" -n "$NAMESPACE" -o json 2>/dev/null | jq -e "$@" "$filter" >/dev/null; do
     [ "$elapsed" -lt "$TIMEOUT" ] || die "timed out waiting for $description"
     sleep 2; elapsed=$((elapsed + 2))
   done
@@ -470,7 +470,10 @@ assert_count "$(ctx get service -n "$NAMESPACE" -o json | jq '.items | length')"
 assert_count "$(ctx get automationruns -n "$NAMESPACE" -o json | jq '.items | length')" 0 'foreign collision AutomationRun claim'
 ctx delete configmap root-config -n "$NAMESPACE"
 ctx annotate webapplication root -n "$NAMESPACE" "oxideloop.dev/e2e-retrigger=$RUN_ID" --overwrite
-wait_json 'root current render status and durable link' '(.status.state.rootUid == .metadata.uid) and (.status.state.name | type == "string") and (.status.state.uid | type == "string") and (.status.observedGeneration == .metadata.generation) and (.status.verifiedBundleDigest == .spec.program.digest) and (.status.inputToken | type == "string") and (.status.cacheEpoch | type == "number")' webapplication/root
+wait_json 'recreated root ConfigMap ownership' '(.metadata.uid | type == "string") and ([.metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}])' configmap/root-config --arg rootUid "$ROOT_UID"
+RECOVERED_CONFIG_UID=$(ctx get configmap root-config -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')
+[ "$RECOVERED_CONFIG_UID" != "$FOREIGN_UID" ] || die 'collision recovery reused the foreign ConfigMap UID'
+wait_json 'root current render status after ConfigMap ownership' '(.status.state.rootUid == .metadata.uid) and (.status.state.name | type == "string") and (.status.state.uid | type == "string") and (.status.observedGeneration == .metadata.generation) and (.status.verifiedBundleDigest == .spec.program.digest) and (.status.inputToken | type == "string") and (.status.cacheEpoch | type == "number")' webapplication/root
 test "$(root_uid)" = "$ROOT_UID" || die 'collision recovery changed the root identity'
 assert_count "$(ctx get configmap root-config -n "$NAMESPACE" -o json | jq --arg uid "$ROOT_UID" '[.metadata.ownerReferences[]? | select(.uid == $uid)] | length')" 1 'managed ConfigMap owner reference'
 ctx get webapplication root -n "$NAMESPACE" -o json >"$EVIDENCE/initial-root.json"
