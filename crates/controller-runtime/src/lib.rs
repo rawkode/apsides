@@ -377,6 +377,8 @@ impl GenuineChangeV0 {
 pub enum FailpointV0 {
     AfterEventBeforeStatus,
     AfterStatusBeforeAck,
+    #[cfg(feature = "test-failpoints")]
+    AfterStateFinalizerBeforeRootFinalizer,
 }
 
 /// A one-shot, atomically consumed failpoint arm.  The state is small enough

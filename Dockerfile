@@ -16,6 +16,7 @@ COPY crates ./crates
 # This must stay a debug build: controller-runtime intentionally rejects a
 # release build with test-failpoints at compile time.
 RUN cargo build --locked -p oxideloop-controller-runtime --features test-failpoints --bin oxideloop-controller \
+    && cargo build --locked -p oxideloop-controller-runtime --features test-failpoints --bin oxideloop-e2e-failpoint-control \
     && cargo build --locked -p oxideloop-renderer-worker --bin renderer-worker
 
 # The e2e init container uses this statically linked BusyBox binary to create
@@ -26,6 +27,7 @@ FROM busybox:1.36.1-musl AS e2e-tools
 
 FROM gcr.io/distroless/cc-debian12:nonroot AS e2e-failpoints
 COPY --from=build-e2e-failpoints /src/target/debug/oxideloop-controller /usr/local/bin/oxideloop-controller
+COPY --from=build-e2e-failpoints /src/target/debug/oxideloop-e2e-failpoint-control /usr/local/bin/oxideloop-e2e-failpoint-control
 COPY --from=build-e2e-failpoints /src/target/debug/renderer-worker /usr/local/bin/renderer-worker
 COPY --from=e2e-tools /bin/busybox /bin/busybox
 USER 65532:65532

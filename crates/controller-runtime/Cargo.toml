@@ -11,6 +11,11 @@ publish = false
 default = []
 test-failpoints = ["dep:rustix"]
 
+[[bin]]
+name = "oxideloop-e2e-failpoint-control"
+path = "src/bin/oxideloop-e2e-failpoint-control.rs"
+required-features = ["test-failpoints"]
+
 [dependencies]
 oxideloop-bundle-archive = { path = "../bundle-archive" }
 oxideloop-bundle-contract = { path = "../bundle-contract" }

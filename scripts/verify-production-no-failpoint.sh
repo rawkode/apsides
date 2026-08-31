@@ -114,8 +114,10 @@ grep -F 'FROM gcr.io/distroless/cc-debian12:nonroot AS production' "$dockerfile"
 grep -F 'FROM gcr.io/distroless/cc-debian12:nonroot AS e2e-failpoints' "$dockerfile" >/dev/null || fail "e2e runtime target missing"
 grep -F 'cargo build --locked --release -p oxideloop-controller-runtime --bin oxideloop-controller' "$dockerfile" >/dev/null || fail "production controller release build missing"
 grep -F 'cargo build --locked -p oxideloop-controller-runtime --features test-failpoints --bin oxideloop-controller' "$dockerfile" >/dev/null || fail "debug failpoint build missing"
+grep -F 'cargo build --locked -p oxideloop-controller-runtime --features test-failpoints --bin oxideloop-e2e-failpoint-control' "$dockerfile" >/dev/null || fail "e2e control client build missing"
 grep -F 'target/release/oxideloop-controller' "$dockerfile" >/dev/null || fail "production controller artifact path missing"
 grep -F 'target/debug/oxideloop-controller' "$dockerfile" >/dev/null || fail "e2e controller artifact path missing"
+grep -F 'target/debug/oxideloop-e2e-failpoint-control' "$dockerfile" >/dev/null || fail "e2e control client artifact path missing"
 grep -F 'COPY --from=e2e-tools /bin/busybox /bin/busybox' "$dockerfile" >/dev/null || fail "e2e failpoint init utility missing"
 last_target=$(awk '/^FROM / { target=$NF } END { print target }' "$dockerfile")
 [ "$last_target" = "production" ] || fail "production must be the safe default final Dockerfile target"
@@ -182,7 +184,8 @@ if [ -n "$runtime_tool" ]; then
     "$runtime_tool" cp "$container:/usr/local/bin/renderer-worker" "$WORK_DIR/$label-renderer"
     "$runtime_tool" rm "$container" >/dev/null
     tar -tf "$WORK_DIR/$label.tar" >"$WORK_DIR/$label.files"
-    grep -E '(^|/)(src|target|Cargo\.toml|Cargo\.lock|\.git)(/|$)' "$WORK_DIR/$label.files" >/dev/null && fail "$image contains source/build-tree content"
+    source_tree_entries=$(grep -E '(^|/)(src|target|Cargo\.toml|Cargo\.lock|\.git)(/|$)' "$WORK_DIR/$label.files" | grep -vE '^usr/src/?$' || true)
+    [ -z "$source_tree_entries" ] || fail "$image contains source/build-tree content"
     grep -E '(^|/)(usr/bin/(apt|apt-get|dpkg)|var/lib/(apt|dpkg))(/|$)' "$WORK_DIR/$label.files" >/dev/null && fail "$image contains package-manager/cache content"
   }
 
@@ -192,12 +195,18 @@ if [ -n "$runtime_tool" ]; then
   export_image_tree "$e2e_image" e2e-image
   grep -E '(^|/)etc/ssl/certs/ca-certificates\.crt$' "$WORK_DIR/production-image.files" >/dev/null || fail "production image is missing the CA bundle required by rustls"
   check_binary "$WORK_DIR/production-image-controller"
+  if grep -F 'usr/local/bin/oxideloop-e2e-failpoint-control' "$WORK_DIR/production-image.files" >/dev/null; then
+    fail "production image contains the e2e control client"
+  fi
+  grep -F 'usr/local/bin/oxideloop-e2e-failpoint-control' "$WORK_DIR/e2e-image.files" >/dev/null || fail "e2e image is missing the e2e control client"
   command -v strings >/dev/null 2>&1 || fail "strings is required for image binary inspection"
   if strings "$WORK_DIR/production-image-renderer" 2>/dev/null | grep -qiE 'evaluator-binary|failpoint'; then
     fail "production renderer contains debug listener/flag evidence"
   fi
   e2e_help=$("$runtime_tool" run --rm --entrypoint /usr/local/bin/oxideloop-controller "$e2e_image" --help 2>&1 || true)
   echo "$e2e_help" | grep -E '^usage:.*failpoint-unix-socket' >/dev/null || fail "e2e image does not expose its debug failpoint surface"
+  control_help=$("$runtime_tool" run --rm --entrypoint /usr/local/bin/oxideloop-e2e-failpoint-control "$e2e_image" --help 2>&1 || true)
+  echo "$control_help" | grep -F 'AfterStateFinalizerBeforeRootFinalizer' >/dev/null || fail "e2e control client does not expose the deletion barrier"
   echo "runtime image verification: passed for exact production/e2e targets"
 else
   echo "runtime image/content verification: SKIPPED (Docker/Podman unavailable; no image proof claimed)" >&2

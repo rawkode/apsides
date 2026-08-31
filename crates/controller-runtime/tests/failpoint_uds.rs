@@ -3,7 +3,7 @@
 use std::{
     ffi::OsString,
     fs,
-    io::Write,
+    io::{Read, Write},
     os::unix::{
         ffi::OsStringExt,
         fs::{FileTypeExt, PermissionsExt},
@@ -17,7 +17,9 @@ use std::{
 
 use oxideloop_controller_runtime::{
     FailpointV0, FailpointsV0,
-    failpoint_uds::{FailpointUdsError, FailpointUdsListenerV0, MAX_REQUEST_BYTES},
+    failpoint_uds::{
+        FailpointControlV0, FailpointUdsError, FailpointUdsListenerV0, MAX_REQUEST_BYTES,
+    },
 };
 
 struct TestDir(PathBuf);
@@ -207,6 +209,100 @@ fn arm_into_is_one_shot_for_both_automation_windows() {
             Err(FailpointUdsError::AlreadyConsumed)
         ));
     }
+}
+
+#[test]
+fn action_arm_is_not_observable_until_the_listener_acknowledges_it() {
+    let root = TestDir::new();
+    let path = socket_path(&root, "armed.sock");
+    let mut listener = FailpointUdsListenerV0::bind(&path).expect("bind listener");
+    let mut client = connect(&path);
+    client
+        .write_all(b"AfterEventBeforeStatus\n")
+        .expect("send action arm");
+    let arm = match listener.poll_control().expect("poll control") {
+        Some(FailpointControlV0::Arm(arm)) => arm,
+        control => panic!("unexpected control: {control:?}"),
+    };
+    assert_eq!(
+        arm.acknowledge().expect("acknowledge"),
+        FailpointV0::AfterEventBeforeStatus
+    );
+    let mut acknowledgement = [0_u8; 6];
+    client.read_exact(&mut acknowledgement).expect("read ARMED");
+    assert_eq!(&acknowledgement, b"ARMED\n");
+}
+
+#[test]
+fn deletion_barrier_signals_reached_then_requires_exact_release() {
+    let root = TestDir::new();
+    let path = socket_path(&root, "barrier.sock");
+    let mut listener = FailpointUdsListenerV0::bind(&path).expect("bind listener");
+    let mut client = connect(&path);
+    client
+        .write_all(b"AfterStateFinalizerBeforeRootFinalizer\n")
+        .expect("arm barrier");
+    let barrier = match listener.poll_control().expect("poll barrier") {
+        Some(FailpointControlV0::DeletionBarrier(barrier)) => barrier,
+        control => panic!("unexpected control: {control:?}"),
+    };
+    assert!(listener.is_consumed());
+    let waiter = thread::spawn(move || barrier.reached_and_wait_for_release());
+    let mut reached = [0_u8; 8];
+    client.read_exact(&mut reached).expect("read reached");
+    assert_eq!(&reached, b"REACHED\n");
+    client.write_all(b"RELEASE\n").expect("release barrier");
+    waiter
+        .join()
+        .expect("join barrier waiter")
+        .expect("accepted release");
+}
+
+#[test]
+fn deletion_barrier_fails_closed_when_release_is_missing_or_wrong() {
+    let root = TestDir::new();
+    let path = socket_path(&root, "bad-release.sock");
+    let mut listener = FailpointUdsListenerV0::bind(&path).expect("bind listener");
+    let mut client = connect(&path);
+    client
+        .write_all(b"AfterStateFinalizerBeforeRootFinalizer\n")
+        .expect("arm barrier");
+    let barrier = match listener.poll_control().expect("poll barrier") {
+        Some(FailpointControlV0::DeletionBarrier(barrier)) => barrier,
+        control => panic!("unexpected control: {control:?}"),
+    };
+    let waiter = thread::spawn(move || barrier.reached_and_wait_for_release());
+    let mut reached = [0_u8; 8];
+    client.read_exact(&mut reached).expect("read reached");
+    client.write_all(b"RELEASE now\n").expect("bad release");
+    assert!(matches!(
+        waiter.join().expect("join barrier waiter"),
+        Err(FailpointUdsError::MalformedRelease)
+    ));
+}
+
+#[test]
+fn deletion_barrier_release_has_one_total_deadline() {
+    let root = TestDir::new();
+    let path = socket_path(&root, "release-deadline.sock");
+    let mut listener = FailpointUdsListenerV0::bind(&path).expect("bind listener");
+    let mut client = connect(&path);
+    client
+        .write_all(b"AfterStateFinalizerBeforeRootFinalizer\n")
+        .expect("arm barrier");
+    let barrier = match listener.poll_control().expect("poll barrier") {
+        Some(FailpointControlV0::DeletionBarrier(barrier)) => barrier,
+        control => panic!("unexpected control: {control:?}"),
+    };
+    let waiter = thread::spawn(move || {
+        barrier.reached_and_wait_for_release_with_deadline(Duration::from_millis(20))
+    });
+    let mut reached = [0_u8; 8];
+    client.read_exact(&mut reached).expect("read reached");
+    assert!(matches!(
+        waiter.join().expect("join barrier waiter"),
+        Err(FailpointUdsError::ReleaseDeadlineExceeded)
+    ));
 }
 
 #[test]

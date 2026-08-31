@@ -31,7 +31,11 @@ use oxideloop_renderer_abi::{
     model::{ABI_VERSION_V0, Dependency, RenderInputV0, RootProjection},
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+#[cfg(feature = "test-failpoints")]
+use tokio::time::{Instant as TokioInstant, sleep, timeout_at};
 
+#[cfg(feature = "test-failpoints")]
+use crate::failpoint_uds::{DeletionBarrierV0, FailpointControlV0};
 use crate::{
     BufferedRetainedWatchV0, CompletedObservationFenceOutcomeV0, FailpointsV0, FixedPointPortV0,
     KubeAutomationObservationPortV0, KubeAutomationPortV0, KubeDeletionObservationPortV0,
@@ -39,6 +43,8 @@ use crate::{
     RetainedWatchCoordinationV0, RootActorV0, RuntimeErrorV0, UnixRendererPortV0,
     dispatch_transport_command, drive_automation, load_machine_from_transport,
 };
+#[cfg(feature = "test-failpoints")]
+use oxideloop_kube_transport::ObjectV0;
 
 /// Explicit production inputs.  There is no archive-file, TCP renderer, or
 /// ambient environment configuration path.
@@ -83,6 +89,14 @@ impl DriverConfigV0 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DriverExitV0 {
     RootFinalized,
+}
+
+enum QuiescentWakeV0 {
+    #[cfg(feature = "test-failpoints")]
+    FailpointPoll,
+    Root(Result<WatchEventV0, TransportErrorV0>),
+    Dependency(Result<BufferedRetainedWatchV0, RuntimeErrorV0>),
+    Automation(Box<Result<oxideloop_kube_transport::ValidatedAutomationRunV0, TransportErrorV0>>),
 }
 
 /// Single-replica process driver.  One instance is deliberately one exact
@@ -140,10 +154,86 @@ impl ControllerDriverV0 {
             .map(crate::failpoint_uds::FailpointUdsListenerV0::bind)
             .transpose()
             .map_err(|error| RuntimeErrorV0::Hold(format!("invalid failpoint socket: {error}")))?;
+        #[cfg(feature = "test-failpoints")]
+        let mut deletion_barrier = None;
+        #[cfg(feature = "test-failpoints")]
+        for _ in 0..10 {
+            let Some(listener) = failpoint_listener.as_mut() else {
+                break;
+            };
+            let control = listener
+                .poll_control()
+                .map_err(|error| RuntimeErrorV0::Hold(format!("failpoint arm failed: {error}")))?;
+            if listener.is_consumed() {
+                failpoint_listener = None;
+            }
+            match control {
+                Some(FailpointControlV0::Arm(arm)) => {
+                    failpoints.arm(arm.point())?;
+                    arm.acknowledge().map_err(|error| {
+                        RuntimeErrorV0::Hold(format!("failpoint acknowledgement failed: {error}"))
+                    })?;
+                    break;
+                }
+                Some(FailpointControlV0::DeletionBarrier(mut barrier)) => {
+                    barrier.acknowledge().map_err(|error| {
+                        RuntimeErrorV0::Hold(format!("failpoint acknowledgement failed: {error}"))
+                    })?;
+                    deletion_barrier = Some(barrier);
+                    break;
+                }
+                None => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        }
 
         loop {
+            // Debug control is checked before every root-watch drain and
+            // command choice. It is nonblocking until the exact deletion
+            // midpoint, so an armed test cannot be stranded behind an idle
+            // controller or an unrelated action execution.
+            #[cfg(feature = "test-failpoints")]
+            if let Some(listener) = failpoint_listener.as_mut() {
+                let control = listener.poll_control().map_err(|error| {
+                    RuntimeErrorV0::Hold(format!("failpoint arm failed: {error}"))
+                })?;
+                if listener.is_consumed() {
+                    failpoint_listener = None;
+                }
+                match control {
+                    Some(FailpointControlV0::Arm(arm)) => {
+                        failpoints.arm(arm.point())?;
+                        arm.acknowledge().map_err(|error| {
+                            RuntimeErrorV0::Hold(format!(
+                                "failpoint acknowledgement failed: {error}"
+                            ))
+                        })?;
+                    }
+                    Some(FailpointControlV0::DeletionBarrier(mut barrier)) => {
+                        barrier.acknowledge().map_err(|error| {
+                            RuntimeErrorV0::Hold(format!(
+                                "failpoint acknowledgement failed: {error}"
+                            ))
+                        })?;
+                        deletion_barrier = Some(barrier);
+                    }
+                    None => {}
+                }
+            }
             let Some(active) = actor.as_mut() else {
-                match root_watch.next_event().await {
+                #[cfg(feature = "test-failpoints")]
+                let Ok(root_event) = tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    root_watch.next_event(),
+                )
+                .await
+                else {
+                    continue;
+                };
+                #[cfg(not(feature = "test-failpoints"))]
+                let root_event = root_watch.next_event().await;
+                match root_event {
                     Ok(event) => {
                         if watch_targets_root(&event, &self.config.root_name)
                             && let Some(machine) = load_machine_from_transport(
@@ -437,6 +527,8 @@ impl ControllerDriverV0 {
                     active.consume_internal();
                 }
                 Some(command) => {
+                    #[cfg(feature = "test-failpoints")]
+                    reject_late_deletion_barrier(&command, deletion_barrier.is_some())?;
                     let (event, buffered) = match execute_kubernetes_command_while_observing(
                         &self.transport,
                         &root_address(active)?,
@@ -481,6 +573,33 @@ impl ControllerDriverV0 {
                             "Kubernetes command did not produce an acknowledgement".into(),
                         )
                     })?;
+                    #[cfg(feature = "test-failpoints")]
+                    if deletion_barrier.is_some()
+                        && matches!(command, CommandV0::RemoveStateFinalizer { .. })
+                    {
+                        if !is_exact_state_finalizer_result(&command, &event) {
+                            return Err(RuntimeErrorV0::Hold(
+                                "armed deletion barrier received a mismatched state-finalizer acknowledgement"
+                                    .into(),
+                            ));
+                        }
+                        let barrier = deletion_barrier.take().ok_or_else(|| {
+                            RuntimeErrorV0::Hold(
+                                "armed deletion barrier disappeared before interception".into(),
+                            )
+                        })?;
+                        verify_deletion_barrier_and_wait(
+                            barrier,
+                            &event,
+                            active,
+                            &self.transport,
+                            &self.config,
+                        )
+                        .await?;
+                        return Err(RuntimeErrorV0::InjectedCrash(
+                            crate::FailpointV0::AfterStateFinalizerBeforeRootFinalizer,
+                        ));
+                    }
                     // Exact effect acknowledgement is reducer authority and
                     // must reduce before an observed root closure/rebase.
                     active.acknowledge(event)?;
@@ -535,12 +654,6 @@ impl ControllerDriverV0 {
                             ));
                         }
                         if !active.state().root().deleting {
-                            #[cfg(feature = "test-failpoints")]
-                            if let Some(listener) = failpoint_listener.as_mut() {
-                                listener.arm_into(&mut failpoints).map_err(|error| {
-                                    RuntimeErrorV0::Hold(format!("failpoint arm failed: {error}"))
-                                })?;
-                            }
                             let descriptor = descriptor_for_program(
                                 &self.transport,
                                 &self.store,
@@ -603,29 +716,12 @@ impl ControllerDriverV0 {
                     let mut root_only_recovery = false;
                     {
                         let port = fixed_point.as_mut();
-                        tokio::select! {
-                            root = root_watch.next_event() => {
-                                match root {
-                                    Ok(event) if watch_targets_root(&event, &self.config.root_name) => {
-                                        root_only_recovery = refresh_actor_from_transport(
-                                            active,
-                                            &self.transport,
-                                            &self.config,
-                                        ).await?;
-                                    }
-                                    Ok(_) => {}
-                                    Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
-                                        active.watch_invalidated();
-                                        let (watch, fresh) = establish_root_barrier(
-                                            &self.transport,
-                                            &self.config,
-                                        ).await?;
-                                        root_watch = watch;
-                                        root_only_recovery = refresh_actor_from_machine(active, fresh)?;
-                                    }
-                                    Err(error) => return Err(error.into()),
-                                }
+                        #[cfg(feature = "test-failpoints")]
+                        let wake = tokio::select! {
+                            () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                                QuiescentWakeV0::FailpointPoll
                             }
+                            root = root_watch.next_event() => QuiescentWakeV0::Root(root),
                             change = async {
                                 match port {
                                     Some(port) => port.await_buffered_retained_watch().await,
@@ -634,21 +730,7 @@ impl ControllerDriverV0 {
                                         RuntimeErrorV0,
                                     >>().await,
                                 }
-                            } => {
-                                match change {
-                                    Ok(record) => {
-                                        let port = fixed_point.as_mut().ok_or_else(|| {
-                                            RuntimeErrorV0::Hold("retained port disappeared".into())
-                                        })?;
-                                        match port.apply_buffered_retained_watch(active, record)? {
-                                            RetainedWatchCoordinationV0::ReconcileScheduled
-                                            | RetainedWatchCoordinationV0::DuplicateIgnored
-                                            | RetainedWatchCoordinationV0::RestartRequired => {}
-                                        }
-                                    }
-                                    Err(error) => return Err(error),
-                                }
-                            }
+                            } => QuiescentWakeV0::Dependency(change),
                             run = async {
                                 match automation_watch.as_mut() {
                                     Some(watch) => watch.next_change().await,
@@ -657,15 +739,77 @@ impl ControllerDriverV0 {
                                         TransportErrorV0,
                                     >>().await,
                                 }
-                            } => {
-                                match run {
-                                    Ok(_) => {}
-                                    Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
-                                        automation_watch = None;
-                                    }
-                                    Err(error) => return Err(error.into()),
+                            } => QuiescentWakeV0::Automation(Box::new(run)),
+                        };
+                        #[cfg(not(feature = "test-failpoints"))]
+                        let wake = tokio::select! {
+                            root = root_watch.next_event() => QuiescentWakeV0::Root(root),
+                            change = async {
+                                match port {
+                                    Some(port) => port.await_buffered_retained_watch().await,
+                                    None => std::future::pending::<Result<
+                                        BufferedRetainedWatchV0,
+                                        RuntimeErrorV0,
+                                    >>().await,
                                 }
-                            }
+                            } => QuiescentWakeV0::Dependency(change),
+                            run = async {
+                                match automation_watch.as_mut() {
+                                    Some(watch) => watch.next_change().await,
+                                    None => std::future::pending::<Result<
+                                        oxideloop_kube_transport::ValidatedAutomationRunV0,
+                                        TransportErrorV0,
+                                    >>().await,
+                                }
+                            } => QuiescentWakeV0::Automation(Box::new(run)),
+                        };
+                        match wake {
+                            #[cfg(feature = "test-failpoints")]
+                            QuiescentWakeV0::FailpointPoll => {}
+                            QuiescentWakeV0::Root(root) => match root {
+                                Ok(event) if watch_targets_root(&event, &self.config.root_name) => {
+                                    root_only_recovery = refresh_actor_from_transport(
+                                        active,
+                                        &self.transport,
+                                        &self.config,
+                                    )
+                                    .await?;
+                                }
+                                Ok(_) => {}
+                                Err(
+                                    TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow,
+                                ) => {
+                                    active.watch_invalidated();
+                                    let (watch, fresh) =
+                                        establish_root_barrier(&self.transport, &self.config)
+                                            .await?;
+                                    root_watch = watch;
+                                    root_only_recovery = refresh_actor_from_machine(active, fresh)?;
+                                }
+                                Err(error) => return Err(error.into()),
+                            },
+                            QuiescentWakeV0::Dependency(change) => match change {
+                                Ok(record) => {
+                                    let port = fixed_point.as_mut().ok_or_else(|| {
+                                        RuntimeErrorV0::Hold("retained port disappeared".into())
+                                    })?;
+                                    match port.apply_buffered_retained_watch(active, record)? {
+                                        RetainedWatchCoordinationV0::ReconcileScheduled
+                                        | RetainedWatchCoordinationV0::DuplicateIgnored
+                                        | RetainedWatchCoordinationV0::RestartRequired => {}
+                                    }
+                                }
+                                Err(error) => return Err(error),
+                            },
+                            QuiescentWakeV0::Automation(run) => match *run {
+                                Ok(_) => {}
+                                Err(
+                                    TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow,
+                                ) => {
+                                    automation_watch = None;
+                                }
+                                Err(error) => return Err(error.into()),
+                            },
                         }
                     }
                     if root_only_recovery {
@@ -1437,6 +1581,168 @@ fn root_address(
     })
 }
 
+#[cfg(feature = "test-failpoints")]
+fn is_exact_state_finalizer_result(command: &CommandV0, event: &EventV0) -> bool {
+    matches!(
+        (command, event),
+        (
+            CommandV0::RemoveStateFinalizer { token, preconditions },
+            EventV0::StateFinalizerRemoved {
+                token: event_token,
+                state_uid,
+                old_state_resource_version,
+                ..
+            },
+        ) if token == event_token
+            && state_uid == &preconditions.state_uid
+            && old_state_resource_version == &preconditions.state_resource_version
+    )
+}
+
+#[cfg(feature = "test-failpoints")]
+fn reject_late_deletion_barrier(
+    command: &CommandV0,
+    barrier_is_armed: bool,
+) -> Result<(), RuntimeErrorV0> {
+    if barrier_is_armed && matches!(command, CommandV0::RemoveRootFinalizer { .. }) {
+        Err(RuntimeErrorV0::Hold(
+            "deletion barrier was armed after the state-finalizer seam; refusing root-finalizer authority"
+                .into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Proves the exact root-only deletion recovery state before exposing the
+/// midpoint to e2e. The direct state reread establishes absence first; the
+/// loader then validates the same deleting root, its finalizer, and complete
+/// cleanup receipt without allowing an arbitrary raw object to become proof.
+#[cfg(feature = "test-failpoints")]
+async fn verify_deletion_barrier_and_wait(
+    barrier: DeletionBarrierV0,
+    event: &EventV0,
+    active: &RootActorV0,
+    transport: &KubeTransportV0,
+    config: &DriverConfigV0,
+) -> Result<(), RuntimeErrorV0> {
+    let original = active.state().root();
+    let (_, state_ref) = root_address(active)?.references();
+    let EventV0::StateFinalizerRemoved {
+        state_uid: expected_state_uid,
+        ..
+    } = event
+    else {
+        return Err(RuntimeErrorV0::Hold(
+            "deletion barrier received the wrong event".into(),
+        ));
+    };
+    wait_for_exact_state_absence(transport, &state_ref, expected_state_uid).await?;
+    let fresh = load_machine_from_transport(transport, &config.namespace, &config.root_name)
+        .await?
+        .ok_or_else(|| RuntimeErrorV0::Hold("deletion barrier root is absent".into()))?;
+    validate_deletion_barrier_root(original, fresh.root())?;
+    tokio::task::block_in_place(|| barrier.reached_and_wait_for_release())
+        .map_err(|error| RuntimeErrorV0::Hold(format!("deletion barrier failed: {error}")))
+}
+
+#[cfg(feature = "test-failpoints")]
+fn validate_deletion_barrier_root(
+    original: &oxideloop_controller_core::RootSnapshotV0,
+    current: &oxideloop_controller_core::RootSnapshotV0,
+) -> Result<(), RuntimeErrorV0> {
+    if current.uid != original.uid
+        || current.namespace != original.namespace
+        || current.name != original.name
+        || !current.deleting
+        || !current.root_finalizer_present
+        || current.status.deletion_cleanup_receipt != original.status.deletion_cleanup_receipt
+    {
+        return Err(RuntimeErrorV0::Hold(
+            "deletion barrier root/receipt proof changed or is incomplete".into(),
+        ));
+    }
+    oxideloop_controller_core::validate_deleting_root_receipt(current).map_err(|error| {
+        RuntimeErrorV0::Hold(format!("deletion barrier receipt is invalid: {error}"))
+    })?;
+    Ok(())
+}
+
+#[cfg(feature = "test-failpoints")]
+const STATE_ABSENCE_TOTAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(feature = "test-failpoints")]
+const STATE_ABSENCE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Deletion of a state object can lag its successful finalizer patch. Only
+/// the exact state UID may remain during this bounded wait; a same-name
+/// replacement is never a reason to wait or continue the deletion protocol.
+#[cfg(feature = "test-failpoints")]
+async fn wait_for_exact_state_absence(
+    transport: &KubeTransportV0,
+    state_ref: &ObjectRefV0,
+    expected_uid: &str,
+) -> Result<(), RuntimeErrorV0> {
+    wait_for_exact_state_absence_with(
+        || async {
+            transport
+                .reread(state_ref)
+                .await
+                .map_err(RuntimeErrorV0::from)
+        },
+        expected_uid,
+        STATE_ABSENCE_TOTAL_DEADLINE,
+        STATE_ABSENCE_POLL_INTERVAL,
+    )
+    .await
+}
+
+#[cfg(feature = "test-failpoints")]
+async fn wait_for_exact_state_absence_with<F, Fut>(
+    mut reread: F,
+    expected_uid: &str,
+    total_deadline: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> Result<(), RuntimeErrorV0>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Option<ObjectV0>, RuntimeErrorV0>>,
+{
+    let deadline = TokioInstant::now() + total_deadline;
+    loop {
+        let observed = timeout_at(deadline, reread()).await.map_err(|_| {
+            RuntimeErrorV0::Hold(
+                "deletion barrier deterministic state reread exceeded deadline".into(),
+            )
+        })??;
+        if state_absence_step(observed.as_ref(), expected_uid)? {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(TokioInstant::now());
+        if remaining.is_zero() {
+            return Err(RuntimeErrorV0::Hold(
+                "deletion barrier deterministic state did not become absent before deadline".into(),
+            ));
+        }
+        sleep(poll_interval.min(remaining)).await;
+    }
+}
+
+/// Returns true only for absence; the exact pre-delete UID is retryable and
+/// any replacement closes the failpoint without exposing a midpoint.
+#[cfg(feature = "test-failpoints")]
+fn state_absence_step(
+    observed: Option<&ObjectV0>,
+    expected_uid: &str,
+) -> Result<bool, RuntimeErrorV0> {
+    match observed {
+        None => Ok(true),
+        Some(observed) if observed.metadata.uid == expected_uid => Ok(false),
+        Some(_) => Err(RuntimeErrorV0::Hold(
+            "deletion barrier deterministic state name was replaced".into(),
+        )),
+    }
+}
+
 fn render_input(
     actor: &RootActorV0,
     preconditions: &PreconditionsV0,
@@ -1605,6 +1911,8 @@ fn event_time() -> Result<String, RuntimeErrorV0> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "test-failpoints")]
+    use std::collections::VecDeque;
     use std::{
         collections::BTreeMap,
         convert::Infallible,
@@ -1655,6 +1963,183 @@ mod tests {
             },
             value: json!({"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication","metadata":{"name":"root","namespace":"ns","uid":ROOT_UID,"resourceVersion":resource_version}}),
         }
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[test]
+    fn deletion_barrier_state_absence_waits_only_for_the_exact_deleted_uid() {
+        let original = root_event("state-rv");
+        assert!(!state_absence_step(Some(&original), ROOT_UID).expect("same UID is retryable"));
+        assert!(state_absence_step(None, ROOT_UID).expect("absence is accepted"));
+
+        let mut replacement = original;
+        replacement.metadata.uid = "replacement-uid".into();
+        assert!(matches!(
+            state_absence_step(Some(&replacement), ROOT_UID),
+            Err(RuntimeErrorV0::Hold(reason)) if reason.contains("replaced")
+        ));
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[test]
+    fn deletion_barrier_root_proof_fails_closed_on_uid_finalizer_or_receipt_change() {
+        let original = receipt_bounded_root_only_machine().root().clone();
+        validate_deletion_barrier_root(&original, &original).expect("complete original proof");
+
+        let mut replacement = original.clone();
+        replacement.uid = "replacement-uid".into();
+        assert!(validate_deletion_barrier_root(&original, &replacement).is_err());
+
+        let mut missing_finalizer = original.clone();
+        missing_finalizer.root_finalizer_present = false;
+        assert!(validate_deletion_barrier_root(&original, &missing_finalizer).is_err());
+
+        let mut missing_receipt = original.clone();
+        missing_receipt.status.deletion_cleanup_receipt = None;
+        assert!(validate_deletion_barrier_root(&original, &missing_receipt).is_err());
+
+        let mutations: [fn(&mut oxideloop_controller_api::DeletionCleanupReceipt); 6] = [
+            |receipt: &mut oxideloop_controller_api::DeletionCleanupReceipt| {
+                receipt.deletion_id = "f".repeat(64);
+            },
+            |receipt: &mut oxideloop_controller_api::DeletionCleanupReceipt| {
+                receipt.deletion_start_generation += 1;
+            },
+            |receipt: &mut oxideloop_controller_api::DeletionCleanupReceipt| {
+                receipt.cleanup_token = "f".repeat(64);
+            },
+            |receipt: &mut oxideloop_controller_api::DeletionCleanupReceipt| {
+                receipt.state_name = "other-state".into();
+            },
+            |receipt: &mut oxideloop_controller_api::DeletionCleanupReceipt| {
+                receipt.state_uid = "other-state-uid".into();
+            },
+            |receipt: &mut oxideloop_controller_api::DeletionCleanupReceipt| {
+                receipt.root_uid = "other-root-uid".into();
+            },
+        ];
+        for mutate in mutations {
+            let mut changed = original.clone();
+            mutate(
+                changed
+                    .status
+                    .deletion_cleanup_receipt
+                    .as_mut()
+                    .expect("receipt"),
+            );
+            assert!(validate_deletion_barrier_root(&original, &changed).is_err());
+        }
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn deletion_barrier_waits_for_the_original_state_to_disappear() {
+        let responses = Arc::new(Mutex::new(VecDeque::from([
+            Some(root_event("state-rv-1")),
+            Some(root_event("state-rv-2")),
+            None,
+        ])));
+        wait_for_exact_state_absence_with(
+            {
+                let responses = Arc::clone(&responses);
+                move || {
+                    let responses = Arc::clone(&responses);
+                    async move { Ok(responses.lock().expect("responses").pop_front().unwrap()) }
+                }
+            },
+            ROOT_UID,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .expect("state eventually disappears");
+        assert!(responses.lock().expect("responses").is_empty());
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[tokio::test]
+    async fn deletion_barrier_state_absence_timeout_and_replacement_fail_closed() {
+        let timeout = wait_for_exact_state_absence_with(
+            || async { Ok(Some(root_event("state-rv"))) },
+            ROOT_UID,
+            std::time::Duration::from_millis(2),
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert!(matches!(
+            timeout,
+            Err(RuntimeErrorV0::Hold(reason)) if reason.contains("did not become absent")
+        ));
+
+        let mut replacement = root_event("state-rv");
+        replacement.metadata.uid = "replacement".into();
+        let replacement = wait_for_exact_state_absence_with(
+            || {
+                let replacement = replacement.clone();
+                async move { Ok(Some(replacement)) }
+            },
+            ROOT_UID,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert!(matches!(
+            replacement,
+            Err(RuntimeErrorV0::Hold(reason)) if reason.contains("replaced")
+        ));
+
+        let stalled = wait_for_exact_state_absence_with(
+            || async { std::future::pending::<Result<Option<ObjectV0>, RuntimeErrorV0>>().await },
+            ROOT_UID,
+            std::time::Duration::from_millis(2),
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert!(matches!(
+            stalled,
+            Err(RuntimeErrorV0::Hold(reason)) if reason.contains("reread exceeded deadline")
+        ));
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[test]
+    fn deletion_barrier_intercepts_only_the_exact_state_finalizer_ack() {
+        let preconditions = PreconditionsV0 {
+            root_uid: ROOT_UID.into(),
+            root_generation: 1,
+            root_resource_version: "root-rv".into(),
+            state_uid: "state-uid".into(),
+            state_resource_version: "state-rv".into(),
+            observation_token: "observation".into(),
+            cache_epoch: "epoch".into(),
+        };
+        let command = CommandV0::RemoveStateFinalizer {
+            token: "state-finalizer-token".into(),
+            preconditions: preconditions.clone(),
+        };
+        let exact = EventV0::StateFinalizerRemoved {
+            token: "state-finalizer-token".into(),
+            state_uid: "state-uid".into(),
+            old_state_resource_version: "state-rv".into(),
+            new_state_resource_version: "state-rv-next".into(),
+        };
+        assert!(is_exact_state_finalizer_result(&command, &exact));
+
+        let stale = EventV0::StateFinalizerRemoved {
+            token: "state-finalizer-token".into(),
+            state_uid: "state-uid".into(),
+            old_state_resource_version: "stale".into(),
+            new_state_resource_version: "state-rv-next".into(),
+        };
+        assert!(!is_exact_state_finalizer_result(&command, &stale));
+        let root_command = CommandV0::RemoveRootFinalizer {
+            token: "root-finalizer-token".into(),
+            preconditions,
+        };
+        assert!(!is_exact_state_finalizer_result(&root_command, &exact));
+        assert!(reject_late_deletion_barrier(&root_command, true).is_err());
+        assert!(reject_late_deletion_barrier(&root_command, false).is_ok());
+        assert!(reject_late_deletion_barrier(&command, true).is_ok());
     }
 
     fn dependency_event(resource_version: &str) -> ObjectV0 {

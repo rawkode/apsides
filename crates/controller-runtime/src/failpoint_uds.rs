@@ -16,11 +16,14 @@
 //! not decide when a process exits; that is owned by the controller wiring.
 //!
 //! The wire format is one UTF-8-free ASCII line: exactly
-//! `AfterEventBeforeStatus\n` or `AfterStatusBeforeAck\n`.
+//! `AfterEventBeforeStatus\n`, `AfterStatusBeforeAck\n`, or
+//! `AfterStateFinalizerBeforeRootFinalizer\n`. The deletion request retains
+//! its one connected client and uses `REACHED\n` / `RELEASE\n` as a bounded
+//! in-band handshake; it never opens a TCP port or another listener.
 
 use std::{
     ffi::{OsStr, OsString},
-    io::{self, Read},
+    io::{self, Read, Write},
     os::{
         fd::{AsFd, OwnedFd},
         unix::{
@@ -46,6 +49,9 @@ pub const MAX_REQUEST_BYTES: usize = 64;
 const SOCKET_MODE: u32 = 0o600;
 const PARENT_MODE: u32 = 0o700;
 const READ_TOTAL_DEADLINE: Duration = Duration::from_millis(100);
+// Fixed and total: e2e has time to record raw midpoint evidence, but neither
+// a client nor the environment can extend the controller's blocked window.
+const RELEASE_TOTAL_DEADLINE: Duration = Duration::from_secs(60);
 const MAX_SOCKET_PATH_BYTES: usize = 100;
 
 /// Errors from validating or servicing the debug-only arming socket.
@@ -77,6 +83,91 @@ pub enum FailpointUdsError {
     AlreadyConsumed,
     #[error("a failpoint is already armed")]
     AlreadyArmed,
+    #[error("deletion barrier release is malformed")]
+    MalformedRelease,
+    #[error("deletion barrier release exceeded its total deadline")]
+    ReleaseDeadlineExceeded,
+}
+
+/// One accepted debug control request. This is deliberately only compiled
+/// with the debug-only failpoint feature.
+#[derive(Debug)]
+pub enum FailpointControlV0 {
+    Arm(ActionArmV0),
+    DeletionBarrier(DeletionBarrierV0),
+}
+
+pub struct ActionArmV0 {
+    point: FailpointV0,
+    stream: UnixStream,
+}
+
+impl std::fmt::Debug for ActionArmV0 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ActionArmV0")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ActionArmV0 {
+    #[must_use]
+    pub fn point(&self) -> FailpointV0 {
+        self.point
+    }
+
+    pub fn acknowledge(mut self) -> Result<FailpointV0, FailpointUdsError> {
+        match self.stream.write_all(b"ARMED\n") {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                ) => {}
+            Err(error) => return Err(FailpointUdsError::Read(error)),
+        }
+        Ok(self.point)
+    }
+}
+
+/// The one-shot connected peer retained for the deletion midpoint handshake.
+pub struct DeletionBarrierV0 {
+    stream: UnixStream,
+}
+
+impl std::fmt::Debug for DeletionBarrierV0 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeletionBarrierV0")
+            .finish_non_exhaustive()
+    }
+}
+
+impl DeletionBarrierV0 {
+    /// Confirm that the controller consumed the deletion barrier request.
+    /// This is distinct from `REACHED`, which proves the later exact effect.
+    pub fn acknowledge(&mut self) -> Result<(), FailpointUdsError> {
+        self.stream
+            .write_all(b"ARMED\n")
+            .map_err(FailpointUdsError::Read)
+    }
+
+    /// Signal the verified midpoint and wait for the exact bounded release.
+    pub fn reached_and_wait_for_release(self) -> Result<(), FailpointUdsError> {
+        self.reached_and_wait_for_release_with_deadline(RELEASE_TOTAL_DEADLINE)
+    }
+
+    /// Like [`Self::reached_and_wait_for_release`], with an explicit bounded
+    /// deadline for deterministic e2e and adversarial tests.
+    pub fn reached_and_wait_for_release_with_deadline(
+        mut self,
+        deadline: Duration,
+    ) -> Result<(), FailpointUdsError> {
+        self.stream
+            .write_all(b"REACHED\n")
+            .map_err(FailpointUdsError::Read)?;
+        read_exact_line(&mut self.stream, deadline, b"RELEASE", LineKindV0::Release)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -429,6 +520,18 @@ impl FailpointUdsListenerV0 {
     /// parser consumes this one-shot listener whether its request is accepted
     /// or rejected, so malformed input cannot leave a dangling debug socket.
     pub fn poll(&mut self) -> Result<Option<FailpointV0>, FailpointUdsError> {
+        match self.poll_control()? {
+            Some(FailpointControlV0::Arm(arm)) => Ok(Some(arm.acknowledge()?)),
+            Some(FailpointControlV0::DeletionBarrier(_)) => {
+                Err(FailpointUdsError::MalformedRequest)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Poll one complete request, retaining the deletion client only for its
+    /// explicit midpoint handshake. Any accepted client consumes this socket.
+    pub fn poll_control(&mut self) -> Result<Option<FailpointControlV0>, FailpointUdsError> {
         let listener = self
             .listener
             .as_ref()
@@ -495,16 +598,62 @@ fn wait_for_input(stream: &UnixStream, deadline: Instant) -> Result<(), Failpoin
     }
 }
 
-fn read_request(mut stream: UnixStream) -> Result<FailpointV0, FailpointUdsError> {
+fn read_request(mut stream: UnixStream) -> Result<FailpointControlV0, FailpointUdsError> {
     stream
         .set_nonblocking(true)
         .map_err(FailpointUdsError::Read)?;
-    let deadline = Instant::now() + READ_TOTAL_DEADLINE;
+    let request = read_line(&mut stream, READ_TOTAL_DEADLINE, LineKindV0::Request)?;
+    match request.as_slice() {
+        b"AfterEventBeforeStatus" => Ok(FailpointControlV0::Arm(ActionArmV0 {
+            point: FailpointV0::AfterEventBeforeStatus,
+            stream,
+        })),
+        b"AfterStatusBeforeAck" => Ok(FailpointControlV0::Arm(ActionArmV0 {
+            point: FailpointV0::AfterStatusBeforeAck,
+            stream,
+        })),
+        b"AfterStateFinalizerBeforeRootFinalizer" => {
+            Ok(FailpointControlV0::DeletionBarrier(DeletionBarrierV0 {
+                stream,
+            }))
+        }
+        _ => Err(FailpointUdsError::MalformedRequest),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LineKindV0 {
+    Request,
+    Release,
+}
+
+impl LineKindV0 {
+    fn malformed(self) -> FailpointUdsError {
+        match self {
+            Self::Request => FailpointUdsError::MalformedRequest,
+            Self::Release => FailpointUdsError::MalformedRelease,
+        }
+    }
+
+    fn deadline(self) -> FailpointUdsError {
+        match self {
+            Self::Request => FailpointUdsError::RequestDeadlineExceeded,
+            Self::Release => FailpointUdsError::ReleaseDeadlineExceeded,
+        }
+    }
+}
+
+fn read_line(
+    stream: &mut UnixStream,
+    total_deadline: Duration,
+    kind: LineKindV0,
+) -> Result<Vec<u8>, FailpointUdsError> {
+    let deadline = Instant::now() + total_deadline;
     let mut request = Vec::with_capacity(MAX_REQUEST_BYTES);
     let mut byte = [0_u8; 1];
     loop {
         match stream.read(&mut byte) {
-            Ok(0) => return Err(FailpointUdsError::MalformedRequest),
+            Ok(0) => return Err(kind.malformed()),
             Ok(1) if byte[0] == b'\n' => break,
             Ok(1) => {
                 request.push(byte[0]);
@@ -514,7 +663,13 @@ fn read_request(mut stream: UnixStream) -> Result<FailpointV0, FailpointUdsError
             }
             Ok(_) => unreachable!("one-byte read cannot return more than one byte"),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                wait_for_input(&stream, deadline)?;
+                match wait_for_input(stream, deadline) {
+                    Err(FailpointUdsError::RequestDeadlineExceeded) => {
+                        return Err(kind.deadline());
+                    }
+                    Err(error) => return Err(error),
+                    Ok(()) => {}
+                }
             }
             Err(error) => return Err(FailpointUdsError::Read(error)),
         }
@@ -527,13 +682,23 @@ fn read_request(mut stream: UnixStream) -> Result<FailpointV0, FailpointUdsError
     match stream.read(&mut extra) {
         Ok(0) => {}
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-        Ok(_) => return Err(FailpointUdsError::MalformedRequest),
+        Ok(_) => return Err(kind.malformed()),
         Err(error) => return Err(FailpointUdsError::Read(error)),
     }
-    match request.as_slice() {
-        b"AfterEventBeforeStatus" => Ok(FailpointV0::AfterEventBeforeStatus),
-        b"AfterStatusBeforeAck" => Ok(FailpointV0::AfterStatusBeforeAck),
-        _ => Err(FailpointUdsError::MalformedRequest),
+    Ok(request)
+}
+
+fn read_exact_line(
+    stream: &mut UnixStream,
+    total_deadline: Duration,
+    expected: &[u8],
+    kind: LineKindV0,
+) -> Result<(), FailpointUdsError> {
+    let request = read_line(stream, total_deadline, kind)?;
+    if request == expected {
+        Ok(())
+    } else {
+        Err(FailpointUdsError::MalformedRelease)
     }
 }
 
