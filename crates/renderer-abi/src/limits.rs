@@ -37,6 +37,11 @@ pub fn validate_json_limits(value: &Value) -> Result<(), AbiError> {
 
 /// Validate JSON limits for event metadata and apply the tighter action
 /// protocol bound in canonical UTF-8 bytes.
+///
+/// # Errors
+///
+/// Returns [`AbiError`] when the metadata exceeds a shared JSON limit or the
+/// tighter canonical-byte bound for automation event metadata.
 pub fn validate_event_metadata(value: &Value) -> Result<(), AbiError> {
     validate_json_limits(value)?;
     let byte_count = canonical::canonical_bytes(value)?.len();
