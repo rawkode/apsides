@@ -382,6 +382,60 @@ await_crash() {
   atomic_capture "controller-${point}-previous.log" ctx logs -n "$NAMESPACE" "$CRASH_POD_NAME" -c controller --previous --tail=-1 || die "missing previous controller log for $point"
   ctx rollout status deployment/oxideloop-controller -n "$NAMESPACE" --timeout="${TIMEOUT}s"
 }
+wait_for_no_controller_pod() {
+  description=$1; elapsed=0
+  while :; do
+    live=$(ctx get pods -n "$NAMESPACE" -l app.kubernetes.io/component=controller -o json 2>/dev/null | jq '.items | length' 2>/dev/null || printf '1')
+    if [ "$live" = 0 ]; then return 0; fi
+    [ "$elapsed" -lt "$TIMEOUT" ] || die "timed out waiting for $description"
+    sleep 2; elapsed=$((elapsed + 2))
+  done
+}
+identity_snapshot() {
+  ctx get webapplications,oxideloopstates,configmaps,services -n "$NAMESPACE" -o json | jq -S '
+    {root:([.items[] | select(.kind == "WebApplication" and .metadata.name == "root") | {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name)),
+     state:([.items[] | select(.kind == "OxideLoopState") | {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name)),
+     config:([.items[] | select(.kind == "ConfigMap" and .metadata.name == "root-config") | {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name)),
+     service:([.items[] | select(.kind == "Service" and .metadata.name == "root-service") | {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name))}
+  '
+}
+capture_empty_journal() {
+  label=$1; root_uid_expected=$2; state_name_expected=$3
+  atomic_capture "${label}-state.json" ctx get oxideloopstates -n "$NAMESPACE" -o json || die "failed to capture $label state"
+  jq -e --arg rootUid "$root_uid_expected" --arg stateName "$state_name_expected" '
+    (.items | length == 1) and (.items[0].metadata.name == $stateName) and
+    (.items[0].spec.root.uid == $rootUid) and (.items[0].spec.state.inventory | length == 0) and
+    ((.items[0].spec.state.pendingDependencies // []) | length == 0) and
+    (.items[0].spec.state.applyTransaction == null and .items[0].spec.state.pendingPersist == null and
+     .items[0].spec.state.pruneCandidate == null and .items[0].spec.state.generationAdvanceClosure == null and
+     .items[0].spec.state.deletion == null) and
+    ((.items[0].spec.state.automation.baselines // []) | length == 0) and
+    ((.items[0].spec.state.automation.pending // []) | length == 0) and
+    ((.items[0].spec.state.automation.completions // []) | length == 0) and
+    ([.items[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}])
+  ' "$EVIDENCE/${label}-state.json" >/dev/null || die "$label did not prove an empty root-bound journal"
+  atomic_capture "${label}-identities.json" identity_snapshot || die "failed to capture $label identities"
+}
+wait_for_prepared_not_issued() {
+  ticks=0; max_ticks=$((TIMEOUT * 10))
+  while :; do
+    snapshot="$WORK/prepared-not-issued-state.json"
+    ctx get oxideloopstate "$STATE_NAME" -n "$NAMESPACE" -o json >"$snapshot" 2>/dev/null || true
+    if jq -e '
+      (.spec.state.pendingPersist.purpose == "Prepare") and
+      (.spec.state.pendingPersist.phase == "Prepare") and
+      (.spec.state.pendingPersist.token | type == "string" and test("^[0-9a-f]{64}$")) and
+      (.spec.state.applyTransaction.results | length == 0) and
+      (.spec.state.applyTransaction.nextCommandLifecycle.state == "PreparedNotIssued") and
+      (.spec.state.applyTransaction.nextCommandLifecycle.commandId | type == "string" and test("^[0-9a-f]{64}$"))
+    ' "$snapshot" >/dev/null 2>&1; then
+      atomic_capture "prepared-not-issued-state.json" cp "$snapshot" || die 'failed to capture PreparedNotIssued state'
+      return 0
+    fi
+    [ "$ticks" -lt "$max_ticks" ] || die 'timed out waiting for durable PreparedNotIssued state'
+    sleep 0.1; ticks=$((ticks + 1))
+  done
+}
 
 note "run=$RUN_ID cluster=$CLUSTER_NAME revision=$HEAD"
 kind create cluster --name "$CLUSTER_NAME" --image "$NODE_IMAGE" --config deploy/e2e/kind-config.yaml --wait "${TIMEOUT}s"
@@ -511,7 +565,7 @@ jq -n --arg node "$NODE_IMAGE" --argjson production "$PRODUCTION_IMAGE_IDENTITY"
 
 # Foreign desired-name collision proves default-deny adoption before bootstrap.
 ctx create configmap root-config -n "$NAMESPACE" --from-literal=foreign=true
-ctx get configmap root-config -n "$NAMESPACE" -o json >"$EVIDENCE/foreign-before.json"
+atomic_capture foreign-before.json ctx get configmap root-config -n "$NAMESPACE" -o json || die 'missing foreign collision object evidence'
 FOREIGN_UID=$(jq -r '.metadata.uid' "$EVIDENCE/foreign-before.json")
 COLLISION_POD=$(controller_pod)
 COLLISION_POD_UID=$(ctx get pod -n "$NAMESPACE" "$COLLISION_POD" -o jsonpath='{.metadata.uid}')
@@ -537,22 +591,36 @@ while :; do
   [ "$elapsed" -lt "$TIMEOUT" ] || die 'timed out waiting for the default-deny collision failure'
   sleep 2; elapsed=$((elapsed + 2))
 done
-ctx get configmap root-config -n "$NAMESPACE" -o json >"$EVIDENCE/foreign-after.json"
+atomic_capture foreign-after.json ctx get configmap root-config -n "$NAMESPACE" -o json || die 'missing foreign collision after evidence'
 jq -e --slurpfile before "$EVIDENCE/foreign-before.json" '. == $before[0]' "$EVIDENCE/foreign-after.json" >/dev/null || die 'foreign collision object was mutated in at least one field'
-ctx get webapplication root -n "$NAMESPACE" -o json >"$EVIDENCE/foreign-collision-root.json"
+cmp -s "$EVIDENCE/foreign-before.json" "$EVIDENCE/foreign-after.json" || die 'foreign collision object bytes changed'
+atomic_capture foreign-collision-root.json ctx get webapplication root -n "$NAMESPACE" -o json || die 'missing foreign collision root evidence'
 COLLISION_STATE_NAME=$(jq -er '.status.state.name' "$EVIDENCE/foreign-collision-root.json")
-ctx get oxideloopstates -n "$NAMESPACE" -o json >"$EVIDENCE/foreign-collision-states.json"
-jq -e --arg rootUid "$ROOT_UID" --arg stateName "$COLLISION_STATE_NAME" '
-  (.items | length == 1) and (.items[0].metadata.name == $stateName) and (.items[0].spec.root.uid == $rootUid) and
-  (.items[0].spec.state.inventory | length == 0) and ((.items[0].spec.state.pendingDependencies // []) | length == 0) and
-  (.items[0].spec.state.applyTransaction == null and .items[0].spec.state.pendingPersist == null and .items[0].spec.state.pruneCandidate == null and .items[0].spec.state.generationAdvanceClosure == null and .items[0].spec.state.deletion == null) and
-  ((.items[0].spec.state.automation.baselines // []) | length == 0) and ((.items[0].spec.state.automation.pending // []) | length == 0) and ((.items[0].spec.state.automation.completions // []) | length == 0) and
-  ([.items[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}])
-' "$EVIDENCE/foreign-collision-states.json" >/dev/null || die 'foreign collision created anything beyond the empty controller-owned journal'
+capture_empty_journal foreign-collision "$ROOT_UID" "$COLLISION_STATE_NAME"
 assert_count "$(ctx get service -n "$NAMESPACE" -o json | jq '.items | length')" 0 'foreign collision service claim'
 assert_count "$(ctx get automationruns -n "$NAMESPACE" -o json | jq '.items | length')" 0 'foreign collision AutomationRun claim'
+
+# The foreign object and empty journal are reasserted while the controller is
+# stopped. This closes the prior race where recovery controls could mutate a
+# foreign object while a CrashLooping controller was still reconciling.
+ctx scale deployment/oxideloop-controller -n "$NAMESPACE" --replicas=0
+wait_for_no_controller_pod 'controller deployment scale-to-zero'
+atomic_capture controller-scaled-zero-pods.json ctx get pods -n "$NAMESPACE" -l app.kubernetes.io/component=controller -o json || die 'failed to capture scale-to-zero controller pod evidence'
+jq -e '.items | length == 0' "$EVIDENCE/controller-scaled-zero-pods.json" >/dev/null || die 'a controller Pod remained after scale-to-zero'
+capture_empty_journal foreign-collision-stopped "$ROOT_UID" "$COLLISION_STATE_NAME"
+cmp -s "$EVIDENCE/foreign-collision-identities.json" "$EVIDENCE/foreign-collision-stopped-identities.json" || die 'stopped collision identity snapshot changed root, state, or foreign ConfigMap UID'
+atomic_capture foreign-collision-stopped.json ctx get configmap root-config -n "$NAMESPACE" -o json || die 'missing stopped foreign collision object evidence'
+jq -e --slurpfile before "$EVIDENCE/foreign-before.json" '. == $before[0]' "$EVIDENCE/foreign-collision-stopped.json" >/dev/null || die 'stopped foreign collision object is not byte-for-byte unchanged'
+cmp -s "$EVIDENCE/foreign-before.json" "$EVIDENCE/foreign-collision-stopped.json" || die 'stopped foreign collision object bytes changed'
+atomic_capture foreign-collision-stopped-root.json ctx get webapplication root -n "$NAMESPACE" -o json || die 'missing stopped collision root evidence'
+jq -e --arg rootUid "$ROOT_UID" '.metadata.uid == $rootUid' "$EVIDENCE/foreign-collision-stopped-root.json" >/dev/null || die 'stopped collision root UID changed'
+
+# Only after the stopped empty-journal proof may the foreign object be deleted
+# and the root retriggered. The controller then creates a new object identity.
 ctx delete configmap root-config -n "$NAMESPACE"
 ctx annotate webapplication root -n "$NAMESPACE" "oxideloop.dev/e2e-retrigger=$RUN_ID" --overwrite
+ctx scale deployment/oxideloop-controller -n "$NAMESPACE" --replicas=1
+ctx rollout status deployment/oxideloop-controller -n "$NAMESPACE" --timeout="${TIMEOUT}s"
 wait_json 'recreated root ConfigMap ownership' '(.metadata.uid | type == "string") and ([.metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}])' configmap/root-config --arg rootUid "$ROOT_UID"
 RECOVERED_CONFIG_UID=$(ctx get configmap root-config -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')
 [ "$RECOVERED_CONFIG_UID" != "$FOREIGN_UID" ] || die 'collision recovery reused the foreign ConfigMap UID'
@@ -583,6 +651,50 @@ jq -e --slurpfile root "$EVIDENCE/initial-root.json" --slurpfile config "$EVIDEN
   ([$config[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}]) and
   ([$service[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}])
 ' "$EVIDENCE/initial-state.json" >/dev/null || die 'bootstrap root, state, inventory, or ownership is not exact'
+
+# P14-E durable preparation boundary. This deliberately uses already-owned
+# children, so every prepared intent is UID/RV-pinned and the boundary cannot
+# contain a POST. The failpoint crashes only after Prepare is durable and
+# before dispatch authorization is persisted; restart must invalidate/replan.
+ctx create configmap prepared-foreign-sentinel -n "$NAMESPACE" --from-literal=foreign=true
+atomic_capture prepared-foreign-before.json ctx get configmap prepared-foreign-sentinel -n "$NAMESPACE" -o json || die 'failed to capture prepared-boundary foreign sentinel'
+wait_json 'journal quiescence before PreparedNotIssued barrier' '(.spec.state.inventory | length == 2) and (.spec.state.applyTransaction == null) and (.spec.state.pendingPersist == null)' "oxideloopstate/$STATE_NAME"
+atomic_capture prepared-not-issued-identities-before.json identity_snapshot || die 'failed to capture PreparedNotIssued identities before restart'
+PREPARE_FIFO="$WORK/prepare-release.fifo"; mkfifo "$PREPARE_FIFO"; exec 8<>"$PREPARE_FIFO"; BARRIER_FD=8
+PREPARE_POD=$(controller_pod)
+PREPARE_POD_UID=$(ctx get pod -n "$NAMESPACE" "$PREPARE_POD" -o jsonpath='{.metadata.uid}')
+PREPARE_RESTART=$(controller_status "$PREPARE_POD" | jq -er '.restartCount')
+ctx exec -i -n "$NAMESPACE" "$PREPARE_POD" -c controller -- /usr/local/bin/oxideloop-e2e-failpoint-control --socket /run/oxideloop/failpoints/control.sock --point AfterPrepareBeforeDispatchAuthorization <&8 >"$EVIDENCE/prepared-not-issued-barrier.txt" 2>&1 &
+BARRIER_PID=$!
+elapsed=0
+while ! grep -q '^ARMED$' "$EVIDENCE/prepared-not-issued-barrier.txt" 2>/dev/null; do [ "$elapsed" -lt "$TIMEOUT" ] || die 'PreparedNotIssued barrier client did not acknowledge ARMED'; sleep 1; elapsed=$((elapsed + 1)); done
+ctx annotate webapplication root -n "$NAMESPACE" "oxideloop.dev/e2e-prepared-not-issued=$RUN_ID" --overwrite
+elapsed=0
+while ! grep -q '^REACHED$' "$EVIDENCE/prepared-not-issued-barrier.txt" 2>/dev/null; do [ "$elapsed" -lt "$TIMEOUT" ] || die 'PreparedNotIssued barrier did not reach REACHED'; sleep 1; elapsed=$((elapsed + 1)); done
+wait_for_prepared_not_issued
+jq -e '
+  (.spec.state.pendingPersist.purpose == "Prepare" and .spec.state.pendingPersist.phase == "Prepare") and
+  (.spec.state.applyTransaction.nextCommandLifecycle.state == "PreparedNotIssued") and
+  (.spec.state.applyTransaction.nextCommandLifecycle.commandId | type == "string") and
+  ([.spec.state.applyTransaction.preparedIntents[] | select(.operation == "Apply" and (.expectedUid | type == "string") and (.expectedResourceVersion | type == "string"))] | length == (.spec.state.applyTransaction.preparedIntents | length)) and
+  ([.spec.state.applyTransaction.preparedIntents[] | select(.operation == "Apply" and (.expectedUid == null or .expectedResourceVersion == null))] | length == 0)
+' "$EVIDENCE/prepared-not-issued-state.json" >/dev/null || die 'PreparedNotIssued journal was not exact and UID/RV-pinned without a POST intent'
+atomic_capture prepared-not-issued-no-post.json jq -n --arg reason 'all prepared mutation intents were existing-object Apply operations with exact UID/resourceVersion pins; no POST was authorized or issued' '{schema:"oxideloop.dev/kind-e2e-prepared-not-issued/v1",lifecycle:"PreparedNotIssued",postAuthorized:false,postIssued:false,reason:$reason}' || die 'failed to capture no-POST PreparedNotIssued evidence'
+atomic_capture prepared-foreign-midpoint.json ctx get configmap prepared-foreign-sentinel -n "$NAMESPACE" -o json || die 'failed to capture prepared-boundary foreign sentinel midpoint'
+cmp -s "$EVIDENCE/prepared-foreign-before.json" "$EVIDENCE/prepared-foreign-midpoint.json" || die 'PreparedNotIssued midpoint touched or adopted the foreign sentinel'
+printf 'RELEASE\n' >&8
+elapsed=0; while ! grep -q '^RELEASED$' "$EVIDENCE/prepared-not-issued-barrier.txt" 2>/dev/null; do [ "$elapsed" -lt "$TIMEOUT" ] || die 'PreparedNotIssued barrier did not acknowledge RELEASE'; sleep 1; elapsed=$((elapsed + 1)); done
+wait "$BARRIER_PID"; BARRIER_PID=''; exec 8>&-; BARRIER_FD=''
+test "$(controller_pod)" = "$PREPARE_POD" || die 'PreparedNotIssued barrier unexpectedly replaced controller pod'
+wait_for_exact_crash 'AfterPrepareBeforeDispatchAuthorization' "$PREPARE_POD" "$PREPARE_POD_UID" "$((PREPARE_RESTART + 1))"
+atomic_capture controller-AfterPrepareBeforeDispatchAuthorization-previous.log ctx logs -n "$NAMESPACE" "$PREPARE_POD" -c controller --previous --tail=-1 || die 'missing PreparedNotIssued previous controller log'
+ctx rollout status deployment/oxideloop-controller -n "$NAMESPACE" --timeout="${TIMEOUT}s"
+wait_json 'PreparedNotIssued invalidation returned to empty journal' '(.spec.state.inventory | length == 2) and ((.spec.state.pendingDependencies // []) | length == 0) and (.spec.state.applyTransaction == null) and (.spec.state.pendingPersist == null) and (.spec.state.pruneCandidate == null) and (.spec.state.generationAdvanceClosure == null) and (.spec.state.deletion == null)' "oxideloopstate/$STATE_NAME"
+atomic_capture prepared-not-issued-after-state.json ctx get oxideloopstate "$STATE_NAME" -n "$NAMESPACE" -o json || die 'failed to capture post-restart PreparedNotIssued state'
+atomic_capture prepared-not-issued-identities-after.json identity_snapshot || die 'failed to capture PreparedNotIssued identities after restart'
+cmp -s "$EVIDENCE/prepared-not-issued-identities-before.json" "$EVIDENCE/prepared-not-issued-identities-after.json" || die 'PreparedNotIssued recovery changed an existing root, state, ConfigMap, or Service identity'
+atomic_capture prepared-foreign-after.json ctx get configmap prepared-foreign-sentinel -n "$NAMESPACE" -o json || die 'failed to capture prepared-boundary foreign sentinel after restart'
+cmp -s "$EVIDENCE/prepared-foreign-before.json" "$EVIDENCE/prepared-foreign-after.json" || die 'PreparedNotIssued restart touched or adopted the foreign sentinel'
 
 # Ownership transition: the existing managed children must be updated through
 # controller SSA rather than recreated. The root annotation is deterministic
@@ -660,18 +772,20 @@ capture_transition baseline
 # Event and one matching durable completion.
 ctx patch configmap demo-input -n "$NAMESPACE" --type merge -p '{"data":{"flavor":"chocolate"}}'
 wait_json 'rerendered dependency value' '.data.flavor == "chocolate"' configmap/root-config
-wait_json 'first, exactly-once dependency automation' '.items | length == 1' automationrun
+wait_json 'first dependency automation' '.items | length == 1' automationrun
 INPUT_RV=$(ctx get configmap demo-input -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
 assert_automation_transition 1 "$INPUT_UID" "$INPUT_RV" chocolate
 AUTOMATION_RUN_NAME=$(ctx get automationruns -n "$NAMESPACE" -o json | jq -er '[.items[] | select(.status.completion.state == "Succeeded") | .metadata.name] | if length == 1 then .[0] else error("expected exactly one completed AutomationRun for managed-fields evidence") end')
 capture_managed_field_ownership automationrun-status "automationrun/$AUTOMATION_RUN_NAME" status 'f:status'
 capture_transition chocolate
 
-# Each crash window must be recovered durably without duplicate Event output.
-arm_crash AfterEventBeforeStatus
+# The ambiguous event-materialization-before-status window is deliberately not
+# a successful recovery path: a POST may have landed without a durable UID or
+# admission witness, so it holds and requires operator intervention. Record
+# that boundary while continuing with the declarative action flow.
+atomic_capture ambiguous-post-window.json jq -n '{schema:"oxideloop.dev/kind-e2e-ambiguous-post-window/v1",status:"not-recoverable",successfulRecovery:false,requiresIntervention:true,reason:"event materialization may have accepted a POST before status persistence; without an admission witness, automatic recovery is unsafe"}' || die 'failed to capture ambiguous POST window statement'
 ctx patch configmap demo-input -n "$NAMESPACE" --type merge -p '{"data":{"flavor":"strawberry"}}'
-await_crash AfterEventBeforeStatus
-wait_json 'first crash recovery creates one durable action' '(.items | length == 2) and ([.items[].status.completion.state] | all(. == "Succeeded"))' automationrun
+wait_json 'action after ambiguous POST window statement creates one durable action' '(.items | length == 2) and ([.items[].status.completion.state] | all(. == "Succeeded"))' automationrun
 INPUT_RV=$(ctx get configmap demo-input -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
 assert_automation_transition 2 "$INPUT_UID" "$INPUT_RV" strawberry
 capture_transition strawberry

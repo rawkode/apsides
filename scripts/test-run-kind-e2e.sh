@@ -354,7 +354,11 @@ recovery_delete_line=$(rg -n -F 'ctx delete configmap root-config -n "$NAMESPACE
 recovery_annotate_line=$(rg -n -F 'ctx annotate webapplication root -n "$NAMESPACE"' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 recovery_config_wait_line=$(rg -n -F "wait_json 'recreated root ConfigMap ownership'" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 recovery_direct_assert_line=$(rg -n -F 'managed ConfigMap owner reference' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
-[ "$recovery_delete_line" -lt "$recovery_annotate_line" ] && [ "$recovery_annotate_line" -lt "$recovery_config_wait_line" ] && [ "$recovery_config_wait_line" -lt "$recovery_direct_assert_line" ] || { echo 'recovery must delete, annotate, wait for exact ConfigMap ownership, then directly assert it' >&2; exit 1; }
+recovery_scale_zero_line=$(rg -n -F 'ctx scale deployment/oxideloop-controller -n "$NAMESPACE" --replicas=0' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+recovery_no_pod_line=$(rg -n -F "wait_for_no_controller_pod 'controller deployment scale-to-zero'" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+recovery_stopped_empty_line=$(rg -n -F 'capture_empty_journal foreign-collision-stopped' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+recovery_scale_one_line=$(rg -n -F 'ctx scale deployment/oxideloop-controller -n "$NAMESPACE" --replicas=1' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+[ "$recovery_scale_zero_line" -lt "$recovery_no_pod_line" ] && [ "$recovery_no_pod_line" -lt "$recovery_stopped_empty_line" ] && [ "$recovery_stopped_empty_line" -lt "$recovery_delete_line" ] && [ "$recovery_delete_line" -lt "$recovery_annotate_line" ] && [ "$recovery_annotate_line" -lt "$recovery_scale_one_line" ] && [ "$recovery_scale_one_line" -lt "$recovery_config_wait_line" ] && [ "$recovery_config_wait_line" -lt "$recovery_direct_assert_line" ] || { echo 'recovery must scale to zero, prove no pod and empty journal, delete/annotate while stopped, scale up, then wait for exact ConfigMap ownership' >&2; exit 1; }
 recovery_wait_line=$(sed -n "${recovery_config_wait_line}p" "$ROOT/scripts/run-kind-e2e.sh")
 assert_recovery_wait_contains() { printf '%s\n' "$recovery_wait_line" | grep -Fq "$1" || { echo "recovery ownership wait is missing: $1" >&2; exit 1; }; }
 for recovery_owner_field in \
@@ -375,6 +379,44 @@ fi
 assert_not_contains "wait_json 'root current render status and durable link'"
 assert_contains 'configmap/root-config --arg rootUid "$ROOT_UID"'
 assert_contains 'collision recovery reused the foreign ConfigMap UID'
+assert_contains 'foreign collision object bytes changed'
+assert_contains 'stopped foreign collision object bytes changed'
+assert_contains 'wait_for_no_controller_pod'
+assert_contains 'controller-scaled-zero-pods.json'
+assert_contains 'PreparedNotIssued'
+assert_contains 'AfterPrepareBeforeDispatchAuthorization'
+assert_contains 'prepared-not-issued-no-post.json'
+assert_contains 'postIssued:false'
+assert_contains 'PreparedNotIssued invalidation returned to empty journal'
+assert_contains 'ambiguous-post-window.json'
+assert_not_contains 'arm_crash AfterEventBeforeStatus'
+assert_not_contains 'await_crash AfterEventBeforeStatus'
+assert_not_contains 'AfterEventBeforeStatus'
+
+# P14-E must capture durable Prepare before the failpoint restart, then prove
+# invalidation/replan and identity preservation before ordinary ownership work.
+prepared_identity_before_line=$(rg -n -F 'prepared-not-issued-identities-before.json' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+prepared_arm_line=$(rg -n -F -- '--point AfterPrepareBeforeDispatchAuthorization' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+prepared_reached_line=$(rg -n -F "PreparedNotIssued barrier did not reach REACHED" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+prepared_capture_line=$(rg -n -F 'wait_for_prepared_not_issued' "$ROOT/scripts/run-kind-e2e.sh" | tail -1 | cut -d: -f1)
+prepared_release_line=$(rg -n -F "PreparedNotIssued barrier did not acknowledge RELEASE" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+prepared_restart_line=$(rg -n -F "wait_for_exact_crash 'AfterPrepareBeforeDispatchAuthorization'" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+prepared_empty_line=$(rg -n -F "wait_json 'PreparedNotIssued invalidation returned to empty journal'" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+prepared_identity_after_line=$(rg -n -F 'prepared-not-issued-identities-after.json' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+ownership_transition_line=$(rg -n -F 'e2e-ownership-transition=$RUN_ID' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+[ "$prepared_identity_before_line" -lt "$prepared_arm_line" ] && [ "$prepared_arm_line" -lt "$prepared_reached_line" ] && [ "$prepared_reached_line" -lt "$prepared_capture_line" ] && [ "$prepared_capture_line" -lt "$prepared_release_line" ] && [ "$prepared_release_line" -lt "$prepared_restart_line" ] && [ "$prepared_restart_line" -lt "$prepared_empty_line" ] && [ "$prepared_empty_line" -lt "$prepared_identity_after_line" ] && [ "$prepared_identity_after_line" -lt "$ownership_transition_line" ] || { echo 'PreparedNotIssued proof must arm, reach the durable barrier, capture, release, crash, replan to empty journal, preserve identities, then continue' >&2; exit 1; }
+assert_contains 'expectedResourceVersion'
+assert_contains 'postAuthorized:false'
+assert_contains 'postIssued:false'
+assert_contains 'requiresIntervention:true'
+assert_contains 'prepared-foreign-before.json'
+assert_contains 'prepared-foreign-midpoint.json'
+assert_contains 'prepared-foreign-after.json'
+assert_contains 'PreparedNotIssued midpoint touched or adopted the foreign sentinel'
+assert_contains 'PreparedNotIssued restart touched or adopted the foreign sentinel'
+after_status_arm_line=$(rg -n -F 'arm_crash AfterStatusBeforeAck' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+after_status_await_line=$(rg -n -F 'await_crash AfterStatusBeforeAck' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+[ -n "$after_status_arm_line" ] && [ "$after_status_arm_line" -lt "$after_status_await_line" ] || { echo 'AfterStatusBeforeAck recovery failpoint must remain exercised' >&2; exit 1; }
 
 # P13-D must run after initial ConfigMap+Service convergence and before the
 # independent prune gate. It captures raw managed-fields documents, records
@@ -398,6 +440,10 @@ for ownership_contract in \
   'managed_field_ownership_from_json' \
   'atomic_capture_ownership' \
   'ownership-restart-identities-before.json' \
+  'prepared-not-issued-state.json' \
+  'prepared-not-issued-identities-before.json' \
+  'prepared-not-issued-identities-after.json' \
+  'ambiguous-post-window.json' \
   'ownership-restart-identities-after.json' \
   'ConfigMap ConditionalApply ownership transition changed its UID' \
   'Service ConditionalApply ownership transition changed its UID' \

@@ -449,6 +449,8 @@ pub enum FailpointV0 {
     AfterEventBeforeStatus,
     AfterStatusBeforeAck,
     #[cfg(feature = "test-failpoints")]
+    AfterPrepareBeforeDispatchAuthorization,
+    #[cfg(feature = "test-failpoints")]
     AfterStateFinalizerBeforeRootFinalizer,
 }
 
@@ -3366,9 +3368,9 @@ pub fn deterministic_request_id(immutable_hash: &str) -> Result<[u8; 16], Runtim
     Ok(id)
 }
 
-/// Execute the durable half of an automation exactly once. Replays use the
-/// same renderer request ID, event plan and status desired value, so the two
-/// port recovery operations provide the no-duplicate restart behaviour.
+/// Execute the durable half of an automation. Status recovery is exact after
+/// its response is pinned; Event POST recovery remains the port's strict
+/// admission-witness decision and must fail closed when that witness is lost.
 #[allow(clippy::too_many_arguments)]
 pub async fn drive_automation<P: AutomationPortV0, R: RendererPortV0>(
     port: &mut P,
@@ -4188,6 +4190,7 @@ mod tests {
             },
         )
         .unwrap();
+        let issued = acknowledge_dispatch_authorization(issued, "state-rv-3");
         let (transaction_id, attempt_token, command) = match &issued.commands[0] {
             CommandV0::Mutate {
                 transaction_id,
@@ -4230,6 +4233,22 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    /// Mutation authority follows the reducer's durable authorization receipt;
+    /// tests must never manufacture the post-revalidation mutation directly.
+    fn acknowledge_dispatch_authorization(transition: TransitionV0, new_rv: &str) -> TransitionV0 {
+        assert!(matches!(
+            transition.commands.as_slice(),
+            [CommandV0::Persist { operation, .. }]
+                if operation.purpose == PersistPurpose::DispatchAuthorization
+        ));
+        let issued = acknowledge_persist(transition, new_rv);
+        assert!(matches!(
+            issued.commands.as_slice(),
+            [CommandV0::Mutate { .. }]
+        ));
+        issued
     }
 
     fn ready_machine() -> MachineStateV0 {
@@ -4969,6 +4988,7 @@ mod tests {
             },
         )
         .unwrap();
+        let issued = acknowledge_dispatch_authorization(issued, "state-rv-5");
         let (transaction_id, attempt_token, command) = match &issued.commands[0] {
             CommandV0::Mutate {
                 transaction_id,
@@ -5453,7 +5473,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn prepared_delete_recreated_actor_revalidates_before_exact_retry() {
+    async fn prepared_delete_recreated_actor_invalidates_without_retry() {
         let base = linked_machine();
         let root = base.root().clone();
         let mut journal = base.journal().clone();
@@ -5619,23 +5639,11 @@ mod tests {
                 observed: second_observed,
             })
             .unwrap();
-        let retried = recreated.next_command().unwrap().unwrap();
+        let invalidated = recreated.next_command().unwrap().unwrap();
         assert!(matches!(
-            retried,
-            CommandV0::Mutate { ref commands, .. }
-                if matches!(
-                    commands.as_slice(),
-                    [oxideloop_controller_core::MutationCommandV0 {
-                        decision: oxideloop_mutation_model::MutationDecision::PreconditionedDelete {
-                            preconditions: oxideloop_mutation_model::ObjectIdentity {
-                                uid,
-                                resource_version,
-                            },
-                            ..
-                        },
-                        ..
-                    }] if uid == "managed-uid" && resource_version == "managed-rv-1"
-                )
+            invalidated,
+            CommandV0::Persist { ref operation, .. }
+                if operation.purpose == PersistPurpose::Invalidate
         ));
     }
 

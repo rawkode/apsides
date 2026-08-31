@@ -8,7 +8,7 @@ use std::{
 };
 
 fn usage() -> &'static str {
-    "usage: oxideloop-e2e-failpoint-control --socket SOCKET --point AfterEventBeforeStatus|AfterStatusBeforeAck|AfterStateFinalizerBeforeRootFinalizer"
+    "usage: oxideloop-e2e-failpoint-control --socket SOCKET --point AfterEventBeforeStatus|AfterStatusBeforeAck|AfterPrepareBeforeDispatchAuthorization|AfterStateFinalizerBeforeRootFinalizer"
 }
 
 fn main() -> ExitCode {
@@ -42,6 +42,7 @@ fn main() -> ExitCode {
             point.as_str(),
             "AfterEventBeforeStatus"
                 | "AfterStatusBeforeAck"
+                | "AfterPrepareBeforeDispatchAuthorization"
                 | "AfterStateFinalizerBeforeRootFinalizer"
         )
     {
@@ -61,7 +62,10 @@ fn run(socket: &PathBuf, point: &str) -> io::Result<()> {
     let mut stream = UnixStream::connect(socket)?;
     stream.write_all(point.as_bytes())?;
     stream.write_all(b"\n")?;
-    if point != "AfterStateFinalizerBeforeRootFinalizer" {
+    if !matches!(
+        point,
+        "AfterPrepareBeforeDispatchAuthorization" | "AfterStateFinalizerBeforeRootFinalizer"
+    ) {
         let mut armed = [0_u8; 6];
         stream.read_exact(&mut armed)?;
         if armed != *b"ARMED\n" {

@@ -3055,7 +3055,10 @@ mod tests {
         KubeFixedPointPortV0<'static, StableRendererV0>,
         FixedPointResultV0,
     ) {
-        split_result_with_discovered_observations_and_inventory(vec![]).await
+        Box::pin(split_result_with_discovered_observations_and_inventory(
+            vec![],
+        ))
+        .await
     }
 
     async fn split_result_with_discovered_observations_and_inventory(
@@ -3708,7 +3711,8 @@ mod tests {
 
     #[tokio::test]
     async fn split_final_input_handoff_is_sealed_and_replaces_only_observations() {
-        let (mut actor, mut port, mut result) = split_result_with_discovered_observations().await;
+        let (mut actor, mut port, mut result) =
+            Box::pin(split_result_with_discovered_observations()).await;
         let initial = active_pin_bytes(&actor);
         let cloned = result.clone();
         assert!(matches!(
@@ -3745,7 +3749,8 @@ mod tests {
             |result| result.input.root.spec = json!({"message":"other"}),
         ];
         for mutate in mutators {
-            let (mut actor, port, mut result) = split_result_with_discovered_observations().await;
+            let (mut actor, port, mut result) =
+                Box::pin(split_result_with_discovered_observations()).await;
             let initial = active_pin_bytes(&actor);
             mutate(&mut result);
             assert!(matches!(
@@ -3755,7 +3760,8 @@ mod tests {
             assert_eq!(active_pin_bytes(&actor), initial);
         }
 
-        let (mut actor, port, mut result) = split_result_with_discovered_observations().await;
+        let (mut actor, port, mut result) =
+            Box::pin(split_result_with_discovered_observations()).await;
         let initial = active_pin_bytes(&actor);
         result
             .provenance
@@ -3769,7 +3775,8 @@ mod tests {
         ));
         assert_eq!(active_pin_bytes(&actor), initial);
 
-        let (mut actor, port, mut result) = split_result_with_discovered_observations().await;
+        let (mut actor, port, mut result) =
+            Box::pin(split_result_with_discovered_observations()).await;
         let initial = active_pin_bytes(&actor);
         let forged_request_id = "forged-fixed-point-request-id".to_owned();
         result
@@ -3785,14 +3792,14 @@ mod tests {
         ));
         assert_eq!(active_pin_bytes(&actor), initial);
 
-        let (mut actor, port, result) = split_result_with_discovered_observations().await;
+        let (mut actor, port, result) = Box::pin(split_result_with_discovered_observations()).await;
         actor.active_render_input = None;
         assert!(matches!(
             port.bind_completed_fixed_point_input(&mut actor, &result),
             Err(RuntimeErrorV0::Hold(_))
         ));
 
-        let (mut actor, port, result) = split_result_with_discovered_observations().await;
+        let (mut actor, port, result) = Box::pin(split_result_with_discovered_observations()).await;
         let initial = active_pin_bytes(&actor);
         let mut replacement = result.input().clone();
         replacement.observation_token = "replacement".into();
@@ -3827,8 +3834,10 @@ mod tests {
             |entry| entry.bundle_digest = "b".repeat(64),
         ];
         for mutate in mutations {
-            let (mut actor, mut port, mut result) =
-                split_result_with_discovered_observations_and_inventory(vec![entry.clone()]).await;
+            let (mut actor, mut port, mut result) = Box::pin(
+                split_result_with_discovered_observations_and_inventory(vec![entry.clone()]),
+            )
+            .await;
             let initial = active_pin_bytes(&actor);
             let mut changed = entry.clone();
             mutate(&mut changed);
@@ -3850,7 +3859,8 @@ mod tests {
 
     #[tokio::test]
     async fn sealed_coverage_change_rejects_stale_or_forged_authority_and_supersedes_once() {
-        let (mut actor, mut port, _result) = split_result_with_discovered_observations().await;
+        let (mut actor, mut port, _result) =
+            Box::pin(split_result_with_discovered_observations()).await;
         let (incarnation, expected) = {
             let retained = port
                 .retained
@@ -3913,8 +3923,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn sealed_final_input_handoff_rejects_cross_port_or_incarnation_and_root_change() {
-        let (mut actor, port, result) = split_result_with_discovered_observations().await;
+        let (mut actor, port, result) = Box::pin(split_result_with_discovered_observations()).await;
         let initial = active_pin_bytes(&actor);
         let mut other = KubeFixedPointPortV0::<()>::observation_only_for_test(actor.barrier());
         other.retained = Some(empty_retained(actor.barrier(), 1));
@@ -3941,7 +3952,8 @@ mod tests {
             },
         ];
         for mutate_coverage in coverage_mutators {
-            let (mut actor, mut port, result) = split_result_with_discovered_observations().await;
+            let (mut actor, mut port, result) =
+                Box::pin(split_result_with_discovered_observations()).await;
             let initial = active_pin_bytes(&actor);
             mutate_coverage(
                 &mut port
@@ -3965,7 +3977,8 @@ mod tests {
         ));
         assert_eq!(active_pin_bytes(&actor), initial);
 
-        let (mut actor, mut port, mut result) = split_result_with_discovered_observations().await;
+        let (mut actor, mut port, mut result) =
+            Box::pin(split_result_with_discovered_observations()).await;
         port.bind_completed_fixed_point_input(&mut actor, &result)
             .expect("sealed final input binds before a genuine root change");
         let mut changed = actor.state().root().clone();
@@ -3977,7 +3990,8 @@ mod tests {
             CompletedObservationFenceOutcomeV0::RestartRequired
         );
 
-        let (mut actor, mut port, result) = split_result_with_discovered_observations().await;
+        let (mut actor, mut port, result) =
+            Box::pin(split_result_with_discovered_observations()).await;
         port.bind_completed_fixed_point_input(&mut actor, &result)
             .expect("sealed final input binds before a genuine dependency change");
         let change = {

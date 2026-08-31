@@ -158,6 +158,7 @@ fn deleting_linked_root(
         "metadata":{
             "name":"root", "namespace":"ns", "uid":"root-uid",
             "resourceVersion":resource_version, "generation":3,
+            "annotations":{"runtime.oxideloop.dev/root-uid":"root-uid"},
             "deletionTimestamp":"2026-08-30T00:00:00Z",
             "finalizers":["demo.oxideloop.dev/finalizer"],
         },
@@ -181,6 +182,15 @@ fn deleting_linked_state(
         "metadata":{
             "name":state_name, "namespace":"ns", "uid":"state-uid",
             "resourceVersion":resource_version,
+            "annotations":{"runtime.oxideloop.dev/root-uid":"root-uid"},
+            "ownerReferences":[{
+                "apiVersion":"demo.oxideloop.dev/v1alpha1",
+                "kind":"WebApplication",
+                "name":"root",
+                "uid":"root-uid",
+                "controller":true,
+                "blockOwnerDeletion":false,
+            }],
             "finalizers":if finalizer_present {
                 vec!["runtime.oxideloop.dev/state-finalizer"]
             } else {
@@ -209,15 +219,17 @@ fn deleting_linked_state(
 
 #[cfg(feature = "test-failpoints")]
 fn failpoint_socket_path() -> PathBuf {
-    let parent = std::env::temp_dir().join(format!(
-        "oxideloop-driver-barrier-{}-{}-{}.sock",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos(),
-        TEST_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed),
-    ));
+    let parent = std::fs::canonicalize("/tmp")
+        .expect("canonical temporary root")
+        .join(format!(
+            "ol-driver-{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos(),
+            TEST_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
     std::fs::create_dir(&parent).expect("private failpoint parent");
     #[cfg(unix)]
     {
@@ -613,11 +625,46 @@ async fn driver_deletion_barrier_crashes_after_exact_state_finalizer_effect_and_
                         .push("state-finalizer");
                 }
                 let next = state_resource_version.fetch_add(1, Ordering::SeqCst) + 1;
-                json_response(&deleting_linked_state(
-                    &state_name,
-                    &format!("state-rv-{next}"),
-                    !removing_finalizer,
-                ))
+                if removing_finalizer {
+                    json_response(&deleting_linked_state(
+                        &state_name,
+                        &format!("state-rv-{next}"),
+                        false,
+                    ))
+                } else {
+                    // A State persist response must echo the exact durable
+                    // spec written by the command, not an older fixture.
+                    let mut written: serde_json::Value =
+                        serde_json::from_slice(&body).expect("state patch JSON");
+                    let metadata = written
+                        .get_mut("metadata")
+                        .and_then(serde_json::Value::as_object_mut)
+                        .expect("state patch metadata");
+                    metadata.insert("name".into(), json!(state_name));
+                    metadata.insert("namespace".into(), json!("ns"));
+                    metadata.insert("uid".into(), json!("state-uid"));
+                    metadata.insert("resourceVersion".into(), json!(format!("state-rv-{next}")));
+                    metadata.insert(
+                        "annotations".into(),
+                        json!({"runtime.oxideloop.dev/root-uid":"root-uid"}),
+                    );
+                    metadata.insert(
+                        "ownerReferences".into(),
+                        json!([{
+                            "apiVersion":"demo.oxideloop.dev/v1alpha1",
+                            "kind":"WebApplication",
+                            "name":"root",
+                            "uid":"root-uid",
+                            "controller":true,
+                            "blockOwnerDeletion":false,
+                        }]),
+                    );
+                    metadata.insert(
+                        "finalizers".into(),
+                        json!(["runtime.oxideloop.dev/state-finalizer"]),
+                    );
+                    json_response(&written)
+                }
             } else {
                 panic!("unexpected deletion-barrier request {method} {path}");
             };
@@ -678,9 +725,14 @@ async fn driver_deletion_barrier_crashes_after_exact_state_finalizer_effect_and_
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("set midpoint deadline");
     let mut armed = [0_u8; 6];
-    client
-        .read_exact(&mut armed)
-        .expect("UDS reports arm acceptance");
+    if let Err(error) = client.read_exact(&mut armed) {
+        let driver_result = tokio::time::timeout(Duration::from_millis(100), &mut run).await;
+        panic!(
+            "UDS reports arm acceptance: {error}; driver_finished={}; driver_result={driver_result:?}; trace={:?}",
+            run.is_finished(),
+            requests.lock().expect("request log lock"),
+        );
+    }
     assert_eq!(&armed, b"ARMED\n");
     let mut reached = [0_u8; 8];
     if let Err(error) = client.read_exact(&mut reached) {

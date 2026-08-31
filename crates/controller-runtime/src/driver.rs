@@ -14,6 +14,8 @@ use std::{
 
 use oxideloop_bundle_archive::install_archive;
 use oxideloop_bundle_contract::{BundleDescriptorV0, BundleStore, MAX_BUNDLE_BYTES};
+#[cfg(feature = "test-failpoints")]
+use oxideloop_controller_api::PersistPurpose;
 use oxideloop_controller_api::{ObjectIdentity, ProgramBundleReference};
 use oxideloop_controller_core::{
     ActionTriggerV0, CommandV0, EventV0, MachineStateV0, PhaseV0, PreconditionsV0,
@@ -35,7 +37,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::time::{Instant as TokioInstant, sleep, timeout_at};
 
 #[cfg(feature = "test-failpoints")]
-use crate::failpoint_uds::{DeletionBarrierV0, FailpointControlV0};
+use crate::failpoint_uds::{EffectBarrierV0, FailpointControlV0};
 use crate::{
     BufferedRetainedWatchV0, CompletedObservationFenceOutcomeV0, FailpointsV0, FixedPointPortV0,
     KubeAutomationObservationPortV0, KubeAutomationPortV0, KubeDeletionObservationPortV0,
@@ -138,6 +140,16 @@ impl ControllerDriverV0 {
     /// and starts only when the nominated name appears.
     #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> Result<DriverExitV0, RuntimeErrorV0> {
+        // Bind the debug-only control before the first root barrier so an e2e
+        // client can arm a narrow effect seam without racing startup I/O.
+        #[cfg(feature = "test-failpoints")]
+        let mut failpoint_listener = self
+            .config
+            .failpoint_unix_socket
+            .as_ref()
+            .map(crate::failpoint_uds::FailpointUdsListenerV0::bind)
+            .transpose()
+            .map_err(|error| RuntimeErrorV0::Hold(format!("invalid failpoint socket: {error}")))?;
         let (mut root_watch, initial_machine) =
             establish_root_barrier(&self.transport, &self.config).await?;
         let mut actor = initial_machine.map(start_actor);
@@ -163,13 +175,7 @@ impl ControllerDriverV0 {
         let mut automation_candidates = VecDeque::<QueuedAutomationV0>::new();
         let mut failpoints = FailpointsV0::default();
         #[cfg(feature = "test-failpoints")]
-        let mut failpoint_listener = self
-            .config
-            .failpoint_unix_socket
-            .as_ref()
-            .map(crate::failpoint_uds::FailpointUdsListenerV0::bind)
-            .transpose()
-            .map_err(|error| RuntimeErrorV0::Hold(format!("invalid failpoint socket: {error}")))?;
+        let mut prepare_barrier = None;
         #[cfg(feature = "test-failpoints")]
         let mut deletion_barrier = None;
         #[cfg(feature = "test-failpoints")]
@@ -189,6 +195,13 @@ impl ControllerDriverV0 {
                     arm.acknowledge().map_err(|error| {
                         RuntimeErrorV0::Hold(format!("failpoint acknowledgement failed: {error}"))
                     })?;
+                    break;
+                }
+                Some(FailpointControlV0::PrepareBarrier(mut barrier)) => {
+                    barrier.acknowledge().map_err(|error| {
+                        RuntimeErrorV0::Hold(format!("failpoint acknowledgement failed: {error}"))
+                    })?;
+                    prepare_barrier = Some(barrier);
                     break;
                 }
                 Some(FailpointControlV0::DeletionBarrier(mut barrier)) => {
@@ -225,6 +238,14 @@ impl ControllerDriverV0 {
                                 "failpoint acknowledgement failed: {error}"
                             ))
                         })?;
+                    }
+                    Some(FailpointControlV0::PrepareBarrier(mut barrier)) => {
+                        barrier.acknowledge().map_err(|error| {
+                            RuntimeErrorV0::Hold(format!(
+                                "failpoint acknowledgement failed: {error}"
+                            ))
+                        })?;
+                        prepare_barrier = Some(barrier);
                     }
                     Some(FailpointControlV0::DeletionBarrier(mut barrier)) => {
                         barrier.acknowledge().map_err(|error| {
@@ -607,6 +628,8 @@ impl ControllerDriverV0 {
                 Some(command) => {
                     #[cfg(feature = "test-failpoints")]
                     reject_late_deletion_barrier(&command, deletion_barrier.is_some())?;
+                    #[cfg(feature = "test-failpoints")]
+                    reject_late_prepare_barrier(&command, prepare_barrier.is_some())?;
                     let (event, buffered) = match execute_kubernetes_command_while_observing(
                         &self.transport,
                         &root_address(active)?,
@@ -681,6 +704,29 @@ impl ControllerDriverV0 {
                     // Exact effect acknowledgement is reducer authority and
                     // must reduce before an observed root closure/rebase.
                     active.acknowledge(event)?;
+                    #[cfg(feature = "test-failpoints")]
+                    if prepare_barrier.is_some()
+                        && matches!(
+                            &command,
+                            CommandV0::Persist { operation, .. }
+                                if operation.purpose == PersistPurpose::Prepare
+                        )
+                    {
+                        let barrier = prepare_barrier.take().ok_or_else(|| {
+                            RuntimeErrorV0::Hold(
+                                "prepared-dispatch barrier disappeared before interception".into(),
+                            )
+                        })?;
+                        tokio::task::block_in_place(|| barrier.reached_and_wait_for_release())
+                            .map_err(|error| {
+                                RuntimeErrorV0::Hold(format!(
+                                    "prepared-dispatch barrier failed: {error}"
+                                ))
+                            })?;
+                        return Err(RuntimeErrorV0::InjectedCrash(
+                            crate::FailpointV0::AfterPrepareBeforeDispatchAuthorization,
+                        ));
+                    }
                     apply_buffered_watches(
                         active,
                         &self.transport,
@@ -1929,13 +1975,28 @@ fn reject_late_deletion_barrier(
     }
 }
 
+#[cfg(feature = "test-failpoints")]
+fn reject_late_prepare_barrier(
+    command: &CommandV0,
+    barrier_is_armed: bool,
+) -> Result<(), RuntimeErrorV0> {
+    if barrier_is_armed && matches!(command, CommandV0::Mutate { .. }) {
+        Err(RuntimeErrorV0::Hold(
+            "prepared-dispatch barrier was armed after the Prepare seam; refusing mutation authority"
+                .into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Proves the exact root-only deletion recovery state before exposing the
 /// midpoint to e2e. The direct state reread establishes absence first; the
 /// loader then validates the same deleting root, its finalizer, and complete
 /// cleanup receipt without allowing an arbitrary raw object to become proof.
 #[cfg(feature = "test-failpoints")]
 async fn verify_deletion_barrier_and_wait(
-    barrier: DeletionBarrierV0,
+    barrier: EffectBarrierV0,
     event: &EventV0,
     active: &RootActorV0,
     transport: &KubeTransportV0,
@@ -2479,6 +2540,14 @@ mod tests {
         assert!(reject_late_deletion_barrier(&root_command, true).is_err());
         assert!(reject_late_deletion_barrier(&root_command, false).is_ok());
         assert!(reject_late_deletion_barrier(&command, true).is_ok());
+        let mutate = CommandV0::Mutate {
+            transaction_id: "transaction".into(),
+            attempt_token: "attempt".into(),
+            commands: vec![],
+        };
+        assert!(reject_late_prepare_barrier(&mutate, true).is_err());
+        assert!(reject_late_prepare_barrier(&mutate, false).is_ok());
+        assert!(reject_late_prepare_barrier(&command, true).is_ok());
     }
 
     fn dependency_event(resource_version: &str) -> ObjectV0 {

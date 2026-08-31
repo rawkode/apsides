@@ -28,13 +28,34 @@ holds, while child mutation emits a token-bound failure and then holds.
 Canonical legacy objects may be lazily claimed on their next authorized write;
 malformed or ownerless objects hold.
 
+P14-E freezes the one-command durable mutation lifecycle. `Prepare` persists
+the frozen render and prepared intent, `PreparedNotIssued` proves that no
+dispatch authorization exists, `DispatchAuthorizedMayHaveIssued` is the only
+restart state that may have sent a Kubernetes request, and mutation results
+complete the transaction. A restart from `PreparedNotIssued` invalidates and
+replans without replaying the prepared bytes. The kind gate must capture the
+state and hashes, prove exact UID/RV-pinned existing-object recovery without a
+POST, and retain authorization-before-request evidence wherever the transport
+surface makes it observable.
+
+The Event-materialization-before-`AutomationRun`-status window remains
+ambiguous: an Event POST may have succeeded without a durable UID or trusted
+admission witness. It therefore holds for operator intervention and is not a
+successful automatic recovery path. `AfterStatusBeforeAck` remains covered by
+exact Event UID/status-pinned recovery. The unresolved pre-status window makes
+no delivery-semantics claim; an exactly-once POST contract requires a future
+admission-side idempotency or witness mechanism.
+
 Gate: kind-backed integration tests for create/update/conflict/delete/restart flows, rollback tests for inventory state, and a default-deny adoption policy.
 
 ## M4: event-driven hooks
 
 Model hooks as declarations in render output: dependencies identify event sources and automations identify immutable action modules. Deduplicate occurrences in Rust using source UID, resource version, automation identity, and occurrence ID. Actions return validated declarations such as Jobs or Events; they do not receive an ambient client.
 
-Gate: replay and crash tests prove at-least-once delivery without duplicate materialization, bounded queues, explicit retry/dead-letter behavior, and namespace/RBAC policy enforcement.
+Gate: replay and crash tests prove durable occurrence deduplication, fail-closed
+handling of ambiguous unpinned creates, exact UID-pinned post-status recovery,
+bounded queues, explicit retry/dead-letter behavior, and namespace/RBAC policy
+enforcement.
 
 ## M5: hardening and release contract
 

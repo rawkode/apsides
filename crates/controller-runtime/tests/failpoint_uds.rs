@@ -37,7 +37,12 @@ impl TestDir {
                 .as_nanos(),
             TEST_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed),
         );
-        let path = std::env::temp_dir().join(unique);
+        // `/var` is a symlink on macOS, while the production listener rejects
+        // symlink ancestors. Keep this test's private parent on the canonical
+        // system temporary root.
+        let path = fs::canonicalize("/tmp")
+            .expect("canonical temporary root")
+            .join(unique);
         fs::create_dir(&path).expect("test directory");
         let mut permissions = fs::metadata(&path).expect("test metadata").permissions();
         permissions.set_mode(0o700);
@@ -181,7 +186,7 @@ fn slow_request_has_one_total_deadline() {
 }
 
 #[test]
-fn arm_into_is_one_shot_for_both_automation_windows() {
+fn arm_into_is_one_shot_for_every_non_barrier_crash_window() {
     for (index, (request, expected)) in [
         (
             b"AfterEventBeforeStatus\n".as_slice(),
@@ -231,6 +236,34 @@ fn action_arm_is_not_observable_until_the_listener_acknowledges_it() {
     let mut acknowledgement = [0_u8; 6];
     client.read_exact(&mut acknowledgement).expect("read ARMED");
     assert_eq!(&acknowledgement, b"ARMED\n");
+}
+
+#[test]
+fn prepare_barrier_acknowledges_then_holds_the_exact_midpoint_until_release() {
+    let root = TestDir::new();
+    let path = socket_path(&root, "prepare-barrier.sock");
+    let mut listener = FailpointUdsListenerV0::bind(&path).expect("bind listener");
+    let mut client = connect(&path);
+    client
+        .write_all(b"AfterPrepareBeforeDispatchAuthorization\n")
+        .expect("arm prepare barrier");
+    let mut barrier = match listener.poll_control().expect("poll barrier") {
+        Some(FailpointControlV0::PrepareBarrier(barrier)) => barrier,
+        control => panic!("unexpected control: {control:?}"),
+    };
+    barrier.acknowledge().expect("acknowledge barrier");
+    let mut armed = [0_u8; 6];
+    client.read_exact(&mut armed).expect("read armed");
+    assert_eq!(&armed, b"ARMED\n");
+    let waiter = thread::spawn(move || barrier.reached_and_wait_for_release());
+    let mut reached = [0_u8; 8];
+    client.read_exact(&mut reached).expect("read reached");
+    assert_eq!(&reached, b"REACHED\n");
+    client.write_all(b"RELEASE\n").expect("release barrier");
+    waiter
+        .join()
+        .expect("join barrier waiter")
+        .expect("accepted release");
 }
 
 #[test]

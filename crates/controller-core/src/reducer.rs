@@ -20,10 +20,11 @@ use oxideloop_controller_api::{
     AutomationRunCompletionState, AutomationRunSpec, DeletionCleanupReceipt, DeletionTransaction,
     DependencySnapshot, DependencySnapshotType, DurablePhase, GenerationAdvanceClosure,
     GenerationAdvanceClosurePurpose, InventoryEntry, MAX_ACTION_INPUT_CANONICAL_BYTES,
-    MAX_CLOSURE_REBASES, MAX_IDENTIFIER_BYTES, MAX_LIST_ENTRIES, ObjectIdentity,
-    OxideLoopStateSpec, PersistOperation, PersistPurpose, PreparedRecoveryClaim, PruneCandidate,
-    PruneObservation, StateBody, WebApplicationSpec, WebApplicationStatus, automation_run_name,
-    bootstrap_id, state_name, validate_automation_run_name, validate_root_state_link,
+    MAX_CLOSURE_REBASES, MAX_IDENTIFIER_BYTES, MAX_LIST_ENTRIES, NextCommandLifecycleStateV0,
+    NextCommandLifecycleV0, ObjectIdentity, OxideLoopStateSpec, PersistOperation, PersistPurpose,
+    PreparedRecoveryClaim, PruneCandidate, PruneObservation, StateBody, WebApplicationSpec,
+    WebApplicationStatus, automation_run_name, bootstrap_id, state_name,
+    validate_automation_run_name, validate_root_state_link,
 };
 use oxideloop_mutation_model::{
     APPLY_PATCH_CONTENT_TYPE, BackendQualification, CONTROLLER_FIELD_MANAGER, HttpMethod,
@@ -91,6 +92,7 @@ pub enum PhaseV0 {
     InformersPending,
     RenderPending,
     PersistPending,
+    DispatchAuthorizationPersistPending,
     RevalidatePending,
     MutationPending,
     Ready,
@@ -137,6 +139,11 @@ pub struct RuntimeStateV0 {
     /// runtime continuation: recovery always obtains a fresh informer fence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_observation: Option<PreconditionsV0>,
+    /// Exact one-command capability retained only between the durable
+    /// dispatch-authorization acknowledgement and the Kubernetes request.
+    /// It is never serialized or reconstructed after restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_dispatch: Option<PendingMutationDispatchV0>,
 }
 
 impl Default for RuntimeStateV0 {
@@ -149,8 +156,17 @@ impl Default for RuntimeStateV0 {
             pending_descriptor_token: None,
             pending_root_refresh: None,
             pending_observation: None,
+            pending_dispatch: None,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingMutationDispatchV0 {
+    pub transaction_id: String,
+    pub attempt_token: String,
+    pub command: MutationCommandV0,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -267,6 +283,7 @@ impl MachineStateV0 {
                 pending_descriptor_token: None,
                 pending_root_refresh: None,
                 pending_observation: None,
+                pending_dispatch: None,
             },
         })
     }
@@ -316,6 +333,7 @@ impl MachineStateV0 {
                 pending_descriptor_token: None,
                 pending_root_refresh: None,
                 pending_observation: None,
+                pending_dispatch: None,
             },
         })
     }
@@ -1206,7 +1224,8 @@ fn root_only_command_allowed(command: &CommandV0) -> bool {
 fn is_effect_ack_pending(phase: PhaseV0) -> bool {
     matches!(
         phase,
-        PhaseV0::MutationPending
+        PhaseV0::DispatchAuthorizationPersistPending
+            | PhaseV0::MutationPending
             | PhaseV0::AutomationEnsurePending
             | PhaseV0::DeletionMutationPending
             | PhaseV0::DeletionAutomationCleanupPending
@@ -1330,6 +1349,17 @@ fn root_refreshed(
             commands,
             "root refresh cannot replace post-finalizer UID absence verification",
         );
+        return Ok(());
+    }
+    if has_may_have_issued(state) {
+        install_root_refresh(state, root);
+        state.runtime.pending_dispatch = None;
+        state.runtime.pending_root_refresh = None;
+        state.phase = PhaseV0::Hold;
+        commands.push(CommandV0::Hold {
+            reason: "root refresh preserves a may-have-issued mutation; manual recovery required"
+                .into(),
+        });
         return Ok(());
     }
     if is_effect_ack_pending(state.phase) {
@@ -1516,9 +1546,26 @@ fn start(state: &mut MachineStateV0, commands: &mut Vec<CommandV0>) {
             pending_descriptor_token: None,
             pending_root_refresh: None,
             pending_observation: None,
+            pending_dispatch: None,
         };
         if !bootstrap_confirmed(state) {
             issue_bootstrap(state, commands);
+            return;
+        }
+        if state
+            .journal
+            .state
+            .apply_transaction
+            .as_ref()
+            .is_some_and(|tx| {
+                tx.next_command_lifecycle.state == NextCommandLifecycleStateV0::LegacyUnknown
+            })
+        {
+            state.phase = PhaseV0::Hold;
+            commands.push(CommandV0::Hold {
+                reason: "legacy prepared transaction lacks issuance lifecycle; refusing replay"
+                    .into(),
+            });
             return;
         }
         if let Some(closure) = state.journal.state.generation_advance_closure.take() {
@@ -1605,7 +1652,14 @@ fn start(state: &mut MachineStateV0, commands: &mut Vec<CommandV0>) {
             return;
         }
         if state.journal.state.deletion.is_some() {
-            if state.journal.state.apply_transaction.is_some() {
+            if has_may_have_issued(state) {
+                state.phase = PhaseV0::Hold;
+                commands.push(CommandV0::Hold {
+                    reason:
+                        "deletion preserves a may-have-issued mutation; manual recovery required"
+                            .into(),
+                });
+            } else if state.journal.state.apply_transaction.is_some() {
                 state.phase = PhaseV0::DeletionObservationPending;
                 commands.push(CommandV0::RequestDeletionObservation {
                     preconditions: pins(&state.root),
@@ -1946,20 +2000,35 @@ fn begin_deletion_durable(
     commands: &mut Vec<CommandV0>,
 ) -> Result<(), ReconcileError> {
     if state.journal.state.deletion.is_some() {
+        if has_may_have_issued(state) {
+            state.phase = PhaseV0::Hold;
+            commands.push(CommandV0::Hold {
+                reason: "deletion preserves a may-have-issued mutation; manual recovery required"
+                    .into(),
+            });
+            return Ok(());
+        }
         state.phase = PhaseV0::DeletionObservationPending;
         commands.push(CommandV0::RequestDeletionObservation {
             preconditions: pins(&state.root),
         });
         return Ok(());
     }
-    // Remove every normal issuance capability. The first deletion effect is
-    // impossible until this replacement journal write has been acknowledged.
+    // Remove every normal issuance capability. A may-have-issued normal
+    // mutation is the one exception: deletion must preserve it and stop,
+    // rather than incorrectly claiming that no normal request could land.
+    let preserve_may_have_issued = has_may_have_issued(state);
     state.runtime.pending_automation = None;
     state.runtime.pending_root_refresh = None;
+    state.runtime.pending_dispatch = None;
     state.frozen = None;
-    state.journal.state.apply_transaction = None;
+    if !preserve_may_have_issued {
+        state.journal.state.apply_transaction = None;
+    }
     state.journal.state.pending_dependencies.clear();
-    state.journal.state.prune_candidate = None;
+    if !preserve_may_have_issued {
+        state.journal.state.prune_candidate = None;
+    }
     state.journal.state.deletion = Some(DeletionTransaction {
         id: hash(&[
             "deletion/v0",
@@ -2129,6 +2198,58 @@ fn persist_ack(
                 preconditions: pins(&state.root),
             });
         }
+        PersistPurpose::DispatchAuthorization => {
+            let Some(mut pending) = state.runtime.pending_dispatch.take() else {
+                state.phase = PhaseV0::Hold;
+                commands.push(CommandV0::Hold {
+                    reason:
+                        "dispatch authorization acknowledgement lost its exact command capability"
+                            .into(),
+                });
+                return Ok(());
+            };
+            let Some(tx) = state.journal.state.apply_transaction.as_ref() else {
+                state.phase = PhaseV0::Hold;
+                commands.push(CommandV0::Hold {
+                    reason: "dispatch authorization acknowledgement has no transaction".into(),
+                });
+                return Ok(());
+            };
+            let exact = matches!(
+                &tx.next_command_lifecycle,
+                NextCommandLifecycleV0 {
+                    state: NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued,
+                    command_id: Some(command_id),
+                } if command_id == &pending.command.command_id
+            ) && next_unrecorded_intent(tx)
+                .is_some_and(|intent| intent.command_id == pending.command.command_id)
+                && tx.id == pending.transaction_id
+                && tx.attempt_token == pending.attempt_token;
+            if !exact {
+                state.phase = PhaseV0::Hold;
+                commands.push(CommandV0::Hold {
+                    reason:
+                        "dispatch authorization acknowledgement does not match the retained command"
+                            .into(),
+                });
+                return Ok(());
+            }
+            pending
+                .command
+                .preconditions
+                .state_resource_version
+                .clone_from(&state.root.state_resource_version);
+            state.phase = if state.journal.state.deletion.is_some() {
+                PhaseV0::DeletionMutationPending
+            } else {
+                PhaseV0::MutationPending
+            };
+            commands.push(CommandV0::Mutate {
+                transaction_id: pending.transaction_id,
+                attempt_token: pending.attempt_token,
+                commands: vec![pending.command],
+            });
+        }
         PersistPurpose::Invalidate => {
             state.phase = PhaseV0::RenderPending;
             commands.push(CommandV0::RequestRender {
@@ -2139,7 +2260,18 @@ fn persist_ack(
         | PersistPurpose::AutomationBaseline
         | PersistPurpose::AutomationPending
         | PersistPurpose::AutomationCompletion => state.phase = PhaseV0::Ready,
-        PersistPurpose::DeletionStart => deletion_prepare(state, commands)?,
+        PersistPurpose::DeletionStart => {
+            if has_may_have_issued(state) {
+                state.phase = PhaseV0::Hold;
+                commands.push(CommandV0::Hold {
+                    reason:
+                        "deletion preserves a may-have-issued mutation; manual recovery required"
+                            .into(),
+                });
+            } else {
+                deletion_prepare(state, commands)?;
+            }
+        }
         PersistPurpose::DeletionPrepare => {
             state.phase = PhaseV0::DeletionObservationPending;
             commands.push(CommandV0::RequestDeletionObservation {
@@ -2199,6 +2331,9 @@ fn phase_matches(phase: PhaseV0, purpose: PersistPurpose) -> bool {
         | PersistPurpose::Invalidate
         | PersistPurpose::MutationResult
         | PersistPurpose::Completion => phase == PhaseV0::PersistPending,
+        PersistPurpose::DispatchAuthorization => {
+            phase == PhaseV0::DispatchAuthorizationPersistPending
+        }
         PersistPurpose::AutomationBaseline
         | PersistPurpose::AutomationPending
         | PersistPurpose::AutomationCompletion => phase == PhaseV0::AutomationPersistPending,
@@ -2262,6 +2397,10 @@ fn deletion_prepare(
             command_id: intent.command_id.clone(),
         })
         .collect();
+    let next_command_lifecycle = match intents.first() {
+        Some(intent) => NextCommandLifecycleV0::prepared(intent.command_id.clone()),
+        None => NextCommandLifecycleV0::complete(),
+    };
     state.journal.state.apply_transaction = Some(ApplyTransaction {
         id: deletion_id,
         generation: deletion_start_generation,
@@ -2280,6 +2419,7 @@ fn deletion_prepare(
             &state.root.state_resource_version,
         ]),
         prepared_intents: intents,
+        next_command_lifecycle,
         recovery_claims,
         results: vec![],
         unresolved_identities: vec![],
@@ -2410,6 +2550,13 @@ fn deletion_revalidated(
     };
     let key = identity_key(&intent.identity);
     if observed_inventory_by_key.contains_key(&key) {
+        if has_may_have_issued(state) {
+            state.phase = PhaseV0::Hold;
+            commands.push(CommandV0::Hold {
+                reason: "may-have-issued DELETE cannot be replayed during deletion".into(),
+            });
+            return Ok(());
+        }
         return deletion_issue(state, commands);
     }
     if !claim_matches(state, &tx, intent)
@@ -2432,6 +2579,7 @@ fn deletion_revalidated(
         resource_version: None,
     };
     record_mutation_results(state, &[recovered])?;
+    advance_next_command_lifecycle(state)?;
     queue_persist(
         state,
         PersistPurpose::DeletionMutationResult,
@@ -2445,20 +2593,14 @@ fn deletion_issue(
     state: &mut MachineStateV0,
     commands: &mut Vec<CommandV0>,
 ) -> Result<(), ReconcileError> {
-    let Some(tx) = state.journal.state.apply_transaction.as_ref() else {
+    let Some(tx) = state.journal.state.apply_transaction.clone() else {
         return deletion_advance(state, commands);
     };
-    let effects = deletion_commands(state, tx);
+    let effects = deletion_commands(state, &tx);
     if effects.is_empty() {
         deletion_advance(state, commands)
     } else {
-        state.phase = PhaseV0::DeletionMutationPending;
-        commands.push(CommandV0::Mutate {
-            transaction_id: tx.id.clone(),
-            attempt_token: tx.attempt_token.clone(),
-            commands: effects,
-        });
-        Ok(())
+        authorize_dispatch(state, &tx, effects, commands)
     }
 }
 
@@ -2512,6 +2654,30 @@ fn revalidate(
         .clone()
         .ok_or_else(|| ReconcileError::Mutation("revalidation has no transaction".into()))?;
     let exact_effect_recovery = tx.generation != state.root.generation || state.frozen.is_none();
+    if tx.next_command_lifecycle.state == NextCommandLifecycleStateV0::LegacyUnknown {
+        state.phase = PhaseV0::Hold;
+        commands.push(CommandV0::Hold {
+            reason: "legacy prepared transaction lacks issuance lifecycle; refusing replay".into(),
+        });
+        return Ok(());
+    }
+    let next_is_post = next_unrecorded_intent(&tx).is_some_and(|intent| {
+        intent.operation == ApplyOperation::Apply
+            && intent.expected_uid.is_none()
+            && intent.expected_resource_version.is_none()
+    });
+    if matches!(
+        tx.next_command_lifecycle.state,
+        NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued
+    ) && next_is_post
+    {
+        state.phase = PhaseV0::Hold;
+        commands.push(CommandV0::Hold {
+            reason: "may-have-issued POST cannot be recovered without a trusted admission witness"
+                .into(),
+        });
+        return Ok(());
+    }
     if !exact_effect_recovery
         && (tx.frozen_render_input_hash != frozen.render_input_hash
             || state
@@ -2530,6 +2696,21 @@ fn revalidate(
     let planning_observed = recovered_observation_projection(state, &tx, &observed);
     let plan = plan_graph(state, &frozen, input, output, planning_observed)?;
     if exact_effect_recovery {
+        if matches!(
+            tx.next_command_lifecycle.state,
+            NextCommandLifecycleStateV0::PreparedNotIssued
+        ) {
+            state.journal.state.apply_transaction = None;
+            state.journal.state.pending_dependencies.clear();
+            state.journal.state.prune_candidate = None;
+            return queue_persist(
+                state,
+                PersistPurpose::Invalidate,
+                DurablePhase::Invalidate,
+                PhaseV0::PersistPending,
+                commands,
+            );
+        }
         let recovered = recover_prepared_result(state, &tx, &observed)?;
         if !recovered.is_empty() {
             state.frozen = Some(frozen);
@@ -2556,39 +2737,6 @@ fn revalidate(
                 PhaseV0::PersistPending,
                 commands,
             );
-        }
-        if plan.hash == tx.desired_graph_hash
-            && next_unrecorded_intent(&tx).is_some_and(|intent| {
-                intent.operation == ApplyOperation::Delete
-                    && observed.iter().any(|item| {
-                        item.identity == intent.identity
-                            && matches!(
-                                &item.observation,
-                                Observation::Existing { identity }
-                                    if intent.expected_uid.as_deref()
-                                        == Some(identity.uid.as_str())
-                                        && intent.expected_resource_version.as_deref()
-                                            == Some(identity.resource_version.as_str())
-                            )
-                    })
-            })
-            && let Ok(effects) = plan.remaining_effects(state, &tx)
-            && matches!(
-                effects.as_slice(),
-                [MutationCommandV0 {
-                    decision: MutationDecision::PreconditionedDelete { .. },
-                    ..
-                }]
-            )
-        {
-            state.frozen = Some(frozen);
-            state.phase = PhaseV0::MutationPending;
-            commands.push(CommandV0::Mutate {
-                transaction_id: tx.id,
-                attempt_token: tx.attempt_token,
-                commands: effects,
-            });
-            return Ok(());
         }
         state.phase = PhaseV0::Hold;
         commands.push(CommandV0::Hold {
@@ -2642,7 +2790,14 @@ fn revalidate(
             commands,
         );
     };
-    let recovered = recover_prepared_result(state, &tx, &observed)?;
+    let recovered = if matches!(
+        tx.next_command_lifecycle.state,
+        NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued
+    ) {
+        recover_prepared_result(state, &tx, &observed)?
+    } else {
+        Vec::new()
+    };
     if !recovered.is_empty() {
         state.frozen = Some(frozen);
         record_mutation_results(state, &recovered)?;
@@ -2667,13 +2822,7 @@ fn revalidate(
             commands,
         )
     } else {
-        state.phase = PhaseV0::MutationPending;
-        commands.push(CommandV0::Mutate {
-            transaction_id: tx.id.clone(),
-            attempt_token: tx.attempt_token.clone(),
-            commands: effects,
-        });
-        Ok(())
+        authorize_dispatch(state, &tx, effects, commands)
     }
 }
 
@@ -2698,6 +2847,7 @@ fn mutation_ack(
         return Ok(());
     }
     record_mutation_results(state, &results)?;
+    advance_next_command_lifecycle(state)?;
     if deleting {
         queue_persist(
             state,
@@ -2840,6 +2990,12 @@ fn recovered_observation_projection(
     tx: &ApplyTransaction,
     observed: &[DesiredObservationV0],
 ) -> Vec<DesiredObservationV0> {
+    if !matches!(
+        tx.next_command_lifecycle.state,
+        NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued
+    ) {
+        return observed.to_vec();
+    }
     let Some(intent) = next_unrecorded_intent(tx) else {
         return observed.to_vec();
     };
@@ -2899,6 +3055,88 @@ fn next_unrecorded_intent(tx: &ApplyTransaction) -> Option<&ApplyIntent> {
                 .any(|result| result.command_id == intent.command_id)
         })
         .min_by(|left, right| left.command_id.cmp(&right.command_id))
+}
+
+fn has_may_have_issued(state: &MachineStateV0) -> bool {
+    state
+        .journal
+        .state
+        .apply_transaction
+        .as_ref()
+        .is_some_and(|tx| {
+            matches!(
+                tx.next_command_lifecycle.state,
+                NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued
+            )
+        })
+}
+
+fn lifecycle_for_next(tx: &ApplyTransaction) -> NextCommandLifecycleV0 {
+    match tx.prepared_intents.get(tx.results.len()) {
+        Some(intent) => NextCommandLifecycleV0::prepared(intent.command_id.clone()),
+        None => NextCommandLifecycleV0::complete(),
+    }
+}
+
+fn advance_next_command_lifecycle(state: &mut MachineStateV0) -> Result<(), ReconcileError> {
+    let tx = state
+        .journal
+        .state
+        .apply_transaction
+        .as_mut()
+        .ok_or_else(|| ReconcileError::Mutation("result has no transaction".into()))?;
+    let lifecycle = lifecycle_for_next(tx);
+    tx.next_command_lifecycle = lifecycle;
+    Ok(())
+}
+
+fn authorize_dispatch(
+    state: &mut MachineStateV0,
+    tx: &ApplyTransaction,
+    mut effects: Vec<MutationCommandV0>,
+    commands: &mut Vec<CommandV0>,
+) -> Result<(), ReconcileError> {
+    if effects.len() != 1 {
+        return Err(ReconcileError::Mutation(
+            "dispatch authorization requires exactly one mutation command".into(),
+        ));
+    }
+    let command = effects.pop().expect("length checked");
+    let Some(intent) = next_unrecorded_intent(tx) else {
+        return Err(ReconcileError::Mutation(
+            "dispatch authorization has no next prepared intent".into(),
+        ));
+    };
+    if !matches!(
+        &tx.next_command_lifecycle,
+        NextCommandLifecycleV0 {
+            state: NextCommandLifecycleStateV0::PreparedNotIssued,
+            command_id: Some(command_id),
+        } if command_id == &command.command_id && command_id == &intent.command_id
+    ) {
+        return Err(ReconcileError::Mutation(
+            "dispatch authorization lifecycle does not match the next command".into(),
+        ));
+    }
+    state
+        .journal
+        .state
+        .apply_transaction
+        .as_mut()
+        .expect("transaction cloned from state")
+        .next_command_lifecycle = NextCommandLifecycleV0::authorized(command.command_id.clone());
+    state.runtime.pending_dispatch = Some(PendingMutationDispatchV0 {
+        transaction_id: tx.id.clone(),
+        attempt_token: tx.attempt_token.clone(),
+        command,
+    });
+    queue_persist(
+        state,
+        PersistPurpose::DispatchAuthorization,
+        DurablePhase::DispatchAuthorization,
+        PhaseV0::DispatchAuthorizationPersistPending,
+        commands,
+    )
 }
 
 fn claim_matches(state: &MachineStateV0, tx: &ApplyTransaction, intent: &ApplyIntent) -> bool {
@@ -4354,6 +4592,10 @@ fn prepare(
             command_id: intent.command_id.clone(),
         })
         .collect();
+    let next_command_lifecycle = match plan.intents.first() {
+        Some(intent) => NextCommandLifecycleV0::prepared(intent.command_id.clone()),
+        None => NextCommandLifecycleV0::complete(),
+    };
     state.journal.state.apply_transaction = Some(ApplyTransaction {
         id: transaction_id,
         generation: frozen.root_generation,
@@ -4362,6 +4604,7 @@ fn prepare(
         recovery_policy: ApplyRecoveryPolicy::ReplanAndRevalidateBeforeEffect,
         attempt_token: attempt,
         prepared_intents: plan.intents,
+        next_command_lifecycle,
         recovery_claims,
         results: vec![],
         unresolved_identities: vec![],
@@ -5135,6 +5378,7 @@ mod tests {
             },
         )
         .unwrap();
+        let issued = acknowledge_dispatch_authorization(issued, "13");
         let (transaction_id, attempt_token, command) = match &issued.commands[0] {
             CommandV0::Mutate {
                 transaction_id,
@@ -5145,7 +5389,7 @@ mod tests {
                 attempt_token.clone(),
                 commands[0].clone(),
             ),
-            _ => panic!("single apply must issue its one prepared effect"),
+            command => panic!("single apply must issue its one prepared effect: {command:?}"),
         };
         let acknowledged = reduce(
             issued.state,
@@ -5172,7 +5416,7 @@ mod tests {
             EventV0::Persisted {
                 token: mutation_result.token,
                 old_state_resource_version: mutation_result.old_state_resource_version,
-                new_state_resource_version: "13".into(),
+                new_state_resource_version: "14".into(),
                 state_uid: "state-uid".into(),
             },
         )
@@ -5207,12 +5451,36 @@ mod tests {
             EventV0::Persisted {
                 token: completion_persist.token,
                 old_state_resource_version: completion_persist.old_state_resource_version,
-                new_state_resource_version: "14".into(),
+                new_state_resource_version: "15".into(),
                 state_uid: "state-uid".into(),
             },
         )
         .unwrap()
         .state
+    }
+
+    fn acknowledge_dispatch_authorization(
+        authorized: TransitionV0,
+        new_state_resource_version: &str,
+    ) -> TransitionV0 {
+        let operation = match &authorized.commands[0] {
+            CommandV0::Persist { operation, .. }
+                if operation.purpose == PersistPurpose::DispatchAuthorization =>
+            {
+                operation.clone()
+            }
+            command => panic!("expected dispatch authorization persist, got {command:?}"),
+        };
+        reduce(
+            authorized.state,
+            EventV0::Persisted {
+                token: operation.token,
+                old_state_resource_version: operation.old_state_resource_version,
+                new_state_resource_version: new_state_resource_version.into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -5497,6 +5765,7 @@ mod tests {
             },
         )
         .unwrap();
+        let deletion_mutation = acknowledge_dispatch_authorization(deletion_mutation, "14");
         let (transaction_id, attempt_token, command) = match &deletion_mutation.commands[0] {
             CommandV0::Mutate {
                 transaction_id,
@@ -5566,7 +5835,9 @@ mod tests {
             assert!(
                 matches!(
                     resumed.commands.as_slice(),
-                    [CommandV0::Persist { .. } | CommandV0::RequestDeletionObservation { .. }]
+                    [CommandV0::Persist { .. }
+                        | CommandV0::RequestDeletionObservation { .. }
+                        | CommandV0::Hold { .. }]
                 ),
                 "{phase} resumed outside durable deletion: {:?}",
                 resumed.commands
@@ -5608,6 +5879,7 @@ mod tests {
                 expected_uid: Some("old-uid".into()),
                 expected_resource_version: Some("old-rv".into()),
             }],
+            next_command_lifecycle: NextCommandLifecycleV0::authorized("1".repeat(64)),
             recovery_claims: vec![PreparedRecoveryClaim {
                 root_uid: "root-uid".into(),
                 transaction_id: "d".repeat(64),
@@ -5821,6 +6093,7 @@ mod tests {
             },
         )
         .unwrap();
+        let revalidated = acknowledge_dispatch_authorization(revalidated, "13");
         let (transaction_id, attempt_token) = match &revalidated.commands[0] {
             CommandV0::Mutate {
                 transaction_id,
@@ -6046,7 +6319,7 @@ mod tests {
     }
 
     #[test]
-    fn serialized_prepared_state_requires_new_observation_and_cannot_replay_effects() {
+    fn prepared_not_issued_restart_requires_revalidation_and_cannot_replay_effects() {
         let machine = boot_to_render(state());
         let (frozen, input, output, observed) = rendered(&machine.root, vec![]);
         let prepared = reduce(
@@ -6564,17 +6837,13 @@ mod tests {
         .unwrap();
         assert!(matches!(
             retried.commands.as_slice(),
-            [CommandV0::Mutate { commands, .. }]
-                if matches!(
-                    commands.as_slice(),
-                    [MutationCommandV0 {
-                        decision: MutationDecision::PreconditionedDelete {
-                            preconditions: MutationIdentity { uid, resource_version },
-                            ..
-                        },
-                        ..
-                    }] if uid == "old-uid" && resource_version == "10"
-                )
+            [CommandV0::Persist {
+                operation: PersistOperation {
+                    purpose: PersistPurpose::Invalidate,
+                    ..
+                },
+                ..
+            }]
         ));
         for (uid, resource_version) in [
             ("replacement-uid", "10"),
@@ -6597,7 +6866,16 @@ mod tests {
                 },
             )
             .unwrap();
-            assert!(matches!(held.commands.as_slice(), [CommandV0::Hold { .. }]));
+            assert!(matches!(
+                held.commands.as_slice(),
+                [CommandV0::Persist {
+                    operation: PersistOperation {
+                        purpose: PersistPurpose::Invalidate,
+                        ..
+                    },
+                    ..
+                }]
+            ));
         }
         let desired_present_output = serde_json::to_string(&RenderOutputV0 {
             abi_version: ABI_VERSION_V0.into(),
@@ -6653,6 +6931,7 @@ mod tests {
             },
         )
         .unwrap();
+        let issued = acknowledge_dispatch_authorization(issued, "13");
         let (transaction_id, attempt_token, command) = match &issued.commands[0] {
             CommandV0::Mutate {
                 transaction_id,
@@ -6690,7 +6969,7 @@ mod tests {
             EventV0::Persisted {
                 token: result.token,
                 old_state_resource_version: result.old_state_resource_version,
-                new_state_resource_version: "13".into(),
+                new_state_resource_version: "14".into(),
                 state_uid: "state-uid".into(),
             },
         )
@@ -6723,7 +7002,7 @@ mod tests {
             EventV0::Persisted {
                 token: completion_persist.token,
                 old_state_resource_version: completion_persist.old_state_resource_version,
-                new_state_resource_version: "14".into(),
+                new_state_resource_version: "15".into(),
                 state_uid: "state-uid".into(),
             },
         )
@@ -6984,7 +7263,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_proof_recovers_one_lost_create_without_adopting_foreign_name() {
+    fn may_have_issued_post_with_copied_proof_holds_without_adoption() {
         let machine = boot_to_render(state());
         let (frozen, input, output, observed) = rendered(&machine.root, vec![]);
         let prepared = reduce(
@@ -7022,6 +7301,7 @@ mod tests {
             },
         )
         .unwrap();
+        let issued = acknowledge_dispatch_authorization(issued, "13");
         let (transaction_id, command_id) = match &issued.commands[0] {
             CommandV0::Mutate {
                 transaction_id,
@@ -7050,10 +7330,7 @@ mod tests {
         .unwrap();
         let render = reduce(informers.state, EventV0::InformersReady).unwrap();
         assert_eq!(render.state.phase, PhaseV0::RevalidatePending);
-        assert_eq!(
-            fresh_frozen.state_resource_version,
-            render.state.root.state_resource_version
-        );
+        assert_eq!(render.state.root.state_resource_version, "13");
         assert_eq!(fresh_frozen.root_generation, render.state.root.generation);
         let mut proof_observed = observed;
         proof_observed[0].observation = Observation::Existing {
@@ -7069,10 +7346,14 @@ mod tests {
             uid: "created-uid".into(),
             resource_version: "30".into(),
         });
+        let recovery_state_resource_version = render.state.root.state_resource_version.clone();
         let recovered_result = reduce(
             render.state,
             EventV0::Revalidated {
-                frozen: fresh_frozen,
+                frozen: FrozenInputV0 {
+                    state_resource_version: recovery_state_resource_version,
+                    ..fresh_frozen
+                },
                 render_input_json: input,
                 render_output_json: output,
                 observed: proof_observed,
@@ -7082,15 +7363,206 @@ mod tests {
         assert!(
             matches!(
                 recovered_result.commands.as_slice(),
-                [CommandV0::Persist { .. }]
+                [CommandV0::Hold { .. }]
             ),
             "{:?}",
             recovered_result.commands
         );
+        assert!(recovered_result.state.journal.state.inventory.is_empty());
+    }
+
+    #[test]
+    fn mutation_requires_an_exact_dispatch_authorization_acknowledgement() {
+        let machine = boot_to_render(state());
+        let (frozen, input, output, observed) = rendered(&machine.root, vec![]);
+        let prepared = reduce(
+            machine,
+            EventV0::Rendered {
+                frozen,
+                render_input_json: input.clone(),
+                render_output_json: output.clone(),
+                observed: observed.clone(),
+            },
+        )
+        .unwrap();
+        let prepare = match &prepared.commands[0] {
+            CommandV0::Persist { operation, .. } => operation.clone(),
+            command => panic!("expected prepare persist, got {command:?}"),
+        };
+        let revalidate = reduce(
+            prepared.state,
+            EventV0::Persisted {
+                token: prepare.token,
+                old_state_resource_version: prepare.old_state_resource_version,
+                new_state_resource_version: "12".into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .unwrap();
+        let authorized = reduce(
+            revalidate.state.clone(),
+            EventV0::Revalidated {
+                frozen: revalidate.state.frozen.clone().unwrap(),
+                render_input_json: input,
+                render_output_json: output,
+                observed,
+            },
+        )
+        .unwrap();
+        let operation = match &authorized.commands[0] {
+            CommandV0::Persist { operation, .. }
+                if operation.purpose == PersistPurpose::DispatchAuthorization =>
+            {
+                operation.clone()
+            }
+            command => panic!("expected dispatch authorization persist, got {command:?}"),
+        };
         assert_eq!(
-            recovered_result.state.journal.state.inventory[0].uid,
-            "created-uid"
+            authorized.state.phase,
+            PhaseV0::DispatchAuthorizationPersistPending
         );
+        assert!(matches!(
+            authorized.commands.as_slice(),
+            [CommandV0::Persist { .. }]
+        ));
+
+        let stale = reduce(
+            authorized.state.clone(),
+            EventV0::Persisted {
+                token: "0".repeat(64),
+                old_state_resource_version: operation.old_state_resource_version.clone(),
+                new_state_resource_version: "13".into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .unwrap();
+        assert!(
+            stale
+                .commands
+                .iter()
+                .all(|command| !matches!(command, CommandV0::Mutate { .. }))
+        );
+
+        let issued = acknowledge_dispatch_authorization(authorized, "13");
+        assert!(
+            matches!(issued.commands.as_slice(), [CommandV0::Mutate { commands, .. }] if commands.len() == 1)
+        );
+    }
+
+    #[test]
+    fn missing_lifecycle_holds_without_issuing_a_recovered_mutation() {
+        let machine = boot_to_render(state());
+        let (frozen, input, output, observed) = rendered(&machine.root, vec![]);
+        let prepared = reduce(
+            machine,
+            EventV0::Rendered {
+                frozen,
+                render_input_json: input,
+                render_output_json: output,
+                observed,
+            },
+        )
+        .unwrap();
+        let mut wire = serde_json::to_value(&prepared.state).unwrap();
+        wire.pointer_mut("/journal/state/applyTransaction/nextCommandLifecycle")
+            .map(|value| *value = Value::Null)
+            .expect("prepared state has a lifecycle");
+        wire.pointer_mut("/journal/state/applyTransaction")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .remove("nextCommandLifecycle");
+        let recovered =
+            MachineStateV0::recover_json(&serde_json::to_string(&wire).unwrap()).unwrap();
+        let held = reduce(recovered, EventV0::Start).unwrap();
+        assert!(matches!(held.commands.as_slice(), [CommandV0::Hold { .. }]));
+    }
+
+    #[test]
+    fn deletion_persists_and_preserves_a_may_have_issued_transaction() {
+        let machine = boot_to_render(state());
+        let (frozen, input, output, observed) = rendered(&machine.root, vec![]);
+        let prepared = reduce(
+            machine,
+            EventV0::Rendered {
+                frozen,
+                render_input_json: input.clone(),
+                render_output_json: output.clone(),
+                observed: observed.clone(),
+            },
+        )
+        .unwrap();
+        let prepare = match &prepared.commands[0] {
+            CommandV0::Persist { operation, .. } => operation.clone(),
+            command => panic!("expected prepare persist, got {command:?}"),
+        };
+        let revalidate = reduce(
+            prepared.state,
+            EventV0::Persisted {
+                token: prepare.token,
+                old_state_resource_version: prepare.old_state_resource_version,
+                new_state_resource_version: "12".into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .unwrap();
+        let authorized = reduce(
+            revalidate.state.clone(),
+            EventV0::Revalidated {
+                frozen: revalidate.state.frozen.clone().unwrap(),
+                render_input_json: input,
+                render_output_json: output,
+                observed,
+            },
+        )
+        .unwrap();
+        let command_id = authorized
+            .state
+            .journal
+            .state
+            .apply_transaction
+            .as_ref()
+            .unwrap()
+            .next_command_lifecycle
+            .command_id
+            .clone();
+        let deleting = reduce(authorized.state, EventV0::BeginDeletion).unwrap();
+        assert!(matches!(
+            deleting.commands.as_slice(),
+            [CommandV0::Persist {
+                operation: PersistOperation {
+                    purpose: PersistPurpose::DeletionStart,
+                    ..
+                },
+                ..
+            }]
+        ));
+        assert_eq!(
+            deleting
+                .state
+                .journal
+                .state
+                .apply_transaction
+                .as_ref()
+                .unwrap()
+                .next_command_lifecycle
+                .command_id,
+            command_id
+        );
+        let operation = match &deleting.commands[0] {
+            CommandV0::Persist { operation, .. } => operation.clone(),
+            _ => unreachable!(),
+        };
+        let held = reduce(
+            deleting.state,
+            EventV0::Persisted {
+                token: operation.token,
+                old_state_resource_version: operation.old_state_resource_version,
+                new_state_resource_version: "13".into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(held.commands.as_slice(), [CommandV0::Hold { .. }]));
     }
 
     #[test]
@@ -7183,6 +7655,7 @@ mod tests {
                 expected_uid: Some("deleted-uid".into()),
                 expected_resource_version: Some("10".into()),
             }],
+            next_command_lifecycle: NextCommandLifecycleV0::authorized(command_id.clone()),
             recovery_claims: vec![PreparedRecoveryClaim {
                 root_uid: "root-uid".into(),
                 transaction_id: transaction_id.clone(),
@@ -7283,6 +7756,7 @@ mod tests {
             },
         )
         .unwrap();
+        let issued = acknowledge_dispatch_authorization(issued, "13");
         let (transaction_id, attempt_token, command_id) = match &issued.commands[0] {
             CommandV0::Mutate {
                 transaction_id,
@@ -7464,6 +7938,7 @@ mod tests {
             },
         )
         .unwrap();
+        let issued = acknowledge_dispatch_authorization(issued, "13");
         let (transaction_id, attempt_token, command) = match &issued.commands[0] {
             CommandV0::Mutate {
                 transaction_id,
@@ -7520,7 +7995,7 @@ mod tests {
             EventV0::Persisted {
                 token: first_persist.token,
                 old_state_resource_version: first_persist.old_state_resource_version,
-                new_state_resource_version: "13".into(),
+                new_state_resource_version: "14".into(),
                 state_uid: "state-uid".into(),
             },
         )
@@ -7579,6 +8054,7 @@ mod tests {
             },
         )
         .unwrap();
+        let second_issued = acknowledge_dispatch_authorization(second_issued, "15");
         let second_command = match &second_issued.commands[0] {
             CommandV0::Mutate { commands, .. } => {
                 assert_eq!(commands.len(), 1);
@@ -7611,7 +8087,7 @@ mod tests {
             EventV0::Persisted {
                 token: second_persist.token,
                 old_state_resource_version: second_persist.old_state_resource_version,
-                new_state_resource_version: "14".into(),
+                new_state_resource_version: "16".into(),
                 state_uid: "state-uid".into(),
             },
         )
@@ -7645,7 +8121,7 @@ mod tests {
             EventV0::Persisted {
                 token: completion_persist.token,
                 old_state_resource_version: completion_persist.old_state_resource_version,
-                new_state_resource_version: "15".into(),
+                new_state_resource_version: "17".into(),
                 state_uid: "state-uid".into(),
             },
         )
@@ -7847,7 +8323,7 @@ mod tests {
     }
 
     #[test]
-    fn mutation_ack_root_race_uses_effect_free_bounded_generation_closure() {
+    fn root_refresh_preserves_may_have_issued_transaction_and_holds() {
         let machine = boot_to_render(state());
         let (frozen, input, output, observed) = rendered(&machine.root, vec![]);
         let prepared = reduce(
@@ -7884,120 +8360,15 @@ mod tests {
             },
         )
         .unwrap();
-        let (transaction_id, attempt_token, command) = match &issued.commands[0] {
-            CommandV0::Mutate {
-                transaction_id,
-                attempt_token,
-                commands,
-            } => (
-                transaction_id.clone(),
-                attempt_token.clone(),
-                commands[0].clone(),
-            ),
-            _ => panic!(),
-        };
+        let issued = acknowledge_dispatch_authorization(issued, "13");
         let mut advanced = issued.state.root.clone();
         advanced.generation = 8;
         advanced.root_resource_version = "31".into();
         advanced.status.observed_generation = Some(8);
         let coalesced = reduce(issued.state, EventV0::RootRefreshed { root: advanced }).unwrap();
-        assert_eq!(coalesced.state.phase, PhaseV0::MutationPending);
-        let closure = reduce(
-            coalesced.state,
-            EventV0::MutationAcknowledged {
-                attempt_token: attempt_token.clone(),
-                transaction_id: transaction_id.clone(),
-                results: vec![ApplyResult {
-                    command_id: command.command_id,
-                    attempt_token,
-                    identity: command.identity,
-                    outcome: ApplyOutcome::Applied,
-                    uid: Some("created-uid".into()),
-                    resource_version: Some("30".into()),
-                }],
-            },
-        )
-        .unwrap();
-        assert_eq!(closure.state.root.generation, 8);
+        assert_eq!(coalesced.state.phase, PhaseV0::Hold);
         assert!(matches!(
-            closure.commands.as_slice(),
-            [CommandV0::Persist {
-                operation: PersistOperation {
-                    purpose: PersistPurpose::GenerationAdvanceClosure,
-                    ..
-                },
-                ..
-            }]
-        ));
-        assert!(
-            closure
-                .state
-                .journal
-                .state
-                .generation_advance_closure
-                .is_some()
-        );
-
-        // A process recreated from a durably written closure issues only an
-        // effect-free cleanup persist, never the original mutation.
-        let recreated =
-            MachineStateV0::recover_json(&serde_json::to_string(&closure.state).unwrap()).unwrap();
-        let resumed = reduce(recreated, EventV0::Start).unwrap();
-        assert!(matches!(
-            resumed.commands.as_slice(),
-            [CommandV0::Persist {
-                operation: PersistOperation {
-                    purpose: PersistPurpose::Invalidate,
-                    ..
-                },
-                ..
-            }]
-        ));
-
-        // If deletion was observed before the closure write was reloaded, the
-        // same durable acknowledged facts may survive, but normal invalidate
-        // work must not. Recovery first persists the absorbing deletion mode.
-        let mut deleting_closure = closure.state.clone();
-        deleting_closure.root.deleting = true;
-        let recreated =
-            MachineStateV0::recover_json(&serde_json::to_string(&deleting_closure).unwrap())
-                .unwrap();
-        let resumed = reduce(recreated, EventV0::Start).unwrap();
-        assert!(matches!(
-            resumed.commands.as_slice(),
-            [CommandV0::Persist {
-                operation: PersistOperation {
-                    purpose: PersistPurpose::DeletionStart,
-                    ..
-                },
-                ..
-            }]
-        ));
-        assert!(
-            resumed
-                .commands
-                .iter()
-                .all(|command| !matches!(command, CommandV0::Mutate { .. }))
-        );
-
-        let mut rebased = closure.state;
-        for index in 0..MAX_CLOSURE_REBASES {
-            let mut root = rebased.root.clone();
-            root.generation += 1;
-            root.root_resource_version = format!("rebase-{index}");
-            root.status.observed_generation = Some(root.generation);
-            rebased = reduce(rebased, EventV0::RootRefreshed { root })
-                .unwrap()
-                .state;
-        }
-        let mut over_bound = rebased.root.clone();
-        over_bound.generation += 1;
-        over_bound.root_resource_version = "rebase-over-bound".into();
-        assert!(matches!(
-            reduce(rebased, EventV0::RootRefreshed { root: over_bound })
-                .unwrap()
-                .commands
-                .as_slice(),
+            coalesced.commands.as_slice(),
             [CommandV0::Hold { .. }]
         ));
     }

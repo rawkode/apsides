@@ -26,16 +26,19 @@ use std::sync::{
 
 use futures_util::StreamExt;
 use oxideloop_controller_api::{
-    ApplyOutcome, ApplyResult, AutomationPending, AutomationRunCompletionState, AutomationRunSpec,
-    AutomationRunStatus, DeletionCleanupReceipt, MAX_MESSAGE_BYTES, ObjectIdentity,
-    OxideLoopStateSpec, ROOT_FINALIZER, STATE_FINALIZER, StateLink, WebApplicationStatus,
+    ApplyOperation, ApplyOutcome, ApplyResult, AutomationPending, AutomationRunCompletionState,
+    AutomationRunSpec, AutomationRunStatus, DeletionCleanupReceipt, DurablePhase,
+    MAX_MESSAGE_BYTES, NextCommandLifecycleStateV0, ObjectIdentity, OxideLoopStateSpec,
+    PersistPurpose, ROOT_FINALIZER, STATE_FINALIZER, StateLink, WebApplicationStatus,
     validate_automation_run_name,
 };
 use oxideloop_controller_core::{
     CommandV0, MutationCommandV0, PreconditionsV0, root_finalizer_command_token,
     root_only_owned_children_verify_token,
 };
-use oxideloop_event_planner::{PlannedEventV0, materialize_event, semantically_equal};
+#[cfg(test)]
+use oxideloop_event_planner::semantically_equal;
+use oxideloop_event_planner::{PlannedEventV0, materialize_event};
 use oxideloop_mutation_model::{
     APPLY_PATCH_CONTENT_TYPE, CONTROLLER_FIELD_MANAGER, HttpMethod, MutationDecision,
 };
@@ -1169,35 +1172,40 @@ impl KubeTransportV0 {
             return Err(TransportErrorV0::Stale("bootstrap root pins"));
         }
         let desired = bootstrap_state(&state_ref, state, &root, token)?;
-        let state = match self.reread(&state_ref).await? {
-            None => {
-                match self.create_state(&desired).await {
-                    Ok(_) => {}
-                    Err(error) if may_recover_response_loss(&error) => {
-                        recover_bootstrap_state(
-                            self.reread(&state_ref).await?,
-                            &desired,
-                            &root,
-                            token,
-                        )?;
-                    }
-                    Err(error) => return Err(error),
+        // A pre-existing same-name state has no create witness. It is safe to
+        // continue only when the root already durably links this exact UID;
+        // otherwise this is a collision, never an adoption candidate.
+        let mut state = match self.reread(&state_ref).await? {
+            None => match self.create_state(&desired).await {
+                Ok(created) => created,
+                Err(error) if may_recover_response_loss(&error) => {
+                    return Err(TransportErrorV0::ResponseLost);
                 }
-                return Ok(CommandOutcomeV0::NeedsSequencing { remaining: 3 });
+                Err(TransportErrorV0::Conflict(ConflictProvenanceV0::Write {
+                    operation: WriteOperationV0::Create,
+                    resource: ResourceKindV0::OxideLoopState,
+                })) => {
+                    return Err(TransportErrorV0::ForeignCollision);
+                }
+                Err(error) => return Err(error),
+            },
+            Some(observed) => {
+                if !has_state_link(&root, &observed) {
+                    return Err(TransportErrorV0::ForeignCollision);
+                }
+                recover_bootstrap_state(Some(observed), &desired, &root, token)?
             }
-            Some(observed) => recover_bootstrap_state(Some(observed), &desired, &root, token)?,
         };
         if !has_finalizer(&state, STATE_FINALIZER) {
-            self.ensure_finalizer(&state, STATE_FINALIZER).await?;
-            return Ok(CommandOutcomeV0::NeedsSequencing { remaining: 2 });
+            state = self.ensure_finalizer(&state, STATE_FINALIZER).await?;
         }
-        if !has_bootstrap_root_metadata(&root, token) {
-            self.bootstrap_root_metadata(&root, token).await?;
-            return Ok(CommandOutcomeV0::NeedsSequencing { remaining: 1 });
-        }
+        let root = if has_bootstrap_root_metadata(&root, token) {
+            root
+        } else {
+            self.bootstrap_root_metadata(&root, token).await?
+        };
         if !has_state_link(&root, &state) {
             self.bootstrap_root_status(&root, &state).await?;
-            return Ok(CommandOutcomeV0::NeedsSequencing { remaining: 0 });
         }
         let final_state = self
             .reread(&state_ref)
@@ -1208,7 +1216,6 @@ impl KubeTransportV0 {
             .await?
             .ok_or(TransportErrorV0::ManualRecoveryHold)?;
         if final_state.metadata.uid != state.metadata.uid
-            || final_state.metadata.resource_version != state.metadata.resource_version
             || !has_finalizer(&final_state, STATE_FINALIZER)
             || !has_bootstrap_root_metadata(&final_root, token)
             || !has_state_link(&final_root, &final_state)
@@ -1270,6 +1277,60 @@ impl KubeTransportV0 {
         let fence = self
             .reread_fence_with_target(address, &command.preconditions, target.as_ref())
             .await?;
+        // Reject stale target identity claims before the final State gate. No
+        // authorization read is needed when the command is already known to
+        // be non-mutating, and this preserves the zero-write stale-target
+        // contract.
+        match &command.decision {
+            MutationDecision::PreconditionedDelete { preconditions, .. }
+                if fence.target.as_ref().is_some_and(|target| {
+                    target.metadata.uid != preconditions.uid
+                        || target.metadata.resource_version != preconditions.resource_version
+                }) =>
+            {
+                return Err(TransportErrorV0::Stale("mutation delete pins"));
+            }
+            MutationDecision::ConditionalApply { expected, .. }
+                if fence.target.as_ref().is_some_and(|target| {
+                    target.metadata.uid != expected.uid
+                        || target.metadata.resource_version != expected.resource_version
+                }) =>
+            {
+                return Ok(mutation_failed_outcome(
+                    transaction_id,
+                    attempt_token,
+                    "conditional apply target identity is stale",
+                ));
+            }
+            _ => {}
+        }
+        if matches!(
+            &command.decision,
+            MutationDecision::Post {
+                method: HttpMethod::Post,
+                ..
+            } | MutationDecision::ConditionalApply {
+                method: HttpMethod::Patch,
+                force: true,
+                ..
+            } | MutationDecision::PreconditionedDelete {
+                method: HttpMethod::Delete,
+                ..
+            }
+        ) {
+            // The target reread above is intentionally followed by this final
+            // State reread/authentication gate. No network operation may be
+            // inserted between this check and the managed child write.
+            self.authorize_dispatch(
+                address,
+                &fence.root,
+                &command.preconditions,
+                transaction_id,
+                attempt_token,
+                command,
+            )
+            .await?;
+        }
         let outcome = match &command.decision {
             MutationDecision::Post {
                 method: HttpMethod::Post,
@@ -1412,6 +1473,34 @@ impl KubeTransportV0 {
         };
         fence.validate(preconditions, target_ref.as_ref())?;
         Ok(fence)
+    }
+
+    /// Performs the final State read and durable dispatch authorization check.
+    /// This method must remain the last network operation before a managed
+    /// child write in `execute_mutation`.
+    async fn authorize_dispatch(
+        &self,
+        address: &RootAddressV0,
+        root: &ObjectV0,
+        preconditions: &PreconditionsV0,
+        transaction_id: &str,
+        attempt_token: &str,
+        command: &MutationCommandV0,
+    ) -> Result<(), TransportErrorV0> {
+        let (_, state_ref) = address.references();
+        let state = self
+            .reread(&state_ref)
+            .await?
+            .ok_or(TransportErrorV0::ManualRecoveryHold)?;
+        validate_dispatch_authority(
+            address,
+            root,
+            &state,
+            preconditions,
+            transaction_id,
+            attempt_token,
+            command,
+        )
     }
 
     async fn ensure_finalizer(
@@ -1573,18 +1662,16 @@ impl KubeTransportV0 {
             ResourceKindV0::Service => self.create_service(&desired).await,
             _ => return Err(TransportErrorV0::UnsupportedTarget),
         };
-        match created {
-            Ok(o) => Ok(o),
-            Err(error) if may_recover_response_loss(&error) => recover_dropped_write_exact(
-                self.reread(reference).await?.as_ref(),
-                &desired,
-                root,
-                None,
-                tx,
-                &command.command_id,
-            ),
-            Err(e) => Err(e),
-        }
+        // A POST response is the sole initial witness for an unpinned create.
+        // A same-name reread after response loss cannot distinguish our write
+        // from a foreign object (or a replay), so fail closed without a read.
+        created.map_err(|error| {
+            if may_recover_response_loss(&error) {
+                TransportErrorV0::ResponseLost
+            } else {
+                error
+            }
+        })
     }
     async fn mutation_apply(
         &self,
@@ -1680,17 +1767,21 @@ impl KubeTransportV0 {
         };
         let desired = automation_object(&reference, spec, &fence.root, token)?;
         let run = match self.reread(&reference).await? {
-            Some(existing) => recover_automation(existing, &desired, &fence.root, token)?,
+            // EnsureAutomationRun is intentionally unpinned. A same-name
+            // object therefore has no durable UID witness and is always a
+            // collision, even when its semantic body looks identical.
+            Some(_) => return Err(TransportErrorV0::ForeignCollision),
             None => match self.create_automation_run(&desired).await {
                 Ok(o) => o,
-                Err(error) if may_recover_response_loss(&error) => recover_automation(
-                    self.reread(&reference)
-                        .await?
-                        .ok_or(TransportErrorV0::ResponseLost)?,
-                    &desired,
-                    &fence.root,
-                    token,
-                )?,
+                Err(error) if may_recover_response_loss(&error) => {
+                    return Err(TransportErrorV0::ResponseLost);
+                }
+                Err(TransportErrorV0::Conflict(ConflictProvenanceV0::Write {
+                    operation: WriteOperationV0::Create,
+                    resource: ResourceKindV0::AutomationRun,
+                })) => {
+                    return Err(TransportErrorV0::ForeignCollision);
+                }
                 Err(e) => return Err(e),
             },
         };
@@ -1848,15 +1939,15 @@ impl KubeTransportV0 {
             .transpose()
     }
 
-    /// Materializes one deterministic Event, then creates it or accepts only
-    /// an exact semantic recovery at its planned name. Kubernetes object types
-    /// and generic bodies never cross this purpose-named boundary.
+    /// Materializes one deterministic Event, then creates it. A planned name
+    /// is unpinned in this interface, so a pre-existing object and an
+    /// ambiguous response are both fail-closed collisions/holds; no semantic
+    /// adoption is attempted.
     ///
     /// # Errors
     ///
-    /// Returns `ForeignCollision` for a present malformed or mismatching Event,
-    /// and `ResponseLost` when an ambiguous create cannot be proven by a fresh
-    /// exact-name read.
+    /// Returns `ForeignCollision` for any pre-existing Event and `ResponseLost`
+    /// when the direct create response is ambiguous.
     pub async fn create_or_exact_recover_event(
         &self,
         plan: &PlannedEventV0,
@@ -1870,9 +1961,8 @@ impl KubeTransportV0 {
             name: plan.metadata.name.clone(),
         };
         validate_reference(&reference)?;
-        if let Some(observed) = self.reread_event(&reference).await? {
-            recover_event(&value, &observed.value)?;
-            return Ok(event_ref(&observed));
+        if self.reread_event(&reference).await?.is_some() {
+            return Err(TransportErrorV0::ForeignCollision);
         }
         let desired = ObjectV0 {
             reference: reference.clone(),
@@ -1884,9 +1974,10 @@ impl KubeTransportV0 {
             },
             value,
         };
-        match self.create_event(&desired).await {
-            Ok(written) => Ok(event_ref(&written)),
-            Err(error)
+        self.create_event(&desired)
+            .await
+            .map(|written| event_ref(&written))
+            .map_err(|error| {
                 if may_recover_response_loss(&error)
                     || matches!(
                         error,
@@ -1894,17 +1985,23 @@ impl KubeTransportV0 {
                             operation: WriteOperationV0::Create,
                             resource: ResourceKindV0::Event,
                         })
-                    ) =>
-            {
-                let observed = self
-                    .reread_event(&reference)
-                    .await?
-                    .ok_or(TransportErrorV0::ResponseLost)?;
-                recover_event(&desired.value, &observed.value)?;
-                Ok(event_ref(&observed))
-            }
-            Err(error) => Err(error),
-        }
+                    )
+                {
+                    if matches!(
+                        error,
+                        TransportErrorV0::Conflict(ConflictProvenanceV0::Write {
+                            operation: WriteOperationV0::Create,
+                            resource: ResourceKindV0::Event,
+                        })
+                    ) {
+                        TransportErrorV0::ForeignCollision
+                    } else {
+                        TransportErrorV0::ResponseLost
+                    }
+                } else {
+                    error
+                }
+            })
     }
 
     /// Reads one bundle key from a same-namespace `ConfigMap`. The controller
@@ -2892,6 +2989,7 @@ fn is_child_apply_write_conflict(error: &TransportErrorV0, resource: ResourceKin
     )
 }
 
+#[cfg(test)]
 fn recover_event(expected: &Value, observed: &Value) -> Result<(), TransportErrorV0> {
     match semantically_equal(expected, observed) {
         Ok(true) => Ok(()),
@@ -3378,6 +3476,137 @@ fn has_root_uid_annotation(object: &ObjectV0, root_uid: &str) -> bool {
         .is_some_and(|value| value == root_uid)
 }
 
+/// Authenticates the durable one-command dispatch capability. This check is
+/// deliberately made from the exact State object returned by the final fresh
+/// read, not from an informer/cache snapshot or command-local claims.
+fn validate_dispatch_authority(
+    address: &RootAddressV0,
+    root: &ObjectV0,
+    state: &ObjectV0,
+    preconditions: &PreconditionsV0,
+    transaction_id: &str,
+    attempt_token: &str,
+    command: &MutationCommandV0,
+) -> Result<(), TransportErrorV0> {
+    let (_, state_ref) = address.references();
+    if !has_exact_object_identity(
+        root,
+        ResourceKindV0::WebApplication,
+        &address.namespace,
+        &address.name,
+    ) || root.metadata.uid != preconditions.root_uid
+        || root.metadata.resource_version != preconditions.root_resource_version
+        || !has_exact_object_identity(
+            state,
+            ResourceKindV0::OxideLoopState,
+            &state_ref.namespace,
+            &state_ref.name,
+        )
+        || state.metadata.uid != preconditions.state_uid
+        || state.metadata.resource_version != preconditions.state_resource_version
+        || !has_finalizer(state, STATE_FINALIZER)
+        || !has_root_uid_annotation(state, &root.metadata.uid)
+        || !has_exact_canonical_owner(state, &root.reference, &root.metadata.uid)
+        || !has_state_link(root, state)
+    {
+        return Err(TransportErrorV0::ManualRecoveryHold);
+    }
+
+    let spec: OxideLoopStateSpec = serde_json::from_value(
+        state
+            .value
+            .get("spec")
+            .cloned()
+            .ok_or(TransportErrorV0::ManualRecoveryHold)?,
+    )
+    .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+    spec.validate()
+        .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+    if spec.root.uid != root.metadata.uid {
+        return Err(TransportErrorV0::ManualRecoveryHold);
+    }
+    let transaction = spec
+        .state
+        .apply_transaction
+        .as_ref()
+        .ok_or(TransportErrorV0::ManualRecoveryHold)?;
+    if transaction.id != transaction_id
+        || transaction.attempt_token != attempt_token
+        || command.attempt_token != attempt_token
+        || transaction.next_command_lifecycle.state
+            != NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued
+        || transaction.next_command_lifecycle.command_id.as_deref()
+            != Some(command.command_id.as_str())
+    {
+        return Err(TransportErrorV0::ManualRecoveryHold);
+    }
+    let intent = transaction
+        .prepared_intents
+        .get(transaction.results.len())
+        .ok_or(TransportErrorV0::ManualRecoveryHold)?;
+    if intent.command_id != command.command_id
+        || intent.logical_id != command.logical_id
+        || intent.identity.api_version != command.identity.api_version
+        || intent.identity.kind != command.identity.kind
+        || intent.identity.namespace != command.identity.namespace
+        || intent.identity.name != command.identity.name
+    {
+        return Err(TransportErrorV0::ManualRecoveryHold);
+    }
+    let expected_operation = match &command.decision {
+        MutationDecision::PreconditionedDelete { .. } => ApplyOperation::Delete,
+        MutationDecision::Post { .. } | MutationDecision::ConditionalApply { .. } => {
+            ApplyOperation::Apply
+        }
+        _ => return Err(TransportErrorV0::ManualRecoveryHold),
+    };
+    if intent.operation != expected_operation {
+        return Err(TransportErrorV0::ManualRecoveryHold);
+    }
+    let claim = transaction
+        .recovery_claims
+        .iter()
+        .find(|claim| claim.command_id == command.command_id)
+        .ok_or(TransportErrorV0::ManualRecoveryHold)?;
+    if claim.root_uid != root.metadata.uid
+        || claim.transaction_id != transaction_id
+        || claim.command_id != command.command_id
+    {
+        return Err(TransportErrorV0::ManualRecoveryHold);
+    }
+    match &command.decision {
+        MutationDecision::PreconditionedDelete { preconditions, .. }
+            if intent.expected_uid.as_deref() != Some(preconditions.uid.as_str())
+                || intent.expected_resource_version.as_deref()
+                    != Some(preconditions.resource_version.as_str()) =>
+        {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        MutationDecision::ConditionalApply { expected, .. }
+            if intent.expected_uid.as_deref() != Some(expected.uid.as_str())
+                || intent.expected_resource_version.as_deref()
+                    != Some(expected.resource_version.as_str()) =>
+        {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        _ => {}
+    }
+    let pending = spec
+        .state
+        .pending_persist
+        .as_ref()
+        .ok_or(TransportErrorV0::ManualRecoveryHold)?;
+    if pending.purpose != PersistPurpose::DispatchAuthorization
+        || pending.phase != DurablePhase::DispatchAuthorization
+        || pending.root_generation != preconditions.root_generation
+        || state.metadata.annotations.get(TRANSACTION_ID_ANNOTATION) != Some(&pending.token)
+        || state.metadata.annotations.get(COMMAND_ID_ANNOTATION) != Some(&pending.token)
+    {
+        return Err(TransportErrorV0::ManualRecoveryHold);
+    }
+    Ok(())
+}
+
 fn conditional_apply_force_authorized(
     command: &MutationCommandV0,
     content_type: &str,
@@ -3591,6 +3820,8 @@ fn automation_object(
         value: body,
     })
 }
+
+#[cfg(test)]
 fn recover_automation(
     observed: ObjectV0,
     desired: &ObjectV0,

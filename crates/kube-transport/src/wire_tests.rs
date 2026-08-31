@@ -13,10 +13,11 @@ use std::{
 use http::{Method, Request, Response, StatusCode};
 use kube::{Client, client::Body};
 use oxideloop_controller_api::{
-    AutomationRunCompletion, AutomationRunCompletionState, AutomationRunSpec, AutomationRunStatus,
-    DurablePhase, ObjectIdentity, OxideLoopStateSpec, PersistOperation, PersistPurpose,
-    ProgramBundleReference, RootBinding, StateBody, StateLink, WebApplicationStatus,
-    automation_run_name, bootstrap_id,
+    ApplyIntent, ApplyOperation, ApplyRecoveryPolicy, ApplyTransaction, AutomationRunCompletion,
+    AutomationRunCompletionState, AutomationRunSpec, AutomationRunStatus, DurablePhase,
+    NextCommandLifecycleStateV0, ObjectIdentity, OxideLoopStateSpec, PersistOperation,
+    PersistPurpose, PreparedRecoveryClaim, ProgramBundleReference, RootBinding, StateBody,
+    StateLink, WebApplicationStatus, automation_run_name, bootstrap_id,
 };
 use oxideloop_controller_core::{
     CommandV0, MutationCommandV0, PreconditionsV0, root_finalizer_command_token,
@@ -480,10 +481,10 @@ fn conditional_apply_command(
 ) -> CommandV0 {
     CommandV0::Mutate {
         transaction_id: "tx".into(),
-        attempt_token: "attempt".into(),
+        attempt_token: "a".repeat(64),
         commands: vec![MutationCommandV0 {
-            command_id: "command".into(),
-            attempt_token: "attempt".into(),
+            command_id: "c".repeat(64),
+            attempt_token: "a".repeat(64),
             preconditions: PreconditionsV0 {
                 root_uid: "root-uid".into(),
                 root_generation: 1,
@@ -541,6 +542,120 @@ fn force_fence_script(child: Value) -> Vec<Expected> {
             response: response(child),
         },
     ]
+}
+
+fn authorized_dispatch_state(
+    kind: ResourceKindV0,
+    name: &str,
+    target_uid: &str,
+    target_rv: &str,
+    state_rv: &str,
+    operation: ApplyOperation,
+) -> Value {
+    let command_id = "c".repeat(64);
+    let attempt_token = "a".repeat(64);
+    let transaction_id = "tx";
+    let intent = ApplyIntent {
+        command_id: command_id.clone(),
+        operation,
+        identity: ObjectIdentity {
+            api_version: "v1".into(),
+            kind: kind.kind().into(),
+            namespace: "tenant-a".into(),
+            name: name.into(),
+        },
+        logical_id: name.into(),
+        expected_uid: Some(target_uid.into()),
+        expected_resource_version: Some(target_rv.into()),
+    };
+    let state_spec = OxideLoopStateSpec {
+        state_version: 1,
+        root: RootBinding {
+            uid: "root-uid".into(),
+            bootstrap_id: bootstrap_id("root-uid").expect("bootstrap id"),
+            bundle_digest: "b".repeat(64),
+        },
+        state: StateBody {
+            apply_transaction: Some(ApplyTransaction {
+                id: transaction_id.into(),
+                generation: 1,
+                frozen_render_input_hash: "d".repeat(64),
+                desired_graph_hash: "e".repeat(64),
+                recovery_policy: ApplyRecoveryPolicy::ReplanAndRevalidateBeforeEffect,
+                attempt_token,
+                prepared_intents: vec![intent],
+                next_command_lifecycle: oxideloop_controller_api::NextCommandLifecycleV0 {
+                    state: NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued,
+                    command_id: Some(command_id),
+                },
+                recovery_claims: vec![PreparedRecoveryClaim {
+                    root_uid: "root-uid".into(),
+                    transaction_id: transaction_id.into(),
+                    command_id: "c".repeat(64),
+                }],
+                results: vec![],
+                unresolved_identities: vec![],
+            }),
+            pending_persist: Some(PersistOperation {
+                token: "f".repeat(64),
+                purpose: PersistPurpose::DispatchAuthorization,
+                phase: DurablePhase::DispatchAuthorization,
+                old_state_resource_version: "3".into(),
+                root_generation: 1,
+            }),
+            ..StateBody::default()
+        },
+    };
+    state_spec
+        .validate()
+        .expect("authorized state spec validates");
+    json!({
+        "apiVersion":"runtime.oxideloop.dev/v1alpha1", "kind":"OxideLoopState",
+        "metadata":{"name":"state-a","namespace":"tenant-a","uid":"state-uid","resourceVersion":state_rv,
+            "finalizers":[STATE_FINALIZER], "annotations":{
+                ROOT_UID_ANNOTATION:"root-uid", TRANSACTION_ID_ANNOTATION:"f".repeat(64), COMMAND_ID_ANNOTATION:"f".repeat(64)},
+            "ownerReferences":[{"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication","name":"app-a","uid":"root-uid","controller":true,"blockOwnerDeletion":false}]},
+        "spec":serde_json::to_value(state_spec).expect("authorized state spec")
+    })
+}
+
+fn authorized_force_fence_script(child: Value) -> Vec<Expected> {
+    let state = authorized_dispatch_state(
+        ResourceKindV0::ConfigMap,
+        "cm-a",
+        "child-uid",
+        "7",
+        "4",
+        ApplyOperation::Apply,
+    );
+    authorized_force_fence_script_with_state(child, state)
+}
+
+fn authorized_force_fence_script_with_state(child: Value, state: Value) -> Vec<Expected> {
+    let mut script = force_fence_script(child);
+    script.push(Expected {
+        method: Method::GET,
+        path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/state-a",
+        content_type: None,
+        body: None,
+        response: response(state),
+    });
+    script
+}
+
+fn authorized_post_dispatch_state() -> Value {
+    let mut state = authorized_dispatch_state(
+        ResourceKindV0::ConfigMap,
+        "cm-a",
+        "unused",
+        "unused",
+        "4",
+        ApplyOperation::Apply,
+    );
+    let intent = &mut state["spec"]["state"]["applyTransaction"]["preparedIntents"][0];
+    intent["expectedUid"] = Value::Null;
+    intent["expectedResourceVersion"] = Value::Null;
+    state
 }
 
 fn force_preconditions() -> PreconditionsV0 {
@@ -703,10 +818,10 @@ fn delete_command(
 ) -> CommandV0 {
     CommandV0::Mutate {
         transaction_id: "tx".into(),
-        attempt_token: "attempt".into(),
+        attempt_token: "a".repeat(64),
         commands: vec![MutationCommandV0 {
-            command_id: "command".into(),
-            attempt_token: "attempt".into(),
+            command_id: "c".repeat(64),
+            attempt_token: "a".repeat(64),
             preconditions: PreconditionsV0 {
                 root_uid: "root-uid".into(),
                 root_generation: 1,
@@ -743,8 +858,9 @@ fn delete_fence_script(
     name: &str,
     target_uid: &str,
     target_resource_version: &str,
-) -> [Expected; 3] {
-    [
+    authorize: bool,
+) -> Vec<Expected> {
+    let mut script = vec![
         Expected {
             method: Method::GET,
             path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a",
@@ -753,7 +869,8 @@ fn delete_fence_script(
             response: response(json!({
                 "apiVersion":"demo.oxideloop.dev/v1alpha1",
                 "kind":"WebApplication",
-                "metadata":{"name":"app-a","uid":"root-uid","resourceVersion":"9","generation":1}
+                "metadata":{"name":"app-a","namespace":"tenant-a","uid":"root-uid","resourceVersion":"9","generation":1,"finalizers":[ROOT_FINALIZER],"annotations":{"runtime.oxideloop.dev/root-uid":"root-uid"}},
+                "status":{"state":{"rootUid":"root-uid","name":"state-a","uid":"state-uid"}}
             })),
         },
         Expected {
@@ -761,11 +878,13 @@ fn delete_fence_script(
             path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/state-a",
             content_type: None,
             body: None,
-            response: response(object_json(
-                ResourceKindV0::OxideLoopState,
-                "state-a",
-                "state-uid",
+            response: response(authorized_dispatch_state(
+                kind,
+                name,
+                target_uid,
+                target_resource_version,
                 "4",
+                ApplyOperation::Delete,
             )),
         },
         Expected {
@@ -779,7 +898,17 @@ fn delete_fence_script(
             body: None,
             response: response(object_json(kind, name, target_uid, target_resource_version)),
         },
-    ]
+    ];
+    if authorize {
+        script.push(Expected {
+            method: Method::GET,
+            path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/state-a",
+            content_type: None,
+            body: None,
+            response: response(authorized_dispatch_state(kind, name, target_uid, target_resource_version, "4", ApplyOperation::Delete)),
+        });
+    }
+    script
 }
 
 #[tokio::test]
@@ -1499,7 +1628,7 @@ async fn conditional_apply_authority_mismatches_issue_no_patch() {
     api.assert_drained();
     let mut foreign_owner = child;
     foreign_owner["metadata"]["ownerReferences"][0]["uid"] = json!("foreign-root");
-    let (transport, api) = ScriptedApi::transport(force_fence_script(foreign_owner));
+    let (transport, api) = ScriptedApi::transport(authorized_force_fence_script(foreign_owner));
     assert!(matches!(
         transport
             .dispatch(
@@ -1517,6 +1646,174 @@ async fn conditional_apply_authority_mismatches_issue_no_patch() {
             .await,
         Ok(super::CommandOutcomeV0::Event(_))
     ));
+    api.assert_drained();
+}
+
+#[tokio::test]
+async fn dispatch_authorization_mismatches_hold_before_any_child_write() {
+    let (_, _, child) = force_fence_objects();
+    let address = RootAddressV0 {
+        namespace: "tenant-a".into(),
+        name: "app-a".into(),
+        state_name: "state-a".into(),
+    };
+    let command = conditional_apply_command(
+        Some(oxideloop_mutation_model::ObjectIdentity {
+            uid: "child-uid".into(),
+            resource_version: "7".into(),
+        }),
+        "application/apply-patch+yaml",
+        "oxideloop-controller",
+        true,
+    );
+    let base = authorized_dispatch_state(
+        ResourceKindV0::ConfigMap,
+        "cm-a",
+        "child-uid",
+        "7",
+        "4",
+        ApplyOperation::Apply,
+    );
+    let mut cases = Vec::new();
+    let mut transaction = base.clone();
+    transaction["spec"]["state"]["applyTransaction"]["id"] = json!("other-tx");
+    cases.push(transaction);
+    let mut attempt = base.clone();
+    attempt["spec"]["state"]["applyTransaction"]["attemptToken"] = json!("b".repeat(64));
+    cases.push(attempt);
+    let mut lifecycle = base.clone();
+    lifecycle["spec"]["state"]["applyTransaction"]["nextCommandLifecycle"]["state"] =
+        json!("PreparedNotIssued");
+    cases.push(lifecycle);
+    let mut command_id = base.clone();
+    command_id["spec"]["state"]["applyTransaction"]["nextCommandLifecycle"]["commandId"] =
+        json!("d".repeat(64));
+    cases.push(command_id);
+    let mut receipt = base.clone();
+    receipt["spec"]["state"]["applyTransaction"]["recoveryClaims"][0]["commandId"] =
+        json!("d".repeat(64));
+    cases.push(receipt);
+    let mut root_pin = base.clone();
+    root_pin["spec"]["root"]["uid"] = json!("foreign-root");
+    cases.push(root_pin);
+    let mut purpose = base.clone();
+    purpose["spec"]["state"]["pendingPersist"]["purpose"] = json!("Prepare");
+    purpose["spec"]["state"]["pendingPersist"]["phase"] = json!("Prepare");
+    cases.push(purpose);
+    let mut token = base.clone();
+    token["metadata"]["annotations"][TRANSACTION_ID_ANNOTATION] = json!("0".repeat(64));
+    cases.push(token);
+    let mut state_uid = base.clone();
+    state_uid["metadata"]["uid"] = json!("foreign-state");
+    cases.push(state_uid);
+    let mut state_rv = base.clone();
+    state_rv["metadata"]["resourceVersion"] = json!("5");
+    cases.push(state_rv);
+
+    let (_, missing_auth, _) = force_fence_objects();
+    let (transport, api) = ScriptedApi::transport(authorized_force_fence_script_with_state(
+        child.clone(),
+        missing_auth,
+    ));
+    assert_eq!(
+        transport.dispatch(&address, &command).await,
+        Err(super::TransportErrorV0::ManualRecoveryHold)
+    );
+    api.assert_drained();
+
+    for state in cases {
+        let (transport, api) = ScriptedApi::transport(authorized_force_fence_script_with_state(
+            child.clone(),
+            state,
+        ));
+        assert_eq!(
+            transport.dispatch(&address, &command).await,
+            Err(super::TransportErrorV0::ManualRecoveryHold)
+        );
+        api.assert_drained();
+    }
+}
+
+#[tokio::test]
+async fn managed_create_response_loss_never_adopts_an_exact_copied_replacement() {
+    let (root, state, _) = force_fence_objects();
+    let address = RootAddressV0 {
+        namespace: "tenant-a".into(),
+        name: "app-a".into(),
+        state_name: "state-a".into(),
+    };
+    let mut command = conditional_apply_command(
+        None,
+        "application/apply-patch+yaml",
+        "oxideloop-controller",
+        true,
+    );
+    let CommandV0::Mutate { commands, .. } = &mut command else {
+        unreachable!()
+    };
+    let body = json!({
+        "apiVersion":"v1",
+        "kind":"ConfigMap",
+        "metadata":{"name":"cm-a","namespace":"tenant-a"},
+        "data":{"new":"value"}
+    });
+    commands[0].decision = MutationDecision::Post {
+        method: HttpMethod::Post,
+        body: body.clone(),
+    };
+    let mut expected = vec![
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a",
+            content_type: None,
+            body: None,
+            response: response(root),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/state-a",
+            content_type: None,
+            body: None,
+            response: response(state),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/state-a",
+            content_type: None,
+            body: None,
+            response: response(authorized_post_dispatch_state()),
+        },
+    ];
+    let expected_body = json!({
+        "apiVersion":"v1",
+        "kind":"ConfigMap",
+        "metadata":{
+            "name":"cm-a",
+            "namespace":"tenant-a",
+            "annotations":{
+                ROOT_UID_ANNOTATION:"root-uid",
+                TRANSACTION_ID_ANNOTATION:"tx",
+                COMMAND_ID_ANNOTATION:"c".repeat(64)
+            },
+            "ownerReferences":[{"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication","name":"app-a","uid":"root-uid","controller":true,"blockOwnerDeletion":false}
+            ]
+        },
+        "data":{"new":"value"}
+    });
+    expected.push(Expected {
+        method: Method::POST,
+        path_and_query: "/api/v1/namespaces/tenant-a/configmaps?",
+        content_type: Some("application/json"),
+        body: Some(expected_body),
+        response: lost_response(),
+    });
+    let (transport, api) = ScriptedApi::transport(expected);
+    assert_eq!(
+        transport.dispatch(&address, &command).await,
+        Err(TransportErrorV0::ResponseLost)
+    );
+    // Even if a same-name object with the exact desired body appeared after
+    // the lost POST, no reread or replay can turn it into an acknowledgement.
     api.assert_drained();
 }
 
@@ -1540,18 +1837,18 @@ async fn conditional_apply_409_rereads_once_and_only_acks_exact_prior_success() 
     let patch_body = json!({
         "apiVersion":"v1", "kind":"ConfigMap",
         "metadata":{"name":"cm-a","namespace":"tenant-a","resourceVersion":"7",
-            "annotations":{ROOT_UID_ANNOTATION:"root-uid",TRANSACTION_ID_ANNOTATION:"tx",COMMAND_ID_ANNOTATION:"command"},
+            "annotations":{ROOT_UID_ANNOTATION:"root-uid",TRANSACTION_ID_ANNOTATION:"tx",COMMAND_ID_ANNOTATION:"c".repeat(64)},
             "ownerReferences":[{"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication","name":"app-a","uid":"root-uid","controller":true,"blockOwnerDeletion":false}]},
         "data":{"new":"value"}
     });
     let recovered = json!({
         "apiVersion":"v1", "kind":"ConfigMap",
         "metadata":{"name":"cm-a","namespace":"tenant-a","uid":"child-uid","resourceVersion":"8",
-            "annotations":{ROOT_UID_ANNOTATION:"root-uid",TRANSACTION_ID_ANNOTATION:"tx",COMMAND_ID_ANNOTATION:"command"},
+            "annotations":{ROOT_UID_ANNOTATION:"root-uid",TRANSACTION_ID_ANNOTATION:"tx",COMMAND_ID_ANNOTATION:"c".repeat(64)},
             "ownerReferences":[{"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication","name":"app-a","uid":"root-uid","controller":true,"blockOwnerDeletion":false}]},
         "data":{"new":"value"}
     });
-    let mut exact = force_fence_script(child.clone());
+    let mut exact = authorized_force_fence_script(child.clone());
     exact.push(Expected {
         method:Method::PATCH,
         path_and_query:"/api/v1/namespaces/tenant-a/configmaps/cm-a?&force=true&fieldManager=oxideloop-controller",
@@ -1576,12 +1873,12 @@ async fn conditional_apply_409_rereads_once_and_only_acks_exact_prior_success() 
                     transaction_id,
                     attempt_token,
                     ..
-                } if transaction_id == "tx" && attempt_token == "attempt"
+                } if transaction_id == "tx" && attempt_token == &"a".repeat(64)
             )
     ));
     api.assert_drained();
 
-    let mut mismatch = force_fence_script(child);
+    let mut mismatch = authorized_force_fence_script(child);
     mismatch.push(Expected {
         method:Method::PATCH,
         path_and_query:"/api/v1/namespaces/tenant-a/configmaps/cm-a?&force=true&fieldManager=oxideloop-controller",
@@ -1603,7 +1900,7 @@ async fn conditional_apply_409_rereads_once_and_only_acks_exact_prior_success() 
                     transaction_id,
                     attempt_token,
                     ..
-                } if transaction_id == "tx" && attempt_token == "attempt"
+                } if transaction_id == "tx" && attempt_token == &"a".repeat(64)
             )
     ));
     api.assert_drained();
@@ -1708,9 +2005,7 @@ async fn managed_delete_ack_echoes_prepared_identity_for_config_map_and_service(
             "/api/v1/namespaces/tenant-a/services/svc-a?",
         ),
     ] {
-        let mut expected: Vec<_> = delete_fence_script(kind, name, uid, resource_version)
-            .into_iter()
-            .collect();
+        let mut expected = delete_fence_script(kind, name, uid, resource_version, true);
         expected.push(Expected {
             method: Method::DELETE,
             path_and_query: delete_path,
@@ -1751,6 +2046,7 @@ async fn stale_delete_target_is_non_mutating_and_not_response_loss_recovery() {
         "cm-a",
         "observed-uid",
         "observed-rv",
+        false,
     ));
     assert_eq!(
         transport
@@ -2412,7 +2708,7 @@ async fn create_carries_recovery_proof_and_non_blocking_owner_reference() {
 }
 
 #[tokio::test]
-async fn event_create_and_exact_recovery_are_typed_and_use_only_get_or_post() {
+async fn event_create_rejects_preexisting_name_and_uses_only_get_or_post() {
     let plan = generated_event_plan();
     let path = format!(
         "/apis/events.k8s.io/v1/namespaces/tenant-a/events/{}",
@@ -2459,16 +2755,14 @@ async fn event_create_and_exact_recovery_are_typed_and_use_only_get_or_post() {
     assert_eq!(
         transport
             .create_or_exact_recover_event(&plan, "2026-01-01T00:00:00Z")
-            .await
-            .expect("exact existing event")
-            .uid,
-        "event-uid"
+            .await,
+        Err(super::TransportErrorV0::ForeignCollision)
     );
     api.assert_drained();
 }
 
 #[tokio::test]
-async fn event_lost_create_recovers_only_a_fresh_semantic_match() {
+async fn event_lost_create_never_adopts_a_reread() {
     let plan = generated_event_plan();
     let path = format!(
         "/apis/events.k8s.io/v1/namespaces/tenant-a/events/{}",
@@ -2496,28 +2790,16 @@ async fn event_lost_create_recovers_only_a_fresh_semantic_match() {
             body: Some(desired.clone()),
             response: lost_response(),
         },
-        Expected {
-            method: Method::GET,
-            path_and_query: Box::leak(path.clone().into_boxed_str()),
-            content_type: None,
-            body: None,
-            response: response(event_response(&plan, "event-uid", "10")),
-        },
     ]);
     assert_eq!(
         transport
             .create_or_exact_recover_event(&plan, "2026-01-01T00:00:00Z")
             .await,
-        Ok(super::EventMaterializationRefV0 {
-            name: plan.metadata.name.clone(),
-            uid: "event-uid".into(),
-            resource_version: "10".into()
-        })
+        Err(super::TransportErrorV0::ResponseLost)
     );
     api.assert_drained();
 
-    let mut foreign = event_response(&plan, "foreign", "11");
-    foreign["note"] = json!("different");
+    // A foreign same-name response is intentionally never reread after POST.
     let (transport, api) = ScriptedApi::transport([
         Expected {
             method: Method::GET,
@@ -2533,19 +2815,12 @@ async fn event_lost_create_recovers_only_a_fresh_semantic_match() {
             body: Some(desired.clone()),
             response: lost_response(),
         },
-        Expected {
-            method: Method::GET,
-            path_and_query: Box::leak(path.clone().into_boxed_str()),
-            content_type: None,
-            body: None,
-            response: response(foreign),
-        },
     ]);
     assert_eq!(
         transport
             .create_or_exact_recover_event(&plan, "2026-01-01T00:00:00Z")
             .await,
-        Err(TransportErrorV0::ForeignCollision)
+        Err(TransportErrorV0::ResponseLost)
     );
     api.assert_drained();
 
@@ -2563,19 +2838,6 @@ async fn event_lost_create_recovers_only_a_fresh_semantic_match() {
             content_type: Some("application/json"),
             body: Some(desired),
             response: lost_response(),
-        },
-        Expected {
-            method: Method::GET,
-            path_and_query: Box::leak(
-                format!(
-                    "/apis/events.k8s.io/v1/namespaces/tenant-a/events/{}",
-                    plan.metadata.name
-                )
-                .into_boxed_str(),
-            ),
-            content_type: None,
-            body: None,
-            response: missing(),
         },
     ]);
     assert_eq!(

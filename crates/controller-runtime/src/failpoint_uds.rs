@@ -16,7 +16,8 @@
 //! not decide when a process exits; that is owned by the controller wiring.
 //!
 //! The wire format is one UTF-8-free ASCII line: exactly
-//! `AfterEventBeforeStatus\n`, `AfterStatusBeforeAck\n`, or
+//! `AfterEventBeforeStatus\n`, `AfterStatusBeforeAck\n`,
+//! `AfterPrepareBeforeDispatchAuthorization\n`, or
 //! `AfterStateFinalizerBeforeRootFinalizer\n`. The deletion request retains
 //! its one connected client and uses `REACHED\n` / `RELEASE\n` as a bounded
 //! in-band handshake; it never opens a TCP port or another listener.
@@ -94,7 +95,8 @@ pub enum FailpointUdsError {
 #[derive(Debug)]
 pub enum FailpointControlV0 {
     Arm(ActionArmV0),
-    DeletionBarrier(DeletionBarrierV0),
+    PrepareBarrier(EffectBarrierV0),
+    DeletionBarrier(EffectBarrierV0),
 }
 
 pub struct ActionArmV0 {
@@ -130,21 +132,21 @@ impl ActionArmV0 {
     }
 }
 
-/// The one-shot connected peer retained for the deletion midpoint handshake.
-pub struct DeletionBarrierV0 {
+/// The one-shot connected peer retained for an exact effect midpoint handshake.
+pub struct EffectBarrierV0 {
     stream: UnixStream,
 }
 
-impl std::fmt::Debug for DeletionBarrierV0 {
+impl std::fmt::Debug for EffectBarrierV0 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("DeletionBarrierV0")
+            .debug_struct("EffectBarrierV0")
             .finish_non_exhaustive()
     }
 }
 
-impl DeletionBarrierV0 {
-    /// Confirm that the controller consumed the deletion barrier request.
+impl EffectBarrierV0 {
+    /// Confirm that the controller consumed the barrier request.
     /// This is distinct from `REACHED`, which proves the later exact effect.
     pub fn acknowledge(&mut self) -> Result<(), FailpointUdsError> {
         self.stream
@@ -522,9 +524,9 @@ impl FailpointUdsListenerV0 {
     pub fn poll(&mut self) -> Result<Option<FailpointV0>, FailpointUdsError> {
         match self.poll_control()? {
             Some(FailpointControlV0::Arm(arm)) => Ok(Some(arm.acknowledge()?)),
-            Some(FailpointControlV0::DeletionBarrier(_)) => {
-                Err(FailpointUdsError::MalformedRequest)
-            }
+            Some(
+                FailpointControlV0::PrepareBarrier(_) | FailpointControlV0::DeletionBarrier(_),
+            ) => Err(FailpointUdsError::MalformedRequest),
             None => Ok(None),
         }
     }
@@ -612,8 +614,13 @@ fn read_request(mut stream: UnixStream) -> Result<FailpointControlV0, FailpointU
             point: FailpointV0::AfterStatusBeforeAck,
             stream,
         })),
+        b"AfterPrepareBeforeDispatchAuthorization" => {
+            Ok(FailpointControlV0::PrepareBarrier(EffectBarrierV0 {
+                stream,
+            }))
+        }
         b"AfterStateFinalizerBeforeRootFinalizer" => {
-            Ok(FailpointControlV0::DeletionBarrier(DeletionBarrierV0 {
+            Ok(FailpointControlV0::DeletionBarrier(EffectBarrierV0 {
                 stream,
             }))
         }
@@ -721,14 +728,20 @@ mod tests {
 
     #[test]
     fn configuration_failure_guard_preserves_a_replacement() {
-        let root = std::env::temp_dir().join(format!(
-            "oxideloop-failpoint-config-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        // macOS commonly reports `/var/...` here, where `/var` is a symlink;
+        // this test intentionally exercises the no-symlink production walk.
+        // Use its canonical, short system temporary root to stay below the
+        // platform Unix-domain-socket pathname limit as well.
+        let root = fs::canonicalize("/tmp")
+            .expect("canonical temporary directory")
+            .join(format!(
+                "oxideloop-failpoint-config-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
         fs::create_dir(&root).expect("test root");
         let mut permissions = fs::metadata(&root)
             .expect("test root metadata")

@@ -431,6 +431,22 @@ impl StateBody {
         }
         if let Some(transaction) = &self.apply_transaction {
             transaction.validate(root_uid)?;
+            if let Some(persist) = &self.pending_persist
+                && persist.purpose == PersistPurpose::DispatchAuthorization
+                && !transaction.is_dispatch_authorized()
+            {
+                return Err(SpecValidationError::Correlation {
+                    field: "dispatchAuthorization lifecycle/pending persist correlation",
+                });
+            }
+        } else if self
+            .pending_persist
+            .as_ref()
+            .is_some_and(|persist| persist.purpose == PersistPurpose::DispatchAuthorization)
+        {
+            return Err(SpecValidationError::Correlation {
+                field: "dispatchAuthorization requires an apply transaction",
+            });
         }
         if let Some(candidate) = &self.prune_candidate {
             candidate.validate(root_bundle_digest)?;
@@ -517,6 +533,7 @@ impl PersistOperation {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub enum DurablePhase {
     Prepare,
+    DispatchAuthorization,
     Invalidate,
     MutationResult,
     Completion,
@@ -536,6 +553,7 @@ pub enum DurablePhase {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub enum PersistPurpose {
     Prepare,
+    DispatchAuthorization,
     Invalidate,
     MutationResult,
     Completion,
@@ -556,6 +574,7 @@ impl PersistPurpose {
     pub const fn durable_phase(self) -> DurablePhase {
         match self {
             Self::Prepare => DurablePhase::Prepare,
+            Self::DispatchAuthorization => DurablePhase::DispatchAuthorization,
             Self::Invalidate => DurablePhase::Invalidate,
             Self::MutationResult => DurablePhase::MutationResult,
             Self::Completion => DurablePhase::Completion,
@@ -855,6 +874,10 @@ pub struct ApplyTransaction {
     pub attempt_token: String,
     #[schemars(length(max = 1024))]
     pub prepared_intents: Vec<ApplyIntent>,
+    /// The durable authority for the one next command. A recovered controller
+    /// may replan only while this proves that no mutation was authorized.
+    #[serde(default)]
+    pub next_command_lifecycle: NextCommandLifecycleV0,
     /// Durable, root-bound recovery claims. A controller may recover an
     /// unpersisted API success only when a fresh observation returns this exact
     /// `(root UID, transaction ID, command ID)` proof.
@@ -982,6 +1005,7 @@ impl ApplyTransaction {
             }
             validate_apply_result(result, intent)?;
         }
+        self.validate_next_command_lifecycle()?;
         let mut claims = std::collections::BTreeSet::new();
         for claim in &self.recovery_claims {
             non_empty_within(
@@ -1019,6 +1043,100 @@ impl ApplyTransaction {
         }
         Ok(())
     }
+
+    fn validate_next_command_lifecycle(&self) -> Result<(), SpecValidationError> {
+        let next = self.prepared_intents.get(self.results.len());
+        match (self.next_command_lifecycle.state, next) {
+            (NextCommandLifecycleStateV0::LegacyUnknown, _) => Ok(()),
+            (NextCommandLifecycleStateV0::AllCommandsRecorded, None) => {
+                if self.next_command_lifecycle.command_id.is_none() {
+                    Ok(())
+                } else {
+                    Err(SpecValidationError::Correlation {
+                        field: "applyTransaction.nextCommandLifecycle result-prefix correlation",
+                    })
+                }
+            }
+            (
+                NextCommandLifecycleStateV0::PreparedNotIssued
+                | NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued,
+                Some(intent),
+            ) if self.next_command_lifecycle.command_id.as_deref() == Some(&intent.command_id) => {
+                Ok(())
+            }
+            _ => Err(SpecValidationError::Correlation {
+                field: "applyTransaction.nextCommandLifecycle result-prefix correlation",
+            }),
+        }
+    }
+
+    /// True only while a matching persisted authorization receipt must be
+    /// present before the transport is allowed to mutate.
+    #[must_use]
+    pub fn is_dispatch_authorized(&self) -> bool {
+        self.next_command_lifecycle.state
+            == NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued
+    }
+
+    #[must_use]
+    pub fn dispatch_authorizes(&self, command_id: &str) -> bool {
+        self.is_dispatch_authorized()
+            && self.next_command_lifecycle.command_id.as_deref() == Some(command_id)
+            && self
+                .prepared_intents
+                .get(self.results.len())
+                .is_some_and(|intent| intent.command_id == command_id)
+    }
+}
+
+/// Durable lifecycle for the one next unrecorded mutation command.
+///
+/// `LegacyUnknown` is the serde-default compatibility value for journals
+/// written before this lifecycle existed. It is intentionally loadable so the
+/// controller can fail closed with a precise Hold rather than treating an old
+/// journal as malformed bootstrap state.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NextCommandLifecycleV0 {
+    pub state: NextCommandLifecycleStateV0,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 64), regex(pattern = "^[0-9a-f]{64}$"))]
+    pub command_id: Option<String>,
+}
+
+impl NextCommandLifecycleV0 {
+    #[must_use]
+    pub fn prepared(command_id: String) -> Self {
+        Self {
+            state: NextCommandLifecycleStateV0::PreparedNotIssued,
+            command_id: Some(command_id),
+        }
+    }
+
+    #[must_use]
+    pub fn authorized(command_id: String) -> Self {
+        Self {
+            state: NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued,
+            command_id: Some(command_id),
+        }
+    }
+
+    #[must_use]
+    pub fn complete() -> Self {
+        Self {
+            state: NextCommandLifecycleStateV0::AllCommandsRecorded,
+            command_id: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub enum NextCommandLifecycleStateV0 {
+    #[default]
+    LegacyUnknown,
+    PreparedNotIssued,
+    DispatchAuthorizedMayHaveIssued,
+    AllCommandsRecorded,
 }
 
 fn validate_apply_result(
@@ -2029,6 +2147,7 @@ mod tests {
             recovery_policy: ApplyRecoveryPolicy::ReplanAndRevalidateBeforeEffect,
             attempt_token: "c".repeat(64),
             prepared_intents: vec![],
+            next_command_lifecycle: NextCommandLifecycleV0::complete(),
             recovery_claims: vec![],
             results: vec![],
             unresolved_identities: vec![],
@@ -2054,6 +2173,40 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn next_command_lifecycle_is_additive_but_correlated_to_the_result_prefix() {
+        let transaction = ApplyTransaction {
+            id: "transaction-1".into(),
+            generation: 7,
+            frozen_render_input_hash: "a".repeat(64),
+            desired_graph_hash: "b".repeat(64),
+            recovery_policy: ApplyRecoveryPolicy::ReplanAndRevalidateBeforeEffect,
+            attempt_token: "c".repeat(64),
+            prepared_intents: vec![],
+            next_command_lifecycle: NextCommandLifecycleV0::complete(),
+            recovery_claims: vec![],
+            results: vec![],
+            unresolved_identities: vec![],
+        };
+        let mut legacy_json = serde_json::to_value(&transaction).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("nextCommandLifecycle");
+        let legacy: ApplyTransaction = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(
+            legacy.next_command_lifecycle.state,
+            NextCommandLifecycleStateV0::LegacyUnknown
+        );
+
+        let mut invalid = transaction;
+        invalid.next_command_lifecycle = NextCommandLifecycleV0::prepared("d".repeat(64));
+        assert!(matches!(
+            invalid.validate("root-uid"),
+            Err(SpecValidationError::Correlation { .. })
+        ));
     }
 
     #[test]
@@ -2178,6 +2331,7 @@ mod tests {
                 expected_uid: Some("uid".into()),
                 expected_resource_version: Some("7".into()),
             }],
+            next_command_lifecycle: NextCommandLifecycleV0::prepared(command_id.clone()),
             recovery_claims: vec![PreparedRecoveryClaim {
                 root_uid: "root-uid".into(),
                 transaction_id: "transaction".into(),

@@ -278,6 +278,28 @@ spec:
                         maxLength: 128
                         minLength: 1
                         type: string
+                      nextCommandLifecycle:
+                        default:
+                          state: LegacyUnknown
+                        description: |-
+                          The durable authority for the one next command. A recovered controller
+                          may replan only while this proves that no mutation was authorized.
+                        properties:
+                          commandId:
+                            maxLength: 64
+                            nullable: true
+                            pattern: ^[0-9a-f]{64}$
+                            type: string
+                          state:
+                            enum:
+                            - LegacyUnknown
+                            - PreparedNotIssued
+                            - DispatchAuthorizedMayHaveIssued
+                            - AllCommandsRecorded
+                            type: string
+                        required:
+                        - state
+                        type: object
                       preparedIntents:
                         items:
                           properties:
@@ -903,6 +925,7 @@ spec:
                         description: Durable protocol phase attached to a [`PersistOperation`].
                         enum:
                         - Prepare
+                        - DispatchAuthorization
                         - Invalidate
                         - MutationResult
                         - Completion
@@ -922,6 +945,7 @@ spec:
                           interpreting implementation details.
                         enum:
                         - Prepare
+                        - DispatchAuthorization
                         - Invalidate
                         - MutationResult
                         - Completion

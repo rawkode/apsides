@@ -20,6 +20,28 @@ token-bound failure and then holds. Canonical legacy objects may be lazily
 claimed on their next authorized write; malformed or ownerless objects hold.
 Broad installed-cluster migration or reset remains an explicit M5 non-goal.
 
+## Durable mutation lifecycle (P14-E)
+
+Each ordinary mutation has a durable, root-bound lifecycle: `Prepare` records
+the frozen render and one next command, `PreparedNotIssued` records that no
+dispatch authorization has been granted, `DispatchAuthorizedMayHaveIssued`
+records the only point at which a Kubernetes request may have been sent, and
+`MutationResult`/completion records its result. A restart at
+`PreparedNotIssued` invalidates and replans the transaction; it never replays
+the prepared bytes. The kind harness captures this state, restarts the
+controller, proves the journal returns to empty, and verifies existing object
+UIDs remain unchanged without a POST.
+
+The event materialization window after an Event POST but before durable
+`AutomationRun` status is intentionally not an automatic recovery path. With
+no trusted admission witness, a restart must hold and require intervention;
+the successful kind path therefore documents that ambiguity rather than
+claiming exactly-once recovery. The retained `AfterStatusBeforeAck` path is
+safe only because the Event UID and status are re-read and pinned exactly.
+OxideLoop makes no exactly-once claim for that unresolved window; exactly-once
+POST semantics require an admission-side idempotency/witness contract that is
+not yet implemented.
+
 ## Design boundary
 
 The spike selects an explicitly React-like TSX runtime for a future process-isolated worker. M0 evaluated its callable bundle in the deliberately rejected in-process harness. Ordinary React rendering works for the tested fixture, but unrestricted React is rejected because a layout-effect callback runs during commit. The current in-process `deno_core` host is rejected as a production boundary because it cannot enforce every memory and fatal-failure limit.

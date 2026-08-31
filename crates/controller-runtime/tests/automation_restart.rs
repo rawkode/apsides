@@ -37,6 +37,9 @@ struct StoredStatus {
 #[derive(Default)]
 struct DurableAutomationState {
     event: Option<PlannedEventV0>,
+    /// Models a POST whose server-side outcome exists but whose admission
+    /// response was lost. A later name match is not authority to adopt it.
+    event_recovery_is_ambiguous: bool,
     status: Option<StoredStatus>,
     event_creations: usize,
     event_recoveries: usize,
@@ -67,6 +70,11 @@ impl AutomationPortV0 for FakeAutomationPort {
             None => {
                 durable.event = Some(plan.clone());
                 durable.event_creations += 1;
+            }
+            Some(_) if durable.event_recovery_is_ambiguous => {
+                return Err(RuntimeErrorV0::Hold(
+                    "Event POST outcome is ambiguous without an admission witness".into(),
+                ));
             }
             Some(existing) if existing == plan => durable.event_recoveries += 1,
             Some(_) => {
@@ -443,8 +451,12 @@ async fn automation_success_uses_strict_pins_and_materializes_the_typed_event() 
 }
 
 #[tokio::test]
-async fn event_crash_replay_recovers_exactly_once_with_fresh_failpoints() {
+async fn event_crash_replay_holds_without_an_admission_witness() {
     let durable = Arc::new(Mutex::new(DurableAutomationState::default()));
+    durable
+        .lock()
+        .expect("durable state lock")
+        .event_recovery_is_ambiguous = true;
     let first_requests = Arc::new(Mutex::new(Vec::new()));
     let replay_requests = Arc::new(Mutex::new(Vec::new()));
     let spec = spec("occurrence-17");
@@ -469,24 +481,23 @@ async fn event_crash_replay_recovers_exactly_once_with_fresh_failpoints() {
     assert!(!first_failpoints.take(FailpointV0::AfterEventBeforeStatus));
     assert!(!fresh_failpoints.take(FailpointV0::AfterEventBeforeStatus));
 
-    assert_eq!(
+    assert!(matches!(
         drive(
             durable.clone(),
             replay_requests.clone(),
             &spec,
             &mut fresh_failpoints,
         )
-        .await
-        .expect("fresh replay succeeds"),
-        expected_completion(&spec)
-    );
+        .await,
+        Err(RuntimeErrorV0::Hold(reason)) if reason.contains("admission witness")
+    ));
     let durable = durable.lock().expect("durable state lock");
     assert_eq!(
         durable.event_creations, 1,
-        "replay did not create a second Event"
+        "ambiguous replay did not create a second Event"
     );
-    assert_eq!(durable.event_recoveries, 1);
-    assert_eq!(durable.status_creations, 1);
+    assert_eq!(durable.event_recoveries, 0);
+    assert_eq!(durable.status_creations, 0);
     drop(durable);
     let first = first_requests.lock().expect("first request lock")[0].clone();
     let replay = replay_requests.lock().expect("replay request lock")[0].clone();
