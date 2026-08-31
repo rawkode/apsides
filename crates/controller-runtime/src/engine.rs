@@ -1,6 +1,6 @@
 //! Small async engine loops which connect actor cache epochs to adapter errors.
 
-use oxideloop_kube_transport::TransportErrorV0;
+use oxideloop_kube_transport::{ConflictProvenanceV0, ResourceKindV0, TransportErrorV0};
 use oxideloop_renderer_abi::RenderInputV0;
 
 use crate::{
@@ -8,8 +8,8 @@ use crate::{
     observation_token_for_barrier, reconcile_fixed_point,
 };
 
-/// A 410 or overflow restarts the full list/watch/reread barrier after
-/// invalidating only observations. Durable acknowledgements are untouched.
+/// A terminal dependency watch restarts the full list/watch/reread barrier
+/// after invalidating only observations. Durable acknowledgements are untouched.
 pub async fn reconcile_with_watch_restarts<P: FixedPointPortV0>(
     actor: &mut RootActorV0,
     port: &mut P,
@@ -19,9 +19,7 @@ pub async fn reconcile_with_watch_restarts<P: FixedPointPortV0>(
         port.set_barrier(actor.barrier());
         input.cache_epoch = actor.barrier().cache_epoch.to_string();
         match reconcile_fixed_point(port, input.clone()).await {
-            Err(RuntimeErrorV0::Discovery(
-                TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow,
-            )) => {
+            Err(RuntimeErrorV0::Discovery(error)) if is_dependency_watch_terminal(&error) => {
                 actor.watch_invalidated();
                 port.watch_invalidated(actor.barrier());
                 port.set_barrier(actor.barrier());
@@ -32,4 +30,22 @@ pub async fn reconcile_with_watch_restarts<P: FixedPointPortV0>(
             result => return result,
         }
     }
+}
+
+fn is_dependency_watch_terminal(error: &TransportErrorV0) -> bool {
+    matches!(
+        error,
+        TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow
+    ) || matches!(
+        error,
+        TransportErrorV0::Conflict(ConflictProvenanceV0::WatchTerminal { resource, .. })
+            if matches!(
+                resource,
+                ResourceKindV0::ConfigMap
+                    | ResourceKindV0::Service
+                    | ResourceKindV0::WebApplication
+                    | ResourceKindV0::OxideLoopState
+                    | ResourceKindV0::AutomationRun
+            )
+    )
 }

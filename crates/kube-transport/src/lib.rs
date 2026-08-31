@@ -67,6 +67,50 @@ pub enum ResourceKindV0 {
     Event,
 }
 
+/// A sealed Kubernetes write shape. This is deliberately descriptive rather
+/// than a generic HTTP method so controller recovery can remain command-local.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteOperationV0 {
+    Create,
+    Apply,
+    ApplyStatus,
+    MergeStatus,
+    JsonPatch,
+    Delete,
+}
+
+/// A sealed read shape whose conflict must retain its request provenance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadOperationV0 {
+    List,
+    Get,
+}
+
+/// The two points at which a Kubernetes watch may fail terminally.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WatchStageV0 {
+    Open,
+    Stream,
+}
+
+/// The provenance of an API conflict. A terminal watch conflict must never be
+/// confused with a write that raced after an exact fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConflictProvenanceV0 {
+    Read {
+        operation: ReadOperationV0,
+        resource: ResourceKindV0,
+    },
+    WatchTerminal {
+        stage: WatchStageV0,
+        resource: ResourceKindV0,
+    },
+    Write {
+        operation: WriteOperationV0,
+        resource: ResourceKindV0,
+    },
+}
+
 /// Exact namespace-scoped RBAC verbs required by the sealed dispatcher.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RequiredRbacV0 {
@@ -452,8 +496,10 @@ pub enum TransportErrorV0 {
     WatchOverflow,
     #[error("AutomationRun observation cannot authenticate the durable pending occurrence: {0}")]
     AutomationObservationHold(String),
-    #[error("Kubernetes conflict (409)")]
-    Conflict,
+    #[error("Kubernetes conflict (409) at {0:?}")]
+    Conflict(ConflictProvenanceV0),
+    #[error("Kubernetes conflict cannot be safely rebased at {0:?}")]
+    NonRebasableConflict(ConflictProvenanceV0),
     #[error("transport failure: {0}")]
     Other(String),
 }
@@ -818,7 +864,10 @@ impl KubeTransportV0 {
                     .await
                 {
                     Ok(written) => written,
-                    Err(error) if may_recover_response_loss(&error) => {
+                    Err(error)
+                        if may_recover_response_loss(&error)
+                            || is_root_status_write_conflict(&error) =>
+                    {
                         return self
                             .recover_root_status(
                                 address,
@@ -1058,14 +1107,22 @@ impl KubeTransportV0 {
                 .annotations
                 .get(ROOT_UID_ANNOTATION)
                 .is_some_and(|value| value == root_uid);
-        if observed.metadata.uid != root_uid
-            || observed.metadata.resource_version.is_empty()
-            || observed.metadata.resource_version == old_rv
-            || observed.value.get("status") != Some(&intended)
+        if observed.metadata.uid != root_uid || observed.metadata.resource_version.is_empty() {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        if observed.metadata.resource_version == old_rv {
+            return Err(TransportErrorV0::NonRebasableConflict(
+                ConflictProvenanceV0::Write {
+                    operation: WriteOperationV0::ApplyStatus,
+                    resource: ResourceKindV0::WebApplication,
+                },
+            ));
+        }
+        if observed.value.get("status") != Some(&intended)
             || status.last_status_persist_token.as_deref() != Some(token)
             || !durable_ownership
         {
-            return Err(TransportErrorV0::ManualRecoveryHold);
+            return Err(TransportErrorV0::Stale("root status conflict"));
         }
         Ok(CommandOutcomeV0::Event(Box::new(
             oxideloop_controller_core::EventV0::RootStatusPersisted {
@@ -1341,7 +1398,13 @@ impl KubeTransportV0 {
                 ),
             )
             .await
-            .map_err(map_kube_error)
+            .map_err(|error| {
+                map_write_error(
+                    error,
+                    WriteOperationV0::JsonPatch,
+                    object.reference.resource,
+                )
+            })
             .and_then(|o| to_domain(object.reference.resource, &object.reference.namespace, o))
     }
 
@@ -1414,7 +1477,13 @@ impl KubeTransportV0 {
                 &Patch::Merge(&body),
             )
             .await
-            .map_err(map_kube_error)?;
+            .map_err(|error| {
+                map_write_error(
+                    error,
+                    WriteOperationV0::MergeStatus,
+                    ResourceKindV0::WebApplication,
+                )
+            })?;
         to_domain(
             ResourceKindV0::WebApplication,
             &root.reference.namespace,
@@ -1436,7 +1505,13 @@ impl KubeTransportV0 {
                 &Patch::<Value>::Json(patch),
             )
             .await
-            .map_err(map_kube_error)?;
+            .map_err(|error| {
+                map_write_error(
+                    error,
+                    WriteOperationV0::JsonPatch,
+                    object.reference.resource,
+                )
+            })?;
         to_domain(
             object.reference.resource,
             &object.reference.namespace,
@@ -1597,7 +1672,7 @@ impl KubeTransportV0 {
             .api(resource, namespace)
             .list(&ListParams::default())
             .await
-            .map_err(map_kube_error)?;
+            .map_err(|error| map_read_error(error, ReadOperationV0::List, resource))?;
         let resource_version =
             listed
                 .metadata
@@ -1717,7 +1792,7 @@ impl KubeTransportV0 {
         self.api(reference.resource, &reference.namespace)
             .get_opt(&reference.name)
             .await
-            .map_err(map_kube_error)?
+            .map_err(|error| map_read_error(error, ReadOperationV0::Get, reference.resource))?
             .map(|object| to_domain(reference.resource, &reference.namespace, object))
             .transpose()
     }
@@ -1761,7 +1836,14 @@ impl KubeTransportV0 {
         match self.create_event(&desired).await {
             Ok(written) => Ok(event_ref(&written)),
             Err(error)
-                if may_recover_response_loss(&error) || error == TransportErrorV0::Conflict =>
+                if may_recover_response_loss(&error)
+                    || matches!(
+                        error,
+                        TransportErrorV0::Conflict(ConflictProvenanceV0::Write {
+                            operation: WriteOperationV0::Create,
+                            resource: ResourceKindV0::Event,
+                        })
+                    ) =>
             {
                 let observed = self
                     .reread_event(&reference)
@@ -2167,7 +2249,7 @@ impl KubeTransportV0 {
             .api(resource, namespace)
             .watch(&kube::api::WatchParams::default(), resource_version)
             .await
-            .map_err(map_kube_error)?;
+            .map_err(|error| map_watch_open_error(error, resource))?;
         let namespace = namespace.to_owned();
         let events = stream.map(move |event| match event {
             Ok(kube::api::WatchEvent::Added(object)) => {
@@ -2192,13 +2274,16 @@ impl KubeTransportV0 {
             Ok(kube::api::WatchEvent::Error(status)) if status.code == 410 => {
                 Err(TransportErrorV0::WatchGone)
             }
-            Ok(kube::api::WatchEvent::Error(status)) if status.code == 409 => {
-                Err(TransportErrorV0::Conflict)
-            }
+            Ok(kube::api::WatchEvent::Error(status)) if status.code == 409 => Err(
+                TransportErrorV0::Conflict(ConflictProvenanceV0::WatchTerminal {
+                    stage: WatchStageV0::Stream,
+                    resource,
+                }),
+            ),
             Ok(kube::api::WatchEvent::Error(status)) => {
                 Err(TransportErrorV0::Other(status.message))
             }
-            Err(error) => Err(map_kube_error(error)),
+            Err(error) => Err(map_watch_stream_error(error, resource)),
         });
         let (sender, receiver) = tokio::sync::mpsc::channel(64);
         let overflowed = Arc::new(AtomicBool::new(false));
@@ -2289,7 +2374,7 @@ impl KubeTransportV0 {
         self.api(ResourceKindV0::Event, &reference.namespace)
             .get_opt(&reference.name)
             .await
-            .map_err(map_kube_error)?
+            .map_err(|error| map_read_error(error, ReadOperationV0::Get, ResourceKindV0::Event))?
             .map(|object| to_domain(ResourceKindV0::Event, &reference.namespace, object))
             .transpose()
     }
@@ -2376,7 +2461,7 @@ impl KubeTransportV0 {
             .api(expected, &object.reference.namespace)
             .create(&kube::api::PostParams::default(), &dynamic)
             .await
-            .map_err(map_kube_error)?;
+            .map_err(|error| map_write_error(error, WriteOperationV0::Create, expected))?;
         to_domain(expected, &object.reference.namespace, written)
     }
 
@@ -2403,7 +2488,7 @@ impl KubeTransportV0 {
             .api(expected, &object.reference.namespace)
             .patch(&object.reference.name, &params, &Patch::Apply(&body))
             .await
-            .map_err(map_kube_error)?;
+            .map_err(|error| map_write_error(error, WriteOperationV0::Apply, expected))?;
         to_domain(expected, &object.reference.namespace, written)
     }
 
@@ -2428,7 +2513,7 @@ impl KubeTransportV0 {
                 &Patch::Apply(&body),
             )
             .await
-            .map_err(map_kube_error)?;
+            .map_err(|error| map_write_error(error, WriteOperationV0::ApplyStatus, expected))?;
         to_domain(expected, &object.reference.namespace, written)
     }
 
@@ -2450,7 +2535,7 @@ impl KubeTransportV0 {
         self.api(expected, &reference.namespace)
             .delete(&reference.name, &params)
             .await
-            .map_err(map_kube_error)?;
+            .map_err(|error| map_write_error(error, WriteOperationV0::Delete, expected))?;
         Ok(())
     }
 }
@@ -2632,15 +2717,78 @@ fn to_domain(
         value,
     })
 }
+/// Maps setup errors without inferring HTTP status from rendered text. API
+/// conflicts receive provenance only at a sealed read, write, or watch boundary.
 fn map_kube_error(error: impl std::fmt::Display) -> TransportErrorV0 {
-    let message = error.to_string();
-    if message.contains(" 409") || message.contains("code: 409") {
-        TransportErrorV0::Conflict
-    } else if message.contains(" 410") || message.contains("code: 410") {
-        TransportErrorV0::WatchGone
-    } else {
-        TransportErrorV0::Other(message)
+    TransportErrorV0::Other(error.to_string())
+}
+
+fn map_read_error(
+    error: kube::Error,
+    operation: ReadOperationV0,
+    resource: ResourceKindV0,
+) -> TransportErrorV0 {
+    match error {
+        kube::Error::Api(status) if status.code == 409 => {
+            TransportErrorV0::Conflict(ConflictProvenanceV0::Read {
+                operation,
+                resource,
+            })
+        }
+        error => TransportErrorV0::Other(error.to_string()),
     }
+}
+
+fn map_watch_open_error(error: kube::Error, resource: ResourceKindV0) -> TransportErrorV0 {
+    match error {
+        kube::Error::Api(status) if status.code == 409 => {
+            TransportErrorV0::Conflict(ConflictProvenanceV0::WatchTerminal {
+                stage: WatchStageV0::Open,
+                resource,
+            })
+        }
+        kube::Error::Api(status) if status.code == 410 => TransportErrorV0::WatchGone,
+        error => TransportErrorV0::Other(error.to_string()),
+    }
+}
+
+fn map_watch_stream_error(error: kube::Error, resource: ResourceKindV0) -> TransportErrorV0 {
+    match error {
+        kube::Error::Api(status) if status.code == 409 => {
+            TransportErrorV0::Conflict(ConflictProvenanceV0::WatchTerminal {
+                stage: WatchStageV0::Stream,
+                resource,
+            })
+        }
+        kube::Error::Api(status) if status.code == 410 => TransportErrorV0::WatchGone,
+        error => TransportErrorV0::Other(error.to_string()),
+    }
+}
+
+fn map_write_error(
+    error: kube::Error,
+    operation: WriteOperationV0,
+    resource: ResourceKindV0,
+) -> TransportErrorV0 {
+    match error {
+        kube::Error::Api(status) if status.code == 409 => {
+            TransportErrorV0::Conflict(ConflictProvenanceV0::Write {
+                operation,
+                resource,
+            })
+        }
+        error => TransportErrorV0::Other(error.to_string()),
+    }
+}
+
+fn is_root_status_write_conflict(error: &TransportErrorV0) -> bool {
+    matches!(
+        error,
+        TransportErrorV0::Conflict(ConflictProvenanceV0::Write {
+            operation: WriteOperationV0::ApplyStatus,
+            resource: ResourceKindV0::WebApplication,
+        })
+    )
 }
 
 fn recover_event(expected: &Value, observed: &Value) -> Result<(), TransportErrorV0> {
@@ -3972,7 +4120,10 @@ mod tests {
     #[tokio::test]
     async fn every_watch_error_is_terminal_before_queued_events() {
         for error in [
-            TransportErrorV0::Conflict,
+            TransportErrorV0::Conflict(ConflictProvenanceV0::WatchTerminal {
+                stage: WatchStageV0::Stream,
+                resource: ResourceKindV0::AutomationRun,
+            }),
             TransportErrorV0::Other("malformed bookmark".into()),
         ] {
             let (sender, receiver) = tokio::sync::mpsc::channel(2);
@@ -4200,8 +4351,41 @@ mod tests {
             "watch resource version expired (410); invalidate the cache epoch"
         );
         assert_eq!(
-            TransportErrorV0::Conflict.to_string(),
-            "Kubernetes conflict (409)"
+            TransportErrorV0::Conflict(ConflictProvenanceV0::Read {
+                operation: ReadOperationV0::Get,
+                resource: ResourceKindV0::ConfigMap,
+            })
+            .to_string(),
+            "Kubernetes conflict (409) at Read { operation: Get, resource: ConfigMap }"
+        );
+        assert_eq!(
+            map_kube_error("fake client reported 409 in display text"),
+            TransportErrorV0::Other("fake client reported 409 in display text".into())
+        );
+    }
+
+    #[test]
+    fn conflict_mappers_preserve_stage_and_fake_409_text_is_other() {
+        let api_error = |code| {
+            kube::Error::Api(Box::new(kube::core::Status {
+                status: Some(kube::core::response::StatusSummary::Failure),
+                message: "conflict".into(),
+                reason: "Conflict".into(),
+                code,
+                details: None,
+                metadata: None,
+            }))
+        };
+        assert_eq!(
+            map_watch_open_error(api_error(409), ResourceKindV0::ConfigMap),
+            TransportErrorV0::Conflict(ConflictProvenanceV0::WatchTerminal {
+                stage: WatchStageV0::Open,
+                resource: ResourceKindV0::ConfigMap,
+            })
+        );
+        assert_eq!(
+            map_kube_error("fake client reported 409 in display text"),
+            TransportErrorV0::Other("fake client reported 409 in display text".into())
         );
     }
 

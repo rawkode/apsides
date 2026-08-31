@@ -3471,7 +3471,9 @@ mod tests {
         ActionTriggerV0, AutomationRunCleanupV0, DesiredObservationV0, FrozenInputV0,
         RootSnapshotV0, TransitionV0, automation_source_transition_token,
     };
-    use oxideloop_kube_transport::{ObjectMetaV0, ObjectV0, WatchEventV0};
+    use oxideloop_kube_transport::{
+        ConflictProvenanceV0, ObjectMetaV0, ObjectV0, WatchEventV0, WatchStageV0,
+    };
     use oxideloop_mutation_model::{BackendQualification, Observation};
     use oxideloop_renderer_abi::model::{
         ABI_VERSION_V0, RenderDisposition, ResourceDeclaration, RootProjection,
@@ -7223,6 +7225,85 @@ mod tests {
         assert_ne!(result.input().observation_token, "gone-token");
         assert_eq!(port.invalidations, 1);
         assert_eq!(port.barrier, Some(actor.barrier()));
+    }
+
+    #[tokio::test]
+    async fn typed_dependency_watch_conflict_restarts_from_a_fresh_epoch() {
+        let mut actor = actor();
+        let mut port = InvalidatingPort {
+            calls: 0,
+            invalidations: 0,
+            barrier: None,
+            error: TransportErrorV0::Conflict(ConflictProvenanceV0::WatchTerminal {
+                stage: WatchStageV0::Stream,
+                resource: ResourceKindV0::ConfigMap,
+            }),
+        };
+        let input = RenderInputV0 {
+            abi_version: "renderer.oxideloop.dev/v0".into(),
+            root: RootProjection {
+                api_version: "demo.oxideloop.dev/v1alpha1".into(),
+                kind: "WebApplication".into(),
+                namespace: "ns".into(),
+                name: "root".into(),
+                uid: "root-uid".into(),
+                generation: 1,
+                spec: serde_json::json!({}),
+            },
+            bundle_digest: "a".repeat(64),
+            cache_epoch: "0".into(),
+            observation_token: "typed-conflict".into(),
+            observations: vec![],
+        };
+        let result = reconcile_with_watch_restarts(&mut actor, &mut port, input)
+            .await
+            .expect("typed dependency watch conflict restarts");
+        assert_eq!(actor.barrier().cache_epoch, 1);
+        assert_eq!(port.invalidations, 1);
+        assert_eq!(result.input().cache_epoch, "1");
+        assert_eq!(port.calls, 3);
+    }
+
+    #[tokio::test]
+    async fn wrong_resource_or_read_conflict_does_not_restart_dependency_barrier() {
+        let input = RenderInputV0 {
+            abi_version: "renderer.oxideloop.dev/v0".into(),
+            root: RootProjection {
+                api_version: "demo.oxideloop.dev/v1alpha1".into(),
+                kind: "WebApplication".into(),
+                namespace: "ns".into(),
+                name: "root".into(),
+                uid: "root-uid".into(),
+                generation: 1,
+                spec: serde_json::json!({}),
+            },
+            bundle_digest: "a".repeat(64),
+            cache_epoch: "0".into(),
+            observation_token: "fail-closed".into(),
+            observations: vec![],
+        };
+        for error in [
+            TransportErrorV0::Conflict(ConflictProvenanceV0::Read {
+                operation: oxideloop_kube_transport::ReadOperationV0::Get,
+                resource: ResourceKindV0::ConfigMap,
+            }),
+            TransportErrorV0::Conflict(ConflictProvenanceV0::WatchTerminal {
+                stage: WatchStageV0::Stream,
+                resource: ResourceKindV0::Event,
+            }),
+        ] {
+            let mut actor = actor();
+            let mut port = InvalidatingPort {
+                calls: 0,
+                invalidations: 0,
+                barrier: None,
+                error,
+            };
+            let result = reconcile_with_watch_restarts(&mut actor, &mut port, input.clone()).await;
+            assert!(result.is_err(), "unrelated conflicts must fail closed");
+            assert_eq!(port.calls, 1);
+            assert_eq!(port.invalidations, 0);
+        }
     }
 
     #[test]

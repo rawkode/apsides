@@ -16,8 +16,8 @@ use oxideloop_controller_core::{
 };
 use oxideloop_kube_transport::{
     AutomationCompletionAckV0, AutomationRunExpectationV0, AutomationRunObservationBarrierV0,
-    EventMaterializationRefV0, KubeTransportV0, ObjectRefV0, ObjectV0, ResourceKindV0,
-    RootAddressV0, WatchEventV0,
+    ConflictProvenanceV0, EventMaterializationRefV0, KubeTransportV0, ObjectRefV0, ObjectV0,
+    ResourceKindV0, RootAddressV0, TransportErrorV0, WatchEventV0,
 };
 use oxideloop_mutation_model::{
     BackendQualification, ObjectIdentity as MutationIdentity, Observation as CoreObservation,
@@ -699,10 +699,7 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
         let retained = self.retained.as_mut().expect("checked retained barrier");
         let changed = match retained.drain_buffered_events() {
             Ok(changed) => changed,
-            Err(RuntimeErrorV0::Discovery(
-                oxideloop_kube_transport::TransportErrorV0::WatchGone
-                | oxideloop_kube_transport::TransportErrorV0::WatchOverflow,
-            )) => {
+            Err(RuntimeErrorV0::Discovery(error)) if retained_watch_terminal(&error, retained) => {
                 return Ok(BufferedRetainedWatchV0::RestartRequired {
                     port_identity: self.identity,
                     barrier: self.barrier,
@@ -713,10 +710,9 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
         if !changed {
             match retained.await_change().await {
                 Ok(()) => {}
-                Err(RuntimeErrorV0::Discovery(
-                    oxideloop_kube_transport::TransportErrorV0::WatchGone
-                    | oxideloop_kube_transport::TransportErrorV0::WatchOverflow,
-                )) => {
+                Err(RuntimeErrorV0::Discovery(error))
+                    if retained_watch_terminal(&error, retained) =>
+                {
                     return Ok(BufferedRetainedWatchV0::RestartRequired {
                         port_identity: self.identity,
                         barrier: self.barrier,
@@ -897,10 +893,7 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
                         CompletedObservationFenceOutcomeV0::Completed(Box::new(capability))
                     })
             }
-            Err(RuntimeErrorV0::Discovery(
-                oxideloop_kube_transport::TransportErrorV0::WatchGone
-                | oxideloop_kube_transport::TransportErrorV0::WatchOverflow,
-            )) => {
+            Err(RuntimeErrorV0::Discovery(error)) if retained_watch_terminal(&error, retained) => {
                 actor.watch_invalidated();
                 self.retained = None;
                 self.barrier = actor.barrier();
@@ -1139,13 +1132,12 @@ impl<R> KubeFixedPointPortV0<'_, R> {
                     retained.incarnation,
                 )?,
             })),
-            Err(RuntimeErrorV0::Discovery(
-                oxideloop_kube_transport::TransportErrorV0::WatchGone
-                | oxideloop_kube_transport::TransportErrorV0::WatchOverflow,
-            )) => Ok(Some(BufferedRetainedWatchV0::RestartRequired {
-                port_identity: self.identity,
-                barrier: self.barrier,
-            })),
+            Err(RuntimeErrorV0::Discovery(error)) if retained_watch_terminal(&error, retained) => {
+                Ok(Some(BufferedRetainedWatchV0::RestartRequired {
+                    port_identity: self.identity,
+                    barrier: self.barrier,
+                }))
+            }
             Err(error) => Err(error),
         }
     }
@@ -1360,10 +1352,7 @@ impl RetainedWatchCollectorV0 {
         }
         let changed = match retained.drain_buffered_events() {
             Ok(changed) => changed,
-            Err(RuntimeErrorV0::Discovery(
-                oxideloop_kube_transport::TransportErrorV0::WatchGone
-                | oxideloop_kube_transport::TransportErrorV0::WatchOverflow,
-            )) => {
+            Err(RuntimeErrorV0::Discovery(error)) if retained_watch_terminal(&error, retained) => {
                 return Ok(Some(BufferedRetainedWatchV0::RestartRequired {
                     port_identity: self.identity,
                     barrier: self.barrier,
@@ -1399,10 +1388,7 @@ impl RetainedWatchCollectorV0 {
         };
         match retained.await_change().await {
             Ok(()) => {}
-            Err(RuntimeErrorV0::Discovery(
-                oxideloop_kube_transport::TransportErrorV0::WatchGone
-                | oxideloop_kube_transport::TransportErrorV0::WatchOverflow,
-            )) => {
+            Err(RuntimeErrorV0::Discovery(error)) if retained_watch_terminal(&error, retained) => {
                 return Ok(BufferedRetainedWatchV0::RestartRequired {
                     port_identity: self.identity,
                     barrier: self.barrier,
@@ -1655,6 +1641,20 @@ impl RetainedObservationBarrierV0 {
             || Self::dependencies_cover(&self.coverage_dependencies, reference)
     }
 
+    fn tracks_resource(&self, resource_kind: ResourceKindV0) -> bool {
+        self.renderer_dependencies
+            .iter()
+            .chain(&self.coverage_dependencies)
+            .any(|dependency| match dependency {
+                Dependency::Collection {
+                    api_version, kind, ..
+                }
+                | Dependency::Object {
+                    api_version, kind, ..
+                } => resource(api_version, kind).ok() == Some(resource_kind),
+            })
+    }
+
     fn final_objects(&self) -> BTreeMap<ObservationKeyV0, Option<ObjectV0>> {
         let mut final_objects = BTreeMap::new();
         for list in self.barrier.collections.values() {
@@ -1852,6 +1852,23 @@ impl RetainedObservationBarrierV0 {
             desired_observations,
         })
     }
+}
+
+/// A dependency watch can restart only for the resource class retained by this
+/// exact barrier.  A terminal error from a root or `AutomationRun` watch must
+/// remain visible to its owner rather than invalidating dependency authority.
+fn retained_watch_terminal(
+    error: &TransportErrorV0,
+    retained: &RetainedObservationBarrierV0,
+) -> bool {
+    matches!(
+        error,
+        TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow
+    ) || matches!(
+        error,
+        TransportErrorV0::Conflict(ConflictProvenanceV0::WatchTerminal { resource, .. })
+            if retained.tracks_resource(*resource)
+    )
 }
 
 fn renderer_observation(object: ObjectV0) -> Observation {

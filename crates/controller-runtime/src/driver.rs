@@ -23,8 +23,8 @@ use oxideloop_event_planner::{
     ObjectIdentity as PlannerIdentityV0, ObjectRef as PlannerObjectRefV0, RunCorrelationV0,
 };
 use oxideloop_kube_transport::{
-    AutomationRunExpectationV0, AutomationRunObservationBarrierV0, KubeTransportV0, ObjectRefV0,
-    ResourceKindV0, TransportErrorV0, WatchEventV0, WatchHandleV0,
+    AutomationRunExpectationV0, AutomationRunObservationBarrierV0, ConflictProvenanceV0,
+    KubeTransportV0, ObjectRefV0, ResourceKindV0, TransportErrorV0, WatchEventV0, WatchHandleV0,
 };
 use oxideloop_renderer_abi::{
     limits::validate_event_metadata,
@@ -90,6 +90,11 @@ impl DriverConfigV0 {
 pub enum DriverExitV0 {
     RootFinalized,
 }
+
+/// A terminal API watch fault must not spin the controller before its process
+/// supervisor can apply backoff. These are deliberately fixed, local bounds.
+const MAX_BARRIER_WATCH_RESTARTS: usize = 3;
+const BARRIER_WATCH_RESTART_DELAY_MS: u64 = 10;
 
 enum QuiescentWakeV0 {
     #[cfg(feature = "test-failpoints")]
@@ -257,7 +262,7 @@ impl ControllerDriverV0 {
                             actor = Some(start_actor(machine));
                         }
                     }
-                    Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
+                    Err(error) if is_root_watch_terminal(&error) => {
                         let (watch, fresh) =
                             establish_root_barrier(&self.transport, &self.config).await?;
                         root_watch = watch;
@@ -468,9 +473,9 @@ impl ControllerDriverV0 {
                             )
                             .await?;
                             match error {
-                                RuntimeErrorV0::Discovery(
-                                    TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow,
-                                ) => {
+                                RuntimeErrorV0::Discovery(error)
+                                    if is_dependency_watch_terminal(&error) =>
+                                {
                                     active.watch_invalidated();
                                     if let Some(port) = fixed_point.as_mut() {
                                         // Reuniting after a failed discovery retains the old
@@ -870,9 +875,7 @@ impl ControllerDriverV0 {
                                     }
                                 }
                                 Ok(_) => {}
-                                Err(
-                                    TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow,
-                                ) => {
+                                Err(error) if is_root_watch_terminal(&error) => {
                                     active.watch_invalidated();
                                     let (watch, fresh) =
                                         establish_root_barrier(&self.transport, &self.config)
@@ -901,9 +904,7 @@ impl ControllerDriverV0 {
                             },
                             QuiescentWakeV0::Automation(run) => match *run {
                                 Ok(_) => {}
-                                Err(
-                                    TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow,
-                                ) => {
+                                Err(error) if is_automation_watch_terminal(&error) => {
                                     automation_watch = None;
                                 }
                                 Err(error) => return Err(error.into()),
@@ -1022,7 +1023,7 @@ fn drain_completion_edge<R>(
             }
             Ok(Some(_)) => {}
             Ok(None) => break,
-            Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
+            Err(error) if is_root_watch_terminal(&error) => {
                 buffered.root = Some(BufferedRootWatchV0::RestartRequired);
             }
             Err(error) => {
@@ -1363,7 +1364,7 @@ where
                         buffered.root = buffered_root_watch(event);
                     }
                     Ok(_) => {}
-                    Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
+                    Err(error) if is_root_watch_terminal(&error) => {
                         buffered.root = Some(BufferedRootWatchV0::RestartRequired);
                     }
                     Err(error) => {
@@ -1402,7 +1403,7 @@ where
                     Ok(run) => {
                         buffered.automation = Some(BufferedAutomationWatchV0::Changed(Box::new(run)));
                     }
-                    Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
+                    Err(error) if is_automation_watch_terminal(&error) => {
                         // Its durable expectation is re-established after the
                         // command acknowledgement; no raw run crosses this
                         // boundary.
@@ -1462,7 +1463,7 @@ where
                     buffered.root = buffered_root_watch(event);
                 }
                 Ok(_) => {}
-                Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
+                Err(error) if is_root_watch_terminal(&error) => {
                     buffered.root = Some(BufferedRootWatchV0::RestartRequired);
                 }
                 Err(error) => {
@@ -1495,7 +1496,7 @@ where
                 Ok(run) => {
                     buffered.automation = Some(BufferedAutomationWatchV0::Changed(Box::new(run)));
                 }
-                Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
+                Err(error) if is_automation_watch_terminal(&error) => {
                     buffered.automation = Some(BufferedAutomationWatchV0::RestartRequired);
                 }
                 Err(error) => {
@@ -1522,7 +1523,7 @@ fn drain_render_completion_edge(
             }
             Ok(Some(_)) => {}
             Ok(None) => break,
-            Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
+            Err(error) if is_root_watch_terminal(&error) => {
                 buffered.root = Some(BufferedRootWatchV0::RestartRequired);
             }
             Err(error) => {
@@ -1685,20 +1686,34 @@ async fn establish_root_barrier(
     transport: &KubeTransportV0,
     config: &DriverConfigV0,
 ) -> Result<(WatchHandleV0, Option<MachineStateV0>), RuntimeErrorV0> {
-    let list = transport
-        .list_exact(ResourceKindV0::WebApplication, &config.namespace)
-        .await?;
-    let watch = transport
-        .watch_from(
-            ResourceKindV0::WebApplication,
-            &config.namespace,
-            &list.resource_version,
-        )
-        .await
-        .map_err(RuntimeErrorV0::Discovery)?;
-    let fresh =
-        load_machine_from_transport(transport, &config.namespace, &config.root_name).await?;
-    Ok((watch, fresh))
+    let mut restarts = 0;
+    loop {
+        let list = transport
+            .list_exact(ResourceKindV0::WebApplication, &config.namespace)
+            .await?;
+        let watch = match transport
+            .watch_from(
+                ResourceKindV0::WebApplication,
+                &config.namespace,
+                &list.resource_version,
+            )
+            .await
+        {
+            Ok(watch) => watch,
+            Err(error) if is_root_watch_terminal(&error) => {
+                if restarts == MAX_BARRIER_WATCH_RESTARTS {
+                    return Err(error.into());
+                }
+                restarts += 1;
+                wait_before_barrier_restart(restarts).await;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let fresh =
+            load_machine_from_transport(transport, &config.namespace, &config.root_name).await?;
+        return Ok((watch, fresh));
+    }
 }
 
 async fn drain_root_watch(
@@ -1720,7 +1735,7 @@ async fn drain_root_watch(
             // command can be selected under stale root authority.
             Ok(Some(_)) => {}
             Ok(None) => return Ok(RootWatchDrainV0::Current),
-            Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
+            Err(error) if is_root_watch_terminal(&error) => {
                 actor.watch_invalidated();
                 return Ok(RootWatchDrainV0::Invalidated);
             }
@@ -1828,6 +1843,37 @@ fn watch_targets_root(event: &WatchEventV0, root_name: &str) -> bool {
         | WatchEventV0::Deleted(object) => object.reference.name == root_name,
         WatchEventV0::Bookmark { .. } => false,
     }
+}
+
+/// Only terminal failures from the named watch source may use its existing
+/// rebarrier or restart path. Request conflicts retain command-local semantics.
+fn is_watch_terminal_for(error: &TransportErrorV0, resource: ResourceKindV0) -> bool {
+    matches!(
+        error,
+        TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow
+    ) || matches!(
+        error,
+        TransportErrorV0::Conflict(ConflictProvenanceV0::WatchTerminal {
+            resource: error_resource,
+            ..
+        }) if *error_resource == resource
+    )
+}
+
+fn is_root_watch_terminal(error: &TransportErrorV0) -> bool {
+    is_watch_terminal_for(error, ResourceKindV0::WebApplication)
+}
+
+fn is_automation_watch_terminal(error: &TransportErrorV0) -> bool {
+    is_watch_terminal_for(error, ResourceKindV0::AutomationRun)
+}
+
+fn is_dependency_watch_terminal(error: &TransportErrorV0) -> bool {
+    is_watch_terminal_for(error, ResourceKindV0::ConfigMap)
+        || is_watch_terminal_for(error, ResourceKindV0::Service)
+        || is_watch_terminal_for(error, ResourceKindV0::WebApplication)
+        || is_watch_terminal_for(error, ResourceKindV0::OxideLoopState)
+        || is_watch_terminal_for(error, ResourceKindV0::AutomationRun)
 }
 
 fn root_address(
@@ -2087,10 +2133,27 @@ async fn establish_pending_watch(
         &actor.state().root().uid,
         pending,
     )?;
-    KubeAutomationObservationPortV0 { transport }
-        .establish(expectation)
-        .await
-        .map(Some)
+    let port = KubeAutomationObservationPortV0 { transport };
+    let mut restarts = 0;
+    loop {
+        match port.establish(expectation.clone()).await {
+            Ok(barrier) => return Ok(Some(barrier)),
+            Err(RuntimeErrorV0::Discovery(error)) if is_automation_watch_terminal(&error) => {
+                if restarts == MAX_BARRIER_WATCH_RESTARTS {
+                    return Err(RuntimeErrorV0::Discovery(error));
+                }
+                restarts += 1;
+                wait_before_barrier_restart(restarts).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn wait_before_barrier_restart(restart: usize) {
+    tokio::task::yield_now().await;
+    let delay = BARRIER_WATCH_RESTART_DELAY_MS * u64::try_from(restart).unwrap_or(u64::MAX);
+    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
 }
 
 fn automation_execution(
@@ -2201,9 +2264,9 @@ mod tests {
     };
     use oxideloop_controller_api::{
         AutomationPending, AutomationRunCompletion, AutomationRunCompletionState,
-        AutomationRunSpec, AutomationRunStatus, ObjectIdentity, OxideLoopStateSpec, RootBinding,
-        STATE_VERSION_V1, StateBody, StateLink, WebApplicationSpec, WebApplicationStatus,
-        automation_run_name, bootstrap_id, state_name,
+        AutomationRunSpec, AutomationRunStatus, AutomationState, ObjectIdentity,
+        OxideLoopStateSpec, RootBinding, STATE_VERSION_V1, StateBody, StateLink,
+        WebApplicationSpec, WebApplicationStatus, automation_run_name, bootstrap_id, state_name,
     };
     use oxideloop_controller_core::RootSnapshotV0;
     use oxideloop_kube_transport::{ObjectMetaV0, ObjectV0};
@@ -2557,6 +2620,75 @@ mod tests {
                 deleting: false,
             })
             .expect("bootstrap actor"),
+        )
+    }
+
+    fn pending_automation_actor() -> RootActorV0 {
+        let spec = automation_spec();
+        let run_name = automation_run_name(ROOT_UID, &spec.occurrence_id).expect("run name");
+        let spec_hash = sha256_hex(
+            &canonical_bytes(&serde_json::to_value(&spec).expect("spec value"))
+                .expect("canonical spec"),
+        );
+        let state_name = state_name(ROOT_UID).expect("state name");
+        RootActorV0::new(
+            MachineStateV0::new(
+                RootSnapshotV0 {
+                    uid: ROOT_UID.into(),
+                    namespace: "ns".into(),
+                    name: "root".into(),
+                    generation: 1,
+                    spec: WebApplicationSpec {
+                        message: "pending automation".into(),
+                        expose: false,
+                        program: ProgramBundleReference {
+                            config_map_name: "bundle".into(),
+                            key: "program.mjs".into(),
+                            digest: BUNDLE_DIGEST.into(),
+                        },
+                    },
+                    bundle_digest: BUNDLE_DIGEST.into(),
+                    status: WebApplicationStatus {
+                        state: Some(StateLink {
+                            root_uid: ROOT_UID.into(),
+                            name: state_name.clone(),
+                            uid: "state-uid".into(),
+                        }),
+                        ..WebApplicationStatus::default()
+                    },
+                    state_name,
+                    state_uid: "state-uid".into(),
+                    state_resource_version: "state-rv".into(),
+                    root_resource_version: "root-rv".into(),
+                    root_finalizer_present: true,
+                    state_finalizer_present: true,
+                    deleting: false,
+                },
+                OxideLoopStateSpec {
+                    state_version: STATE_VERSION_V1,
+                    root: RootBinding {
+                        uid: ROOT_UID.into(),
+                        bootstrap_id: bootstrap_id(ROOT_UID).expect("bootstrap id"),
+                        bundle_digest: BUNDLE_DIGEST.into(),
+                    },
+                    state: StateBody {
+                        automation: AutomationState {
+                            pending: vec![AutomationPending {
+                                occurrence_id: spec.occurrence_id,
+                                automation_id: spec.automation_id,
+                                source: spec.source,
+                                run_name,
+                                run_uid: "run-uid".into(),
+                                run_resource_version: "31".into(),
+                                spec_hash,
+                            }],
+                            ..AutomationState::default()
+                        },
+                        ..StateBody::default()
+                    },
+                },
+            )
+            .expect("valid pending automation machine"),
         )
     }
 
@@ -3516,6 +3648,112 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
+    fn conflict_response() -> Response<Body> {
+        Response::builder()
+            .status(http::StatusCode::CONFLICT)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "apiVersion":"v1",
+                    "kind":"Status",
+                    "status":"Failure",
+                    "reason":"Conflict",
+                    "message":"scripted conflict",
+                    "code":409
+                }))
+                .expect("conflict response JSON"),
+            ))
+            .expect("conflict response")
+    }
+
+    #[tokio::test]
+    async fn pending_automation_watch_stream_conflict_retries_only_its_bounded_barrier() {
+        let spec = automation_spec();
+        let run_name = automation_run_name(ROOT_UID, &spec.occurrence_id).expect("run name");
+        let run = automation_object(&spec, &run_name, "31", &AutomationRunStatus::default()).value;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service_calls = Arc::clone(&calls);
+        let service = service_fn(move |request: Request<Body>| {
+            let service_calls = Arc::clone(&service_calls);
+            let run = run.clone();
+            let run_name = run_name.clone();
+            async move {
+                let ordinal = service_calls.fetch_add(1, Ordering::SeqCst);
+                let response = if ordinal.is_multiple_of(2) {
+                    assert!(request.uri().path().contains("/automationruns"));
+                    wire_json(json!({
+                        "apiVersion":"runtime.oxideloop.dev/v1alpha1",
+                        "kind":"AutomationRunList",
+                        "metadata":{"resourceVersion":format!("list-rv-{ordinal}")},
+                        "items":[]
+                    }))
+                } else {
+                    assert!(
+                        request
+                            .uri()
+                            .path()
+                            .ends_with(&format!("/automationruns/{run_name}"))
+                    );
+                    wire_json(run)
+                };
+                Ok::<_, Infallible>(response)
+            }
+        });
+        let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
+        for _ in 0..=MAX_BARRIER_WATCH_RESTARTS {
+            let (sender, watch) = WatchHandleV0::test_channel(1);
+            sender
+                .try_send(Err(TransportErrorV0::Conflict(
+                    ConflictProvenanceV0::WatchTerminal {
+                        stage: oxideloop_kube_transport::WatchStageV0::Stream,
+                        resource: ResourceKindV0::AutomationRun,
+                    },
+                )))
+                .expect("terminal AutomationRun watch record");
+            transport.test_push_watch(watch);
+        }
+        let Err(error) = establish_pending_watch(&pending_automation_actor(), &transport).await
+        else {
+            panic!("fourth AutomationRun stream conflict must exhaust the bounded barrier")
+        };
+        assert!(matches!(
+            error,
+            RuntimeErrorV0::Discovery(TransportErrorV0::Conflict(
+                ConflictProvenanceV0::WatchTerminal {
+                    stage: oxideloop_kube_transport::WatchStageV0::Stream,
+                    resource: ResourceKindV0::AutomationRun,
+                }
+            ))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 8);
+    }
+
+    #[tokio::test]
+    async fn pending_automation_read_conflict_is_not_retried_as_a_watch_fault() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service_calls = Arc::clone(&calls);
+        let service = service_fn(move |_request: Request<Body>| {
+            let service_calls = Arc::clone(&service_calls);
+            async move {
+                service_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Infallible>(conflict_response())
+            }
+        });
+        let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
+        let Err(error) = establish_pending_watch(&pending_automation_actor(), &transport).await
+        else {
+            panic!("AutomationRun list conflict must remain terminal")
+        };
+        assert!(matches!(
+            error,
+            RuntimeErrorV0::Discovery(TransportErrorV0::Conflict(ConflictProvenanceV0::Read {
+                operation: oxideloop_kube_transport::ReadOperationV0::List,
+                resource: ResourceKindV0::AutomationRun,
+            }))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     fn drain_root_json(resource_version: &str) -> serde_json::Value {
         json!({
             "apiVersion":"demo.oxideloop.dev/v1alpha1",
@@ -3578,7 +3816,14 @@ mod tests {
 
     #[tokio::test]
     async fn drain_root_watch_skips_unrelated_records_before_terminal_restart() {
-        for terminal in [TransportErrorV0::WatchGone, TransportErrorV0::WatchOverflow] {
+        for terminal in [
+            TransportErrorV0::WatchGone,
+            TransportErrorV0::WatchOverflow,
+            TransportErrorV0::Conflict(ConflictProvenanceV0::WatchTerminal {
+                stage: oxideloop_kube_transport::WatchStageV0::Stream,
+                resource: ResourceKindV0::WebApplication,
+            }),
+        ] {
             let service = service_fn(move |_request: Request<Body>| async move {
                 panic!("terminal root drain must not reread before restart handling");
                 #[allow(unreachable_code)]

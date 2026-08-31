@@ -14,7 +14,7 @@ use http::{Method, Request, Response, StatusCode};
 use kube::{Client, client::Body};
 use oxideloop_controller_api::{
     AutomationRunCompletion, AutomationRunCompletionState, AutomationRunSpec, AutomationRunStatus,
-    ObjectIdentity, ProgramBundleReference, automation_run_name,
+    ObjectIdentity, ProgramBundleReference, WebApplicationStatus, automation_run_name,
 };
 use oxideloop_controller_core::{
     CommandV0, MutationCommandV0, PreconditionsV0, root_finalizer_command_token,
@@ -33,11 +33,11 @@ use tower::service_fn;
 
 use super::{
     AutomationRunExpectationV0, AutomationRunObservationBarrierV0, COMMAND_ID_ANNOTATION,
-    KubeTransportV0, ListV0, ObjectMetaV0, ObjectRefV0, ObjectV0, ROOT_FINALIZER,
-    ROOT_UID_ANNOTATION, ResourceKindV0, RootAddressV0, TRANSACTION_ID_ANNOTATION,
-    TransportErrorV0, WatchEventV0, WatchHandleV0, validate_automation_run_get,
-    validate_automation_run_list, validate_automation_run_observation,
-    validate_automation_watch_event,
+    ConflictProvenanceV0, KubeTransportV0, ListV0, ObjectMetaV0, ObjectRefV0, ObjectV0,
+    ROOT_FINALIZER, ROOT_UID_ANNOTATION, ReadOperationV0, ResourceKindV0, RootAddressV0,
+    TRANSACTION_ID_ANNOTATION, TransportErrorV0, WatchEventV0, WatchHandleV0, WatchStageV0,
+    WriteOperationV0, validate_automation_run_get, validate_automation_run_list,
+    validate_automation_run_observation, validate_automation_watch_event,
 };
 
 struct Expected {
@@ -638,6 +638,55 @@ async fn list_and_reread_use_exact_namespace_paths_and_collection_resource_versi
 }
 
 #[tokio::test]
+async fn read_conflicts_retain_list_and_get_provenance() {
+    let conflict = || {
+        status(
+            StatusCode::CONFLICT,
+            json!({"kind":"Status","apiVersion":"v1","code":409}),
+        )
+    };
+    let (transport, api) = ScriptedApi::transport([Expected {
+        method: Method::GET,
+        path_and_query: "/api/v1/namespaces/tenant-a/configmaps?",
+        content_type: None,
+        body: None,
+        response: conflict(),
+    }]);
+    assert_eq!(
+        transport
+            .list_exact(ResourceKindV0::ConfigMap, "tenant-a")
+            .await,
+        Err(TransportErrorV0::Conflict(ConflictProvenanceV0::Read {
+            operation: ReadOperationV0::List,
+            resource: ResourceKindV0::ConfigMap,
+        }))
+    );
+    api.assert_drained();
+
+    let (transport, api) = ScriptedApi::transport([Expected {
+        method: Method::GET,
+        path_and_query: "/api/v1/namespaces/tenant-a/configmaps/cm-a",
+        content_type: None,
+        body: None,
+        response: conflict(),
+    }]);
+    assert_eq!(
+        transport
+            .reread(&ObjectRefV0 {
+                resource: ResourceKindV0::ConfigMap,
+                namespace: "tenant-a".into(),
+                name: "cm-a".into(),
+            })
+            .await,
+        Err(TransportErrorV0::Conflict(ConflictProvenanceV0::Read {
+            operation: ReadOperationV0::Get,
+            resource: ResourceKindV0::ConfigMap,
+        }))
+    );
+    api.assert_drained();
+}
+
+#[tokio::test]
 async fn watch_uses_exact_resource_version_and_410_is_watch_gone() {
     let (transport, api) = ScriptedApi::transport([Expected {
         method: Method::GET,
@@ -658,6 +707,101 @@ async fn watch_uses_exact_resource_version_and_410_is_watch_gone() {
         watch.next_event().await,
         Err(TransportErrorV0::WatchGone)
     ));
+    api.assert_drained();
+}
+
+#[tokio::test]
+async fn watch_open_and_stream_conflicts_retain_stage_and_resource() {
+    let body =
+        serde_json::json!({"type":"ERROR","object":{"kind":"Status","apiVersion":"v1","code":409}})
+            .to_string()
+            + "\n";
+    let (transport, api) = ScriptedApi::transport([Expected {
+        method: Method::GET,
+        path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/automationruns?&watch=true&timeoutSeconds=290&allowWatchBookmarks=true&resourceVersion=77",
+        content_type: None,
+        body: None,
+        response: Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.into_bytes()))
+            .expect("watch conflict stream"),
+    }]);
+    let mut watch = transport
+        .watch_from(ResourceKindV0::AutomationRun, "tenant-a", "77")
+        .await
+        .expect("watch opens");
+    let expected = Err(TransportErrorV0::Conflict(
+        ConflictProvenanceV0::WatchTerminal {
+            stage: WatchStageV0::Stream,
+            resource: ResourceKindV0::AutomationRun,
+        },
+    ));
+    assert_eq!(watch.next_event().await, expected);
+    assert_eq!(watch.next_event().await, expected);
+    api.assert_drained();
+}
+
+#[tokio::test]
+async fn root_status_conflict_recovery_distinguishes_ack_stale_and_hold() {
+    let status = WebApplicationStatus {
+        last_status_persist_token: Some("token".into()),
+        ..Default::default()
+    };
+    let mut root = object_json(ResourceKindV0::WebApplication, "app-a", "root-uid", "100");
+    root["metadata"]["annotations"][ROOT_UID_ANNOTATION] = json!("root-uid");
+    root["metadata"]["finalizers"] = json!([ROOT_FINALIZER]);
+    root["status"] = serde_json::to_value(&status).expect("status JSON");
+    let address = RootAddressV0 {
+        namespace: "tenant-a".into(),
+        name: "app-a".into(),
+        state_name: "state-a".into(),
+    };
+    let expected = || Expected {
+        method: Method::GET,
+        path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a",
+        content_type: None,
+        body: None,
+        response: response(root.clone()),
+    };
+    let (transport, api) = ScriptedApi::transport([expected()]);
+    let acknowledged = transport
+        .recover_root_status(&address, "token", "root-uid", "99", &status)
+        .await
+        .expect("advanced exact status is an acknowledgement");
+    assert!(matches!(acknowledged, super::CommandOutcomeV0::Event(_)));
+    api.assert_drained();
+
+    let mut mismatched = root.clone();
+    mismatched["status"]["cacheEpoch"] = json!(7);
+    let (transport, api) = ScriptedApi::transport([Expected {
+        response: response(mismatched),
+        ..expected()
+    }]);
+    assert_eq!(
+        transport
+            .recover_root_status(&address, "token", "root-uid", "99", &status)
+            .await,
+        Err(TransportErrorV0::Stale("root status conflict"))
+    );
+    api.assert_drained();
+
+    let mut unchanged = root.clone();
+    unchanged["metadata"]["resourceVersion"] = json!("99");
+    let (transport, api) = ScriptedApi::transport([Expected {
+        response: response(unchanged),
+        ..expected()
+    }]);
+    assert_eq!(
+        transport
+            .recover_root_status(&address, "token", "root-uid", "99", &status)
+            .await,
+        Err(TransportErrorV0::NonRebasableConflict(
+            ConflictProvenanceV0::Write {
+                operation: WriteOperationV0::ApplyStatus,
+                resource: ResourceKindV0::WebApplication,
+            }
+        ))
+    );
     api.assert_drained();
 }
 
@@ -2034,7 +2178,10 @@ async fn stale_pins_make_no_effect_request_and_409_maps_to_conflict() {
     }]);
     assert_eq!(
         transport.patch_config_map(&conflict, "42").await,
-        Err(TransportErrorV0::Conflict)
+        Err(TransportErrorV0::Conflict(ConflictProvenanceV0::Write {
+            operation: WriteOperationV0::Apply,
+            resource: ResourceKindV0::ConfigMap,
+        }))
     );
     api.assert_drained();
 }
