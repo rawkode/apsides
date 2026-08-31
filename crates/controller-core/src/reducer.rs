@@ -2188,15 +2188,33 @@ fn persist_ack(
     state.journal.state.pending_persist = None;
     match operation.purpose {
         PersistPurpose::Prepare | PersistPurpose::MutationResult => {
-            if let Some(frozen) = &mut state.frozen {
-                frozen
-                    .state_resource_version
-                    .clone_from(&state.root.state_resource_version);
+            let Some(frozen) = &mut state.frozen else {
+                state.phase = PhaseV0::Hold;
+                commands.push(CommandV0::Hold {
+                    reason: "revalidation persistence acknowledgement has no frozen observation"
+                        .into(),
+                });
+                return Ok(());
+            };
+            frozen
+                .state_resource_version
+                .clone_from(&state.root.state_resource_version);
+            if frozen.observation_token.is_empty() || frozen.cache_epoch.is_empty() {
+                state.phase = PhaseV0::Hold;
+                commands.push(CommandV0::Hold {
+                    reason:
+                        "revalidation persistence acknowledgement has no sealed observation pins"
+                            .into(),
+                });
+                return Ok(());
             }
+            let mut preconditions = pins(&state.root);
+            preconditions
+                .observation_token
+                .clone_from(&frozen.observation_token);
+            preconditions.cache_epoch.clone_from(&frozen.cache_epoch);
             state.phase = PhaseV0::RevalidatePending;
-            commands.push(CommandV0::RequestRender {
-                preconditions: pins(&state.root),
-            });
+            commands.push(CommandV0::RequestRender { preconditions });
         }
         PersistPurpose::DispatchAuthorization => {
             let Some(mut pending) = state.runtime.pending_dispatch.take() else {
@@ -2711,6 +2729,35 @@ fn revalidate(
                 commands,
             );
         }
+        if matches!(
+            tx.next_command_lifecycle.state,
+            NextCommandLifecycleStateV0::AllCommandsRecorded
+        ) {
+            state.journal.state.apply_transaction = None;
+            if plan.hash != tx.desired_graph_hash
+                || !all_recorded_results_match_fresh_observation(state, &tx, &observed)
+            {
+                state.journal.state.pending_dependencies.clear();
+                state.journal.state.prune_candidate = None;
+                return queue_persist(
+                    state,
+                    PersistPurpose::Invalidate,
+                    DurablePhase::Invalidate,
+                    PhaseV0::PersistPending,
+                    commands,
+                );
+            }
+            state.frozen = Some(frozen);
+            state.journal.state.committed_dependencies =
+                std::mem::take(&mut state.journal.state.pending_dependencies);
+            return queue_persist(
+                state,
+                PersistPurpose::Completion,
+                DurablePhase::Completion,
+                PhaseV0::PersistPending,
+                commands,
+            );
+        }
         let recovered = recover_prepared_result(state, &tx, &observed)?;
         if !recovered.is_empty() {
             state.frozen = Some(frozen);
@@ -2865,6 +2912,66 @@ fn mutation_ack(
             commands,
         )
     }
+}
+
+/// A complete durable result prefix is not an observation fence. Before it can
+/// complete after an observation supersession, every accepted result must
+/// still be exactly present (for Apply) or absent (for Delete). This prevents
+/// a deleted or same-name foreign replacement from being retained as inventory
+/// merely because desired graph bytes did not change.
+fn all_recorded_results_match_fresh_observation(
+    state: &MachineStateV0,
+    tx: &ApplyTransaction,
+    observed: &[DesiredObservationV0],
+) -> bool {
+    tx.results.len() == tx.prepared_intents.len()
+        && tx.results.iter().all(|result| {
+            let Some(intent) = tx
+                .prepared_intents
+                .iter()
+                .find(|intent| intent.command_id == result.command_id)
+            else {
+                return false;
+            };
+            let Some(observation) = observed
+                .iter()
+                .find(|observation| observation.identity == intent.identity)
+            else {
+                return false;
+            };
+            // `NativeStructuralCrd` has already passed adapter manifest
+            // validation; the planner treats both it and built-ins as
+            // supported. Only an explicitly Unsupported backend invalidates
+            // a completed result.
+            if matches!(
+                observation.qualification,
+                BackendQualification::Unsupported { .. }
+            ) {
+                return false;
+            }
+            match (&intent.operation, result.outcome, &observation.observation) {
+                (
+                    ApplyOperation::Apply,
+                    ApplyOutcome::Applied,
+                    Observation::Existing { identity },
+                ) => {
+                    result.uid.as_deref() == Some(identity.uid.as_str())
+                        && result.resource_version.as_deref()
+                            == Some(identity.resource_version.as_str())
+                        && apply_recovery_matches(state, tx, intent, observation, identity)
+                }
+                (ApplyOperation::Delete, ApplyOutcome::Deleted, Observation::Absent) => {
+                    result.uid.as_deref() == intent.expected_uid.as_deref()
+                        && result.resource_version.as_deref()
+                            == intent.expected_resource_version.as_deref()
+                        && claim_matches(state, tx, intent)
+                }
+                (ApplyOperation::Delete, ApplyOutcome::AlreadyAbsent, Observation::Absent) => {
+                    deletion_recovery_matches(state, tx, intent, observation)
+                }
+                _ => false,
+            }
+        })
 }
 
 fn record_mutation_results(
@@ -4391,6 +4498,20 @@ fn plan_graph(
                     object: resource.object.clone(),
                 },
             };
+            let (expected_uid, expected_resource_version) = match &intent {
+                MutationIntent::Apply { expected, .. } => (
+                    Some(expected.uid.clone()),
+                    Some(expected.resource_version.clone()),
+                ),
+                // A fresh absence is a POST/Create capability, even if a
+                // stale inventory row remains while Invalidate is durable.
+                // Carrying that old UID/RV would reject the new POST result
+                // after the write and strand the transaction in Hold.
+                MutationIntent::Create { .. } | MutationIntent::CreateConflict { .. } => {
+                    (None, None)
+                }
+                MutationIntent::Delete { .. } => unreachable!("desired planning never deletes"),
+            };
             let decision = plan(&MutationPlanInputV0 {
                 probe_version: PROBE_VERSION_V0.into(),
                 qualification: observed.qualification,
@@ -4409,8 +4530,8 @@ fn plan_graph(
                 operation: ApplyOperation::Apply,
                 identity: identity.clone(),
                 logical_id: resource.logical_id.clone(),
-                expected_uid: inventory.map(|item| item.uid.clone()),
-                expected_resource_version: inventory.map(|item| item.resource_version.clone()),
+                expected_uid,
+                expected_resource_version,
             });
             decisions.insert(command_id, decision);
         }
@@ -5368,6 +5489,13 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(matches!(
+            revalidate.commands.as_slice(),
+            [CommandV0::RequestRender { preconditions }]
+                if preconditions.state_resource_version == "12"
+                    && preconditions.observation_token == "observation-1"
+                    && preconditions.cache_epoch == "epoch-1"
+        ));
         let issued = reduce(
             revalidate.state.clone(),
             EventV0::Revalidated {
@@ -5421,6 +5549,13 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(matches!(
+            revalidate_completion.commands.as_slice(),
+            [CommandV0::RequestRender { preconditions }]
+                if preconditions.state_resource_version == "14"
+                    && preconditions.observation_token == "observation-1"
+                    && preconditions.cache_epoch == "epoch-1"
+        ));
         let mut fresh_observed = observed;
         fresh_observed
             .iter_mut()
@@ -6049,6 +6184,46 @@ mod tests {
         assert!(matches!(
             stale.commands.as_slice(),
             [CommandV0::IgnoredStale { .. }]
+        ));
+    }
+
+    #[test]
+    fn prepare_persist_ack_without_a_sealed_observation_holds() {
+        let machine = boot_to_render(state());
+        let (frozen, input, output, observed) = rendered(&machine.root, vec![]);
+        let prepared = reduce(
+            machine,
+            EventV0::Rendered {
+                frozen,
+                render_input_json: input,
+                render_output_json: output,
+                observed,
+            },
+        )
+        .unwrap();
+        let operation = match &prepared.commands[0] {
+            CommandV0::Persist { operation, .. } => operation.clone(),
+            _ => panic!("render must persist the prepared transaction"),
+        };
+        let mut lost_observation = prepared.state;
+        lost_observation.frozen = None;
+
+        let held = reduce(
+            lost_observation,
+            EventV0::Persisted {
+                token: operation.token,
+                old_state_resource_version: operation.old_state_resource_version,
+                new_state_resource_version: "12".into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(held.state.phase, PhaseV0::Hold);
+        assert!(matches!(
+            held.commands.as_slice(),
+            [CommandV0::Hold { reason }]
+                if reason == "revalidation persistence acknowledgement has no frozen observation"
         ));
     }
 

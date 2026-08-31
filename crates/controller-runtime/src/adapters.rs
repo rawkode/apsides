@@ -3503,9 +3503,17 @@ mod tests {
             })
             .expect("exact root status acknowledgement");
         assert!(actor.root_observed(acknowledged_root));
+        assert!(
+            actor
+                .next_command()
+                .expect("correlated root echo reduces before any old render")
+                .is_none()
+        );
+        let fresh_barrier = actor.barrier();
+        actor.informers_ready(fresh_barrier);
         let follow_up = actor
             .next_command()
-            .expect("status acknowledgement must queue follow-up render")
+            .expect("fresh root barrier must queue follow-up render")
             .expect("follow-up render command");
         let follow_up_preconditions = match follow_up {
             CommandV0::RequestRender { preconditions } => preconditions,
@@ -3515,8 +3523,11 @@ mod tests {
             follow_up_preconditions.root_resource_version,
             "root-rv-after-render"
         );
-        assert_eq!(follow_up_preconditions.observation_token, observation_token);
-        assert_eq!(follow_up_preconditions.cache_epoch, cache_epoch);
+        assert_ne!(follow_up_preconditions.observation_token, observation_token);
+        assert_eq!(
+            follow_up_preconditions.cache_epoch,
+            fresh_barrier.cache_epoch.to_string()
+        );
         let mut follow_up_input = template.input.clone();
         follow_up_input.observation_token = follow_up_preconditions.observation_token.clone();
         follow_up_input.cache_epoch = follow_up_preconditions.cache_epoch.clone();

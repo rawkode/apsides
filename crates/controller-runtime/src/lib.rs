@@ -140,6 +140,11 @@ pub(crate) struct CoverageChangedV0 {
 /// acknowledgement has reduced to `Ready`.
 #[derive(Clone, Debug)]
 struct DeferredGenuineChangeV0 {
+    /// The sealed fixed-point barrier whose post-persist continuation may be
+    /// replaced. This remains stable while later retained changes coalesce.
+    sealed_barrier: BarrierV0,
+    /// The exact current barrier for the latest authenticated token.
+    target_barrier: BarrierV0,
     change: GenuineChangeV0,
     observation_token: String,
     cache_epoch: String,
@@ -1239,6 +1244,10 @@ impl RootActorV0 {
         if self.last_dependency_observation.as_ref() == Some(&dedupe_key) {
             return false;
         }
+        let sealed_barrier = self
+            .deferred_genuine_change
+            .as_ref()
+            .map_or(change.barrier, |deferred| deferred.sealed_barrier);
         self.last_dependency_observation = Some(dedupe_key);
         self.pending_informer_readiness = None;
         self.observation_events.clear();
@@ -1254,6 +1263,8 @@ impl RootActorV0 {
             .as_bytes(),
         );
         let deferred = DeferredGenuineChangeV0 {
+            sealed_barrier,
+            target_barrier: self.barrier,
             change: change.clone(),
             observation_token: observation_token.clone(),
             cache_epoch: self.barrier.cache_epoch.to_string(),
@@ -1315,6 +1326,87 @@ impl RootActorV0 {
             observation_token: deferred.observation_token,
             cache_epoch: deferred.cache_epoch,
         })
+    }
+
+    /// A genuine retained change may arrive while an acknowledged command owns
+    /// the actor. Once that acknowledgement has reduced, it may produce only a new
+    /// observation-only revalidation request.  Replace that request before it
+    /// is issued when (and only when) it is still bound to the sealed input of
+    /// the older barrier.  The durable transaction and any acknowledged
+    /// result remain in the reducer state; the fresh barrier decides whether
+    /// to replan, recover a proof, complete, or hold.
+    fn reconcile_post_acknowledgement_render(&mut self) -> Result<(), RuntimeErrorV0> {
+        if !matches!(
+            self.state.phase(),
+            PhaseV0::RenderPending | PhaseV0::RevalidatePending
+        ) {
+            return Ok(());
+        }
+        let Some(CommandV0::RequestRender { preconditions }) = self.commands.front() else {
+            return Ok(());
+        };
+        let Some((sealed_barrier, sealed_input)) = self.active_render_input.as_ref() else {
+            // A 410/overflow has intentionally consumed this active input and
+            // installed an authenticated invalidation seed. The regular
+            // invalidation delivery below owns that replacement.
+            if self.latched_invalidation_seed.is_some() {
+                return Ok(());
+            }
+            self.hold(
+                "durable revalidation lost its sealed fixed-point input before barrier supersession"
+                    .into(),
+            );
+            return Err(RuntimeErrorV0::Hold(
+                "durable revalidation lost its sealed fixed-point input before barrier supersession"
+                    .into(),
+            ));
+        };
+        if *sealed_barrier == self.barrier {
+            if preconditions.observation_token != sealed_input.observation_token
+                || preconditions.cache_epoch != sealed_input.cache_epoch
+            {
+                self.hold(
+                    "durable revalidation does not match its current sealed fixed-point input"
+                        .into(),
+                );
+                return Err(RuntimeErrorV0::Hold(
+                    "durable revalidation does not match its current sealed fixed-point input"
+                        .into(),
+                ));
+            }
+            return Ok(());
+        }
+        let Some(deferred) = self.deferred_genuine_change.as_ref() else {
+            self.hold(
+                "durable revalidation barrier advanced without an authenticated replacement".into(),
+            );
+            return Err(RuntimeErrorV0::Hold(
+                "durable revalidation barrier advanced without an authenticated replacement".into(),
+            ));
+        };
+        if deferred.sealed_barrier != *sealed_barrier
+            || deferred.target_barrier != self.barrier
+            || deferred.cache_epoch != self.barrier.cache_epoch.to_string()
+            || preconditions.observation_token != sealed_input.observation_token
+            || preconditions.cache_epoch != sealed_input.cache_epoch
+        {
+            self.hold(
+                "durable revalidation and retained change do not share an exact sealed barrier"
+                    .into(),
+            );
+            return Err(RuntimeErrorV0::Hold(
+                "durable revalidation and retained change do not share an exact sealed barrier"
+                    .into(),
+            ));
+        }
+        let observation_token = deferred.observation_token.clone();
+        if !self.supersede_observation_only(observation_token) {
+            return Err(RuntimeErrorV0::Hold(
+                "durable revalidation could not be superseded by the authenticated retained change"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     fn can_supersede_observation_only(&self) -> bool {
@@ -1474,6 +1566,13 @@ impl RootActorV0 {
         // obsolete pins, except the post-finalizer exact UID absence proof.
         if let Some(ack) = self.priority_ack.take() {
             self.reduce_event(ack)?;
+            // A coalesced root refresh has independent authority to replace
+            // the acknowledgement continuation and intentionally clears its
+            // prior sealed input. Otherwise inspect the immediate render
+            // continuation before it can be issued.
+            if self.pending_root_refresh.is_none() {
+                self.reconcile_post_acknowledgement_render()?;
+            }
             if let Some(root) = self.pending_root_refresh.take() {
                 // A root self-watch may be buffered while its owned write is
                 // in flight. Once the acknowledgement has installed that
@@ -1481,7 +1580,32 @@ impl RootActorV0 {
                 // continuation just produced by the acknowledgement (for
                 // example RequestDescriptor after bootstrap). It carries no
                 // new authority, so consume only this post-ack duplicate.
-                if root != *self.state.root() {
+                if root == *self.state.root() {
+                    // The root self-watch can arrive after its status write
+                    // has left transport but before the matching
+                    // RootStatusPersisted event reduces. `root_observed`
+                    // correctly advanced the barrier and cleared the old
+                    // fixed-point pin. Now that the acknowledgement proves
+                    // this is its exact echo, never issue the status-pinned
+                    // old RequestRender under that newer barrier; consume it
+                    // into a fresh root-derived informer admission instead.
+                    if matches!(self.commands.front(), Some(CommandV0::RequestRender { .. })) {
+                        let seed = self
+                            .state
+                            .root()
+                            .status
+                            .input_token
+                            .as_deref()
+                            .unwrap_or(self.state.root().uid.as_str());
+                        let token = observation_token_for_barrier(seed, self.barrier);
+                        if !self.supersede_observation_only(token) {
+                            return Err(RuntimeErrorV0::Hold(
+                                "correlated root status echo could not supersede its old render"
+                                    .into(),
+                            ));
+                        }
+                    }
+                } else {
                     if self.state.phase() != PhaseV0::RootDeletionVerifyPending {
                         self.commands.clear();
                     }
@@ -3517,7 +3641,7 @@ mod tests {
     };
     use oxideloop_controller_core::{
         ActionTriggerV0, AutomationRunCleanupV0, DesiredObservationV0, FrozenInputV0,
-        RootSnapshotV0, TransitionV0, automation_source_transition_token,
+        RecoveryProofV0, RootSnapshotV0, TransitionV0, automation_source_transition_token,
     };
     use oxideloop_kube_transport::{
         ConflictProvenanceV0, ObjectMetaV0, ObjectV0, WatchEventV0, WatchStageV0,
@@ -5252,6 +5376,171 @@ mod tests {
         }
     }
 
+    fn genuine_change(actor: &RootActorV0) -> GenuineChangeV0 {
+        GenuineChangeV0::from_observations(
+            &[oxideloop_renderer_abi::model::Observation {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                name: "retained-change".into(),
+                uid: "retained-change-uid".into(),
+                resource_version: "retained-change-rv".into(),
+                value: serde_json::json!({"data":{"change":"new"}}),
+            }],
+            actor.barrier(),
+            1,
+        )
+        .expect("canonical retained change")
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn actor_with_prepared_apply_persist() -> (RootActorV0, CommandV0) {
+        let base = linked_machine();
+        let root = base.root().clone();
+        let mut actor =
+            RootActorV0::new(MachineStateV0::recover(root, base.journal().clone()).unwrap());
+        actor.enqueue(EventV0::Start);
+        let CommandV0::RequestDescriptor { token, .. } = actor
+            .next_command()
+            .expect("recovered actor requests descriptor")
+            .expect("recovered actor has descriptor command")
+        else {
+            panic!("recovered actor did not request descriptor");
+        };
+        actor
+            .acknowledge(EventV0::DescriptorReady {
+                token,
+                bundle_digest: "a".repeat(64),
+            })
+            .expect("descriptor acknowledgement");
+        assert!(
+            actor
+                .next_command()
+                .expect("descriptor reduction")
+                .is_none()
+        );
+        let barrier = actor.barrier();
+        actor
+            .prepare_initial_informer_observation(barrier)
+            .expect("initial informer observation is sealed");
+        actor.informers_ready(barrier);
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("informer readiness reduction")
+            .expect("first render command")
+        else {
+            panic!("informer readiness did not issue render");
+        };
+        actor
+            .issue_render_capability(
+                trusted_render_input(&actor, &preconditions.observation_token),
+                1,
+            )
+            .expect("first render has concrete fixed-point provenance");
+        let (frozen, input, _, _) = prune_render_documents(
+            actor.state().root(),
+            &preconditions.state_resource_version,
+            &preconditions.observation_token,
+            &preconditions.cache_epoch,
+        );
+        let identity = oxideloop_controller_api::ObjectIdentity {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: "ns".into(),
+            name: "managed-new".into(),
+        };
+        let output = serde_json::to_string(&RenderOutputV0 {
+            abi_version: ABI_VERSION_V0.into(),
+            disposition: RenderDisposition::Apply,
+            resources: vec![ResourceDeclaration {
+                logical_id: "managed-new".into(),
+                object: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "managed-new", "namespace": "ns"},
+                    "data": {"value": "new"}
+                }),
+                readiness: None,
+            }],
+            dependencies: vec![],
+            automations: vec![],
+            diagnostics: vec![],
+        })
+        .expect("prepared apply output serializes");
+        let observed = vec![DesiredObservationV0 {
+            identity,
+            observation: Observation::Absent,
+            qualification: BackendQualification::BuiltInTested {
+                kubernetes_minor: "1.36".into(),
+                gvr: "configmaps".into(),
+            },
+            recovery_proof: None,
+            deletion_recovery_proof: None,
+        }];
+        actor
+            .accept_acknowledgement(EventV0::Rendered {
+                frozen: frozen.clone(),
+                render_input_json: input.clone(),
+                render_output_json: output.clone(),
+                observed: observed.clone(),
+            })
+            .expect("render acknowledgement");
+        let continuation = actor
+            .next_command()
+            .expect("render reduction")
+            .expect("render status continuation");
+        let CommandV0::PersistRootStatus {
+            token,
+            old_root_resource_version,
+            ..
+        } = continuation
+        else {
+            panic!("first render did not persist its status: {continuation:?}");
+        };
+        actor
+            .acknowledge(EventV0::RootStatusPersisted {
+                token,
+                old_root_resource_version,
+                new_root_resource_version: "root-rv-after-first-render".into(),
+                root_uid: actor.state().root().uid.clone(),
+            })
+            .expect("root status acknowledgement");
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("status continuation reduces")
+            .expect("status-pinned render retry")
+        else {
+            panic!("status acknowledgement did not request exact render retry");
+        };
+        actor
+            .issue_render_capability(
+                trusted_render_input(&actor, &preconditions.observation_token),
+                1,
+            )
+            .expect("status-pinned render has concrete fixed-point provenance");
+        actor
+            .accept_acknowledgement(EventV0::Rendered {
+                frozen,
+                render_input_json: input,
+                render_output_json: output,
+                observed,
+            })
+            .expect("status-pinned render acknowledgement");
+        let persist = actor
+            .next_command()
+            .expect("status-pinned render reduction")
+            .expect("prepared transaction persistence");
+        assert!(
+            matches!(
+                persist,
+                CommandV0::Persist { ref operation, .. }
+                    if operation.purpose == PersistPurpose::Prepare
+            ),
+            "expected Prepare persist, got {persist:?}"
+        );
+        (actor, persist)
+    }
+
     fn assert_actor_closure(
         machine: &MachineStateV0,
         ack: &EventV0,
@@ -5505,6 +5794,7 @@ mod tests {
             })
             .unwrap();
         assert!(actor.next_command().unwrap().is_none());
+        actor.barrier.cache_epoch = 1;
         actor.enqueue(EventV0::InformersReady);
         assert!(matches!(
             actor.next_command().unwrap(),
@@ -5520,14 +5810,29 @@ mod tests {
                 observed: observed.clone(),
             })
             .unwrap();
+        actor.active_render_input = Some((
+            actor.barrier(),
+            trusted_render_input(&actor, &first_frozen.observation_token),
+        ));
         let first_prepare = actor.next_command().unwrap().unwrap();
         actor
             .acknowledge(persisted_event(&first_prepare, "state-rv-2"))
             .unwrap();
-        assert!(matches!(
-            actor.next_command().unwrap(),
-            Some(CommandV0::RequestRender { .. })
-        ));
+        let CommandV0::RequestRender { preconditions } = actor.next_command().unwrap().unwrap()
+        else {
+            panic!("prepared transaction did not request exact revalidation");
+        };
+        assert_eq!(
+            preconditions.observation_token,
+            first_frozen.observation_token
+        );
+        assert_eq!(preconditions.cache_epoch, first_frozen.cache_epoch);
+        actor
+            .issue_render_capability(
+                trusted_render_input(&actor, &preconditions.observation_token),
+                1,
+            )
+            .expect("driver-facing fixed-point capability accepts retained prepare pins");
         let mut first_revalidated_frozen = first_frozen;
         first_revalidated_frozen.state_resource_version = "state-rv-2".into();
         actor
@@ -5550,10 +5855,16 @@ mod tests {
             observation_token: "observation-2".into(),
             cache_epoch: "1".into(),
         });
-        assert!(matches!(
-            actor.next_command().unwrap(),
-            Some(CommandV0::RequestRender { .. })
-        ));
+        let CommandV0::RequestRender { preconditions } = actor.next_command().unwrap().unwrap()
+        else {
+            panic!("second prune barrier did not request a render");
+        };
+        actor
+            .issue_render_capability(
+                trusted_render_input(&actor, &preconditions.observation_token),
+                1,
+            )
+            .expect("second prune barrier has concrete fixed-point provenance");
         let (second_frozen, second_input, _, second_observed) =
             prune_render_documents(actor.state().root(), "state-rv-3", "observation-2", "1");
         actor
@@ -5581,10 +5892,16 @@ mod tests {
                 root_uid: "root-uid".into(),
             })
             .unwrap();
-        assert!(matches!(
-            actor.next_command().unwrap(),
-            Some(CommandV0::RequestRender { .. })
-        ));
+        let CommandV0::RequestRender { preconditions } = actor.next_command().unwrap().unwrap()
+        else {
+            panic!("second prune status acknowledgement did not request render");
+        };
+        actor
+            .issue_render_capability(
+                trusted_render_input(&actor, &preconditions.observation_token),
+                1,
+            )
+            .expect("second prune status-pinned render has concrete provenance");
         actor
             .accept_acknowledgement(EventV0::Rendered {
                 frozen: second_frozen.clone(),
@@ -5645,6 +5962,797 @@ mod tests {
             CommandV0::Persist { ref operation, .. }
                 if operation.purpose == PersistPurpose::Invalidate
         ));
+    }
+
+    #[test]
+    fn genuine_change_during_prepare_persist_supersedes_only_the_new_revalidation() {
+        let (mut actor, prepare) = actor_with_prepared_apply_persist();
+        let sealed_barrier = actor.barrier();
+        let sealed_token = actor
+            .active_render_input
+            .as_ref()
+            .expect("prepared persistence retains the sealed render input")
+            .1
+            .observation_token
+            .clone();
+        let change = genuine_change(&actor);
+        assert!(actor.record_genuine_dependency_change(&change));
+        let fresh_barrier = actor.barrier();
+        assert_ne!(fresh_barrier, sealed_barrier);
+
+        actor
+            .acknowledge(persisted_event(&prepare, "state-rv-after-prepare"))
+            .expect("exact prepare acknowledgement is durable authority");
+        assert!(
+            actor
+                .next_command()
+                .expect("prepare acknowledgement reduces before the retained change")
+                .is_none(),
+            "the old sealed render request must be superseded before driver issuance"
+        );
+        assert_eq!(actor.state().phase(), PhaseV0::InformersPending);
+        assert!(actor.active_render_input.is_none());
+        let transaction = actor
+            .state()
+            .journal()
+            .state
+            .apply_transaction
+            .as_ref()
+            .expect("supersession preserves the durable prepared transaction");
+        assert_eq!(
+            transaction.next_command_lifecycle.state,
+            oxideloop_controller_api::NextCommandLifecycleStateV0::PreparedNotIssued
+        );
+
+        actor.informers_ready(fresh_barrier);
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("fresh informer readiness reduces")
+            .expect("fresh retained barrier requests render")
+        else {
+            panic!("fresh retained barrier did not request render");
+        };
+        assert_ne!(preconditions.observation_token, sealed_token);
+        assert_eq!(
+            preconditions.cache_epoch,
+            fresh_barrier.cache_epoch.to_string()
+        );
+        actor
+            .issue_render_capability(
+                trusted_render_input(&actor, &preconditions.observation_token),
+                1,
+            )
+            .expect("only the authenticated fresh barrier may reach the driver capability");
+    }
+
+    #[test]
+    fn coalesced_genuine_changes_during_prepare_persist_keep_the_original_sealed_barrier() {
+        let (mut actor, prepare) = actor_with_prepared_apply_persist();
+        let sealed_barrier = actor.barrier();
+        assert!(actor.record_genuine_dependency_change(&genuine_change(&actor)));
+        let intermediate_barrier = actor.barrier();
+        assert!(actor.record_genuine_dependency_change(&genuine_change(&actor)));
+        let target_barrier = actor.barrier();
+        assert_ne!(intermediate_barrier, target_barrier);
+        assert_eq!(
+            actor
+                .deferred_genuine_change
+                .as_ref()
+                .map(|deferred| (deferred.sealed_barrier, deferred.target_barrier)),
+            Some((sealed_barrier, target_barrier))
+        );
+
+        actor
+            .acknowledge(persisted_event(&prepare, "state-rv-after-coalesced-change"))
+            .expect("prepare acknowledgement remains durable authority");
+        assert!(
+            actor
+                .next_command()
+                .expect("coalesced retained changes supersede the post-ack request")
+                .is_none(),
+            "a valid coalesced retained change must not fail closed or issue stale pins"
+        );
+        assert_eq!(actor.state().phase(), PhaseV0::InformersPending);
+
+        actor.informers_ready(target_barrier);
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("latest barrier readiness reduces")
+            .expect("latest barrier requests render")
+        else {
+            panic!("latest retained barrier did not request render");
+        };
+        assert_eq!(
+            preconditions.cache_epoch,
+            target_barrier.cache_epoch.to_string()
+        );
+        actor
+            .issue_render_capability(
+                trusted_render_input(&actor, &preconditions.observation_token),
+                1,
+            )
+            .expect("latest authenticated retained token reaches the driver capability");
+    }
+
+    #[test]
+    fn coalesced_genuine_changes_during_root_status_persist_replace_its_old_render() {
+        let (mut actor, status) = render_status_pending_actor();
+        let CommandV0::PersistRootStatus {
+            status: root_status,
+            ..
+        } = &status
+        else {
+            panic!("render status helper returned a non-status command");
+        };
+        let sealed_token = root_status
+            .input_token
+            .clone()
+            .expect("render status continuation records its sealed token");
+        let sealed_barrier = actor.barrier();
+        actor.active_render_input =
+            Some((sealed_barrier, trusted_render_input(&actor, &sealed_token)));
+
+        assert!(actor.record_genuine_dependency_change(&genuine_change(&actor)));
+        assert!(actor.record_genuine_dependency_change(&genuine_change(&actor)));
+        let fresh_barrier = actor.barrier();
+        assert_ne!(fresh_barrier, sealed_barrier);
+
+        let CommandV0::PersistRootStatus {
+            token,
+            old_root_resource_version,
+            ..
+        } = status
+        else {
+            panic!("render status helper returned a non-status command");
+        };
+        actor
+            .acknowledge(EventV0::RootStatusPersisted {
+                token,
+                old_root_resource_version,
+                new_root_resource_version: "root-rv-after-status".into(),
+                root_uid: actor.state().root().uid.clone(),
+            })
+            .expect("root status acknowledgement stays durable authority");
+        assert!(
+            actor
+                .next_command()
+                .expect("root status acknowledgement supersedes its old render")
+                .is_none(),
+            "the old status continuation must never issue under the advanced barrier"
+        );
+        assert_eq!(actor.state().phase(), PhaseV0::InformersPending);
+
+        actor.informers_ready(fresh_barrier);
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("fresh informer readiness reduces")
+            .expect("fresh authenticated render is issued")
+        else {
+            panic!("fresh root-status barrier did not request render");
+        };
+        assert_ne!(preconditions.observation_token, sealed_token);
+        assert_eq!(
+            preconditions.cache_epoch,
+            fresh_barrier.cache_epoch.to_string()
+        );
+        actor
+            .issue_render_capability(
+                trusted_render_input(&actor, &preconditions.observation_token),
+                1,
+            )
+            .expect("only the fresh root-status barrier reaches the driver capability");
+    }
+
+    #[test]
+    fn root_status_self_echo_before_ack_supersedes_its_old_render() {
+        let (mut actor, status) = render_status_pending_actor();
+        let CommandV0::PersistRootStatus {
+            token,
+            old_root_resource_version,
+            status: persisted_status,
+            ..
+        } = &status
+        else {
+            panic!("render status helper returned a non-status command");
+        };
+        let old_token = persisted_status
+            .input_token
+            .clone()
+            .expect("status-pinned render has an old observation token");
+        let mut echo = actor.state().root().clone();
+        echo.root_resource_version = "root-rv-after-status".into();
+        echo.status = persisted_status.clone();
+        assert!(actor.root_observed(echo));
+        let fresh_barrier = actor.barrier();
+
+        actor
+            .acknowledge(EventV0::RootStatusPersisted {
+                token: token.clone(),
+                old_root_resource_version: old_root_resource_version.clone(),
+                new_root_resource_version: "root-rv-after-status".into(),
+                root_uid: actor.state().root().uid.clone(),
+            })
+            .expect("status acknowledgement remains reducer authority");
+        assert!(
+            actor
+                .next_command()
+                .expect("correlated root echo supersedes the old render")
+                .is_none(),
+            "the pre-ack status token must not issue under the advanced barrier"
+        );
+        assert_eq!(actor.state().phase(), PhaseV0::InformersPending);
+
+        actor.informers_ready(fresh_barrier);
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("fresh root echo readiness reduces")
+            .expect("fresh root echo requests render")
+        else {
+            panic!("fresh root echo barrier did not request render");
+        };
+        assert_ne!(preconditions.observation_token, old_token);
+        assert_eq!(
+            preconditions.cache_epoch,
+            fresh_barrier.cache_epoch.to_string()
+        );
+        actor
+            .issue_render_capability(
+                trusted_render_input(&actor, &preconditions.observation_token),
+                1,
+            )
+            .expect("only the root-derived fresh token reaches the driver capability");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn genuine_change_during_mutation_result_persist_preserves_the_accepted_result() {
+        let (machine, mutation_ack) = mutation_pending();
+        let mut actor = RootActorV0::new(machine);
+        actor.barrier.cache_epoch = 1;
+        actor.active_render_input = Some((
+            actor.barrier(),
+            trusted_render_input(&actor, "observation-1"),
+        ));
+        actor.priority_ack = Some(mutation_ack);
+        let result_persist = actor
+            .next_command()
+            .expect("mutation acknowledgement reduces")
+            .expect("accepted result is persisted");
+        assert!(matches!(
+            result_persist,
+            CommandV0::Persist { ref operation, .. }
+                if operation.purpose == PersistPurpose::MutationResult
+        ));
+        assert_eq!(
+            actor
+                .state()
+                .journal()
+                .state
+                .apply_transaction
+                .as_ref()
+                .map_or(0, |tx| tx.results.len()),
+            1
+        );
+
+        assert!(actor.record_genuine_dependency_change(&genuine_change(&actor)));
+        let fresh_barrier = actor.barrier();
+        actor
+            .acknowledge(persisted_event(&result_persist, "state-rv-after-result"))
+            .expect("result persistence acknowledgement remains durable authority");
+        assert!(
+            actor
+                .next_command()
+                .expect("result acknowledgement supersedes stale revalidation")
+                .is_none()
+        );
+        assert_eq!(actor.state().phase(), PhaseV0::InformersPending);
+        assert_eq!(
+            actor
+                .state()
+                .journal()
+                .state
+                .apply_transaction
+                .as_ref()
+                .map_or(0, |tx| tx.results.len()),
+            1
+        );
+
+        actor.informers_ready(fresh_barrier);
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("fresh result-barrier readiness reduces")
+            .expect("fresh result-barrier requests render")
+        else {
+            panic!("fresh result barrier did not request render");
+        };
+        actor
+            .issue_render_capability(
+                trusted_render_input(&actor, &preconditions.observation_token),
+                1,
+            )
+            .expect("fresh result barrier reaches the driver capability");
+        let input = serde_json::to_string(&trusted_render_input(
+            &actor,
+            &preconditions.observation_token,
+        ))
+        .expect("fresh result input serializes");
+        let frozen = FrozenInputV0 {
+            root_generation: actor.state().root().generation,
+            state_resource_version: actor.state().root().state_resource_version.clone(),
+            observation_token: preconditions.observation_token.clone(),
+            cache_epoch: preconditions.cache_epoch.clone(),
+            final_observation_fence_token: "f".repeat(64),
+            render_input_hash: parse_validate_render_input(&input)
+                .expect("fresh result input validates")
+                .sha256,
+        };
+        let output = serde_json::to_string(&RenderOutputV0 {
+            abi_version: ABI_VERSION_V0.into(),
+            disposition: RenderDisposition::Apply,
+            resources: vec![ResourceDeclaration {
+                logical_id: "managed".into(),
+                object: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "managed", "namespace": "ns"},
+                    "data": {"value": "one"}
+                }),
+                readiness: None,
+            }],
+            dependencies: vec![],
+            automations: vec![],
+            diagnostics: vec![],
+        })
+        .expect("same desired output serializes");
+        let accepted_inventory = actor.state().journal().state.inventory.clone();
+        let transaction = actor
+            .state()
+            .journal()
+            .state
+            .apply_transaction
+            .as_ref()
+            .expect("accepted result remains durable until fresh revalidation");
+        let observed = accepted_inventory
+            .iter()
+            .map(|entry| DesiredObservationV0 {
+                identity: entry.identity.clone(),
+                observation: Observation::Existing {
+                    identity: oxideloop_mutation_model::ObjectIdentity {
+                        uid: entry.uid.clone(),
+                        resource_version: entry.resource_version.clone(),
+                    },
+                },
+                qualification: BackendQualification::NativeStructuralCrd {
+                    kubernetes_minor: "1.36".into(),
+                    gvr: "configmaps".into(),
+                    compatibility_manifest: "validated-native-structural-manifest".into(),
+                },
+                recovery_proof: Some(RecoveryProofV0 {
+                    root_uid: actor.state().root().uid.clone(),
+                    transaction_id: transaction.id.clone(),
+                    command_id: transaction
+                        .results
+                        .iter()
+                        .find(|result| result.identity == entry.identity)
+                        .expect("accepted inventory has its exact result")
+                        .command_id
+                        .clone(),
+                    uid: entry.uid.clone(),
+                    resource_version: entry.resource_version.clone(),
+                }),
+                deletion_recovery_proof: None,
+            })
+            .collect();
+        actor
+            .accept_acknowledgement(EventV0::Revalidated {
+                frozen,
+                render_input_json: input,
+                render_output_json: output,
+                observed,
+            })
+            .expect("fresh complete lifecycle revalidation is accepted");
+        let completion = actor
+            .next_command()
+            .expect("complete lifecycle reduction")
+            .expect("all-recorded transaction completes");
+        assert!(matches!(
+            completion,
+            CommandV0::Persist { ref operation, .. }
+                if operation.purpose == PersistPurpose::Completion
+        ));
+        assert!(actor.state().journal().state.apply_transaction.is_none());
+        assert_eq!(actor.state().journal().state.inventory, accepted_inventory);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn all_recorded_same_plan_absence_or_foreign_uid_invalidates_without_replay() {
+        let (machine, mutation_ack) = mutation_pending();
+        let accepted = reduce(machine, mutation_ack).expect("mutation result reduces");
+        let CommandV0::Persist { operation, .. } = &accepted.commands[0] else {
+            panic!("accepted mutation result must persist");
+        };
+        let persisted = reduce(
+            accepted.state,
+            EventV0::Persisted {
+                token: operation.token.clone(),
+                old_state_resource_version: operation.old_state_resource_version.clone(),
+                new_state_resource_version: "state-rv-after-result".into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .expect("result persistence acknowledgement reduces");
+        let accepted_inventory = persisted.state.journal().state.inventory.clone();
+        let root = persisted.state.root().clone();
+        let superseded = reduce(
+            persisted.state,
+            EventV0::ObservationSuperseded {
+                preconditions: PreconditionsV0 {
+                    root_uid: root.uid.clone(),
+                    root_generation: root.generation,
+                    root_resource_version: root.root_resource_version.clone(),
+                    state_uid: root.state_uid.clone(),
+                    state_resource_version: root.state_resource_version.clone(),
+                    observation_token: "fresh-observation".into(),
+                    cache_epoch: "1".into(),
+                },
+            },
+        )
+        .expect("authenticated observation supersession reduces")
+        .state;
+        let superseded = reduce(superseded, EventV0::InformersReady)
+            .expect("fresh informer barrier enters revalidation")
+            .state;
+        let input_document = RenderInputV0 {
+            abi_version: ABI_VERSION_V0.into(),
+            root: RootProjection {
+                api_version: "demo.oxideloop.dev/v1alpha1".into(),
+                kind: "WebApplication".into(),
+                uid: root.uid.clone(),
+                namespace: root.namespace.clone(),
+                name: root.name.clone(),
+                generation: u64::try_from(root.generation).expect("nonnegative generation"),
+                spec: serde_json::to_value(&root.spec).expect("root spec serializes"),
+            },
+            bundle_digest: root.bundle_digest.clone(),
+            cache_epoch: "1".into(),
+            observation_token: "fresh-observation".into(),
+            observations: vec![],
+        };
+        let input = serde_json::to_string(&input_document).expect("fresh input serializes");
+        let frozen = FrozenInputV0 {
+            root_generation: root.generation,
+            state_resource_version: root.state_resource_version.clone(),
+            observation_token: input_document.observation_token.clone(),
+            cache_epoch: input_document.cache_epoch.clone(),
+            final_observation_fence_token: "f".repeat(64),
+            render_input_hash: parse_validate_render_input(&input)
+                .expect("fresh input validates")
+                .sha256,
+        };
+        let output = serde_json::to_string(&RenderOutputV0 {
+            abi_version: ABI_VERSION_V0.into(),
+            disposition: RenderDisposition::Apply,
+            resources: vec![ResourceDeclaration {
+                logical_id: "managed".into(),
+                object: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "managed", "namespace": "ns"},
+                    "data": {"value": "one"}
+                }),
+                readiness: None,
+            }],
+            dependencies: vec![],
+            automations: vec![],
+            diagnostics: vec![],
+        })
+        .expect("same desired output serializes");
+        let absent = accepted_inventory
+            .iter()
+            .map(|entry| DesiredObservationV0 {
+                identity: entry.identity.clone(),
+                observation: Observation::Absent,
+                qualification: BackendQualification::BuiltInTested {
+                    kubernetes_minor: "1.36".into(),
+                    gvr: "configmaps".into(),
+                },
+                recovery_proof: None,
+                deletion_recovery_proof: None,
+            })
+            .collect::<Vec<_>>();
+        let foreign = accepted_inventory
+            .iter()
+            .map(|entry| DesiredObservationV0 {
+                identity: entry.identity.clone(),
+                observation: Observation::Existing {
+                    identity: oxideloop_mutation_model::ObjectIdentity {
+                        uid: "foreign-uid".into(),
+                        resource_version: "foreign-rv".into(),
+                    },
+                },
+                qualification: BackendQualification::BuiltInTested {
+                    kubernetes_minor: "1.36".into(),
+                    gvr: "configmaps".into(),
+                },
+                recovery_proof: None,
+                deletion_recovery_proof: None,
+            })
+            .collect::<Vec<_>>();
+        let invalidate = |observed| {
+            reduce(
+                superseded.clone(),
+                EventV0::Revalidated {
+                    frozen: frozen.clone(),
+                    render_input_json: input.clone(),
+                    render_output_json: output.clone(),
+                    observed,
+                },
+            )
+            .expect("all-recorded unproven result revalidation reduces")
+        };
+        let absent_invalidated = invalidate(absent.clone());
+        let foreign_invalidated = invalidate(foreign);
+        for (case, invalidated) in [
+            ("absent", &absent_invalidated),
+            ("foreign replacement", &foreign_invalidated),
+        ] {
+            assert!(
+                matches!(
+                    invalidated.commands.as_slice(),
+                    [CommandV0::Persist { operation, .. }]
+                        if operation.purpose == PersistPurpose::Invalidate
+                ),
+                "expected {case} to invalidate without a mutation, got {:?}",
+                invalidated.commands
+            );
+            assert!(
+                invalidated
+                    .state
+                    .journal()
+                    .state
+                    .apply_transaction
+                    .is_none()
+            );
+            assert_eq!(
+                invalidated.state.journal().state.inventory,
+                accepted_inventory
+            );
+        }
+
+        // A durable invalidation keeps the accepted old inventory only until
+        // a fresh descriptor/informer/render replan. Fresh absence then
+        // prepares a true POST with no stale UID/RV target, so its new result
+        // can replace that inventory row rather than writing and holding.
+        let CommandV0::Persist { operation, .. } = &absent_invalidated.commands[0] else {
+            panic!("absence invalidation did not persist");
+        };
+        let descriptor = reduce(
+            absent_invalidated.state,
+            EventV0::Persisted {
+                token: operation.token.clone(),
+                old_state_resource_version: operation.old_state_resource_version.clone(),
+                new_state_resource_version: "state-rv-after-invalidate".into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .expect("invalidation acknowledgement requests a fresh descriptor");
+        let CommandV0::RequestDescriptor { token, .. } = &descriptor.commands[0] else {
+            panic!("invalidation acknowledgement did not request descriptor");
+        };
+        let ready = reduce(
+            descriptor.state,
+            EventV0::DescriptorReady {
+                token: token.clone(),
+                bundle_digest: "a".repeat(64),
+            },
+        )
+        .expect("fresh descriptor is accepted");
+        let render = reduce(ready.state, EventV0::InformersReady)
+            .expect("fresh informer admission reaches render");
+        let replan_root = render.state.root().clone();
+        let replan_input_document = RenderInputV0 {
+            abi_version: ABI_VERSION_V0.into(),
+            root: RootProjection {
+                api_version: "demo.oxideloop.dev/v1alpha1".into(),
+                kind: "WebApplication".into(),
+                uid: replan_root.uid.clone(),
+                namespace: replan_root.namespace.clone(),
+                name: replan_root.name.clone(),
+                generation: u64::try_from(replan_root.generation).expect("nonnegative generation"),
+                spec: serde_json::to_value(&replan_root.spec).expect("root spec serializes"),
+            },
+            bundle_digest: replan_root.bundle_digest.clone(),
+            cache_epoch: "2".into(),
+            observation_token: "post-invalidate-observation".into(),
+            observations: vec![],
+        };
+        let replan_input =
+            serde_json::to_string(&replan_input_document).expect("replan input serializes");
+        let replan_frozen = FrozenInputV0 {
+            root_generation: replan_root.generation,
+            state_resource_version: replan_root.state_resource_version.clone(),
+            observation_token: replan_input_document.observation_token.clone(),
+            cache_epoch: replan_input_document.cache_epoch.clone(),
+            final_observation_fence_token: "e".repeat(64),
+            render_input_hash: parse_validate_render_input(&replan_input)
+                .expect("replan input validates")
+                .sha256,
+        };
+        let replan_status = reduce(
+            render.state,
+            EventV0::Rendered {
+                frozen: replan_frozen.clone(),
+                render_input_json: replan_input.clone(),
+                render_output_json: output.clone(),
+                observed: absent.clone(),
+            },
+        )
+        .expect("fresh absence replans");
+        let CommandV0::PersistRootStatus {
+            token,
+            old_root_resource_version,
+            ..
+        } = &replan_status.commands[0]
+        else {
+            panic!("fresh replan did not first persist its status");
+        };
+        let replan_render = reduce(
+            replan_status.state,
+            EventV0::RootStatusPersisted {
+                token: token.clone(),
+                old_root_resource_version: old_root_resource_version.clone(),
+                new_root_resource_version: "root-rv-after-invalidate-replan".into(),
+                root_uid: "root-uid".into(),
+            },
+        )
+        .expect("replan status persistence is acknowledged");
+        let replan_prepared = reduce(
+            replan_render.state,
+            EventV0::Rendered {
+                frozen: replan_frozen.clone(),
+                render_input_json: replan_input.clone(),
+                render_output_json: output.clone(),
+                observed: absent.clone(),
+            },
+        )
+        .expect("status-pinned replan prepares its POST");
+        let CommandV0::Persist { operation, .. } = &replan_prepared.commands[0] else {
+            panic!(
+                "replan did not durably prepare its POST: {:?}",
+                replan_prepared.commands
+            );
+        };
+        assert_eq!(operation.purpose, PersistPurpose::Prepare);
+        let revalidated = reduce(
+            replan_prepared.state,
+            EventV0::Persisted {
+                token: operation.token.clone(),
+                old_state_resource_version: operation.old_state_resource_version.clone(),
+                new_state_resource_version: "state-rv-after-replan-prepare".into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .expect("replan prepare is acknowledged");
+        let mut revalidated_frozen = replan_frozen;
+        revalidated_frozen.state_resource_version = "state-rv-after-replan-prepare".into();
+        let authorization = reduce(
+            revalidated.state,
+            EventV0::Revalidated {
+                frozen: revalidated_frozen,
+                render_input_json: replan_input,
+                render_output_json: output,
+                observed: absent,
+            },
+        )
+        .expect("fresh POST revalidation is accepted");
+        let issued =
+            acknowledge_dispatch_authorization(authorization, "state-rv-after-replan-auth");
+        let CommandV0::Mutate {
+            transaction_id,
+            attempt_token,
+            commands,
+        } = &issued.commands[0]
+        else {
+            panic!("fresh absence did not reach its authorized POST");
+        };
+        assert!(commands[0].prepared_expected_target.is_none());
+        let accepted = reduce(
+            issued.state,
+            EventV0::MutationAcknowledged {
+                transaction_id: transaction_id.clone(),
+                attempt_token: attempt_token.clone(),
+                results: vec![ApplyResult {
+                    command_id: commands[0].command_id.clone(),
+                    attempt_token: attempt_token.clone(),
+                    identity: commands[0].identity.clone(),
+                    outcome: ApplyOutcome::Applied,
+                    uid: Some("managed-uid-recreated".into()),
+                    resource_version: Some("managed-rv-recreated".into()),
+                }],
+            },
+        )
+        .expect("new POST result is accepted");
+        assert!(
+            accepted
+                .state
+                .journal()
+                .state
+                .inventory
+                .iter()
+                .any(|entry| {
+                    entry.uid == "managed-uid-recreated"
+                        && entry.resource_version == "managed-rv-recreated"
+                })
+        );
+    }
+
+    #[test]
+    fn watch_invalidation_during_prepare_persist_never_issues_the_old_revalidation() {
+        let (mut actor, prepare) = actor_with_prepared_apply_persist();
+        let sealed_token = actor
+            .active_render_input
+            .as_ref()
+            .expect("prepared persistence retains the sealed render input")
+            .1
+            .observation_token
+            .clone();
+        actor.watch_invalidated();
+        let fresh_barrier = actor.barrier();
+
+        actor
+            .acknowledge(persisted_event(&prepare, "state-rv-after-watch-restart"))
+            .expect("prepare acknowledgement remains durable authority");
+        assert!(
+            actor
+                .next_command()
+                .expect("watch restart supersedes after acknowledgement")
+                .is_none()
+        );
+        assert_eq!(actor.state().phase(), PhaseV0::InformersPending);
+        actor.informers_ready(fresh_barrier);
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("fresh cache barrier reduces")
+            .expect("fresh cache barrier requests render")
+        else {
+            panic!("fresh cache barrier did not request render");
+        };
+        assert_ne!(preconditions.observation_token, sealed_token);
+        assert_eq!(
+            preconditions.cache_epoch,
+            fresh_barrier.cache_epoch.to_string()
+        );
+    }
+
+    #[test]
+    fn root_refresh_during_prepare_persist_replaces_the_post_ack_render() {
+        let (mut actor, prepare) = actor_with_prepared_apply_persist();
+        let refreshed = advanced_root(
+            actor.state(),
+            actor.state().root().generation + 1,
+            "prepare-persist-root-refresh",
+        );
+        assert!(actor.root_observed(refreshed.clone()));
+
+        actor
+            .acknowledge(persisted_event(&prepare, "state-rv-after-root-refresh"))
+            .expect("prepare acknowledgement remains durable authority");
+        let command = actor
+            .next_command()
+            .expect("root refresh reduces after acknowledged persistence")
+            .expect("root refresh has its own durable continuation");
+        assert!(matches!(
+            command,
+            CommandV0::Persist { ref operation, ref preconditions, .. }
+                if operation.purpose == PersistPurpose::Invalidate
+                    && preconditions.root_generation == refreshed.generation
+                    && preconditions.root_resource_version == refreshed.root_resource_version
+        ));
+        assert!(
+            !matches!(command, CommandV0::RequestRender { .. }),
+            "a root refresh must not issue the old post-persist revalidation"
+        );
     }
 
     struct StaleClosureDispatcher {
