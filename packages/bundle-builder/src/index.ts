@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
 import { access, lstat, mkdtemp, open, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { transform } from "oxc-transform";
 import { rolldown } from "rolldown";
+import { parseAst } from "rolldown/parseAst";
 
 import { encodeBundleArchive } from "./archive.js";
 
@@ -89,12 +90,12 @@ export async function buildBundle(options: BundleOptions): Promise<BuiltBundle> 
 }
 
 async function validateAuthoredSources(rootDir: string): Promise<void> {
-  const realRoot = await realpath(rootDir);
+  const realRoot = await canonicalPath(rootDir);
+  const lexicalRoot = resolve(rootDir);
   for (const entry of [join(rootDir, "action.ts"), join(rootDir, "render.tsx")]) {
-    const info = await lstat(entry);
-    if (info.isSymbolicLink()) throw new Error(`authored entrypoint is a symlink: ${entry}`);
-    const resolved = await realpath(entry);
-    if (!resolved.startsWith(`${realRoot}/`)) throw new Error("authored entrypoint escapes rootDir");
+    await assertNoSymlinkBelow(lexicalRoot, resolve(entry));
+    const resolved = await canonicalPath(entry);
+    if (!isContainedPath(realRoot, resolved) || resolved === realRoot) throw new Error("authored entrypoint escapes rootDir");
   }
 }
 
@@ -116,33 +117,83 @@ async function bundle(
   const workingDir = dirname(output);
   const intermediate = join(workingDir, `${basename(input)}.compiled.mjs`);
   await writeFile(intermediate, transformed.code, "utf8");
+  const transformedSources = new Map<string, string>();
   const aliases = {
     "@oxideloop/sdk": join(workspaceRoot, "packages/sdk/src/index.ts"),
     "@oxideloop/sdk/hooks": join(workspaceRoot, "packages/sdk/src/hooks.ts"),
     "@oxideloop/react-like-runtime": join(workspaceRoot, "packages/react-like-runtime/src/index.ts"),
     "@oxideloop/react-like-runtime/jsx-runtime": join(workspaceRoot, "packages/react-like-runtime/src/jsx-runtime.ts"),
   } as const;
+  const canonicalAliases = await canonicalizeAliases(aliases);
+  const runtimeRoots = await Promise.all([
+    canonicalPath(join(workspaceRoot, "packages/sdk/src")),
+    canonicalPath(join(workspaceRoot, "packages/react-like-runtime/src")),
+  ]);
   const build = await rolldown({
     input: intermediate,
     define: { "process.env.NODE_ENV": JSON.stringify("production"), ...define },
     plugins: [{
       name: "oxideloop-workspace-aliases",
       async resolveId(source: string, importer?: string) {
-        const alias = aliases[source as keyof typeof aliases];
-        if (alias) return alias;
-        if (!importer) return null;
-        const resolvedImporter = resolve(importer);
-        const isAuthoredEntrypoint = resolvedImporter === resolve(intermediate);
-        const isAuthoredModule = resolvedImporter.startsWith(`${resolve(authoredRoot)}/`);
-        if ((isAuthoredEntrypoint || isAuthoredModule) &&
-            !source.startsWith(".") && !source.startsWith("/")) {
-          throw new Error(`unapproved bare import from authored module: ${source}`);
+        // Rolldown may hand plugins virtual ids. Always establish the importer
+        // identity before considering an alias, so a foreign module can never
+        // borrow the authored graph's trust.
+        if (!importer) {
+          // The sole importer-less resolution is Rolldown's declared staged
+          // entrypoint. Every other graph edge must carry a classified parent.
+          if (await sameCanonicalPath(source, intermediate)) return intermediate;
+          throw new Error(`unapproved import without importer: ${source}`);
         }
-        if (isAuthoredEntrypoint) {
-          return resolveAuthoredModule(authoredRoot, dirname(input), source);
+        const state = await classifyImporter(importer, authoredRoot, intermediate, runtimeRoots);
+        const alias = canonicalAliases[source as keyof typeof canonicalAliases];
+        if (alias) {
+          if (state === "unknown") throw new Error(`unapproved alias import from unknown importer: ${source}`);
+          return alias;
         }
-        if (!isAuthoredModule) return null;
-        return resolveAuthoredModule(authoredRoot, dirname(resolvedImporter), source);
+        if (source.startsWith("/") || isAbsolute(source)) {
+          throw new Error(`absolute imports are not allowed: ${source}`);
+        }
+        if (!source.startsWith(".")) {
+          throw new Error(`unapproved bare import from ${state} module: ${source}`);
+        }
+        if (state === "unknown") throw new Error(`unapproved relative import from unknown importer: ${source}`);
+        if (state === "entrypoint") return resolveAuthoredModule(authoredRoot, dirname(input), source);
+        if (state === "authored") return resolveAuthoredModule(authoredRoot, dirname(await canonicalPath(importer)), source);
+        return resolveTrustedRuntimeModule(runtimeRoots, dirname(await canonicalPath(importer)), source);
+      },
+      async load(id: string) {
+        const root = await canonicalPath(authoredRoot);
+        let canonical: string;
+        try { canonical = await canonicalPath(id); } catch { return null; }
+        const runtime = runtimeRoots.some((runtimeRoot) => isContainedPath(runtimeRoot, canonical));
+        if ((!isContainedPath(root, canonical) && !runtime) || !/\.(?:ts|tsx)$/.test(canonical)) return null;
+        const cached = transformedSources.get(canonical);
+        if (cached !== undefined) return cached;
+        const source = await readFile(canonical, "utf8");
+        const compiled = transform(canonical, source, {
+          lang: canonical.endsWith(".tsx") ? "tsx" : "ts",
+          jsx: { runtime: "automatic", importSource: "@oxideloop/react-like-runtime" },
+        }).code;
+        transformedSources.set(canonical, compiled);
+        return compiled;
+      },
+      transform(code: string) {
+        // Rolldown's resolveDynamicImport hook is not invoked for every
+        // expression-valued import in this pinned release. Parse each module
+        // with Rolldown's pinned Oxc parser so literal and nonliteral AST
+        // ImportExpression nodes fail before code generation. This deliberately
+        // does not confuse strings, comments, templates, or regular expressions
+        // containing the text `import(` with executable syntax.
+        if (containsImportExpression(parseAst(code, { lang: "js", sourceType: "module" }))) {
+          throw new Error("dynamic imports are not allowed in bundle modules");
+        }
+        return null;
+      },
+      async resolveDynamicImport(_specifier: string, importer?: string) {
+        // A dynamic import is never part of this static, single-file ABI.
+        // This applies to literal and expression specifiers alike.
+        if (importer) throw new Error("dynamic imports are not allowed in bundle modules");
+        throw new Error("dynamic imports are not allowed without an importer");
       },
     }],
   });
@@ -161,63 +212,95 @@ async function bundle(
   }
 }
 
+function containsImportExpression(node: unknown, seen = new WeakSet<object>()): boolean {
+  if (node === null || typeof node !== "object") return false;
+  if (seen.has(node)) return false;
+  seen.add(node);
+  if ((node as { type?: unknown }).type === "ImportExpression") return true;
+  if (Array.isArray(node)) return node.some((value) => containsImportExpression(value, seen));
+  return Object.values(node).some((value) => containsImportExpression(value, seen));
+}
+
+async function canonicalizeAliases<T extends Record<string, string>>(aliases: T): Promise<{ readonly [K in keyof T]: string }> {
+  const entries = await Promise.all(Object.entries(aliases).map(async ([name, path]) => [name, await canonicalPath(path)] as const));
+  return Object.fromEntries(entries) as { readonly [K in keyof T]: string };
+}
+
 async function resolveAuthoredModule(root: string, from: string, source: string): Promise<string> {
-  const realRoot = await realpath(root);
+  return resolveStaticTypeScriptModule(root, from, source, "authored");
+}
+
+async function resolveTrustedRuntimeModule(roots: readonly string[], from: string, source: string): Promise<string> {
+  const owner = roots.find((root) => isContainedPath(root, from));
+  if (!owner) throw new Error(`trusted runtime importer escapes fixed roots: ${from}`);
+  return resolveStaticTypeScriptModule(owner, from, source, "trusted runtime");
+}
+
+async function resolveStaticTypeScriptModule(root: string, from: string, source: string, label: string): Promise<string> {
+  const realRoot = await canonicalPath(root);
+  const lexicalRoot = resolve(root);
+  if (source.startsWith("/") || !source.startsWith(".")) throw new Error(`unapproved authored import: ${source}`);
+  if (/\.(?:mjs|cjs|jsx|json|css|tsbuildinfo)$/.test(source)) {
+    throw new Error(`unsupported authored import: ${source}`);
+  }
   const raw = resolve(from, source);
-  for (const candidate of [raw, raw.replace(/\.js$/, ".ts"), raw.replace(/\.js$/, ".tsx"), `${raw}.ts`, `${raw}.tsx`, join(raw, "index.ts"), join(raw, "index.tsx")]) {
+  const candidates = /\.js$/.test(raw)
+    ? [raw.slice(0, -3) + ".ts", raw.slice(0, -3) + ".tsx"]
+    : /\.[^/]+$/.test(raw)
+      ? [raw]
+      : [raw + ".ts", raw + ".tsx", join(raw, "index.ts"), join(raw, "index.tsx")];
+  for (const candidate of candidates) {
     try {
-      await assertNoSymlinkBelow(realRoot, candidate);
-      const resolved = await realpath(candidate);
-      if (!resolved.startsWith(`${realRoot}/`) || !/\.(?:ts|tsx|js|mjs)$/.test(resolved)) throw new Error(`authored import escapes rootDir: ${source}`);
+      await assertNoSymlinkBelow(lexicalRoot, candidate);
+      const resolved = await canonicalPath(candidate);
+      if (!isContainedPath(realRoot, resolved) || !/\.(?:ts|tsx)$/.test(resolved)) throw new Error(`${label} import escapes fixed root: ${source}`);
       return resolved;
     } catch (error) {
-      if (error instanceof Error && error.message.includes("escapes rootDir")) throw error;
+      if (error instanceof Error && (error.message.includes("escapes rootDir") || error.message.includes("escapes fixed root"))) throw error;
     }
   }
   throw new Error(`cannot resolve authored import ${source}`);
 }
 
 async function assertNoSymlinkBelow(root: string, target: string): Promise<void> {
-  const relativePath = relative(root, target);
-  if (relativePath.startsWith("..") || relativePath === "") throw new Error("authored import escapes rootDir");
+  const relativePath = relative(root, resolve(target));
+  if (!isContainedPath(root, resolve(target)) || relativePath === "") throw new Error("authored import escapes rootDir");
   let cursor = root;
-  for (const component of relativePath.split("/")) {
+  for (const component of relativePath.split(/[/\\]/)) {
     cursor = join(cursor, component);
-    try { if ((await lstat(cursor)).isSymbolicLink()) throw new Error("authored import escapes rootDir"); } catch (error) {
-      if (error instanceof Error && error.message.includes("escapes rootDir")) throw error;
-      break;
-    }
+    try { if ((await lstat(cursor)).isSymbolicLink()) throw new Error("authored import escapes rootDir"); }
+    catch (error) { if (error instanceof Error && error.message.includes("escapes rootDir")) throw error; return; }
   }
 }
 
-async function rewriteRelativeImports(code: string, sourcePath: string): Promise<string> {
-  const sourceDirectory = dirname(sourcePath);
-  const pattern = /((?:from\s*|import\s*\()(["']))(\.{1,2}\/[\s\S]*?)(\2)/g;
-  const matches = [...code.matchAll(pattern)];
-  let rewritten = code;
-  for (const match of matches) {
-    const specifier = match[3] ?? "";
-    const absolute = await resolveSourceImport(sourceDirectory, specifier);
-    rewritten = rewritten.replace(match[0], `${match[1]}${absolute}${match[4]}`);
-  }
-  return rewritten;
+async function canonicalPath(path: string): Promise<string> {
+  return realpath(resolve(path));
 }
 
-async function resolveSourceImport(sourceDirectory: string, specifier: string): Promise<string> {
-  const candidate = resolve(sourceDirectory, specifier);
-  for (const path of [candidate, candidate.replace(/\.js$/, ".ts"), candidate.replace(/\.js$/, ".tsx")]) {
-    try {
-      await access(path);
-      if ((await lstat(path)).isSymbolicLink()) throw new Error(`authored import is a symlink: ${specifier}`);
-      if (path !== sourceDirectory && !path.startsWith(`${sourceDirectory}/`)) {
-        throw new Error(`authored import escapes rootDir: ${specifier}`);
-      }
-      return path;
-    } catch (error) {
-      if (error instanceof Error && error.message.includes("escapes rootDir")) throw error;
-    }
-  }
-  throw new Error(`cannot resolve authored relative import ${specifier}`);
+async function sameCanonicalPath(left: string, right: string): Promise<boolean> {
+  try { return (await canonicalPath(left)) === (await canonicalPath(right)); }
+  catch { return false; }
+}
+
+function isContainedPath(root: string, target: string): boolean {
+  const rootResolved = resolve(root);
+  const targetResolved = resolve(target);
+  if (isAbsolute(relative(rootResolved, targetResolved)) || isAbsolute(relative(targetResolved, rootResolved))) return false;
+  const rel = relative(rootResolved, targetResolved);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !rel.startsWith("../") && !rel.startsWith("..\\"));
+}
+
+type ImporterState = "entrypoint" | "authored" | "runtime" | "unknown";
+
+async function classifyImporter(importer: string, root: string, intermediate: string, runtimeRoots: readonly string[]): Promise<ImporterState> {
+  let canonical: string;
+  try { canonical = await canonicalPath(importer); } catch { return "unknown"; }
+  const realRoot = await canonicalPath(root);
+  const realIntermediate = await canonicalPath(intermediate);
+  if (canonical === realIntermediate) return "entrypoint";
+  if (isContainedPath(realRoot, canonical) && /\.(?:ts|tsx)$/.test(canonical)) return "authored";
+  if (runtimeRoots.some((runtimeRoot) => isContainedPath(runtimeRoot, canonical)) && /\.(?:ts|tsx)$/.test(canonical)) return "runtime";
+  return "unknown";
 }
 
 async function readOwnedStagingFile(path: string): Promise<Buffer> {
