@@ -1,11 +1,11 @@
 use std::fs;
 
 use oxideloop_bundle_contract::{
-    BUNDLE_MANIFEST_VERSION_V0, BundleError, BundleIntegrityManifestV0, BundleStore,
-    ExecutionPhaseV0, FileIntegrityV0, MAX_FILE_BYTES, MAX_MANIFEST_BYTES, ModuleIntegrityV0,
-    PhaseModuleV0, ToolIdentityV0, parse_validate_manifest,
+    BUNDLE_MANIFEST_VERSION_V0, BundleError, BundleInstallRecordV0, BundleIntegrityManifestV0,
+    BundleStore, ExecutionPhaseV0, FileIntegrityV0, MAX_FILE_BYTES, MAX_MANIFEST_BYTES,
+    ModuleIntegrityV0, PhaseModuleV0, ToolIdentityV0, parse_validate_manifest,
 };
-use oxideloop_renderer_abi::sha256_hex;
+use oxideloop_renderer_abi::{canonical_bytes, sha256_hex};
 use tempfile::TempDir;
 
 fn digest(bytes: &[u8]) -> String {
@@ -65,6 +65,24 @@ fn write_bundle(directory: &TempDir, manifest: &BundleIntegrityManifestV0) {
         fs::write(directory.path().join(path), contents).unwrap();
     }
     assert_eq!(manifest.render_modules[0].file.path, "render.js");
+}
+
+fn bundle_bytes() -> Vec<(&'static str, &'static [u8])> {
+    vec![
+        ("descriptor.json", b"descriptor"),
+        ("render.js", b"render"),
+        ("action.js", b"action"),
+        ("render.js.map", b"map"),
+    ]
+}
+
+fn store_entries(path: &std::path::Path) -> Vec<String> {
+    let mut entries = fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
 }
 fn validated(
     manifest: &BundleIntegrityManifestV0,
@@ -143,6 +161,213 @@ fn install_uses_canonical_digest_and_verified_handles() {
             .open_phase_module(ExecutionPhaseV0::Render, "render.main")
             .unwrap_err(),
         BundleError::DigestMismatch
+    );
+}
+
+#[test]
+fn direct_byte_install_opens_and_reuses_the_identical_bundle() {
+    let storage = TempDir::new().unwrap();
+    let validated = validated(&manifest());
+    let store = BundleStore::new(storage.path()).unwrap();
+
+    let installed = store.install_bytes(&validated, bundle_bytes()).unwrap();
+    assert_eq!(installed.digest(), validated.bundle_digest());
+    assert_eq!(
+        installed
+            .open_phase_module(ExecutionPhaseV0::Render, "render.main")
+            .unwrap()
+            .bytes(),
+        b"render"
+    );
+    assert_eq!(
+        store
+            .install_bytes(&validated, bundle_bytes())
+            .unwrap()
+            .digest(),
+        validated.bundle_digest()
+    );
+    assert_eq!(
+        store_entries(storage.path()),
+        vec![validated.bundle_digest()]
+    );
+}
+
+#[test]
+fn direct_byte_install_creates_nested_declared_paths_without_ambient_staging() {
+    let storage = TempDir::new().unwrap();
+    let mut input = manifest();
+    input.descriptor.path = "metadata/descriptor.json".into();
+    input.render_modules[0].file.path = "modules/render.js".into();
+    input.action_modules[0].file.path = "modules/action.js".into();
+    input.source_maps[0].path = "maps/render.js.map".into();
+    let validated = validated(&input);
+    let store = BundleStore::new(storage.path()).unwrap();
+
+    let installed = store
+        .install_bytes(
+            &validated,
+            [
+                ("metadata/descriptor.json", b"descriptor".as_slice()),
+                ("modules/render.js", b"render".as_slice()),
+                ("modules/action.js", b"action".as_slice()),
+                ("maps/render.js.map", b"map".as_slice()),
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        installed
+            .open_declared("metadata/descriptor.json")
+            .unwrap()
+            .bytes(),
+        b"descriptor"
+    );
+    assert_eq!(
+        installed
+            .open_phase_module(ExecutionPhaseV0::Action, "action.smoke")
+            .unwrap()
+            .bytes(),
+        b"action"
+    );
+}
+
+#[test]
+fn direct_byte_install_rejects_nonexact_or_unverified_sets_without_residue() {
+    let storage = TempDir::new().unwrap();
+    let validated = validated(&manifest());
+    let store = BundleStore::new(storage.path()).unwrap();
+    let missing = vec![
+        ("descriptor.json", b"descriptor".as_slice()),
+        ("render.js", b"render".as_slice()),
+        ("action.js", b"action".as_slice()),
+    ];
+    let extra = vec![
+        ("descriptor.json", b"descriptor".as_slice()),
+        ("render.js", b"render".as_slice()),
+        ("action.js", b"action".as_slice()),
+        ("render.js.map", b"map".as_slice()),
+        ("extra.js", b"extra".as_slice()),
+    ];
+    let duplicate = vec![
+        ("descriptor.json", b"descriptor".as_slice()),
+        ("descriptor.json", b"descriptor".as_slice()),
+    ];
+    let confused_path = vec![
+        ("nested/../descriptor.json", b"descriptor".as_slice()),
+        ("render.js", b"render".as_slice()),
+        ("action.js", b"action".as_slice()),
+        ("render.js.map", b"map".as_slice()),
+    ];
+    let wrong_length = vec![
+        ("descriptor.json", b"short".as_slice()),
+        ("render.js", b"render".as_slice()),
+        ("action.js", b"action".as_slice()),
+        ("render.js.map", b"map".as_slice()),
+    ];
+    let wrong_digest = vec![
+        ("descriptor.json", b"XXXXXXXXXX".as_slice()),
+        ("render.js", b"render".as_slice()),
+        ("action.js", b"action".as_slice()),
+        ("render.js.map", b"map".as_slice()),
+    ];
+
+    for (files, expected) in [
+        (missing, BundleError::FileSetMismatch),
+        (extra, BundleError::FileSetMismatch),
+        (duplicate, BundleError::DuplicateDeclaration),
+        (confused_path, BundleError::InvalidPath),
+        (wrong_length, BundleError::LengthMismatch),
+        (wrong_digest, BundleError::DigestMismatch),
+    ] {
+        assert_eq!(
+            store.install_bytes(&validated, files).unwrap_err(),
+            expected
+        );
+        assert!(
+            store_entries(storage.path()).is_empty(),
+            "ordinary validation failures must not publish or retain temporary directories"
+        );
+    }
+}
+
+#[test]
+fn direct_byte_install_bounds_the_input_iterator_before_publishing() {
+    let storage = TempDir::new().unwrap();
+    let mut input = manifest();
+    input.source_maps = (0..61)
+        .map(|index| file(&format!("source-{index}.map"), b""))
+        .collect();
+    let validated = validated(&input);
+    let store = BundleStore::new(storage.path()).unwrap();
+
+    let mut files = vec![
+        ("descriptor.json".to_owned(), b"descriptor".to_vec()),
+        ("render.js".to_owned(), b"render".to_vec()),
+        ("action.js".to_owned(), b"action".to_vec()),
+    ];
+    files.extend((0..61).map(|index| (format!("source-{index}.map"), Vec::new())));
+    files.push(("not-reached.map".to_owned(), Vec::new()));
+
+    assert_eq!(
+        store
+            .install_bytes(
+                &validated,
+                files
+                    .iter()
+                    .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+            )
+            .unwrap_err(),
+        BundleError::Limit
+    );
+    assert!(store_entries(storage.path()).is_empty());
+}
+
+#[test]
+fn direct_byte_install_validates_new_input_before_reusing_an_existing_bundle() {
+    let storage = TempDir::new().unwrap();
+    let validated = validated(&manifest());
+    let store = BundleStore::new(storage.path()).unwrap();
+    store.install_bytes(&validated, bundle_bytes()).unwrap();
+
+    let malformed = vec![
+        ("descriptor.json", b"descriptor".as_slice()),
+        ("render.js", b"render".as_slice()),
+        ("action.js", b"action".as_slice()),
+    ];
+    assert_eq!(
+        store.install_bytes(&validated, malformed).unwrap_err(),
+        BundleError::FileSetMismatch
+    );
+    assert_eq!(
+        store_entries(storage.path()),
+        vec![validated.bundle_digest()]
+    );
+}
+
+#[test]
+fn direct_byte_install_rejects_a_different_existing_record() {
+    let storage = TempDir::new().unwrap();
+    let expected_manifest = manifest();
+    let expected = validated(&expected_manifest);
+    let store = BundleStore::new(storage.path()).unwrap();
+    store.install_bytes(&expected, bundle_bytes()).unwrap();
+
+    let mut different_manifest = expected_manifest;
+    different_manifest.compiler.version = "different".into();
+    let different = validated(&different_manifest);
+    let record = BundleInstallRecordV0 {
+        bundle_digest: different.bundle_digest().to_owned(),
+        manifest: different_manifest,
+    };
+    let record_bytes = canonical_bytes(&serde_json::to_value(record).unwrap()).unwrap();
+    let directory = storage.path().join(expected.bundle_digest());
+    let record_path = directory.join("install-record.json");
+    make_writable(&directory, 0o700);
+    make_writable(&record_path, 0o600);
+    fs::write(record_path, record_bytes).unwrap();
+
+    assert_eq!(
+        store.install_bytes(&expected, bundle_bytes()).unwrap_err(),
+        BundleError::ExistingInstallMismatch
     );
 }
 

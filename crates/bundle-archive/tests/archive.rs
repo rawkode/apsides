@@ -1,4 +1,4 @@
-use std::{fs, sync::Arc, thread};
+use std::{env, fs, path::Path, process::Command, sync::Arc, thread};
 
 use oxideloop_bundle_archive::{ArchiveError, install_archive, parse_validate_archive};
 use oxideloop_bundle_contract::{
@@ -130,6 +130,54 @@ fn validates_and_installs_then_reinstalls_after_store_wipe() {
         install_archive(&store, &bytes, &digest).unwrap().digest(),
         digest
     );
+}
+
+#[test]
+fn archive_install_uses_only_the_store_capability_for_staging() {
+    const CHILD: &str = "OXIDELOOP_ARCHIVE_AMBIENT_TEMP_CHILD";
+    const STORE: &str = "OXIDELOOP_ARCHIVE_AMBIENT_TEMP_STORE";
+    const TEMP_FIXTURE: &str = "OXIDELOOP_ARCHIVE_AMBIENT_TEMP_FIXTURE";
+    const SENTINEL: &str = "direct-bytes-store-only";
+    match env::var(CHILD) {
+        Ok(value) if value == SENTINEL => {
+            let temporary = env::var("TMPDIR").expect("child receives TMPDIR fixture");
+            assert_eq!(
+                temporary,
+                env::var(TEMP_FIXTURE).expect("child receives exact TMPDIR fixture path")
+            );
+            assert!(
+                Path::new(&temporary).is_file(),
+                "TMPDIR fixture must be a regular file so ambient TempDir creation fails even as root"
+            );
+            let (bytes, digest) = archive();
+            let root = env::var(STORE).expect("child receives writable store path");
+            let store = BundleStore::new(root).expect("open child store");
+            assert_eq!(
+                install_archive(&store, &bytes, &digest).unwrap().digest(),
+                digest
+            );
+            return;
+        }
+        Ok(value) => panic!("unexpected archive child sentinel: {value}"),
+        Err(env::VarError::NotPresent) => {}
+        Err(error) => panic!("invalid archive child sentinel: {error}"),
+    }
+
+    let root = TempDir::new().unwrap();
+    let temporary = root.path().join("not-a-directory");
+    fs::write(&temporary, b"ambient temporary directory fixture").unwrap();
+    let status = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "archive_install_uses_only_the_store_capability_for_staging",
+        ])
+        .env(CHILD, SENTINEL)
+        .env(STORE, root.path())
+        .env(TEMP_FIXTURE, &temporary)
+        .env("TMPDIR", &temporary)
+        .status()
+        .expect("start isolated archive-install child");
+    assert!(status.success());
 }
 
 #[test]

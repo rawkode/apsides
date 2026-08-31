@@ -19,17 +19,13 @@
 //! entries. This makes links, devices, FIFOs, and tar-like format confusion
 //! unrepresentable at the wire boundary.
 
-use std::collections::BTreeSet;
-use std::fs::OpenOptions;
-use std::io::Write;
-
 use oxideloop_bundle_contract::{
     BundleError, BundleInstallRecordV0, BundleStore, InstalledBundle, ValidatedManifestV0,
     parse_validate_manifest,
 };
 use oxideloop_renderer_abi::{canonical_bytes, parse_strict_value, sha256_hex};
 use serde_json::Value;
-use tempfile::TempDir;
+use std::collections::BTreeSet;
 use thiserror::Error;
 
 const MAGIC: &[u8; 4] = b"OLBA";
@@ -70,12 +66,6 @@ pub enum ArchiveError {
 
 impl From<BundleError> for ArchiveError {
     fn from(_: BundleError) -> Self {
-        Self::Install
-    }
-}
-
-impl From<std::io::Error> for ArchiveError {
-    fn from(_: std::io::Error) -> Self {
         Self::Install
     }
 }
@@ -286,26 +276,29 @@ fn has_exact_v0_roles(manifest: &oxideloop_bundle_contract::BundleIntegrityManif
             && action.module_identity == "demo.web-application.input-changed")
 }
 
-/// Validate and install an archive through a private temporary capability.
-/// Only manifest-declared runtime artifacts are staged; transport metadata is
-/// never passed to [`BundleStore::install_directory`].
+/// Validate and install an archive directly into the store capability.
+/// Only manifest-declared runtime artifacts are supplied; transport metadata
+/// is never passed to [`BundleStore::install_bytes`].
 ///
 /// # Errors
 ///
-/// Returns [`ArchiveError`] if parsing, validation, temporary staging, or the
-/// underlying atomic `BundleStore` installation fails.
+/// Returns [`ArchiveError`] if parsing, validation, or the underlying atomic
+/// `BundleStore` installation fails.
 pub fn install_archive(
     store: &BundleStore,
     bytes: &[u8],
     expected_digest: &str,
 ) -> Result<InstalledBundle, ArchiveError> {
     let archive = parse_validate_archive(bytes, expected_digest)?;
-    let staging = TempDir::new()?;
-    for path in STAGED_PATHS {
-        write_private_file(staging.path(), path, archive.entry(path)?)?;
-    }
     store
-        .install_directory(staging.path(), archive.manifest())
+        .install_bytes(
+            archive.manifest(),
+            [
+                (STAGED_PATHS[0], archive.entry(STAGED_PATHS[0])?),
+                (STAGED_PATHS[1], archive.entry(STAGED_PATHS[1])?),
+                (STAGED_PATHS[2], archive.entry(STAGED_PATHS[2])?),
+            ],
+        )
         .map_err(ArchiveError::from)
 }
 
@@ -377,18 +370,4 @@ fn parse_canonical_install_record(bytes: &[u8]) -> Result<BundleInstallRecordV0,
     )
     .map_err(|_| ArchiveError::InvalidMetadata)?;
     Ok(record)
-}
-
-fn write_private_file(
-    directory: &std::path::Path,
-    path: &str,
-    bytes: &[u8],
-) -> Result<(), ArchiveError> {
-    let target = directory.join(path);
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    let mut file = options.open(target)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
 }

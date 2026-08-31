@@ -11,7 +11,6 @@ publish = false
 oxideloop-bundle-contract = { path = "../bundle-contract" }
 oxideloop-renderer-abi = { path = "../renderer-abi" }
 serde_json = "1"
-tempfile = "3"
 thiserror = "2"
 
 [dev-dependencies]

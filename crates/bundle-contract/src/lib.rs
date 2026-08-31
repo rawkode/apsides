@@ -3,7 +3,7 @@
 pub mod generate;
 pub mod model;
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path};
@@ -417,8 +417,60 @@ impl BundleStore {
         source: &Path,
         manifest: &ValidatedManifestV0,
     ) -> Result<InstalledBundle, BundleError> {
+        validate_validated_manifest(manifest)?;
         let source = open_ambient_directory(source)?;
         validate_directory_exact(&source, manifest.manifest(), false)?;
+        self.publish_verified(manifest, |temporary| {
+            for file in declared_files(manifest.manifest()) {
+                copy_verified(&source, temporary, file)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Install an exact set of verified in-memory bundle files.
+    ///
+    /// Every supplied path must be a manifest-declared, normalized relative
+    /// path and every declared file must appear exactly once. Lengths and
+    /// SHA-256 values are checked before an existing installation is reused or
+    /// any store directory is created. Publication is capability-relative to
+    /// this store's already-open root and follows the same atomic path as
+    /// [`Self::install_directory`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError`] when the manifest, supplied set, or bytes fail
+    /// validation, or when the atomic installation cannot be completed.
+    pub fn install_bytes<'a, I>(
+        &self,
+        manifest: &ValidatedManifestV0,
+        files: I,
+    ) -> Result<InstalledBundle, BundleError>
+    where
+        I: IntoIterator<Item = (&'a str, &'a [u8])>,
+    {
+        validate_validated_manifest(manifest)?;
+        let files = validate_exact_bytes(manifest.manifest(), files)?;
+        self.publish_verified(manifest, |temporary| {
+            for file in declared_files(manifest.manifest()) {
+                let bytes = files
+                    .get(file.path.as_str())
+                    .copied()
+                    .ok_or(BundleError::FileSetMismatch)?;
+                write_new_file(temporary, &file.path, bytes)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn publish_verified<F>(
+        &self,
+        manifest: &ValidatedManifestV0,
+        populate: F,
+    ) -> Result<InstalledBundle, BundleError>
+    where
+        F: FnOnce(&Dir) -> Result<(), BundleError>,
+    {
         let store = self.root.try_clone()?;
         let record = BundleInstallRecordV0 {
             bundle_digest: manifest.bundle_digest().to_owned(),
@@ -436,9 +488,7 @@ impl BundleStore {
         let temporary_name = create_temporary_directory(&store, manifest.bundle_digest())?;
         let temporary = store.open_dir_nofollow(&temporary_name)?;
         let outcome = (|| {
-            for file in declared_files(manifest.manifest()) {
-                copy_verified(&source, &temporary, file)?;
-            }
+            populate(&temporary)?;
             write_new_file(&temporary, INSTALL_RECORD_NAME, &record_bytes)?;
             seal_directory(&temporary)?;
             sync_directory(&temporary)?;
@@ -466,6 +516,55 @@ impl BundleStore {
         }
         outcome
     }
+}
+
+fn validate_validated_manifest(manifest: &ValidatedManifestV0) -> Result<(), BundleError> {
+    validate_manifest(manifest.manifest())?;
+    let canonical = canonical_manifest_bytes(manifest.manifest())?;
+    if canonical != manifest.canonical_bytes || sha256_hex(&canonical) != manifest.bundle_digest {
+        return Err(BundleError::InvalidContract);
+    }
+    Ok(())
+}
+
+fn validate_exact_bytes<'a, I>(
+    manifest: &BundleIntegrityManifestV0,
+    files: I,
+) -> Result<BTreeMap<&'a str, &'a [u8]>, BundleError>
+where
+    I: IntoIterator<Item = (&'a str, &'a [u8])>,
+{
+    let declared: BTreeMap<&str, &FileIntegrityV0> = declared_files(manifest)
+        .map(|file| (file.path.as_str(), file))
+        .collect();
+    let mut supplied = BTreeMap::new();
+    let mut count = 0_usize;
+    for (path, bytes) in files {
+        count = count.checked_add(1).ok_or(BundleError::Limit)?;
+        if count > MAX_DECLARED_FILES {
+            return Err(BundleError::Limit);
+        }
+        if !valid_relative_path(path)
+            || path == INSTALL_RECORD_NAME
+            || path.starts_with(&format!("{INSTALL_RECORD_NAME}/"))
+        {
+            return Err(BundleError::InvalidPath);
+        }
+        let expected = declared.get(path).ok_or(BundleError::FileSetMismatch)?;
+        if supplied.insert(path, bytes).is_some() {
+            return Err(BundleError::DuplicateDeclaration);
+        }
+        if u64::try_from(bytes.len()).map_err(|_| BundleError::Limit)? != expected.length {
+            return Err(BundleError::LengthMismatch);
+        }
+        if sha256_hex(bytes) != expected.sha256 {
+            return Err(BundleError::DigestMismatch);
+        }
+    }
+    if supplied.len() != declared.len() {
+        return Err(BundleError::FileSetMismatch);
+    }
+    Ok(supplied)
 }
 
 fn declared_files(manifest: &BundleIntegrityManifestV0) -> impl Iterator<Item = &FileIntegrityV0> {
