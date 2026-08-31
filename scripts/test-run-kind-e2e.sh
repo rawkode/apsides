@@ -248,6 +248,47 @@ jq '.items[0].status.containerStatuses += [.items[0].status.containerStatuses[0]
 jq 'del(.items[0].spec.containers[0])' "$TEMP/pod-valid.json" >"$TEMP/pod-missing-declaration.json"; assert_pod_rejected "$TEMP/pod-missing-declaration.json"
 jq '.items[0].spec.containers += [.items[0].spec.containers[0]]' "$TEMP/pod-valid.json" >"$TEMP/pod-duplicate-declaration.json"; assert_pod_rejected "$TEMP/pod-duplicate-declaration.json"
 jq '.items += [.items[0] | .metadata.name = "controller-1" | .metadata.uid = "pod-uid-2"]' "$TEMP/pod-valid.json" >"$TEMP/pod-multiple-live.json"; assert_pod_rejected "$TEMP/pod-multiple-live.json"
+
+# The default-deny collision is proved from the atomically captured container
+# termination state, not a rotating `kubectl logs --previous` buffer.
+sed -n '/^foreign_collision_termination_from_json() {/,/^}/p' "$ROOT/scripts/run-kind-e2e.sh" >"$TEMP/collision-termination.sh"
+. "$TEMP/collision-termination.sh"
+collision_failure='controller stopped: core: mutation model rejected desired graph: unsafe desired mutation decision'
+write_collision_pod_fixture() {
+  fixture=$1; uid=$2; restart=$3; exit_code=$4; message=$5
+  jq -n --arg uid "$uid" --argjson restart "$restart" --argjson exitCode "$exit_code" --arg message "$message" '
+    {metadata:{name:"controller-0",uid:$uid},status:{containerStatuses:[{name:"controller",restartCount:$restart,lastState:{terminated:{exitCode:$exitCode,message:$message}}}]}}
+  ' >"$fixture"
+}
+assert_collision_rejected() {
+  if foreign_collision_termination_from_json "$1" pod-uid 4 "$collision_failure" >/dev/null 2>&1; then
+    echo "invalid foreign-collision termination evidence was accepted: $1" >&2
+    exit 1
+  fi
+}
+write_collision_pod_fixture "$TEMP/collision-valid.json" pod-uid 4 1 "$collision_failure"
+foreign_collision_termination_from_json "$TEMP/collision-valid.json" pod-uid 4 "$collision_failure" >"$TEMP/collision-termination.json"
+jq -e '.expected == {podUid:"pod-uid",restartCount:4,exitCode:1,message:"controller stopped: core: mutation model rejected desired graph: unsafe desired mutation decision"} and .observed.container.terminated.messageRelation == "exact"' "$TEMP/collision-termination.json" >/dev/null
+write_collision_pod_fixture "$TEMP/collision-newline.json" pod-uid 4 1 "$collision_failure"$'\n'
+foreign_collision_termination_from_json "$TEMP/collision-newline.json" pod-uid 4 "$collision_failure" >"$TEMP/collision-newline-termination.json"
+jq -e --arg message "$collision_failure" '.observed.container.terminated.message == ($message + "\n") and .observed.container.terminated.normalizedMessage == $message and .observed.container.terminated.messageRelation == "single-trailing-newline-normalized"' "$TEMP/collision-newline-termination.json" >/dev/null
+write_collision_pod_fixture "$TEMP/collision-wrong-message.json" pod-uid 4 1 "$collision_failure extra"; assert_collision_rejected "$TEMP/collision-wrong-message.json"
+write_collision_pod_fixture "$TEMP/collision-double-newline.json" pod-uid 4 1 "$collision_failure"$'\n\n'; assert_collision_rejected "$TEMP/collision-double-newline.json"
+write_collision_pod_fixture "$TEMP/collision-wrong-uid.json" replacement-uid 4 1 "$collision_failure"; assert_collision_rejected "$TEMP/collision-wrong-uid.json"
+write_collision_pod_fixture "$TEMP/collision-wrong-restart.json" pod-uid 5 1 "$collision_failure"; assert_collision_rejected "$TEMP/collision-wrong-restart.json"
+write_collision_pod_fixture "$TEMP/collision-wrong-exit.json" pod-uid 4 75 "$collision_failure"; assert_collision_rejected "$TEMP/collision-wrong-exit.json"
+jq '.status.containerStatuses += [.status.containerStatuses[0]]' "$TEMP/collision-valid.json" >"$TEMP/collision-duplicate-controller.json"; assert_collision_rejected "$TEMP/collision-duplicate-controller.json"
+jq '.status.containerStatuses[0].lastState.terminated.message = false' "$TEMP/collision-valid.json" >"$TEMP/collision-message-false.json"; assert_collision_rejected "$TEMP/collision-message-false.json"
+jq 'del(.status.containerStatuses[0].lastState.terminated.message)' "$TEMP/collision-valid.json" >"$TEMP/collision-message-missing.json"; assert_collision_rejected "$TEMP/collision-message-missing.json"
+jq '.status.containerStatuses[0].restartCount = "4"' "$TEMP/collision-valid.json" >"$TEMP/collision-restart-string.json"; assert_collision_rejected "$TEMP/collision-restart-string.json"
+
+# The E2E-only overlay must request a durable termination message from the
+# controller without changing the production deployment.
+rg -Fq 'terminationMessagePolicy: FallbackToLogsOnError' "$ROOT/deploy/e2e/patch-deployment.yaml" || { echo 'missing E2E controller termination message policy' >&2; exit 1; }
+! rg -Fq 'terminationMessagePolicy: FallbackToLogsOnError' "$ROOT/deploy/controller/deployment.yaml" || { echo 'termination message policy leaked into the production deployment' >&2; exit 1; }
+rendered_e2e=$(kubectl kustomize "$ROOT/deploy/e2e")
+printf '%s\n' "$rendered_e2e" | grep -Fq 'terminationMessagePolicy: FallbackToLogsOnError' || { echo 'E2E render lost controller termination message policy' >&2; exit 1; }
+
 production_inspect_line=$(rg -n -F 'docker-image-production.inspect.json' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 kind_load_line=$(rg -n -F 'kind load docker-image --name "$CLUSTER_NAME"' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 [ "$production_inspect_line" -lt "$kind_load_line" ] || { echo 'Docker inspect must be captured before kind loads the tag' >&2; exit 1; }
@@ -260,6 +301,10 @@ for token in \
   'RUN_ID must contain only lowercase' \
   'exec 9<>"$FIFO"' \
   'wait_for_exact_crash' \
+  'foreign_collision_termination_from_json' \
+  'controller-foreign-collision-pod.json' \
+  'controller-foreign-collision-termination.json' \
+  'foreign collision termination evidence is not exact' \
   'CRASH_POD_UID' \
   'docker-image-production.inspect.json' \
   'docker-image-failpoints.inspect.json' \
@@ -286,5 +331,6 @@ assert_not_contains 'map(select(.name == "controller") | .imageID | contains($ex
 assert_not_contains 'docker image inspect "$PRODUCTION_IMAGE" --format '\''{{.Id}}'\'''
 assert_not_contains 'docker image inspect "$FAILPOINT_IMAGE" --format '\''{{.Id}}'\'''
 assert_not_contains 'contains("sha256:")'
+assert_not_contains 'controller-foreign-collision-previous.log'
 assert_not_contains "'.items[0].status.containerStatuses[] | select(.name == \"controller\") | .lastState.terminated.exitCode == 75'"
 assert_not_contains "wait_json 'dependency automation materialization' '.items | length == 1' automationrun"

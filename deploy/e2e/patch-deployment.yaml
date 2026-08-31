@@ -53,6 +53,7 @@ spec:
         - name: controller
           image: ghcr.io/oxideloop/oxideloop:e2e-failpoints
           imagePullPolicy: IfNotPresent
+          terminationMessagePolicy: FallbackToLogsOnError
           args:
             - --namespace
             - $(POD_NAMESPACE)

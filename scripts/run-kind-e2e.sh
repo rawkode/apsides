@@ -176,6 +176,37 @@ wait_for_exact_crash() {
     sleep 0.1; ticks=$((ticks + 1))
   done
 }
+foreign_collision_termination_from_json() {
+  pod_file=$1; expected_uid=$2; expected_restart=$3; expected_message=$4
+  jq -ec --arg expectedUid "$expected_uid" --argjson expectedRestart "$expected_restart" --arg expectedMessage "$expected_message" '
+  def nonempty_string($field):
+    if type == "string" and length > 0 then . else error($field + " must be a nonempty string") end;
+  def integer($field):
+    if type == "number" and floor == . and . >= 0 then . else error($field + " must be a nonnegative integer") end;
+  def exact_termination_message:
+    if type != "string" then error("controller termination message must be a string")
+    elif . == $expectedMessage then {observed:.,normalized:$expectedMessage,relation:"exact"}
+    elif . == ($expectedMessage + "\n") then {observed:.,normalized:$expectedMessage,relation:"single-trailing-newline-normalized"}
+    else error("controller termination message does not equal the exact foreign-collision failure") end;
+  if (.metadata | type) != "object" then error("collision pod metadata is invalid") else . end |
+  (.metadata.uid | nonempty_string("collision pod UID")) as $pod_uid |
+  if $pod_uid != $expectedUid then error("collision pod UID changed") else . end |
+  (.metadata.name | nonempty_string("collision pod name")) as $pod_name |
+  if (.status | type) != "object" or (.status.containerStatuses | type) != "array" then error("collision pod container statuses are invalid") else . end |
+  [.status.containerStatuses[] | select(.name == "controller")] as $controllers |
+  if ($controllers | length) != 1 then error("collision pod must have exactly one controller container status") else $controllers[0] end as $controller |
+  ($controller.restartCount | integer("controller restartCount")) as $restart |
+  if $restart != $expectedRestart then error("controller restartCount is not the exact expected increment") else . end |
+  ($controller.lastState | if type == "object" then . else error("controller lastState is invalid") end) as $last_state |
+  ($last_state.terminated | if type == "object" then . else error("controller termination is missing") end) as $terminated |
+  ($terminated.exitCode | integer("controller termination exitCode")) as $exit_code |
+  if $exit_code != 1 then error("controller termination exitCode is not 1") else . end |
+  ($terminated.message | exact_termination_message) as $message |
+  {schema:"oxideloop.dev/kind-e2e-controller-termination/v1",
+   expected:{podUid:$expectedUid,restartCount:$expectedRestart,exitCode:1,message:$expectedMessage},
+   observed:{pod:{name:$pod_name,uid:$pod_uid},container:{name:"controller",restartCount:$restart,terminated:{exitCode:$exit_code,message:$message.observed,normalizedMessage:$message.normalized,messageRelation:$message.relation}}}}
+  ' "$pod_file"
+}
 assert_automation_transition() {
   expected_total=$1; source_uid=$2; source_rv=$3; label=$4
   elapsed=0
@@ -402,6 +433,7 @@ FOREIGN_UID=$(jq -r '.metadata.uid' "$EVIDENCE/foreign-before.json")
 COLLISION_POD=$(controller_pod)
 COLLISION_POD_UID=$(ctx get pod -n "$NAMESPACE" "$COLLISION_POD" -o jsonpath='{.metadata.uid}')
 COLLISION_RESTART=$(controller_status "$COLLISION_POD" | jq -er '.restartCount')
+COLLISION_FAILURE='controller stopped: core: mutation model rejected desired graph: unsafe desired mutation decision'
 write_root; ctx apply -f "$WORK/root.yaml"
 ROOT_UID=$(root_uid)
 elapsed=0
@@ -410,13 +442,18 @@ while :; do
   collision_uid=$(ctx get pod -n "$NAMESPACE" "$COLLISION_POD" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
   [ "$collision_uid" = "$COLLISION_POD_UID" ] || die 'foreign collision replaced the controller pod'
   collision_restarts=$(printf '%s' "$collision_status" | jq -r '.restartCount // 0')
-  collision_exit=$(printf '%s' "$collision_status" | jq -r '.lastState.terminated.exitCode // empty')
-  if [ "$collision_restarts" -ge "$((COLLISION_RESTART + 1))" ] 2>/dev/null && [ "$collision_exit" = 1 ]; then break; fi
+  [ "$collision_restarts" -le "$((COLLISION_RESTART + 1))" ] 2>/dev/null || die 'foreign collision incremented controller restartCount more than once'
+  if [ "$collision_restarts" = "$((COLLISION_RESTART + 1))" ]; then
+    atomic_capture controller-foreign-collision-pod.json ctx get pod -n "$NAMESPACE" "$COLLISION_POD" -o json || die 'missing foreign collision controller pod evidence'
+    COLLISION_TERMINATION=$(foreign_collision_termination_from_json "$EVIDENCE/controller-foreign-collision-pod.json" "$COLLISION_POD_UID" "$((COLLISION_RESTART + 1))" "$COLLISION_FAILURE") || die 'foreign collision termination evidence is not exact'
+    printf '%s\n' "$COLLISION_TERMINATION" >"$EVIDENCE/.controller-foreign-collision-termination.json.tmp" && mv "$EVIDENCE/.controller-foreign-collision-termination.json.tmp" "$EVIDENCE/controller-foreign-collision-termination.json"
+    hash_file "$EVIDENCE/controller-foreign-collision-termination.json" >"$EVIDENCE/controller-foreign-collision-termination.json.sha256"
+    ARTIFACTS="$ARTIFACTS controller-foreign-collision-termination.json"
+    break
+  fi
   [ "$elapsed" -lt "$TIMEOUT" ] || die 'timed out waiting for the default-deny collision failure'
   sleep 2; elapsed=$((elapsed + 2))
 done
-atomic_capture controller-foreign-collision-previous.log ctx logs -n "$NAMESPACE" "$COLLISION_POD" -c controller --previous --tail=-1 || die 'missing foreign collision controller log'
-grep -F 'controller stopped: core: mutation model rejected desired graph: unsafe desired mutation decision' "$EVIDENCE/controller-foreign-collision-previous.log" >/dev/null || die 'foreign collision did not fail through the no-adoption mutation boundary'
 ctx get configmap root-config -n "$NAMESPACE" -o json >"$EVIDENCE/foreign-after.json"
 jq -e --slurpfile before "$EVIDENCE/foreign-before.json" '. == $before[0]' "$EVIDENCE/foreign-after.json" >/dev/null || die 'foreign collision object was mutated in at least one field'
 ctx get webapplication root -n "$NAMESPACE" -o json >"$EVIDENCE/foreign-collision-root.json"
