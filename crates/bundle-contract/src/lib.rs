@@ -910,9 +910,13 @@ fn make_writable(permissions: &mut cap_std::fs::Permissions, directory: bool) {
 }
 
 fn sync_directory(directory: &Dir) -> Result<(), BundleError> {
+    // A cloned cap-std `Dir` may be an O_PATH descriptor on Linux, which
+    // cannot be fsynced. Reopen this capability's own directory through its
+    // relative `.` entry to obtain a readable, no-follow handle instead.
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
     directory
-        .try_clone()?
-        .into_std_file()
+        .open_with(".", &options)?
         .sync_all()
         .map_err(Into::into)
 }
