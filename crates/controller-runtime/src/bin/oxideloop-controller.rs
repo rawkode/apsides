@@ -79,8 +79,22 @@ fn parse_args_from(values: impl IntoIterator<Item = String>) -> Result<Args, Str
     Ok(args)
 }
 
+/// Select the process-wide rustls backend before `KubeTransportV0::in_cluster`
+/// constructs its HTTPS client. The production dependency graph deliberately
+/// disables rustls default features, so this must not rely on transitive
+/// feature selection.
+fn install_crypto_provider() -> Result<(), String> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| "rustls CryptoProvider was already installed incompatibly".to_owned())
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    if let Err(error) = install_crypto_provider() {
+        eprintln!("controller setup failed: {error}");
+        return ExitCode::from(1);
+    }
     let args = match parse_args() {
         Ok(args) => args,
         Err(error) => {
