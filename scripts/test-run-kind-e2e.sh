@@ -209,9 +209,9 @@ controller_config_digest="$config_digest"
 renderer_config_digest='sha256:3333333333333333333333333333333333333333333333333333333333333333'
 wrong_digest='sha256:4444444444444444444444444444444444444444444444444444444444444444'
 write_pod_fixture() {
-  fixture=$1; controller_id=$2; renderer_id=$3
+  fixture=$1; controller_id=$2; renderer_id=$3; controller_status=${4:-$controller_tag}; renderer_status=${5:-$renderer_tag}
   cat >"$fixture" <<EOF
-{"items":[{"metadata":{"name":"controller-0","uid":"pod-uid"},"spec":{"containers":[{"name":"controller","image":"$controller_tag"},{"name":"renderer","image":"$renderer_tag"}]},"status":{"containerStatuses":[{"name":"controller","image":"$controller_tag","imageID":"$controller_id"},{"name":"renderer","image":"$renderer_tag","imageID":"$renderer_id"}]}}]}
+{"items":[{"metadata":{"name":"controller-0","uid":"pod-uid"},"spec":{"containers":[{"name":"controller","image":"$controller_tag"},{"name":"renderer","image":"$renderer_tag"}]},"status":{"containerStatuses":[{"name":"controller","image":"$controller_status","imageID":"$controller_id"},{"name":"renderer","image":"$renderer_status","imageID":"$renderer_id"}]}}]}
 EOF
 }
 assert_pod_rejected() {
@@ -226,9 +226,21 @@ write_pod_fixture "$TEMP/pod-valid.json" "containerd://$controller_config_digest
 pod_image_identities_from_json "$TEMP/pod-valid.json" "$controller_tag" "$renderer_tag" "$controller_config_digest" "$renderer_config_digest" >/dev/null
 write_pod_fixture "$TEMP/pod-valid.json" "registry.example/oxideloop@$controller_config_digest" "registry.example/oxideloop@$renderer_config_digest"
 pod_image_identities_from_json "$TEMP/pod-valid.json" "$controller_tag" "$renderer_tag" "$controller_config_digest" "$renderer_config_digest" >/dev/null
+write_pod_fixture "$TEMP/pod-qualified.json" "containerd://$controller_config_digest" "containerd://$renderer_config_digest" "docker.io/library/$controller_tag" "docker.io/library/$renderer_tag"
+pod_image_identities_from_json "$TEMP/pod-qualified.json" "$controller_tag" "$renderer_tag" "$controller_config_digest" "$renderer_config_digest" >"$TEMP/pod-qualified-identity.json"
+jq -e '.observed | all(.[]; .imageRelation == "docker.io/library-qualified" and .normalizedImage == .declaredImage)' "$TEMP/pod-qualified-identity.json" >/dev/null
+for bad_status_image in "registry.example/$controller_tag" "docker.io/not-library/$controller_tag" "docker.io/library/other:tag" "docker.io/library/oxideloop-e2e:wrong"; do
+  jq --arg image "$bad_status_image" '.items[0].status.containerStatuses[0].image = $image' "$TEMP/pod-qualified.json" >"$TEMP/pod-wrong-qualified-image.json"
+  assert_pod_rejected "$TEMP/pod-wrong-qualified-image.json"
+done
+if pod_image_identities_from_json "$TEMP/pod-valid.json" "docker.io/library/$controller_tag" "$renderer_tag" "$controller_config_digest" "$renderer_config_digest" >/dev/null 2>&1; then
+  echo 'qualified requested controller tag was accepted' >&2
+  exit 1
+fi
 jq '.items[0].spec.containers[0].image = "wrong:tag"' "$TEMP/pod-valid.json" >"$TEMP/pod-wrong-declared.json"; assert_pod_rejected "$TEMP/pod-wrong-declared.json"
 jq '.items[0].status.containerStatuses[0].image = "wrong:tag"' "$TEMP/pod-valid.json" >"$TEMP/pod-wrong-status.json"; assert_pod_rejected "$TEMP/pod-wrong-status.json"
 jq --arg digest "$wrong_digest" '.items[0].status.containerStatuses[0].imageID = $digest' "$TEMP/pod-valid.json" >"$TEMP/pod-wrong-digest.json"; assert_pod_rejected "$TEMP/pod-wrong-digest.json"
+jq --arg digest "$wrong_digest" '.items[0].status.containerStatuses[0].imageID = ("containerd://" + $digest)' "$TEMP/pod-qualified.json" >"$TEMP/pod-qualified-wrong-digest.json"; assert_pod_rejected "$TEMP/pod-qualified-wrong-digest.json"
 jq --arg digest "$wrong_digest" '.items[0].status.containerStatuses[1].imageID = $digest' "$TEMP/pod-valid.json" >"$TEMP/pod-wrong-renderer-digest.json"; assert_pod_rejected "$TEMP/pod-wrong-renderer-digest.json"
 jq '.items[0].status.containerStatuses[0].imageID = "not-a-digest"' "$TEMP/pod-valid.json" >"$TEMP/pod-malformed.json"; assert_pod_rejected "$TEMP/pod-malformed.json"
 jq 'del(.items[0].status.containerStatuses[0])' "$TEMP/pod-valid.json" >"$TEMP/pod-missing-status.json"; assert_pod_rejected "$TEMP/pod-missing-status.json"

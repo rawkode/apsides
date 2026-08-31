@@ -364,6 +364,12 @@ ctx rollout status deployment/oxideloop-controller -n "$NAMESPACE" --timeout="${
 pod_image_identities_from_json() {
   pod_file=$1; controller_image=$2; renderer_image=$3; controller_config=$4; renderer_config=$5
   jq -ec --arg controllerImage "$controller_image" --arg rendererImage "$renderer_image" --arg controllerConfig "$controller_config" --arg rendererConfig "$renderer_config" '
+  def local_image_tag($field):
+    if type == "string" and test("^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$") then . else error($field + " must be an unqualified local image tag") end;
+  def status_image($expected):
+    if . == $expected then {observedImage:.,normalizedImage:$expected,relation:"exact"}
+    elif . == ("docker.io/library/" + $expected) then {observedImage:.,normalizedImage:$expected,relation:"docker.io/library-qualified"}
+    else error("container status image is not the exact local tag or its docker.io/library qualification") end;
   def runtime_digest:
     if type != "string" then error("container imageID is missing") else sub("^[A-Za-z0-9+.-]+://"; "") end |
     if test("^sha256:[0-9a-f]{64}$") then .
@@ -372,9 +378,17 @@ pod_image_identities_from_json() {
   [.items[] | select(.metadata.deletionTimestamp == null)] as $pods |
   if ($pods | length) != 1 then error("expected exactly one live controller pod") else $pods[0] end |
   . as $pod |
-  (["controller", "renderer"] | map(. as $name | {name:$name,declaredImage:([$pod.spec.containers[] | select(.name == $name) | .image] | if length == 1 then .[0] else error("controller container declaration is ambiguous") end),observedImage:([$pod.status.containerStatuses[] | select(.name == $name) | .image] | if length == 1 then .[0] else error("controller container status is ambiguous") end),configDigest:([$pod.status.containerStatuses[] | select(.name == $name) | .imageID | runtime_digest] | if length == 1 then .[0] else error("controller container imageID is ambiguous") end)})) as $observed |
-  if $observed != [{name:"controller",declaredImage:$controllerImage,observedImage:$controllerImage,configDigest:$controllerConfig},{name:"renderer",declaredImage:$rendererImage,observedImage:$rendererImage,configDigest:$rendererConfig}] then error("controller and renderer runtime config digests differ from their exact Docker inspect identities")
-  else {pod:{name:$pod.metadata.name,uid:$pod.metadata.uid},expected:{controller:{tag:$controllerImage,configDigest:$controllerConfig},renderer:{tag:$rendererImage,configDigest:$rendererConfig}},observed:$observed} end
+  ($controllerImage | local_image_tag("controller expected image")) as $controller_short |
+  ($rendererImage | local_image_tag("renderer expected image")) as $renderer_short |
+  (["controller", "renderer"] | map(. as $name |
+    (if $name == "controller" then $controller_short else $renderer_short end) as $expected |
+    ([$pod.spec.containers[] | select(.name == $name) | .image] | if length == 1 then .[0] else error("controller container declaration is ambiguous") end) as $declared |
+    ([$pod.status.containerStatuses[] | select(.name == $name) | .image] | if length == 1 then .[0] else error("controller container status is ambiguous") end | status_image($expected)) as $status |
+    {name:$name,declaredImage:$declared,observedImage:$status.observedImage,normalizedImage:$status.normalizedImage,imageRelation:$status.relation,configDigest:([$pod.status.containerStatuses[] | select(.name == $name) | .imageID | runtime_digest] | if length == 1 then .[0] else error("controller container imageID is ambiguous") end)}
+  )) as $observed |
+  ([ $observed[] | {name,declaredImage,normalizedImage,configDigest} ]) as $normalized |
+  if $normalized != [{name:"controller",declaredImage:$controller_short,normalizedImage:$controller_short,configDigest:$controllerConfig},{name:"renderer",declaredImage:$renderer_short,normalizedImage:$renderer_short,configDigest:$rendererConfig}] then error("controller and renderer runtime config digests differ from their exact Docker inspect identities")
+  else {pod:{name:$pod.metadata.name,uid:$pod.metadata.uid},expected:{controller:{tag:$controller_short,acceptedStatusImages:[$controller_short,"docker.io/library/" + $controller_short],configDigest:$controllerConfig},renderer:{tag:$renderer_short,acceptedStatusImages:[$renderer_short,"docker.io/library/" + $renderer_short],configDigest:$rendererConfig}},observed:$observed} end
   ' "$pod_file"
 }
 atomic_capture controller-pod-images.json ctx get pod -n "$NAMESPACE" -l app.kubernetes.io/component=controller -o json || die 'failed to capture controller pod image JSON'
