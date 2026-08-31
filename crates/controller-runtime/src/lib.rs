@@ -2504,14 +2504,59 @@ fn install_linked_state_pins(
         ));
     }
     let finalizers = metadata_finalizers(metadata, "linked state finalizers are invalid")?;
+    if !finalizers
+        .iter()
+        .any(|value| value.as_str() == Some(oxideloop_controller_api::STATE_FINALIZER))
+    {
+        return Err(RuntimeErrorV0::Hold(
+            "linked state finalizer is absent".into(),
+        ));
+    }
+    let annotations = metadata
+        .get("annotations")
+        .and_then(Value::as_object)
+        .ok_or_else(|| RuntimeErrorV0::Hold("linked state annotations are invalid".into()))?;
+    let annotated_root_uid = annotations
+        .get(oxideloop_kube_transport::ROOT_UID_ANNOTATION)
+        .and_then(Value::as_str)
+        .filter(|value| *value == snapshot.uid)
+        .ok_or_else(|| {
+            RuntimeErrorV0::Hold("linked state root UID annotation is invalid".into())
+        })?;
+    if state
+        .metadata
+        .annotations
+        .get(oxideloop_kube_transport::ROOT_UID_ANNOTATION)
+        .is_none_or(|value| value != annotated_root_uid)
+    {
+        return Err(RuntimeErrorV0::Hold(
+            "linked state root UID annotation is invalid".into(),
+        ));
+    }
+    let owners = metadata
+        .get("ownerReferences")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RuntimeErrorV0::Hold("linked state owner is invalid".into()))?;
+    if owners.len() != 1
+        || !owners[0].as_object().is_some_and(|owner| {
+            owner.get("apiVersion").and_then(Value::as_str)
+                == Some(ResourceKindV0::WebApplication.api_version())
+                && owner.get("kind").and_then(Value::as_str)
+                    == Some(ResourceKindV0::WebApplication.kind())
+                && owner.get("name").and_then(Value::as_str) == Some(snapshot.name.as_str())
+                && owner.get("uid").and_then(Value::as_str) == Some(snapshot.uid.as_str())
+                && owner.get("controller").and_then(Value::as_bool) == Some(true)
+                && owner.get("blockOwnerDeletion").and_then(Value::as_bool) == Some(false)
+        })
+    {
+        return Err(RuntimeErrorV0::Hold("linked state owner is invalid".into()));
+    }
     snapshot.state_name.clone_from(&link.name);
     snapshot.state_uid.clone_from(&state.metadata.uid);
     snapshot
         .state_resource_version
         .clone_from(&state.metadata.resource_version);
-    snapshot.state_finalizer_present = finalizers
-        .iter()
-        .any(|value| value.as_str() == Some(oxideloop_controller_api::STATE_FINALIZER));
+    snapshot.state_finalizer_present = true;
     Ok(())
 }
 
@@ -2798,9 +2843,10 @@ async fn drive_kubernetes_with_dispatcher<D: KubernetesDispatcherV0>(
                 sequencing_retries = 0;
             }
             Err(RuntimeErrorV0::Discovery(TransportErrorV0::ManualRecoveryHold)) => {
-                actor.hold("manual recovery required after delete/finalizer ambiguity".into());
+                actor
+                    .hold("manual recovery required after an ambiguous Kubernetes mutation".into());
                 return Err(RuntimeErrorV0::Hold(
-                    "manual recovery required after delete/finalizer ambiguity".into(),
+                    "manual recovery required after an ambiguous Kubernetes mutation".into(),
                 ));
             }
             Err(error) => return Err(error),
@@ -3560,7 +3606,10 @@ mod tests {
             metadata: ObjectMetaV0 {
                 uid: root.state_uid.clone(),
                 resource_version: state_rv.into(),
-                annotations: BTreeMap::new(),
+                annotations: BTreeMap::from([(
+                    oxideloop_kube_transport::ROOT_UID_ANNOTATION.into(),
+                    root.uid.clone(),
+                )]),
                 owner_uids: vec![root.uid.clone()],
             },
             value: serde_json::json!({
@@ -3576,6 +3625,17 @@ mod tests {
                     } else {
                         vec![]
                     },
+                    "annotations": {
+                        oxideloop_kube_transport::ROOT_UID_ANNOTATION: root.uid,
+                    },
+                    "ownerReferences": [{
+                        "apiVersion": "demo.oxideloop.dev/v1alpha1",
+                        "kind": "WebApplication",
+                        "name": root.name,
+                        "uid": root.uid,
+                        "controller": true,
+                        "blockOwnerDeletion": false,
+                    }],
                 },
                 "spec": machine.journal(),
                 "status": {},
@@ -3625,7 +3685,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn omitted_linked_state_finalizers_are_a_valid_partial_recovery_object() {
+    async fn linked_state_without_finalizer_cannot_be_runtime_authority() {
         let machine = linked_machine();
         let mut loader = loader_port_for_machine(&machine, "state-rv-2");
         loader.objects[1]
@@ -3635,11 +3695,10 @@ mod tests {
             .expect("state metadata")
             .remove("finalizers");
 
-        let recovered_machine = load_machine_from_reader(&loader, "ns", "demo")
-            .await
-            .expect("partial linked state is valid")
-            .expect("root exists");
-        assert!(!recovered_machine.root().state_finalizer_present);
+        assert!(matches!(
+            load_machine_from_reader(&loader, "ns", "demo").await,
+            Err(RuntimeErrorV0::Hold(error)) if error == "linked state finalizer is absent"
+        ));
     }
 
     #[tokio::test]
@@ -3658,6 +3717,60 @@ mod tests {
                 Err(RuntimeErrorV0::Hold(error)) if error == "linked state finalizers are invalid"
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn linked_state_recovery_requires_exact_root_annotation_and_owner() {
+        let machine = linked_machine();
+
+        let mut missing_annotation = loader_port_for_machine(&machine, "state-rv-2");
+        missing_annotation.objects[1].value["metadata"]
+            .as_object_mut()
+            .expect("state metadata")
+            .remove("annotations");
+        assert!(matches!(
+            load_machine_from_reader(&missing_annotation, "ns", "demo").await,
+            Err(RuntimeErrorV0::Hold(error)) if error == "linked state annotations are invalid"
+        ));
+
+        let mut mismatched_annotation = loader_port_for_machine(&machine, "state-rv-2");
+        mismatched_annotation.objects[1].value["metadata"]["annotations"]
+            [oxideloop_kube_transport::ROOT_UID_ANNOTATION] = Value::String("foreign-root".into());
+        assert!(matches!(
+            load_machine_from_reader(&mismatched_annotation, "ns", "demo").await,
+            Err(RuntimeErrorV0::Hold(error)) if error == "linked state root UID annotation is invalid"
+        ));
+
+        let mut typed_annotation_mismatch = loader_port_for_machine(&machine, "state-rv-2");
+        typed_annotation_mismatch.objects[1]
+            .metadata
+            .annotations
+            .insert(
+                oxideloop_kube_transport::ROOT_UID_ANNOTATION.into(),
+                "foreign-root".into(),
+            );
+        assert!(matches!(
+            load_machine_from_reader(&typed_annotation_mismatch, "ns", "demo").await,
+            Err(RuntimeErrorV0::Hold(error)) if error == "linked state root UID annotation is invalid"
+        ));
+
+        let mut extra_owner = loader_port_for_machine(&machine, "state-rv-2");
+        extra_owner.objects[1].value["metadata"]["ownerReferences"]
+            .as_array_mut()
+            .expect("state owners")
+            .push(serde_json::json!({"uid": "foreign"}));
+        assert!(matches!(
+            load_machine_from_reader(&extra_owner, "ns", "demo").await,
+            Err(RuntimeErrorV0::Hold(error)) if error == "linked state owner is invalid"
+        ));
+
+        let mut non_controller_owner = loader_port_for_machine(&machine, "state-rv-2");
+        non_controller_owner.objects[1].value["metadata"]["ownerReferences"][0]["controller"] =
+            Value::Bool(false);
+        assert!(matches!(
+            load_machine_from_reader(&non_controller_owner, "ns", "demo").await,
+            Err(RuntimeErrorV0::Hold(error)) if error == "linked state owner is invalid"
+        ));
     }
     #[derive(Default)]
     struct Port {
@@ -5863,6 +5976,7 @@ mod tests {
                 name: "managed".into(),
             },
             logical_id: "managed".into(),
+            prepared_expected_target: None,
             decision: oxideloop_mutation_model::MutationDecision::Post {
                 method: oxideloop_mutation_model::HttpMethod::Post,
                 body: serde_json::json!({}),
@@ -5878,6 +5992,78 @@ mod tests {
             Err(RuntimeErrorV0::Hold(_))
         ));
     }
+
+    #[derive(Default)]
+    struct ManualRecoveryDispatcher {
+        calls: Vec<CommandV0>,
+        fresh_snapshot_calls: usize,
+    }
+
+    #[async_trait]
+    impl KubernetesDispatcherV0 for ManualRecoveryDispatcher {
+        async fn dispatch(
+            &mut self,
+            command: &CommandV0,
+        ) -> Result<Option<EventV0>, RuntimeErrorV0> {
+            self.calls.push(command.clone());
+            Err(RuntimeErrorV0::Discovery(
+                TransportErrorV0::ManualRecoveryHold,
+            ))
+        }
+
+        async fn fresh_root_snapshot(&mut self) -> Result<RootSnapshotV0, RuntimeErrorV0> {
+            self.fresh_snapshot_calls += 1;
+            Err(RuntimeErrorV0::Hold(
+                "manual recovery must not replan".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_recovery_hold_from_mutation_never_replans_or_retries() {
+        let mut actor = actor();
+        actor.commands.push_back(CommandV0::Mutate {
+            transaction_id: "t".repeat(64),
+            attempt_token: "a".repeat(64),
+            commands: vec![oxideloop_controller_core::MutationCommandV0 {
+                command_id: "c".repeat(64),
+                attempt_token: "a".repeat(64),
+                preconditions: oxideloop_controller_core::PreconditionsV0 {
+                    root_uid: "root-uid".into(),
+                    root_generation: 1,
+                    root_resource_version: "root-rv".into(),
+                    state_uid: "state-uid".into(),
+                    state_resource_version: "state-rv".into(),
+                    observation_token: String::new(),
+                    cache_epoch: String::new(),
+                },
+                identity: oxideloop_controller_api::ObjectIdentity {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: "ns".into(),
+                    name: "managed".into(),
+                },
+                logical_id: "managed".into(),
+                prepared_expected_target: None,
+                decision: oxideloop_mutation_model::MutationDecision::Post {
+                    method: oxideloop_mutation_model::HttpMethod::Post,
+                    body: serde_json::json!({}),
+                },
+            }],
+        });
+        let mut dispatcher = ManualRecoveryDispatcher::default();
+
+        assert!(matches!(
+            drive_kubernetes_with_dispatcher(&mut actor, &mut dispatcher).await,
+            Err(RuntimeErrorV0::Hold(error))
+                if error == "manual recovery required after an ambiguous Kubernetes mutation"
+        ));
+        assert_eq!(dispatcher.calls.len(), 1);
+        assert!(matches!(dispatcher.calls[0], CommandV0::Mutate { .. }));
+        assert_eq!(dispatcher.fresh_snapshot_calls, 0);
+        assert!(matches!(actor.mode(), ModeV0::Hold(_)));
+    }
+
     #[test]
     fn watch_invalidation_preserves_durable_effect_ownership() {
         let mut actor = actor();

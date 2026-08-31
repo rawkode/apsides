@@ -4,6 +4,8 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 pub const PROBE_VERSION_V0: &str = "mutation-probe.oxideloop.dev/v0";
+pub const CONTROLLER_FIELD_MANAGER: &str = "oxideloop-controller";
+pub const APPLY_PATCH_CONTENT_TYPE: &str = "application/apply-patch+yaml";
 
 /// Generate the checked-in probe schema with deterministic object-key order.
 ///
@@ -98,6 +100,10 @@ pub enum MutationIntent {
     Apply {
         observation: Observation,
         expected: ObjectIdentity,
+        // Retained in the v0 probe input for backward-compatible decoding.
+        // The controller does not delegate its field-manager authority to
+        // probe input: successful conditional applies always use
+        // `CONTROLLER_FIELD_MANAGER`.
         field_manager: String,
         #[schemars(with = "Value")]
         object: Value,
@@ -247,9 +253,9 @@ pub fn plan(input: &MutationPlanInputV0) -> Result<MutationDecision, MutationMod
                     let body = object_with_identity(object, expected)?;
                     Ok(MutationDecision::ConditionalApply {
                         method: HttpMethod::Patch,
-                        content_type: "application/apply-patch+yaml".into(),
-                        field_manager: field_manager.clone(),
-                        force: false,
+                        content_type: APPLY_PATCH_CONTENT_TYPE.into(),
+                        field_manager: CONTROLLER_FIELD_MANAGER.into(),
+                        force: true,
                         expected: expected.clone(),
                         body,
                     })
@@ -392,4 +398,59 @@ fn require_nonempty(field: &str, value: &str) -> Result<(), MutationModelError> 
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        APPLY_PATCH_CONTENT_TYPE, BackendQualification, CONTROLLER_FIELD_MANAGER, HttpMethod,
+        MutationDecision, MutationIntent, MutationPlanInputV0, ObjectIdentity, Observation,
+        PROBE_VERSION_V0, plan,
+    };
+
+    #[test]
+    fn conditional_apply_uses_the_fixed_controller_force_contract() {
+        let expected = ObjectIdentity {
+            uid: "uid-1".into(),
+            resource_version: "17".into(),
+        };
+        let decision = plan(&MutationPlanInputV0 {
+            probe_version: PROBE_VERSION_V0.into(),
+            qualification: BackendQualification::BuiltInTested {
+                kubernetes_minor: "1.36".into(),
+                gvr: "configmaps".into(),
+            },
+            intent: MutationIntent::Apply {
+                observation: Observation::Existing {
+                    identity: expected.clone(),
+                },
+                expected: expected.clone(),
+                // This remains accepted only to decode the v0 probe shape;
+                // it cannot alter the emitted controller authority.
+                field_manager: "untrusted-probe-value".into(),
+                object: json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "example"}
+                }),
+            },
+        })
+        .unwrap();
+
+        assert!(matches!(
+            decision,
+            MutationDecision::ConditionalApply {
+                method: HttpMethod::Patch,
+                content_type,
+                field_manager,
+                force: true,
+                expected: decision_expected,
+                ..
+            } if content_type == APPLY_PATCH_CONTENT_TYPE
+                && field_manager == CONTROLLER_FIELD_MANAGER
+                && decision_expected == expected
+        ));
+    }
 }

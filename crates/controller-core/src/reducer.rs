@@ -26,8 +26,9 @@ use oxideloop_controller_api::{
     bootstrap_id, state_name, validate_automation_run_name, validate_root_state_link,
 };
 use oxideloop_mutation_model::{
-    BackendQualification, HttpMethod, MutationDecision, MutationIntent, MutationPlanInputV0,
-    ObjectIdentity as MutationIdentity, Observation, PROBE_VERSION_V0, plan,
+    APPLY_PATCH_CONTENT_TYPE, BackendQualification, CONTROLLER_FIELD_MANAGER, HttpMethod,
+    MutationDecision, MutationIntent, MutationPlanInputV0, ObjectIdentity as MutationIdentity,
+    Observation, PROBE_VERSION_V0, plan,
 };
 use oxideloop_renderer_abi::model::{Dependency, RenderDisposition};
 use oxideloop_renderer_abi::{
@@ -653,6 +654,17 @@ pub struct MutationCommandV0 {
     pub preconditions: PreconditionsV0,
     pub identity: ObjectIdentity,
     pub logical_id: String,
+    /// The target identity recorded in the durable prepared intent. This is
+    /// intentionally independent from `decision.expected`: transport must
+    /// compare both values with its fresh target read before a conditional
+    /// apply is authorized. `None` represents POST; `Some` represents an
+    /// existing target for conditional apply or delete.
+    ///
+    /// The default preserves decoding of pre-P13 command envelopes while
+    /// `deny_unknown_fields` continues to reject unrecognized fields. Such a
+    /// legacy envelope cannot satisfy the later transport force gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_expected_target: Option<MutationIdentity>,
     pub decision: MutationDecision,
 }
 
@@ -2466,6 +2478,8 @@ fn deletion_commands(state: &MachineStateV0, tx: &ApplyTransaction) -> Vec<Mutat
             preconditions: pins(&state.root),
             identity: intent.identity.clone(),
             logical_id: intent.logical_id.clone(),
+            prepared_expected_target: prepared_expected_target(intent)
+                .expect("validated delete intent has an exact target identity"),
             decision: MutationDecision::PreconditionedDelete {
                 method: HttpMethod::Delete,
                 preconditions: MutationIdentity {
@@ -4002,6 +4016,7 @@ impl Plan {
                 preconditions: pins(&state.root),
                 identity: intent.identity.clone(),
                 logical_id: intent.logical_id.clone(),
+                prepared_expected_target: prepared_expected_target(intent)?,
                 decision,
             });
         }
@@ -4011,12 +4026,42 @@ impl Plan {
 }
 
 fn safe_mutation_decision(decision: &MutationDecision) -> bool {
-    matches!(
-        decision,
-        MutationDecision::Post { .. }
-            | MutationDecision::ConditionalApply { .. }
-            | MutationDecision::PreconditionedDelete { .. }
-    )
+    match decision {
+        MutationDecision::Post {
+            method: HttpMethod::Post,
+            ..
+        }
+        | MutationDecision::PreconditionedDelete {
+            method: HttpMethod::Delete,
+            ..
+        } => true,
+        MutationDecision::ConditionalApply {
+            method: HttpMethod::Patch,
+            content_type,
+            field_manager,
+            force: true,
+            ..
+        } => content_type == APPLY_PATCH_CONTENT_TYPE && field_manager == CONTROLLER_FIELD_MANAGER,
+        _ => false,
+    }
+}
+
+fn prepared_expected_target(
+    intent: &ApplyIntent,
+) -> Result<Option<MutationIdentity>, ReconcileError> {
+    match (
+        intent.expected_uid.as_deref(),
+        intent.expected_resource_version.as_deref(),
+    ) {
+        (Some(uid), Some(resource_version)) => Ok(Some(MutationIdentity {
+            uid: uid.into(),
+            resource_version: resource_version.into(),
+        })),
+        (None, None) => Ok(None),
+        _ => Err(ReconcileError::Mutation(
+            "prepared intent has a partial target UID/resourceVersion pin".into(),
+        )),
+    }
 }
 
 fn plan_graph(
@@ -4784,6 +4829,119 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn mutation_command_keeps_prepared_target_separate_from_decision_expected() {
+        let command = MutationCommandV0 {
+            command_id: "c".repeat(64),
+            attempt_token: "a".repeat(64),
+            preconditions: PreconditionsV0 {
+                root_uid: "root-uid".into(),
+                root_generation: 7,
+                root_resource_version: "root-rv".into(),
+                state_uid: "state-uid".into(),
+                state_resource_version: "state-rv".into(),
+                observation_token: "observation".into(),
+                cache_epoch: "epoch".into(),
+            },
+            identity: ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "demo".into(),
+                name: "config".into(),
+            },
+            logical_id: "config".into(),
+            prepared_expected_target: Some(MutationIdentity {
+                uid: "durable-uid".into(),
+                resource_version: "durable-rv".into(),
+            }),
+            decision: MutationDecision::ConditionalApply {
+                method: HttpMethod::Patch,
+                content_type: APPLY_PATCH_CONTENT_TYPE.into(),
+                field_manager: CONTROLLER_FIELD_MANAGER.into(),
+                force: true,
+                expected: MutationIdentity {
+                    uid: "decision-uid".into(),
+                    resource_version: "decision-rv".into(),
+                },
+                body: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "config"}
+                }),
+            },
+        };
+
+        let encoded = serde_json::to_value(&command).unwrap();
+        assert_eq!(encoded["preparedExpectedTarget"]["uid"], "durable-uid");
+        assert_eq!(encoded["decision"]["expected"]["uid"], "decision-uid");
+        assert_eq!(
+            serde_json::from_value::<MutationCommandV0>(encoded).unwrap(),
+            command
+        );
+
+        let mut legacy = serde_json::to_value(&command).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("preparedExpectedTarget");
+        assert!(
+            serde_json::from_value::<MutationCommandV0>(legacy.clone())
+                .unwrap()
+                .prepared_expected_target
+                .is_none()
+        );
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".into(), serde_json::Value::Null);
+        assert!(serde_json::from_value::<MutationCommandV0>(legacy).is_err());
+    }
+
+    #[test]
+    fn prepared_target_option_tracks_the_durable_intent_pin_pair() {
+        let identity = ObjectIdentity {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: "demo".into(),
+            name: "config".into(),
+        };
+        let post = ApplyIntent {
+            command_id: "p".repeat(64),
+            operation: ApplyOperation::Apply,
+            identity: identity.clone(),
+            logical_id: "config".into(),
+            expected_uid: None,
+            expected_resource_version: None,
+        };
+        let pinned = ApplyIntent {
+            command_id: "a".repeat(64),
+            operation: ApplyOperation::Apply,
+            identity: identity.clone(),
+            logical_id: "config".into(),
+            expected_uid: Some("uid".into()),
+            expected_resource_version: Some("rv".into()),
+        };
+        let delete = ApplyIntent {
+            command_id: "d".repeat(64),
+            operation: ApplyOperation::Delete,
+            identity,
+            logical_id: "config".into(),
+            expected_uid: Some("uid".into()),
+            expected_resource_version: Some("rv".into()),
+        };
+
+        assert_eq!(prepared_expected_target(&post).unwrap(), None);
+        for intent in [&pinned, &delete] {
+            assert_eq!(
+                prepared_expected_target(intent).unwrap(),
+                Some(MutationIdentity {
+                    uid: "uid".into(),
+                    resource_version: "rv".into(),
+                })
+            );
+        }
     }
 
     fn boot_to_render(mut machine: MachineStateV0) -> MachineStateV0 {

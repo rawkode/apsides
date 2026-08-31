@@ -77,6 +77,7 @@ fi
 PASS=true
 FAILURE=''
 ARTIFACTS=''
+OWNERSHIP_ARTIFACTS=''
 atomic_capture() {
   name=$1; shift
   temporary="$EVIDENCE/.${name}.tmp"
@@ -84,6 +85,16 @@ atomic_capture() {
   mv "$temporary" "$EVIDENCE/$name"
   hash_file "$EVIDENCE/$name" >"$EVIDENCE/$name.sha256"
   ARTIFACTS="$ARTIFACTS $name"
+}
+atomic_capture_ownership() {
+  name=$1; shift
+  atomic_capture "$name" "$@" || return 1
+  OWNERSHIP_ARTIFACTS="$OWNERSHIP_ARTIFACTS $name"
+}
+ownership_reproducibility() {
+  for name in $OWNERSHIP_ARTIFACTS; do
+    jq -n --arg path "$name" --arg sha256 "$(cat "$EVIDENCE/$name.sha256")" '{path:$path,sha256:$sha256}'
+  done | jq -s .
 }
 capture() {
   [ "$CLUSTER_CREATED" = true ] || return 0
@@ -130,7 +141,8 @@ cleanup() {
   fi
   status=passed; [ "$PASS" = true ] || status=failed
   image_ids=$(cat "$EVIDENCE/image-ids.json" 2>/dev/null || printf '{}')
-  jq -n --arg runId "$RUN_ID" --arg cluster "$CLUSTER_NAME" --arg namespace "$NAMESPACE" --arg revision "$HEAD" --arg finalRevision "$FINAL_HEAD" --arg nodeImage "$NODE_IMAGE" --arg actualNodeImage "${ACTUAL_NODE_IMAGE:-}" --arg kindVersion "$(kind version 2>/dev/null || true)" --arg clusterDisposition "$cluster_disposition" --argjson images "$image_ids" --arg bundleDigest "${BUNDLE_DIGEST:-}" --arg bundleArchiveSha "${BUNDLE_SHA:-}" '{schema:"oxideloop.dev/kind-e2e-reproducibility/v1",runId:$runId,cluster:$cluster,namespace:$namespace,sourceRevision:$revision,finalSourceRevision:$finalRevision,sourceTree:"clean-at-start-and-cleanup",nodeImage:{requested:$nodeImage,actual:$actualNodeImage},kindVersion:$kindVersion,clusterDisposition:$clusterDisposition,imageIds:$images,bundle:{digest:$bundleDigest,archiveSha256:$bundleArchiveSha}}' >"$EVIDENCE/.reproducibility.json.tmp" && mv "$EVIDENCE/.reproducibility.json.tmp" "$EVIDENCE/reproducibility.json"
+  ownership_evidence=$(ownership_reproducibility)
+  jq -n --arg runId "$RUN_ID" --arg cluster "$CLUSTER_NAME" --arg namespace "$NAMESPACE" --arg revision "$HEAD" --arg finalRevision "$FINAL_HEAD" --arg nodeImage "$NODE_IMAGE" --arg actualNodeImage "${ACTUAL_NODE_IMAGE:-}" --arg kindVersion "$(kind version 2>/dev/null || true)" --arg clusterDisposition "$cluster_disposition" --argjson images "$image_ids" --argjson ownershipEvidence "$ownership_evidence" --arg bundleDigest "${BUNDLE_DIGEST:-}" --arg bundleArchiveSha "${BUNDLE_SHA:-}" '{schema:"oxideloop.dev/kind-e2e-reproducibility/v1",runId:$runId,cluster:$cluster,namespace:$namespace,sourceRevision:$revision,finalSourceRevision:$finalRevision,sourceTree:"clean-at-start-and-cleanup",nodeImage:{requested:$nodeImage,actual:$actualNodeImage},kindVersion:$kindVersion,clusterDisposition:$clusterDisposition,imageIds:$images,ownershipEvidence:$ownershipEvidence,bundle:{digest:$bundleDigest,archiveSha256:$bundleArchiveSha}}' >"$EVIDENCE/.reproducibility.json.tmp" && mv "$EVIDENCE/.reproducibility.json.tmp" "$EVIDENCE/reproducibility.json"
   (
     cd "$EVIDENCE"
     find . -type f ! -name '.artifact-inventory.json.tmp' ! -name 'artifact-inventory.json' ! -name 'artifact-inventory.json.sha256' ! -name 'result.json' ! -name 'result.json.sha256' | LC_ALL=C sort | while IFS= read -r file; do
@@ -155,6 +167,77 @@ wait_json() {
   done
 }
 assert_count() { actual=$1; expected=$2; label=$3; [ "$actual" = "$expected" ] || die "$label: expected $expected, got $actual"; }
+wait_for_same_uid_changed_rv() {
+  description=$1; resource=$2; expected_uid=$3; expected_rv=$4
+  wait_json "$description" '(.metadata.uid == $expectedUid) and (.metadata.resourceVersion | type == "string" and . != $expectedRv)' "$resource" --arg expectedUid "$expected_uid" --arg expectedRv "$expected_rv"
+}
+managed_field_ownership_from_json() {
+  json_file=$1; resource=$2; expected_subresource=$3; representative_field=$4
+  jq -ec --arg resource "$resource" --arg expectedSubresource "$expected_subresource" --arg representativeField "$representative_field" '
+    def exact_subresource:
+      if $expectedSubresource == "main" then
+        (if has("subresource") then .subresource == null else true end)
+      else .subresource == $expectedSubresource end;
+    def ownership_entry:
+      (.manager == "oxideloop-controller") and
+      (.operation == "Apply") and
+      exact_subresource and
+      (.fieldsType == "FieldsV1") and
+      (.fieldsV1 | type == "object") and
+      (.fieldsV1 | has($representativeField));
+    if (.metadata | type) != "object" then error("managed-fields resource metadata is invalid") else . end |
+    if (.metadata.managedFields | type) != "array" then error("managed-fields array is missing") else . end |
+    [.metadata.managedFields[] | select(ownership_entry)] as $entries |
+    if ($entries | length) == 0 then
+      error("missing oxideloop-controller Apply ownership for " + $resource + " " + $expectedSubresource + " " + $representativeField)
+    else $entries[0] as $entry |
+      {schema:"oxideloop.dev/kind-e2e-managed-fields/v1",
+       resource:$resource,
+       uid:.metadata.uid,
+       resourceVersion:.metadata.resourceVersion,
+       manager:$entry.manager,
+       operation:$entry.operation,
+       subresource:($entry.subresource // null),
+       fieldsType:$entry.fieldsType,
+       representativeField:$representativeField}
+    end
+  ' "$json_file"
+}
+capture_managed_field_ownership() {
+  label=$1; resource=$2; expected_subresource=$3; representative_field=$4
+  raw="ownership-${label}-managed-fields.json"
+  assertion="ownership-${label}-assertion.json"
+  atomic_capture_ownership "$raw" ctx get "$resource" -n "$NAMESPACE" -o json --show-managed-fields || die "failed to capture $label managed-fields JSON"
+  atomic_capture_ownership "$assertion" managed_field_ownership_from_json "$EVIDENCE/$raw" "$resource" "$expected_subresource" "$representative_field" || die "$label managed-fields ownership is not controller Apply/$expected_subresource/$representative_field"
+}
+ownership_restart_identities() {
+  ctx get webapplication/root,oxideloopstate/"$STATE_NAME",configmap/root-config,service/root-service -n "$NAMESPACE" -o json | jq -Sec --arg stateName "$STATE_NAME" '
+    def exact($kind; $name):
+      [.items[] | select(.kind == $kind and .metadata.name == $name)] |
+      if (length == 1 and (.[0].metadata.uid | type == "string")) then .[0] | {name:.metadata.name,uid:.metadata.uid} else error("missing exact " + $kind + "/" + $name + " identity") end;
+    {root:exact("WebApplication"; "root"),state:exact("OxideLoopState"; $stateName),config:exact("ConfigMap"; "root-config"),service:exact("Service"; "root-service")}
+  '
+}
+restart_controller() {
+  label=$1
+  RESTART_OLD_POD=$(controller_pod)
+  RESTART_OLD_POD_UID=$(ctx get pod -n "$NAMESPACE" "$RESTART_OLD_POD" -o jsonpath='{.metadata.uid}')
+  ctx delete pod -n "$NAMESPACE" "$RESTART_OLD_POD" --wait=false
+  elapsed=0; RESTART_NEW_POD=''; RESTART_NEW_POD_UID=''
+  while [ -z "$RESTART_NEW_POD" ]; do
+    restart_snapshot=$(ctx get pods -n "$NAMESPACE" -l app.kubernetes.io/component=controller -o json 2>/dev/null || true)
+    restart_pair=$(printf '%s' "$restart_snapshot" | jq -r --arg oldUid "$RESTART_OLD_POD_UID" '[.items[] | select(.metadata.deletionTimestamp == null and .metadata.uid != $oldUid and ([.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length == 1)) | [.metadata.name,.metadata.uid] | @tsv] | if length == 1 then .[0] else empty end' 2>/dev/null || true)
+    if [ -n "$restart_pair" ]; then
+      RESTART_NEW_POD=$(printf '%s' "$restart_pair" | cut -f1)
+      RESTART_NEW_POD_UID=$(printf '%s' "$restart_pair" | cut -f2)
+      break
+    fi
+    [ "$elapsed" -lt "$TIMEOUT" ] || die "timed out waiting for a new Ready controller pod after $label restart"
+    sleep 2; elapsed=$((elapsed + 2))
+  done
+  [ "$RESTART_NEW_POD_UID" != "$RESTART_OLD_POD_UID" ] || die "$label restart reused the controller pod UID"
+  ctx rollout status deployment/oxideloop-controller -n "$NAMESPACE" --timeout="${TIMEOUT}s"
+}
 controller_pod() {
   ctx get pod -n "$NAMESPACE" -l app.kubernetes.io/component=controller -o json |
     jq -er '[.items[] | select(.metadata.deletionTimestamp == null)] | if length == 1 then .[0].metadata.name else error("expected exactly one live controller pod") end'
@@ -501,9 +584,41 @@ jq -e --slurpfile root "$EVIDENCE/initial-root.json" --slurpfile config "$EVIDEN
   ([$service[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}])
 ' "$EVIDENCE/initial-state.json" >/dev/null || die 'bootstrap root, state, inventory, or ownership is not exact'
 
-# Pruning a service must retain the same root/state identity.
+# Ownership transition: the existing managed children must be updated through
+# controller SSA rather than recreated. The root annotation is deterministic
+# per run and only retriggers reconciliation.
 CONFIG_UID=$(ctx get configmap root-config -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')
+CONFIG_RV=$(ctx get configmap root-config -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
 SERVICE_UID=$(ctx get service root-service -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')
+SERVICE_RV=$(ctx get service root-service -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
+ctx annotate webapplication root -n "$NAMESPACE" "oxideloop.dev/e2e-ownership-transition=$RUN_ID" --overwrite
+wait_for_same_uid_changed_rv 'ConfigMap ConditionalApply ownership transition' configmap/root-config "$CONFIG_UID" "$CONFIG_RV"
+wait_for_same_uid_changed_rv 'Service ConditionalApply ownership transition' service/root-service "$SERVICE_UID" "$SERVICE_RV"
+wait_json 'ownership transition state final convergence' '(.metadata.uid == $stateUid) and (.spec.state.inventory | length == 2) and ((.spec.state.pendingDependencies // []) | length == 0) and (.spec.state.applyTransaction == null and .spec.state.pendingPersist == null and .spec.state.pruneCandidate == null and .spec.state.generationAdvanceClosure == null and .spec.state.deletion == null)' "oxideloopstate/$STATE_NAME" --arg stateUid "$STATE_UID"
+wait_json 'ownership transition root current status' '(.metadata.uid == $rootUid) and (.status.state == {rootUid:$rootUid,name:$stateName,uid:$stateUid}) and (.status.observedGeneration == .metadata.generation) and (.status.verifiedBundleDigest == .spec.program.digest)' webapplication/root --arg rootUid "$ROOT_UID" --arg stateName "$STATE_NAME" --arg stateUid "$STATE_UID"
+test "$(ctx get configmap root-config -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')" = "$CONFIG_UID" || die 'ConfigMap ConditionalApply ownership transition changed its UID'
+test "$(ctx get service root-service -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')" = "$SERVICE_UID" || die 'Service ConditionalApply ownership transition changed its UID'
+OWNERSHIP_CONFIG_RV=$(ctx get configmap root-config -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
+OWNERSHIP_SERVICE_RV=$(ctx get service root-service -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
+capture_managed_field_ownership state "oxideloopstate/$STATE_NAME" main 'f:spec'
+capture_managed_field_ownership config configmap/root-config main 'f:data'
+capture_managed_field_ownership service service/root-service main 'f:spec'
+capture_managed_field_ownership root-status webapplication/root status 'f:status'
+
+# Restart after all ownership transitions while the Service remains present.
+# Reconciliation is then retriggered once more to expose any ownership conflict
+# before the independent Service-prune gate below.
+atomic_capture_ownership ownership-restart-identities-before.json ownership_restart_identities || die 'failed to capture ownership restart identities before restart'
+restart_controller 'ownership transition'
+wait_json 'ownership restart Service remains present' '(.metadata.uid == $serviceUid)' service/root-service --arg serviceUid "$SERVICE_UID"
+ctx annotate webapplication root -n "$NAMESPACE" "oxideloop.dev/e2e-ownership-restart=$RUN_ID" --overwrite
+wait_for_same_uid_changed_rv 'ConfigMap ConditionalApply after ownership restart' configmap/root-config "$CONFIG_UID" "$OWNERSHIP_CONFIG_RV"
+wait_for_same_uid_changed_rv 'Service ConditionalApply after ownership restart' service/root-service "$SERVICE_UID" "$OWNERSHIP_SERVICE_RV"
+wait_json 'ownership restart root current status' '(.metadata.uid == $rootUid) and (.status.state == {rootUid:$rootUid,name:$stateName,uid:$stateUid}) and (.status.observedGeneration == .metadata.generation) and (.status.verifiedBundleDigest == .spec.program.digest)' webapplication/root --arg rootUid "$ROOT_UID" --arg stateName "$STATE_NAME" --arg stateUid "$STATE_UID"
+atomic_capture_ownership ownership-restart-identities-after.json ownership_restart_identities || die 'failed to capture ownership restart identities after restart'
+cmp -s "$EVIDENCE/ownership-restart-identities-before.json" "$EVIDENCE/ownership-restart-identities-after.json" || die 'ownership restart changed root, state, ConfigMap, or Service identities'
+
+# Pruning a service must retain the same root/state identity.
 ctx patch webapplication root -n "$NAMESPACE" --type merge -p '{"spec":{"expose":false}}'
 wait_json 'service pruned' '.items | length == 0' service
 test "$(root_uid)" = "$ROOT_UID" || die 'prune changed the root identity'
@@ -548,6 +663,8 @@ wait_json 'rerendered dependency value' '.data.flavor == "chocolate"' configmap/
 wait_json 'first, exactly-once dependency automation' '.items | length == 1' automationrun
 INPUT_RV=$(ctx get configmap demo-input -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
 assert_automation_transition 1 "$INPUT_UID" "$INPUT_RV" chocolate
+AUTOMATION_RUN_NAME=$(ctx get automationruns -n "$NAMESPACE" -o json | jq -er '[.items[] | select(.status.completion.state == "Succeeded") | .metadata.name] | if length == 1 then .[0] else error("expected exactly one completed AutomationRun for managed-fields evidence") end')
+capture_managed_field_ownership automationrun-status "automationrun/$AUTOMATION_RUN_NAME" status 'f:status'
 capture_transition chocolate
 
 # Each crash window must be recovered durably without duplicate Event output.

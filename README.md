@@ -6,6 +6,20 @@ This repository began as an M0 feasibility spike and now includes an experimenta
 
 The name and every `v0` interface remain provisional through M1 and until a later explicit compatibility freeze.
 
+## Ownership and apply policy (P13-E)
+
+Create remains `POST` with strict no-adoption. Lazy SSA ownership acquisition may
+use force only for a fully fenced State Persist write, an inventory-pinned
+ConfigMap/Service ConditionalApply, or normal WebApplication status after its
+bootstrap Merge. AutomationRun status and every POST, delete, finalizer,
+metadata, and bootstrap path remain non-force.
+
+A definite forced-write `409` gets one proof-only reread; it never retries or
+stale-rebases. Unproven State or root status holds. A child mutation emits a
+token-bound failure and then holds. Canonical legacy objects may be lazily
+claimed on their next authorized write; malformed or ownerless objects hold.
+Broad installed-cluster migration or reset remains an explicit M5 non-goal.
+
 ## Design boundary
 
 The spike selects an explicitly React-like TSX runtime for a future process-isolated worker. M0 evaluated its callable bundle in the deliberately rejected in-process harness. Ordinary React rendering works for the tested fixture, but unrestricted React is rejected because a layout-effect callback runs during commit. The current in-process `deno_core` host is rejected as a production boundary because it cannot enforce every memory and fatal-failure limit.
@@ -105,6 +119,8 @@ may override that choice with `KIND_EXPERIMENTAL_PROVIDER`. Common failures are
 missing `kind`, `kubectl`, `docker`, `jq`, or `pnpm`; an unavailable Docker API;
 or a bounded wait timeout. Inspect `runner.log`, `controller.log`,
 `pods.describe.txt`, and `result.json` in the evidence directory before rerun.
+This harness is an acceptance path. Treat a run as passed only when its
+`result.json` records `status: "passed"` for the exact source revision.
 
 ## Local renderer checks
 

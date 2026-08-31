@@ -36,7 +36,9 @@ use oxideloop_controller_core::{
     root_only_owned_children_verify_token,
 };
 use oxideloop_event_planner::{PlannedEventV0, materialize_event, semantically_equal};
-use oxideloop_mutation_model::{HttpMethod, MutationDecision};
+use oxideloop_mutation_model::{
+    APPLY_PATCH_CONTENT_TYPE, CONTROLLER_FIELD_MANAGER, HttpMethod, MutationDecision,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -815,6 +817,7 @@ impl KubeTransportV0 {
                     Ok(fence) => fence,
                     Err(error) => return Err(error),
                 };
+                validate_persist_force_authority(address, &fence, preconditions)?;
                 let mut desired = state_object(&fence.state, state);
                 inject_operation_proof(
                     &mut desired.value,
@@ -822,11 +825,13 @@ impl KubeTransportV0 {
                     &operation.token,
                 )?;
                 let written = match self
-                    .patch_state(&desired, &preconditions.state_resource_version)
+                    .patch_state(&desired, &preconditions.state_resource_version, true)
                     .await
                 {
                     Ok(written) => written,
-                    Err(error) if may_recover_response_loss(&error) => {
+                    Err(error)
+                        if may_recover_response_loss(&error) || is_state_write_conflict(&error) =>
+                    {
                         return self
                             .recover_persist(address, state, preconditions, operation)
                             .await;
@@ -856,11 +861,18 @@ impl KubeTransportV0 {
                 if fence.root.metadata.uid != *root_uid
                     || old_root_resource_version != &preconditions.root_resource_version
                 {
-                    return Err(TransportErrorV0::Stale("root status pins"));
+                    return Err(TransportErrorV0::ManualRecoveryHold);
                 }
+                validate_root_status_force_authority(
+                    address,
+                    &fence,
+                    preconditions,
+                    token,
+                    status,
+                )?;
                 let desired = root_status_object(&fence.root, status);
                 let written = match self
-                    .patch_web_application_status(&desired, old_root_resource_version)
+                    .patch_web_application_status(&desired, old_root_resource_version, true)
                     .await
                 {
                     Ok(written) => written,
@@ -1055,13 +1067,15 @@ impl KubeTransportV0 {
         preconditions: &PreconditionsV0,
         operation: &oxideloop_controller_api::PersistOperation,
     ) -> Result<CommandOutcomeV0, TransportErrorV0> {
-        let (_, state_ref) = address.references();
+        let (root_ref, state_ref) = address.references();
         let observed = self
             .reread(&state_ref)
             .await?
             .ok_or(TransportErrorV0::ManualRecoveryHold)?;
         if observed.metadata.uid != preconditions.state_uid
             || observed.metadata.resource_version == preconditions.state_resource_version
+            || !has_finalizer(&observed, STATE_FINALIZER)
+            || !has_exact_canonical_owner(&observed, &root_ref, &preconditions.root_uid)
             || observed.value.get("spec")
                 != Some(
                     &serde_json::to_value(state)
@@ -1111,18 +1125,13 @@ impl KubeTransportV0 {
             return Err(TransportErrorV0::ManualRecoveryHold);
         }
         if observed.metadata.resource_version == old_rv {
-            return Err(TransportErrorV0::NonRebasableConflict(
-                ConflictProvenanceV0::Write {
-                    operation: WriteOperationV0::ApplyStatus,
-                    resource: ResourceKindV0::WebApplication,
-                },
-            ));
+            return Err(TransportErrorV0::ManualRecoveryHold);
         }
         if observed.value.get("status") != Some(&intended)
             || status.last_status_persist_token.as_deref() != Some(token)
             || !durable_ownership
         {
-            return Err(TransportErrorV0::Stale("root status conflict"));
+            return Err(TransportErrorV0::ManualRecoveryHold);
         }
         Ok(CommandOutcomeV0::Event(Box::new(
             oxideloop_controller_core::EventV0::RootStatusPersisted {
@@ -1237,11 +1246,20 @@ impl KubeTransportV0 {
             return Err(TransportErrorV0::UnsupportedTarget);
         }
         match &command.decision {
-            MutationDecision::Post { body, .. }
-            | MutationDecision::ConditionalApply { body, .. } => {
+            MutationDecision::Post { body, .. } => {
                 // This validation deliberately precedes the fence rereads:
                 // unsupported Service modes must make zero Kubernetes calls.
                 validate_desired_object(body, &reference)?;
+            }
+            MutationDecision::ConditionalApply { body, expected, .. }
+                if !conditional_apply_envelope_authorized(command)
+                    || validate_conditional_apply_body(body, &reference, expected).is_err() =>
+            {
+                return Ok(mutation_failed_outcome(
+                    transaction_id,
+                    attempt_token,
+                    "conditional apply envelope is not authorized",
+                ));
             }
             _ => {}
         }
@@ -1262,28 +1280,43 @@ impl KubeTransportV0 {
                 .map(|o| result(command, ApplyOutcome::Applied, Some(o))),
             MutationDecision::ConditionalApply {
                 method: HttpMethod::Patch,
+                content_type,
+                field_manager,
+                force: true,
                 body,
                 expected,
-                ..
-            } if expected.uid == fence.target.as_ref().expect("fenced").metadata.uid
-                && expected.resource_version
-                    == fence
-                        .target
-                        .as_ref()
-                        .expect("fenced")
-                        .metadata
-                        .resource_version =>
+            } if conditional_apply_force_authorized(
+                command,
+                content_type,
+                field_manager,
+                expected,
+                &fence.root,
+                fence.target.as_ref().expect("fenced"),
+            ) =>
             {
-                self.mutation_apply(
-                    &reference,
-                    body,
-                    &fence.root,
-                    transaction_id,
-                    command,
-                    &fence.target.expect("fenced"),
+                Ok(
+                    match self
+                        .mutation_apply(
+                            &reference,
+                            body,
+                            &fence.root,
+                            transaction_id,
+                            command,
+                            &fence.target.expect("fenced"),
+                        )
+                        .await
+                    {
+                        Ok(object) => result(command, ApplyOutcome::Applied, Some(object)),
+                        Err(TransportErrorV0::ManualRecoveryHold) => {
+                            return Ok(mutation_failed_outcome(
+                                transaction_id,
+                                attempt_token,
+                                "conditional apply conflict could not prove prior success",
+                            ));
+                        }
+                        Err(error) => return Err(error),
+                    },
                 )
-                .await
-                .map(|o| result(command, ApplyOutcome::Applied, Some(o)))
             }
             MutationDecision::PreconditionedDelete {
                 method: HttpMethod::Delete,
@@ -1299,6 +1332,13 @@ impl KubeTransportV0 {
                         Some(identity.resource_version),
                     )
                 }),
+            MutationDecision::ConditionalApply { .. } => {
+                return Ok(mutation_failed_outcome(
+                    transaction_id,
+                    attempt_token,
+                    "conditional apply force authority proof failed",
+                ));
+            }
             _ => {
                 return Ok(CommandOutcomeV0::Event(Box::new(
                     oxideloop_controller_core::EventV0::MutationFailed {
@@ -1559,17 +1599,28 @@ impl KubeTransportV0 {
         desired.metadata = target.metadata.clone();
         let applied = match reference.resource {
             ResourceKindV0::ConfigMap => {
-                self.patch_config_map(&desired, &target.metadata.resource_version)
+                self.patch_config_map(&desired, &target.metadata.resource_version, true)
                     .await
             }
             ResourceKindV0::Service => {
-                self.patch_service(&desired, &target.metadata.resource_version)
+                self.patch_service(&desired, &target.metadata.resource_version, true)
                     .await
             }
             _ => return Err(TransportErrorV0::UnsupportedTarget),
         };
         match applied {
             Ok(o) => Ok(o),
+            Err(error) if is_child_apply_write_conflict(&error, reference.resource) => {
+                recover_dropped_write_exact(
+                    self.reread(reference).await?.as_ref(),
+                    &desired,
+                    root,
+                    Some(&target.metadata.uid),
+                    tx,
+                    &command.command_id,
+                )
+                .map_err(|_| TransportErrorV0::ManualRecoveryHold)
+            }
             Err(error) if may_recover_response_loss(&error) => recover_dropped_write_exact(
                 self.reread(reference).await?.as_ref(),
                 &desired,
@@ -2194,6 +2245,7 @@ impl KubeTransportV0 {
                 &desired,
                 ResourceKindV0::AutomationRun,
                 expected_old_resource_version,
+                false,
             )
             .await
         {
@@ -2383,27 +2435,45 @@ impl KubeTransportV0 {
         &self,
         object: &ObjectV0,
         expected_rv: &str,
+        force_authorized: bool,
     ) -> Result<ObjectV0, TransportErrorV0> {
-        self.apply(object, ResourceKindV0::ConfigMap, expected_rv, false)
-            .await
+        self.apply(
+            object,
+            ResourceKindV0::ConfigMap,
+            expected_rv,
+            force_authorized,
+        )
+        .await
     }
     /// Server-side applies only a `Service` with the exact expected RV.
     async fn patch_service(
         &self,
         object: &ObjectV0,
         expected_rv: &str,
+        force_authorized: bool,
     ) -> Result<ObjectV0, TransportErrorV0> {
-        self.apply(object, ResourceKindV0::Service, expected_rv, false)
-            .await
+        self.apply(
+            object,
+            ResourceKindV0::Service,
+            expected_rv,
+            force_authorized,
+        )
+        .await
     }
     /// Patches only an `OxideLoopState` with the exact expected RV.
     async fn patch_state(
         &self,
         object: &ObjectV0,
         expected_rv: &str,
+        force_authorized: bool,
     ) -> Result<ObjectV0, TransportErrorV0> {
-        self.apply(object, ResourceKindV0::OxideLoopState, expected_rv, false)
-            .await
+        self.apply(
+            object,
+            ResourceKindV0::OxideLoopState,
+            expected_rv,
+            force_authorized,
+        )
+        .await
     }
 
     /// Server-side applies only an `AutomationRun` with the exact expected RV.
@@ -2412,9 +2482,15 @@ impl KubeTransportV0 {
         &self,
         object: &ObjectV0,
         expected_rv: &str,
+        force_authorized: bool,
     ) -> Result<ObjectV0, TransportErrorV0> {
-        self.apply_status(object, ResourceKindV0::WebApplication, expected_rv)
-            .await
+        self.apply_status(
+            object,
+            ResourceKindV0::WebApplication,
+            expected_rv,
+            force_authorized,
+        )
+        .await
     }
 
     /// Deletes only an `AutomationRun` with UID and RV preconditions.
@@ -2497,6 +2573,7 @@ impl KubeTransportV0 {
         object: &ObjectV0,
         expected: ResourceKindV0,
         expected_rv: &str,
+        force_authorized: bool,
     ) -> Result<ObjectV0, TransportErrorV0> {
         require_resource(object, expected)?;
         validate_desired_object(&object.value, &object.reference)?;
@@ -2509,7 +2586,11 @@ impl KubeTransportV0 {
             .api(expected, &object.reference.namespace)
             .patch_status(
                 &object.reference.name,
-                &PatchParams::apply("oxideloop-controller"),
+                &if force_authorized {
+                    PatchParams::apply("oxideloop-controller").force()
+                } else {
+                    PatchParams::apply("oxideloop-controller")
+                },
                 &Patch::Apply(&body),
             )
             .await
@@ -2788,6 +2869,26 @@ fn is_root_status_write_conflict(error: &TransportErrorV0) -> bool {
             operation: WriteOperationV0::ApplyStatus,
             resource: ResourceKindV0::WebApplication,
         })
+    )
+}
+
+fn is_state_write_conflict(error: &TransportErrorV0) -> bool {
+    matches!(
+        error,
+        TransportErrorV0::Conflict(ConflictProvenanceV0::Write {
+            operation: WriteOperationV0::Apply,
+            resource: ResourceKindV0::OxideLoopState,
+        })
+    )
+}
+
+fn is_child_apply_write_conflict(error: &TransportErrorV0, resource: ResourceKindV0) -> bool {
+    matches!(
+        error,
+        TransportErrorV0::Conflict(ConflictProvenanceV0::Write {
+            operation: WriteOperationV0::Apply,
+            resource: actual,
+        }) if *actual == resource
     )
 }
 
@@ -3184,6 +3285,146 @@ fn has_state_link(root: &ObjectV0, state: &ObjectV0) -> bool {
             && link.get("uid").and_then(Value::as_str) == Some(state.metadata.uid.as_str())
     })
 }
+
+/// The forced state/status paths are intentionally narrower than the normal
+/// effect fence: every ownership and durable-link claim must be present in the
+/// fresh objects which immediately precede the write.
+fn validate_persist_force_authority(
+    address: &RootAddressV0,
+    fence: &EffectFenceV0,
+    preconditions: &PreconditionsV0,
+) -> Result<(), TransportErrorV0> {
+    if !has_force_root_authority(address, &fence.root, preconditions)
+        || !has_exact_object_identity(
+            &fence.state,
+            ResourceKindV0::OxideLoopState,
+            &address.namespace,
+            &address.state_name,
+        )
+        || fence.state.metadata.uid != preconditions.state_uid
+        || fence.state.metadata.resource_version != preconditions.state_resource_version
+        || !has_finalizer(&fence.state, STATE_FINALIZER)
+        || !has_root_uid_annotation(&fence.state, &fence.root.metadata.uid)
+        || !has_exact_canonical_owner(
+            &fence.state,
+            &fence.root.reference,
+            &fence.root.metadata.uid,
+        )
+        || !has_state_link(&fence.root, &fence.state)
+    {
+        return Err(TransportErrorV0::ManualRecoveryHold);
+    }
+    Ok(())
+}
+
+fn validate_root_status_force_authority(
+    address: &RootAddressV0,
+    fence: &EffectFenceV0,
+    preconditions: &PreconditionsV0,
+    token: &str,
+    status: &WebApplicationStatus,
+) -> Result<(), TransportErrorV0> {
+    if status.last_status_persist_token.as_deref() != Some(token) {
+        return Err(TransportErrorV0::ManualRecoveryHold);
+    }
+    validate_persist_force_authority(address, fence, preconditions)
+}
+
+fn has_force_root_authority(
+    address: &RootAddressV0,
+    root: &ObjectV0,
+    preconditions: &PreconditionsV0,
+) -> bool {
+    has_exact_object_identity(
+        root,
+        ResourceKindV0::WebApplication,
+        &address.namespace,
+        &address.name,
+    ) && root.metadata.uid == preconditions.root_uid
+        && root.metadata.resource_version == preconditions.root_resource_version
+        && generation(root).ok() == Some(preconditions.root_generation)
+        && has_finalizer(root, ROOT_FINALIZER)
+        && has_root_uid_annotation(root, &root.metadata.uid)
+}
+
+fn has_exact_object_identity(
+    object: &ObjectV0,
+    resource: ResourceKindV0,
+    namespace: &str,
+    name: &str,
+) -> bool {
+    object.reference.resource == resource
+        && object.reference.namespace == namespace
+        && object.reference.name == name
+        && object.value.get("apiVersion").and_then(Value::as_str) == Some(resource.api_version())
+        && object.value.get("kind").and_then(Value::as_str) == Some(resource.kind())
+        && object
+            .value
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            == Some(name)
+        && object
+            .value
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            == Some(namespace)
+}
+
+fn has_root_uid_annotation(object: &ObjectV0, root_uid: &str) -> bool {
+    object
+        .metadata
+        .annotations
+        .get(ROOT_UID_ANNOTATION)
+        .is_some_and(|value| value == root_uid)
+}
+
+fn conditional_apply_force_authorized(
+    command: &MutationCommandV0,
+    content_type: &str,
+    field_manager: &str,
+    expected: &oxideloop_mutation_model::ObjectIdentity,
+    root: &ObjectV0,
+    target: &ObjectV0,
+) -> bool {
+    conditional_apply_envelope_authorized(command)
+        && content_type == APPLY_PATCH_CONTENT_TYPE
+        && field_manager == CONTROLLER_FIELD_MANAGER
+        && target.metadata.uid == expected.uid
+        && target.metadata.resource_version == expected.resource_version
+        && has_root_uid_annotation(target, &root.metadata.uid)
+        && has_exact_canonical_owner(target, &root.reference, &root.metadata.uid)
+}
+
+fn conditional_apply_envelope_authorized(command: &MutationCommandV0) -> bool {
+    matches!(
+        &command.decision,
+        MutationDecision::ConditionalApply {
+            method: HttpMethod::Patch,
+            content_type,
+            field_manager,
+            force: true,
+            expected,
+            ..
+        } if content_type == APPLY_PATCH_CONTENT_TYPE
+            && field_manager == CONTROLLER_FIELD_MANAGER
+            && command.prepared_expected_target.as_ref() == Some(expected)
+    )
+}
+
+fn mutation_failed_outcome(
+    transaction_id: &str,
+    attempt_token: &str,
+    reason: &str,
+) -> CommandOutcomeV0 {
+    CommandOutcomeV0::Event(Box::new(
+        oxideloop_controller_core::EventV0::MutationFailed {
+            attempt_token: attempt_token.into(),
+            transaction_id: transaction_id.into(),
+            reason: reason.into(),
+        },
+    ))
+}
+
 fn owned_by(object: &ObjectV0, root_uid: &str) -> bool {
     object.metadata.owner_uids.iter().any(|uid| uid == root_uid)
 }
@@ -3224,8 +3465,19 @@ fn owned_mutation_object(
     tx: &str,
     command: &MutationCommandV0,
 ) -> Result<ObjectV0, TransportErrorV0> {
-    validate_desired_object(body, reference)?;
     let mut value = body.clone();
+    {
+        let metadata = value
+            .pointer_mut("/metadata")
+            .and_then(Value::as_object_mut)
+            .ok_or(TransportErrorV0::MetadataSmuggling)?;
+        // The model's conditional-apply envelope carries its observed UID/RV
+        // as an authority claim. Transport checks those claims against the
+        // fresh target before this point; neither field is desired state.
+        metadata.remove("uid");
+        metadata.remove("resourceVersion");
+    }
+    validate_desired_object(&value, reference)?;
     let metadata = value
         .pointer_mut("/metadata")
         .and_then(Value::as_object_mut)
@@ -3492,6 +3744,34 @@ pub fn validate_desired_object(
         return Err(TransportErrorV0::UnsupportedTarget);
     }
     Ok(())
+}
+
+/// Conditional-apply inputs may carry only the observed UID/RV supplied by
+/// the sealed decision. They are checked again against the fresh target at
+/// the force gate and removed from the desired apply document before writing.
+fn validate_conditional_apply_body(
+    object: &Value,
+    expected: &ObjectRefV0,
+    target: &oxideloop_mutation_model::ObjectIdentity,
+) -> Result<(), TransportErrorV0> {
+    let metadata = object
+        .pointer("/metadata")
+        .and_then(Value::as_object)
+        .ok_or(TransportErrorV0::MetadataSmuggling)?;
+    if metadata.get("uid").and_then(Value::as_str) != Some(target.uid.as_str())
+        || metadata.get("resourceVersion").and_then(Value::as_str)
+            != Some(target.resource_version.as_str())
+    {
+        return Err(TransportErrorV0::ManualRecoveryHold);
+    }
+    let mut sanitized = object.clone();
+    let metadata = sanitized
+        .pointer_mut("/metadata")
+        .and_then(Value::as_object_mut)
+        .ok_or(TransportErrorV0::MetadataSmuggling)?;
+    metadata.remove("uid");
+    metadata.remove("resourceVersion");
+    validate_desired_object(&sanitized, expected)
 }
 
 /// P5 v0 deliberately supports only `ClusterIP` Service semantics. Headless

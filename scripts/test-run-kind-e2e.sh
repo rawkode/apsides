@@ -50,8 +50,8 @@ run_guard() {
   [ "$result" -ne 0 ] && grep -Fq "$expected" "$TEMP/out"
 }
 
-assert_contains() { grep -Fq "$1" "$ROOT/scripts/run-kind-e2e.sh" || { echo "missing runner contract: $1" >&2; exit 1; }; }
-assert_not_contains() { ! grep -Fq "$1" "$ROOT/scripts/run-kind-e2e.sh" || { echo "obsolete or vacuous runner contract: $1" >&2; exit 1; }; }
+assert_contains() { grep -Fq -- "$1" "$ROOT/scripts/run-kind-e2e.sh" || { echo "missing runner contract: $1" >&2; exit 1; }; }
+assert_not_contains() { ! grep -Fq -- "$1" "$ROOT/scripts/run-kind-e2e.sh" || { echo "obsolete or vacuous runner contract: $1" >&2; exit 1; }; }
 
 mkdir -p "$TEMP/repo/work/kind-e2e/existing"
 run_guard 'evidence path already exists' env RUN_ID=existing scripts/run-kind-e2e.sh
@@ -282,6 +282,63 @@ jq '.status.containerStatuses[0].lastState.terminated.message = false' "$TEMP/co
 jq 'del(.status.containerStatuses[0].lastState.terminated.message)' "$TEMP/collision-valid.json" >"$TEMP/collision-message-missing.json"; assert_collision_rejected "$TEMP/collision-message-missing.json"
 jq '.status.containerStatuses[0].restartCount = "4"' "$TEMP/collision-valid.json" >"$TEMP/collision-restart-string.json"; assert_collision_rejected "$TEMP/collision-restart-string.json"
 
+# Managed-fields proof is fixture-driven so the E2E runner cannot accidentally
+# accept Update ownership, an incorrect subresource, or a vacuous fieldsV1.
+sed -n '/^managed_field_ownership_from_json() {/,/^}/p' "$ROOT/scripts/run-kind-e2e.sh" >"$TEMP/managed-fields.sh"
+. "$TEMP/managed-fields.sh"
+write_managed_fields_fixture() {
+  fixture=$1; subresource=$2; field=$3
+  jq -n --arg subresource "$subresource" --arg field "$field" '
+    {metadata:{uid:"object-uid",resourceVersion:"42",managedFields:[
+      ({manager:"oxideloop-controller",operation:"Apply",fieldsType:"FieldsV1",fieldsV1:{($field):{}}} + (if $subresource == "absent" then {} else {subresource:$subresource} end))
+    ]}}
+  ' >"$fixture"
+}
+assert_managed_fields_rejected() {
+  if managed_field_ownership_from_json "$1" configmap/root-config main 'f:data' >/dev/null 2>&1; then
+    echo "invalid managed-fields ownership was accepted: $1" >&2
+    exit 1
+  fi
+}
+write_managed_fields_fixture "$TEMP/managed-config-valid.json" absent 'f:data'
+managed_field_ownership_from_json "$TEMP/managed-config-valid.json" configmap/root-config main 'f:data' >"$TEMP/managed-config-assertion.json"
+jq -e '.resource == "configmap/root-config" and .manager == "oxideloop-controller" and .operation == "Apply" and .subresource == null and .representativeField == "f:data"' "$TEMP/managed-config-assertion.json" >/dev/null
+jq '.metadata.managedFields[0].manager = "other"' "$TEMP/managed-config-valid.json" >"$TEMP/managed-wrong-manager.json"; assert_managed_fields_rejected "$TEMP/managed-wrong-manager.json"
+jq '.metadata.managedFields[0].operation = "Update"' "$TEMP/managed-config-valid.json" >"$TEMP/managed-update.json"; assert_managed_fields_rejected "$TEMP/managed-update.json"
+jq '.metadata.managedFields[0].subresource = "status"' "$TEMP/managed-config-valid.json" >"$TEMP/managed-main-status.json"; assert_managed_fields_rejected "$TEMP/managed-main-status.json"
+jq 'del(.metadata.managedFields[0].fieldsV1["f:data"])' "$TEMP/managed-config-valid.json" >"$TEMP/managed-no-data.json"; assert_managed_fields_rejected "$TEMP/managed-no-data.json"
+write_managed_fields_fixture "$TEMP/managed-root-status-valid.json" status 'f:status'
+managed_field_ownership_from_json "$TEMP/managed-root-status-valid.json" webapplication/root status 'f:status' >"$TEMP/managed-root-status-assertion.json"
+jq -e '.resource == "webapplication/root" and .subresource == "status" and .representativeField == "f:status"' "$TEMP/managed-root-status-assertion.json" >/dev/null
+if managed_field_ownership_from_json "$TEMP/managed-root-status-valid.json" webapplication/root main 'f:status' >/dev/null 2>&1; then
+  echo 'status managed-fields ownership was accepted as a main-resource apply' >&2
+  exit 1
+fi
+
+# The restart snapshot has no dependency on list order or resourceVersion; it
+# accepts exactly one UID-bearing root, state, ConfigMap, and Service.
+sed -n '/^ownership_restart_identities() {/,/^}/p' "$ROOT/scripts/run-kind-e2e.sh" >"$TEMP/ownership-restart-identities.sh"
+. "$TEMP/ownership-restart-identities.sh"
+STATE_NAME=state-for-root
+NAMESPACE=test-namespace
+ctx() { cat "$TEMP/ownership-restart-fixture.json"; }
+jq -n '
+  {items:[
+    {kind:"Service",metadata:{name:"root-service",uid:"service-uid"}},
+    {kind:"ConfigMap",metadata:{name:"root-config",uid:"config-uid"}},
+    {kind:"WebApplication",metadata:{name:"root",uid:"root-uid"}},
+    {kind:"OxideLoopState",metadata:{name:"state-for-root",uid:"state-uid"}}
+  ]}
+' >"$TEMP/ownership-restart-fixture.json"
+ownership_restart_identities >"$TEMP/ownership-restart-identities.json"
+jq -e '. == {root:{name:"root",uid:"root-uid"},state:{name:"state-for-root",uid:"state-uid"},config:{name:"root-config",uid:"config-uid"},service:{name:"root-service",uid:"service-uid"}}' "$TEMP/ownership-restart-identities.json" >/dev/null
+jq 'del(.items[] | select(.kind == "Service"))' "$TEMP/ownership-restart-fixture.json" >"$TEMP/ownership-restart-missing-service.json"
+mv "$TEMP/ownership-restart-missing-service.json" "$TEMP/ownership-restart-fixture.json"
+if ownership_restart_identities >/dev/null 2>&1; then
+  echo 'restart identity snapshot accepted a missing Service' >&2
+  exit 1
+fi
+
 # The E2E-only overlay must request a durable termination message from the
 # controller without changing the production deployment.
 rg -Fq 'terminationMessagePolicy: FallbackToLogsOnError' "$ROOT/deploy/e2e/patch-deployment.yaml" || { echo 'missing E2E controller termination message policy' >&2; exit 1; }
@@ -319,6 +376,41 @@ assert_not_contains "wait_json 'root current render status and durable link'"
 assert_contains 'configmap/root-config --arg rootUid "$ROOT_UID"'
 assert_contains 'collision recovery reused the foreign ConfigMap UID'
 
+# P13-D must run after initial ConfigMap+Service convergence and before the
+# independent prune gate. It captures raw managed-fields documents, records
+# their hashes through atomic capture, and restarts while the Service exists.
+ownership_transition_line=$(rg -n -F 'e2e-ownership-transition=$RUN_ID' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+ownership_config_wait_line=$(rg -n -F "wait_for_same_uid_changed_rv 'ConfigMap ConditionalApply ownership transition'" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+ownership_service_wait_line=$(rg -n -F "wait_for_same_uid_changed_rv 'Service ConditionalApply ownership transition'" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+ownership_state_capture_line=$(rg -n -F 'capture_managed_field_ownership state "oxideloopstate/$STATE_NAME" main '\''f:spec'\''' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+ownership_config_capture_line=$(rg -n -F 'capture_managed_field_ownership config configmap/root-config main '\''f:data'\''' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+ownership_service_capture_line=$(rg -n -F 'capture_managed_field_ownership service service/root-service main '\''f:spec'\''' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+ownership_root_capture_line=$(rg -n -F 'capture_managed_field_ownership root-status webapplication/root status '\''f:status'\''' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+ownership_restart_line=$(rg -n -F "restart_controller 'ownership transition'" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+ownership_service_present_line=$(rg -n -F "wait_json 'ownership restart Service remains present'" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+prune_line=$(rg -n -F 'ctx patch webapplication root -n "$NAMESPACE" --type merge -p '\''{"spec":{"expose":false}}'\''' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+[ "$ownership_transition_line" -lt "$ownership_config_wait_line" ] && [ "$ownership_config_wait_line" -lt "$ownership_service_wait_line" ] && [ "$ownership_service_wait_line" -lt "$ownership_state_capture_line" ] && [ "$ownership_state_capture_line" -lt "$ownership_config_capture_line" ] && [ "$ownership_config_capture_line" -lt "$ownership_service_capture_line" ] && [ "$ownership_service_capture_line" -lt "$ownership_root_capture_line" ] && [ "$ownership_root_capture_line" -lt "$ownership_restart_line" ] && [ "$ownership_restart_line" -lt "$ownership_service_present_line" ] && [ "$ownership_service_present_line" -lt "$prune_line" ] || { echo 'ownership transition must reconcile, capture all main/status ownership, restart with Service present, then prune' >&2; exit 1; }
+automation_completion_line=$(rg -n -F "assert_automation_transition 1 \"\$INPUT_UID\" \"\$INPUT_RV\" chocolate" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+automation_ownership_line=$(rg -n -F "capture_managed_field_ownership automationrun-status \"automationrun/\$AUTOMATION_RUN_NAME\" status 'f:status'" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+automation_capture_line=$(rg -n -F 'capture_transition chocolate' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+[ "$automation_completion_line" -lt "$automation_ownership_line" ] && [ "$automation_ownership_line" -lt "$automation_capture_line" ] || { echo 'AutomationRun status ownership must be captured after completion and before transition evidence' >&2; exit 1; }
+for ownership_contract in \
+  'managed_field_ownership_from_json' \
+  'atomic_capture_ownership' \
+  'ownership-restart-identities-before.json' \
+  'ownership-restart-identities-after.json' \
+  'ConfigMap ConditionalApply ownership transition changed its UID' \
+  'Service ConditionalApply ownership transition changed its UID' \
+  'ownership restart changed root, state, ConfigMap, or Service identities' \
+  '--show-managed-fields' \
+  'ownershipEvidence:$ownershipEvidence' \
+  'missing oxideloop-controller Apply ownership' \
+  'f:spec' \
+  'f:data' \
+  'f:status'; do
+  assert_contains "$ownership_contract"
+done
+
 # These source-level assertions intentionally reject the regressions that a
 # command fake cannot model: empty successful captures, list-index crash
 # checks, vacuous image checks, and count-only automation/deletion evidence.
@@ -349,6 +441,8 @@ for token in \
   'source revision changed during run' \
   'kind cluster deletion failed' \
   'artifact-inventory.json' \
+  'ownership-restart-identities-before.json' \
+  'automationrun-status' \
   'kind-e2e-reproducibility/v1'; do
   assert_contains "$token"
 done

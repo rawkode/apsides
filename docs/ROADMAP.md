@@ -18,6 +18,16 @@ Gate: envtest coverage for watch restarts, generation changes, stale observation
 
 Add server-side apply behind an explicit feature gate. Define field-manager identity, inventory persistence, adoption policy, readiness, pruning, finalizers, conflict behavior, and deletion recovery before enabling writes. Re-render from observed state; never allow JavaScript to issue imperative API calls.
 
+P13-E keeps create as `POST` with strict no-adoption. Lazy SSA ownership
+acquisition uses force only for fully fenced State Persist, inventory-pinned
+ConfigMap/Service ConditionalApply, and normal WebApplication status after
+bootstrap Merge. AutomationRun status and all POST, delete, finalizer, metadata,
+and bootstrap paths remain non-force. A definite forced-write `409` receives one
+proof-only reread, with no retry or stale rebase; unproven State/root status
+holds, while child mutation emits a token-bound failure and then holds.
+Canonical legacy objects may be lazily claimed on their next authorized write;
+malformed or ownerless objects hold.
+
 Gate: kind-backed integration tests for create/update/conflict/delete/restart flows, rollback tests for inventory state, and a default-deny adoption policy.
 
 ## M4: event-driven hooks
@@ -31,6 +41,8 @@ Gate: replay and crash tests prove at-least-once delivery without duplicate mate
 Freeze a versioned ABI only after compatibility fixtures cover SDK, compiler, worker, and controller upgrades. Add signatures and provenance for bundles, supply-chain policy, multi-tenant isolation, metrics, tracing, leader election, backpressure, and upgrade/rollback procedures.
 
 Gate: adversarial review, resource-exhaustion tests, conformance matrix, documented support window, and an operator-visible migration path.
+
+Broad installed-cluster migration or reset remains an explicit M5 non-goal.
 
 ## Deliberate non-goals
 

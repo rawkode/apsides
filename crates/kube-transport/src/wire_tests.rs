@@ -14,7 +14,9 @@ use http::{Method, Request, Response, StatusCode};
 use kube::{Client, client::Body};
 use oxideloop_controller_api::{
     AutomationRunCompletion, AutomationRunCompletionState, AutomationRunSpec, AutomationRunStatus,
-    ObjectIdentity, ProgramBundleReference, WebApplicationStatus, automation_run_name,
+    DurablePhase, ObjectIdentity, OxideLoopStateSpec, PersistOperation, PersistPurpose,
+    ProgramBundleReference, RootBinding, StateBody, StateLink, WebApplicationStatus,
+    automation_run_name, bootstrap_id,
 };
 use oxideloop_controller_core::{
     CommandV0, MutationCommandV0, PreconditionsV0, root_finalizer_command_token,
@@ -35,8 +37,8 @@ use super::{
     AutomationRunExpectationV0, AutomationRunObservationBarrierV0, COMMAND_ID_ANNOTATION,
     ConflictProvenanceV0, KubeTransportV0, ListV0, ObjectMetaV0, ObjectRefV0, ObjectV0,
     ROOT_FINALIZER, ROOT_UID_ANNOTATION, ReadOperationV0, ResourceKindV0, RootAddressV0,
-    TRANSACTION_ID_ANNOTATION, TransportErrorV0, WatchEventV0, WatchHandleV0, WatchStageV0,
-    WriteOperationV0, validate_automation_run_get, validate_automation_run_list,
+    STATE_FINALIZER, TRANSACTION_ID_ANNOTATION, TransportErrorV0, WatchEventV0, WatchHandleV0,
+    WatchStageV0, WriteOperationV0, validate_automation_run_get, validate_automation_run_list,
     validate_automation_run_observation, validate_automation_watch_event,
 };
 
@@ -447,6 +449,252 @@ fn desired(kind: ResourceKindV0, name: &str, rv: &str) -> ObjectV0 {
     }
 }
 
+fn force_fence_objects() -> (Value, Value, Value) {
+    let root = json!({
+        "apiVersion":"demo.oxideloop.dev/v1alpha1", "kind":"WebApplication",
+        "metadata":{"name":"app-a","namespace":"tenant-a","uid":"root-uid","resourceVersion":"9","generation":1,
+            "finalizers":[ROOT_FINALIZER], "annotations":{ROOT_UID_ANNOTATION:"root-uid"}},
+        "status":{"state":{"rootUid":"root-uid","name":"state-a","uid":"state-uid"}}
+    });
+    let state = json!({
+        "apiVersion":"runtime.oxideloop.dev/v1alpha1", "kind":"OxideLoopState",
+        "metadata":{"name":"state-a","namespace":"tenant-a","uid":"state-uid","resourceVersion":"4",
+            "finalizers":[STATE_FINALIZER], "annotations":{ROOT_UID_ANNOTATION:"root-uid"},
+            "ownerReferences":[{"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication","name":"app-a","uid":"root-uid","controller":true,"blockOwnerDeletion":false}]}
+    });
+    let child = json!({
+        "apiVersion":"v1", "kind":"ConfigMap",
+        "metadata":{"name":"cm-a","namespace":"tenant-a","uid":"child-uid","resourceVersion":"7",
+            "annotations":{ROOT_UID_ANNOTATION:"root-uid"},
+            "ownerReferences":[{"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication","name":"app-a","uid":"root-uid","controller":true,"blockOwnerDeletion":false}]},
+        "data":{"old":"value"}
+    });
+    (root, state, child)
+}
+
+fn conditional_apply_command(
+    prepared: Option<oxideloop_mutation_model::ObjectIdentity>,
+    content_type: &str,
+    manager: &str,
+    force: bool,
+) -> CommandV0 {
+    CommandV0::Mutate {
+        transaction_id: "tx".into(),
+        attempt_token: "attempt".into(),
+        commands: vec![MutationCommandV0 {
+            command_id: "command".into(),
+            attempt_token: "attempt".into(),
+            preconditions: PreconditionsV0 {
+                root_uid: "root-uid".into(),
+                root_generation: 1,
+                root_resource_version: "9".into(),
+                state_uid: "state-uid".into(),
+                state_resource_version: "4".into(),
+                observation_token: "o".into(),
+                cache_epoch: "e".into(),
+            },
+            identity: ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "tenant-a".into(),
+                name: "cm-a".into(),
+            },
+            logical_id: "cm-a".into(),
+            prepared_expected_target: prepared,
+            decision: MutationDecision::ConditionalApply {
+                method: HttpMethod::Patch,
+                content_type: content_type.into(),
+                field_manager: manager.into(),
+                force,
+                expected: oxideloop_mutation_model::ObjectIdentity {
+                    uid: "child-uid".into(),
+                    resource_version: "7".into(),
+                },
+                body: json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm-a","namespace":"tenant-a","uid":"child-uid","resourceVersion":"7"},"data":{"new":"value"}}),
+            },
+        }],
+    }
+}
+
+fn force_fence_script(child: Value) -> Vec<Expected> {
+    let (root, state, _) = force_fence_objects();
+    vec![
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a",
+            content_type: None,
+            body: None,
+            response: response(root),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/state-a",
+            content_type: None,
+            body: None,
+            response: response(state),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: "/api/v1/namespaces/tenant-a/configmaps/cm-a",
+            content_type: None,
+            body: None,
+            response: response(child),
+        },
+    ]
+}
+
+fn force_preconditions() -> PreconditionsV0 {
+    PreconditionsV0 {
+        root_uid: "root-uid".into(),
+        root_generation: 1,
+        root_resource_version: "9".into(),
+        state_uid: "state-uid".into(),
+        state_resource_version: "4".into(),
+        observation_token: "o".into(),
+        cache_epoch: "e".into(),
+    }
+}
+
+fn persisted_state() -> OxideLoopStateSpec {
+    OxideLoopStateSpec {
+        state_version: 1,
+        root: RootBinding {
+            uid: "root-uid".into(),
+            bootstrap_id: bootstrap_id("root-uid").expect("bootstrap id"),
+            bundle_digest: "bundle".into(),
+        },
+        state: StateBody::default(),
+    }
+}
+
+fn persist_command() -> CommandV0 {
+    CommandV0::Persist {
+        state: persisted_state(),
+        preconditions: force_preconditions(),
+        operation: PersistOperation {
+            token: "a".repeat(64),
+            purpose: PersistPurpose::Prepare,
+            phase: DurablePhase::Prepare,
+            old_state_resource_version: "4".into(),
+            root_generation: 1,
+        },
+    }
+}
+
+fn persist_state_patch_body(state: &OxideLoopStateSpec) -> Value {
+    json!({
+        "apiVersion":"runtime.oxideloop.dev/v1alpha1", "kind":"OxideLoopState",
+        "metadata":{"name":"state-a","namespace":"tenant-a","resourceVersion":"4",
+            "annotations":{ROOT_UID_ANNOTATION:"root-uid",TRANSACTION_ID_ANNOTATION:"a".repeat(64),COMMAND_ID_ANNOTATION:"a".repeat(64)}},
+        "spec":state,
+    })
+}
+
+fn root_status_command() -> CommandV0 {
+    let token = "b".repeat(64);
+    CommandV0::PersistRootStatus {
+        token: token.clone(),
+        root_uid: "root-uid".into(),
+        old_root_resource_version: "9".into(),
+        preconditions: force_preconditions(),
+        status: WebApplicationStatus {
+            last_status_persist_token: Some(token),
+            state: Some(StateLink {
+                root_uid: "root-uid".into(),
+                name: "state-a".into(),
+                uid: "state-uid".into(),
+            }),
+            ..Default::default()
+        },
+    }
+}
+
+fn state_force_script(recovery: Value) -> Vec<Expected> {
+    let (root, state, _) = force_fence_objects();
+    let body = persist_state_patch_body(&persisted_state());
+    vec![
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a",
+            content_type: None,
+            body: None,
+            response: response(root),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/state-a",
+            content_type: None,
+            body: None,
+            response: response(state),
+        },
+        Expected {
+            method: Method::PATCH,
+            path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/state-a?&force=true&fieldManager=oxideloop-controller",
+            content_type: Some("application/apply-patch+yaml"),
+            body: Some(body),
+            response: status(
+                StatusCode::CONFLICT,
+                json!({"kind":"Status","apiVersion":"v1","code":409}),
+            ),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/state-a",
+            content_type: None,
+            body: None,
+            response: response(recovery),
+        },
+    ]
+}
+
+fn root_status_force_script(recovery: Value) -> Vec<Expected> {
+    let (root, state, _) = force_fence_objects();
+    let CommandV0::PersistRootStatus {
+        status: desired_status,
+        ..
+    } = root_status_command()
+    else {
+        unreachable!()
+    };
+    let body = json!({
+        "apiVersion":"demo.oxideloop.dev/v1alpha1", "kind":"WebApplication",
+        "metadata":{"name":"app-a","namespace":"tenant-a","resourceVersion":"9"}, "status":desired_status,
+    });
+    vec![
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a",
+            content_type: None,
+            body: None,
+            response: response(root),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/state-a",
+            content_type: None,
+            body: None,
+            response: response(state),
+        },
+        Expected {
+            method: Method::PATCH,
+            path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a/status?&force=true&fieldManager=oxideloop-controller",
+            content_type: Some("application/apply-patch+yaml"),
+            body: Some(body),
+            response: status(
+                StatusCode::CONFLICT,
+                json!({"kind":"Status","apiVersion":"v1","code":409}),
+            ),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a",
+            content_type: None,
+            body: None,
+            response: response(recovery),
+        },
+    ]
+}
+
 fn delete_command(
     kind: ResourceKindV0,
     name: &str,
@@ -475,6 +723,10 @@ fn delete_command(
                 name: name.into(),
             },
             logical_id: name.into(),
+            prepared_expected_target: Some(oxideloop_mutation_model::ObjectIdentity {
+                uid: uid.into(),
+                resource_version: resource_version.into(),
+            }),
             decision: MutationDecision::PreconditionedDelete {
                 method: HttpMethod::Delete,
                 preconditions: oxideloop_mutation_model::ObjectIdentity {
@@ -555,6 +807,7 @@ async fn unsupported_service_mode_is_rejected_before_any_fence_or_write_request(
                 name: "svc".into(),
             },
             logical_id: "svc".into(),
+            prepared_expected_target: None,
             decision: MutationDecision::Post {
                 method: HttpMethod::Post,
                 body: json!({"apiVersion":"v1","kind":"Service","metadata":{"name":"svc","namespace":"tenant-a"},"spec":{"type":"NodePort","ports":[{"port":80}]}}),
@@ -781,7 +1034,7 @@ async fn root_status_conflict_recovery_distinguishes_ack_stale_and_hold() {
         transport
             .recover_root_status(&address, "token", "root-uid", "99", &status)
             .await,
-        Err(TransportErrorV0::Stale("root status conflict"))
+        Err(TransportErrorV0::ManualRecoveryHold)
     );
     api.assert_drained();
 
@@ -795,12 +1048,7 @@ async fn root_status_conflict_recovery_distinguishes_ack_stale_and_hold() {
         transport
             .recover_root_status(&address, "token", "root-uid", "99", &status)
             .await,
-        Err(TransportErrorV0::NonRebasableConflict(
-            ConflictProvenanceV0::Write {
-                operation: WriteOperationV0::ApplyStatus,
-                resource: ResourceKindV0::WebApplication,
-            }
-        ))
+        Err(TransportErrorV0::ManualRecoveryHold)
     );
     api.assert_drained();
 }
@@ -1084,17 +1332,361 @@ async fn apply_status_and_delete_have_exact_wire_preconditions() {
     ]);
 
     transport
-        .patch_config_map(&config_map, "42")
+        .patch_config_map(&config_map, "42", false)
         .await
         .expect("SSA config map");
     transport
-        .patch_web_application_status(&root, "99")
+        .patch_web_application_status(&root, "99", false)
         .await
         .expect("status patch");
     transport
         .delete_config_map(&config_map.reference, "cm-uid", "43")
         .await
         .expect("delete");
+    api.assert_drained();
+}
+
+#[tokio::test]
+async fn forced_apply_is_limited_to_an_explicit_authorization() {
+    let config_map = desired(ResourceKindV0::ConfigMap, "cm-a", "42");
+    let state = desired(ResourceKindV0::OxideLoopState, "state-a", "4");
+    let mut root = desired(ResourceKindV0::WebApplication, "app-a", "9");
+    root.value = json!({
+        "apiVersion":"demo.oxideloop.dev/v1alpha1", "kind":"WebApplication",
+        "metadata":{"name":"app-a","namespace":"tenant-a"}, "status":{}
+    });
+    let (transport, api) = ScriptedApi::transport([
+        Expected {
+            method: Method::PATCH,
+            path_and_query: "/api/v1/namespaces/tenant-a/configmaps/cm-a?&force=true&fieldManager=oxideloop-controller",
+            content_type: Some("application/apply-patch+yaml"),
+            body: Some(
+                json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm-a","namespace":"tenant-a","resourceVersion":"42"},"spec":{"desired":true}}),
+            ),
+            response: response(object_json(
+                ResourceKindV0::ConfigMap,
+                "cm-a",
+                "child",
+                "43",
+            )),
+        },
+        Expected {
+            method: Method::PATCH,
+            path_and_query: "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/state-a?&force=true&fieldManager=oxideloop-controller",
+            content_type: Some("application/apply-patch+yaml"),
+            body: Some(
+                json!({"apiVersion":"runtime.oxideloop.dev/v1alpha1","kind":"OxideLoopState","metadata":{"name":"state-a","namespace":"tenant-a","resourceVersion":"4"},"spec":{"desired":true}}),
+            ),
+            response: response(object_json(
+                ResourceKindV0::OxideLoopState,
+                "state-a",
+                "state",
+                "5",
+            )),
+        },
+        Expected {
+            method: Method::PATCH,
+            path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a/status?&force=true&fieldManager=oxideloop-controller",
+            content_type: Some("application/apply-patch+yaml"),
+            body: Some(
+                json!({"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication","metadata":{"name":"app-a","namespace":"tenant-a","resourceVersion":"9"},"status":{}}),
+            ),
+            response: response(object_json(
+                ResourceKindV0::WebApplication,
+                "app-a",
+                "root",
+                "10",
+            )),
+        },
+    ]);
+    transport
+        .patch_config_map(&config_map, "42", true)
+        .await
+        .unwrap();
+    transport.patch_state(&state, "4", true).await.unwrap();
+    transport
+        .patch_web_application_status(&root, "9", true)
+        .await
+        .unwrap();
+    api.assert_drained();
+}
+
+#[tokio::test]
+async fn conditional_apply_authority_mismatches_issue_no_patch() {
+    let (_, _, child) = force_fence_objects();
+    let address = RootAddressV0 {
+        namespace: "tenant-a".into(),
+        name: "app-a".into(),
+        state_name: "state-a".into(),
+    };
+    let cases = [
+        (
+            None,
+            "application/apply-patch+yaml",
+            "oxideloop-controller",
+            true,
+        ),
+        (
+            Some(oxideloop_mutation_model::ObjectIdentity {
+                uid: "wrong".into(),
+                resource_version: "7".into(),
+            }),
+            "application/apply-patch+yaml",
+            "oxideloop-controller",
+            true,
+        ),
+        (
+            Some(oxideloop_mutation_model::ObjectIdentity {
+                uid: "child-uid".into(),
+                resource_version: "7".into(),
+            }),
+            "application/merge-patch+json",
+            "oxideloop-controller",
+            true,
+        ),
+        (
+            Some(oxideloop_mutation_model::ObjectIdentity {
+                uid: "child-uid".into(),
+                resource_version: "7".into(),
+            }),
+            "application/apply-patch+yaml",
+            "other",
+            true,
+        ),
+        (
+            Some(oxideloop_mutation_model::ObjectIdentity {
+                uid: "child-uid".into(),
+                resource_version: "7".into(),
+            }),
+            "application/apply-patch+yaml",
+            "oxideloop-controller",
+            false,
+        ),
+    ];
+    for (prepared, content_type, manager, force) in cases {
+        let (transport, api) = ScriptedApi::transport([]);
+        assert!(matches!(
+            transport
+                .dispatch(
+                    &address,
+                    &conditional_apply_command(prepared, content_type, manager, force)
+                )
+                .await,
+            Ok(super::CommandOutcomeV0::Event(_))
+        ));
+        api.assert_drained();
+    }
+    let mut target_pin_mismatch = child.clone();
+    target_pin_mismatch["metadata"]["resourceVersion"] = json!("8");
+    let (transport, api) = ScriptedApi::transport(force_fence_script(target_pin_mismatch));
+    assert!(matches!(
+        transport
+            .dispatch(
+                &address,
+                &conditional_apply_command(
+                    Some(oxideloop_mutation_model::ObjectIdentity {
+                        uid: "child-uid".into(),
+                        resource_version: "7".into(),
+                    }),
+                    "application/apply-patch+yaml",
+                    "oxideloop-controller",
+                    true,
+                ),
+            )
+            .await,
+        Ok(super::CommandOutcomeV0::Event(_))
+    ));
+    api.assert_drained();
+    let mut foreign_owner = child;
+    foreign_owner["metadata"]["ownerReferences"][0]["uid"] = json!("foreign-root");
+    let (transport, api) = ScriptedApi::transport(force_fence_script(foreign_owner));
+    assert!(matches!(
+        transport
+            .dispatch(
+                &address,
+                &conditional_apply_command(
+                    Some(oxideloop_mutation_model::ObjectIdentity {
+                        uid: "child-uid".into(),
+                        resource_version: "7".into(),
+                    }),
+                    "application/apply-patch+yaml",
+                    "oxideloop-controller",
+                    true,
+                ),
+            )
+            .await,
+        Ok(super::CommandOutcomeV0::Event(_))
+    ));
+    api.assert_drained();
+}
+
+#[tokio::test]
+async fn conditional_apply_409_rereads_once_and_only_acks_exact_prior_success() {
+    let (_, _, child) = force_fence_objects();
+    let address = RootAddressV0 {
+        namespace: "tenant-a".into(),
+        name: "app-a".into(),
+        state_name: "state-a".into(),
+    };
+    let command = conditional_apply_command(
+        Some(oxideloop_mutation_model::ObjectIdentity {
+            uid: "child-uid".into(),
+            resource_version: "7".into(),
+        }),
+        "application/apply-patch+yaml",
+        "oxideloop-controller",
+        true,
+    );
+    let patch_body = json!({
+        "apiVersion":"v1", "kind":"ConfigMap",
+        "metadata":{"name":"cm-a","namespace":"tenant-a","resourceVersion":"7",
+            "annotations":{ROOT_UID_ANNOTATION:"root-uid",TRANSACTION_ID_ANNOTATION:"tx",COMMAND_ID_ANNOTATION:"command"},
+            "ownerReferences":[{"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication","name":"app-a","uid":"root-uid","controller":true,"blockOwnerDeletion":false}]},
+        "data":{"new":"value"}
+    });
+    let recovered = json!({
+        "apiVersion":"v1", "kind":"ConfigMap",
+        "metadata":{"name":"cm-a","namespace":"tenant-a","uid":"child-uid","resourceVersion":"8",
+            "annotations":{ROOT_UID_ANNOTATION:"root-uid",TRANSACTION_ID_ANNOTATION:"tx",COMMAND_ID_ANNOTATION:"command"},
+            "ownerReferences":[{"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication","name":"app-a","uid":"root-uid","controller":true,"blockOwnerDeletion":false}]},
+        "data":{"new":"value"}
+    });
+    let mut exact = force_fence_script(child.clone());
+    exact.push(Expected {
+        method:Method::PATCH,
+        path_and_query:"/api/v1/namespaces/tenant-a/configmaps/cm-a?&force=true&fieldManager=oxideloop-controller",
+        content_type:Some("application/apply-patch+yaml"), body:Some(patch_body.clone()),
+        response:status(StatusCode::CONFLICT, json!({"kind":"Status","apiVersion":"v1","code":409})),
+    });
+    exact.push(Expected {
+        method: Method::GET,
+        path_and_query: "/api/v1/namespaces/tenant-a/configmaps/cm-a",
+        content_type: None,
+        body: None,
+        response: response(recovered),
+    });
+    let (transport, api) = ScriptedApi::transport(exact);
+    let outcome = transport.dispatch(&address, &command).await.unwrap();
+    assert!(matches!(
+        outcome,
+        super::CommandOutcomeV0::Event(event)
+            if matches!(
+                event.as_ref(),
+                oxideloop_controller_core::EventV0::MutationAcknowledged {
+                    transaction_id,
+                    attempt_token,
+                    ..
+                } if transaction_id == "tx" && attempt_token == "attempt"
+            )
+    ));
+    api.assert_drained();
+
+    let mut mismatch = force_fence_script(child);
+    mismatch.push(Expected {
+        method:Method::PATCH,
+        path_and_query:"/api/v1/namespaces/tenant-a/configmaps/cm-a?&force=true&fieldManager=oxideloop-controller",
+        content_type:Some("application/apply-patch+yaml"), body:Some(patch_body),
+        response:status(StatusCode::CONFLICT, json!({"kind":"Status","apiVersion":"v1","code":409})),
+    });
+    mismatch.push(Expected { method:Method::GET, path_and_query:"/api/v1/namespaces/tenant-a/configmaps/cm-a", content_type:None, body:None, response:response(json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm-a","namespace":"tenant-a","uid":"child-uid","resourceVersion":"8"},"data":{"other":"value"}})) });
+    let (transport, api) = ScriptedApi::transport(mismatch);
+    let outcome = transport
+        .dispatch(&address, &command)
+        .await
+        .expect("conflict becomes a reducer event");
+    assert!(matches!(
+        outcome,
+        super::CommandOutcomeV0::Event(event)
+            if matches!(
+                event.as_ref(),
+                oxideloop_controller_core::EventV0::MutationFailed {
+                    transaction_id,
+                    attempt_token,
+                    ..
+                } if transaction_id == "tx" && attempt_token == "attempt"
+            )
+    ));
+    api.assert_drained();
+}
+
+#[tokio::test]
+async fn persist_state_409_rereads_once_and_requires_an_exact_advanced_proof() {
+    let address = RootAddressV0 {
+        namespace: "tenant-a".into(),
+        name: "app-a".into(),
+        state_name: "state-a".into(),
+    };
+    let (_, mut recovered, _) = force_fence_objects();
+    recovered["metadata"]["resourceVersion"] = json!("5");
+    recovered["metadata"]["annotations"][TRANSACTION_ID_ANNOTATION] = json!("a".repeat(64));
+    recovered["metadata"]["annotations"][COMMAND_ID_ANNOTATION] = json!("a".repeat(64));
+    recovered["spec"] = serde_json::to_value(persisted_state()).unwrap();
+    let (transport, api) = ScriptedApi::transport(state_force_script(recovered));
+    assert!(matches!(
+        transport.dispatch(&address, &persist_command()).await,
+        Ok(super::CommandOutcomeV0::Event(event))
+            if matches!(event.as_ref(), oxideloop_controller_core::EventV0::Persisted { .. })
+    ));
+    api.assert_drained();
+
+    let (_, unchanged, _) = force_fence_objects();
+    let (transport, api) = ScriptedApi::transport(state_force_script(unchanged));
+    assert_eq!(
+        transport.dispatch(&address, &persist_command()).await,
+        Err(TransportErrorV0::ManualRecoveryHold)
+    );
+    api.assert_drained();
+
+    let (_, mut divergent, _) = force_fence_objects();
+    divergent["metadata"]["resourceVersion"] = json!("5");
+    divergent["metadata"]["annotations"][TRANSACTION_ID_ANNOTATION] = json!("a".repeat(64));
+    divergent["metadata"]["annotations"][COMMAND_ID_ANNOTATION] = json!("a".repeat(64));
+    divergent["spec"] = json!({"divergent":true});
+    let (transport, api) = ScriptedApi::transport(state_force_script(divergent));
+    assert_eq!(
+        transport.dispatch(&address, &persist_command()).await,
+        Err(TransportErrorV0::ManualRecoveryHold)
+    );
+    api.assert_drained();
+}
+
+#[tokio::test]
+async fn persist_root_status_409_rereads_once_and_requires_an_exact_advanced_proof() {
+    let address = RootAddressV0 {
+        namespace: "tenant-a".into(),
+        name: "app-a".into(),
+        state_name: "state-a".into(),
+    };
+    let CommandV0::PersistRootStatus { status, .. } = root_status_command() else {
+        unreachable!()
+    };
+    let (mut recovered, _, _) = force_fence_objects();
+    recovered["metadata"]["resourceVersion"] = json!("10");
+    recovered["status"] = serde_json::to_value(&status).unwrap();
+    let (transport, api) = ScriptedApi::transport(root_status_force_script(recovered));
+    assert!(matches!(
+        transport.dispatch(&address, &root_status_command()).await,
+        Ok(super::CommandOutcomeV0::Event(event))
+            if matches!(event.as_ref(), oxideloop_controller_core::EventV0::RootStatusPersisted { .. })
+    ));
+    api.assert_drained();
+
+    let (unchanged, _, _) = force_fence_objects();
+    let (transport, api) = ScriptedApi::transport(root_status_force_script(unchanged));
+    assert_eq!(
+        transport.dispatch(&address, &root_status_command()).await,
+        Err(TransportErrorV0::ManualRecoveryHold)
+    );
+    api.assert_drained();
+
+    let (mut divergent, _, _) = force_fence_objects();
+    divergent["metadata"]["resourceVersion"] = json!("10");
+    divergent["status"]["lastStatusPersistToken"] = json!("other");
+    let (transport, api) = ScriptedApi::transport(root_status_force_script(divergent));
+    assert_eq!(
+        transport.dispatch(&address, &root_status_command()).await,
+        Err(TransportErrorV0::ManualRecoveryHold)
+    );
     api.assert_drained();
 }
 
@@ -2158,7 +2750,7 @@ async fn stale_pins_make_no_effect_request_and_409_maps_to_conflict() {
     let stale = desired(ResourceKindV0::ConfigMap, "cm-a", "actual");
     let (transport, api) = ScriptedApi::transport([]);
     assert_eq!(
-        transport.patch_config_map(&stale, "expected").await,
+        transport.patch_config_map(&stale, "expected", false).await,
         Err(TransportErrorV0::Stale("write resourceVersion"))
     );
     api.assert_drained();
@@ -2177,7 +2769,7 @@ async fn stale_pins_make_no_effect_request_and_409_maps_to_conflict() {
         ),
     }]);
     assert_eq!(
-        transport.patch_config_map(&conflict, "42").await,
+        transport.patch_config_map(&conflict, "42", false).await,
         Err(TransportErrorV0::Conflict(ConflictProvenanceV0::Write {
             operation: WriteOperationV0::Apply,
             resource: ResourceKindV0::ConfigMap,

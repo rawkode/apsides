@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::Path;
 
-use oxideloop_mutation_model::{MutationDecision, MutationIntent, ProbeCaseV0, plan};
+use oxideloop_mutation_model::{
+    CONTROLLER_FIELD_MANAGER, MutationDecision, MutationIntent, ProbeCaseV0, plan,
+};
 
 #[test]
 fn every_probe_fixture_matches_the_model() {
@@ -25,14 +27,21 @@ fn every_probe_fixture_matches_the_model() {
 }
 
 #[test]
-fn conditional_apply_is_always_force_false() {
+fn conditional_apply_is_always_forced_by_the_controller_manager() {
     let fixture =
         include_str!("../../../probes/conditional-mutation/v0/fixtures/conditional-apply.json");
     let case: ProbeCaseV0 = serde_json::from_str(fixture).unwrap();
-    let MutationDecision::ConditionalApply { force, body, .. } = plan(&case.input).unwrap() else {
+    let MutationDecision::ConditionalApply {
+        force,
+        field_manager,
+        body,
+        ..
+    } = plan(&case.input).unwrap()
+    else {
         panic!("fixture did not produce conditional apply")
     };
-    assert!(!force);
+    assert!(force);
+    assert_eq!(field_manager, CONTROLLER_FIELD_MANAGER);
     assert_eq!(body["metadata"]["uid"], "uid-1");
     assert_eq!(body["metadata"]["resourceVersion"], "17");
 }
