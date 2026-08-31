@@ -1864,6 +1864,25 @@ pub struct ControllerRuntimeV0 {
     actors: BTreeMap<ActorKeyV0, RootActorV0>,
 }
 
+/// Kubernetes omits `metadata.finalizers` for a fresh object with no
+/// finalizers. An explicitly present value remains strict: only an array of
+/// strings is a valid finalizer list.
+fn metadata_finalizers<'a>(
+    metadata: &'a serde_json::Map<String, Value>,
+    error: &'static str,
+) -> Result<&'a [Value], RuntimeErrorV0> {
+    let Some(value) = metadata.get("finalizers") else {
+        return Ok(&[]);
+    };
+    let Some(finalizers) = value.as_array() else {
+        return Err(RuntimeErrorV0::Hold(error.into()));
+    };
+    if finalizers.iter().any(|value| value.as_str().is_none()) {
+        return Err(RuntimeErrorV0::Hold(error.into()));
+    }
+    Ok(finalizers)
+}
+
 /// Validate the raw transport DTO before it becomes reducer authority. This is
 /// deliberately local and narrow: callers must nominate the exact root key,
 /// while the typed spec/status parsers reject unknown authored/status fields.
@@ -1904,13 +1923,7 @@ pub fn root_snapshot_from_object(
         .and_then(Value::as_i64)
         .filter(|value| *value >= 0)
         .ok_or_else(|| RuntimeErrorV0::Hold("root generation is invalid".into()))?;
-    let finalizers = metadata
-        .get("finalizers")
-        .and_then(Value::as_array)
-        .ok_or_else(|| RuntimeErrorV0::Hold("root finalizers are invalid".into()))?;
-    if finalizers.iter().any(|value| value.as_str().is_none()) {
-        return Err(RuntimeErrorV0::Hold("root finalizers are invalid".into()));
-    }
+    let finalizers = metadata_finalizers(metadata, "root finalizers are invalid")?;
     let spec: WebApplicationSpec = serde_json::from_value(
         object
             .value
@@ -2047,15 +2060,7 @@ fn install_linked_state_pins(
             "linked state metadata pins are invalid".into(),
         ));
     }
-    let finalizers = metadata
-        .get("finalizers")
-        .and_then(Value::as_array)
-        .ok_or_else(|| RuntimeErrorV0::Hold("linked state finalizers are invalid".into()))?;
-    if finalizers.iter().any(|value| value.as_str().is_none()) {
-        return Err(RuntimeErrorV0::Hold(
-            "linked state finalizers are invalid".into(),
-        ));
-    }
+    let finalizers = metadata_finalizers(metadata, "linked state finalizers are invalid")?;
     snapshot.state_name.clone_from(&link.name);
     snapshot.state_uid.clone_from(&state.metadata.uid);
     snapshot
@@ -3132,6 +3137,80 @@ mod tests {
         };
         LoaderPort {
             objects: vec![root_object, state_object],
+        }
+    }
+
+    #[tokio::test]
+    async fn omitted_root_finalizers_bootstrap_a_fresh_root() {
+        let actor = actor();
+        let mut loader = loader_port_for_machine(actor.state(), "state-rv-1");
+        loader.objects.truncate(1);
+        loader.objects[0]
+            .value
+            .pointer_mut("/metadata")
+            .and_then(Value::as_object_mut)
+            .expect("root metadata")
+            .remove("finalizers");
+
+        let machine = load_machine_from_reader(&loader, "ns", "demo")
+            .await
+            .expect("fresh root is valid")
+            .expect("root exists");
+        assert!(!machine.root().root_finalizer_present);
+        assert!(machine.root().status.state.is_none());
+    }
+
+    #[test]
+    fn malformed_present_root_finalizers_hold() {
+        for finalizers in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!("not-an-array"),
+            serde_json::json!(["valid", 1]),
+        ] {
+            let actor = actor();
+            let mut loader = loader_port_for_machine(actor.state(), "state-rv-1");
+            loader.objects[0].value["metadata"]["finalizers"] = finalizers;
+            assert!(matches!(
+                root_snapshot_from_object(&loader.objects[0], "ns", "demo"),
+                Err(RuntimeErrorV0::Hold(error)) if error == "root finalizers are invalid"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn omitted_linked_state_finalizers_are_a_valid_partial_recovery_object() {
+        let machine = linked_machine();
+        let mut loader = loader_port_for_machine(&machine, "state-rv-2");
+        loader.objects[1]
+            .value
+            .pointer_mut("/metadata")
+            .and_then(Value::as_object_mut)
+            .expect("state metadata")
+            .remove("finalizers");
+
+        let recovered_machine = load_machine_from_reader(&loader, "ns", "demo")
+            .await
+            .expect("partial linked state is valid")
+            .expect("root exists");
+        assert!(!recovered_machine.root().state_finalizer_present);
+    }
+
+    #[tokio::test]
+    async fn malformed_present_linked_state_finalizers_hold() {
+        for finalizers in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!("not-an-array"),
+            serde_json::json!(["valid", false]),
+        ] {
+            let machine = linked_machine();
+            let mut loader = loader_port_for_machine(&machine, "state-rv-2");
+            loader.objects[1].value["metadata"]["finalizers"] = finalizers;
+            assert!(matches!(
+                load_machine_from_reader(&loader, "ns", "demo").await,
+                Err(RuntimeErrorV0::Hold(error)) if error == "linked state finalizers are invalid"
+            ));
         }
     }
     #[derive(Default)]
