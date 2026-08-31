@@ -417,7 +417,11 @@ mod unix_tests {
     #[test]
     fn replacement_after_connect_is_lost_before_any_request_reaches_substitute() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("renderer.sock");
+        let path = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("renderer.sock");
         let original = UnixListener::bind(&path).unwrap();
         let original_server = thread::spawn(move || {
             let (mut stream, _) = original.accept().unwrap();

@@ -183,7 +183,7 @@ fn slow_drip_response_cannot_extend_the_absolute_client_deadline() {
 #[test]
 fn unix_roundtrip_response_mismatch_and_disconnect() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("renderer.sock");
+    let path = dir.path().canonicalize().unwrap().join("renderer.sock");
     let listener = UnixListener::bind(&path).unwrap();
     let server = thread::spawn(move || {
         let (mut s, _) = listener.accept().unwrap();
@@ -250,6 +250,7 @@ fn unix_roundtrip_response_mismatch_and_disconnect() {
 fn unix_paths_and_pre_call_replacements_are_rejected() {
     use std::os::unix::ffi::OsStringExt;
     let dir = tempfile::tempdir().unwrap();
+    let canonical_dir = dir.path().canonicalize().unwrap();
     assert!(matches!(
         RendererClient::new_unix("relative.sock"),
         Err(RendererClientError::InvalidUnixPath)
@@ -269,14 +270,14 @@ fn unix_paths_and_pre_call_replacements_are_rejected() {
         Err(RendererClientError::InvalidUnixPath)
     ));
     for kind in ["regular", "symlink", "directory"] {
-        let path = dir.path().join(format!("{kind}.sock"));
+        let path = canonical_dir.join(format!("{kind}.sock"));
         let listener = UnixListener::bind(&path).unwrap();
         let mut client = RendererClient::new_unix(&path).unwrap();
         drop(listener);
         std::fs::remove_file(&path).unwrap();
         match kind {
             "regular" => std::fs::write(&path, b"not a socket").unwrap(),
-            "symlink" => std::os::unix::fs::symlink(dir.path(), &path).unwrap(),
+            "symlink" => std::os::unix::fs::symlink(&canonical_dir, &path).unwrap(),
             "directory" => std::fs::create_dir(&path).unwrap(),
             _ => unreachable!(),
         }
@@ -290,8 +291,8 @@ fn unix_paths_and_pre_call_replacements_are_rejected() {
             std::fs::remove_file(&path).unwrap();
         }
     }
-    let trusted_parent = dir.path().join("trusted");
-    let aliased_parent = dir.path().join("aliased");
+    let trusted_parent = canonical_dir.join("trusted");
+    let aliased_parent = canonical_dir.join("aliased");
     std::fs::create_dir(&trusted_parent).unwrap();
     std::os::unix::fs::symlink(&trusted_parent, &aliased_parent).unwrap();
     let socket = trusted_parent.join("renderer.sock");
@@ -308,7 +309,8 @@ fn unix_paths_and_pre_call_replacements_are_rejected() {
 #[test]
 fn unix_slow_drip_and_unavailable_connect_are_deadline_bounded() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("renderer.sock");
+    let canonical_dir = dir.path().canonicalize().unwrap();
+    let path = canonical_dir.join("renderer.sock");
     let listener = UnixListener::bind(&path).unwrap();
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -345,7 +347,7 @@ fn unix_slow_drip_and_unavailable_connect_are_deadline_bounded() {
     ));
     assert!(started.elapsed() < Duration::from_millis(300));
     server.join().unwrap();
-    let missing = dir.path().join("missing.sock");
+    let missing = canonical_dir.join("missing.sock");
     let started = Instant::now();
     assert!(matches!(
         RendererClient::new_unix(missing).unwrap().call(&request()),
