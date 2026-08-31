@@ -136,6 +136,17 @@ impl ControllerDriverV0 {
         let (mut root_watch, initial_machine) =
             establish_root_barrier(&self.transport, &self.config).await?;
         let mut actor = initial_machine.map(start_actor);
+        if let Some(active) = actor
+            .as_ref()
+            .filter(|active| active.state().is_root_only_deletion_recovery())
+        {
+            eprintln!(
+                "oxideloop: entering receipt-bounded root-only deletion recovery for {}/{} uid={}",
+                self.config.namespace,
+                self.config.root_name,
+                active.state().root().uid
+            );
+        }
         let mut fixed_point: Option<KubeFixedPointPortV0<'_, UnixRendererPortV0>> = None;
         let mut automation_watch: Option<AutomationRunObservationBarrierV0> = None;
         let mut descriptors = BTreeMap::<String, BundleDescriptorV0>::new();
