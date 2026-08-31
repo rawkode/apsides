@@ -1045,7 +1045,7 @@ impl<R: RendererPortV0> FixedPointPortV0 for KubeFixedPointPortV0<'_, R> {
         let mut retained =
             RetainedObservationBarrierV0::with_incarnation(barrier, self.next_retained_incarnation);
         retained.drain_buffered_events()?;
-        let observations = retained.observations();
+        let observations = retained.renderer_observations();
         // The fixed-point loop returns immediately after its stable render.
         // Keep these handles rather than dropping them at that boundary so a
         // later dependency event can trigger the next reconciliation.
@@ -1318,7 +1318,7 @@ impl<R: RendererPortV0> FixedPointPortV0 for RenderExecutionPortV0<'_, R> {
         let mut retained =
             RetainedObservationBarrierV0::with_incarnation(barrier, self.next_retained_incarnation);
         retained.drain_buffered_events()?;
-        let observations = retained.observations();
+        let observations = retained.renderer_observations();
         self.retained = Some(retained);
         Ok(observations)
     }
@@ -3208,7 +3208,17 @@ mod tests {
                                     "apiVersion":"v1",
                                     "kind":"ConfigMapList",
                                     "metadata":{"resourceVersion":"cm-list"},
-                                    "items":[]
+                                    "items":[{
+                                        "apiVersion":"v1",
+                                        "kind":"ConfigMap",
+                                        "metadata":{
+                                            "name":"foreign",
+                                            "namespace":"ns",
+                                            "uid":"foreign-uid",
+                                            "resourceVersion":"foreign-rv"
+                                        },
+                                        "data":{"foreign":"true"}
+                                    }]
                                 }))
                                 .expect("ConfigMap list"),
                             ))
@@ -3231,7 +3241,31 @@ mod tests {
                             .expect("Service response"),
                     );
                 }
-                if path.ends_with("/configmaps/removed") || path.ends_with("/services/managed") {
+                if path.ends_with("/configmaps/foreign") {
+                    return Ok::<_, std::convert::Infallible>(
+                        Response::builder()
+                            .header(http::header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                serde_json::to_vec(&json!({
+                                    "apiVersion":"v1",
+                                    "kind":"ConfigMap",
+                                    "metadata":{
+                                        "name":"foreign",
+                                        "namespace":"ns",
+                                        "uid":"foreign-uid",
+                                        "resourceVersion":"foreign-rv"
+                                    },
+                                    "data":{"foreign":"true"}
+                                }))
+                                .expect("foreign ConfigMap"),
+                            ))
+                            .expect("foreign ConfigMap response"),
+                    );
+                }
+                if path.ends_with("/configmaps/dependency")
+                    || path.ends_with("/configmaps/removed")
+                    || path.ends_with("/services/managed")
+                {
                     return Ok::<_, std::convert::Infallible>(
                         Response::builder()
                             .status(404)
@@ -3260,14 +3294,6 @@ mod tests {
             transport.test_push_watch(watch);
         }
 
-        let d = vec![Dependency::Collection {
-            api_version: "v1".into(),
-            kind: "ConfigMap".into(),
-            namespace: "ns".into(),
-            selector: String::new(),
-            collection_revision: "d".into(),
-            observation_token: "global-token".into(),
-        }];
         let inventory = InventoryEntry {
             identity: ObjectIdentity {
                 api_version: "v1".into(),
@@ -3280,23 +3306,57 @@ mod tests {
             resource_version: "removed-rv".into(),
             bundle_digest: "a".repeat(64),
         };
-        let mut template = fixed_final_result(d.clone());
-        template.output.resources = vec![ResourceDeclaration {
-            logical_id: "managed".into(),
-            object: json!({
-                "apiVersion":"v1",
-                "kind":"Service",
-                "metadata":{"name":"managed","namespace":"ns"},
-                "spec":{"selector":{"app":"demo"},"ports":[{"port":80}]}
-            }),
-            readiness: None,
-        }];
         let mut actor = fenced_actor(vec![inventory], None);
         actor.barrier = BarrierV0 {
             generation: 9,
             cache_epoch: 4,
         };
-        owned_render(&mut actor, template.input());
+        let barrier = actor.barrier();
+        actor
+            .prepare_initial_informer_observation(barrier)
+            .expect("the production informer transition seals its observation token");
+        actor.informers_ready(barrier);
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("the production actor accepts informer readiness")
+            .expect("the production actor requests a render")
+        else {
+            panic!("informer readiness must issue the owned render command");
+        };
+        let d = vec![Dependency::Object {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: "ns".into(),
+            name: "dependency".into(),
+            uid: None,
+            resource_version: None,
+            observation_token: preconditions.observation_token.clone(),
+        }];
+        let mut template = fixed_final_result(d.clone());
+        template.input.observation_token = preconditions.observation_token;
+        template.input.cache_epoch = preconditions.cache_epoch;
+        template.output.resources = vec![
+            ResourceDeclaration {
+                logical_id: "managed".into(),
+                object: json!({
+                    "apiVersion":"v1",
+                    "kind":"Service",
+                    "metadata":{"name":"managed","namespace":"ns"},
+                    "spec":{"selector":{"app":"demo"},"ports":[{"port":80}]}
+                }),
+                readiness: None,
+            },
+            ResourceDeclaration {
+                logical_id: "foreign".into(),
+                object: json!({
+                    "apiVersion":"v1",
+                    "kind":"ConfigMap",
+                    "metadata":{"name":"foreign","namespace":"ns"},
+                    "data":{"managed":"true"}
+                }),
+                readiness: None,
+            },
+        ];
         let port = KubeFixedPointPortV0::new(
             &transport,
             StableRendererV0 {
@@ -3316,11 +3376,22 @@ mod tests {
         let RenderExecutionOutcomeV0::Stable(result) = outcome else {
             panic!("C-only absences must not force a D coverage restart");
         };
-        assert!(result.input().observations.is_empty());
+        assert_eq!(
+            result.input().observations,
+            vec![absent_observation(&ObjectRefV0 {
+                resource: ResourceKindV0::ConfigMap,
+                namespace: "ns".into(),
+                name: "dependency".into(),
+            })],
+            "an exact D object must not inherit unrelated members of its parent LIST"
+        );
         let retained = execution.retained.as_ref().expect("production U retained");
         assert_eq!(retained.incarnation, 2);
-        assert!(retained.renderer_observations().is_empty());
-        assert_eq!(retained.coverage_dependencies.len(), 2);
+        assert_eq!(
+            retained.renderer_observations(),
+            result.input().observations
+        );
+        assert_eq!(retained.coverage_dependencies.len(), 3);
         assert!(retained.coverage_dependencies.iter().any(|dependency| matches!(dependency,
             Dependency::Object { kind, name, .. } if kind == "ConfigMap" && name == "removed"
         )));
@@ -3332,19 +3403,39 @@ mod tests {
                     Dependency::Object { kind, name, .. } if kind == "Service" && name == "managed"
                 ))
         );
+        assert!(retained.coverage_dependencies.iter().any(|dependency| matches!(dependency,
+            Dependency::Object { kind, name, .. } if kind == "ConfigMap" && name == "foreign"
+        )));
         assert_eq!(retained.barrier.watches.len(), 2);
-        let _port = KubeFixedPointPortV0::reunite_after_render(execution, collector, reunion)
+        let mut result = *result;
+        let mut port = KubeFixedPointPortV0::reunite_after_render(execution, collector, reunion)
             .expect("full capability path reunites");
+        port.bind_completed_fixed_point_input(&mut actor, &result)
+            .expect("stable D-only input binds after C collision coverage");
+        let CompletedObservationFenceOutcomeV0::Completed(observation) = port
+            .complete_observation_fence(&mut actor, &mut result)
+            .expect("the desired-name collision reaches the full final fence")
+        else {
+            panic!("a stable collision snapshot must complete rather than reschedule");
+        };
+        assert!(observation.desired_observations().iter().any(|observed| {
+            observed.identity.kind == "ConfigMap"
+                && observed.identity.name == "foreign"
+                && matches!(observed.observation, CoreObservation::Existing { .. })
+        }));
         assert_eq!(watch_senders.len(), 3);
         assert_eq!(
             paths.lock().unwrap().as_slice(),
             [
                 "/api/v1/namespaces/ns/configmaps",
                 "/api/v1/namespaces/ns/configmaps",
+                "/api/v1/namespaces/ns/configmaps/dependency",
                 "/api/v1/namespaces/ns/configmaps",
                 "/api/v1/namespaces/ns/services",
                 "/api/v1/namespaces/ns/configmaps",
                 "/api/v1/namespaces/ns/services",
+                "/api/v1/namespaces/ns/configmaps/dependency",
+                "/api/v1/namespaces/ns/configmaps/foreign",
                 "/api/v1/namespaces/ns/configmaps/removed",
                 "/api/v1/namespaces/ns/services/managed",
             ]
