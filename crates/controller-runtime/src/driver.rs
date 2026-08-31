@@ -630,6 +630,20 @@ impl ControllerDriverV0 {
                     if matches!(active.mode(), ModeV0::Terminal) {
                         return Ok(DriverExitV0::RootFinalized);
                     }
+                    if active.state().phase() == PhaseV0::InformersPending {
+                        let port = fixed_point.as_mut().ok_or_else(|| {
+                            RuntimeErrorV0::Hold(
+                                "informers pending before a verified fixed-point port".into(),
+                            )
+                        })?;
+                        if port.admit_initial_informer_readiness(active)? {
+                            // The actor will reduce its sealed readiness into
+                            // the normal RequestRender path on the next turn.
+                            // Do not enter the retained-watch idle path before
+                            // that first render installs its barrier.
+                            continue;
+                        }
+                    }
                     // The journal owns pending runs.  Their list/watch/GET
                     // barrier is re-established after a restart, so a run
                     // created before the watch cannot be missed.
@@ -1934,7 +1948,13 @@ mod tests {
     };
 
     use http::{Request, Response};
+    use http_body_util::BodyExt;
     use kube::{Client, client::Body};
+    use oxideloop_bundle_contract::{
+        BUNDLE_MANIFEST_VERSION_V0, BundleInstallRecordV0, BundleIntegrityManifestV0,
+        DescriptorModuleV0, ExecutionPhaseV0, FileIntegrityV0, ModuleIntegrityV0, PhaseModuleV0,
+        ToolIdentityV0,
+    };
     use oxideloop_controller_api::{
         AutomationPending, AutomationRunCompletion, AutomationRunCompletionState,
         AutomationRunSpec, AutomationRunStatus, ObjectIdentity, WebApplicationSpec,
@@ -2261,10 +2281,14 @@ mod tests {
     }
 
     fn automation_candidate_actor() -> RootActorV0 {
+        automation_candidate_actor_for_digest(BUNDLE_DIGEST)
+    }
+
+    fn automation_candidate_actor_for_digest(bundle_digest: &str) -> RootActorV0 {
         let program = ProgramBundleReference {
             config_map_name: "bundle".into(),
             key: "program.mjs".into(),
-            digest: BUNDLE_DIGEST.into(),
+            digest: bundle_digest.into(),
         };
         RootActorV0::new(
             MachineStateV0::bootstrap(RootSnapshotV0 {
@@ -2277,7 +2301,7 @@ mod tests {
                     expose: false,
                     program,
                 },
-                bundle_digest: BUNDLE_DIGEST.into(),
+                bundle_digest: bundle_digest.into(),
                 status: WebApplicationStatus::default(),
                 state_name: String::new(),
                 state_uid: String::new(),
@@ -2444,6 +2468,8 @@ mod tests {
         state_finalizer: bool,
         root_metadata: bool,
         root_status: bool,
+        root_statuses: Vec<serde_json::Value>,
+        descriptor_reads: usize,
         requests: Vec<String>,
     }
 
@@ -2453,6 +2479,23 @@ mod tests {
         root_metadata: bool,
         root_status: bool,
     ) -> serde_json::Value {
+        bootstrap_wire_root_for_bundle(
+            token,
+            state_name,
+            root_metadata,
+            root_status
+                .then(|| json!({"state":{"rootUid":ROOT_UID,"name":state_name,"uid":"state-uid"}})),
+            BUNDLE_DIGEST,
+        )
+    }
+
+    fn bootstrap_wire_root_for_bundle(
+        token: &str,
+        _state_name: &str,
+        root_metadata: bool,
+        status: Option<serde_json::Value>,
+        bundle_digest: &str,
+    ) -> serde_json::Value {
         let annotations = root_metadata.then(|| {
             json!({
                 "runtime.oxideloop.dev/root-uid": ROOT_UID,
@@ -2460,16 +2503,14 @@ mod tests {
                 "runtime.oxideloop.dev/command-id": token,
             })
         });
-        let status = root_status
-            .then(|| json!({"state":{"rootUid":ROOT_UID,"name":state_name,"uid":"state-uid"}}));
-        json!({
+        let mut root = json!({
             "apiVersion":"demo.oxideloop.dev/v1alpha1",
             "kind":"WebApplication",
             "metadata": {
                 "name":"root",
                 "namespace":"ns",
                 "uid":ROOT_UID,
-                "resourceVersion": if root_status { "3" } else if root_metadata { "2" } else { "1" },
+                "resourceVersion": if status.is_some() { "3" } else if root_metadata { "2" } else { "1" },
                 "generation":1,
                 "annotations":annotations.unwrap_or_else(|| json!({})),
                 "finalizers":if root_metadata { vec!["demo.oxideloop.dev/finalizer"] } else { vec![] },
@@ -2477,10 +2518,151 @@ mod tests {
             "spec": {
                 "message":"fresh bootstrap",
                 "expose":false,
-                "program": {"configMapName":"bundle","key":"program.mjs","digest":BUNDLE_DIGEST}
+                "program": {"configMapName":"bundle","key":"program.mjs","digest":bundle_digest}
             },
             "status":status.unwrap_or_else(|| json!({})),
-        })
+        });
+        if !root_metadata {
+            root["metadata"]
+                .as_object_mut()
+                .expect("root metadata is an object")
+                .remove("finalizers");
+        }
+        root
+    }
+
+    fn base64_encode(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let first = chunk[0];
+            let second = *chunk.get(1).unwrap_or(&0);
+            let third = *chunk.get(2).unwrap_or(&0);
+            encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
+            encoded.push(char::from(
+                ALPHABET[usize::from((first & 0x03) << 4 | second >> 4)],
+            ));
+            encoded.push(if chunk.len() > 1 {
+                char::from(ALPHABET[usize::from((second & 0x0f) << 2 | third >> 6)])
+            } else {
+                '='
+            });
+            encoded.push(if chunk.len() > 2 {
+                char::from(ALPHABET[usize::from(third & 0x3f)])
+            } else {
+                '='
+            });
+        }
+        encoded
+    }
+
+    fn bundle_file(path: &str, bytes: &[u8]) -> FileIntegrityV0 {
+        FileIntegrityV0 {
+            path: path.into(),
+            length: bytes.len().try_into().expect("test file length fits u64"),
+            sha256: sha256_hex(bytes),
+        }
+    }
+
+    fn unseal_test_bundle_directory(directory: &std::path::Path) -> std::io::Result<()> {
+        let mut permissions = std::fs::metadata(directory)?.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            permissions.set_mode(0o700);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(directory, permissions)
+    }
+
+    fn valid_bundle_archive() -> (Vec<u8>, String) {
+        let render = b"render callable".to_vec();
+        let action = b"action callable".to_vec();
+        let descriptor = BundleDescriptorV0 {
+            descriptor_version: "oxideloop.dev/descriptor/v0".into(),
+            renderer_abi_version: ABI_VERSION_V0.into(),
+            render_module: DescriptorModuleV0 {
+                identity: "demo.web-application.render".into(),
+                digest: sha256_hex(&render),
+            },
+            action_modules: vec![DescriptorModuleV0 {
+                identity: "demo.web-application.input-changed".into(),
+                digest: sha256_hex(&action),
+            }],
+        };
+        let descriptor = canonical_bytes(
+            &serde_json::to_value(&descriptor).expect("descriptor is serializable"),
+        )
+        .expect("descriptor is canonical");
+        let manifest = BundleIntegrityManifestV0 {
+            manifest_version: BUNDLE_MANIFEST_VERSION_V0.into(),
+            compiler: ToolIdentityV0 {
+                identity: "test".into(),
+                version: "1".into(),
+            },
+            bundler: ToolIdentityV0 {
+                identity: "test".into(),
+                version: "1".into(),
+            },
+            renderer_abi_version: ABI_VERSION_V0.into(),
+            descriptor: bundle_file("descriptor.json", &descriptor),
+            render_modules: vec![ModuleIntegrityV0 {
+                identity: "demo.web-application.render".into(),
+                file: bundle_file("render.callable.js", &render),
+            }],
+            action_modules: vec![ModuleIntegrityV0 {
+                identity: "demo.web-application.input-changed".into(),
+                file: bundle_file("action.callable.js", &action),
+            }],
+            source_maps: vec![],
+            phase_modules: vec![
+                PhaseModuleV0 {
+                    phase: ExecutionPhaseV0::Render,
+                    module_identity: "demo.web-application.render".into(),
+                },
+                PhaseModuleV0 {
+                    phase: ExecutionPhaseV0::Action,
+                    module_identity: "demo.web-application.input-changed".into(),
+                },
+            ],
+        };
+        let manifest =
+            canonical_bytes(&serde_json::to_value(&manifest).expect("manifest is serializable"))
+                .expect("manifest is canonical");
+        let digest = sha256_hex(&manifest);
+        let install = canonical_bytes(
+            &serde_json::to_value(&BundleInstallRecordV0 {
+                bundle_digest: digest.clone(),
+                manifest: serde_json::from_slice(&manifest).expect("manifest re-parses"),
+            })
+            .expect("install record is serializable"),
+        )
+        .expect("install record is canonical");
+        let entries = [
+            ("action.callable.js", action),
+            ("bundle-install.json", install),
+            ("descriptor.json", descriptor),
+            ("integrity-manifest.json", manifest),
+            ("render.callable.js", render),
+        ];
+        let mut archive = b"OLBA\x01\x05".to_vec();
+        for (path, bytes) in &entries {
+            archive.push(path.len().try_into().expect("test path fits framing"));
+            archive.extend_from_slice(path.as_bytes());
+            archive.extend_from_slice(
+                &u32::try_from(bytes.len())
+                    .expect("test payload fits framing")
+                    .to_be_bytes(),
+            );
+            archive.extend_from_slice(sha256_hex(bytes).as_bytes());
+        }
+        for (_, bytes) in entries {
+            archive.extend_from_slice(&bytes);
+        }
+        (archive, digest)
     }
 
     fn bootstrap_wire_state(
@@ -2651,12 +2833,15 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn driver_run_waits_for_root_then_bootstraps_once_before_a_controlled_hold() {
+    async fn driver_run_bootstraps_through_self_watches_then_reaches_renderer() {
         // Use the reducer's exact bootstrap output as the scripted API's
         // state response. This keeps the composition test focused on the
         // driver's list/watch/run sequencing rather than duplicating the
         // durable journal constructor.
-        let mut expected = automation_candidate_actor();
+        let (archive, bundle_digest) = valid_bundle_archive();
+        let archive = base64_encode(&archive);
+        let installed_digest = bundle_digest.clone();
+        let mut expected = automation_candidate_actor_for_digest(&bundle_digest);
         expected.start();
         let command = expected
             .next_command()
@@ -2673,17 +2858,36 @@ mod tests {
         };
         let root_present = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let wire = Arc::new(Mutex::new(BootstrapWireStateV0::default()));
+        let (root_sender, root_watch) = WatchHandleV0::test_channel(8);
         let service_wire = Arc::clone(&wire);
         let service_root_present = Arc::clone(&root_present);
+        let service_root_sender = root_sender.clone();
         let service = service_fn(move |request: Request<Body>| {
             let wire = Arc::clone(&service_wire);
             let root_present = Arc::clone(&service_root_present);
+            let root_sender = service_root_sender.clone();
             let token = token.clone();
             let state_name = state_name.clone();
             let state = state.clone();
+            let bundle_digest = bundle_digest.clone();
+            let archive = archive.clone();
             async move {
                 let method = request.method().clone();
                 let path = request.uri().path().to_owned();
+                let status_body = if path.ends_with("/webapplications/root/status")
+                    && method == http::Method::PATCH
+                {
+                    Some(
+                        request
+                            .into_body()
+                            .collect()
+                            .await
+                            .expect("status patch body is readable")
+                            .to_bytes(),
+                    )
+                } else {
+                    None
+                };
                 let mut wire = wire.lock().expect("composed driver wire lock");
                 wire.requests.push(format!("{method} {path}"));
                 let response = if path.ends_with("/webapplications") && method == http::Method::GET
@@ -2696,12 +2900,18 @@ mod tests {
                     }))
                 } else if path.ends_with("/webapplications/root") && method == http::Method::GET {
                     if root_present.load(Ordering::SeqCst) {
-                        wire_json(bootstrap_wire_root(
+                        let mut root = bootstrap_wire_root_for_bundle(
                             &token,
                             &state_name,
                             wire.root_metadata,
-                            wire.root_status,
-                        ))
+                            wire.root_statuses.last().cloned(),
+                            &bundle_digest,
+                        );
+                        if !wire.root_statuses.is_empty() {
+                            root["metadata"]["resourceVersion"] =
+                                json!((2 + wire.root_statuses.len()).to_string());
+                        }
+                        wire_json(root)
                     } else {
                         Response::builder()
                             .status(404)
@@ -2749,23 +2959,44 @@ mod tests {
                 } else if path.ends_with("/webapplications/root/status")
                     && method == http::Method::PATCH
                 {
+                    let status_patch: serde_json::Value =
+                        serde_json::from_slice(&status_body.expect("status body was selected"))
+                            .expect("status patch is JSON");
+                    let status = status_patch
+                        .get("status")
+                        .cloned()
+                        .expect("status patch carries the complete status");
                     wire.root_status = true;
-                    wire_json(bootstrap_wire_root(&token, &state_name, true, true))
+                    wire.root_statuses.push(status);
+                    let resource_version = (2 + wire.root_statuses.len()).to_string();
+                    let mut root = bootstrap_wire_root_for_bundle(
+                        &token,
+                        &state_name,
+                        true,
+                        wire.root_statuses.last().cloned(),
+                        &bundle_digest,
+                    );
+                    root["metadata"]["resourceVersion"] = json!(resource_version.clone());
+                    root_sender
+                        .try_send(Ok(WatchEventV0::Modified(root_event(&resource_version))))
+                        .expect("root self-watch fits the composed buffer");
+                    wire_json(root)
                 } else if path.ends_with("/webapplications/root") && method == http::Method::PATCH {
                     wire.root_metadata = true;
                     wire_json(bootstrap_wire_root(&token, &state_name, true, false))
                 } else if path.ends_with("/configmaps/bundle") && method == http::Method::GET {
-                    Response::builder()
-                        .status(500)
-                        .header(http::header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(
-                            serde_json::to_vec(&json!({
-                                "apiVersion":"v1", "kind":"Status", "status":"Failure",
-                                "reason":"InternalError", "code":500,
-                            }))
-                            .expect("controlled descriptor failure JSON"),
-                        ))
-                        .expect("controlled descriptor failure")
+                    wire.descriptor_reads += 1;
+                    wire_json(json!({
+                        "apiVersion":"v1",
+                        "kind":"ConfigMap",
+                        "metadata": {
+                            "name":"bundle",
+                            "namespace":"ns",
+                            "uid":"bundle-uid",
+                            "resourceVersion":"bundle-rv-1"
+                        },
+                        "binaryData":{"program.mjs":archive}
+                    }))
                 } else {
                     panic!("unexpected composed-driver request {method} {path}");
                 };
@@ -2773,7 +3004,6 @@ mod tests {
             }
         });
         let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
-        let (root_sender, root_watch) = WatchHandleV0::test_channel(2);
         transport.test_push_watch(root_watch);
         let store =
             std::env::temp_dir().join(format!("oxideloop-driver-run-smoke-{}", std::process::id()));
@@ -2782,7 +3012,7 @@ mod tests {
                 namespace: "ns".into(),
                 root_name: "root".into(),
                 bundle_store: store.clone(),
-                renderer_unix_socket: "/tmp/renderer.sock".into(),
+                renderer_unix_socket: store.join("renderer.sock"),
                 #[cfg(feature = "test-failpoints")]
                 failpoint_unix_socket: None,
             },
@@ -2813,7 +3043,7 @@ mod tests {
             .expect("named root creation event");
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), run)
             .await
-            .expect("driver reaches controlled descriptor hold")
+            .expect("driver reaches controlled renderer failure")
             .expect("driver task joins");
         let request_log = wire
             .lock()
@@ -2821,8 +3051,8 @@ mod tests {
             .requests
             .clone();
         assert!(
-            matches!(result, Err(RuntimeErrorV0::Hold(_))),
-            "unexpected driver result: {result:?}; requests: {request_log:?}"
+            matches!(result, Err(RuntimeErrorV0::Renderer)),
+            "the verified descriptor and sealed initial readiness must reach the renderer: {result:?}; {request_log:?}"
         );
         let wire = wire.lock().expect("composed driver wire inspection");
         assert_eq!(
@@ -2858,9 +3088,20 @@ mod tests {
                 .iter()
                 .filter(|request| request == &"PATCH /apis/demo.oxideloop.dev/v1alpha1/namespaces/ns/webapplications/root/status")
                 .count(),
-            1,
-            "fresh root writes its state status link once"
+            2,
+            "bootstrap and descriptor verification each persist root status once"
         );
+        assert_eq!(
+            wire.root_statuses.len(),
+            2,
+            "bootstrap and descriptor verification each persist one exact status"
+        );
+        assert_eq!(
+            wire.descriptor_reads, 1,
+            "the verified descriptor is read once before the renderer is contacted"
+        );
+        unseal_test_bundle_directory(&store.join(installed_digest))
+            .expect("unseal immutable test bundle for cleanup");
         std::fs::remove_dir_all(store).expect("smoke store cleanup");
     }
 

@@ -2495,6 +2495,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "http",
+ "http-body-util",
  "kube",
  "oxideloop-bundle-archive",
  "oxideloop-bundle-contract",

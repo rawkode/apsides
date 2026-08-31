@@ -1171,6 +1171,14 @@ impl RootActorV0 {
             root.root_finalizer_present,
             root.state_finalizer_present,
         );
+        // An exact API echo can arrive after its owned acknowledgement has
+        // already reduced, including while the first render is in flight.
+        // Record it for later duplicate suppression, but it has no new root
+        // authority and must not advance the barrier or cancel that render.
+        if root == *self.state.root() {
+            self.last_root_observation = Some(fingerprint);
+            return false;
+        }
         if self.last_root_observation.as_ref() == Some(&fingerprint) {
             return false;
         }
@@ -1218,10 +1226,18 @@ impl RootActorV0 {
         if let Some(ack) = self.priority_ack.take() {
             self.reduce_event(ack)?;
             if let Some(root) = self.pending_root_refresh.take() {
-                if self.state.phase() != PhaseV0::RootDeletionVerifyPending {
-                    self.commands.clear();
+                // A root self-watch may be buffered while its owned write is
+                // in flight. Once the acknowledgement has installed that
+                // exact snapshot, reducing it as a refresh would clear the
+                // continuation just produced by the acknowledgement (for
+                // example RequestDescriptor after bootstrap). It carries no
+                // new authority, so consume only this post-ack duplicate.
+                if root != *self.state.root() {
+                    if self.state.phase() != PhaseV0::RootDeletionVerifyPending {
+                        self.commands.clear();
+                    }
+                    self.reduce_event(EventV0::RootRefreshed { root })?;
                 }
-                self.reduce_event(EventV0::RootRefreshed { root })?;
             }
         } else if let Some(root) = self.pending_root_refresh.take() {
             if self.state.phase() != PhaseV0::RootDeletionVerifyPending {
@@ -1655,6 +1671,38 @@ impl RootActorV0 {
         // global renderer-observation barrier.
         self.barrier
     }
+
+    /// Seals the initial no-effect observation request before informer
+    /// readiness is accepted. Bootstrap has no prior retained watch, but its
+    /// first render still needs the same root/barrier-derived preconditions as
+    /// every later observation-only restart.
+    pub(crate) fn prepare_initial_informer_observation(
+        &mut self,
+        candidate: BarrierV0,
+    ) -> Result<(), RuntimeErrorV0> {
+        if candidate != self.barrier
+            || !matches!(self.mode, ModeV0::Running)
+            || self.state.phase() != PhaseV0::InformersPending
+        {
+            return Err(RuntimeErrorV0::Hold(
+                "initial informer readiness does not match the current actor barrier".into(),
+            ));
+        }
+        let prior_token = self
+            .active_render_input
+            .as_ref()
+            .map(|(_, input)| input.observation_token.as_str())
+            .or(self.state.root().status.input_token.as_deref())
+            .unwrap_or(self.state.root().uid.as_str());
+        let observation_token = observation_token_for_barrier(prior_token, candidate);
+        if !self.supersede_observation_only(observation_token) {
+            return Err(RuntimeErrorV0::Hold(
+                "initial informer observation could not be sealed".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn informers_ready(&mut self, candidate: BarrierV0) {
         self.queue_informer_readiness(candidate);
     }
@@ -5587,6 +5635,93 @@ mod tests {
     }
 
     #[test]
+    fn exact_bootstrap_self_watch_preserves_descriptor_continuation() {
+        let mut actor = actor();
+        actor.start();
+        let CommandV0::EnsureBootstrap {
+            token,
+            state_name,
+            root_resource_version,
+            ..
+        } = actor
+            .next_command()
+            .expect("bootstrap command lookup")
+            .expect("fresh actor issues bootstrap")
+        else {
+            panic!("fresh actor did not issue EnsureBootstrap");
+        };
+
+        let mut acknowledged_root = actor.state().root().clone();
+        acknowledged_root.state_name = state_name.clone();
+        acknowledged_root.state_uid = "state-uid".into();
+        acknowledged_root.state_resource_version = "state-rv-1".into();
+        acknowledged_root.root_resource_version = "root-rv-2".into();
+        acknowledged_root.root_finalizer_present = true;
+        acknowledged_root.state_finalizer_present = true;
+        acknowledged_root.status.state = Some(oxideloop_controller_api::StateLink {
+            root_uid: acknowledged_root.uid.clone(),
+            name: state_name.clone(),
+            uid: "state-uid".into(),
+        });
+
+        // This models a Modified self-watch buffered while EnsureBootstrap
+        // owns the write. Its snapshot is exactly what the acknowledgement
+        // will install, so it must not erase RequestDescriptor.
+        assert!(actor.root_observed(acknowledged_root));
+        actor
+            .acknowledge(EventV0::BootstrapAcknowledged {
+                token,
+                state_name: state_name.clone(),
+                state_uid: "state-uid".into(),
+                state_resource_version: "state-rv-1".into(),
+                old_root_resource_version: root_resource_version,
+                new_root_resource_version: "root-rv-2".into(),
+                status_state_link: oxideloop_controller_api::StateLink {
+                    root_uid: "root-uid".into(),
+                    name: state_name,
+                    uid: "state-uid".into(),
+                },
+                root_finalizer_present: true,
+                state_finalizer_present: true,
+            })
+            .expect("exact bootstrap acknowledgement is accepted");
+
+        assert!(matches!(
+            actor.next_command(),
+            Ok(Some(CommandV0::RequestDescriptor { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn delayed_exact_root_echo_does_not_cancel_an_owned_render() {
+        let mut actor = informers_pending_actor();
+        let barrier = actor.barrier();
+        actor
+            .prepare_initial_informer_observation(barrier)
+            .expect("initial observation pins are sealed");
+        actor.informers_ready(barrier);
+        assert!(matches!(
+            actor.next_command(),
+            Ok(Some(CommandV0::RequestRender { .. }))
+        ));
+        assert!(actor.owns_render_request());
+
+        // Yield after ownership is established: this is the late Modified
+        // self-watch ordering that cannot be covered by a pre-ack buffer.
+        tokio::task::yield_now().await;
+        let exact = actor.state().root().clone();
+        assert!(!actor.root_observed(exact));
+        assert_eq!(actor.barrier(), barrier);
+        assert!(actor.owns_render_request());
+
+        let mut changed = actor.state().root().clone();
+        changed.root_resource_version = "changed-after-render-owned".into();
+        assert!(actor.root_observed(changed));
+        assert_eq!(actor.barrier().generation, barrier.generation + 1);
+        assert!(!actor.owns_render_request());
+    }
+
+    #[test]
     fn root_refresh_drops_queued_readiness_before_it_can_render_old_pins() {
         let mut actor = informers_pending_actor();
         let barrier_a = actor.barrier();
@@ -5669,7 +5804,8 @@ mod tests {
         assert!(actor.observation_events.is_empty());
         assert!(actor.deferred_genuine_change.is_some());
 
-        let root = actor.state().root().clone();
+        let mut root = actor.state().root().clone();
+        root.root_resource_version = "root-rv-genuine-change".into();
         assert!(actor.root_observed(root.clone()));
         assert!(!actor.root_observed(root));
         assert_eq!(actor.barrier().generation, initial.generation + 2);

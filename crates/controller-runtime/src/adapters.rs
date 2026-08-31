@@ -11,7 +11,9 @@ use async_trait::async_trait;
 use futures_util::future::select_all;
 use oxideloop_bundle_contract::BundleDescriptorV0;
 use oxideloop_controller_api::{AutomationRunSpec, InventoryEntry, ObjectIdentity, StateBody};
-use oxideloop_controller_core::{AutomationRunCleanupV0, DesiredObservationV0, RecoveryProofV0};
+use oxideloop_controller_core::{
+    AutomationRunCleanupV0, DesiredObservationV0, PhaseV0 as CorePhaseV0, RecoveryProofV0,
+};
 use oxideloop_kube_transport::{
     AutomationCompletionAckV0, AutomationRunExpectationV0, AutomationRunObservationBarrierV0,
     EventMaterializationRefV0, KubeTransportV0, ObjectRefV0, ObjectV0, ResourceKindV0,
@@ -449,6 +451,40 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
     #[must_use]
     pub(crate) fn identity(&self) -> u64 {
         self.identity
+    }
+
+    /// Queues the first render only after a verified descriptor has reached
+    /// the actor's durable `InformersPending` continuation. No retained
+    /// observation exists before that first render, so waiting for one would
+    /// incorrectly turn startup into a watch restart.
+    ///
+    /// This is deliberately narrower than retained-watch coordination: a
+    /// retained barrier here means observation authority already exists and
+    /// must not be discarded or re-issued as initial readiness.
+    pub(crate) fn admit_initial_informer_readiness(
+        &mut self,
+        actor: &mut RootActorV0,
+    ) -> Result<bool, RuntimeErrorV0> {
+        if !matches!(actor.mode(), crate::ModeV0::Running)
+            || actor.state().phase() != CorePhaseV0::InformersPending
+        {
+            return Ok(false);
+        }
+        if self.retained.is_some() {
+            return Err(RuntimeErrorV0::Hold(
+                "informers pending fixed-point port unexpectedly retains an observation barrier"
+                    .into(),
+            ));
+        }
+
+        // An exact post-ack root self-watch or a prior terminal watch fault
+        // may have advanced the actor barrier. With no retained handles there
+        // is no old observation authority to preserve, so bind this verified
+        // descriptor port to the actor's current sealed readiness candidate.
+        self.barrier = actor.begin_observation_barrier();
+        actor.prepare_initial_informer_observation(self.barrier)?;
+        actor.informers_ready(self.barrier);
+        Ok(true)
     }
 
     /// Consumes the concrete port into two actor-free halves.  The execution
@@ -2040,6 +2076,62 @@ mod tests {
     }
 
     #[test]
+    fn initial_informer_readiness_is_phase_mode_and_retention_gated() {
+        let mut actor = fenced_actor(vec![], None);
+        actor.watch_invalidated();
+        let prior_barrier = BarrierV0 {
+            generation: actor.barrier().generation.saturating_sub(1),
+            cache_epoch: actor.barrier().cache_epoch,
+        };
+        let mut port = KubeFixedPointPortV0::<()>::observation_only_for_test(prior_barrier);
+
+        assert!(
+            port.admit_initial_informer_readiness(&mut actor)
+                .expect("empty informer port is admitted")
+        );
+        assert_eq!(port.barrier, actor.barrier());
+        assert!(matches!(
+            actor.next_command(),
+            Ok(Some(CommandV0::RequestRender { ref preconditions }))
+                if !preconditions.observation_token.is_empty()
+                    && preconditions.cache_epoch == actor.barrier().cache_epoch.to_string()
+        ));
+
+        let mut held_actor = fenced_actor(vec![], None);
+        held_actor.hold("test hold".into());
+        let mut held_port =
+            KubeFixedPointPortV0::<()>::observation_only_for_test(held_actor.barrier());
+        assert!(
+            !held_port
+                .admit_initial_informer_readiness(&mut held_actor)
+                .expect("held actor is not admitted")
+        );
+
+        let mut render_pending_actor = fenced_actor(vec![], None);
+        render_pending_actor.informers_ready(render_pending_actor.barrier());
+        assert!(matches!(
+            render_pending_actor.next_command(),
+            Ok(Some(CommandV0::RequestRender { .. }))
+        ));
+        let mut render_pending_port =
+            KubeFixedPointPortV0::<()>::observation_only_for_test(render_pending_actor.barrier());
+        assert!(
+            !render_pending_port
+                .admit_initial_informer_readiness(&mut render_pending_actor)
+                .expect("render-pending actor is not admitted")
+        );
+
+        let mut retained_actor = fenced_actor(vec![], None);
+        let mut retained_port =
+            KubeFixedPointPortV0::<()>::observation_only_for_test(retained_actor.barrier());
+        retained_port.retained = Some(retained_with(object("config", "uid-1", "1")));
+        assert!(matches!(
+            retained_port.admit_initial_informer_readiness(&mut retained_actor),
+            Err(RuntimeErrorV0::Hold(_))
+        ));
+    }
+
+    #[test]
     fn retained_watch_ignores_duplicate_uid_rv_but_admits_a_genuine_change() {
         let mut retained = retained_with(object("config", "uid-1", "1"));
         assert!(!retained.record(WatchEventV0::Modified(object("config", "uid-1", "1"))));
@@ -2759,7 +2851,9 @@ mod tests {
         // A fresh root observation replaces the actor's barrier before a
         // retained watch can deliver. The old handle must be dropped before
         // it can turn its payload into a renderer-token transition.
-        assert!(actor.root_observed(actor.state().root().clone()));
+        let mut changed_root = actor.state().root().clone();
+        changed_root.root_resource_version = "root-rv-after-retained-barrier".into();
+        assert!(actor.root_observed(changed_root));
         assert_eq!(
             port.coordinate_retained_watch(&mut actor)
                 .await

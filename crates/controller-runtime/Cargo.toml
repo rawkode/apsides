@@ -39,6 +39,7 @@ time = { version = "0.3", features = ["formatting"] }
 [dev-dependencies]
 oxideloop-kube-transport = { path = "../kube-transport", features = ["test-support"] }
 http = "1"
+http-body-util = "0.1"
 kube = { version = "4.2", default-features = false, features = ["client", "rustls-tls"] }
 tower = { version = "0.5", features = ["util"] }
 
