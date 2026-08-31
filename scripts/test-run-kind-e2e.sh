@@ -79,6 +79,7 @@ set -e
 [ -f "$TEMP/repo/work/kind-e2e/empty-capture/git-status.txt" ]
 [ ! -s "$TEMP/repo/work/kind-e2e/empty-capture/git-status.txt" ]
 jq -e '.status == "failed" and .clusterDisposition == "deleted"' "$TEMP/repo/work/kind-e2e/empty-capture/result.json" >/dev/null
+jq -e '.status == "failed" and .failureReason == "self-test stop after cluster creation"' "$TEMP/repo/work/kind-e2e/empty-capture/result.json" >/dev/null
 
 # Cluster cleanup is part of success, so an otherwise-successful self-test
 # must become failed when the exact fresh cluster cannot be deleted.
@@ -357,8 +358,10 @@ recovery_direct_assert_line=$(rg -n -F 'managed ConfigMap owner reference' "$ROO
 recovery_scale_zero_line=$(rg -n -F 'ctx scale deployment/oxideloop-controller -n "$NAMESPACE" --replicas=0' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 recovery_no_pod_line=$(rg -n -F "wait_for_no_controller_pod 'controller deployment scale-to-zero'" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 recovery_stopped_empty_line=$(rg -n -F 'capture_empty_journal foreign-collision-stopped' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+recovery_retrigger_root_line=$(rg -n -F 'foreign-collision-retrigger-root.json' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+recovery_retrigger_empty_line=$(rg -n -F 'capture_empty_journal foreign-collision-retrigger' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 recovery_scale_one_line=$(rg -n -F 'ctx scale deployment/oxideloop-controller -n "$NAMESPACE" --replicas=1' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
-[ "$recovery_scale_zero_line" -lt "$recovery_no_pod_line" ] && [ "$recovery_no_pod_line" -lt "$recovery_stopped_empty_line" ] && [ "$recovery_stopped_empty_line" -lt "$recovery_delete_line" ] && [ "$recovery_delete_line" -lt "$recovery_annotate_line" ] && [ "$recovery_annotate_line" -lt "$recovery_scale_one_line" ] && [ "$recovery_scale_one_line" -lt "$recovery_config_wait_line" ] && [ "$recovery_config_wait_line" -lt "$recovery_direct_assert_line" ] || { echo 'recovery must scale to zero, prove no pod and empty journal, delete/annotate while stopped, scale up, then wait for exact ConfigMap ownership' >&2; exit 1; }
+[ "$recovery_scale_zero_line" -lt "$recovery_no_pod_line" ] && [ "$recovery_no_pod_line" -lt "$recovery_stopped_empty_line" ] && [ "$recovery_stopped_empty_line" -lt "$recovery_delete_line" ] && [ "$recovery_delete_line" -lt "$recovery_annotate_line" ] && [ "$recovery_annotate_line" -lt "$recovery_retrigger_root_line" ] && [ "$recovery_retrigger_root_line" -lt "$recovery_retrigger_empty_line" ] && [ "$recovery_retrigger_empty_line" -lt "$recovery_scale_one_line" ] && [ "$recovery_scale_one_line" -lt "$recovery_config_wait_line" ] && [ "$recovery_config_wait_line" -lt "$recovery_direct_assert_line" ] || { echo 'recovery must scale to zero, prove no pod and empty journal, delete/annotate and recapture exact stopped state, scale up, then wait for exact ConfigMap ownership' >&2; exit 1; }
 recovery_wait_line=$(sed -n "${recovery_config_wait_line}p" "$ROOT/scripts/run-kind-e2e.sh")
 assert_recovery_wait_contains() { printf '%s\n' "$recovery_wait_line" | grep -Fq "$1" || { echo "recovery ownership wait is missing: $1" >&2; exit 1; }; }
 for recovery_owner_field in \
@@ -383,6 +386,10 @@ assert_contains 'foreign collision object bytes changed'
 assert_contains 'stopped foreign collision object bytes changed'
 assert_contains 'wait_for_no_controller_pod'
 assert_contains 'controller-scaled-zero-pods.json'
+assert_contains 'foreign-collision-retrigger-root.json'
+assert_contains 'foreign-collision-retrigger-identities.json'
+assert_contains 'stopped collision retrigger identities or foreign ConfigMap absence is not exact'
+assert_contains 'FAILURE="$*"'
 assert_contains 'PreparedNotIssued'
 assert_contains 'AfterPrepareBeforeDispatchAuthorization'
 assert_contains 'prepared-not-issued-no-post.json'

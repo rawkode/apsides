@@ -5704,7 +5704,10 @@ mod tests {
         let external = drive_kubernetes_with_dispatcher(&mut actor, &mut dispatcher)
             .await
             .unwrap();
-        assert!(matches!(external, Some(CommandV0::RequestRender { .. })));
+        assert!(matches!(
+            external,
+            Some(CommandV0::RequestDescriptor { .. })
+        ));
         assert_eq!(dispatcher.calls.len(), 3);
         assert!(
             dispatcher
@@ -6390,6 +6393,73 @@ mod tests {
     }
 
     #[test]
+    fn invalidate_ack_without_latched_seed_reverifies_descriptor_before_sealed_readiness() {
+        let mut actor = informers_pending_actor();
+        let root = advanced_root(&actor.state, actor.state().root().generation, "invalidate");
+        assert!(actor.root_observed(root));
+        assert!(actor.latched_invalidation_seed.is_none());
+
+        let invalidate = actor
+            .next_command()
+            .expect("root refresh reduces")
+            .expect("durable invalidation is issued");
+        assert!(matches!(
+            invalidate,
+            CommandV0::Persist { ref operation, .. }
+                if operation.purpose == PersistPurpose::Invalidate
+        ));
+        actor
+            .acknowledge(persisted_event(&invalidate, "state-rv-after-invalidate"))
+            .expect("exact invalidation persistence acknowledgement is accepted");
+
+        let CommandV0::RequestDescriptor { token, .. } = actor
+            .next_command()
+            .expect("invalidation acknowledgement reduces")
+            .expect("descriptor is re-verified before rendering")
+        else {
+            panic!("invalidation acknowledgement issued a render without descriptor verification");
+        };
+        actor
+            .acknowledge(EventV0::DescriptorReady {
+                token,
+                bundle_digest: "a".repeat(64),
+            })
+            .expect("descriptor acknowledgement is exact");
+        assert!(
+            actor
+                .next_command()
+                .expect("descriptor acknowledgement reduces")
+                .is_none(),
+            "descriptor verification must wait for sealed informer readiness"
+        );
+        assert_eq!(actor.state().phase(), PhaseV0::InformersPending);
+
+        let barrier = actor.barrier();
+        actor
+            .prepare_initial_informer_observation(barrier)
+            .expect("fresh informer observation is sealed after descriptor verification");
+        actor.informers_ready(barrier);
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("sealed readiness reduces")
+            .expect("sealed readiness issues the first render")
+        else {
+            panic!("sealed readiness did not issue a render");
+        };
+        assert!(!preconditions.observation_token.is_empty());
+        assert_eq!(
+            preconditions.cache_epoch,
+            actor.barrier().cache_epoch.to_string()
+        );
+        actor
+            .issue_render_capability(
+                trusted_render_input(&actor, &preconditions.observation_token),
+                1,
+            )
+            .expect("sealed render input matches the owned command provenance");
+    }
+
+    #[test]
     fn root_refresh_after_a_completed_render_future_releases_only_that_no_effect_slot() {
         let mut actor = informers_pending_actor();
         let barrier = actor.barrier();
@@ -6639,10 +6709,23 @@ mod tests {
                 "state-rv-after-supersession-root-refresh",
             ))
             .expect("root refresh persistence acknowledgement");
+        let CommandV0::RequestDescriptor { token, .. } = actor
+            .next_command()
+            .expect("root refresh continuation reduces")
+            .expect("root refresh re-verifies its descriptor")
+        else {
+            panic!("root refresh continuation did not re-verify its descriptor");
+        };
+        actor
+            .acknowledge(EventV0::DescriptorReady {
+                token,
+                bundle_digest: "a".repeat(64),
+            })
+            .expect("root refresh descriptor acknowledgement is exact");
         assert!(
             actor
                 .next_command()
-                .expect("root refresh continuation reduces")
+                .expect("root refresh descriptor acknowledgement reduces")
                 .is_none()
         );
         let final_barrier = actor.barrier();
@@ -6673,6 +6756,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn terminal_watch_before_render_status_ack_never_reissues_the_stale_render() {
         // Both root and retained 410/overflow are converted by the driver to
         // this authenticated actor invalidation.  The root self-echo is
@@ -6728,6 +6812,20 @@ mod tests {
                 let next = actor
                     .next_command()
                     .expect("ordinary invalidation continuation reduces");
+                let Some(CommandV0::RequestDescriptor { token, .. }) = next else {
+                    panic!(
+                        "{source}/{terminal} must re-verify its descriptor before fresh informer admission: {next:?}"
+                    );
+                };
+                actor
+                    .acknowledge(EventV0::DescriptorReady {
+                        token,
+                        bundle_digest: "a".repeat(64),
+                    })
+                    .expect("terminal-watch descriptor acknowledgement is exact");
+                let next = actor
+                    .next_command()
+                    .expect("terminal-watch descriptor acknowledgement reduces");
                 assert!(
                     next.is_none(),
                     "{source}/{terminal} must supersede, never issue the stale render: {next:?}"

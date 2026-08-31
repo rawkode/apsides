@@ -2251,10 +2251,10 @@ fn persist_ack(
             });
         }
         PersistPurpose::Invalidate => {
-            state.phase = PhaseV0::RenderPending;
-            commands.push(CommandV0::RequestRender {
-                preconditions: pins(&state.root),
-            });
+            // A durable invalidation has no observation capability. Re-verify
+            // the descriptor before admitting a new informer barrier instead
+            // of issuing a tokenless render under stale retained watches.
+            request_descriptor(state, commands);
         }
         PersistPurpose::Completion
         | PersistPurpose::AutomationBaseline
@@ -8319,6 +8319,42 @@ mod tests {
             .commands
             .as_slice(),
             [CommandV0::Hold { .. }]
+        ));
+    }
+
+    #[test]
+    fn invalidate_persist_ack_reverifies_descriptor_before_any_render() {
+        let machine = boot_to_render(state());
+        let mut refreshed_root = machine.root.clone();
+        refreshed_root.root_resource_version = "root-rv-after-invalidate".into();
+
+        let invalidated = reduce(
+            machine,
+            EventV0::RootRefreshed {
+                root: refreshed_root,
+            },
+        )
+        .unwrap();
+        let CommandV0::Persist { operation, .. } = &invalidated.commands[0] else {
+            panic!("root refresh did not issue durable invalidation");
+        };
+        assert_eq!(operation.purpose, PersistPurpose::Invalidate);
+
+        let resumed = reduce(
+            invalidated.state,
+            EventV0::Persisted {
+                token: operation.token.clone(),
+                old_state_resource_version: operation.old_state_resource_version.clone(),
+                new_state_resource_version: "state-rv-after-invalidate".into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(resumed.state.phase, PhaseV0::DescriptorPending);
+        assert!(matches!(
+            resumed.commands.as_slice(),
+            [CommandV0::RequestDescriptor { preconditions, .. }]
+                if preconditions.observation_token.is_empty() && preconditions.cache_epoch.is_empty()
         ));
     }
 

@@ -20,7 +20,7 @@ CLUSTER_CREATED=false
 BARRIER_PID=''
 BARRIER_FD=''
 
-die() { echo "run-kind-e2e: $*" >&2; exit 1; }
+die() { FAILURE="$*"; echo "run-kind-e2e: $FAILURE" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "required command is unavailable: $1"; }
 note() { printf '%s\n' "$*" | tee -a "$EVIDENCE/runner.log"; }
 
@@ -616,9 +616,24 @@ atomic_capture foreign-collision-stopped-root.json ctx get webapplication root -
 jq -e --arg rootUid "$ROOT_UID" '.metadata.uid == $rootUid' "$EVIDENCE/foreign-collision-stopped-root.json" >/dev/null || die 'stopped collision root UID changed'
 
 # Only after the stopped empty-journal proof may the foreign object be deleted
-# and the root retriggered. The controller then creates a new object identity.
+# and the root retriggered. Capture the resulting stopped state before the
+# controller starts again, proving the external delete did not alter the root,
+# linked journal, or durable identities.
 ctx delete configmap root-config -n "$NAMESPACE"
 ctx annotate webapplication root -n "$NAMESPACE" "oxideloop.dev/e2e-retrigger=$RUN_ID" --overwrite
+atomic_capture foreign-collision-retrigger-root.json ctx get webapplication root -n "$NAMESPACE" -o json || die 'missing stopped collision retrigger root evidence'
+COLLISION_STATE_UID=$(jq -er '.status.state.uid' "$EVIDENCE/foreign-collision-retrigger-root.json")
+jq -e --arg rootUid "$ROOT_UID" --arg stateName "$COLLISION_STATE_NAME" --arg stateUid "$COLLISION_STATE_UID" --arg runId "$RUN_ID" '
+  (.metadata.uid == $rootUid) and
+  (.metadata.annotations["oxideloop.dev/e2e-retrigger"] == $runId) and
+  (.status.state == {rootUid:$rootUid,name:$stateName,uid:$stateUid}) and
+  (.status.state.rootUid == .metadata.uid)
+' "$EVIDENCE/foreign-collision-retrigger-root.json" >/dev/null || die 'stopped collision retrigger root link or UID is not exact'
+capture_empty_journal foreign-collision-retrigger "$ROOT_UID" "$COLLISION_STATE_NAME"
+jq -e --slurpfile stopped "$EVIDENCE/foreign-collision-stopped-identities.json" '
+  (.root == $stopped[0].root) and (.state == $stopped[0].state) and
+  (.config == []) and (.service == [])
+' "$EVIDENCE/foreign-collision-retrigger-identities.json" >/dev/null || die 'stopped collision retrigger identities or foreign ConfigMap absence is not exact'
 ctx scale deployment/oxideloop-controller -n "$NAMESPACE" --replicas=1
 ctx rollout status deployment/oxideloop-controller -n "$NAMESPACE" --timeout="${TIMEOUT}s"
 wait_json 'recreated root ConfigMap ownership' '(.metadata.uid | type == "string") and ([.metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}])' configmap/root-config --arg rootUid "$ROOT_UID"
