@@ -2,11 +2,11 @@
 
 OxideLoop is an experimental Rust kernel for continuously reconciling Kubernetes resources described by TypeScript and TSX.
 
-This repository currently contains the **M0 feasibility spike**. M0 is intentionally local-only: it evaluates the renderer boundary, real React versus an explicitly React-like runtime, deterministic ABI encoding, capability isolation, and a model of conditional Kubernetes mutations. It does not connect to a cluster or mutate Kubernetes resources.
+This repository began as an M0 feasibility spike and now includes an experimental, single-root controller path through ownership, durable inventory, pruning, dependency-driven rendering, and declarative event actions. It is still not a production system: interfaces remain provisional and the kind run below is an isolated acceptance harness, not a release or hosted-cluster certification.
 
 The name and every `v0` interface remain provisional through M1 and until a later explicit compatibility freeze.
 
-## M0 result
+## Design boundary
 
 The spike selects an explicitly React-like TSX runtime for a future process-isolated worker. M0 evaluated its callable bundle in the deliberately rejected in-process harness. Ordinary React rendering works for the tested fixture, but unrestricted React is rejected because a layout-effect callback runs during commit. The current in-process `deno_core` host is rejected as a production boundary because it cannot enforce every memory and fatal-failure limit.
 
@@ -28,7 +28,85 @@ An empty desired graph is destructive intent, so ordinary `null`, booleans, prim
 
 See `docs/m0/BOUNDARY.md` before interpreting any test result as Kubernetes or production evidence.
 
-## Reproduce the positive path
+## Authoring a TSX program
+
+The author-facing program is pure TSX. It receives an immutable root projection
+and named observations; it cannot obtain a Kubernetes client. `useResource`
+declares a dependency, and `useAutomation` declares one immutable action for a
+particular observed transition.
+
+```tsx
+import { Fragment, jsx } from "@oxideloop/react-like-runtime/jsx-runtime";
+import { createRenderer } from "@oxideloop/react-like-runtime";
+import { createHookSession, useAutomation, useResource } from "@oxideloop/sdk/hooks";
+import { defineAction } from "@oxideloop/sdk";
+
+export const action = defineAction(({ eventMetadata }) => ({
+  abiVersion: "renderer.oxideloop.dev/v0",
+  actions: [{
+    logicalId: "dependency-changed",
+    kind: "Event",
+    specification: { apiVersion: "events.k8s.io/v1", kind: "Event",
+      metadata: { namespace: eventMetadata.namespace },
+      reason: "InputChanged", type: "Normal", note: "dependency changed" },
+  }], diagnostics: [],
+}));
+
+export function render(input) {
+  const session = createHookSession({
+    observationToken: input.observationToken,
+    read: (ref) => input.observations.find((o) => o.name === ref.name) ?? { ref, present: false },
+  });
+  const inputConfig = useResource(session, { apiVersion: "v1", kind: "ConfigMap", namespace: input.root.namespace, name: "demo-input" });
+  if (inputConfig.observation?.uid) {
+    useAutomation(session, { identity: "example.input-changed", version: "1",
+      sourceDependency: { type: "object", apiVersion: "v1", kind: "ConfigMap", namespace: input.root.namespace, name: "demo-input", uid: inputConfig.observation.uid, resourceVersion: inputConfig.observation.resourceVersion, observationToken: input.observationToken },
+      eventMetadata: { namespace: input.root.namespace }, bundleDigest: input.bundleDigest,
+      actionModuleIdentity: "example.input-changed", actionModuleDigest: "<build-time digest>", rendererAbiVersion: "renderer.oxideloop.dev/v0" });
+  }
+  const tree = jsx(Fragment, { children: [jsx("ConfigMap", { apiVersion: "v1", kind: "ConfigMap", metadata: { name: `${input.root.name}-config`, namespace: input.root.namespace }, data: { value: "managed" } })] });
+  const rendered = createRenderer(session).render(tree);
+  return { abiVersion: "renderer.oxideloop.dev/v0", disposition: rendered.disposition, resources: rendered.resources.map((object) => ({ logicalId: `configmap/${object.metadata.name}`, object, readiness: null })), dependencies: rendered.dependencies, automations: rendered.automations, diagnostics: [] };
+}
+```
+
+The complete, typechecked version lives in [packages/example-bundle/src/render.tsx](packages/example-bundle/src/render.tsx); its paired action is [packages/example-bundle/src/action.ts](packages/example-bundle/src/action.ts).
+
+## Fresh kind E2E acceptance
+
+One public command builds a new bundle, creates a new kind cluster, builds and
+loads separate production and E2E-failpoint images, installs the CRDs and E2E
+overlay, and runs the serialized ownership/recovery/deletion matrix:
+
+```sh
+scripts/run-kind-e2e.sh
+```
+
+It records the bundle metadata, generated manifests, controller logs, cluster
+objects, exact transition snapshots, and deletion midpoint snapshots under the
+ignored `work/kind-e2e/<RUN_ID>/` directory. `RUN_ID` defaults to a lowercase,
+DNS-safe timestamp-and-process identifier; caller-provided IDs must also be
+lowercase. Successful empty command output is retained as evidence rather than
+misreported as a capture failure.
+
+`result.json` points to `reproducibility.json` (the clean source revision,
+kind/node input, built bundle digest, and loaded image identities) and to an
+atomic `artifact-inventory.json` whose entries include every completed evidence
+file's path, SHA-256, and byte length. The inventory intentionally excludes its
+own bytes and `result.json`, avoiding a self-referential hash. The cluster is
+deleted even after failure; use `KEEP_CLUSTER=1` only to inspect a failure. The
+runner refuses every nonignored working-tree change; commit or stash all source
+changes before starting it. Its own ignored evidence directory is the only
+run-time write.
+
+For OrbStack, start its Docker-compatible engine and run the same command. The
+runner detects OrbStack only within its own process and selects Docker; callers
+may override that choice with `KIND_EXPERIMENTAL_PROVIDER`. Common failures are
+missing `kind`, `kubectl`, `docker`, `jq`, or `pnpm`; an unavailable Docker API;
+or a bounded wait timeout. Inspect `runner.log`, `controller.log`,
+`pods.describe.txt`, and `result.json` in the evidence directory before rerun.
+
+## Local renderer checks
 
 ```sh
 pnpm install --frozen-lockfile

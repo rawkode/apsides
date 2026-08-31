@@ -1,0 +1,603 @@
+#!/usr/bin/env bash
+# Fresh-kind acceptance runner. It is intentionally bash 3 compatible.
+set -euo pipefail
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$ROOT"
+
+NODE_IMAGE='kindest/node:v1.34.3@sha256:08497ee19eace7b4b5348db5c6a1591d7752b164530a36f855cb0f2bdcbadd48'
+RUN_ID=${RUN_ID:-"$(date -u +%Y%m%dt%H%M%Sz)-$$"}
+CLUSTER_NAME=${KIND_CLUSTER_NAME:-"oxideloop-e2e-${RUN_ID}"}
+NAMESPACE=${E2E_NAMESPACE:-oxideloop-e2e}
+KEEP_CLUSTER=${KEEP_CLUSTER:-0}
+TIMEOUT=${E2E_TIMEOUT_SECONDS:-180}
+EVIDENCE="$ROOT/work/kind-e2e/$RUN_ID"
+WORK="$EVIDENCE/work"
+RESULT="$EVIDENCE/result.json"
+STATE_FILE="$EVIDENCE/state.json"
+KUBECTL_TIMEOUT=${KUBECTL_TIMEOUT_SECONDS:-20}
+CLUSTER_CREATED=false
+BARRIER_PID=''
+BARRIER_FD=''
+
+die() { echo "run-kind-e2e: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "required command is unavailable: $1"; }
+note() { printf '%s\n' "$*" | tee -a "$EVIDENCE/runner.log"; }
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/run-kind-e2e.sh
+
+Creates a fresh disposable kind cluster, runs the serialized controller E2E
+matrix, and writes inspectable evidence below work/kind-e2e/<RUN_ID>.
+
+Environment: RUN_ID, KIND_CLUSTER_NAME, E2E_NAMESPACE, E2E_TIMEOUT_SECONDS,
+KEEP_CLUSTER=1, KIND_EXPERIMENTAL_PROVIDER, and KUBECTL_TIMEOUT_SECONDS.
+EOF
+}
+case "${1:-}" in -h|--help) usage; exit 0;; esac
+
+need git; need kind; need kubectl; need docker; need jq; need pnpm
+case "$RUN_ID" in *[!a-z0-9._-]*|'') die 'RUN_ID must contain only lowercase letters, digits, dot, underscore, or hyphen';; esac
+case "$CLUSTER_NAME" in oxideloop-e2e-*);; *) die 'KIND_CLUSTER_NAME must begin oxideloop-e2e-';; esac
+case "$CLUSTER_NAME" in *[!a-z0-9.-]*|*..*|.*|*.) die 'KIND_CLUSTER_NAME must be a DNS label';; esac
+case "$NAMESPACE" in *[!a-z0-9-]*|*--*|-*|*-) die 'E2E_NAMESPACE must be a DNS label';; esac
+[ "$TIMEOUT" -gt 0 ] 2>/dev/null || die 'E2E_TIMEOUT_SECONDS must be positive'
+[ "$KUBECTL_TIMEOUT" -gt 0 ] 2>/dev/null || die 'KUBECTL_TIMEOUT_SECONDS must be positive'
+if [ -e "$EVIDENCE" ]; then die "evidence path already exists: $EVIDENCE"; fi
+if kind get clusters 2>/dev/null | awk -v name="$CLUSTER_NAME" '$0 == name { found=1 } END { exit !found }'; then die "cluster already exists: $CLUSTER_NAME"; fi
+mkdir -p "$WORK"
+hash_file() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}';
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}';
+  else die "required command is unavailable: sha256sum or shasum"; fi
+}
+
+# A run must be attributable to an exact, entirely clean source tree. Ignored
+# run evidence is deliberately outside porcelain status and is the sole write.
+HEAD=$(git rev-parse HEAD)
+DIRT=$(git status --porcelain --untracked-files=all)
+[ -z "$DIRT" ] || { printf '%s\n' "$DIRT" >&2; die 'refusing nonignored working-tree changes'; }
+
+# Keep provider selection local to this process. In particular, OrbStack's
+# Docker-compatible daemon needs no global kind configuration.
+if [ -z "${KIND_EXPERIMENTAL_PROVIDER:-}" ]; then
+  docker info >/dev/null 2>&1 || die "Docker-compatible daemon is not ready (start Docker or OrbStack)"
+  if command -v orbctl >/dev/null 2>&1 && orbctl status >/dev/null 2>&1; then
+    export KIND_EXPERIMENTAL_PROVIDER=docker
+    note "provider=docker (OrbStack detected)"
+  else
+    export KIND_EXPERIMENTAL_PROVIDER=docker
+    note "provider=docker"
+  fi
+else
+  note "provider=$KIND_EXPERIMENTAL_PROVIDER (caller supplied)"
+fi
+
+PASS=true
+FAILURE=''
+ARTIFACTS=''
+atomic_capture() {
+  name=$1; shift
+  temporary="$EVIDENCE/.${name}.tmp"
+  "$@" >"$temporary" 2>&1 || { rm -f "$temporary"; FAILURE="required capture failed: $name"; return 1; }
+  mv "$temporary" "$EVIDENCE/$name"
+  hash_file "$EVIDENCE/$name" >"$EVIDENCE/$name.sha256"
+  ARTIFACTS="$ARTIFACTS $name"
+}
+capture() {
+  [ "$CLUSTER_CREATED" = true ] || return 0
+  atomic_capture resources.yaml ctx get all,webapplications,oxideloopstates,automationruns,events.events.k8s.io -n "$NAMESPACE" -o yaml || return 1
+  atomic_capture pods.txt ctx get pods -A -o wide || return 1
+  atomic_capture pods.describe.txt ctx describe pods -n "$NAMESPACE" || return 1
+  atomic_capture controller.log ctx logs deployment/oxideloop-controller -n "$NAMESPACE" --all-containers --tail=-1 || return 1
+  atomic_capture events.txt ctx get events -A --sort-by=.lastTimestamp || return 1
+  atomic_capture node.inspect.json docker inspect "${CLUSTER_NAME}-control-plane" || return 1
+  atomic_capture source-revision.txt git rev-parse HEAD || return 1
+  atomic_capture git-status.txt git status --porcelain --untracked-files=all || return 1
+}
+cleanup() {
+  exit_code=$?
+  if [ "$exit_code" -ne 0 ]; then PASS=false; FAILURE=${FAILURE:-"runner exited $exit_code"}; fi
+  if [ -n "$BARRIER_PID" ]; then kill "$BARRIER_PID" >/dev/null 2>&1 || true; wait "$BARRIER_PID" 2>/dev/null || true; fi
+  if [ -n "$BARRIER_FD" ]; then eval "exec ${BARRIER_FD}>&-"; fi
+  capture || { PASS=false; FAILURE=${FAILURE:-'required evidence capture failed'}; }
+  FINAL_HEAD=$(git rev-parse HEAD 2>/dev/null || true)
+  [ "$FINAL_HEAD" = "$HEAD" ] || { PASS=false; FAILURE=${FAILURE:-'source revision changed during run'}; }
+  FINAL_DIRT=$(git status --porcelain --untracked-files=all)
+  [ -z "$FINAL_DIRT" ] || { PASS=false; FAILURE=${FAILURE:-'source tree became nonignored-dirty'}; }
+  cluster_disposition=kept
+  if [ "$CLUSTER_CREATED" = true ] && [ "$KEEP_CLUSTER" != 1 ]; then
+    if kind delete cluster --name "$CLUSTER_NAME" >/dev/null 2>&1; then
+      if clusters_after_delete=$(kind get clusters 2>/dev/null); then
+        if printf '%s\n' "$clusters_after_delete" | awk -v name="$CLUSTER_NAME" '$0 == name { found=1 } END { exit !found }'; then
+          PASS=false
+          FAILURE=${FAILURE:-'kind reported deletion but the exact cluster still exists'}
+          cluster_disposition=delete-failed
+        else
+          cluster_disposition=deleted
+        fi
+      else
+        PASS=false
+        FAILURE=${FAILURE:-'kind cluster deletion could not be verified'}
+        cluster_disposition=delete-unverified
+      fi
+    else
+      PASS=false
+      FAILURE=${FAILURE:-'kind cluster deletion failed'}
+      cluster_disposition=delete-failed
+    fi
+  fi
+  status=passed; [ "$PASS" = true ] || status=failed
+  image_ids=$(cat "$EVIDENCE/image-ids.json" 2>/dev/null || printf '{}')
+  jq -n --arg runId "$RUN_ID" --arg cluster "$CLUSTER_NAME" --arg namespace "$NAMESPACE" --arg revision "$HEAD" --arg finalRevision "$FINAL_HEAD" --arg nodeImage "$NODE_IMAGE" --arg actualNodeImage "${ACTUAL_NODE_IMAGE:-}" --arg kindVersion "$(kind version 2>/dev/null || true)" --arg clusterDisposition "$cluster_disposition" --argjson images "$image_ids" --arg bundleDigest "${BUNDLE_DIGEST:-}" --arg bundleArchiveSha "${BUNDLE_SHA:-}" '{schema:"oxideloop.dev/kind-e2e-reproducibility/v1",runId:$runId,cluster:$cluster,namespace:$namespace,sourceRevision:$revision,finalSourceRevision:$finalRevision,sourceTree:"clean-at-start-and-cleanup",nodeImage:{requested:$nodeImage,actual:$actualNodeImage},kindVersion:$kindVersion,clusterDisposition:$clusterDisposition,imageIds:$images,bundle:{digest:$bundleDigest,archiveSha256:$bundleArchiveSha}}' >"$EVIDENCE/.reproducibility.json.tmp" && mv "$EVIDENCE/.reproducibility.json.tmp" "$EVIDENCE/reproducibility.json"
+  (
+    cd "$EVIDENCE"
+    find . -type f ! -name '.artifact-inventory.json.tmp' ! -name 'artifact-inventory.json' ! -name 'artifact-inventory.json.sha256' ! -name 'result.json' ! -name 'result.json.sha256' | LC_ALL=C sort | while IFS= read -r file; do
+      file=${file#./}
+      jq -n --arg path "$file" --arg sha256 "$(hash_file "$EVIDENCE/$file")" --argjson bytes "$(wc -c <"$EVIDENCE/$file" | tr -d ' ')" '{path:$path,sha256:$sha256,bytes:$bytes}'
+    done
+  ) | jq -s '{schema:"oxideloop.dev/kind-e2e-artifact-inventory/v1",artifacts:.}' >"$EVIDENCE/.artifact-inventory.json.tmp" && mv "$EVIDENCE/.artifact-inventory.json.tmp" "$EVIDENCE/artifact-inventory.json"
+  hash_file "$EVIDENCE/artifact-inventory.json" >"$EVIDENCE/artifact-inventory.json.sha256"
+  inventory_sha=$(cat "$EVIDENCE/artifact-inventory.json.sha256")
+  jq -n --arg runId "$RUN_ID" --arg cluster "$CLUSTER_NAME" --arg namespace "$NAMESPACE" --arg revision "$HEAD" --arg status "$status" --arg failure "$FAILURE" --arg evidence "$EVIDENCE" --arg nodeImage "$NODE_IMAGE" --arg kindVersion "$(kind version 2>/dev/null || true)" --arg clusterDisposition "$cluster_disposition" --argjson images "$image_ids" --arg artifacts "$ARTIFACTS" --arg inventory "artifact-inventory.json" --arg inventorySha256 "$inventory_sha" '{schema:"oxideloop.dev/kind-e2e-result/v1",runId:$runId,cluster:$cluster,namespace:$namespace,sourceRevision:$revision,status:$status,failureReason:$failure,evidence:$evidence,nodeImage:$nodeImage,kindVersion:$kindVersion,clusterDisposition:$clusterDisposition,imageIds:$images,capturedArtifacts:($artifacts|split(" ")|map(select(length>0))),reproducibility:"reproducibility.json",artifactInventory:{path:$inventory,sha256:$inventorySha256}}' >"$RESULT.tmp" && mv "$RESULT.tmp" "$RESULT"
+  hash_file "$RESULT" >"$RESULT.sha256"
+  [ "$PASS" = true ] && [ "$exit_code" -eq 0 ] || exit 1
+}
+trap cleanup EXIT
+
+ctx() { kubectl --request-timeout="${KUBECTL_TIMEOUT}s" --context "kind-$CLUSTER_NAME" "$@"; }
+wait_json() {
+  description=$1; filter=$2; elapsed=0
+  while ! ctx get "$3" -n "$NAMESPACE" -o json 2>/dev/null | jq -e "$filter" >/dev/null; do
+    [ "$elapsed" -lt "$TIMEOUT" ] || die "timed out waiting for $description"
+    sleep 2; elapsed=$((elapsed + 2))
+  done
+}
+assert_count() { actual=$1; expected=$2; label=$3; [ "$actual" = "$expected" ] || die "$label: expected $expected, got $actual"; }
+controller_pod() {
+  ctx get pod -n "$NAMESPACE" -l app.kubernetes.io/component=controller -o json |
+    jq -er '[.items[] | select(.metadata.deletionTimestamp == null)] | if length == 1 then .[0].metadata.name else error("expected exactly one live controller pod") end'
+}
+root_uid() { ctx get webapplication root -n "$NAMESPACE" -o jsonpath='{.metadata.uid}'; }
+controller_status() { ctx get pod -n "$NAMESPACE" "$1" -o json | jq -er '.status.containerStatuses[] | select(.name == "controller")'; }
+wait_for_exact_crash() {
+  point=$1; pod=$2; expected_uid=$3; expected_restart=$4; ticks=0; max_ticks=$((TIMEOUT * 10))
+  while :; do
+    snapshot=$(ctx get pod -n "$NAMESPACE" "$pod" -o json 2>/dev/null || true)
+    actual_uid=$(printf '%s' "$snapshot" | jq -r '.metadata.uid // empty' 2>/dev/null || true)
+    [ "$actual_uid" = "$expected_uid" ] || die "crash $point replaced the exact controller pod"
+    status=$(printf '%s' "$snapshot" | jq -c '.status.containerStatuses[]? | select(.name == "controller")' 2>/dev/null || true)
+    restart=$(printf '%s' "$status" | jq -r '.restartCount // empty' 2>/dev/null || true)
+    [ -n "$restart" ] || die "crash $point lost controller container status"
+    [ "$restart" -le "$expected_restart" ] 2>/dev/null || die "crash $point incremented restartCount more than once"
+    if [ "$restart" = "$expected_restart" ] && [ "$(printf '%s' "$status" | jq -r '.lastState.terminated.exitCode // empty')" = 75 ]; then return 0; fi
+    [ "$ticks" -lt "$max_ticks" ] || die "timed out waiting for exact exit 75 after $point"
+    sleep 0.1; ticks=$((ticks + 1))
+  done
+}
+assert_automation_transition() {
+  expected_total=$1; source_uid=$2; source_rv=$3; label=$4
+  elapsed=0
+  while :; do
+    ctx get automationruns -n "$NAMESPACE" -o json >"$WORK/automationruns-${label}.json"
+    ctx get events.events.k8s.io -n "$NAMESPACE" -o json >"$WORK/events-${label}.json"
+    ctx get oxideloopstate "$STATE_NAME" -n "$NAMESPACE" -o json >"$WORK/state-automation-${label}.json"
+    if jq -e --argjson expected "$expected_total" --arg rootUid "$ROOT_UID" --arg namespace "$NAMESPACE" --arg sourceUid "$source_uid" --arg sourceRv "$source_rv" --arg bundleDigest "$BUNDLE_DIGEST" '
+    .items as $runs |
+    ($runs | length == $expected) and
+    ($runs | all(.[]; .spec.rootUid == $rootUid and .spec.bundleDigest == $bundleDigest and .spec.program.digest == $bundleDigest and .spec.source == {apiVersion:"v1",kind:"ConfigMap",namespace:$namespace,name:"demo-input"} and .spec.sourceUid == $sourceUid and (.spec.sourceResourceVersion | type == "string") and (.spec.sourceTransitionId | test("^[0-9a-f]{64}$")) and (.spec.occurrenceId | test("^[0-9a-f]{64}$")) and (.metadata.uid | type == "string") and ([.metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}]) and .status.attempts == 1 and (.status.completion.state == "Succeeded") and (.status.materializationName | type == "string") and (.status.materializationUid | type == "string"))) and
+    ([ $runs[].spec.occurrenceId ] | unique | length == $expected) and
+    ([ $runs[].spec.sourceTransitionId ] | unique | length == $expected) and
+    ([ $runs[].spec.sourceResourceVersion ] | unique | length == $expected) and
+    ([ $runs[].metadata.uid ] | unique | length == $expected) and
+    ([ $runs[].status.materializationUid ] | unique | length == $expected) and
+    ([ $runs[] | select(.spec.sourceResourceVersion == $sourceRv) ] | length == (if $expected == 0 then 0 else 1 end))
+  ' "$WORK/automationruns-${label}.json" >/dev/null && jq -e --slurpfile runs "$WORK/automationruns-${label}.json" --argjson expected "$expected_total" --arg namespace "$NAMESPACE" --arg rootUid "$ROOT_UID" --arg sourceUid "$source_uid" '
+    [.items[] | select(.reason == "InputChanged")] as $events |
+    ($events | length == $expected) and
+    ($events | all(.[]; .metadata.uid | type == "string")) and
+    ([ $events[].metadata.uid ] | unique | length == $expected) and
+    ($runs[0].items | all(.[]; . as $run | $events | any(.[];
+      .metadata.name == $run.status.materializationName and
+      .metadata.uid == $run.status.materializationUid and
+      .regarding == {apiVersion:"v1",kind:"ConfigMap",namespace:$namespace,name:"demo-input",uid:$sourceUid,resourceVersion:$run.spec.sourceResourceVersion} and
+      .metadata.annotations["runtime.oxideloop.dev/root-uid"] == $rootUid and
+      .metadata.annotations["runtime.oxideloop.dev/occurrence-id"] == $run.spec.occurrenceId and
+      (.metadata.labels["runtime.oxideloop.dev/root-uid"] | test("^[0-9a-f]{63}$")) and
+      (.metadata.labels["runtime.oxideloop.dev/occurrence-id"] | test("^[0-9a-f]{63}$")) and
+      ([.metadata.ownerReferences[]?] == [{apiVersion:"runtime.oxideloop.dev/v1alpha1",kind:"AutomationRun",name:$run.metadata.name,uid:$run.metadata.uid,controller:true,blockOwnerDeletion:false}])
+    ))) and
+    ($events | all(.[]; . as $event | $runs[0].items | any(.[]; .status.materializationName == $event.metadata.name and .status.materializationUid == $event.metadata.uid)))
+  ' "$WORK/events-${label}.json" >/dev/null && jq -e --slurpfile runs "$WORK/automationruns-${label}.json" --argjson expected "$expected_total" --arg namespace "$NAMESPACE" '
+    (.spec.state.automation // {}) as $automation |
+    ((.spec.state.pendingDependencies // []) | length == 0) and
+    (.spec.state.applyTransaction == null and .spec.state.pendingPersist == null and .spec.state.pruneCandidate == null and .spec.state.generationAdvanceClosure == null and .spec.state.deletion == null) and
+    (($automation.baselines // []) | length == 1) and
+    (($automation.baselines // [])[0].automationId == "demo.web-application.input-changed") and
+    (($automation.baselines // [])[0].source == {apiVersion:"v1",kind:"ConfigMap",namespace:$namespace,name:"demo-input"}) and
+    (($automation.pending // []) | length == 0) and
+    (($automation.completions // []) | length == $expected) and
+    ($runs[0].items | all(.[]; . as $run | ($automation.completions // []) | any(.[];
+      .occurrenceId == $run.spec.occurrenceId and .runName == $run.metadata.name and .runUid == $run.metadata.uid and
+      (.oldResourceVersion | type == "string") and .oldResourceVersion != .completedResourceVersion and
+      .completedResourceVersion == $run.metadata.resourceVersion and
+      .materializationName == $run.status.materializationName and .materializationUid == $run.status.materializationUid and .outcome == "Succeeded"
+    ))) and
+    (($automation.completions // []) | all(.[]; . as $completion | $runs[0].items | any(.[]; .spec.occurrenceId == $completion.occurrenceId and .metadata.uid == $completion.runUid)))
+  ' "$WORK/state-automation-${label}.json" >/dev/null; then
+      return 0
+    fi
+    [ "$elapsed" -lt "$TIMEOUT" ] || die "$label: timed out waiting for exact source, AutomationRun, Event, and durable-completion convergence"
+    sleep 2; elapsed=$((elapsed + 2))
+  done
+}
+capture_transition() {
+  label=$1
+  atomic_capture "automationruns-${label}.json" ctx get automationruns -n "$NAMESPACE" -o json || die "failed to capture AutomationRuns for $label"
+  atomic_capture "events-${label}.json" ctx get events.events.k8s.io -n "$NAMESPACE" -o json || die "failed to capture Events for $label"
+  atomic_capture "state-automation-${label}.json" ctx get oxideloopstate "$STATE_NAME" -n "$NAMESPACE" -o json || die "failed to capture automation state for $label"
+}
+write_root() {
+  cat >"$WORK/root.yaml" <<EOF
+apiVersion: demo.oxideloop.dev/v1alpha1
+kind: WebApplication
+metadata:
+  name: root
+  namespace: $NAMESPACE
+spec:
+  message: hello
+  expose: true
+  program:
+    configMapName: oxideloop-e2e-bundle
+    key: bundle.archive
+    digest: $BUNDLE_DIGEST
+EOF
+}
+arm_crash() {
+  point=$1; pod=$(controller_pod); CRASH_POD_NAME=$pod
+  CRASH_POD_UID=$(ctx get pod -n "$NAMESPACE" "$pod" -o jsonpath='{.metadata.uid}')
+  CRASH_RESTART=$(controller_status "$pod" | jq -er '.restartCount')
+  ctx exec -n "$NAMESPACE" "$pod" -c controller -- /usr/local/bin/oxideloop-e2e-failpoint-control --socket /run/oxideloop/failpoints/control.sock --point "$point" | tee "$EVIDENCE/failpoint-${point}.txt"
+}
+await_crash() {
+  point=$1
+  pod=$(controller_pod)
+  [ "$pod" = "$CRASH_POD_NAME" ] 2>/dev/null || die "crash $point changed controller pod name"
+  wait_for_exact_crash "$point" "$CRASH_POD_NAME" "$CRASH_POD_UID" "$((CRASH_RESTART + 1))"
+  atomic_capture "controller-${point}-previous.log" ctx logs -n "$NAMESPACE" "$CRASH_POD_NAME" -c controller --previous --tail=-1 || die "missing previous controller log for $point"
+  ctx rollout status deployment/oxideloop-controller -n "$NAMESPACE" --timeout="${TIMEOUT}s"
+}
+
+note "run=$RUN_ID cluster=$CLUSTER_NAME revision=$HEAD"
+kind create cluster --name "$CLUSTER_NAME" --image "$NODE_IMAGE" --config deploy/e2e/kind-config.yaml --wait "${TIMEOUT}s"
+CLUSTER_CREATED=true
+ACTUAL_NODE_IMAGE=$(docker inspect "${CLUSTER_NAME}-control-plane" --format '{{.Config.Image}}')
+[ "$ACTUAL_NODE_IMAGE" = "$NODE_IMAGE" ] || die "kind control-plane image differs from the immutable requested image: $ACTUAL_NODE_IMAGE"
+if [ "${OXIDELOOP_E2E_SELF_TEST_STOP_AFTER_CLUSTER_CREATE:-0}" = 1 ]; then
+  die 'self-test stop after cluster creation'
+fi
+if [ "${OXIDELOOP_E2E_SELF_TEST_FINISH_AFTER_CLUSTER_CREATE:-0}" = 1 ]; then
+  exit 0
+fi
+ctx create namespace "$NAMESPACE"
+ctx apply -f deploy/crds/oxideloop-crds.yaml
+ctx wait --for=condition=Established crd/webapplications.demo.oxideloop.dev --timeout="${TIMEOUT}s"
+
+# Build from this exact source and retain the archive plus immutable metadata.
+pnpm install --frozen-lockfile
+pnpm bundle:e2e -- --out "$WORK/bundle.archive" --metadata "$WORK/bundle-metadata.json"
+BUNDLE_DIGEST=$(jq -er '.buildBundle.bundleDigest' "$WORK/bundle-metadata.json")
+BUNDLE_SHA=$(jq -er '.buildBundle.archive.sha256' "$WORK/bundle-metadata.json")
+test "$(hash_file "$WORK/bundle.archive")" = "$BUNDLE_SHA" || die "bundle archive digest differs from metadata"
+base64 <"$WORK/bundle.archive" | tr -d '\n' >"$WORK/bundle.base64"
+cat >"$WORK/bundle-configmap.yaml" <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oxideloop-e2e-bundle
+  namespace: $NAMESPACE
+binaryData:
+  bundle.archive: $(cat "$WORK/bundle.base64")
+EOF
+ctx apply -f "$WORK/bundle-configmap.yaml"
+
+PRODUCTION_IMAGE="oxideloop-e2e:production-$RUN_ID"
+FAILPOINT_IMAGE="oxideloop-e2e:failpoints-$RUN_ID"
+# Disable provenance attestations for this local load so each tag names one
+# platform manifest and the exact digest kind/containerd reports is comparable
+# to Docker's local image identity.
+docker build --provenance=false --target production -t "$PRODUCTION_IMAGE" .
+docker build --provenance=false --target e2e-failpoints -t "$FAILPOINT_IMAGE" .
+PRODUCTION_IMAGE_ID=$(docker image inspect "$PRODUCTION_IMAGE" --format '{{.Id}}')
+FAILPOINT_IMAGE_ID=$(docker image inspect "$FAILPOINT_IMAGE" --format '{{.Id}}')
+kind load docker-image --name "$CLUSTER_NAME" "$PRODUCTION_IMAGE" "$FAILPOINT_IMAGE"
+kubectl kustomize deploy/e2e | sed -e "s#ghcr.io/oxideloop/oxideloop:production#$PRODUCTION_IMAGE#g" -e "s#ghcr.io/oxideloop/oxideloop:e2e-failpoints#$FAILPOINT_IMAGE#g" | ctx apply -n "$NAMESPACE" -f -
+ctx rollout status deployment/oxideloop-controller -n "$NAMESPACE" --timeout="${TIMEOUT}s"
+normalize_image_id() {
+  printf '%s' "$1" | sed -E 's#^[[:alnum:]+.-]+://##; s#^.*@##; s#^.*(sha256:)#\1#'
+}
+NORMALIZED_PRODUCTION_IMAGE_ID=$(normalize_image_id "$PRODUCTION_IMAGE_ID")
+NORMALIZED_FAILPOINT_IMAGE_ID=$(normalize_image_id "$FAILPOINT_IMAGE_ID")
+POD_IMAGE_IDENTITIES=$(ctx get pod -n "$NAMESPACE" -l app.kubernetes.io/component=controller -o json | jq -ec --arg controllerImage "$FAILPOINT_IMAGE" --arg rendererImage "$PRODUCTION_IMAGE" --arg controllerId "$NORMALIZED_FAILPOINT_IMAGE_ID" --arg rendererId "$NORMALIZED_PRODUCTION_IMAGE_ID" '
+  [.items[] | select(.metadata.deletionTimestamp == null)] as $pods |
+  if ($pods | length) != 1 then error("expected exactly one live controller pod") else $pods[0] end |
+  . as $pod |
+  ([.spec.containers[] | select(.name == "controller" or .name == "renderer") | {name,image}] | sort_by(.name)) as $declared |
+  ([.status.containerStatuses[] | select(.name == "controller" or .name == "renderer") | {name,image,imageID:(.imageID | sub("^[A-Za-z0-9+.-]+://"; "") | if contains("@") then split("@")[-1] else . end | if contains("sha256:") then sub("^.*(sha256:)"; "sha256:") else . end)}] | sort_by(.name)) as $observed |
+  if $declared != [{name:"controller",image:$controllerImage},{name:"renderer",image:$rendererImage}] then error("controller and renderer declarations differ from loaded tags")
+  elif ($observed | length) != 2 then error("controller and renderer status identities are incomplete")
+  elif ($observed | any(.[]; .name == "controller" and .imageID == $controllerId) | not) then error("controller image identity differs from loaded failpoint image")
+  elif ($observed | any(.[]; .name == "renderer" and .imageID == $rendererId) | not) then error("renderer image identity differs from loaded production image")
+  else {pod:{name:$pod.metadata.name,uid:$pod.metadata.uid},expected:{controller:{tag:$controllerImage,imageID:$controllerId},renderer:{tag:$rendererImage,imageID:$rendererId}},observed:$observed} end
+') || die 'controller and renderer image identity proof failed'
+jq -n --arg production "$NORMALIZED_PRODUCTION_IMAGE_ID" --arg failpoints "$NORMALIZED_FAILPOINT_IMAGE_ID" --arg node "$NODE_IMAGE" --argjson pod "$POD_IMAGE_IDENTITIES" '{production:$production,failpoints:$failpoints,nodeImage:$node,podIdentity:$pod}' >"$EVIDENCE/image-ids.json"
+
+# Foreign desired-name collision proves default-deny adoption before bootstrap.
+ctx create configmap root-config -n "$NAMESPACE" --from-literal=foreign=true
+ctx get configmap root-config -n "$NAMESPACE" -o json >"$EVIDENCE/foreign-before.json"
+FOREIGN_UID=$(jq -r '.metadata.uid' "$EVIDENCE/foreign-before.json")
+COLLISION_POD=$(controller_pod)
+COLLISION_POD_UID=$(ctx get pod -n "$NAMESPACE" "$COLLISION_POD" -o jsonpath='{.metadata.uid}')
+COLLISION_RESTART=$(controller_status "$COLLISION_POD" | jq -er '.restartCount')
+write_root; ctx apply -f "$WORK/root.yaml"
+ROOT_UID=$(root_uid)
+elapsed=0
+while :; do
+  collision_status=$(controller_status "$COLLISION_POD" 2>/dev/null || true)
+  collision_uid=$(ctx get pod -n "$NAMESPACE" "$COLLISION_POD" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+  [ "$collision_uid" = "$COLLISION_POD_UID" ] || die 'foreign collision replaced the controller pod'
+  collision_restarts=$(printf '%s' "$collision_status" | jq -r '.restartCount // 0')
+  collision_exit=$(printf '%s' "$collision_status" | jq -r '.lastState.terminated.exitCode // empty')
+  if [ "$collision_restarts" -ge "$((COLLISION_RESTART + 1))" ] 2>/dev/null && [ "$collision_exit" = 1 ]; then break; fi
+  [ "$elapsed" -lt "$TIMEOUT" ] || die 'timed out waiting for the default-deny collision failure'
+  sleep 2; elapsed=$((elapsed + 2))
+done
+atomic_capture controller-foreign-collision-previous.log ctx logs -n "$NAMESPACE" "$COLLISION_POD" -c controller --previous --tail=-1 || die 'missing foreign collision controller log'
+grep -F 'controller stopped: core: mutation model rejected desired graph: unsafe desired mutation decision' "$EVIDENCE/controller-foreign-collision-previous.log" >/dev/null || die 'foreign collision did not fail through the no-adoption mutation boundary'
+ctx get configmap root-config -n "$NAMESPACE" -o json >"$EVIDENCE/foreign-after.json"
+jq -e --slurpfile before "$EVIDENCE/foreign-before.json" '. == $before[0]' "$EVIDENCE/foreign-after.json" >/dev/null || die 'foreign collision object was mutated in at least one field'
+ctx get webapplication root -n "$NAMESPACE" -o json >"$EVIDENCE/foreign-collision-root.json"
+COLLISION_STATE_NAME=$(jq -er '.status.state.name' "$EVIDENCE/foreign-collision-root.json")
+ctx get oxideloopstates -n "$NAMESPACE" -o json >"$EVIDENCE/foreign-collision-states.json"
+jq -e --arg rootUid "$ROOT_UID" --arg stateName "$COLLISION_STATE_NAME" '
+  (.items | length == 1) and (.items[0].metadata.name == $stateName) and (.items[0].spec.root.uid == $rootUid) and
+  (.items[0].spec.state.inventory | length == 0) and ((.items[0].spec.state.pendingDependencies // []) | length == 0) and
+  (.items[0].spec.state.applyTransaction == null and .items[0].spec.state.pendingPersist == null and .items[0].spec.state.pruneCandidate == null and .items[0].spec.state.generationAdvanceClosure == null and .items[0].spec.state.deletion == null) and
+  ((.items[0].spec.state.automation.baselines // []) | length == 0) and ((.items[0].spec.state.automation.pending // []) | length == 0) and ((.items[0].spec.state.automation.completions // []) | length == 0) and
+  ([.items[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}])
+' "$EVIDENCE/foreign-collision-states.json" >/dev/null || die 'foreign collision created anything beyond the empty controller-owned journal'
+assert_count "$(ctx get service -n "$NAMESPACE" -o json | jq '.items | length')" 0 'foreign collision service claim'
+assert_count "$(ctx get automationruns -n "$NAMESPACE" -o json | jq '.items | length')" 0 'foreign collision AutomationRun claim'
+ctx delete configmap root-config -n "$NAMESPACE"
+ctx annotate webapplication root -n "$NAMESPACE" "oxideloop.dev/e2e-retrigger=$RUN_ID" --overwrite
+wait_json 'root current render status and durable link' '(.status.state.rootUid == .metadata.uid) and (.status.state.name | type == "string") and (.status.state.uid | type == "string") and (.status.observedGeneration == .metadata.generation) and (.status.verifiedBundleDigest == .spec.program.digest) and (.status.inputToken | type == "string") and (.status.cacheEpoch | type == "number")' webapplication/root
+test "$(root_uid)" = "$ROOT_UID" || die 'collision recovery changed the root identity'
+assert_count "$(ctx get configmap root-config -n "$NAMESPACE" -o json | jq --arg uid "$ROOT_UID" '[.metadata.ownerReferences[]? | select(.uid == $uid)] | length')" 1 'managed ConfigMap owner reference'
+ctx get webapplication root -n "$NAMESPACE" -o json >"$EVIDENCE/initial-root.json"
+STATE_NAME=$(jq -er '.status.state.name' "$EVIDENCE/initial-root.json")
+wait_json 'initial state final convergence' '(.spec.state.inventory | length == 2) and ((.spec.state.pendingDependencies // []) | length == 0) and (.spec.state.applyTransaction == null) and (.spec.state.pendingPersist == null) and (.spec.state.pruneCandidate == null) and (.spec.state.generationAdvanceClosure == null) and (.spec.state.deletion == null) and ((.spec.state.automation.pending // []) | length == 0)' "oxideloopstate/$STATE_NAME"
+wait_json 'initial root current render status' '(.status.state.rootUid == .metadata.uid) and (.status.observedGeneration == .metadata.generation) and (.status.verifiedBundleDigest == .spec.program.digest) and (.status.inputToken | type == "string") and (.status.cacheEpoch | type == "number")' webapplication/root
+ctx get webapplication root -n "$NAMESPACE" -o json >"$EVIDENCE/initial-root.json"
+STATE_UID=$(jq -er '.status.state.uid' "$EVIDENCE/initial-root.json")
+ctx get oxideloopstate "$STATE_NAME" -n "$NAMESPACE" -o json >"$EVIDENCE/initial-state.json"
+ctx get configmap root-config -n "$NAMESPACE" -o json >"$EVIDENCE/initial-config.json"
+ctx get service root-service -n "$NAMESPACE" -o json >"$EVIDENCE/initial-service.json"
+jq -e --slurpfile root "$EVIDENCE/initial-root.json" --slurpfile config "$EVIDENCE/initial-config.json" --slurpfile service "$EVIDENCE/initial-service.json" --arg stateUid "$STATE_UID" --arg rootUid "$ROOT_UID" --arg stateName "$STATE_NAME" '
+  (.metadata.uid == $stateUid) and (.spec.root.uid == $rootUid) and (.spec.root.bundleDigest == $root[0].spec.program.digest) and
+  ([.metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}]) and
+  (.spec.state.inventory | length == 2) and
+  ([.spec.state.inventory[] | select(.logicalId == "configmap/root-config" and .identity == {apiVersion:"v1",kind:"ConfigMap",namespace:$config[0].metadata.namespace,name:$config[0].metadata.name} and .uid == $config[0].metadata.uid and .resourceVersion == $config[0].metadata.resourceVersion and .bundleDigest == $root[0].spec.program.digest)] | length == 1) and
+  ([.spec.state.inventory[] | select(.logicalId == "service/root-service" and .identity == {apiVersion:"v1",kind:"Service",namespace:$service[0].metadata.namespace,name:$service[0].metadata.name} and .uid == $service[0].metadata.uid and .resourceVersion == $service[0].metadata.resourceVersion and .bundleDigest == $root[0].spec.program.digest)] | length == 1) and
+  ((.spec.state.pendingDependencies // []) | length == 0) and
+  (.spec.state.applyTransaction == null and .spec.state.pendingPersist == null and .spec.state.pruneCandidate == null and .spec.state.generationAdvanceClosure == null and .spec.state.deletion == null) and
+  ((.spec.state.automation.pending // []) | length == 0) and ((.spec.state.automation.completions // []) | length == 0) and
+  ($root[0].metadata.uid == $rootUid and $root[0].status.state == {rootUid:$rootUid,name:$stateName,uid:$stateUid}) and
+  ($root[0].status.observedGeneration == $root[0].metadata.generation and $root[0].status.verifiedBundleDigest == $root[0].spec.program.digest) and
+  ($root[0].metadata.finalizers | index("demo.oxideloop.dev/finalizer") != null) and
+  ([$config[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}]) and
+  ([$service[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}])
+' "$EVIDENCE/initial-state.json" >/dev/null || die 'bootstrap root, state, inventory, or ownership is not exact'
+
+# Pruning a service must retain the same root/state identity.
+CONFIG_UID=$(ctx get configmap root-config -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')
+SERVICE_UID=$(ctx get service root-service -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')
+ctx patch webapplication root -n "$NAMESPACE" --type merge -p '{"spec":{"expose":false}}'
+wait_json 'service pruned' '.items | length == 0' service
+test "$(root_uid)" = "$ROOT_UID" || die 'prune changed the root identity'
+wait_json 'prune state final convergence' '(.spec.state.inventory | length == 1) and ((.spec.state.pendingDependencies // []) | length == 0) and (.spec.state.applyTransaction == null) and (.spec.state.pendingPersist == null) and (.spec.state.pruneCandidate == null) and (.spec.state.generationAdvanceClosure == null) and (.spec.state.deletion == null) and ((.spec.state.automation.pending // []) | length == 0)' "oxideloopstate/$STATE_NAME"
+wait_json 'prune root current render status' '(.status.state.rootUid == .metadata.uid) and (.status.observedGeneration == .metadata.generation) and (.status.verifiedBundleDigest == .spec.program.digest) and (.status.inputToken | type == "string") and (.status.cacheEpoch | type == "number")' webapplication/root
+ctx get oxideloopstate -n "$NAMESPACE" -o json >"$EVIDENCE/post-prune-state.json"
+ctx get webapplication root -n "$NAMESPACE" -o json >"$EVIDENCE/post-prune-root.json"
+ctx get configmap root-config -n "$NAMESPACE" -o json >"$EVIDENCE/post-prune-config.json"
+jq -e --slurpfile root "$EVIDENCE/post-prune-root.json" --slurpfile config "$EVIDENCE/post-prune-config.json" --arg stateUid "$STATE_UID" --arg rootUid "$ROOT_UID" --arg stateName "$STATE_NAME" --arg configUid "$CONFIG_UID" '
+  (.items | length == 1) and (.items[0].metadata.uid == $stateUid) and (.items[0].spec.root.uid == $rootUid) and
+  ([.items[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}]) and
+  (.items[0].spec.state.inventory | length == 1) and
+  (.items[0].spec.state.inventory[0].logicalId == "configmap/root-config") and
+  (.items[0].spec.state.inventory[0].identity == {apiVersion:"v1",kind:"ConfigMap",namespace:$config[0].metadata.namespace,name:$config[0].metadata.name}) and
+  (.items[0].spec.state.inventory[0].uid == $configUid and .items[0].spec.state.inventory[0].resourceVersion == $config[0].metadata.resourceVersion and .items[0].spec.state.inventory[0].bundleDigest == $root[0].spec.program.digest) and
+  ((.items[0].spec.state.pendingDependencies // []) | length == 0) and
+  (.items[0].spec.state.applyTransaction == null and .items[0].spec.state.pendingPersist == null and .items[0].spec.state.pruneCandidate == null and .items[0].spec.state.generationAdvanceClosure == null and .items[0].spec.state.deletion == null) and
+  ((.items[0].spec.state.automation.pending // []) | length == 0) and
+  ($root[0].metadata.uid == $rootUid and $root[0].status.state == {rootUid:$rootUid,name:$stateName,uid:$stateUid}) and
+  ($root[0].status.observedGeneration == $root[0].metadata.generation and $root[0].status.verifiedBundleDigest == $root[0].spec.program.digest) and
+  ([$config[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}])
+' "$EVIDENCE/post-prune-state.json" >/dev/null || die 'prune did not leave exact root, state, config inventory, and ownership'
+
+# No source means no baseline and no action.
+assert_count "$(ctx get automationruns -n "$NAMESPACE" -o json | jq '.items | length')" 0 'AutomationRuns before source creation'
+assert_count "$(ctx get events.events.k8s.io -n "$NAMESPACE" -o json | jq '[.items[] | select(.reason == "InputChanged")] | length')" 0 'InputChanged Events before source creation'
+
+# The first present observation establishes the durable baseline and produces
+# no run or Event. Only later source transitions are automations.
+ctx create configmap demo-input -n "$NAMESPACE" --from-literal=flavor=vanilla
+wait_json 'dependency baseline rerender' '.data.flavor == "vanilla"' configmap/root-config
+wait_json 'durable automation baseline' '(.spec.state.automation.baselines // [] | length == 1) and (.spec.state.automation.pending // [] | length == 0) and (.spec.state.automation.completions // [] | length == 0)' "oxideloopstate/$STATE_NAME"
+INPUT_UID=$(ctx get configmap demo-input -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')
+INPUT_RV=$(ctx get configmap demo-input -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
+assert_automation_transition 0 "$INPUT_UID" "$INPUT_RV" baseline
+capture_transition baseline
+
+# Every later observed source RV creates exactly one uniquely linked run and
+# Event and one matching durable completion.
+ctx patch configmap demo-input -n "$NAMESPACE" --type merge -p '{"data":{"flavor":"chocolate"}}'
+wait_json 'rerendered dependency value' '.data.flavor == "chocolate"' configmap/root-config
+wait_json 'first, exactly-once dependency automation' '.items | length == 1' automationrun
+INPUT_RV=$(ctx get configmap demo-input -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
+assert_automation_transition 1 "$INPUT_UID" "$INPUT_RV" chocolate
+capture_transition chocolate
+
+# Each crash window must be recovered durably without duplicate Event output.
+arm_crash AfterEventBeforeStatus
+ctx patch configmap demo-input -n "$NAMESPACE" --type merge -p '{"data":{"flavor":"strawberry"}}'
+await_crash AfterEventBeforeStatus
+wait_json 'first crash recovery creates one durable action' '(.items | length == 2) and ([.items[].status.completion.state] | all(. == "Succeeded"))' automationrun
+INPUT_RV=$(ctx get configmap demo-input -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
+assert_automation_transition 2 "$INPUT_UID" "$INPUT_RV" strawberry
+capture_transition strawberry
+arm_crash AfterStatusBeforeAck
+ctx patch configmap demo-input -n "$NAMESPACE" --type merge -p '{"data":{"flavor":"mint"}}'
+await_crash AfterStatusBeforeAck
+wait_json 'second crash recovery creates one durable action' '(.items | length == 3) and ([.items[].status.completion.state] | all(. == "Succeeded"))' automationrun
+INPUT_RV=$(ctx get configmap demo-input -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
+assert_automation_transition 3 "$INPUT_UID" "$INPUT_RV" mint
+capture_transition mint
+
+# An ordinary pod restart is a separate recovery proof.
+RESTART_OLD_POD=$(controller_pod)
+RESTART_OLD_POD_UID=$(ctx get pod -n "$NAMESPACE" "$RESTART_OLD_POD" -o jsonpath='{.metadata.uid}')
+ctx get webapplications,oxideloopstates,configmaps,automationruns,events.events.k8s.io -n "$NAMESPACE" -o json | jq -S '
+  {root:[.items[] | select(.kind == "WebApplication" and .metadata.name == "root") | {name:.metadata.name,uid:.metadata.uid}],
+   state:[.items[] | select(.kind == "OxideLoopState") | {name:.metadata.name,uid:.metadata.uid}],
+   config:[.items[] | select(.kind == "ConfigMap" and .metadata.name == "root-config") | {name:.metadata.name,uid:.metadata.uid}],
+   runs:([.items[] | select(.kind == "AutomationRun") | {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name)),
+   events:([.items[] | select(.kind == "Event" and .reason == "InputChanged") | {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name))}
+' >"$EVIDENCE/ordinary-restart-identities-before.json"
+ctx delete pod -n "$NAMESPACE" "$RESTART_OLD_POD" --wait=false
+elapsed=0; RESTART_NEW_POD=''; RESTART_NEW_POD_UID=''
+while [ -z "$RESTART_NEW_POD" ]; do
+  restart_snapshot=$(ctx get pods -n "$NAMESPACE" -l app.kubernetes.io/component=controller -o json 2>/dev/null || true)
+  restart_pair=$(printf '%s' "$restart_snapshot" | jq -r --arg oldUid "$RESTART_OLD_POD_UID" '[.items[] | select(.metadata.deletionTimestamp == null and .metadata.uid != $oldUid and ([.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length == 1)) | [.metadata.name,.metadata.uid] | @tsv] | if length == 1 then .[0] else empty end' 2>/dev/null || true)
+  if [ -n "$restart_pair" ]; then
+    RESTART_NEW_POD=$(printf '%s' "$restart_pair" | cut -f1)
+    RESTART_NEW_POD_UID=$(printf '%s' "$restart_pair" | cut -f2)
+    break
+  fi
+  [ "$elapsed" -lt "$TIMEOUT" ] || die 'timed out waiting for a new Ready controller pod after ordinary restart'
+  sleep 2; elapsed=$((elapsed + 2))
+done
+[ "$RESTART_NEW_POD_UID" != "$RESTART_OLD_POD_UID" ] || die 'ordinary restart reused the controller pod UID'
+ctx rollout status deployment/oxideloop-controller -n "$NAMESPACE" --timeout="${TIMEOUT}s"
+ctx get webapplications,oxideloopstates,configmaps,automationruns,events.events.k8s.io -n "$NAMESPACE" -o json | jq -S '
+  {root:[.items[] | select(.kind == "WebApplication" and .metadata.name == "root") | {name:.metadata.name,uid:.metadata.uid}],
+   state:[.items[] | select(.kind == "OxideLoopState") | {name:.metadata.name,uid:.metadata.uid}],
+   config:[.items[] | select(.kind == "ConfigMap" and .metadata.name == "root-config") | {name:.metadata.name,uid:.metadata.uid}],
+   runs:([.items[] | select(.kind == "AutomationRun") | {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name)),
+   events:([.items[] | select(.kind == "Event" and .reason == "InputChanged") | {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name))}
+' >"$EVIDENCE/ordinary-restart-identities-after.json"
+cmp -s "$EVIDENCE/ordinary-restart-identities-before.json" "$EVIDENCE/ordinary-restart-identities-after.json" || die 'ordinary restart changed durable or managed object identities'
+assert_count "$(ctx get automationruns -n "$NAMESPACE" -o json | jq '.items | length')" 3 'AutomationRuns after ordinary restart'
+assert_automation_transition 3 "$INPUT_UID" "$INPUT_RV" post-ordinary-restart
+capture_transition post-ordinary-restart
+
+# Deletion barrier: the parent owns an RDWR descriptor, so opening the FIFO
+# cannot deadlock if the client crashes before reading.  ARMED and REACHED are
+# emitted by the private controller/client protocol; RELEASE is the only byte
+# this parent can send after the midpoint snapshot has been captured.
+FIFO="$WORK/release.fifo"; mkfifo "$FIFO"; exec 9<>"$FIFO"; BARRIER_FD=9
+pod=$(controller_pod)
+DELETE_POD_UID=$(ctx get pod -n "$NAMESPACE" "$pod" -o jsonpath='{.metadata.uid}')
+DELETE_RESTART=$(controller_status "$pod" | jq -er '.restartCount')
+ctx get webapplication root -n "$NAMESPACE" -o json >"$EVIDENCE/deletion-before-root.json"
+ctx get oxideloopstate "$STATE_NAME" -n "$NAMESPACE" -o json >"$EVIDENCE/deletion-before-state.json"
+DELETE_ROOT_GENERATION=$(jq -er '.metadata.generation' "$EVIDENCE/deletion-before-root.json")
+ctx exec -i -n "$NAMESPACE" "$pod" -c controller -- /usr/local/bin/oxideloop-e2e-failpoint-control --socket /run/oxideloop/failpoints/control.sock --point AfterStateFinalizerBeforeRootFinalizer <&9 >"$EVIDENCE/deletion-barrier.txt" 2>&1 &
+BARRIER_PID=$!
+elapsed=0
+while ! grep -q '^ARMED$' "$EVIDENCE/deletion-barrier.txt" 2>/dev/null; do [ "$elapsed" -lt "$TIMEOUT" ] || die 'deletion barrier client did not acknowledge ARMED'; sleep 1; elapsed=$((elapsed + 1)); done
+ctx delete webapplication root -n "$NAMESPACE" --wait=false
+elapsed=0
+while ! grep -q '^REACHED$' "$EVIDENCE/deletion-barrier.txt" 2>/dev/null; do [ "$elapsed" -lt "$TIMEOUT" ] || die 'deletion barrier did not reach REACHED'; sleep 1; elapsed=$((elapsed + 1)); done
+sleep 2
+ctx get webapplication root -n "$NAMESPACE" -o json >"$EVIDENCE/deletion-midpoint-root.json"
+ctx get oxideloopstates -n "$NAMESPACE" -o json >"$EVIDENCE/deletion-midpoint-state.json"
+ctx get configmaps,services,automationruns -n "$NAMESPACE" -o json >"$EVIDENCE/deletion-midpoint-owned-children.json"
+jq -e --arg uid "$ROOT_UID" '(.metadata.uid == $uid) and (.metadata.deletionTimestamp != null) and ([.metadata.finalizers[]?] | length > 0)' "$EVIDENCE/deletion-midpoint-root.json" >/dev/null || die 'deletion midpoint lacks original deleting root/finalizer'
+assert_count "$(jq '.items | length' "$EVIDENCE/deletion-midpoint-state.json")" 0 'deletion midpoint state absence'
+jq -e --arg rootUid "$ROOT_UID" '[.items[] | select(any(.metadata.ownerReferences[]?; .uid == $rootUid))] | length == 0' "$EVIDENCE/deletion-midpoint-owned-children.json" >/dev/null || die 'deletion midpoint still has a ConfigMap, Service, or AutomationRun owned by the original root'
+jq -e --arg rootUid "$ROOT_UID" --arg stateUid "$STATE_UID" --arg stateName "$STATE_NAME" --argjson generation "$DELETE_ROOT_GENERATION" '
+  .status.deletionCleanupReceipt as $receipt |
+  (.metadata.uid == $rootUid) and (.metadata.deletionTimestamp != null) and
+  (.metadata.finalizers | index("demo.oxideloop.dev/finalizer") != null) and
+  ($receipt.rootUid == $rootUid and $receipt.stateUid == $stateUid and $receipt.stateName == $stateName and $receipt.deletionStartGeneration == $generation) and
+  ($receipt.deletionId | test("^[0-9a-f]{64}$")) and ($receipt.cleanupToken | test("^[0-9a-f]{64}$"))
+' "$EVIDENCE/deletion-midpoint-root.json" >/dev/null || die 'deletion midpoint receipt is not exact for the original root and state'
+printf 'RELEASE\n' >&9
+elapsed=0; while ! grep -q '^RELEASED$' "$EVIDENCE/deletion-barrier.txt" 2>/dev/null; do [ "$elapsed" -lt "$TIMEOUT" ] || die 'deletion barrier did not acknowledge RELEASE'; sleep 1; elapsed=$((elapsed + 1)); done
+wait "$BARRIER_PID"; BARRIER_PID=''; exec 9>&-; BARRIER_FD=''
+test "$(controller_pod)" = "$pod" || die 'deletion barrier unexpectedly replaced controller pod'
+wait_for_exact_crash 'deletion barrier' "$pod" "$DELETE_POD_UID" "$((DELETE_RESTART + 1))"
+atomic_capture controller-deletion-previous.log ctx logs -n "$NAMESPACE" "$pod" -c controller --previous --tail=-1 || die 'missing deletion previous log'
+wait_json 'original root absence after RELEASE' '.items | length == 0' webapplications
+if ctx get webapplication root -n "$NAMESPACE" >/dev/null 2>&1; then die 'original root still exists after deletion'; fi
+elapsed=0
+while :; do
+  deletion_status=$(controller_status "$pod" 2>/dev/null || true)
+  deletion_uid=$(ctx get pod -n "$NAMESPACE" "$pod" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+  [ "$deletion_uid" = "$DELETE_POD_UID" ] || die 'root-only recovery replaced the exact controller pod'
+  deletion_restarts=$(printf '%s' "$deletion_status" | jq -r '.restartCount // empty')
+  deletion_exit=$(printf '%s' "$deletion_status" | jq -r '.lastState.terminated.exitCode // empty')
+  [ "$deletion_restarts" -le "$((DELETE_RESTART + 2))" ] 2>/dev/null || die 'root-only deletion recovery restarted more than once'
+  if [ "$deletion_restarts" = "$((DELETE_RESTART + 2))" ] && [ "$deletion_exit" = 0 ]; then break; fi
+  [ "$elapsed" -lt "$TIMEOUT" ] || die 'timed out waiting for one successful root-only recovery process exit'
+  sleep 1; elapsed=$((elapsed + 1))
+done
+atomic_capture controller-root-only-recovery-previous.log ctx logs -n "$NAMESPACE" "$pod" -c controller --previous --tail=-1 || die 'missing root-only recovery log'
+grep -F "oxideloop: entering receipt-bounded root-only deletion recovery for $NAMESPACE/root uid=$ROOT_UID" "$EVIDENCE/controller-root-only-recovery-previous.log" >/dev/null || die 'post-crash process did not enter receipt-bounded root-only recovery'
+ctx get all -n "$NAMESPACE" -o yaml >"$EVIDENCE/post-delete-inventory.yaml"
+ctx get webapplications,oxideloopstates,automationruns -n "$NAMESPACE" -o json >"$EVIDENCE/post-delete-controller-inventory.json"
+if ctx get configmap root-config -n "$NAMESPACE" >/dev/null 2>&1; then die 'managed ConfigMap remains after deletion'; fi
+assert_count "$(ctx get oxideloopstates -n "$NAMESPACE" -o json | jq '.items | length')" 0 'post-delete durable inventory'
+assert_count "$(ctx get automationruns -n "$NAMESPACE" -o json | jq '.items | length')" 0 'post-delete AutomationRun inventory'
+assert_count "$(ctx get service -n "$NAMESPACE" -o json | jq '.items | length')" 0 'post-delete Service inventory'
+wait_json 'post-delete InputChanged Event garbage collection' '[.items[] | select(.reason == "InputChanged")] | length == 0' events.events.k8s.io
+ctx get configmaps,services,automationruns,events.events.k8s.io -n "$NAMESPACE" -o json >"$EVIDENCE/post-delete-owned-objects.json"
+jq -e --arg rootUid "$ROOT_UID" '
+  ([.items[] | select(any(.metadata.ownerReferences[]?; .uid == $rootUid))] | length == 0) and
+  ([.items[] | select(.kind == "Event" and .reason == "InputChanged")] | length == 0)
+' "$EVIDENCE/post-delete-owned-objects.json" >/dev/null || die 'post-delete namespace retains an original-root child or action Event'
+
+# Only after the original UID is absent may the same name be replaced.
+write_root; ctx apply -f "$WORK/root.yaml"
+wait_json 'replacement current render status and durable link' '(.status.state.rootUid == .metadata.uid) and (.status.state.name | type == "string") and (.status.state.uid | type == "string") and (.status.observedGeneration == .metadata.generation) and (.status.verifiedBundleDigest == .spec.program.digest) and (.status.inputToken | type == "string") and (.status.cacheEpoch | type == "number")' webapplication/root
+REPLACEMENT_UID=$(root_uid)
+[ "$REPLACEMENT_UID" != "$ROOT_UID" ] || die 'replacement reused original UID'
+ctx get webapplication root -n "$NAMESPACE" -o json >"$EVIDENCE/replacement-root.json"
+REPLACEMENT_STATE_NAME=$(jq -er '.status.state.name' "$EVIDENCE/replacement-root.json")
+REPLACEMENT_STATE_UID=$(jq -er '.status.state.uid' "$EVIDENCE/replacement-root.json")
+wait_json 'replacement state and baseline final convergence' '(.spec.state.inventory | length == 2) and ((.spec.state.pendingDependencies // []) | length == 0) and (.spec.state.applyTransaction == null) and (.spec.state.pendingPersist == null) and (.spec.state.pruneCandidate == null) and (.spec.state.generationAdvanceClosure == null) and (.spec.state.deletion == null) and ((.spec.state.automation.baselines // []) | length == 1) and ((.spec.state.automation.pending // []) | length == 0) and ((.spec.state.automation.completions // []) | length == 0)' "oxideloopstate/$REPLACEMENT_STATE_NAME"
+wait_json 'replacement root current render status' '(.status.state.rootUid == .metadata.uid) and (.status.observedGeneration == .metadata.generation) and (.status.verifiedBundleDigest == .spec.program.digest) and (.status.inputToken | type == "string") and (.status.cacheEpoch | type == "number")' webapplication/root
+ctx get webapplication root -n "$NAMESPACE" -o json >"$EVIDENCE/replacement-root.json"
+ctx get oxideloopstate -n "$NAMESPACE" -o json >"$EVIDENCE/replacement-inventory.json"
+ctx get configmap root-config -n "$NAMESPACE" -o json >"$EVIDENCE/replacement-config.json"
+ctx get service root-service -n "$NAMESPACE" -o json >"$EVIDENCE/replacement-service.json"
+jq -e --slurpfile root "$EVIDENCE/replacement-root.json" --slurpfile config "$EVIDENCE/replacement-config.json" --slurpfile service "$EVIDENCE/replacement-service.json" --arg namespace "$NAMESPACE" --arg oldRootUid "$ROOT_UID" --arg oldStateUid "$STATE_UID" --arg rootUid "$REPLACEMENT_UID" --arg stateName "$REPLACEMENT_STATE_NAME" --arg stateUid "$REPLACEMENT_STATE_UID" '
+  (.items | length == 1) and (.items[0].metadata.name == $stateName and .items[0].metadata.uid == $stateUid and .items[0].metadata.uid != $oldStateUid) and
+  (.items[0].spec.root.uid == $rootUid and .items[0].spec.root.uid != $oldRootUid and .items[0].spec.root.bundleDigest == $root[0].spec.program.digest) and
+  ([.items[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}]) and
+  (.items[0].spec.state.inventory | length == 2) and
+  ([.items[0].spec.state.inventory[] | select(.logicalId == "configmap/root-config" and .identity == {apiVersion:"v1",kind:"ConfigMap",namespace:$namespace,name:"root-config"} and .uid == $config[0].metadata.uid and .resourceVersion == $config[0].metadata.resourceVersion and .bundleDigest == $root[0].spec.program.digest)] | length == 1) and
+  ([.items[0].spec.state.inventory[] | select(.logicalId == "service/root-service" and .identity == {apiVersion:"v1",kind:"Service",namespace:$namespace,name:"root-service"} and .uid == $service[0].metadata.uid and .resourceVersion == $service[0].metadata.resourceVersion and .bundleDigest == $root[0].spec.program.digest)] | length == 1) and
+  ((.items[0].spec.state.pendingDependencies // []) | length == 0) and
+  (.items[0].spec.state.applyTransaction == null and .items[0].spec.state.pendingPersist == null and .items[0].spec.state.pruneCandidate == null and .items[0].spec.state.generationAdvanceClosure == null and .items[0].spec.state.deletion == null) and
+  ((.items[0].spec.state.automation.baselines // []) | length == 1) and ((.items[0].spec.state.automation.pending // []) | length == 0) and ((.items[0].spec.state.automation.completions // []) | length == 0) and
+  ($root[0].metadata.uid == $rootUid and $root[0].status.state == {rootUid:$rootUid,name:$stateName,uid:$stateUid}) and
+  ($root[0].status.observedGeneration == $root[0].metadata.generation and $root[0].status.verifiedBundleDigest == $root[0].spec.program.digest) and
+  ($config[0].data.flavor == "mint") and
+  ([$config[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}]) and
+  ([$service[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}])
+' "$EVIDENCE/replacement-inventory.json" >/dev/null || die 'replacement did not prove a new root/state/owned inventory without original identities'
+assert_count "$(ctx get automationruns -n "$NAMESPACE" -o json | jq '.items | length')" 0 'replacement fresh baseline AutomationRun inventory'
+assert_count "$(ctx get events.events.k8s.io -n "$NAMESPACE" -o json | jq '[.items[] | select(.reason == "InputChanged")] | length')" 0 'replacement fresh baseline Event inventory'
+note 'matrix passed'
