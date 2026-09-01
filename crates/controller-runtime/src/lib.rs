@@ -102,6 +102,18 @@ pub enum ModeV0 {
     Terminal,
 }
 
+/// The driver may wait for external watch authority only in these explicit
+/// states. A new reducer phase fails closed until it has a runtime
+/// disposition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NoCommandDispositionV0 {
+    Terminal,
+    AdmitInformers,
+    WatchReady,
+    WatchBlockedForeignCollision,
+    IllegalQuiescence,
+}
+
 type RootObservationFingerprintV0 = (
     String,
     i64,
@@ -193,6 +205,37 @@ struct QueuedObservationV0 {
     barrier: BarrierV0,
     root: RootSnapshotV0,
     event: EventV0,
+}
+
+/// Process-local correlation for an exact transport/render acknowledgement.
+/// It is intentionally neither serialized nor accepted from a caller: only
+/// `acknowledgement_matches` may mint it while the actor owns the command.
+#[derive(Clone, Debug)]
+struct PendingEffectAcknowledgementV0 {
+    command: CommandV0,
+    event_class: EffectAcknowledgementClassV0,
+    fence_token_hash: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EffectAcknowledgementClassV0 {
+    Rendered,
+    Revalidated,
+    MutationAcknowledged,
+    MutationFailed,
+    Other,
+}
+
+impl EffectAcknowledgementClassV0 {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rendered => "rendered",
+            Self::Revalidated => "revalidated",
+            Self::MutationAcknowledged => "mutation_acknowledged",
+            Self::MutationFailed => "mutation_failed",
+            Self::Other => "other",
+        }
+    }
 }
 
 impl QueuedObservationV0 {
@@ -636,6 +679,11 @@ pub struct RootActorV0 {
     /// Reducer/effect acknowledgements are durable work. Observation events may
     /// be discarded when a watch cache is invalidated; these may not.
     priority_ack: Option<EventV0>,
+    pending_effect_acknowledgement: Option<PendingEffectAcknowledgementV0>,
+    ready_observed: bool,
+    blocked_collision_observed: bool,
+    #[cfg(test)]
+    observability_records: std::sync::Mutex<Vec<serde_json::Value>>,
     core_events: VecDeque<EventV0>,
     pending_root_refresh: Option<RootSnapshotV0>,
     pending_informer_readiness: Option<QueuedInformerReadinessV0>,
@@ -729,6 +777,11 @@ impl RootActorV0 {
                 cache_epoch: 0,
             },
             priority_ack: None,
+            pending_effect_acknowledgement: None,
+            ready_observed: false,
+            blocked_collision_observed: false,
+            #[cfg(test)]
+            observability_records: std::sync::Mutex::new(Vec::new()),
             core_events: VecDeque::new(),
             pending_root_refresh: None,
             pending_informer_readiness: None,
@@ -748,6 +801,170 @@ impl RootActorV0 {
     }
     pub fn mode(&self) -> &ModeV0 {
         &self.mode
+    }
+
+    /// Emits deterministic, line-oriented runtime diagnostics. These records
+    /// are strictly observational and never confer reducer or I/O authority.
+    pub(crate) fn emit_observability(&self, event: &str, command: Option<&CommandV0>) {
+        self.emit_observability_with_acknowledgement(event, command, None, None);
+    }
+
+    fn emit_observability_with_acknowledgement(
+        &self,
+        event: &str,
+        command: Option<&CommandV0>,
+        acknowledgement_class: Option<EffectAcknowledgementClassV0>,
+        fence_token_hash: Option<&str>,
+    ) {
+        let record =
+            self.observability_record(event, command, acknowledgement_class, fence_token_hash);
+        eprintln!("{record}");
+        #[cfg(test)]
+        self.observability_records
+            .lock()
+            .expect("test observability capture lock")
+            .push(record);
+    }
+
+    /// Test-only capture of records already emitted to stderr. This is never
+    /// compiled into the controller binary and cannot affect authority.
+    #[cfg(test)]
+    pub(crate) fn take_observability_records_for_test(&self) -> Vec<serde_json::Value> {
+        std::mem::take(
+            &mut *self
+                .observability_records
+                .lock()
+                .expect("test observability capture lock"),
+        )
+    }
+
+    /// Builds the stable JSONL record separately from writing stderr so
+    /// driver-level tests can assert the exact correlation shape without
+    /// treating logging as an authority channel.
+    pub(crate) fn observability_record(
+        &self,
+        event: &str,
+        command: Option<&CommandV0>,
+        acknowledgement_class: Option<EffectAcknowledgementClassV0>,
+        fence_token_hash: Option<&str>,
+    ) -> serde_json::Value {
+        let root = self.state.root();
+        let collision = self.state.blocked_foreign_collision().map(|witness| {
+            witness
+                .collisions
+                .iter()
+                .map(|target| {
+                    serde_json::json!({
+                        "identity": format!(
+                            "{}/{}/{}/{}",
+                            target.identity.api_version,
+                            target.identity.kind,
+                            target.identity.namespace,
+                            target.identity.name,
+                        ),
+                        "foreign_uid": target.uid,
+                        "foreign_resource_version": target.resource_version,
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        serde_json::json!({
+            "component": "oxideloop-controller-runtime",
+            "event": event,
+            "root_uid": root.uid,
+            "root_resource_version": root.root_resource_version,
+            "state_resource_version": root.state_resource_version,
+            "phase": format!("{:?}", self.state.phase()),
+            "barrier_generation": self.barrier.generation,
+            "cache_epoch": self.barrier.cache_epoch,
+            "command_class": command.map_or("none", command_class),
+            "command_detail": command.map(command_detail),
+            "acknowledgement_class": acknowledgement_class.map(EffectAcknowledgementClassV0::as_str),
+            "fence_token_sha256": fence_token_hash,
+            "collision": collision,
+        })
+    }
+
+    pub(crate) fn no_command_disposition(&self) -> NoCommandDispositionV0 {
+        match self.state.phase() {
+            PhaseV0::Terminal => NoCommandDispositionV0::Terminal,
+            PhaseV0::InformersPending => NoCommandDispositionV0::AdmitInformers,
+            PhaseV0::Ready => NoCommandDispositionV0::WatchReady,
+            PhaseV0::BlockedForeignCollision if self.blocked_collision_is_quiescent() => {
+                NoCommandDispositionV0::WatchBlockedForeignCollision
+            }
+            PhaseV0::Recovery
+            | PhaseV0::Bootstrap
+            | PhaseV0::BootstrapPending
+            | PhaseV0::DescriptorPending
+            | PhaseV0::RenderPending
+            | PhaseV0::PersistPending
+            | PhaseV0::DispatchAuthorizationPersistPending
+            | PhaseV0::RevalidatePending
+            | PhaseV0::MutationPending
+            | PhaseV0::AutomationEnsurePending
+            | PhaseV0::AutomationPersistPending
+            | PhaseV0::DeletionStartPersistPending
+            | PhaseV0::DeletionPreparePersistPending
+            | PhaseV0::DeletionMutationPending
+            | PhaseV0::DeletionMutationPersistPending
+            | PhaseV0::DeletionAutomationCleanupPending
+            | PhaseV0::DeletionAutomationPersistPending
+            | PhaseV0::GenerationAdvanceClosurePersistPending
+            | PhaseV0::DeletionObservationPending
+            | PhaseV0::OwnedChildrenVerifyPending
+            | PhaseV0::StateFinalizerPending
+            | PhaseV0::RootFinalizerPending
+            | PhaseV0::RootDeletionVerifyPending
+            | PhaseV0::RootStatusPersistPending
+            | PhaseV0::BlockedForeignCollision
+            | PhaseV0::Hold => NoCommandDispositionV0::IllegalQuiescence,
+        }
+    }
+
+    /// Emits `ready` only after the actor has drained every local source of
+    /// authority. The driver calls this at its Ready no-command boundary,
+    /// before entering its retained-watch select.
+    pub(crate) fn emit_ready_if_quiescent(&mut self) -> bool {
+        if self.delivery_is_quiescent() && !self.ready_observed {
+            self.emit_observability("ready", None);
+            self.ready_observed = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Emits the retained-collision watch transition exactly once for one
+    /// unchanged witness.  A subsequent root/dependency reduction resets the
+    /// marker before a new quiescent boundary can be observed.
+    pub(crate) fn emit_blocked_collision_if_new(&mut self) -> bool {
+        if self.blocked_collision_is_quiescent() && !self.blocked_collision_observed {
+            self.emit_observability("watching_blocked_foreign_collision", None);
+            self.blocked_collision_observed = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn blocked_collision_is_quiescent(&self) -> bool {
+        let Some(witness) = self.state.blocked_foreign_collision() else {
+            return false;
+        };
+        preconditions_match_root(&witness.observation_barrier, self.state.root())
+            && witness.observation_barrier.observation_token == witness.frozen.observation_token
+            && witness.observation_barrier.cache_epoch == witness.frozen.cache_epoch
+            && witness.observation_barrier.cache_epoch == self.barrier.cache_epoch.to_string()
+            && !witness.collisions.is_empty()
+            && witness.collisions.iter().all(|target| {
+                !target.identity.api_version.is_empty()
+                    && !target.identity.kind.is_empty()
+                    && !target.identity.namespace.is_empty()
+                    && !target.identity.name.is_empty()
+                    && !target.uid.is_empty()
+                    && !target.resource_version.is_empty()
+            })
     }
 
     /// Captures the only root self-echo which a collected command may safely
@@ -1321,6 +1538,7 @@ impl RootActorV0 {
         if self.last_dependency_observation.as_ref() == Some(&dedupe_key) {
             return false;
         }
+        let blocked_collision = self.blocked_collision_is_quiescent();
         let sealed_barrier = self
             .deferred_genuine_change
             .as_ref()
@@ -1346,7 +1564,20 @@ impl RootActorV0 {
             observation_token: observation_token.clone(),
             cache_epoch: self.barrier.cache_epoch.to_string(),
         };
-        if self.delivery_is_quiescent() {
+        if blocked_collision {
+            // The core retained an exact empty-journal collision witness. A
+            // canonical retained desired/inventory change is the only
+            // authority that may retire it; this schedules a fresh informer
+            // fence, never a timer, retry, or mutation command.
+            self.emit_observability("fenced_reobservation", None);
+            if !self.supersede_observation_only(observation_token) {
+                self.hold(
+                    "blocked foreign collision could not be fenced for re-observation".into(),
+                );
+                return false;
+            }
+            true
+        } else if self.delivery_is_quiescent() {
             self.active_render_input = None;
             self.render_provenance_request = None;
             self.enqueue_observation_reconcile(
@@ -1510,7 +1741,10 @@ impl RootActorV0 {
             || (!self.in_flight
                 && matches!(
                     self.state.phase(),
-                    PhaseV0::InformersPending | PhaseV0::RenderPending | PhaseV0::RevalidatePending
+                    PhaseV0::InformersPending
+                        | PhaseV0::RenderPending
+                        | PhaseV0::RevalidatePending
+                        | PhaseV0::BlockedForeignCollision
                 ))
     }
 
@@ -1698,6 +1932,9 @@ impl RootActorV0 {
         // obsolete pins, except the post-finalizer exact UID absence proof.
         if let Some(ack) = self.priority_ack.take() {
             self.reduce_event(ack)?;
+            if let Some(evidence) = self.pending_effect_acknowledgement.take() {
+                self.emit_effect_acknowledgement(&evidence);
+            }
             // A coalesced root refresh has independent authority to replace
             // the acknowledgement continuation and intentionally clears its
             // prior sealed input. Otherwise inspect the immediate render
@@ -1768,6 +2005,7 @@ impl RootActorV0 {
         if let Some(command) = self.commands.pop_front() {
             self.in_flight = true;
             self.owned_in_flight = Some(command.clone());
+            self.emit_observability("effect_started", Some(&command));
             Ok(Some(command))
         } else {
             Ok(None)
@@ -1887,7 +2125,8 @@ impl RootActorV0 {
                 "render observation does not match the owned request pins".into(),
             ));
         }
-        self.accept_acknowledgement(observation.event)
+        let fence_token_hash = oxideloop_renderer_abi::sha256_hex(observation.token().as_bytes());
+        self.accept_acknowledgement_with_fence(observation.event, Some(fence_token_hash))
     }
 
     /// Queues one authenticated pending-run completion in the same priority
@@ -1939,7 +2178,9 @@ impl RootActorV0 {
                 "automation completion does not match durable pending pins".into(),
             ));
         }
-        if self.priority_ack.replace(event).is_some() {
+        if self.pending_effect_acknowledgement.is_some()
+            || self.priority_ack.replace(event).is_some()
+        {
             return Err(RuntimeErrorV0::Hold(
                 "multiple priority acknowledgements attempted to occupy the priority slot".into(),
             ));
@@ -1948,6 +2189,22 @@ impl RootActorV0 {
     }
 
     fn accept_acknowledgement(&mut self, event: EventV0) -> Result<(), RuntimeErrorV0> {
+        self.accept_acknowledgement_with_fence(event, None)
+    }
+
+    fn accept_acknowledgement_with_fence(
+        &mut self,
+        event: EventV0,
+        fence_token_hash: Option<String>,
+    ) -> Result<(), RuntimeErrorV0> {
+        if self.pending_effect_acknowledgement.is_some() {
+            return Err(RuntimeErrorV0::Hold(
+                "effect acknowledgement evidence is still pending reduction".into(),
+            ));
+        }
+        let command = self.owned_in_flight.clone().ok_or_else(|| {
+            RuntimeErrorV0::Hold("effect acknowledgement arrived without an owned command".into())
+        })?;
         self.in_flight = false;
         self.owned_in_flight = None;
         self.render_provenance_request = None;
@@ -1957,7 +2214,33 @@ impl RootActorV0 {
                 "multiple acknowledgements attempted to occupy the priority slot".into(),
             ));
         }
+        self.pending_effect_acknowledgement = Some(PendingEffectAcknowledgementV0 {
+            command,
+            event_class: effect_acknowledgement_class(
+                self.priority_ack.as_ref().expect("ack queued"),
+            ),
+            fence_token_hash,
+        });
         Ok(())
+    }
+
+    fn emit_effect_acknowledgement(&self, evidence: &PendingEffectAcknowledgementV0) {
+        self.emit_observability_with_acknowledgement(
+            "effect_acknowledged",
+            Some(&evidence.command),
+            Some(evidence.event_class),
+            evidence.fence_token_hash.as_deref(),
+        );
+        if let Some(event) =
+            specialized_effect_acknowledgement_event(&evidence.command, evidence.event_class)
+        {
+            self.emit_observability_with_acknowledgement(
+                event,
+                Some(&evidence.command),
+                Some(evidence.event_class),
+                evidence.fence_token_hash.as_deref(),
+            );
+        }
     }
 
     // Keep the complete command/event correlation matrix together: splitting
@@ -2175,6 +2458,12 @@ impl RootActorV0 {
             .map_err(|error| RuntimeErrorV0::Core(error.to_string()))?;
         self.state = transition.state;
         self.commands.extend(transition.commands);
+        if self.state.phase() != PhaseV0::Ready {
+            self.ready_observed = false;
+        }
+        if self.state.phase() != PhaseV0::BlockedForeignCollision {
+            self.blocked_collision_observed = false;
+        }
         Ok(())
     }
 
@@ -2346,6 +2635,208 @@ fn preconditions_match_root(preconditions: &PreconditionsV0, root: &RootSnapshot
         && preconditions.root_resource_version == root.root_resource_version
         && preconditions.state_uid == root.state_uid
         && preconditions.state_resource_version == root.state_resource_version
+}
+
+fn command_class(command: &CommandV0) -> &'static str {
+    match command {
+        CommandV0::EnsureBootstrap { .. } => "ensure_bootstrap",
+        CommandV0::Persist { .. } => "persist",
+        CommandV0::PersistRootStatus { .. } => "persist_root_status",
+        CommandV0::RequestDescriptor { .. } => "request_descriptor",
+        CommandV0::RequestRender { .. } => "request_render",
+        CommandV0::RequestDeletionObservation { .. } => "request_deletion_observation",
+        CommandV0::Mutate { .. } => "mutate",
+        CommandV0::EnsureAutomationRun { .. } => "ensure_automation_run",
+        CommandV0::DeleteAutomationRun { .. } => "delete_automation_run",
+        CommandV0::VerifyOwnedChildrenAbsent { .. } => "verify_owned_children_absent",
+        CommandV0::RemoveStateFinalizer { .. } => "remove_state_finalizer",
+        CommandV0::RemoveRootFinalizer { .. } => "remove_root_finalizer",
+        CommandV0::VerifyRootUidAbsent { .. } => "verify_root_uid_absent",
+        CommandV0::Hold { .. } => "hold",
+        CommandV0::IgnoredStale { .. } => "ignored_stale",
+    }
+}
+
+fn effect_acknowledgement_class(event: &EventV0) -> EffectAcknowledgementClassV0 {
+    match event {
+        EventV0::Rendered { .. } => EffectAcknowledgementClassV0::Rendered,
+        EventV0::Revalidated { .. } => EffectAcknowledgementClassV0::Revalidated,
+        EventV0::MutationAcknowledged { .. } => EffectAcknowledgementClassV0::MutationAcknowledged,
+        EventV0::MutationFailed { .. } => EffectAcknowledgementClassV0::MutationFailed,
+        EventV0::BootstrapAcknowledged { .. }
+        | EventV0::Persisted { .. }
+        | EventV0::RootStatusPersisted { .. }
+        | EventV0::DescriptorReady { .. }
+        | EventV0::EstablishAutomationBaseline { .. }
+        | EventV0::TriggerAutomation { .. }
+        | EventV0::AutomationRunEnsured { .. }
+        | EventV0::AutomationRunDeleted { .. }
+        | EventV0::AutomationRunDeleteFailed { .. }
+        | EventV0::OwnedChildrenVerifiedAbsent { .. }
+        | EventV0::OwnedChildrenVerificationFailed { .. }
+        | EventV0::StateFinalizerRemoved { .. }
+        | EventV0::RootFinalizerRemoved { .. }
+        | EventV0::RootUidVerifiedAbsent { .. }
+        | EventV0::RootUidAbsenceFailed { .. }
+        | EventV0::Start
+        | EventV0::RootRefreshed { .. }
+        | EventV0::InformersReady
+        | EventV0::ReconcileRequested { .. }
+        | EventV0::ObservationSuperseded { .. }
+        | EventV0::DeletionRevalidated { .. }
+        | EventV0::AutomationCompleted { .. }
+        | EventV0::BeginDeletion => EffectAcknowledgementClassV0::Other,
+    }
+}
+
+fn specialized_effect_acknowledgement_event(
+    command: &CommandV0,
+    event_class: EffectAcknowledgementClassV0,
+) -> Option<&'static str> {
+    match (command, event_class) {
+        (CommandV0::RequestRender { .. }, EffectAcknowledgementClassV0::Revalidated) => {
+            Some("revalidation_completed")
+        }
+        (CommandV0::Persist { operation, .. }, EffectAcknowledgementClassV0::Other)
+            if operation.purpose
+                == oxideloop_controller_api::PersistPurpose::DispatchAuthorization =>
+        {
+            Some("dispatch_authorization_acknowledged")
+        }
+        (CommandV0::Mutate { .. }, EffectAcknowledgementClassV0::MutationAcknowledged) => {
+            Some("mutation_post_acknowledged")
+        }
+        (CommandV0::Persist { operation, .. }, EffectAcknowledgementClassV0::Other)
+            if operation.purpose == oxideloop_controller_api::PersistPurpose::MutationResult =>
+        {
+            Some("mutation_result_persist_acknowledged")
+        }
+        (
+            CommandV0::EnsureBootstrap { .. }
+            | CommandV0::Persist { .. }
+            | CommandV0::PersistRootStatus { .. }
+            | CommandV0::RequestDescriptor { .. }
+            | CommandV0::RequestRender { .. }
+            | CommandV0::RequestDeletionObservation { .. }
+            | CommandV0::Mutate { .. }
+            | CommandV0::EnsureAutomationRun { .. }
+            | CommandV0::DeleteAutomationRun { .. }
+            | CommandV0::VerifyOwnedChildrenAbsent { .. }
+            | CommandV0::RemoveStateFinalizer { .. }
+            | CommandV0::RemoveRootFinalizer { .. }
+            | CommandV0::VerifyRootUidAbsent { .. }
+            | CommandV0::Hold { .. }
+            | CommandV0::IgnoredStale { .. },
+            _,
+        ) => None,
+    }
+}
+
+fn command_detail(command: &CommandV0) -> serde_json::Value {
+    let (
+        persist_purpose,
+        _persist_observation_token_hash,
+        command_token_hash,
+        transaction_id_hash,
+        attempt_token_hash,
+    ) = match command {
+        CommandV0::Persist {
+            operation,
+            preconditions,
+            ..
+        } => (
+            Some(persist_purpose_name(operation.purpose)),
+            Some(oxideloop_renderer_abi::sha256_hex(
+                preconditions.observation_token.as_bytes(),
+            )),
+            Some(oxideloop_renderer_abi::sha256_hex(
+                operation.token.as_bytes(),
+            )),
+            None,
+            None,
+        ),
+        CommandV0::Mutate {
+            transaction_id,
+            attempt_token,
+            ..
+        } => (
+            None,
+            None,
+            None,
+            Some(oxideloop_renderer_abi::sha256_hex(
+                transaction_id.as_bytes(),
+            )),
+            Some(oxideloop_renderer_abi::sha256_hex(attempt_token.as_bytes())),
+        ),
+        CommandV0::EnsureBootstrap { .. }
+        | CommandV0::PersistRootStatus { .. }
+        | CommandV0::RequestDescriptor { .. }
+        | CommandV0::RequestRender { .. }
+        | CommandV0::RequestDeletionObservation { .. }
+        | CommandV0::EnsureAutomationRun { .. }
+        | CommandV0::DeleteAutomationRun { .. }
+        | CommandV0::VerifyOwnedChildrenAbsent { .. }
+        | CommandV0::RemoveStateFinalizer { .. }
+        | CommandV0::RemoveRootFinalizer { .. }
+        | CommandV0::VerifyRootUidAbsent { .. }
+        | CommandV0::Hold { .. }
+        | CommandV0::IgnoredStale { .. } => (None, None, None, None, None),
+    };
+    let observation_token_hash = command_preconditions(command).map(|preconditions| {
+        oxideloop_renderer_abi::sha256_hex(preconditions.observation_token.as_bytes())
+    });
+    serde_json::json!({
+        "class": command_class(command),
+        "persist_purpose": persist_purpose,
+        "observation_token_sha256": observation_token_hash,
+        "operation_token_sha256": command_token_hash,
+        "transaction_id_sha256": transaction_id_hash,
+        "attempt_token_sha256": attempt_token_hash,
+    })
+}
+
+fn command_preconditions(command: &CommandV0) -> Option<&PreconditionsV0> {
+    match command {
+        CommandV0::Persist { preconditions, .. }
+        | CommandV0::PersistRootStatus { preconditions, .. }
+        | CommandV0::RequestDescriptor { preconditions, .. }
+        | CommandV0::RequestRender { preconditions }
+        | CommandV0::RequestDeletionObservation { preconditions }
+        | CommandV0::EnsureAutomationRun { preconditions, .. }
+        | CommandV0::DeleteAutomationRun { preconditions, .. }
+        | CommandV0::VerifyOwnedChildrenAbsent { preconditions, .. }
+        | CommandV0::RemoveStateFinalizer { preconditions, .. }
+        | CommandV0::RemoveRootFinalizer { preconditions, .. }
+        | CommandV0::VerifyRootUidAbsent { preconditions, .. } => Some(preconditions),
+        CommandV0::EnsureBootstrap { .. }
+        | CommandV0::Mutate { .. }
+        | CommandV0::Hold { .. }
+        | CommandV0::IgnoredStale { .. } => None,
+    }
+}
+
+const fn persist_purpose_name(purpose: oxideloop_controller_api::PersistPurpose) -> &'static str {
+    match purpose {
+        oxideloop_controller_api::PersistPurpose::Prepare => "prepare",
+        oxideloop_controller_api::PersistPurpose::DispatchAuthorization => "dispatch_authorization",
+        oxideloop_controller_api::PersistPurpose::Invalidate => "invalidate",
+        oxideloop_controller_api::PersistPurpose::MutationResult => "mutation_result",
+        oxideloop_controller_api::PersistPurpose::Completion => "completion",
+        oxideloop_controller_api::PersistPurpose::AutomationBaseline => "automation_baseline",
+        oxideloop_controller_api::PersistPurpose::AutomationPending => "automation_pending",
+        oxideloop_controller_api::PersistPurpose::AutomationCompletion => "automation_completion",
+        oxideloop_controller_api::PersistPurpose::DeletionStart => "deletion_start",
+        oxideloop_controller_api::PersistPurpose::DeletionPrepare => "deletion_prepare",
+        oxideloop_controller_api::PersistPurpose::DeletionMutationResult => {
+            "deletion_mutation_result"
+        }
+        oxideloop_controller_api::PersistPurpose::DeletionAutomationCleanup => {
+            "deletion_automation_cleanup"
+        }
+        oxideloop_controller_api::PersistPurpose::GenerationAdvanceClosure => {
+            "generation_advance_closure"
+        }
+    }
 }
 
 fn fixed_point_request_id(preconditions: &PreconditionsV0) -> String {
@@ -4765,6 +5256,24 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn recovered_phase_without_start_is_illegal_quiescence() {
+        let machine = linked_machine();
+        let recovered = MachineStateV0::recover(machine.root().clone(), machine.journal().clone())
+            .expect("linked machine recovers into a non-executable phase");
+        let mut actor = RootActorV0::new(recovered);
+        assert!(
+            actor
+                .next_command()
+                .expect("a synthetic recovered actor has no command")
+                .is_none()
+        );
+        assert_eq!(
+            actor.no_command_disposition(),
+            NoCommandDispositionV0::IllegalQuiescence
+        );
+    }
+
     fn informers_pending_actor() -> RootActorV0 {
         let mut actor = RootActorV0::new(linked_machine());
         actor.start();
@@ -6174,6 +6683,210 @@ mod tests {
             "expected Prepare persist, got {persist:?}"
         );
         (actor, persist)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn acknowledgement_observability_follows_successful_priority_reduction() {
+        let (mut actor, prepare) = actor_with_prepared_apply_persist();
+        let initial_records = actor.take_observability_records_for_test();
+        assert!(initial_records.iter().any(|record| {
+            record["event"] == "effect_acknowledged"
+                && record["acknowledgement_class"] == "rendered"
+        }));
+        assert!(
+            !initial_records
+                .iter()
+                .any(|record| record["event"] == "revalidation_completed"),
+            "the initial Rendered acknowledgement must not claim revalidation"
+        );
+
+        // Accepted transport facts remain process-local until this exact
+        // priority event has reduced. No success evidence is emitted merely
+        // because the acknowledgement was queued.
+        actor
+            .acknowledge(persisted_event(&prepare, "state-rv-after-prepare"))
+            .expect("Prepare acknowledgement is exactly correlated");
+        assert!(actor.take_observability_records_for_test().is_empty());
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("Prepare acknowledgement reduces")
+            .expect("Prepare acknowledgement requires revalidation")
+        else {
+            panic!("Prepare persistence did not request revalidation");
+        };
+        let prepare_records = actor.take_observability_records_for_test();
+        assert!(prepare_records.iter().any(|record| {
+            record["event"] == "effect_acknowledged"
+                && record["command_detail"]["persist_purpose"] == "prepare"
+                && record["command_detail"]["operation_token_sha256"]
+                    .as_str()
+                    .is_some_and(|hash| hash.len() == 64)
+        }));
+
+        actor
+            .issue_render_capability(
+                trusted_render_input(&actor, &preconditions.observation_token),
+                1,
+            )
+            .expect("revalidation request has a concrete capability");
+        let (frozen, input, _, _) = prune_render_documents(
+            actor.state().root(),
+            &preconditions.state_resource_version,
+            &preconditions.observation_token,
+            &preconditions.cache_epoch,
+        );
+        let identity = oxideloop_controller_api::ObjectIdentity {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: "ns".into(),
+            name: "managed-new".into(),
+        };
+        let output = serde_json::to_string(&RenderOutputV0 {
+            abi_version: ABI_VERSION_V0.into(),
+            disposition: RenderDisposition::Apply,
+            resources: vec![ResourceDeclaration {
+                logical_id: "managed-new".into(),
+                object: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "managed-new", "namespace": "ns"},
+                    "data": {"value": "new"}
+                }),
+                readiness: None,
+            }],
+            dependencies: vec![],
+            automations: vec![],
+            diagnostics: vec![],
+        })
+        .expect("revalidation output serializes");
+        actor
+            .accept_acknowledgement(EventV0::Revalidated {
+                frozen,
+                render_input_json: input,
+                render_output_json: output,
+                observed: vec![DesiredObservationV0 {
+                    identity: identity.clone(),
+                    observation: Observation::Absent,
+                    qualification: BackendQualification::BuiltInTested {
+                        kubernetes_minor: "1.36".into(),
+                        gvr: "configmaps".into(),
+                    },
+                    recovery_proof: None,
+                    deletion_recovery_proof: None,
+                }],
+            })
+            .expect("sealed revalidation acknowledgement queues");
+        assert!(actor.take_observability_records_for_test().is_empty());
+        let authorization = actor
+            .next_command()
+            .expect("Revalidated event reduces")
+            .expect("revalidation persists dispatch authorization");
+        let revalidated_records = actor.take_observability_records_for_test();
+        assert!(revalidated_records.iter().any(|record| {
+            record["event"] == "effect_acknowledged"
+                && record["acknowledgement_class"] == "revalidated"
+        }));
+        assert!(
+            revalidated_records
+                .iter()
+                .any(|record| record["event"] == "revalidation_completed"),
+            "revalidation success is emitted only after the reducer accepts Revalidated"
+        );
+        assert!(matches!(
+            authorization,
+            CommandV0::Persist { ref operation, .. }
+                if operation.purpose == PersistPurpose::DispatchAuthorization
+        ));
+
+        actor
+            .acknowledge(persisted_event(
+                &authorization,
+                "state-rv-after-dispatch-authorization",
+            ))
+            .expect("dispatch authorization acknowledgement is exactly correlated");
+        assert!(actor.take_observability_records_for_test().is_empty());
+        let mutation = actor
+            .next_command()
+            .expect("dispatch authorization reduces")
+            .expect("authorized mutation follows");
+        let authorization_records = actor.take_observability_records_for_test();
+        assert!(authorization_records.iter().any(|record| {
+            record["event"] == "dispatch_authorization_acknowledged"
+                && record["command_detail"]["persist_purpose"] == "dispatch_authorization"
+        }));
+
+        let CommandV0::Mutate {
+            transaction_id,
+            attempt_token,
+            commands,
+        } = &mutation
+        else {
+            panic!("dispatch authorization did not issue a mutation");
+        };
+        actor
+            .acknowledge(EventV0::MutationAcknowledged {
+                transaction_id: transaction_id.clone(),
+                attempt_token: attempt_token.clone(),
+                results: vec![ApplyResult {
+                    command_id: commands[0].command_id.clone(),
+                    attempt_token: attempt_token.clone(),
+                    identity,
+                    outcome: ApplyOutcome::Applied,
+                    uid: Some("managed-new-uid".into()),
+                    resource_version: Some("managed-new-rv".into()),
+                }],
+            })
+            .expect("mutation acknowledgement is exactly correlated");
+        assert!(actor.take_observability_records_for_test().is_empty());
+        let mutation_result = actor
+            .next_command()
+            .expect("mutation acknowledgement reduces")
+            .expect("mutation result persists");
+        let mutation_records = actor.take_observability_records_for_test();
+        assert!(mutation_records.iter().any(|record| {
+            record["event"] == "mutation_post_acknowledged"
+                && record["command_detail"]["transaction_id_sha256"]
+                    .as_str()
+                    .is_some_and(|hash| hash.len() == 64)
+                && record["command_detail"]["attempt_token_sha256"]
+                    .as_str()
+                    .is_some_and(|hash| hash.len() == 64)
+        }));
+        assert!(matches!(
+            mutation_result,
+            CommandV0::Persist { ref operation, .. }
+                if operation.purpose == PersistPurpose::MutationResult
+        ));
+
+        actor
+            .acknowledge(persisted_event(&mutation_result, "state-rv-after-result"))
+            .expect("mutation result acknowledgement is exactly correlated");
+        assert!(actor.take_observability_records_for_test().is_empty());
+        let _ = actor.next_command().expect("mutation result reduces");
+        let result_records = actor.take_observability_records_for_test();
+        assert!(result_records.iter().any(|record| {
+            record["event"] == "mutation_result_persist_acknowledged"
+                && record["command_detail"]["persist_purpose"] == "mutation_result"
+        }));
+    }
+
+    #[test]
+    fn rejected_or_failed_acknowledgements_emit_no_success_evidence() {
+        let (mut actor, prepare) = actor_with_prepared_apply_persist();
+        let _ = actor.take_observability_records_for_test();
+        assert!(
+            actor
+                .acknowledge(EventV0::Persisted {
+                    token: "wrong-token".into(),
+                    old_state_resource_version: "wrong-rv".into(),
+                    new_state_resource_version: "state-rv-never".into(),
+                    state_uid: "state-uid".into(),
+                })
+                .is_err()
+        );
+        assert!(actor.take_observability_records_for_test().is_empty());
+        assert!(matches!(prepare, CommandV0::Persist { .. }));
     }
 
     fn assert_actor_closure(

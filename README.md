@@ -119,6 +119,38 @@ scripts/verify-production-no-failpoint.sh
 scripts/run-kind-e2e.sh
 ```
 
+The foreign-name collision portion has two separate acceptance modes. Run each
+mode from a new, clean checkout state with a distinct `RUN_ID`; do not reuse an
+existing evidence directory or cluster name. The runner enforces the same
+clean-revision guard before it starts and again during cleanup, but this makes
+the revision being exercised explicit:
+
+```sh
+REVISION=$(git rev-parse HEAD)
+test -z "$(git status --porcelain --untracked-files=all)" || {
+  printf '%s\n' "refusing dirty source tree" >&2
+  exit 1
+}
+printf 'testing clean revision %s\n' "$REVISION"
+
+RUN_ID="collision-live-$(date -u +%Y%m%dt%H%M%Sz)-$$" \
+  E2E_COLLISION_MODE=live scripts/run-kind-e2e.sh
+
+RUN_ID="collision-restart-$(date -u +%Y%m%dt%H%M%Sz)-$$" \
+  E2E_COLLISION_MODE=restart scripts/run-kind-e2e.sh
+```
+
+Use a newly generated `RUN_ID` when repeating either command. `live` proves
+that deletion of the exact foreign object wakes the retained desired-object
+watch, discards the in-memory collision witness, and converges in the same
+controller pod without an annotation retrigger or container restart. `restart`
+proves the opposite recovery boundary: the controller is scaled to zero before
+the foreign object is removed, so a new process must obtain fresh informer
+evidence rather than treating the former in-memory witness as replay
+authority. Both modes require the ordered, correlated JSONL evidence from the
+fresh absence render through `Prepare`, revalidation, dispatch authorization,
+mutation result persistence, and a genuine `Ready` boundary.
+
 It records the bundle metadata, generated manifests, controller logs, cluster
 objects, exact transition snapshots, and deletion midpoint snapshots under the
 ignored `work/kind-e2e/<RUN_ID>/` directory. `RUN_ID` defaults to a lowercase,
@@ -135,6 +167,14 @@ deleted even after failure; use `KEEP_CLUSTER=1` only to inspect a failure. The
 runner refuses every nonignored working-tree change; commit or stash all source
 changes before starting it. Its own ignored evidence directory is the only
 run-time write.
+
+For either collision mode, require `result.json` to report `status: "passed"`,
+the selected `mode` and `collisionMode` (`"live"` or `"restart"`), its exact
+`sourceRevision`, and a deleted cluster disposition. The linked
+`reproducibility.json` records the same mode, `sourceRevision` and
+`finalSourceRevision`, and the clean-tree claim; the inventory hashes the
+captured evidence. Until a command has produced that evidence, these are harness
+intentions rather than a claim that kind acceptance has been observed.
 
 The fresh kind run proves controller/renderer process separation and rendered
 Kubernetes lifecycle behavior. Finite renderer protocol framing, EOF,

@@ -3491,69 +3491,19 @@ mod tests {
                 && observed.identity.name == "foreign"
                 && matches!(observed.observation, CoreObservation::Existing { .. })
         }));
-        let observation_token = result.input().observation_token.clone();
-        let cache_epoch = result.input().cache_epoch.clone();
         actor
             .acknowledge_render_observation(*observation)
             .expect("completed render observation is acknowledged by the actor");
-        let status = actor
+        let held = actor
             .next_command()
-            .expect("render acknowledgement must queue root status")
-            .expect("root status continuation command");
-        let (status_token, old_root_resource_version, acknowledged_status) = match status {
-            CommandV0::PersistRootStatus {
-                token,
-                old_root_resource_version,
-                status,
-                ..
-            } => {
-                assert_eq!(
-                    status.input_token.as_deref(),
-                    Some(observation_token.as_str())
-                );
-                assert_eq!(status.cache_epoch, cache_epoch.parse::<u64>().ok());
-                (token, old_root_resource_version, status)
-            }
-            other => panic!("expected render status continuation, got {other:?}"),
-        };
-        let mut acknowledged_root = actor.state().root().clone();
-        acknowledged_root.root_resource_version = "root-rv-after-render".into();
-        acknowledged_root.status = acknowledged_status;
-        actor
-            .acknowledge(EventV0::RootStatusPersisted {
-                token: status_token,
-                old_root_resource_version,
-                new_root_resource_version: "root-rv-after-render".into(),
-                root_uid: "root-uid".into(),
-            })
-            .expect("exact root status acknowledgement");
-        assert!(
-            !actor.root_observed(acknowledged_root),
-            "the driver-order exact root-status self-echo must not create another status token"
-        );
-        let follow_up = actor
-            .next_command()
-            .expect("the acknowledged status continuation must retain its follow-up render")
-            .expect("follow-up render command");
-        let follow_up_preconditions = match follow_up {
-            CommandV0::RequestRender { preconditions } => preconditions,
-            other => panic!("expected follow-up render, got {other:?}"),
-        };
-        assert_eq!(
-            follow_up_preconditions.root_resource_version,
-            "root-rv-after-render"
-        );
-        assert_eq!(follow_up_preconditions.observation_token, observation_token);
-        assert_eq!(
-            follow_up_preconditions.cache_epoch,
-            actor.barrier().cache_epoch.to_string()
-        );
-        let mut follow_up_input = template.input.clone();
-        follow_up_input.observation_token = follow_up_preconditions.observation_token.clone();
-        follow_up_input.cache_epoch = follow_up_preconditions.cache_epoch.clone();
-        actor
-            .issue_render_capability(follow_up_input, port.identity())
-            .expect("follow-up render capability remains issuable after status continuation");
+            .expect("unsafe mixed desired decisions reduce deterministically")
+            .expect("unsafe mixed desired decisions emit a local Hold command");
+        assert!(matches!(held, CommandV0::Hold { .. }));
+        assert_eq!(actor.state().phase(), CorePhaseV0::Hold);
+        assert!(actor.state().blocked_foreign_collision().is_none());
+        // The only I/O above was the sealed render/list/reread fence. The
+        // mixed existing foreign object plus inventory/prune decisions may
+        // not write status, State, or a child resource.
         assert_eq!(watch_senders.len(), 3);
         assert_eq!(
             paths.lock().unwrap().as_slice(),
@@ -4429,12 +4379,22 @@ mod tests {
             actor
                 .acknowledge_render_observation(*capability)
                 .expect("sealed retry render acknowledgement");
-            assert!(matches!(
-                actor.next_command(),
-                Ok(Some(
-                    CommandV0::Persist { .. } | CommandV0::PersistRootStatus { .. }
-                ))
-            ));
+            assert!(
+                actor
+                    .next_command()
+                    .expect("eligible foreign collision has no continuation command")
+                    .is_none()
+            );
+            assert_eq!(actor.state().phase(), CorePhaseV0::BlockedForeignCollision);
+            let witness = actor
+                .state()
+                .blocked_foreign_collision()
+                .expect("empty-journal foreign collision retains an exact witness");
+            assert_eq!(witness.collisions.len(), 1);
+            assert_eq!(witness.collisions[0].identity.name, "managed");
+            assert_eq!(witness.collisions[0].uid, "service-uid");
+            assert_eq!(witness.collisions[0].resource_version, "retry-rv");
+            assert!(!actor.in_flight, "collision block must not own an effect");
         }
     }
 
@@ -4498,6 +4458,8 @@ mod tests {
             let mut retry_input = template.input.clone();
             retry_input.observation_token = preconditions.observation_token;
             retry_input.cache_epoch = preconditions.cache_epoch;
+            let (collision_sender, collision_watch) =
+                oxideloop_kube_transport::WatchHandleV0::test_channel(1);
             let retry_port = KubeFixedPointPortV0::fixed_point_for_test(
                 StableRendererV0 {
                     output: template.output.clone(),
@@ -4510,7 +4472,7 @@ mod tests {
                         .expect("retry dependencies are normalized"),
                     collections: retained_collections(),
                     objects: vec![],
-                    watches: vec![],
+                    watches: vec![collision_watch],
                 },
             );
             let (mut retry_port, mut retry) =
@@ -4526,11 +4488,49 @@ mod tests {
             actor
                 .acknowledge_render_observation(*capability)
                 .expect("sealed retry render acknowledgement");
+            assert!(
+                actor
+                    .next_command()
+                    .expect("eligible foreign collision has no continuation command")
+                    .is_none()
+            );
+            assert_eq!(actor.state().phase(), CorePhaseV0::BlockedForeignCollision);
+            let witness = actor
+                .state()
+                .blocked_foreign_collision()
+                .expect("empty-journal foreign collision retains an exact witness");
+            assert_eq!(witness.collisions.len(), 1);
+            assert_eq!(witness.collisions[0].identity.name, "config");
+            assert_eq!(witness.collisions[0].uid, "uid-1");
+            assert_eq!(witness.collisions[0].resource_version, "z-old-rv");
+            assert!(!actor.in_flight, "collision block must not own an effect");
+
+            // Deleting the exact retained foreign target is a genuine
+            // desired/inventory observation. It fences the witness into a
+            // fresh informer pass, which immediately re-enters rendering;
+            // no timer or requeue is involved.
+            collision_sender
+                .try_send(Ok(WatchEventV0::Deleted(object(
+                    "config", "uid-1", "next-rv",
+                ))))
+                .expect("queue exact collision-target deletion");
+            assert_eq!(
+                retry_port
+                    .coordinate_retained_watch(&mut actor)
+                    .await
+                    .expect("retained collision-target deletion is authenticated"),
+                RetainedWatchCoordinationV0::ReconcileScheduled
+            );
+            assert_eq!(actor.state().phase(), CorePhaseV0::InformersPending);
+            assert!(actor.state().blocked_foreign_collision().is_none());
+            assert!(
+                retry_port
+                    .admit_initial_informer_readiness(&mut actor)
+                    .expect("fresh informer admission follows fenced collision deletion")
+            );
             assert!(matches!(
                 actor.next_command(),
-                Ok(Some(
-                    CommandV0::Persist { .. } | CommandV0::PersistRootStatus { .. }
-                ))
+                Ok(Some(CommandV0::RequestRender { .. }))
             ));
         }
     }

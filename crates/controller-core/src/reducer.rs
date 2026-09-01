@@ -111,6 +111,11 @@ pub enum PhaseV0 {
     RootFinalizerPending,
     RootDeletionVerifyPending,
     RootStatusPersistPending,
+    /// A fresh desired-object observation found a same-name foreign object
+    /// before this root has any durable reconciliation facts. The exact
+    /// runtime-only witness is retained for a watch-driven re-observation;
+    /// recovery always starts again from `Recovery`.
+    BlockedForeignCollision,
     Terminal,
     Hold,
 }
@@ -144,6 +149,12 @@ pub struct RuntimeStateV0 {
     /// It is never serialized or reconstructed after restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_dispatch: Option<PendingMutationDispatchV0>,
+    /// A pre-effect foreign-name collision is intentionally not durable: the
+    /// witness is an observation barrier, never replay authority. Keeping it
+    /// process-local also guarantees entering this phase performs no
+    /// Kubernetes write.
+    #[serde(skip)]
+    pub blocked_foreign_collision: Option<ForeignCollisionWitnessV0>,
 }
 
 impl Default for RuntimeStateV0 {
@@ -157,6 +168,7 @@ impl Default for RuntimeStateV0 {
             pending_root_refresh: None,
             pending_observation: None,
             pending_dispatch: None,
+            blocked_foreign_collision: None,
         }
     }
 }
@@ -284,6 +296,7 @@ impl MachineStateV0 {
                 pending_root_refresh: None,
                 pending_observation: None,
                 pending_dispatch: None,
+                blocked_foreign_collision: None,
             },
         })
     }
@@ -334,6 +347,7 @@ impl MachineStateV0 {
                 pending_root_refresh: None,
                 pending_observation: None,
                 pending_dispatch: None,
+                blocked_foreign_collision: None,
             },
         })
     }
@@ -440,6 +454,13 @@ impl MachineStateV0 {
     #[must_use]
     pub const fn phase(&self) -> PhaseV0 {
         self.phase
+    }
+
+    /// Exact process-local observation witness for a safely blocked foreign
+    /// desired-object collision. It is absent after serialization/recovery.
+    #[must_use]
+    pub fn blocked_foreign_collision(&self) -> Option<&ForeignCollisionWitnessV0> {
+        self.runtime.blocked_foreign_collision.as_ref()
     }
 }
 
@@ -673,6 +694,30 @@ pub struct PreconditionsV0 {
     pub cache_epoch: String,
 }
 
+/// Exact foreign object which prevented a first effect. `collisions` in the
+/// enclosing witness is sorted by the desired object identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignCollisionTargetV0 {
+    pub identity: ObjectIdentity,
+    pub uid: String,
+    pub resource_version: String,
+}
+
+/// Runtime-only evidence for the sole collision state that can safely wait
+/// for a retained desired-object watch. It is deliberately not serde data:
+/// after restart every pin and observation must be acquired again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignCollisionWitnessV0 {
+    /// Root/state and observation pins retained for the watch boundary.
+    pub observation_barrier: PreconditionsV0,
+    /// The fully validated render/final-observation fence that produced the
+    /// collision. This remains distinct from the mutable root snapshot.
+    pub frozen: FrozenInputV0,
+    /// Bounded, deterministic set of desired identities whose current UID/RV
+    /// proves they are foreign to this empty journal.
+    pub collisions: Vec<ForeignCollisionTargetV0>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MutationCommandV0 {
@@ -904,6 +949,19 @@ pub fn reduce(mut state: MachineStateV0, event: EventV0) -> Result<TransitionV0,
             if state.phase != PhaseV0::RenderPending || !matches_root(&state, &frozen) {
                 stale(&mut commands, "render phase or pins mismatch");
             } else {
+                // Plan before considering a status write. A safely blocked
+                // foreign collision must remain completely write-free.
+                let plan = plan_graph(
+                    &state,
+                    &frozen,
+                    &render_input_json,
+                    &render_output_json,
+                    observed,
+                )?;
+                if !plan.foreign_collisions.is_empty() {
+                    block_or_hold_foreign_collision(&mut state, frozen, plan, &mut commands);
+                    return finish(state, commands);
+                }
                 let status = root_status_for(
                     &state.root,
                     Some(&frozen),
@@ -920,23 +978,14 @@ pub fn reduce(mut state: MachineStateV0, event: EventV0) -> Result<TransitionV0,
                     // The status acknowledgement must land before this render can
                     // contribute a durable state transition. The adapter will
                     // supply a fresh render on the continuation.
+                } else if plan.disposition == RenderDisposition::Hold {
+                    state.phase = PhaseV0::Hold;
+                    state.frozen = Some(frozen);
+                    commands.push(CommandV0::Hold {
+                        reason: "renderer requested hold".into(),
+                    });
                 } else {
-                    let plan = plan_graph(
-                        &state,
-                        &frozen,
-                        &render_input_json,
-                        &render_output_json,
-                        observed,
-                    )?;
-                    if plan.disposition == RenderDisposition::Hold {
-                        state.phase = PhaseV0::Hold;
-                        state.frozen = Some(frozen);
-                        commands.push(CommandV0::Hold {
-                            reason: "renderer requested hold".into(),
-                        });
-                    } else {
-                        prepare(&mut state, frozen, plan, &mut commands)?;
-                    }
+                    prepare(&mut state, frozen, plan, &mut commands)?;
                 }
             }
         }
@@ -1340,6 +1389,10 @@ fn root_refreshed(
         return Ok(());
     }
     if let Err(reason) = root_refresh_compatible(state, &root) {
+        // A collision witness is meaningful only in its dedicated waiting
+        // phase. An incompatible root refresh is a terminal local boundary,
+        // so discard the stale observation evidence before entering Hold.
+        state.runtime.blocked_foreign_collision = None;
         state.phase = PhaseV0::Hold;
         commands.push(CommandV0::Hold {
             reason: reason.into(),
@@ -1358,6 +1411,23 @@ fn root_refreshed(
             commands,
             "root refresh cannot replace post-finalizer UID absence verification",
         );
+        return Ok(());
+    }
+    if state.phase == PhaseV0::BlockedForeignCollision {
+        // A root change invalidates the runtime-only collision witness. Do
+        // not write an empty-journal invalidate record: a fresh informer
+        // fence must decide whether the foreign object still exists. Root
+        // deletion is the sole preemption and installs its normal durable
+        // deletion boundary before any child observation is requested.
+        install_root_refresh(state, root);
+        state.runtime.blocked_foreign_collision = None;
+        state.runtime.pending_observation = None;
+        state.frozen = None;
+        if state.root.deleting {
+            begin_deletion_durable(state, commands)?;
+        } else {
+            state.phase = PhaseV0::InformersPending;
+        }
         return Ok(());
     }
     if has_may_have_issued(state) {
@@ -1496,7 +1566,10 @@ fn observation_superseded(
     if state.root.deleting
         || !matches!(
             state.phase,
-            PhaseV0::InformersPending | PhaseV0::RenderPending | PhaseV0::RevalidatePending
+            PhaseV0::InformersPending
+                | PhaseV0::RenderPending
+                | PhaseV0::RevalidatePending
+                | PhaseV0::BlockedForeignCollision
         )
         || preconditions.root_uid != state.root.uid
         || preconditions.root_generation != state.root.generation
@@ -1512,6 +1585,7 @@ fn observation_superseded(
         return;
     }
     state.frozen = None;
+    state.runtime.blocked_foreign_collision = None;
     state.runtime.pending_observation = Some(preconditions);
     state.phase = PhaseV0::InformersPending;
 }
@@ -1556,6 +1630,7 @@ fn start(state: &mut MachineStateV0, commands: &mut Vec<CommandV0>) {
             pending_root_refresh: None,
             pending_observation: None,
             pending_dispatch: None,
+            blocked_foreign_collision: None,
         };
         if !bootstrap_confirmed(state) {
             issue_bootstrap(state, commands);
@@ -1978,6 +2053,10 @@ fn valid_render_continuation(
 
 fn begin_deletion(mut state: MachineStateV0) -> Result<TransitionV0, ReconcileError> {
     state.root.deleting = true;
+    // A collision witness is process-local observation state, never deletion
+    // authority. Direct deletion preemption must discard it just as a
+    // deleting root refresh does.
+    state.runtime.blocked_foreign_collision = None;
     // A deleting root is never bootstrapped. If its internal state is already
     // gone, only the bounded status receipt is admissible recovery evidence;
     // missing or mismatched evidence holds without creating anything.
@@ -2835,16 +2914,19 @@ fn revalidate(
             return Ok(());
         }
     }
-    let Ok(effects) = plan.remaining_effects(state, &tx) else {
-        state.journal.state.apply_transaction = None;
-        state.journal.state.pending_dependencies.clear();
-        return queue_persist(
-            state,
-            PersistPurpose::Invalidate,
-            DurablePhase::Invalidate,
-            PhaseV0::PersistPending,
-            commands,
-        );
+    let effects = match plan.remaining_effects(state, &tx) {
+        Ok(effects) => effects,
+        Err(error) => {
+            // A prepared journal is never eligible for the watchable
+            // empty-journal collision path. Invalidation here would discard
+            // an ambiguous or otherwise unsafe remaining effect, so retain
+            // the journal and fail closed instead.
+            state.phase = PhaseV0::Hold;
+            commands.push(CommandV0::Hold {
+                reason: error.to_string(),
+            });
+            return Ok(());
+        }
     };
     let recovered = if matches!(
         tx.next_command_lifecycle.state,
@@ -4427,6 +4509,10 @@ struct Plan {
     hash: String,
     intents: Vec<ApplyIntent>,
     decisions: BTreeMap<String, MutationDecision>,
+    /// Desired objects that are definitely foreign before this render could
+    /// prepare or issue an effect. This is intentionally populated only from
+    /// the typed mutation-model path below, never an error string.
+    foreign_collisions: Vec<ForeignCollisionTargetV0>,
     dependencies: Vec<DependencySnapshot>,
     candidate: Option<PruneCandidate>,
     absent: Vec<ObjectIdentity>,
@@ -4580,6 +4666,7 @@ fn plan_graph(
     let mut logical = BTreeSet::new();
     let mut intents = Vec::new();
     let mut decisions = BTreeMap::new();
+    let mut foreign_collisions = Vec::new();
     if output.document.disposition != RenderDisposition::Hold {
         for resource in &output.document.resources {
             let identity = identity_from_object(&resource.object, &state.root.namespace)?;
@@ -4600,14 +4687,6 @@ fn plan_graph(
                 .inventory
                 .iter()
                 .find(|item| item.identity == identity);
-            if matches!(
-                &observed.qualification,
-                BackendQualification::Unsupported { .. }
-            ) {
-                return Err(ReconcileError::Mutation(
-                    "desired observation uses an unsupported backend".into(),
-                ));
-            }
             let intent = match (&observed.observation, inventory) {
                 (Observation::Absent, _) => MutationIntent::Create {
                     observation: observed.observation.clone(),
@@ -4646,12 +4725,36 @@ fn plan_graph(
                 }
                 MutationIntent::Delete { .. } => unreachable!("desired planning never deletes"),
             };
+            let mut foreign_collision = match (&intent, &observed.qualification) {
+                (
+                    MutationIntent::Create {
+                        observation:
+                            Observation::Existing {
+                                identity: observed_identity,
+                            },
+                        ..
+                    },
+                    BackendQualification::BuiltInTested { .. }
+                    | BackendQualification::NativeStructuralCrd { .. },
+                ) => Some(ForeignCollisionTargetV0 {
+                    identity: identity.clone(),
+                    uid: observed_identity.uid.clone(),
+                    resource_version: observed_identity.resource_version.clone(),
+                }),
+                _ => None,
+            };
             let decision = plan(&MutationPlanInputV0 {
                 probe_version: PROBE_VERSION_V0.into(),
                 qualification: observed.qualification,
                 intent,
             })
             .map_err(|e| ReconcileError::Mutation(e.to_string()))?;
+            if !matches!(decision, MutationDecision::RefetchNoAdopt { .. }) {
+                // A same-name observation is not enough: only the mutation
+                // model's typed no-adopt decision may enter the watchable
+                // pre-effect collision state.
+                foreign_collision = None;
+            }
             let command_id = hash(&[
                 "apply-command/v0",
                 &state.root.uid,
@@ -4668,6 +4771,9 @@ fn plan_graph(
                 expected_resource_version,
             });
             decisions.insert(command_id, decision);
+            if let Some(collision) = foreign_collision {
+                foreign_collisions.push(collision);
+            }
         }
     }
     let mut absent = Vec::new();
@@ -4789,6 +4895,7 @@ fn plan_graph(
         }
     }
     intents.sort_by(|a, b| a.command_id.cmp(&b.command_id));
+    foreign_collisions.sort_by_key(|collision| identity_key(&collision.identity));
     // The durable graph pin deliberately excludes live inventory,
     // observations, effects and prune progress. Those evolve after each
     // command acknowledgement; remaining prepared intents are checked below
@@ -4803,6 +4910,7 @@ fn plan_graph(
         hash,
         intents,
         decisions,
+        foreign_collisions,
         dependencies,
         candidate,
         absent,
@@ -4815,7 +4923,17 @@ fn prepare(
     plan: Plan,
     commands: &mut Vec<CommandV0>,
 ) -> Result<(), ReconcileError> {
-    plan.validate_initial_effects()?;
+    if let Err(error) = plan.validate_initial_effects() {
+        // A mutation-model refusal is never an error path that permits the
+        // caller to retry blindly. The one watchable no-adopt case has
+        // already been handled above; every other unsafe decision is a
+        // durable hold boundary.
+        state.phase = PhaseV0::Hold;
+        commands.push(CommandV0::Hold {
+            reason: error.to_string(),
+        });
+        return Ok(());
+    }
     state
         .journal
         .state
@@ -4873,6 +4991,67 @@ fn prepare(
         PhaseV0::PersistPending,
         commands,
     )
+}
+
+/// The no-adopt decision is normally a terminal planning error: there is no
+/// safe mutation to prepare. There is exactly one exception. Before any
+/// durable reconciliation fact exists, an observed same-name object can be
+/// watched until its exact identity changes. This never authorizes adoption,
+/// a retry, or a POST from the stale observation.
+fn block_or_hold_foreign_collision(
+    state: &mut MachineStateV0,
+    frozen: FrozenInputV0,
+    plan: Plan,
+    commands: &mut Vec<CommandV0>,
+) {
+    let default_journal = state.journal.state == StateBody::default();
+    // Safe sibling intents are allowed to coexist with a collision, but every
+    // unsafe decision must be represented by the exact typed collision entry
+    // below. In particular, an unsupported backend or another no-adopt path
+    // must not hide behind one otherwise watchable collision.
+    let only_foreign_collision_unsafe_decisions = plan
+        .decisions
+        .values()
+        .filter(|decision| !safe_mutation_decision(decision))
+        .count()
+        == plan.foreign_collisions.len();
+    let exact_bounded_targets = !plan.foreign_collisions.is_empty()
+        && plan.foreign_collisions.len() <= MAX_LIST_ENTRIES
+        && plan
+            .foreign_collisions
+            .windows(2)
+            .all(|pair| identity_key(&pair[0].identity) < identity_key(&pair[1].identity))
+        && plan.foreign_collisions.iter().all(|target| {
+            !target.uid.is_empty()
+                && target.uid.len() <= MAX_IDENTIFIER_BYTES
+                && !target.resource_version.is_empty()
+                && target.resource_version.len() <= MAX_IDENTIFIER_BYTES
+        });
+    if state.root.deleting
+        || !default_journal
+        || !only_foreign_collision_unsafe_decisions
+        || !exact_bounded_targets
+    {
+        state.phase = PhaseV0::Hold;
+        commands.push(CommandV0::Hold {
+            reason: "unsafe desired mutation decision".into(),
+        });
+        return;
+    }
+    let mut observation_barrier = pins(&state.root);
+    observation_barrier
+        .observation_token
+        .clone_from(&frozen.observation_token);
+    observation_barrier
+        .cache_epoch
+        .clone_from(&frozen.cache_epoch);
+    state.frozen = None;
+    state.runtime.blocked_foreign_collision = Some(ForeignCollisionWitnessV0 {
+        observation_barrier,
+        frozen,
+        collisions: plan.foreign_collisions,
+    });
+    state.phase = PhaseV0::BlockedForeignCollision;
 }
 
 fn validate_input(
@@ -5543,6 +5722,404 @@ mod tests {
                 deletion_recovery_proof: None,
             }],
         )
+    }
+
+    fn rendered_with_foreign_collision(machine: MachineStateV0) -> TransitionV0 {
+        let (frozen, input, output, mut observed) = rendered(&machine.root, vec![]);
+        observed[0].observation = Observation::Existing {
+            identity: MutationIdentity {
+                uid: "foreign-uid".into(),
+                resource_version: "foreign-rv".into(),
+            },
+        };
+        reduce(
+            machine,
+            EventV0::Rendered {
+                frozen,
+                render_input_json: input,
+                render_output_json: output,
+                observed,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn empty_journal_foreign_collision_blocks_without_any_kubernetes_write() {
+        let machine = boot_to_render(state());
+        let journal = machine.journal.clone();
+        let blocked = rendered_with_foreign_collision(machine);
+
+        assert_eq!(blocked.state.phase, PhaseV0::BlockedForeignCollision);
+        assert!(blocked.commands.is_empty());
+        assert_eq!(blocked.state.journal, journal);
+        let witness = blocked.state.blocked_foreign_collision().unwrap();
+        assert_eq!(witness.observation_barrier.root_uid, "root-uid");
+        assert_eq!(witness.observation_barrier.state_uid, "state-uid");
+        assert_eq!(
+            witness.observation_barrier.observation_token,
+            "observation-1"
+        );
+        assert_eq!(witness.frozen.final_observation_fence_token, "f".repeat(64));
+        assert_eq!(witness.collisions.len(), 1);
+        assert_eq!(witness.collisions[0].identity.name, "object");
+        assert_eq!(witness.collisions[0].uid, "foreign-uid");
+        assert_eq!(witness.collisions[0].resource_version, "foreign-rv");
+    }
+
+    #[test]
+    fn foreign_collision_near_misses_hold_instead_of_becoming_watchable() {
+        let mut inventory = boot_to_render(state());
+        inventory.journal.state.inventory.push(InventoryEntry {
+            identity: ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "demo".into(),
+                name: "object".into(),
+            },
+            logical_id: "object".into(),
+            uid: "known-uid".into(),
+            resource_version: "known-rv".into(),
+            bundle_digest: "a".repeat(64),
+        });
+        let held_inventory = rendered_with_foreign_collision(inventory);
+        assert_eq!(held_inventory.state.phase, PhaseV0::Hold);
+        assert!(matches!(
+            held_inventory.commands.as_slice(),
+            [CommandV0::Hold { .. }]
+        ));
+
+        let clean = boot_to_render(state());
+        let (frozen, input, output, observed) = rendered(&clean.root, vec![]);
+        let prepared = reduce(
+            clean,
+            EventV0::Rendered {
+                frozen,
+                render_input_json: input,
+                render_output_json: output,
+                observed,
+            },
+        )
+        .unwrap();
+        let mut pending = prepared.state;
+        pending.phase = PhaseV0::RenderPending;
+        let held_pending = rendered_with_foreign_collision(pending);
+        assert_eq!(held_pending.state.phase, PhaseV0::Hold);
+        assert!(matches!(
+            held_pending.commands.as_slice(),
+            [CommandV0::Hold { .. }]
+        ));
+
+        let deleting = reduce(boot_to_render(state()), EventV0::BeginDeletion).unwrap();
+        let mut deleting = deleting.state;
+        deleting.phase = PhaseV0::RenderPending;
+        let held_deleting = rendered_with_foreign_collision(deleting);
+        assert_eq!(held_deleting.state.phase, PhaseV0::Hold);
+        assert!(matches!(
+            held_deleting.commands.as_slice(),
+            [CommandV0::Hold { .. }]
+        ));
+
+        let mut automation = boot_to_render(state());
+        automation
+            .journal
+            .state
+            .automation
+            .baselines
+            .push(AutomationBaseline {
+                automation_id: "automation".into(),
+                source: ObjectIdentity {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: "demo".into(),
+                    name: "source".into(),
+                },
+                token: "a".repeat(64),
+            });
+        let held_automation = rendered_with_foreign_collision(automation);
+        assert_eq!(held_automation.state.phase, PhaseV0::Hold);
+        assert!(matches!(
+            held_automation.commands.as_slice(),
+            [CommandV0::Hold { .. }]
+        ));
+    }
+
+    #[test]
+    fn unsupported_desired_observation_holds_without_becoming_a_collision_block() {
+        let machine = boot_to_render(state());
+        let (frozen, input, output, mut observed) = rendered(&machine.root, vec![]);
+        observed[0].qualification = BackendQualification::Unsupported {
+            reason: "untrusted backend proof".into(),
+        };
+        let held = reduce(
+            machine,
+            EventV0::Rendered {
+                frozen,
+                render_input_json: input,
+                render_output_json: output,
+                observed,
+            },
+        )
+        .unwrap();
+        assert_eq!(held.state.phase, PhaseV0::Hold);
+        assert!(held.state.blocked_foreign_collision().is_none());
+        assert!(matches!(held.commands.as_slice(), [CommandV0::Hold { .. }]));
+    }
+
+    #[test]
+    fn mixed_collision_and_another_unsafe_decision_holds_instead_of_blocking() {
+        let machine = boot_to_render(state());
+        let (frozen, input, output, mut observed) = rendered(&machine.root, vec![]);
+        let mut output: RenderOutputV0 = serde_json::from_str(&output).unwrap();
+        output.resources.push(ResourceDeclaration {
+            logical_id: "unsupported".into(),
+            object: serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"namespace":"demo","name":"unsupported"}}),
+            readiness: None,
+        });
+        observed[0].observation = Observation::Existing {
+            identity: MutationIdentity {
+                uid: "foreign-uid".into(),
+                resource_version: "foreign-rv".into(),
+            },
+        };
+        observed.push(DesiredObservationV0 {
+            identity: ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "demo".into(),
+                name: "unsupported".into(),
+            },
+            observation: Observation::Absent,
+            qualification: BackendQualification::Unsupported {
+                reason: "untrusted backend proof".into(),
+            },
+            recovery_proof: None,
+            deletion_recovery_proof: None,
+        });
+        let held = reduce(
+            machine,
+            EventV0::Rendered {
+                frozen,
+                render_input_json: input,
+                render_output_json: serde_json::to_string(&output).unwrap(),
+                observed,
+            },
+        )
+        .unwrap();
+        assert_eq!(held.state.phase, PhaseV0::Hold);
+        assert!(held.state.blocked_foreign_collision().is_none());
+        assert!(matches!(held.commands.as_slice(), [CommandV0::Hold { .. }]));
+    }
+
+    #[test]
+    fn collision_with_safe_absent_sibling_blocks_the_entire_graph_without_writing() {
+        let machine = boot_to_render(state());
+        let journal = machine.journal.clone();
+        let (frozen, input, output, mut observed) = rendered(&machine.root, vec![]);
+        let mut output: RenderOutputV0 = serde_json::from_str(&output).unwrap();
+        output.resources.push(ResourceDeclaration {
+            logical_id: "safe-sibling".into(),
+            object: serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"namespace":"demo","name":"safe-sibling"}}),
+            readiness: None,
+        });
+        observed[0].observation = Observation::Existing {
+            identity: MutationIdentity {
+                uid: "foreign-uid".into(),
+                resource_version: "foreign-rv".into(),
+            },
+        };
+        observed.push(DesiredObservationV0 {
+            identity: ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "demo".into(),
+                name: "safe-sibling".into(),
+            },
+            observation: Observation::Absent,
+            qualification: BackendQualification::BuiltInTested {
+                kubernetes_minor: "1.36".into(),
+                gvr: "configmaps".into(),
+            },
+            recovery_proof: None,
+            deletion_recovery_proof: None,
+        });
+        let blocked = reduce(
+            machine,
+            EventV0::Rendered {
+                frozen,
+                render_input_json: input,
+                render_output_json: serde_json::to_string(&output).unwrap(),
+                observed,
+            },
+        )
+        .unwrap();
+        assert_eq!(blocked.state.phase, PhaseV0::BlockedForeignCollision);
+        assert!(blocked.commands.is_empty());
+        assert_eq!(blocked.state.journal, journal);
+        assert_eq!(
+            blocked
+                .state
+                .blocked_foreign_collision()
+                .unwrap()
+                .collisions,
+            vec![ForeignCollisionTargetV0 {
+                identity: ObjectIdentity {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: "demo".into(),
+                    name: "object".into(),
+                },
+                uid: "foreign-uid".into(),
+                resource_version: "foreign-rv".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn blocked_foreign_collision_supersession_and_recovery_discard_its_witness() {
+        let blocked = rendered_with_foreign_collision(boot_to_render(state()));
+        let mut next = blocked
+            .state
+            .blocked_foreign_collision()
+            .unwrap()
+            .observation_barrier
+            .clone();
+        next.observation_token = "observation-2".into();
+        next.cache_epoch = "epoch-2".into();
+        let superseded = reduce(
+            blocked.state,
+            EventV0::ObservationSuperseded {
+                preconditions: next.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(superseded.state.phase, PhaseV0::InformersPending);
+        assert!(superseded.state.blocked_foreign_collision().is_none());
+        assert!(superseded.commands.is_empty());
+        let rendered = reduce(superseded.state, EventV0::InformersReady).unwrap();
+        assert!(matches!(
+            rendered.commands.as_slice(),
+            [CommandV0::RequestRender { preconditions }] if preconditions == &next
+        ));
+
+        let blocked = rendered_with_foreign_collision(boot_to_render(state()));
+        let recovered =
+            MachineStateV0::recover_json(&serde_json::to_string(&blocked.state).unwrap()).unwrap();
+        assert_eq!(recovered.phase, PhaseV0::Recovery);
+        assert!(recovered.blocked_foreign_collision().is_none());
+        let started = reduce(recovered, EventV0::Start).unwrap();
+        assert!(matches!(
+            started.commands.as_slice(),
+            [CommandV0::RequestDescriptor { .. }]
+        ));
+    }
+
+    #[test]
+    fn blocked_foreign_collision_root_deletion_preempts_through_normal_deletion_boundary() {
+        let blocked = rendered_with_foreign_collision(boot_to_render(state()));
+        let mut deleting_root = blocked.state.root.clone();
+        deleting_root.deleting = true;
+        deleting_root.root_resource_version = "21".into();
+        let deleting = reduce(
+            blocked.state,
+            EventV0::RootRefreshed {
+                root: deleting_root,
+            },
+        )
+        .unwrap();
+        assert_eq!(deleting.state.phase, PhaseV0::DeletionStartPersistPending);
+        assert!(deleting.state.blocked_foreign_collision().is_none());
+        assert!(matches!(
+            deleting.commands.as_slice(),
+            [CommandV0::Persist { operation, .. }]
+                if operation.purpose == PersistPurpose::DeletionStart
+        ));
+
+        let blocked = rendered_with_foreign_collision(boot_to_render(state()));
+        let direct = reduce(blocked.state, EventV0::BeginDeletion).unwrap();
+        assert_eq!(direct.state.phase, PhaseV0::DeletionStartPersistPending);
+        assert!(direct.state.blocked_foreign_collision().is_none());
+        assert!(matches!(
+            direct.commands.as_slice(),
+            [CommandV0::Persist { operation, .. }]
+                if operation.purpose == PersistPurpose::DeletionStart
+        ));
+
+        let blocked = rendered_with_foreign_collision(boot_to_render(state()));
+        let mut incompatible_root = blocked.state.root.clone();
+        incompatible_root.uid = "replacement-root-uid".into();
+        let held = reduce(
+            blocked.state,
+            EventV0::RootRefreshed {
+                root: incompatible_root,
+            },
+        )
+        .unwrap();
+        assert_eq!(held.state.phase, PhaseV0::Hold);
+        assert!(held.state.blocked_foreign_collision().is_none());
+        assert!(matches!(held.commands.as_slice(), [CommandV0::Hold { .. }]));
+    }
+
+    #[test]
+    fn multiple_foreign_collisions_are_bounded_and_sorted_by_exact_identity() {
+        let machine = boot_to_render(state());
+        let (frozen, input, output, mut observed) = rendered(&machine.root, vec![]);
+        let mut output: RenderOutputV0 = serde_json::from_str(&output).unwrap();
+        output.resources.push(ResourceDeclaration {
+            logical_id: "another".into(),
+            object: serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"namespace":"demo","name":"another"}}),
+            readiness: None,
+        });
+        observed.push(DesiredObservationV0 {
+            identity: ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "demo".into(),
+                name: "another".into(),
+            },
+            observation: Observation::Existing {
+                identity: MutationIdentity {
+                    uid: "foreign-another-uid".into(),
+                    resource_version: "foreign-another-rv".into(),
+                },
+            },
+            qualification: BackendQualification::BuiltInTested {
+                kubernetes_minor: "1.36".into(),
+                gvr: "configmaps".into(),
+            },
+            recovery_proof: None,
+            deletion_recovery_proof: None,
+        });
+        observed[0].observation = Observation::Existing {
+            identity: MutationIdentity {
+                uid: "foreign-object-uid".into(),
+                resource_version: "foreign-object-rv".into(),
+            },
+        };
+        observed.reverse();
+        let blocked = reduce(
+            machine,
+            EventV0::Rendered {
+                frozen,
+                render_input_json: input,
+                render_output_json: serde_json::to_string(&output).unwrap(),
+                observed,
+            },
+        )
+        .unwrap();
+        assert_eq!(blocked.state.phase, PhaseV0::BlockedForeignCollision);
+        assert!(blocked.commands.is_empty());
+        assert_eq!(
+            blocked
+                .state
+                .blocked_foreign_collision()
+                .unwrap()
+                .collisions
+                .iter()
+                .map(|target| target.identity.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["another", "object"]
+        );
     }
 
     #[test]
@@ -6241,6 +6818,10 @@ mod tests {
         let machine = boot_to_render(state());
         let (mut frozen, input, output, observed) = rendered(&machine.root, vec![]);
         frozen.cache_epoch = "1".into();
+        let mut input: RenderInputV0 = serde_json::from_str(&input).unwrap();
+        input.cache_epoch = "1".into();
+        let input = serde_json::to_string(&input).unwrap();
+        frozen.render_input_hash = parse_validate_render_input(&input).unwrap().sha256;
         let issued = reduce(
             machine,
             EventV0::Rendered {
@@ -7923,19 +8504,19 @@ mod tests {
         unsupported[0].qualification = BackendQualification::Unsupported {
             reason: "hostile adapter proof".into(),
         };
-        assert!(matches!(
-            reduce(
-                pending.clone(),
-                EventV0::Revalidated {
-                    frozen: fresh,
-                    render_input_json: input,
-                    render_output_json: output,
-                    observed: unsupported,
-                }
-            ),
-            Err(ReconcileError::Mutation(_))
-        ));
-        assert_eq!(pending, before);
+        let held = reduce(
+            pending.clone(),
+            EventV0::Revalidated {
+                frozen: fresh,
+                render_input_json: input,
+                render_output_json: output,
+                observed: unsupported,
+            },
+        )
+        .unwrap();
+        assert_eq!(held.state.phase, PhaseV0::Hold);
+        assert_eq!(held.state.journal, before.journal);
+        assert!(matches!(held.commands.as_slice(), [CommandV0::Hold { .. }]));
     }
 
     #[test]

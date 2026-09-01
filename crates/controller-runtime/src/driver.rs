@@ -43,9 +43,10 @@ use crate::failpoint_uds::{EffectBarrierV0, FailpointControlV0};
 use crate::{
     BufferedRetainedWatchV0, CompletedObservationFenceOutcomeV0, FailpointsV0, FixedPointPortV0,
     KubeAutomationObservationPortV0, KubeAutomationPortV0, KubeDeletionObservationPortV0,
-    KubeFixedPointPortV0, ModeV0, PrewriteRootAuthenticationV0, PrewriteRootWitnessV0,
-    RenderExecutionOutcomeV0, RetainedWatchCollectorV0, RetainedWatchCoordinationV0, RootActorV0,
-    RuntimeErrorV0, UnixRendererPortV0, dispatch_transport_command_in_operation, drive_automation,
+    KubeFixedPointPortV0, ModeV0, NoCommandDispositionV0, PrewriteRootAuthenticationV0,
+    PrewriteRootWitnessV0, RenderExecutionOutcomeV0, RetainedWatchCollectorV0,
+    RetainedWatchCoordinationV0, RootActorV0, RuntimeErrorV0, UnixRendererPortV0,
+    dispatch_transport_command_in_operation, drive_automation,
     fresh_root_snapshot_from_transport_prewrite_in_operation, load_machine_from_transport,
     load_machine_from_transport_in_operation,
 };
@@ -108,6 +109,63 @@ enum QuiescentWakeV0 {
     Root(Result<WatchEventV0, TransportErrorV0>),
     Dependency(Result<BufferedRetainedWatchV0, RuntimeErrorV0>),
     Automation(Box<Result<oxideloop_kube_transport::ValidatedAutomationRunV0, TransportErrorV0>>),
+}
+
+/// The only no-command driver boundary. Keeping this policy separate from the
+/// `select!` makes it auditable that a witnessed foreign collision cannot
+/// establish or poll an automation watch, while every other non-watchable
+/// reducer phase fails before any external wait is entered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NoCommandDriverActionV0 {
+    Exit,
+    ContinueAfterInformerAdmission,
+    Watch {
+        watch_automation: bool,
+        emitted_observability: bool,
+    },
+}
+
+fn drive_no_command_disposition<F>(
+    active: &mut RootActorV0,
+    mut admit_informers: F,
+) -> Result<NoCommandDriverActionV0, RuntimeErrorV0>
+where
+    F: FnMut(&mut RootActorV0) -> Result<bool, RuntimeErrorV0>,
+{
+    match active.no_command_disposition() {
+        NoCommandDispositionV0::Terminal => Ok(NoCommandDriverActionV0::Exit),
+        NoCommandDispositionV0::AdmitInformers => {
+            active.emit_observability("waiting_informers", None);
+            if !admit_informers(active)? {
+                active.emit_observability("illegal_quiescence", None);
+                let reason: String = "informer readiness admission made no progress".into();
+                active.hold(reason.clone());
+                return Err(RuntimeErrorV0::Hold(reason));
+            }
+            // Admission queues exactly one sealed readiness; the next turn
+            // must reduce it into RequestRender rather than entering a watch.
+            Ok(NoCommandDriverActionV0::ContinueAfterInformerAdmission)
+        }
+        NoCommandDispositionV0::WatchReady => Ok(NoCommandDriverActionV0::Watch {
+            watch_automation: true,
+            emitted_observability: active.emit_ready_if_quiescent(),
+        }),
+        NoCommandDispositionV0::WatchBlockedForeignCollision => {
+            Ok(NoCommandDriverActionV0::Watch {
+                watch_automation: false,
+                emitted_observability: active.emit_blocked_collision_if_new(),
+            })
+        }
+        NoCommandDispositionV0::IllegalQuiescence => {
+            active.emit_observability("illegal_quiescence", None);
+            let reason = format!(
+                "illegal quiescence: phase {:?} produced no command",
+                active.state().phase()
+            );
+            active.hold(reason.clone());
+            Err(RuntimeErrorV0::Hold(reason))
+        }
+    }
 }
 
 /// Single-replica process driver.  One instance is deliberately one exact
@@ -820,30 +878,28 @@ impl ControllerDriverV0 {
                     .await?;
                 }
                 None => {
-                    if matches!(active.mode(), ModeV0::Terminal) {
-                        return Ok(DriverExitV0::RootFinalized);
-                    }
-                    if active.state().phase() == PhaseV0::InformersPending {
+                    let action = drive_no_command_disposition(active, |actor| {
                         let port = fixed_point.as_mut().ok_or_else(|| {
                             RuntimeErrorV0::Hold(
                                 "informers pending before a verified fixed-point port".into(),
                             )
                         })?;
-                        if port.admit_initial_informer_readiness(active)? {
-                            // The actor will reduce its sealed readiness into
-                            // the normal RequestRender path on the next turn.
-                            // Do not enter the retained-watch idle path before
-                            // that first render installs its barrier.
-                            continue;
-                        }
-                    }
+                        port.admit_initial_informer_readiness(actor)
+                    })?;
+                    let blocked_foreign_collision = match action {
+                        NoCommandDriverActionV0::Exit => return Ok(DriverExitV0::RootFinalized),
+                        NoCommandDriverActionV0::ContinueAfterInformerAdmission => continue,
+                        NoCommandDriverActionV0::Watch {
+                            watch_automation, ..
+                        } => !watch_automation,
+                    };
                     // The journal owns pending runs.  Their list/watch/GET
                     // barrier is re-established after a restart, so a run
                     // created before the watch cannot be missed.
-                    if automation_watch.is_none() {
+                    if !blocked_foreign_collision && automation_watch.is_none() {
                         automation_watch = establish_pending_watch(active, &self.transport).await?;
                     }
-                    if let Some(watch) = automation_watch.as_mut() {
+                    if !blocked_foreign_collision && let Some(watch) = automation_watch.as_mut() {
                         if let Some(completion) = watch.current().completion() {
                             active.acknowledge_automation_completion(
                                 EventV0::AutomationCompleted {
@@ -917,7 +973,8 @@ impl ControllerDriverV0 {
                     // establishes the baseline if necessary; serial delivery
                     // prevents a later declaration from overtaking that
                     // durable baseline/write.
-                    if active.state().phase() == PhaseV0::Ready
+                    if !blocked_foreign_collision
+                        && active.state().phase() == PhaseV0::Ready
                         && !active.state().root().deleting
                         && enqueue_next_automation_candidate(active, &mut automation_candidates)
                     {
@@ -950,12 +1007,19 @@ impl ControllerDriverV0 {
                                 }
                             } => QuiescentWakeV0::Dependency(change),
                             run = async {
-                                match automation_watch.as_mut() {
-                                    Some(watch) => watch.next_change().await,
-                                    None => std::future::pending::<Result<
+                                if blocked_foreign_collision {
+                                    std::future::pending::<Result<
                                         oxideloop_kube_transport::ValidatedAutomationRunV0,
                                         TransportErrorV0,
-                                    >>().await,
+                                    >>().await
+                                } else {
+                                    match automation_watch.as_mut() {
+                                        Some(watch) => watch.next_change().await,
+                                        None => std::future::pending::<Result<
+                                            oxideloop_kube_transport::ValidatedAutomationRunV0,
+                                            TransportErrorV0,
+                                        >>().await,
+                                    }
                                 }
                             } => QuiescentWakeV0::Automation(Box::new(run)),
                         };
@@ -972,12 +1036,19 @@ impl ControllerDriverV0 {
                                 }
                             } => QuiescentWakeV0::Dependency(change),
                             run = async {
-                                match automation_watch.as_mut() {
-                                    Some(watch) => watch.next_change().await,
-                                    None => std::future::pending::<Result<
+                                if blocked_foreign_collision {
+                                    std::future::pending::<Result<
                                         oxideloop_kube_transport::ValidatedAutomationRunV0,
                                         TransportErrorV0,
-                                    >>().await,
+                                    >>().await
+                                } else {
+                                    match automation_watch.as_mut() {
+                                        Some(watch) => watch.next_change().await,
+                                        None => std::future::pending::<Result<
+                                            oxideloop_kube_transport::ValidatedAutomationRunV0,
+                                            TransportErrorV0,
+                                        >>().await,
+                                    }
                                 }
                             } => QuiescentWakeV0::Automation(Box::new(run)),
                         };
@@ -3252,15 +3323,16 @@ mod tests {
         OxideLoopStateSpec, RootBinding, STATE_VERSION_V1, StateBody, StateLink,
         WebApplicationSpec, WebApplicationStatus, automation_run_name, bootstrap_id, state_name,
     };
-    use oxideloop_controller_core::RootSnapshotV0;
+    use oxideloop_controller_core::{DesiredObservationV0, FrozenInputV0, RootSnapshotV0};
     use oxideloop_kube_transport::{ObjectMetaV0, ObjectV0};
+    use oxideloop_mutation_model::{BackendQualification, Observation as MutationObservation};
     use oxideloop_renderer_abi::{
         ActionInputV0, canonical_bytes,
         model::{
             ABI_VERSION_V0, AutomationDeclaration, Dependency, Observation, RenderDisposition,
-            RenderOutputV0,
+            RenderOutputV0, ResourceDeclaration,
         },
-        sha256_hex,
+        parse_validate_render_input, sha256_hex,
     };
     use serde_json::json;
     use tower::service_fn;
@@ -7552,6 +7624,443 @@ mod tests {
                 .fault
                 .as_deref()
                 .is_some_and(|fault| fault.contains("root watch failed"))
+        );
+    }
+
+    /// Creates the same reducer-owned, empty-journal collision state the
+    /// production fixed-point acknowledgement reaches.  This intentionally
+    /// uses no adapter shortcut: the driver tests below exercise the exact
+    /// no-command policy after the pure reducer has retained its witness.
+    fn blocked_foreign_collision_actor() -> RootActorV0 {
+        let mut actor = render_ready_actor_for_coverage_test();
+        let barrier = actor.barrier();
+        actor
+            .prepare_initial_informer_observation(barrier)
+            .expect("informer observation is sealed");
+        actor.informers_ready(barrier);
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("informer readiness is reduced")
+            .expect("informer readiness requests a render")
+        else {
+            panic!("informer readiness must request a render");
+        };
+        let root = actor.state().root().clone();
+        let input = RenderInputV0 {
+            abi_version: ABI_VERSION_V0.into(),
+            root: RootProjection {
+                api_version: "demo.oxideloop.dev/v1alpha1".into(),
+                kind: "WebApplication".into(),
+                uid: root.uid.clone(),
+                namespace: root.namespace.clone(),
+                name: root.name.clone(),
+                generation: u64::try_from(root.generation).expect("nonnegative generation"),
+                spec: serde_json::to_value(&root.spec).expect("root spec serializes"),
+            },
+            bundle_digest: root.bundle_digest.clone(),
+            cache_epoch: preconditions.cache_epoch.clone(),
+            observation_token: preconditions.observation_token.clone(),
+            observations: vec![],
+        };
+        let input_json = serde_json::to_string(&input).expect("render input serializes");
+        let output_json = serde_json::to_string(&RenderOutputV0 {
+            abi_version: ABI_VERSION_V0.into(),
+            disposition: RenderDisposition::Apply,
+            resources: vec![ResourceDeclaration {
+                logical_id: "foreign".into(),
+                object: json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "foreign", "namespace": "ns"},
+                    "data": {"value": "foreign"},
+                }),
+                readiness: None,
+            }],
+            dependencies: vec![],
+            automations: vec![],
+            diagnostics: vec![],
+        })
+        .expect("render output serializes");
+        let blocked = oxideloop_controller_core::reduce(
+            actor.state().clone(),
+            EventV0::Rendered {
+                frozen: FrozenInputV0 {
+                    root_generation: root.generation,
+                    state_resource_version: root.state_resource_version.clone(),
+                    observation_token: preconditions.observation_token.clone(),
+                    cache_epoch: preconditions.cache_epoch.clone(),
+                    final_observation_fence_token: "f".repeat(64),
+                    render_input_hash: parse_validate_render_input(&input_json)
+                        .expect("render input validates")
+                        .sha256,
+                },
+                render_input_json: input_json,
+                render_output_json: output_json,
+                observed: vec![DesiredObservationV0 {
+                    identity: ObjectIdentity {
+                        api_version: "v1".into(),
+                        kind: "ConfigMap".into(),
+                        namespace: "ns".into(),
+                        name: "foreign".into(),
+                    },
+                    observation: MutationObservation::Existing {
+                        identity: oxideloop_mutation_model::ObjectIdentity {
+                            uid: "foreign-uid".into(),
+                            resource_version: "foreign-rv".into(),
+                        },
+                    },
+                    qualification: BackendQualification::BuiltInTested {
+                        kubernetes_minor: "1.36".into(),
+                        gvr: "configmaps".into(),
+                    },
+                    recovery_proof: None,
+                    deletion_recovery_proof: None,
+                }],
+            },
+        )
+        .expect("empty-journal foreign collision is watchable");
+        assert_eq!(blocked.state.phase(), PhaseV0::BlockedForeignCollision);
+        assert!(blocked.commands.is_empty());
+        RootActorV0::new(blocked.state)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn ready_actor() -> RootActorV0 {
+        let mut actor = render_ready_actor_for_coverage_test();
+        let barrier = actor.barrier();
+        actor
+            .prepare_initial_informer_observation(barrier)
+            .expect("informer observation is sealed");
+        actor.informers_ready(barrier);
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("informer readiness is reduced")
+            .expect("informer readiness requests a render")
+        else {
+            panic!("informer readiness must request a render");
+        };
+        let root = actor.state().root().clone();
+        let input = RenderInputV0 {
+            abi_version: ABI_VERSION_V0.into(),
+            root: RootProjection {
+                api_version: "demo.oxideloop.dev/v1alpha1".into(),
+                kind: "WebApplication".into(),
+                uid: root.uid.clone(),
+                namespace: root.namespace.clone(),
+                name: root.name.clone(),
+                generation: u64::try_from(root.generation).expect("nonnegative generation"),
+                spec: serde_json::to_value(&root.spec).expect("root spec serializes"),
+            },
+            bundle_digest: root.bundle_digest.clone(),
+            cache_epoch: preconditions.cache_epoch.clone(),
+            observation_token: preconditions.observation_token.clone(),
+            observations: vec![],
+        };
+        let input_json = serde_json::to_string(&input).expect("render input serializes");
+        let frozen = FrozenInputV0 {
+            root_generation: root.generation,
+            state_resource_version: root.state_resource_version.clone(),
+            observation_token: preconditions.observation_token.clone(),
+            cache_epoch: preconditions.cache_epoch.clone(),
+            final_observation_fence_token: "e".repeat(64),
+            render_input_hash: parse_validate_render_input(&input_json)
+                .expect("render input validates")
+                .sha256,
+        };
+        let output_json = serde_json::to_string(&RenderOutputV0 {
+            abi_version: ABI_VERSION_V0.into(),
+            disposition: RenderDisposition::ExplicitEmpty,
+            resources: vec![],
+            dependencies: vec![],
+            automations: vec![],
+            diagnostics: vec![],
+        })
+        .expect("empty output serializes");
+        let first = oxideloop_controller_core::reduce(
+            actor.state().clone(),
+            EventV0::Rendered {
+                frozen: frozen.clone(),
+                render_input_json: input_json.clone(),
+                render_output_json: output_json.clone(),
+                observed: vec![],
+            },
+        )
+        .expect("initial render enters persistence");
+        // The driver fixture has an initial root status self-echo to close.
+        // Reduce it first, then render against the status-pinned request
+        // exactly as the production driver does before durable revalidation.
+        let (prepared, mut completion_frozen, completion_input_json) =
+            if let CommandV0::PersistRootStatus {
+                token,
+                old_root_resource_version,
+                root_uid,
+                ..
+            } = &first.commands[0]
+            {
+                let status_persisted = oxideloop_controller_core::reduce(
+                    first.state,
+                    EventV0::RootStatusPersisted {
+                        token: token.clone(),
+                        old_root_resource_version: old_root_resource_version.clone(),
+                        new_root_resource_version: "root-rv-ready-status".into(),
+                        root_uid: root_uid.clone(),
+                    },
+                )
+                .expect("initial status persistence is accepted");
+                let CommandV0::RequestRender { preconditions } = &status_persisted.commands[0]
+                else {
+                    panic!("initial status persistence must request a status-pinned render");
+                };
+                let root = status_persisted.state.root().clone();
+                let input = RenderInputV0 {
+                    abi_version: ABI_VERSION_V0.into(),
+                    root: RootProjection {
+                        api_version: "demo.oxideloop.dev/v1alpha1".into(),
+                        kind: "WebApplication".into(),
+                        uid: root.uid.clone(),
+                        namespace: root.namespace.clone(),
+                        name: root.name.clone(),
+                        generation: u64::try_from(root.generation).expect("nonnegative generation"),
+                        spec: serde_json::to_value(&root.spec).expect("root spec serializes"),
+                    },
+                    bundle_digest: root.bundle_digest.clone(),
+                    cache_epoch: preconditions.cache_epoch.clone(),
+                    observation_token: preconditions.observation_token.clone(),
+                    observations: vec![],
+                };
+                let input_json = serde_json::to_string(&input).expect("render input serializes");
+                let frozen = FrozenInputV0 {
+                    root_generation: root.generation,
+                    state_resource_version: root.state_resource_version.clone(),
+                    observation_token: preconditions.observation_token.clone(),
+                    cache_epoch: preconditions.cache_epoch.clone(),
+                    final_observation_fence_token: "d".repeat(64),
+                    render_input_hash: parse_validate_render_input(&input_json)
+                        .expect("render input validates")
+                        .sha256,
+                };
+                let prepared = oxideloop_controller_core::reduce(
+                    status_persisted.state,
+                    EventV0::Rendered {
+                        frozen: frozen.clone(),
+                        render_input_json: input_json.clone(),
+                        render_output_json: output_json.clone(),
+                        observed: vec![],
+                    },
+                )
+                .expect("status-pinned render enters persistence");
+                (prepared, frozen, input_json)
+            } else {
+                (first, frozen, input_json)
+            };
+        let CommandV0::Persist { operation, .. } = &prepared.commands[0] else {
+            panic!(
+                "render must persist its revalidation receipt: {:?}",
+                prepared.commands[0]
+            );
+        };
+        let revalidate = oxideloop_controller_core::reduce(
+            prepared.state,
+            EventV0::Persisted {
+                token: operation.token.clone(),
+                old_state_resource_version: operation.old_state_resource_version.clone(),
+                new_state_resource_version: "state-rv-revalidate".into(),
+                state_uid: root.state_uid.clone(),
+            },
+        )
+        .expect("prepared receipt schedules revalidation");
+        completion_frozen.state_resource_version = "state-rv-revalidate".into();
+        let completed = oxideloop_controller_core::reduce(
+            revalidate.state,
+            EventV0::Revalidated {
+                frozen: completion_frozen,
+                render_input_json: completion_input_json,
+                render_output_json: output_json,
+                observed: vec![],
+            },
+        )
+        .expect("revalidation completes");
+        let CommandV0::Persist { operation, .. } = &completed.commands[0] else {
+            panic!("completed revalidation must persist result");
+        };
+        let ready = oxideloop_controller_core::reduce(
+            completed.state,
+            EventV0::Persisted {
+                token: operation.token.clone(),
+                old_state_resource_version: operation.old_state_resource_version.clone(),
+                new_state_resource_version: "state-rv-ready".into(),
+                state_uid: root.state_uid.clone(),
+            },
+        )
+        .expect("result persistence reaches Ready");
+        assert_eq!(ready.state.phase(), PhaseV0::Ready);
+        RootActorV0::new(ready.state)
+    }
+
+    #[test]
+    fn driver_bfc_no_command_policy_disables_automation_and_exact_deletion_reenters_render() {
+        let mut actor = blocked_foreign_collision_actor();
+        assert!(
+            actor
+                .next_command()
+                .expect("collision has no command")
+                .is_none()
+        );
+        let mut informer_admissions = 0;
+        let first = drive_no_command_disposition(&mut actor, |actor| {
+            informer_admissions += 1;
+            actor.informers_ready(actor.barrier());
+            Ok(true)
+        })
+        .expect("valid collision enters retained-watch policy");
+        assert_eq!(
+            first,
+            NoCommandDriverActionV0::Watch {
+                watch_automation: false,
+                emitted_observability: true,
+            }
+        );
+        assert_eq!(
+            informer_admissions, 0,
+            "a blocked collision neither establishes nor polls automation authority"
+        );
+        assert_eq!(
+            drive_no_command_disposition(&mut actor, |_| Ok(true))
+                .expect("unchanged collision remains watchable"),
+            NoCommandDriverActionV0::Watch {
+                watch_automation: false,
+                emitted_observability: false,
+            },
+            "unchanged watch select passes do not emit a loop of collision logs"
+        );
+
+        let change = crate::GenuineChangeV0::from_observations(
+            &[Observation {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                name: "foreign".into(),
+                uid: "foreign-uid".into(),
+                resource_version: "foreign-rv-after-delete".into(),
+                value: json!({"deleted": true}),
+            }],
+            actor.barrier(),
+            1,
+        )
+        .expect("exact retained deletion observation is canonical");
+        assert!(
+            actor.record_genuine_dependency_change(&change),
+            "the exact foreign target deletion wakes the retained watch"
+        );
+        assert_eq!(actor.state().phase(), PhaseV0::InformersPending);
+        assert_eq!(
+            drive_no_command_disposition(&mut actor, |actor| {
+                informer_admissions += 1;
+                actor.informers_ready(actor.barrier());
+                Ok(true)
+            })
+            .expect("fenced collision wake admits one fresh informer readiness"),
+            NoCommandDriverActionV0::ContinueAfterInformerAdmission
+        );
+        assert_eq!(informer_admissions, 1);
+        assert!(matches!(
+            actor.next_command(),
+            Ok(Some(CommandV0::RequestRender { .. }))
+        ));
+    }
+
+    #[test]
+    fn driver_stale_blocked_collision_witness_is_illegal_quiescence() {
+        let mut actor = blocked_foreign_collision_actor();
+        let prior_epoch = actor.barrier().cache_epoch;
+        // This is a production-representable failure mode: a retained watch
+        // invalidates after the reducer retained its old collision witness.
+        // BFC intentionally has no generic invalidation continuation, so the
+        // phase remains blocked while the witness's old cache pin is stale.
+        actor.watch_invalidated();
+        assert_eq!(actor.state().phase(), PhaseV0::BlockedForeignCollision);
+        assert_eq!(actor.barrier().cache_epoch, prior_epoch + 1);
+        assert!(
+            actor
+                .next_command()
+                .expect("stale collision has no command")
+                .is_none()
+        );
+        let mut informer_admissions = 0;
+        assert!(matches!(
+            drive_no_command_disposition(&mut actor, |_| {
+                informer_admissions += 1;
+                Ok(true)
+            }),
+            Err(RuntimeErrorV0::Hold(reason)) if reason.contains("illegal quiescence")
+        ));
+        assert_eq!(
+            informer_admissions, 0,
+            "a stale witness fails before informer or automation watch authority"
+        );
+        assert!(
+            matches!(actor.mode(), ModeV0::Hold(reason) if reason.contains("illegal quiescence"))
+        );
+    }
+
+    #[test]
+    fn driver_root_deletion_preempts_blocked_collision_and_jsonl_is_correlated_and_deduped() {
+        let mut actor = blocked_foreign_collision_actor();
+        let first = drive_no_command_disposition(&mut actor, |_| Ok(true))
+            .expect("collision reaches driver watch policy");
+        assert!(matches!(
+            first,
+            NoCommandDriverActionV0::Watch {
+                watch_automation: false,
+                emitted_observability: true,
+            }
+        ));
+        let record =
+            actor.observability_record("watching_blocked_foreign_collision", None, None, None);
+        assert_eq!(record["component"], "oxideloop-controller-runtime");
+        assert_eq!(record["root_uid"], ROOT_UID);
+        assert_eq!(record["root_resource_version"], "root-rv-after-descriptor");
+        assert_eq!(record["command_class"], "none");
+        assert_eq!(
+            record["collision"][0]["identity"],
+            "v1/ConfigMap/ns/foreign"
+        );
+        assert_eq!(record["collision"][0]["foreign_uid"], "foreign-uid");
+        assert_eq!(
+            record["collision"][0]["foreign_resource_version"],
+            "foreign-rv"
+        );
+
+        let mut deleting = actor.state().root().clone();
+        deleting.deleting = true;
+        deleting.root_resource_version = "root-rv-deleting".into();
+        assert!(actor.root_observed(deleting));
+        let command = actor
+            .next_command()
+            .expect("root deletion refresh is reduced before a retained wait")
+            .expect("root deletion begins a durable cleanup transition");
+        assert_ne!(actor.state().phase(), PhaseV0::BlockedForeignCollision);
+        assert!(!matches!(command, CommandV0::RequestRender { .. }));
+    }
+
+    #[test]
+    fn driver_ready_policy_dedupes_stable_jsonl_observation() {
+        let mut actor = ready_actor();
+        assert_eq!(
+            drive_no_command_disposition(&mut actor, |_| Ok(true))
+                .expect("Ready enters the retained watch policy"),
+            NoCommandDriverActionV0::Watch {
+                watch_automation: true,
+                emitted_observability: true,
+            }
+        );
+        assert_eq!(
+            drive_no_command_disposition(&mut actor, |_| Ok(true))
+                .expect("unchanged Ready remains a retained watch policy"),
+            NoCommandDriverActionV0::Watch {
+                watch_automation: true,
+                emitted_observability: false,
+            }
         );
     }
 }
