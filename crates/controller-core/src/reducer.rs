@@ -2978,7 +2978,7 @@ fn revalidate(
             || state
                 .frozen
                 .as_ref()
-                .is_some_and(|previous| previous != &frozen))
+                .is_some_and(|previous| !same_revalidation_stable_baseline(previous, &frozen)))
     {
         stale(commands, "revalidation frozen hash mismatch");
         return Ok(());
@@ -2989,7 +2989,30 @@ fn revalidate(
     // A qualified response-lost proof is projected only for that pure graph
     // check; the actual fresh observation is retained for result recovery.
     let planning_observed = recovered_observation_projection(state, &tx, &observed);
-    let plan = plan_graph(state, &frozen, input, output, planning_observed)?;
+    let revalidating_prepared_delete = tx.prepared_intents.iter().any(|intent| {
+        intent.operation == ApplyOperation::Delete
+            && !tx
+                .results
+                .iter()
+                .any(|result| result.command_id == intent.command_id)
+    });
+    // A live revalidation proves a new completed-observation fence. For an
+    // already prepared prune, the durable second fence instead identifies the
+    // plan being reconstructed. Keep every other planning pin, and all
+    // authorization inputs below, fresh.
+    let planning_frozen = if !exact_effect_recovery && revalidating_prepared_delete {
+        let prepared = state
+            .frozen
+            .as_ref()
+            .expect("normal revalidation retains a prepared frozen input");
+        FrozenInputV0 {
+            final_observation_fence_token: prepared.final_observation_fence_token.clone(),
+            ..frozen.clone()
+        }
+    } else {
+        frozen.clone()
+    };
+    let plan = plan_graph(state, &planning_frozen, input, output, planning_observed)?;
     if exact_effect_recovery {
         if matches!(
             tx.next_command_lifecycle.state,
@@ -5670,6 +5693,18 @@ fn matches_root(state: &MachineStateV0, frozen: &FrozenInputV0) -> bool {
         && frozen.state_resource_version == state.root.state_resource_version
         && is_raw_sha256(&frozen.final_observation_fence_token)
 }
+
+/// A revalidation repeats the completed-observation fence after `Prepare`
+/// persisted. The new fence token is deliberately unique, so it proves the
+/// fresh observation rather than identifying the earlier render. Every other
+/// frozen input field remains a stable binding to the prepared transaction.
+fn same_revalidation_stable_baseline(previous: &FrozenInputV0, fresh: &FrozenInputV0) -> bool {
+    previous.root_generation == fresh.root_generation
+        && previous.state_resource_version == fresh.state_resource_version
+        && previous.observation_token == fresh.observation_token
+        && previous.cache_epoch == fresh.cache_epoch
+        && previous.render_input_hash == fresh.render_input_hash
+}
 fn stale(commands: &mut Vec<CommandV0>, reason: &str) {
     commands.push(CommandV0::IgnoredStale {
         reason: reason.into(),
@@ -6652,6 +6687,123 @@ mod tests {
         )
         .unwrap()
         .state
+    }
+
+    #[test]
+    fn revalidation_accepts_a_fresh_fence_but_rejects_stable_baseline_drift() {
+        let machine = boot_to_render(state());
+        let (frozen, input, output, observed) = rendered(&machine.root, vec![]);
+        let prepared = reduce(
+            machine,
+            EventV0::Rendered {
+                frozen: frozen.clone(),
+                render_input_json: input.clone(),
+                render_output_json: output.clone(),
+                observed: observed.clone(),
+            },
+        )
+        .unwrap();
+        let prepare = match &prepared.commands[0] {
+            CommandV0::Persist { operation, .. } => operation.clone(),
+            command => panic!("render must persist Prepare: {command:?}"),
+        };
+        let revalidate = reduce(
+            prepared.state,
+            EventV0::Persisted {
+                token: prepare.token,
+                old_state_resource_version: prepare.old_state_resource_version,
+                new_state_resource_version: "revalidate-state-rv".into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .unwrap();
+        let baseline = FrozenInputV0 {
+            state_resource_version: "revalidate-state-rv".into(),
+            final_observation_fence_token: "e".repeat(64),
+            ..frozen
+        };
+
+        let accepted = reduce(
+            revalidate.state.clone(),
+            EventV0::Revalidated {
+                frozen: baseline.clone(),
+                render_input_json: input.clone(),
+                render_output_json: output.clone(),
+                observed: observed.clone(),
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(accepted.commands.as_slice(), [CommandV0::Persist { operation, .. }]
+                if operation.purpose == PersistPurpose::DispatchAuthorization),
+            "a distinct, valid final fence must authorize the prepared effect: {:?}",
+            accepted.commands
+        );
+
+        let cases = [
+            (
+                "root generation",
+                FrozenInputV0 {
+                    root_generation: baseline.root_generation + 1,
+                    ..baseline.clone()
+                },
+            ),
+            (
+                "state resource version",
+                FrozenInputV0 {
+                    state_resource_version: "wrong-state-rv".into(),
+                    ..baseline.clone()
+                },
+            ),
+            (
+                "observation token",
+                FrozenInputV0 {
+                    observation_token: "wrong-observation".into(),
+                    ..baseline.clone()
+                },
+            ),
+            (
+                "cache epoch",
+                FrozenInputV0 {
+                    cache_epoch: "wrong-epoch".into(),
+                    ..baseline.clone()
+                },
+            ),
+            (
+                "render input hash",
+                FrozenInputV0 {
+                    render_input_hash: "d".repeat(64),
+                    ..baseline.clone()
+                },
+            ),
+            (
+                "final fence shape",
+                FrozenInputV0 {
+                    final_observation_fence_token: "not-a-sha256".into(),
+                    ..baseline.clone()
+                },
+            ),
+        ];
+        for (field, drifted) in cases {
+            let rejected = reduce(
+                revalidate.state.clone(),
+                EventV0::Revalidated {
+                    frozen: drifted,
+                    render_input_json: input.clone(),
+                    render_output_json: output.clone(),
+                    observed: observed.clone(),
+                },
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    rejected.commands.as_slice(),
+                    [CommandV0::IgnoredStale { .. }]
+                ),
+                "revalidation must reject {field} drift: {:?}",
+                rejected.commands
+            );
+        }
     }
 
     fn acknowledge_dispatch_authorization(
@@ -8190,17 +8342,26 @@ mod tests {
                 .iter()
                 .all(|command| !matches!(command, CommandV0::Mutate { .. }))
         );
-        let issued = reduce(
+        let fresh_frozen = FrozenInputV0 {
+            final_observation_fence_token: "e".repeat(64),
+            ..revalidate.state.frozen.clone().unwrap()
+        };
+        let authorized = reduce(
             revalidate.state.clone(),
             EventV0::Revalidated {
-                frozen: revalidate.state.frozen.clone().unwrap(),
+                frozen: fresh_frozen,
                 render_input_json: input.clone(),
                 render_output_json: output.clone(),
                 observed: observed.clone(),
             },
         )
         .unwrap();
-        let issued = acknowledge_dispatch_authorization(issued, "13");
+        assert!(matches!(
+            authorized.commands.as_slice(),
+            [CommandV0::Persist { operation, .. }]
+                if operation.purpose == PersistPurpose::DispatchAuthorization
+        ));
+        let issued = acknowledge_dispatch_authorization(authorized, "13");
         let (transaction_id, attempt_token, command) = match &issued.commands[0] {
             CommandV0::Mutate {
                 transaction_id,
@@ -8213,6 +8374,23 @@ mod tests {
             ),
             _ => panic!("prepared prune must issue an exact delete"),
         };
+        assert_eq!(
+            command.prepared_expected_target.as_ref(),
+            Some(&MutationIdentity {
+                uid: "old-uid".into(),
+                resource_version: "10".into(),
+            })
+        );
+        assert!(matches!(
+            &command.decision,
+            MutationDecision::PreconditionedDelete {
+                method: HttpMethod::Delete,
+                preconditions: MutationIdentity {
+                    uid,
+                    resource_version,
+                },
+            } if uid == "old-uid" && resource_version == "10"
+        ));
         let acknowledged = reduce(
             issued.state,
             EventV0::MutationAcknowledged {
