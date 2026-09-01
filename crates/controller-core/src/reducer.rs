@@ -3062,6 +3062,7 @@ fn revalidate(
         if !recovered.is_empty() {
             state.frozen = Some(frozen);
             record_mutation_results(state, &recovered)?;
+            advance_next_command_lifecycle(state)?;
             return queue_persist(
                 state,
                 PersistPurpose::MutationResult,
@@ -3151,6 +3152,7 @@ fn revalidate(
     if !recovered.is_empty() {
         state.frozen = Some(frozen);
         record_mutation_results(state, &recovered)?;
+        advance_next_command_lifecycle(state)?;
         return queue_persist(
             state,
             PersistPurpose::MutationResult,
@@ -9145,6 +9147,398 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    struct SsaResponseLossFixture {
+        issued: MachineStateV0,
+        dispatch_frozen: FrozenInputV0,
+        input: String,
+        output: String,
+        response_observed: Vec<DesiredObservationV0>,
+        first_command_id: String,
+    }
+
+    fn issued_ssa_response_loss_fixture(multi_intent: bool) -> SsaResponseLossFixture {
+        let mut machine = boot_to_render(state());
+        let (frozen, input, output, mut observed) = rendered(&machine.root, vec![]);
+        let first_identity = observed[0].identity.clone();
+        machine.journal.state.inventory.push(InventoryEntry {
+            identity: first_identity.clone(),
+            logical_id: "object".into(),
+            uid: "first-uid".into(),
+            resource_version: "10".into(),
+            bundle_digest: "a".repeat(64),
+        });
+        observed[0].observation = Observation::Existing {
+            identity: MutationIdentity {
+                uid: "first-uid".into(),
+                resource_version: "10".into(),
+            },
+        };
+        let mut output: RenderOutputV0 = serde_json::from_str(&output).unwrap();
+        if multi_intent {
+            let second_identity = ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "demo".into(),
+                name: "object-two".into(),
+            };
+            machine.journal.state.inventory.push(InventoryEntry {
+                identity: second_identity.clone(),
+                logical_id: "object-two".into(),
+                uid: "second-uid".into(),
+                resource_version: "20".into(),
+                bundle_digest: "a".repeat(64),
+            });
+            output.resources.push(ResourceDeclaration {
+                logical_id: "object-two".into(),
+                object: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"namespace": "demo", "name": "object-two"},
+                }),
+                readiness: None,
+            });
+            observed.push(DesiredObservationV0 {
+                identity: second_identity,
+                observation: Observation::Existing {
+                    identity: MutationIdentity {
+                        uid: "second-uid".into(),
+                        resource_version: "20".into(),
+                    },
+                },
+                qualification: BackendQualification::BuiltInTested {
+                    kubernetes_minor: "1.36".into(),
+                    gvr: "configmaps".into(),
+                },
+                recovery_proof: None,
+                deletion_recovery_proof: None,
+            });
+        }
+        let output = serde_json::to_string(&output).unwrap();
+        let prepared = reduce(
+            machine,
+            EventV0::Rendered {
+                frozen,
+                render_input_json: input.clone(),
+                render_output_json: output.clone(),
+                observed: observed.clone(),
+            },
+        )
+        .unwrap();
+        let prepare = match &prepared.commands[0] {
+            CommandV0::Persist { operation, .. } => operation.clone(),
+            command => panic!("render must persist Prepare: {command:?}"),
+        };
+        let revalidate = reduce(
+            prepared.state,
+            EventV0::Persisted {
+                token: prepare.token,
+                old_state_resource_version: prepare.old_state_resource_version,
+                new_state_resource_version: "12".into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .unwrap();
+        let dispatch_frozen = revalidate.state.frozen.clone().unwrap();
+        let authorized = reduce(
+            revalidate.state,
+            EventV0::Revalidated {
+                frozen: dispatch_frozen.clone(),
+                render_input_json: input.clone(),
+                render_output_json: output.clone(),
+                observed: observed.clone(),
+            },
+        )
+        .unwrap();
+        let issued = acknowledge_dispatch_authorization(authorized, "13");
+        let (transaction_id, first_command_id, first_identity) = match &issued.commands[0] {
+            CommandV0::Mutate {
+                transaction_id,
+                commands,
+                ..
+            } => (
+                transaction_id.clone(),
+                commands[0].command_id.clone(),
+                commands[0].identity.clone(),
+            ),
+            command => panic!("dispatch authorization must issue one SSA command: {command:?}"),
+        };
+        let response_observed = observed
+            .into_iter()
+            .map(|mut observation| {
+                if observation.identity == first_identity {
+                    observation.observation = Observation::Existing {
+                        identity: MutationIdentity {
+                            uid: match observation.observation {
+                                Observation::Existing { ref identity } => identity.uid.clone(),
+                                Observation::Absent => unreachable!("prepared SSA must be present"),
+                            },
+                            resource_version: "30".into(),
+                        },
+                    };
+                    observation.recovery_proof = Some(RecoveryProofV0 {
+                        root_uid: "root-uid".into(),
+                        transaction_id: transaction_id.clone(),
+                        command_id: first_command_id.clone(),
+                        uid: match &observation.observation {
+                            Observation::Existing { identity } => identity.uid.clone(),
+                            Observation::Absent => {
+                                unreachable!("response-loss object remains present")
+                            }
+                        },
+                        resource_version: "30".into(),
+                    });
+                }
+                observation
+            })
+            .collect();
+        SsaResponseLossFixture {
+            issued: issued.state,
+            dispatch_frozen,
+            input,
+            output,
+            response_observed,
+            first_command_id,
+        }
+    }
+
+    fn restart_to_revalidation(state: MachineStateV0) -> MachineStateV0 {
+        let recovered =
+            MachineStateV0::recover_json(&serde_json::to_string(&state).unwrap()).unwrap();
+        let descriptor = reduce(recovered, EventV0::Start).unwrap();
+        let token = match &descriptor.commands[0] {
+            CommandV0::RequestDescriptor { token, .. } => token.clone(),
+            command => panic!("restart must request a descriptor: {command:?}"),
+        };
+        let informers = reduce(
+            descriptor.state,
+            EventV0::DescriptorReady {
+                token,
+                bundle_digest: "a".repeat(64),
+            },
+        )
+        .unwrap();
+        reduce(informers.state, EventV0::InformersReady)
+            .unwrap()
+            .state
+    }
+
+    #[test]
+    fn response_loss_restart_persists_a_correlated_complete_single_result() {
+        let fixture = issued_ssa_response_loss_fixture(false);
+        let recovery = restart_to_revalidation(fixture.issued);
+        assert_eq!(recovery.phase, PhaseV0::RevalidatePending);
+        assert!(
+            recovery.frozen.is_none(),
+            "restart exactness is frozen=None"
+        );
+        assert_eq!(
+            recovery
+                .journal
+                .state
+                .apply_transaction
+                .as_ref()
+                .unwrap()
+                .generation,
+            recovery.root.generation,
+            "restart must not take the generation-mismatch path"
+        );
+        let fresh_frozen = FrozenInputV0 {
+            state_resource_version: recovery.root.state_resource_version.clone(),
+            final_observation_fence_token: "e".repeat(64),
+            ..fixture.dispatch_frozen
+        };
+        let recovered = reduce(
+            recovery,
+            EventV0::Revalidated {
+                frozen: fresh_frozen,
+                render_input_json: fixture.input,
+                render_output_json: fixture.output,
+                observed: fixture.response_observed,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            recovered.commands.as_slice(),
+            [CommandV0::Persist { operation, .. }]
+                if operation.purpose == PersistPurpose::MutationResult
+        ));
+        assert!(
+            recovered
+                .commands
+                .iter()
+                .all(|command| !matches!(command, CommandV0::Mutate { .. }))
+        );
+        let tx = recovered
+            .state
+            .journal
+            .state
+            .apply_transaction
+            .as_ref()
+            .unwrap();
+        assert_eq!(tx.results.len(), 1);
+        assert!(matches!(
+            tx.next_command_lifecycle,
+            NextCommandLifecycleV0 {
+                state: NextCommandLifecycleStateV0::AllCommandsRecorded,
+                command_id: None,
+            }
+        ));
+        assert!(
+            MachineStateV0::recover_json(&serde_json::to_string(&recovered.state).unwrap()).is_ok()
+        );
+    }
+
+    #[test]
+    fn normal_response_loss_revalidation_persists_a_correlated_complete_result() {
+        let fixture = issued_ssa_response_loss_fixture(false);
+        let mut normal = fixture.issued;
+        normal.phase = PhaseV0::RevalidatePending;
+        let current_state_resource_version = normal.root.state_resource_version.clone();
+        normal
+            .frozen
+            .as_mut()
+            .unwrap()
+            .state_resource_version
+            .clone_from(&current_state_resource_version);
+        let fresh_frozen = FrozenInputV0 {
+            state_resource_version: current_state_resource_version,
+            final_observation_fence_token: "e".repeat(64),
+            ..normal.frozen.clone().unwrap()
+        };
+        let recovered = reduce(
+            normal,
+            EventV0::Revalidated {
+                frozen: fresh_frozen,
+                render_input_json: fixture.input,
+                render_output_json: fixture.output,
+                observed: fixture.response_observed,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            recovered.commands.as_slice(),
+            [CommandV0::Persist { operation, .. }]
+                if operation.purpose == PersistPurpose::MutationResult
+        ));
+        assert!(
+            recovered
+                .commands
+                .iter()
+                .all(|command| !matches!(command, CommandV0::Mutate { .. }))
+        );
+        let tx = recovered
+            .state
+            .journal
+            .state
+            .apply_transaction
+            .as_ref()
+            .unwrap();
+        assert_eq!(tx.results.len(), 1);
+        assert!(matches!(
+            tx.next_command_lifecycle,
+            NextCommandLifecycleV0 {
+                state: NextCommandLifecycleStateV0::AllCommandsRecorded,
+                command_id: None,
+            }
+        ));
+        assert!(
+            MachineStateV0::recover_json(&serde_json::to_string(&recovered.state).unwrap()).is_ok()
+        );
+    }
+
+    #[test]
+    fn response_loss_restart_advances_a_multi_intent_transaction_without_replay() {
+        let fixture = issued_ssa_response_loss_fixture(true);
+        let recovery = restart_to_revalidation(fixture.issued);
+        assert!(recovery.frozen.is_none());
+        let fresh_frozen = FrozenInputV0 {
+            state_resource_version: recovery.root.state_resource_version.clone(),
+            final_observation_fence_token: "e".repeat(64),
+            ..fixture.dispatch_frozen
+        };
+        let recovered = reduce(
+            recovery,
+            EventV0::Revalidated {
+                frozen: fresh_frozen,
+                render_input_json: fixture.input.clone(),
+                render_output_json: fixture.output.clone(),
+                observed: fixture.response_observed.clone(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            recovered.commands.as_slice(),
+            [CommandV0::Persist { operation, .. }]
+                if operation.purpose == PersistPurpose::MutationResult
+        ));
+        assert!(
+            recovered
+                .commands
+                .iter()
+                .all(|command| !matches!(command, CommandV0::Mutate { .. }))
+        );
+        let next_command_id = match &recovered
+            .state
+            .journal
+            .state
+            .apply_transaction
+            .as_ref()
+            .unwrap()
+            .next_command_lifecycle
+        {
+            NextCommandLifecycleV0 {
+                state: NextCommandLifecycleStateV0::PreparedNotIssued,
+                command_id: Some(command_id),
+            } => command_id.clone(),
+            lifecycle => {
+                panic!("recovered first result must advance to the second intent: {lifecycle:?}")
+            }
+        };
+        assert_ne!(next_command_id, fixture.first_command_id);
+        assert!(
+            MachineStateV0::recover_json(&serde_json::to_string(&recovered.state).unwrap()).is_ok()
+        );
+        let result_persist = match &recovered.commands[0] {
+            CommandV0::Persist { operation, .. } => operation.clone(),
+            command => panic!("recovered result must persist: {command:?}"),
+        };
+        let next_revalidation = reduce(
+            recovered.state,
+            EventV0::Persisted {
+                token: result_persist.token,
+                old_state_resource_version: result_persist.old_state_resource_version,
+                new_state_resource_version: "14".into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .unwrap();
+        let next_frozen = FrozenInputV0 {
+            final_observation_fence_token: "d".repeat(64),
+            ..next_revalidation.state.frozen.clone().unwrap()
+        };
+        let authorized = reduce(
+            next_revalidation.state,
+            EventV0::Revalidated {
+                frozen: next_frozen,
+                render_input_json: fixture.input,
+                render_output_json: fixture.output,
+                observed: fixture.response_observed,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            authorized.commands.as_slice(),
+            [CommandV0::Persist { operation, .. }]
+                if operation.purpose == PersistPurpose::DispatchAuthorization
+        ));
+        let issued = acknowledge_dispatch_authorization(authorized, "15");
+        assert!(matches!(
+            issued.commands.as_slice(),
+            [CommandV0::Mutate { commands, .. }]
+                if commands.len() == 1 && commands[0].command_id == next_command_id
+        ));
     }
 
     #[test]
