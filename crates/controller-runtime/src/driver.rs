@@ -6943,7 +6943,8 @@ mod tests {
         assert!(matches!(
             actor.next_command(),
             Ok(Some(CommandV0::Persist { operation, .. }))
-                if operation.purpose == PersistPurpose::AutomationBaseline
+                if operation.purpose
+                    == oxideloop_controller_api::PersistPurpose::AutomationBaseline
         ));
     }
 
