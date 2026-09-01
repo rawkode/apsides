@@ -2949,7 +2949,8 @@ fn revalidate(
         .clone()
         .ok_or_else(|| ReconcileError::Mutation("revalidation has no transaction".into()))?;
     let exact_effect_recovery = tx.generation != state.root.generation || state.frozen.is_none();
-    if tx.next_command_lifecycle.state == NextCommandLifecycleStateV0::LegacyUnknown {
+    let lifecycle = tx.next_command_lifecycle.state;
+    if lifecycle == NextCommandLifecycleStateV0::LegacyUnknown {
         state.phase = PhaseV0::Hold;
         commands.push(CommandV0::Hold {
             reason: "legacy prepared transaction lacks issuance lifecycle; refusing replay".into(),
@@ -2961,11 +2962,7 @@ fn revalidate(
             && intent.expected_uid.is_none()
             && intent.expected_resource_version.is_none()
     });
-    if matches!(
-        tx.next_command_lifecycle.state,
-        NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued
-    ) && next_is_post
-    {
+    if lifecycle == NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued && next_is_post {
         state.phase = PhaseV0::Hold;
         commands.push(CommandV0::Hold {
             reason: "may-have-issued POST cannot be recovered without a trusted admission witness"
@@ -2973,15 +2970,14 @@ fn revalidate(
         });
         return Ok(());
     }
-    if !exact_effect_recovery
-        && (tx.frozen_render_input_hash != frozen.render_input_hash
-            || state
-                .frozen
-                .as_ref()
-                .is_some_and(|previous| !same_revalidation_stable_baseline(previous, &frozen)))
-    {
-        stale(commands, "revalidation frozen hash mismatch");
-        return Ok(());
+    let non_exact_baseline_mismatch = !exact_effect_recovery
+        && (!state
+            .frozen
+            .as_ref()
+            .is_some_and(|previous| same_revalidation_stable_baseline(previous, &frozen))
+            || (tx.results.is_empty() && tx.frozen_render_input_hash != frozen.render_input_hash));
+    if non_exact_baseline_mismatch {
+        return safely_invalidate_transaction(state, commands);
     }
     // Rebuild the complete fresh graph before considering an unpersisted API
     // response. This validates canonical render bytes, root/frozen pins,
@@ -3014,39 +3010,16 @@ fn revalidate(
     };
     let plan = plan_graph(state, &planning_frozen, input, output, planning_observed)?;
     if exact_effect_recovery {
-        if matches!(
-            tx.next_command_lifecycle.state,
-            NextCommandLifecycleStateV0::PreparedNotIssued
-        ) {
-            state.journal.state.apply_transaction = None;
-            state.journal.state.pending_dependencies.clear();
-            state.journal.state.prune_candidate = None;
-            return queue_persist(
-                state,
-                PersistPurpose::Invalidate,
-                DurablePhase::Invalidate,
-                PhaseV0::PersistPending,
-                commands,
-            );
+        if lifecycle == NextCommandLifecycleStateV0::PreparedNotIssued {
+            return safely_invalidate_transaction(state, commands);
         }
-        if matches!(
-            tx.next_command_lifecycle.state,
-            NextCommandLifecycleStateV0::AllCommandsRecorded
-        ) {
-            state.journal.state.apply_transaction = None;
+        if lifecycle == NextCommandLifecycleStateV0::AllCommandsRecorded {
             if plan.hash != tx.desired_graph_hash
                 || !all_recorded_results_match_fresh_observation(state, &tx, &observed)
             {
-                state.journal.state.pending_dependencies.clear();
-                state.journal.state.prune_candidate = None;
-                return queue_persist(
-                    state,
-                    PersistPurpose::Invalidate,
-                    DurablePhase::Invalidate,
-                    PhaseV0::PersistPending,
-                    commands,
-                );
+                return safely_invalidate_transaction(state, commands);
             }
+            state.journal.state.apply_transaction = None;
             state.frozen = Some(frozen);
             state.journal.state.committed_dependencies =
                 std::mem::take(&mut state.journal.state.pending_dependencies);
@@ -3058,8 +3031,28 @@ fn revalidate(
                 commands,
             );
         }
+        if plan.hash != tx.desired_graph_hash {
+            state.phase = PhaseV0::Hold;
+            commands.push(CommandV0::Hold {
+                reason: "may-have-issued mutation graph changed; retaining journal".into(),
+            });
+            return Ok(());
+        }
+        let remaining = match plan.remaining_effects(state, &tx) {
+            Ok(remaining) => remaining,
+            Err(error) => {
+                state.phase = PhaseV0::Hold;
+                commands.push(CommandV0::Hold {
+                    reason: error.to_string(),
+                });
+                return Ok(());
+            }
+        };
         let recovered = recover_prepared_result(state, &tx, &observed)?;
-        if !recovered.is_empty() {
+        if matches!(
+            (remaining.as_slice(), recovered.as_slice()),
+            ([command], [result]) if command.command_id == result.command_id
+        ) {
             state.frozen = Some(frozen);
             record_mutation_results(state, &recovered)?;
             advance_next_command_lifecycle(state)?;
@@ -3071,35 +3064,34 @@ fn revalidate(
                 commands,
             );
         }
-        let desired_flipped_present = next_unrecorded_intent(&tx).is_some_and(|intent| {
-            intent.operation == ApplyOperation::Delete && plan.hash != tx.desired_graph_hash
-        });
-        if desired_flipped_present {
-            state.journal.state.apply_transaction = None;
-            state.journal.state.pending_dependencies.clear();
-            state.journal.state.prune_candidate = None;
-            return queue_persist(
-                state,
-                PersistPurpose::Invalidate,
-                DurablePhase::Invalidate,
-                PhaseV0::PersistPending,
-                commands,
-            );
-        }
         state.phase = PhaseV0::Hold;
         commands.push(CommandV0::Hold {
             reason: "recovered effect cannot be exactly proven; refusing replay".into(),
         });
         return Ok(());
     }
-    if plan.hash != tx.desired_graph_hash || tx.frozen_render_input_hash != frozen.render_input_hash
-    {
+    if plan.hash != tx.desired_graph_hash {
+        if lifecycle == NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued {
+            state.phase = PhaseV0::Hold;
+            commands.push(CommandV0::Hold {
+                reason: "may-have-issued mutation graph changed; retaining journal".into(),
+            });
+            return Ok(());
+        }
+        return safely_invalidate_transaction(state, commands);
+    }
+    if lifecycle == NextCommandLifecycleStateV0::AllCommandsRecorded {
+        if !all_recorded_results_match_fresh_observation(state, &tx, &observed) {
+            return safely_invalidate_transaction(state, commands);
+        }
         state.journal.state.apply_transaction = None;
-        state.journal.state.pending_dependencies.clear();
+        state.frozen = Some(frozen);
+        state.journal.state.committed_dependencies =
+            std::mem::take(&mut state.journal.state.pending_dependencies);
         return queue_persist(
             state,
-            PersistPurpose::Invalidate,
-            DurablePhase::Invalidate,
+            PersistPurpose::Completion,
+            DurablePhase::Completion,
             PhaseV0::PersistPending,
             commands,
         );
@@ -3130,15 +3122,14 @@ fn revalidate(
     let effects = match plan.remaining_effects(state, &tx) {
         Ok(effects) => effects,
         Err(error) => {
-            // A prepared journal is never eligible for the watchable
-            // empty-journal collision path. Invalidation here would discard
-            // an ambiguous or otherwise unsafe remaining effect, so retain
-            // the journal and fail closed instead.
-            state.phase = PhaseV0::Hold;
-            commands.push(CommandV0::Hold {
-                reason: error.to_string(),
-            });
-            return Ok(());
+            if lifecycle == NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued {
+                state.phase = PhaseV0::Hold;
+                commands.push(CommandV0::Hold {
+                    reason: error.to_string(),
+                });
+                return Ok(());
+            }
+            return safely_invalidate_transaction(state, commands);
         }
     };
     let recovered = if matches!(
@@ -3161,21 +3152,64 @@ fn revalidate(
             commands,
         );
     }
+    if lifecycle == NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued {
+        state.phase = PhaseV0::Hold;
+        commands.push(CommandV0::Hold {
+            reason: "may-have-issued mutation lacks an exact recovery proof; retaining journal"
+                .into(),
+        });
+        return Ok(());
+    }
     state.frozen = Some(frozen);
     if effects.is_empty() {
-        state.journal.state.apply_transaction = None;
-        state.journal.state.committed_dependencies =
-            std::mem::take(&mut state.journal.state.pending_dependencies);
-        queue_persist(
-            state,
-            PersistPurpose::Completion,
-            DurablePhase::Completion,
-            PhaseV0::PersistPending,
-            commands,
-        )
-    } else {
-        authorize_dispatch(state, &tx, effects, commands)
+        return safely_invalidate_transaction(state, commands);
     }
+    authorize_dispatch(state, &tx, effects, commands)
+}
+
+/// Clear only an unambiguous prepared/complete transaction before persisting
+/// its invalidation. A legacy or may-have-issued lifecycle is an ambiguous
+/// external-effect boundary and must remain intact under Hold.
+fn safely_invalidate_transaction(
+    state: &mut MachineStateV0,
+    commands: &mut Vec<CommandV0>,
+) -> Result<(), ReconcileError> {
+    let Some(lifecycle) = state
+        .journal
+        .state
+        .apply_transaction
+        .as_ref()
+        .map(|tx| tx.next_command_lifecycle.state)
+    else {
+        state.phase = PhaseV0::Hold;
+        commands.push(CommandV0::Hold {
+            reason: "cannot invalidate a missing transaction".into(),
+        });
+        return Ok(());
+    };
+    if matches!(
+        lifecycle,
+        NextCommandLifecycleStateV0::LegacyUnknown
+            | NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued
+    ) {
+        state.phase = PhaseV0::Hold;
+        commands.push(CommandV0::Hold {
+            reason: "ambiguous mutation lifecycle cannot be invalidated safely".into(),
+        });
+        return Ok(());
+    }
+    state.journal.state.apply_transaction = None;
+    state.journal.state.pending_dependencies.clear();
+    state.journal.state.prune_candidate = None;
+    state.frozen = None;
+    state.runtime.pending_dispatch = None;
+    queue_persist(
+        state,
+        PersistPurpose::Invalidate,
+        DurablePhase::Invalidate,
+        PhaseV0::PersistPending,
+        commands,
+    )
 }
 
 fn mutation_ack(
@@ -6664,6 +6698,30 @@ mod tests {
                 resource_version: resource_version.into(),
             },
         };
+        let tx = revalidate_completion
+            .state
+            .journal
+            .state
+            .apply_transaction
+            .as_ref()
+            .expect("recorded result remains journaled until completion proof")
+            .clone();
+        let result = tx
+            .results
+            .iter()
+            .find(|result| result.identity == command.identity)
+            .expect("fresh inventory has its recorded result");
+        let item = fresh_observed
+            .iter_mut()
+            .find(|item| item.identity == command.identity)
+            .unwrap();
+        item.recovery_proof = Some(RecoveryProofV0 {
+            root_uid: revalidate_completion.state.root.uid.clone(),
+            transaction_id: tx.id,
+            command_id: result.command_id.clone(),
+            uid: uid.into(),
+            resource_version: resource_version.into(),
+        });
         let completion = reduce(
             revalidate_completion.state.clone(),
             EventV0::Revalidated {
@@ -6797,15 +6855,347 @@ mod tests {
                 },
             )
             .unwrap();
-            assert!(
-                matches!(
+            if matches!(
+                field,
+                "root generation" | "state resource version" | "final fence shape"
+            ) {
+                assert!(matches!(
                     rejected.commands.as_slice(),
                     [CommandV0::IgnoredStale { .. }]
-                ),
-                "revalidation must reject {field} drift: {:?}",
-                rejected.commands
-            );
+                ));
+            } else {
+                assert!(
+                    matches!(
+                        rejected.commands.as_slice(),
+                        [CommandV0::Persist {
+                            operation: PersistOperation {
+                                purpose: PersistPurpose::Invalidate,
+                                ..
+                            },
+                            ..
+                        }]
+                    ),
+                    "revalidation must invalidate {field} drift: {:?}",
+                    rejected.commands
+                );
+            }
         }
+    }
+
+    #[test]
+    fn prepared_revalidation_with_fresh_input_hash_invalidates_without_replaying() {
+        let machine = boot_to_render(state());
+        let dependency = Dependency::Collection {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: "demo".into(),
+            selector: "app=retained".into(),
+            collection_revision: "collection-rv".into(),
+            observation_token: "dependency-token".into(),
+        };
+        let (frozen, input, output, observed) = rendered(&machine.root, vec![dependency]);
+        let prepared = reduce(
+            machine,
+            EventV0::Rendered {
+                frozen,
+                render_input_json: input.clone(),
+                render_output_json: output.clone(),
+                observed,
+            },
+        )
+        .unwrap();
+        let operation = match &prepared.commands[0] {
+            CommandV0::Persist { operation, .. } => operation.clone(),
+            command => panic!("render must persist Prepare: {command:?}"),
+        };
+        let revalidate = reduce(
+            prepared.state,
+            EventV0::Persisted {
+                token: operation.token,
+                old_state_resource_version: operation.old_state_resource_version,
+                new_state_resource_version: "12".into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .unwrap();
+        let original_hash = revalidate
+            .state
+            .journal
+            .state
+            .apply_transaction
+            .as_ref()
+            .unwrap()
+            .frozen_render_input_hash
+            .clone();
+        let mut changed_input: RenderInputV0 = serde_json::from_str(&input).unwrap();
+        changed_input
+            .observations
+            .push(oxideloop_renderer_abi::model::Observation {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "demo".into(),
+                name: "dependency".into(),
+                uid: "dependency-uid".into(),
+                resource_version: "2".into(),
+                value: serde_json::json!({"data":{"value":"fresh"}}),
+            });
+        let changed_input = serde_json::to_string(&changed_input).unwrap();
+        let changed_hash = parse_validate_render_input(&changed_input).unwrap().sha256;
+        assert_ne!(original_hash, changed_hash);
+        let mut revalidate_state = revalidate.state;
+        let retained_committed = revalidate_state.journal.state.pending_dependencies.clone();
+        assert!(!retained_committed.is_empty());
+        revalidate_state.journal.state.committed_dependencies = retained_committed.clone();
+        let retained_inventory = InventoryEntry {
+            identity: ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "demo".into(),
+                name: "retained".into(),
+            },
+            logical_id: "retained".into(),
+            uid: "retained-uid".into(),
+            resource_version: "retained-rv".into(),
+            bundle_digest: revalidate_state.root.bundle_digest.clone(),
+        };
+        revalidate_state
+            .journal
+            .state
+            .inventory
+            .push(retained_inventory.clone());
+        revalidate_state.journal.state.prune_candidate = Some(PruneCandidate {
+            complete_key: prune_key(&revalidate_state, &retained_inventory),
+            inventory: retained_inventory.clone(),
+            first_observation: PruneObservation {
+                observed_resource_version: "retained-rv".into(),
+                observed_generation: revalidate_state.root.generation,
+                barrier_token: "first-prune-fence".into(),
+            },
+            second_observation: None,
+        });
+        revalidate_state
+            .journal
+            .state
+            .automation
+            .baselines
+            .push(AutomationBaseline {
+                automation_id: "retained-automation".into(),
+                source: retained_inventory.identity.clone(),
+                token: "retained-automation-token".into(),
+            });
+        let retained_automation = revalidate_state.journal.state.automation.clone();
+        let invalidated = reduce(
+            revalidate_state.clone(),
+            EventV0::Revalidated {
+                frozen: FrozenInputV0 {
+                    render_input_hash: changed_hash,
+                    final_observation_fence_token: "e".repeat(64),
+                    ..revalidate_state.frozen.clone().unwrap()
+                },
+                render_input_json: changed_input,
+                render_output_json: output,
+                observed: vec![DesiredObservationV0 {
+                    identity: ObjectIdentity {
+                        api_version: "v1".into(),
+                        kind: "ConfigMap".into(),
+                        namespace: "demo".into(),
+                        name: "object".into(),
+                    },
+                    observation: Observation::Absent,
+                    qualification: BackendQualification::BuiltInTested {
+                        kubernetes_minor: "1.36".into(),
+                        gvr: "configmaps".into(),
+                    },
+                    recovery_proof: None,
+                    deletion_recovery_proof: None,
+                }],
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            invalidated.commands.as_slice(),
+            [CommandV0::Persist {
+                operation: PersistOperation {
+                    purpose: PersistPurpose::Invalidate,
+                    ..
+                },
+                ..
+            }]
+        ));
+        assert!(invalidated.state.journal.state.apply_transaction.is_none());
+        assert!(
+            invalidated
+                .state
+                .journal
+                .state
+                .pending_dependencies
+                .is_empty()
+        );
+        assert!(invalidated.state.journal.state.prune_candidate.is_none());
+        assert!(invalidated.state.frozen.is_none());
+        assert_eq!(
+            invalidated.state.journal.state.inventory,
+            vec![retained_inventory]
+        );
+        assert_eq!(
+            invalidated.state.journal.state.committed_dependencies,
+            retained_committed
+        );
+        assert_eq!(
+            invalidated.state.journal.state.automation,
+            retained_automation
+        );
+        assert_eq!(invalidated.state.root.uid, "root-uid");
+        let operation = match &invalidated.commands[0] {
+            CommandV0::Persist { operation, .. } => operation.clone(),
+            command => panic!("safe invalidation must persist: {command:?}"),
+        };
+        let descriptor = reduce(
+            invalidated.state,
+            EventV0::Persisted {
+                token: operation.token,
+                old_state_resource_version: operation.old_state_resource_version,
+                new_state_resource_version: "13".into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(descriptor.state.phase, PhaseV0::DescriptorPending);
+        assert!(matches!(
+            descriptor.commands.as_slice(),
+            [CommandV0::RequestDescriptor { .. }]
+        ));
+        assert_eq!(
+            descriptor.state.journal.state.committed_dependencies,
+            retained_committed
+        );
+        assert_eq!(
+            descriptor.state.journal.state.automation,
+            retained_automation
+        );
+    }
+
+    #[test]
+    fn normal_may_have_issued_revalidation_holds_and_retains_journal_on_graph_change() {
+        let fixture = issued_ssa_response_loss_fixture(false);
+        let mut before = fixture.issued.clone();
+        before.phase = PhaseV0::RevalidatePending;
+        let current_state_resource_version = before.root.state_resource_version.clone();
+        before
+            .frozen
+            .as_mut()
+            .unwrap()
+            .state_resource_version
+            .clone_from(&current_state_resource_version);
+        let mut changed_output: RenderOutputV0 = serde_json::from_str(&fixture.output).unwrap();
+        changed_output.resources[0].logical_id = "replacement".into();
+        let fresh_frozen = FrozenInputV0 {
+            final_observation_fence_token: "e".repeat(64),
+            ..before.frozen.clone().unwrap()
+        };
+        let held = reduce(
+            before.clone(),
+            EventV0::Revalidated {
+                frozen: fresh_frozen,
+                render_input_json: fixture.input,
+                render_output_json: serde_json::to_string(&changed_output).unwrap(),
+                observed: fixture.response_observed,
+            },
+        )
+        .unwrap();
+        assert_eq!(held.state.phase, PhaseV0::Hold);
+        assert_eq!(
+            held.state.journal.state.apply_transaction,
+            before.journal.state.apply_transaction
+        );
+        assert!(matches!(held.commands.as_slice(), [CommandV0::Hold { .. }]));
+    }
+
+    #[test]
+    fn normal_may_have_issued_without_recovery_proof_holds_and_retains_journal() {
+        let fixture = issued_ssa_response_loss_fixture(false);
+        let mut before = fixture.issued.clone();
+        before.phase = PhaseV0::RevalidatePending;
+        let current_state_resource_version = before.root.state_resource_version.clone();
+        before
+            .frozen
+            .as_mut()
+            .unwrap()
+            .state_resource_version
+            .clone_from(&current_state_resource_version);
+        let transaction = before
+            .journal
+            .state
+            .apply_transaction
+            .as_ref()
+            .unwrap()
+            .clone();
+        let next = next_unrecorded_intent(&transaction).unwrap();
+        let mut observed = fixture.response_observed;
+        let target = observed
+            .iter_mut()
+            .find(|item| item.identity == next.identity)
+            .unwrap();
+        target.observation = Observation::Existing {
+            identity: MutationIdentity {
+                uid: next.expected_uid.clone().unwrap(),
+                resource_version: next.expected_resource_version.clone().unwrap(),
+            },
+        };
+        target.recovery_proof = None;
+        let held = reduce(
+            before.clone(),
+            EventV0::Revalidated {
+                frozen: FrozenInputV0 {
+                    final_observation_fence_token: "e".repeat(64),
+                    ..before.frozen.clone().unwrap()
+                },
+                render_input_json: fixture.input,
+                render_output_json: fixture.output,
+                observed,
+            },
+        )
+        .unwrap();
+        assert_eq!(held.state.phase, PhaseV0::Hold);
+        assert_eq!(
+            held.state.journal.state.apply_transaction,
+            Some(transaction)
+        );
+        assert!(matches!(held.commands.as_slice(), [CommandV0::Hold { .. }]));
+        assert!(held.commands.iter().all(|command| !matches!(
+            command,
+            CommandV0::Persist { .. } | CommandV0::Mutate { .. }
+        )));
+    }
+
+    #[test]
+    fn exact_response_loss_recovery_holds_and_retains_journal_on_graph_change() {
+        let fixture = issued_ssa_response_loss_fixture(false);
+        let recovery = restart_to_revalidation(fixture.issued);
+        assert!(recovery.frozen.is_none());
+        let retained_transaction = recovery.journal.state.apply_transaction.clone();
+        let mut changed_output: RenderOutputV0 = serde_json::from_str(&fixture.output).unwrap();
+        changed_output.resources[0].logical_id = "replacement".into();
+        let held = reduce(
+            recovery.clone(),
+            EventV0::Revalidated {
+                frozen: FrozenInputV0 {
+                    state_resource_version: recovery.root.state_resource_version.clone(),
+                    final_observation_fence_token: "e".repeat(64),
+                    ..fixture.dispatch_frozen
+                },
+                render_input_json: fixture.input,
+                render_output_json: serde_json::to_string(&changed_output).unwrap(),
+                observed: fixture.response_observed,
+            },
+        )
+        .unwrap();
+        assert_eq!(held.state.phase, PhaseV0::Hold);
+        assert_eq!(
+            held.state.journal.state.apply_transaction,
+            retained_transaction
+        );
+        assert!(matches!(held.commands.as_slice(), [CommandV0::Hold { .. }]));
     }
 
     fn acknowledge_dispatch_authorization(
@@ -9073,9 +9463,19 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(held.state.phase, PhaseV0::Hold);
-        assert_eq!(held.state.journal, before.journal);
-        assert!(matches!(held.commands.as_slice(), [CommandV0::Hold { .. }]));
+        assert_eq!(held.state.phase, PhaseV0::PersistPending);
+        assert!(held.state.journal.state.apply_transaction.is_none());
+        assert!(held.state.journal.state.pending_dependencies.is_empty());
+        assert!(matches!(
+            held.commands.as_slice(),
+            [CommandV0::Persist {
+                operation: PersistOperation {
+                    purpose: PersistPurpose::Invalidate,
+                    ..
+                },
+                ..
+            }]
+        ));
     }
 
     #[test]
@@ -9453,16 +9853,31 @@ mod tests {
         let fixture = issued_ssa_response_loss_fixture(true);
         let recovery = restart_to_revalidation(fixture.issued);
         assert!(recovery.frozen.is_none());
+        let original_audit_hash = recovery
+            .journal
+            .state
+            .apply_transaction
+            .as_ref()
+            .unwrap()
+            .frozen_render_input_hash
+            .clone();
+        let mut fresh_input: RenderInputV0 = serde_json::from_str(&fixture.input).unwrap();
+        fresh_input.cache_epoch = "recovery-epoch".into();
+        let fresh_input = serde_json::to_string(&fresh_input).unwrap();
+        let fresh_input_hash = parse_validate_render_input(&fresh_input).unwrap().sha256;
+        assert_ne!(original_audit_hash, fresh_input_hash);
         let fresh_frozen = FrozenInputV0 {
             state_resource_version: recovery.root.state_resource_version.clone(),
+            cache_epoch: "recovery-epoch".into(),
             final_observation_fence_token: "e".repeat(64),
+            render_input_hash: fresh_input_hash.clone(),
             ..fixture.dispatch_frozen
         };
         let recovered = reduce(
             recovery,
             EventV0::Revalidated {
                 frozen: fresh_frozen,
-                render_input_json: fixture.input.clone(),
+                render_input_json: fresh_input.clone(),
                 render_output_json: fixture.output.clone(),
                 observed: fixture.response_observed.clone(),
             },
@@ -9497,6 +9912,21 @@ mod tests {
             }
         };
         assert_ne!(next_command_id, fixture.first_command_id);
+        assert_eq!(
+            recovered
+                .state
+                .journal
+                .state
+                .apply_transaction
+                .as_ref()
+                .unwrap()
+                .frozen_render_input_hash,
+            original_audit_hash
+        );
+        assert_eq!(
+            recovered.state.frozen.as_ref().unwrap().render_input_hash,
+            fresh_input_hash
+        );
         assert!(
             MachineStateV0::recover_json(&serde_json::to_string(&recovered.state).unwrap()).is_ok()
         );
@@ -9522,7 +9952,7 @@ mod tests {
             next_revalidation.state,
             EventV0::Revalidated {
                 frozen: next_frozen,
-                render_input_json: fixture.input,
+                render_input_json: fresh_input,
                 render_output_json: fixture.output,
                 observed: fixture.response_observed,
             },
@@ -9852,6 +10282,26 @@ mod tests {
                 resource_version: "30".into(),
             },
         };
+        let first_tx = after_first
+            .state
+            .journal
+            .state
+            .apply_transaction
+            .as_ref()
+            .unwrap()
+            .clone();
+        let first_result = first_tx.results.first().unwrap();
+        after_first_observed
+            .iter_mut()
+            .find(|item| item.identity == command.identity)
+            .unwrap()
+            .recovery_proof = Some(RecoveryProofV0 {
+            root_uid: after_first.state.root.uid.clone(),
+            transaction_id: first_tx.id,
+            command_id: first_result.command_id.clone(),
+            uid: "uid-one".into(),
+            resource_version: "30".into(),
+        });
         let mut changed_output: RenderOutputV0 = serde_json::from_str(&output_json).unwrap();
         changed_output
             .resources
@@ -9943,6 +10393,26 @@ mod tests {
                 resource_version: "31".into(),
             },
         };
+        let second_tx = after_second
+            .state
+            .journal
+            .state
+            .apply_transaction
+            .as_ref()
+            .unwrap()
+            .clone();
+        let second_result = second_tx.results.last().unwrap();
+        after_first_observed
+            .iter_mut()
+            .find(|item| item.identity == second_command.identity)
+            .unwrap()
+            .recovery_proof = Some(RecoveryProofV0 {
+            root_uid: after_second.state.root.uid.clone(),
+            transaction_id: second_tx.id,
+            command_id: second_result.command_id.clone(),
+            uid: "uid-two".into(),
+            resource_version: "31".into(),
+        });
         let completion = reduce(
             after_second.state.clone(),
             EventV0::Revalidated {

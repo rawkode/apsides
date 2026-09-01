@@ -7175,12 +7175,95 @@ mod tests {
             .acknowledge(persisted_event(&mutation_result, "state-rv-after-result"))
             .expect("mutation result acknowledgement is exactly correlated");
         assert!(actor.take_observability_records_for_test().is_empty());
-        let _ = actor.next_command().expect("mutation result reduces");
+        let CommandV0::RequestRender { preconditions } = actor
+            .next_command()
+            .expect("mutation result reduces")
+            .expect("mutation result persistence requires a fresh revalidation")
+        else {
+            panic!("mutation result persistence did not request revalidation");
+        };
         let result_records = actor.take_observability_records_for_test();
         assert!(result_records.iter().any(|record| {
             record["event"] == "mutation_result_persist_acknowledged"
                 && record["command_detail"]["persist_purpose"] == "mutation_result"
         }));
+
+        // A fresh sealed render which no longer matches the rolling frozen
+        // input is an effect-free durable invalidation, not IgnoredStale. The
+        // latter would strand RevalidatePending and make the driver report
+        // illegal quiescence, which is the production restart regression.
+        let mut changed_input = trusted_render_input(&actor, &preconditions.observation_token);
+        changed_input
+            .observations
+            .push(oxideloop_renderer_abi::model::Observation {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                name: "changed-input".into(),
+                uid: "changed-input-uid".into(),
+                resource_version: "changed-input-rv".into(),
+                value: serde_json::json!({"data":{"value":"changed"}}),
+            });
+        actor
+            .issue_render_capability(changed_input.clone(), 1)
+            .expect("post-result revalidation has a concrete capability");
+        let changed_input_json =
+            serde_json::to_string(&changed_input).expect("changed input serializes");
+        let changed_frozen = FrozenInputV0 {
+            root_generation: preconditions.root_generation,
+            state_resource_version: preconditions.state_resource_version.clone(),
+            observation_token: preconditions.observation_token.clone(),
+            cache_epoch: preconditions.cache_epoch.clone(),
+            final_observation_fence_token: "e".repeat(64),
+            render_input_hash: parse_validate_render_input(&changed_input_json)
+                .expect("changed input validates")
+                .sha256,
+        };
+        let changed_output = serde_json::to_string(&RenderOutputV0 {
+            abi_version: ABI_VERSION_V0.into(),
+            disposition: RenderDisposition::Apply,
+            resources: vec![ResourceDeclaration {
+                logical_id: "managed-new".into(),
+                object: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "managed-new", "namespace": "ns"},
+                    "data": {"value": "new"}
+                }),
+                readiness: None,
+            }],
+            dependencies: vec![],
+            automations: vec![],
+            diagnostics: vec![],
+        })
+        .expect("post-result output serializes");
+        actor
+            .accept_acknowledgement(EventV0::Revalidated {
+                frozen: changed_frozen,
+                render_input_json: changed_input_json,
+                render_output_json: changed_output,
+                observed: vec![],
+            })
+            .expect("sealed post-result revalidation queues");
+        let invalidation = actor
+            .next_command()
+            .expect("post-result revalidation reduces")
+            .expect("baseline mismatch persists invalidation");
+        assert!(matches!(
+            invalidation,
+            CommandV0::Persist { ref operation, .. }
+                if operation.purpose == PersistPurpose::Invalidate
+        ));
+        actor
+            .acknowledge(persisted_event(
+                &invalidation,
+                "state-rv-after-invalidation",
+            ))
+            .expect("invalidation acknowledgement is exactly correlated");
+        assert!(matches!(
+            actor.next_command(),
+            Ok(Some(CommandV0::RequestDescriptor { .. }))
+        ));
     }
 
     #[test]
