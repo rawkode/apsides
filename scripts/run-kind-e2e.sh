@@ -111,7 +111,7 @@ capture_collision_regression_boundary() {
       set -e
       printf "%s\n" "$output"
       [ "$result" -eq 0 ] || return 1
-      test_count=$(printf "%s\n" "$output" | grep -c '^running 1 test$' || true)
+      test_count=$(printf "%s\n" "$output" | grep -c "^running 1 test$" || true)
       [ "$test_count" -eq 1 ] || {
         printf "%s\n" "targeted test did not execute exactly one test: $package $test_name" >&2
         return 1

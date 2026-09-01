@@ -627,6 +627,7 @@ for token in \
   'prepared-foreign-after-final-root-deletion.json' \
   'collision-regression-tests.txt' \
   'raw stale tombstone injection is not deterministic in kind' \
+  'grep -c "^running 1 test$"' \
   'reducer::tests::blocked_foreign_collision_root_deletion_preempts_through_normal_deletion_boundary' \
   'driver::tests::driver_root_deletion_preempts_blocked_collision_and_jsonl_is_correlated_and_deduped' \
   'adapters::tests::stale_or_unpinned_delete_never_erases_a_replacement' \
