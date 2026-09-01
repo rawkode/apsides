@@ -3620,22 +3620,147 @@ fn owned_children_verified(
 }
 
 fn state_finalizer_token(state: &MachineStateV0) -> String {
-    hash(&[
-        "state-finalizer/v0",
+    let receipt = state
+        .root
+        .status
+        .deletion_cleanup_receipt
+        .as_ref()
+        .expect("linked State finalizer requires a durable cleanup receipt");
+    linked_state_finalizer_command_token(
         &state.root.uid,
+        state.root.generation,
+        &state.root.root_resource_version,
+        &state.root.state_name,
         &state.root.state_uid,
         &state.root.state_resource_version,
-        &state.root.root_resource_version,
-    ])
+        &receipt.deletion_id,
+        receipt.deletion_start_generation,
+        &receipt.cleanup_token,
+    )
 }
 
 fn root_finalizer_token(state: &MachineStateV0) -> String {
-    root_finalizer_command_token(
+    if state.root_only_deletion_recovery {
+        let receipt = state
+            .root
+            .status
+            .deletion_cleanup_receipt
+            .as_ref()
+            .expect("root-only finalizer requires a durable cleanup receipt");
+        return root_only_finalizer_command_token(
+            &state.root.uid,
+            state.root.generation,
+            &state.root.root_resource_version,
+            &state.root.state_name,
+            &state.root.state_uid,
+            &receipt.deletion_id,
+            receipt.deletion_start_generation,
+            &receipt.cleanup_token,
+        );
+    }
+    let receipt = state
+        .root
+        .status
+        .deletion_cleanup_receipt
+        .as_ref()
+        .expect("linked root finalizer requires a durable cleanup receipt");
+    linked_root_finalizer_command_token(
         &state.root.uid,
+        state.root.generation,
         &state.root.root_resource_version,
+        &state.root.state_name,
         &state.root.state_uid,
         &state.root.state_resource_version,
+        &receipt.deletion_id,
+        receipt.deletion_start_generation,
+        &receipt.cleanup_token,
     )
+}
+
+/// Deterministic token for the root-only finalizer command after the linked
+/// State has been proven absent. The explicit empty-State-RV marker is part of
+/// this recovery-only domain; no unavailable prior State RV is inferred.
+#[must_use]
+pub fn root_only_finalizer_command_token(
+    root_uid: &str,
+    root_generation: i64,
+    root_resource_version: &str,
+    state_name: &str,
+    state_uid: &str,
+    deletion_id: &str,
+    deletion_start_generation: i64,
+    cleanup_token: &str,
+) -> String {
+    hash(&[
+        "root-only-finalizer/v1",
+        "state-rv-empty",
+        root_uid,
+        &root_generation.to_string(),
+        root_resource_version,
+        state_name,
+        state_uid,
+        deletion_id,
+        &deletion_start_generation.to_string(),
+        cleanup_token,
+    ])
+}
+
+/// Deterministic token for the linked State-finalizer removal command.
+///
+/// The receipt is deliberately part of this capability: a durable child
+/// deletion record alone cannot authorize an irreversible finalizer write.
+#[must_use]
+pub fn linked_state_finalizer_command_token(
+    root_uid: &str,
+    root_generation: i64,
+    root_resource_version: &str,
+    state_name: &str,
+    state_uid: &str,
+    state_resource_version: &str,
+    deletion_id: &str,
+    deletion_start_generation: i64,
+    cleanup_token: &str,
+) -> String {
+    hash(&[
+        "linked-state-finalizer/v1",
+        root_uid,
+        &root_generation.to_string(),
+        root_resource_version,
+        state_name,
+        state_uid,
+        state_resource_version,
+        deletion_id,
+        &deletion_start_generation.to_string(),
+        cleanup_token,
+    ])
+}
+
+/// Deterministic token for the linked root-finalizer removal command after
+/// the exact original State has been proven absent.
+#[must_use]
+pub fn linked_root_finalizer_command_token(
+    root_uid: &str,
+    root_generation: i64,
+    root_resource_version: &str,
+    state_name: &str,
+    state_uid: &str,
+    prior_state_resource_version: &str,
+    deletion_id: &str,
+    deletion_start_generation: i64,
+    cleanup_token: &str,
+) -> String {
+    hash(&[
+        "linked-root-finalizer/v1",
+        root_uid,
+        &root_generation.to_string(),
+        root_resource_version,
+        state_name,
+        state_uid,
+        prior_state_resource_version,
+        deletion_id,
+        &deletion_start_generation.to_string(),
+        cleanup_token,
+    ])
 }
 
 /// Deterministic token for the exact root-finalizer removal command. Adapters

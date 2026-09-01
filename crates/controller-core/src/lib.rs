@@ -14,6 +14,7 @@ pub use reducer::{
     MutationCommandV0, PendingAutomationV0, PendingRootStatusV0, PhaseV0, PreconditionsV0,
     ReconcileError, RecoveryProofV0, RootSnapshotV0, RootStatusContinuationPayloadV0,
     RootStatusContinuationV0, RuntimeStateV0, TransitionV0, automation_source_transition_token,
-    reduce, root_finalizer_command_token, root_only_owned_children_verify_token,
-    validate_deleting_root_receipt,
+    linked_root_finalizer_command_token, linked_state_finalizer_command_token, reduce,
+    root_finalizer_command_token, root_only_finalizer_command_token,
+    root_only_owned_children_verify_token, validate_deleting_root_receipt,
 };

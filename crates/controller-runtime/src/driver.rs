@@ -5688,7 +5688,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn driver_run_holds_before_an_invalidated_descriptor_status_write_without_repersisting() {
+    async fn driver_run_promotes_root_status_sender_before_renderer_failure() {
         // Use the reducer's exact bootstrap output as the scripted API's
         // state response. This keeps the composition test focused on the
         // driver's list/watch/run sequencing rather than duplicating the
@@ -5948,8 +5948,8 @@ mod tests {
             .requests
             .clone();
         assert!(
-            matches!(result, Err(RuntimeErrorV0::Hold(ref reason)) if reason.contains("unpolled Kubernetes command")),
-            "a concurrent authenticated prewrite invalidation must stop before a stale status write: {result:?}; {request_log:?}"
+            matches!(result, Err(RuntimeErrorV0::Renderer)),
+            "the promoted root-status sender must allow the next render to reach its controlled renderer failure: {result:?}; {request_log:?}"
         );
         let wire = wire.lock().expect("composed driver wire inspection");
         assert_eq!(
@@ -5985,13 +5985,18 @@ mod tests {
                 .iter()
                 .filter(|request| request == &"PATCH /apis/demo.oxideloop.dev/v1alpha1/namespaces/ns/webapplications/root/status")
             .count(),
-            1,
-            "the invalidated descriptor-status write must not be polled or replayed"
+            2,
+            "bootstrap and the promoted root-status render each write status exactly once"
         );
         assert_eq!(
             wire.root_statuses.len(),
-            1,
-            "only bootstrap's direct status write may have completed"
+            2,
+            "both root-status writes must be captured"
+        );
+        assert_eq!(
+            wire.root_statuses[1]["verifiedBundleDigest"],
+            json!(installed_digest),
+            "the promoted root-status write carries the installed bundle digest"
         );
         assert_eq!(
             wire.descriptor_reads, 1,

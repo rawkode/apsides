@@ -24,7 +24,7 @@ use oxideloop_controller_api::{
     StateLink, WebApplicationStatus, automation_run_name, bootstrap_id,
 };
 use oxideloop_controller_core::{
-    CommandV0, MutationCommandV0, PreconditionsV0, root_finalizer_command_token,
+    CommandV0, MutationCommandV0, PreconditionsV0, root_only_finalizer_command_token,
     root_only_owned_children_verify_token,
 };
 use oxideloop_event_planner::{
@@ -430,6 +430,25 @@ fn root_only_json(
             }
         }
     })
+}
+
+fn root_only_finalizer_token(
+    root_rv: &str,
+    root_generation: i64,
+    state_name: &str,
+    state_uid: &str,
+    cleanup_token: &str,
+) -> String {
+    root_only_finalizer_command_token(
+        "root-uid",
+        root_generation,
+        root_rv,
+        state_name,
+        state_uid,
+        &"d".repeat(64),
+        root_generation,
+        cleanup_token,
+    )
 }
 
 fn desired(kind: ResourceKindV0, name: &str, rv: &str) -> ObjectV0 {
@@ -2774,8 +2793,8 @@ async fn root_only_verify_uses_receipt_state_identity_and_empty_state_rv() {
 #[tokio::test]
 async fn root_only_remove_rechecks_children_before_exact_finalizer_patch() {
     let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
-    let token = root_finalizer_command_token("root-uid", "9", "state-uid", "");
     let receipt_cleanup_token = "d".repeat(64);
+    let token = root_only_finalizer_token("9", 3, &state_name, "state-uid", &receipt_cleanup_token);
     let state_path = format!(
         "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/{state_name}"
     );
@@ -2786,6 +2805,12 @@ async fn root_only_remove_rechecks_children_before_exact_finalizer_patch() {
         {"op":"test","path":"/metadata/finalizers/0","value":ROOT_FINALIZER},
         {"op":"remove","path":"/metadata/finalizers/0"}
     ]);
+    let mut written_root = root.clone();
+    written_root["metadata"]["resourceVersion"] = json!("10");
+    written_root["metadata"]
+        .as_object_mut()
+        .expect("root metadata")
+        .remove("finalizers");
     let (transport, api) = ScriptedApi::transport([
         Expected {
             method: Method::GET,
@@ -2830,12 +2855,7 @@ async fn root_only_remove_rechecks_children_before_exact_finalizer_patch() {
             path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a?",
             content_type: Some("application/json-patch+json"),
             body: Some(patch),
-            response: response(object_json(
-                ResourceKindV0::WebApplication,
-                "app-a",
-                "root-uid",
-                "10",
-            )),
+            response: response(written_root),
         },
     ]);
     let outcome = transport
@@ -2916,11 +2936,12 @@ async fn root_only_current_command_tokens_are_checked_independently_of_the_recei
 #[tokio::test]
 async fn root_only_remove_holds_for_state_or_child_reappearance_without_patch() {
     let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
-    let token = root_finalizer_command_token("root-uid", "9", "state-uid", "");
+    let receipt_cleanup_token = "d".repeat(64);
+    let token = root_only_finalizer_token("9", 3, &state_name, "state-uid", &receipt_cleanup_token);
     let state_path = format!(
         "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/{state_name}"
     );
-    let root = root_only_json("9", 3, &state_name, "state-uid", &token);
+    let root = root_only_json("9", 3, &state_name, "state-uid", &receipt_cleanup_token);
     let absent = || {
         status(
             StatusCode::NOT_FOUND,
@@ -3017,29 +3038,36 @@ async fn root_only_remove_holds_for_state_or_child_reappearance_without_patch() 
 #[tokio::test]
 async fn root_only_validation_failures_never_issue_state_or_patch_requests() {
     let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
-    let token = root_finalizer_command_token("root-uid", "9", "state-uid", "");
-    let stale_rv = root_only_json("10", 3, &state_name, "state-uid", &token);
-    let mut not_deleting = root_only_json("9", 3, &state_name, "state-uid", &token);
+    let receipt_cleanup_token = "d".repeat(64);
+    let token = root_only_finalizer_token("9", 3, &state_name, "state-uid", &receipt_cleanup_token);
+    let stale_rv = root_only_json("10", 3, &state_name, "state-uid", &receipt_cleanup_token);
+    let mut not_deleting = root_only_json("9", 3, &state_name, "state-uid", &receipt_cleanup_token);
     not_deleting["metadata"]
         .as_object_mut()
         .expect("metadata")
         .remove("deletionTimestamp");
-    let mut no_receipt = root_only_json("9", 3, &state_name, "state-uid", &token);
+    let mut no_receipt = root_only_json("9", 3, &state_name, "state-uid", &receipt_cleanup_token);
     no_receipt["status"]
         .as_object_mut()
         .expect("status")
         .remove("deletionCleanupReceipt");
-    let mut receipt_root_mismatch = root_only_json("9", 3, &state_name, "state-uid", &token);
+    let mut receipt_root_mismatch =
+        root_only_json("9", 3, &state_name, "state-uid", &receipt_cleanup_token);
     receipt_root_mismatch["status"]["deletionCleanupReceipt"]["rootUid"] = json!("other-root");
-    let wrong_state_name = root_only_json("9", 3, "wrong-state", "state-uid", &token);
-    let wrong_state_uid = root_only_json("9", 3, &state_name, "other-state", &token);
-    let mut no_finalizer = root_only_json("9", 3, &state_name, "state-uid", &token);
+    let wrong_state_name =
+        root_only_json("9", 3, "wrong-state", "state-uid", &receipt_cleanup_token);
+    let wrong_state_uid =
+        root_only_json("9", 3, &state_name, "other-state", &receipt_cleanup_token);
+    let mut no_finalizer = root_only_json("9", 3, &state_name, "state-uid", &receipt_cleanup_token);
     no_finalizer["metadata"]["finalizers"] = json!([]);
-    let mut wrong_root_kind = root_only_json("9", 3, &state_name, "state-uid", &token);
+    let mut wrong_root_kind =
+        root_only_json("9", 3, &state_name, "state-uid", &receipt_cleanup_token);
     wrong_root_kind["kind"] = json!("Service");
-    let mut wrong_root_name = root_only_json("9", 3, &state_name, "state-uid", &token);
+    let mut wrong_root_name =
+        root_only_json("9", 3, &state_name, "state-uid", &receipt_cleanup_token);
     wrong_root_name["metadata"]["name"] = json!("other");
-    let mut wrong_root_namespace = root_only_json("9", 3, &state_name, "state-uid", &token);
+    let mut wrong_root_namespace =
+        root_only_json("9", 3, &state_name, "state-uid", &receipt_cleanup_token);
     wrong_root_namespace["metadata"]["namespace"] = json!("tenant-b");
     let cases = [
         stale_rv,

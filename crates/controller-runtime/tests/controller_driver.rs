@@ -531,6 +531,11 @@ async fn driver_deletion_barrier_crashes_after_exact_state_finalizer_effect_and_
     let state_finalizer_removed = Arc::new(AtomicBool::new(false));
     let state_resource_version = Arc::new(AtomicU64::new(1));
     let state_rereads_after_finalizer = Arc::new(AtomicU64::new(0));
+    let persisted_state = Arc::new(Mutex::new(deleting_linked_state(
+        &state_name,
+        "state-rv-1",
+        true,
+    )));
     let root_status_persisted = Arc::new(AtomicBool::new(false));
     let cleanup_token = Arc::new(Mutex::new(ROOT_ONLY_DIGEST.to_owned()));
     let finalizer_effects = Arc::new(Mutex::new(Vec::<&'static str>::new()));
@@ -538,6 +543,7 @@ async fn driver_deletion_barrier_crashes_after_exact_state_finalizer_effect_and_
     let service_state_finalizer_removed = Arc::clone(&state_finalizer_removed);
     let service_state_resource_version = Arc::clone(&state_resource_version);
     let service_state_rereads_after_finalizer = Arc::clone(&state_rereads_after_finalizer);
+    let service_persisted_state = Arc::clone(&persisted_state);
     let service_root_status_persisted = Arc::clone(&root_status_persisted);
     let service_cleanup_token = Arc::clone(&cleanup_token);
     let service_finalizer_effects = Arc::clone(&finalizer_effects);
@@ -547,6 +553,7 @@ async fn driver_deletion_barrier_crashes_after_exact_state_finalizer_effect_and_
         let state_finalizer_removed = Arc::clone(&service_state_finalizer_removed);
         let state_resource_version = Arc::clone(&service_state_resource_version);
         let state_rereads_after_finalizer = Arc::clone(&service_state_rereads_after_finalizer);
+        let persisted_state = Arc::clone(&service_persisted_state);
         let root_status_persisted = Arc::clone(&service_root_status_persisted);
         let cleanup_token = Arc::clone(&service_cleanup_token);
         let finalizer_effects = Arc::clone(&service_finalizer_effects);
@@ -582,11 +589,7 @@ async fn driver_deletion_barrier_crashes_after_exact_state_finalizer_effect_and_
                 if !state_finalizer_removed.load(Ordering::SeqCst)
                     || state_rereads_after_finalizer.fetch_add(1, Ordering::SeqCst) == 0
                 {
-                    json_response(&deleting_linked_state(
-                        &state_name,
-                        &format!("state-rv-{}", state_resource_version.load(Ordering::SeqCst)),
-                        !state_finalizer_removed.load(Ordering::SeqCst),
-                    ))
+                    json_response(&persisted_state.lock().expect("persisted State lock"))
                 } else {
                     not_found()
                 }
@@ -626,11 +629,19 @@ async fn driver_deletion_barrier_crashes_after_exact_state_finalizer_effect_and_
                 }
                 let next = state_resource_version.fetch_add(1, Ordering::SeqCst) + 1;
                 if removing_finalizer {
-                    json_response(&deleting_linked_state(
-                        &state_name,
-                        &format!("state-rv-{next}"),
-                        false,
-                    ))
+                    let mut written = persisted_state
+                        .lock()
+                        .expect("persisted State lock")
+                        .clone();
+                    let metadata = written
+                        .get_mut("metadata")
+                        .and_then(serde_json::Value::as_object_mut)
+                        .expect("state metadata");
+                    metadata.insert("resourceVersion".into(), json!(format!("state-rv-{next}")));
+                    metadata.insert("finalizers".into(), json!(Vec::<String>::new()));
+                    metadata.insert("managedFields".into(), json!([{"manager":"fixture"}]));
+                    *persisted_state.lock().expect("persisted State lock") = written.clone();
+                    json_response(&written)
                 } else {
                     // A State persist response must echo the exact durable
                     // spec written by the command, not an older fixture.
@@ -644,10 +655,11 @@ async fn driver_deletion_barrier_crashes_after_exact_state_finalizer_effect_and_
                     metadata.insert("namespace".into(), json!("ns"));
                     metadata.insert("uid".into(), json!("state-uid"));
                     metadata.insert("resourceVersion".into(), json!(format!("state-rv-{next}")));
-                    metadata.insert(
-                        "annotations".into(),
-                        json!({"runtime.oxideloop.dev/root-uid":"root-uid"}),
-                    );
+                    let annotations = metadata
+                        .get("annotations")
+                        .cloned()
+                        .expect("State persist includes operation annotations");
+                    metadata.insert("annotations".into(), annotations);
                     metadata.insert(
                         "ownerReferences".into(),
                         json!([{
@@ -663,6 +675,7 @@ async fn driver_deletion_barrier_crashes_after_exact_state_finalizer_effect_and_
                         "finalizers".into(),
                         json!(["runtime.oxideloop.dev/state-finalizer"]),
                     );
+                    *persisted_state.lock().expect("persisted State lock") = written.clone();
                     json_response(&written)
                 }
             } else {
@@ -746,6 +759,17 @@ async fn driver_deletion_barrier_crashes_after_exact_state_finalizer_effect_and_
     assert_eq!(&reached, b"REACHED\n");
 
     assert!(state_finalizer_removed.load(Ordering::SeqCst));
+    let persisted_state_at_midpoint = persisted_state
+        .lock()
+        .expect("persisted State lock")
+        .clone();
+    assert!(
+        persisted_state_at_midpoint
+            .pointer("/spec/state/pendingPersist/token")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|token| token != "bootstrap-token"),
+        "the linked fixture preserves the current acknowledged State operation proof"
+    );
     let trace_at_midpoint = requests.lock().expect("request log lock").clone();
     assert_eq!(
         finalizer_effects

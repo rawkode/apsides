@@ -686,15 +686,17 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
     pub(crate) async fn await_buffered_retained_watch(
         &mut self,
     ) -> Result<BufferedRetainedWatchV0, RuntimeErrorV0> {
-        if self
-            .retained
-            .as_ref()
-            .is_none_or(|retained| retained.barrier.generation != self.barrier)
-        {
+        let Some(retained) = self.retained.as_ref() else {
+            return std::future::pending().await;
+        };
+        if retained.barrier.generation != self.barrier {
             return Ok(BufferedRetainedWatchV0::RestartRequired {
                 port_identity: self.identity,
                 barrier: self.barrier,
             });
+        }
+        if retained.is_structurally_empty() {
+            return std::future::pending().await;
         }
         let retained = self.retained.as_mut().expect("checked retained barrier");
         let changed = match retained.drain_buffered_events() {
@@ -1380,12 +1382,22 @@ impl RetainedWatchCollectorV0 {
     pub(crate) async fn await_buffered_retained_watch(
         &mut self,
     ) -> Result<BufferedRetainedWatchV0, RuntimeErrorV0> {
+        let Some(retained) = self.retained.as_ref() else {
+            return std::future::pending().await;
+        };
+        if retained.barrier.generation != self.barrier {
+            return Ok(BufferedRetainedWatchV0::RestartRequired {
+                port_identity: self.identity,
+                barrier: self.barrier,
+            });
+        }
+        if retained.is_structurally_empty() {
+            return std::future::pending().await;
+        }
         if let Some(record) = self.drain_ready_retained_watch()? {
             return Ok(record);
         }
-        let Some(retained) = self.retained.as_mut() else {
-            return std::future::pending().await;
-        };
+        let retained = self.retained.as_mut().expect("checked retained barrier");
         match retained.await_change().await {
             Ok(()) => {}
             Err(RuntimeErrorV0::Discovery(error)) if retained_watch_terminal(&error, retained) => {
@@ -1453,6 +1465,19 @@ impl RetainedObservationBarrierV0 {
             renderer_dependencies,
             coverage_dependencies,
         }
+    }
+
+    /// A completed render may legitimately retain no dependency authority at
+    /// all. Distinguish that idle state from a malformed barrier that declares
+    /// observations but owns no watch capable of advancing them.
+    fn is_structurally_empty(&self) -> bool {
+        self.barrier.dependencies.is_empty()
+            && self.barrier.collections.is_empty()
+            && self.barrier.objects.is_empty()
+            && self.barrier.watches.is_empty()
+            && self.latest.is_empty()
+            && self.renderer_dependencies.is_empty()
+            && self.coverage_dependencies.is_empty()
     }
 
     fn drain_buffered_events(&mut self) -> Result<bool, RuntimeErrorV0> {
@@ -4656,6 +4681,133 @@ mod tests {
             actor.record_genuine_dependency_change(&second_change),
             "barrier two's Y-to-X change must not be suppressed by barrier one's X snapshot"
         );
+    }
+
+    #[tokio::test]
+    async fn retained_watch_collector_keeps_missing_or_structurally_empty_barriers_pending() {
+        let barrier = BarrierV0 {
+            generation: 9,
+            cache_epoch: 4,
+        };
+        for retained in [None, Some(empty_retained(barrier, 1))] {
+            let mut collector = RetainedWatchCollectorV0 {
+                identity: 1,
+                barrier,
+                retained,
+            };
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(10),
+                    collector.await_buffered_retained_watch()
+                )
+                .await
+                .is_err(),
+                "missing and structurally empty retained barriers stay pending"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_watch_collector_restarts_before_pending_on_generation_mismatch() {
+        let barrier = BarrierV0 {
+            generation: 9,
+            cache_epoch: 4,
+        };
+        let current = BarrierV0 {
+            generation: 10,
+            cache_epoch: 4,
+        };
+        let mut collector = RetainedWatchCollectorV0 {
+            identity: 7,
+            barrier: current,
+            retained: Some(empty_retained(barrier, 1)),
+        };
+        assert!(matches!(
+            collector.await_buffered_retained_watch().await,
+            Ok(BufferedRetainedWatchV0::RestartRequired {
+                port_identity: 7,
+                barrier: observed,
+            }) if observed == current
+        ));
+    }
+
+    #[tokio::test]
+    async fn retained_watch_collector_holds_inconsistent_nonempty_barrier_without_watch() {
+        let barrier = BarrierV0 {
+            generation: 9,
+            cache_epoch: 4,
+        };
+        let mut retained = retained_with(object("config", "uid-1", "rv-1"));
+        retained.barrier.generation = barrier;
+        let mut collector = RetainedWatchCollectorV0 {
+            identity: 1,
+            barrier,
+            retained: Some(retained),
+        };
+        assert!(matches!(
+            collector.await_buffered_retained_watch().await,
+            Err(RuntimeErrorV0::Hold(reason))
+                if reason == "retained dependency barrier has no watch handles"
+        ));
+    }
+
+    #[tokio::test]
+    async fn fixed_point_port_keeps_missing_or_empty_retained_barrier_pending() {
+        let barrier = BarrierV0 {
+            generation: 9,
+            cache_epoch: 4,
+        };
+        for retained in [None, Some(empty_retained(barrier, 1))] {
+            let mut port = KubeFixedPointPortV0::<()>::observation_only_for_test(barrier);
+            port.retained = retained;
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(10),
+                    port.await_buffered_retained_watch()
+                )
+                .await
+                .is_err(),
+                "fixed-point port keeps missing and structurally empty barriers pending"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fixed_point_port_restarts_before_pending_on_generation_mismatch() {
+        let retained_barrier = BarrierV0 {
+            generation: 9,
+            cache_epoch: 4,
+        };
+        let current_barrier = BarrierV0 {
+            generation: 10,
+            cache_epoch: 4,
+        };
+        let mut port = KubeFixedPointPortV0::<()>::observation_only_for_test(current_barrier);
+        port.retained = Some(empty_retained(retained_barrier, 1));
+        assert!(matches!(
+            port.await_buffered_retained_watch().await,
+            Ok(BufferedRetainedWatchV0::RestartRequired {
+                barrier,
+                ..
+            }) if barrier == current_barrier
+        ));
+    }
+
+    #[tokio::test]
+    async fn fixed_point_port_holds_inconsistent_nonempty_barrier_without_watch() {
+        let barrier = BarrierV0 {
+            generation: 9,
+            cache_epoch: 4,
+        };
+        let mut retained = retained_with(object("config", "uid-1", "rv-1"));
+        retained.barrier.generation = barrier;
+        let mut port = KubeFixedPointPortV0::<()>::observation_only_for_test(barrier);
+        port.retained = Some(retained);
+        assert!(matches!(
+            port.await_buffered_retained_watch().await,
+            Err(RuntimeErrorV0::Hold(reason))
+                if reason == "retained dependency barrier has no watch handles"
+        ));
     }
 
     #[test]

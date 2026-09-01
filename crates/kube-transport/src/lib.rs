@@ -27,12 +27,13 @@ use futures_util::StreamExt;
 use oxideloop_controller_api::{
     ApplyOperation, ApplyOutcome, ApplyResult, AutomationPending, AutomationRunCompletionState,
     AutomationRunSpec, AutomationRunStatus, DeletionCleanupReceipt, DurablePhase,
-    MAX_MESSAGE_BYTES, NextCommandLifecycleStateV0, ObjectIdentity, OxideLoopStateSpec,
-    PersistPurpose, ROOT_FINALIZER, STATE_FINALIZER, StateLink, WebApplicationStatus,
-    validate_automation_run_name,
+    GenerationAdvanceClosurePurpose, MAX_MESSAGE_BYTES, NextCommandLifecycleStateV0,
+    ObjectIdentity, OxideLoopStateSpec, PersistPurpose, ROOT_FINALIZER, STATE_FINALIZER, StateLink,
+    WebApplicationStatus, validate_automation_run_name,
 };
 use oxideloop_controller_core::{
-    CommandV0, MutationCommandV0, PreconditionsV0, root_finalizer_command_token,
+    CommandV0, MutationCommandV0, PreconditionsV0, linked_root_finalizer_command_token,
+    linked_state_finalizer_command_token, root_only_finalizer_command_token,
     root_only_owned_children_verify_token,
 };
 #[cfg(test)]
@@ -4652,11 +4653,19 @@ impl KubeTransportV0 {
                 let fence = self
                     .reread_fence_in_operation(address, preconditions, session)
                     .await?;
-                validate_bootstrap_deletion_state_authority(address, &fence, preconditions)?;
+                validate_linked_deletion_state_finalizer_authority(
+                    address,
+                    &fence,
+                    preconditions,
+                    token,
+                )?;
                 let written = self
                     .remove_finalizer_in_operation(&fence.state, STATE_FINALIZER, session)
                     .await
                     .map_err(|_| ambiguous_delete_or_finalizer())?;
+                if !finalizer_response_matches(&fence.state, &written, STATE_FINALIZER) {
+                    return Err(TransportErrorV0::ManualRecoveryHold);
+                }
                 Ok(CommandOutcomeV0::Event(Box::new(
                     oxideloop_controller_core::EventV0::StateFinalizerRemoved {
                         token: token.clone(),
@@ -4675,7 +4684,12 @@ impl KubeTransportV0 {
                     .reread_prewrite_in_operation(&root_ref, session)
                     .await?
                     .ok_or(TransportErrorV0::ManualRecoveryHold)?;
-                validate_root_finalizer_after_state_absence(address, &root, preconditions)?;
+                validate_linked_root_finalizer_after_state_absence(
+                    address,
+                    &root,
+                    preconditions,
+                    token,
+                )?;
                 // The original UID must be absent, not merely unlinked or
                 // finalizer-free.  A same-name object (including a replacement
                 // UID) is a hard hold and remains untouched.
@@ -4690,6 +4704,9 @@ impl KubeTransportV0 {
                     .remove_finalizer_in_operation(&root, ROOT_FINALIZER, session)
                     .await
                     .map_err(|_| ambiguous_delete_or_finalizer())?;
+                if !finalizer_response_matches(&root, &written, ROOT_FINALIZER) {
+                    return Err(TransportErrorV0::ManualRecoveryHold);
+                }
                 Ok(CommandOutcomeV0::Event(Box::new(
                     oxideloop_controller_core::EventV0::RootFinalizerRemoved {
                         token: token.clone(),
@@ -6589,6 +6606,7 @@ impl KubeTransportV0 {
             || root.metadata.uid != preconditions.root_uid
             || root.metadata.resource_version != preconditions.root_resource_version
             || generation(&root)? != preconditions.root_generation
+            || !raw_metadata_pins_match(&root)
             || !has_finalizer(&root, ROOT_FINALIZER)
             || root
                 .value
@@ -6640,11 +6658,15 @@ impl KubeTransportV0 {
                     &receipt.state_uid,
                 )
             }
-            RootOnlyCleanupCommandV0::RemoveRootFinalizer => root_finalizer_command_token(
+            RootOnlyCleanupCommandV0::RemoveRootFinalizer => root_only_finalizer_command_token(
                 &root.metadata.uid,
+                root_generation,
                 &root.metadata.resource_version,
+                &receipt.state_name,
                 &receipt.state_uid,
-                "",
+                &receipt.deletion_id,
+                receipt.deletion_start_generation,
+                &receipt.cleanup_token,
             ),
         };
         if token != expected_token {
@@ -6752,6 +6774,9 @@ impl KubeTransportV0 {
             .remove_finalizer_in_operation(&root, ROOT_FINALIZER, session)
             .await
             .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+        if !finalizer_response_matches(&root, &written, ROOT_FINALIZER) {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
         Ok(CommandOutcomeV0::Event(Box::new(
             oxideloop_controller_core::EventV0::RootFinalizerRemoved {
                 token: token.into(),
@@ -7578,6 +7603,79 @@ impl KubeTransportV0 {
         permit.prove()?;
         Ok(())
     }
+}
+
+/// A successful finalizer response is itself the only acknowledgement proof.
+/// Kubernetes may update the resource version and managed fields, but every
+/// other raw field must still be the exact prewrite witness with just the
+/// requested finalizer removed.
+fn finalizer_response_matches(before: &ObjectV0, written: &ObjectV0, removed: &str) -> bool {
+    if written.reference != before.reference
+        || written.metadata.uid != before.metadata.uid
+        || written.metadata.resource_version.is_empty()
+        || written.metadata.resource_version == before.metadata.resource_version
+        || !raw_metadata_pins_match(written)
+        || has_finalizer(written, removed)
+    {
+        return false;
+    }
+    let mut expected = before.value.clone();
+    let mut actual = written.value.clone();
+    let Some(expected_metadata) = expected.get_mut("metadata").and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    let Some(finalizers) = expected_metadata
+        .get_mut("finalizers")
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    let Some(mut remaining_finalizers) = finalizers
+        .iter()
+        .map(|finalizer| finalizer.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let Some(index) = remaining_finalizers
+        .iter()
+        .position(|finalizer| finalizer == removed)
+    else {
+        return false;
+    };
+    remaining_finalizers.remove(index);
+    let actual_finalizers = match actual
+        .get("metadata")
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("finalizers"))
+    {
+        None => Vec::new(),
+        Some(Value::Array(finalizers)) => match finalizers
+            .iter()
+            .map(|finalizer| finalizer.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(finalizers) => finalizers,
+            None => return false,
+        },
+        Some(_) => return false,
+    };
+    if actual_finalizers != remaining_finalizers {
+        return false;
+    }
+    // Kubernetes may omit an empty finalizer list. Compare its normalized
+    // absence after the exact remaining sequence has already been checked.
+    expected_metadata.remove("finalizers");
+    expected_metadata.remove("resourceVersion");
+    expected_metadata.remove("managedFields");
+    let Some(actual_metadata) = actual.get_mut("metadata").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    actual_metadata.remove("finalizers");
+    actual_metadata.remove("resourceVersion");
+    actual_metadata.remove("managedFields");
+    actual == expected
 }
 
 fn api_resource(resource: ResourceKindV0) -> ApiResource {
@@ -8602,111 +8700,191 @@ fn owned_by(object: &ObjectV0, root_uid: &str) -> bool {
     object.metadata.owner_uids.iter().any(|uid| uid == root_uid)
 }
 
-/// Deletion may remove a State finalizer only from the exact object bound by
-/// the durable bootstrap bundle.  This is deliberately stricter than the
-/// generic effect fence: the State's identity, RV, finalizer, canonical owner,
-/// domain-separated spec digest, and both durable proof tokens all have to
-/// agree with the root before a delete-time write is even polled.
-fn validate_bootstrap_deletion_state_authority(
+/// A linked deletion removes the State finalizer only after fresh root and
+/// State witnesses prove one current durable deletion transaction. Bootstrap
+/// authority is intentionally not consulted here: it describes the separate
+/// unlinked cleanup route, and the current State persist legitimately changes
+/// its spec and operation token as deletion progresses.
+fn validate_linked_deletion_state_finalizer_authority(
     address: &RootAddressV0,
     fence: &EffectFenceV0,
     preconditions: &PreconditionsV0,
+    command_token: &str,
 ) -> Result<(), TransportErrorV0> {
-    let proof = fence
-        .root
-        .metadata
-        .annotations
-        .get(BOOTSTRAP_PROOF_TOKEN_ANNOTATION)
-        .ok_or(TransportErrorV0::ManualRecoveryHold)?;
-    if !has_exact_object_identity(
-        &fence.root,
-        ResourceKindV0::WebApplication,
-        &address.namespace,
-        &address.name,
-    ) || fence.root.metadata.uid != preconditions.root_uid
-        || fence.root.metadata.resource_version != preconditions.root_resource_version
-        || generation(&fence.root)? != preconditions.root_generation
-        || !has_finalizer(&fence.root, ROOT_FINALIZER)
+    let root = &fence.root;
+    let state = &fence.state;
+    let receipt = linked_deletion_receipt(root, address, preconditions)?;
+    if !has_linked_deleting_root_authority(address, root, preconditions)
         || !has_exact_object_identity(
-            &fence.state,
+            state,
             ResourceKindV0::OxideLoopState,
             &address.namespace,
             &address.state_name,
         )
-        || fence.state.metadata.uid != preconditions.state_uid
-        || fence.state.metadata.resource_version != preconditions.state_resource_version
-        || !has_finalizer(&fence.state, STATE_FINALIZER)
-        || !has_exact_canonical_owner(
-            &fence.state,
-            &fence.root.reference,
-            &fence.root.metadata.uid,
-        )
-        || !bootstrap_root_metadata_matches_state(&fence.root, &fence.state, proof)
-        || !has_recovery_proof(&fence.state, &fence.root.metadata.uid, proof, proof)
+        || state.metadata.uid != preconditions.state_uid
+        || state.metadata.resource_version != preconditions.state_resource_version
+        || !raw_metadata_pins_match(state)
+        || !has_finalizer(state, STATE_FINALIZER)
+        || !has_root_uid_annotation(state, &root.metadata.uid)
+        || !has_exact_canonical_owner(state, &root.reference, &root.metadata.uid)
+        || !has_state_link(root, state)
+        || !linked_deletion_state_spec_matches(root, state, preconditions, &receipt)
     {
+        return Err(TransportErrorV0::ManualRecoveryHold);
+    }
+    let expected = linked_state_finalizer_command_token(
+        &root.metadata.uid,
+        preconditions.root_generation,
+        &root.metadata.resource_version,
+        &address.state_name,
+        &state.metadata.uid,
+        &state.metadata.resource_version,
+        &receipt.deletion_id,
+        receipt.deletion_start_generation,
+        &receipt.cleanup_token,
+    );
+    if command_token != expected {
         return Err(TransportErrorV0::ManualRecoveryHold);
     }
     Ok(())
 }
 
-/// The normal deletion path must observe the old State name as absent before
-/// it removes the root finalizer.  This helper validates the original root
-/// pin independently of a State read so a same-name replacement can never be
-/// collapsed into "absence" by a generic two-object fence.
-fn validate_root_finalizer_after_state_absence(
+/// The linked root finalizer may be removed only after the deterministic State
+/// name has been reread as absent. Its authority is retained in the root's
+/// status receipt and the original State pins, not in a bootstrap bundle.
+fn validate_linked_root_finalizer_after_state_absence(
     address: &RootAddressV0,
     root: &ObjectV0,
     preconditions: &PreconditionsV0,
+    command_token: &str,
 ) -> Result<(), TransportErrorV0> {
-    let proof = root
-        .metadata
-        .annotations
-        .get(BOOTSTRAP_PROOF_TOKEN_ANNOTATION)
-        .ok_or(TransportErrorV0::ManualRecoveryHold)?;
-    if !has_exact_object_identity(
+    let receipt = linked_deletion_receipt(root, address, preconditions)?;
+    if !has_linked_deleting_root_authority(address, root, preconditions)
+        || preconditions.state_uid.is_empty()
+        || preconditions.state_resource_version.is_empty()
+        || !root.value.pointer("/status/state").is_some_and(|link| {
+            link.get("rootUid").and_then(Value::as_str) == Some(root.metadata.uid.as_str())
+                && link.get("name").and_then(Value::as_str) == Some(address.state_name.as_str())
+                && link.get("uid").and_then(Value::as_str) == Some(preconditions.state_uid.as_str())
+        })
+    {
+        return Err(TransportErrorV0::ManualRecoveryHold);
+    }
+    let expected = linked_root_finalizer_command_token(
+        &root.metadata.uid,
+        preconditions.root_generation,
+        &root.metadata.resource_version,
+        &address.state_name,
+        &preconditions.state_uid,
+        &preconditions.state_resource_version,
+        &receipt.deletion_id,
+        receipt.deletion_start_generation,
+        &receipt.cleanup_token,
+    );
+    if command_token != expected {
+        return Err(TransportErrorV0::ManualRecoveryHold);
+    }
+    Ok(())
+}
+
+fn has_linked_deleting_root_authority(
+    address: &RootAddressV0,
+    root: &ObjectV0,
+    preconditions: &PreconditionsV0,
+) -> bool {
+    let expected_state_name = oxideloop_controller_api::state_name(&root.metadata.uid).ok();
+    has_exact_object_identity(
         root,
         ResourceKindV0::WebApplication,
         &address.namespace,
         &address.name,
-    ) || root.metadata.uid != preconditions.root_uid
-        || root.metadata.resource_version != preconditions.root_resource_version
-        || generation(root)? != preconditions.root_generation
-        || !has_finalizer(root, ROOT_FINALIZER)
-        || !bootstrap_absent_state_bundle_matches(root, address, preconditions, proof)
-    {
-        return Err(TransportErrorV0::ManualRecoveryHold);
-    }
-    Ok(())
+    ) && root.metadata.uid == preconditions.root_uid
+        && root.metadata.resource_version == preconditions.root_resource_version
+        && generation(root).ok() == Some(preconditions.root_generation)
+        && raw_metadata_pins_match(root)
+        && root
+            .value
+            .pointer("/metadata/deletionTimestamp")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        && has_finalizer(root, ROOT_FINALIZER)
+        && has_root_uid_annotation(root, &root.metadata.uid)
+        && expected_state_name.as_deref() == Some(address.state_name.as_str())
 }
 
-/// Once the original State is absent its canonical spec cannot be reread, so
-/// root-finalizer cleanup validates the immutable portion of the v1 bundle
-/// against the exact deletion pins.  The digest was already recomputed while
-/// the State was present before its finalizer could be removed; here we retain
-/// its versioned, canonical-shape commitment rather than silently accepting a
-/// token-only root.
-fn bootstrap_absent_state_bundle_matches(
+fn linked_deletion_receipt(
     root: &ObjectV0,
     address: &RootAddressV0,
     preconditions: &PreconditionsV0,
-    proof: &str,
+) -> Result<DeletionCleanupReceipt, TransportErrorV0> {
+    let status: WebApplicationStatus = serde_json::from_value(
+        root.value
+            .get("status")
+            .cloned()
+            .ok_or(TransportErrorV0::ManualRecoveryHold)?,
+    )
+    .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+    let receipt = status
+        .deletion_cleanup_receipt
+        .ok_or(TransportErrorV0::ManualRecoveryHold)?;
+    receipt
+        .validate()
+        .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+    if receipt.root_uid != root.metadata.uid
+        || receipt.state_name != address.state_name
+        || receipt.state_uid != preconditions.state_uid
+        || receipt.deletion_start_generation > preconditions.root_generation
+        || preconditions.state_resource_version.is_empty()
+    {
+        return Err(TransportErrorV0::ManualRecoveryHold);
+    }
+    Ok(receipt)
+}
+
+fn linked_deletion_state_spec_matches(
+    root: &ObjectV0,
+    state: &ObjectV0,
+    preconditions: &PreconditionsV0,
+    receipt: &DeletionCleanupReceipt,
 ) -> bool {
-    let annotations = &root.metadata.annotations;
-    has_bootstrap_root_metadata(root, proof)
-        && annotations
-            .get(BOOTSTRAP_STATE_NAME_ANNOTATION)
-            .is_some_and(|value| value == &address.state_name)
-        && annotations
-            .get(BOOTSTRAP_STATE_UID_ANNOTATION)
-            .is_some_and(|value| value == &preconditions.state_uid && !value.is_empty())
-        && annotations
-            .get(BOOTSTRAP_STATE_SPEC_DIGEST_ANNOTATION)
-            .is_some_and(|digest| {
-                digest.len() == 64
-                    && digest
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            })
+    let spec: OxideLoopStateSpec =
+        match serde_json::from_value(state.value.get("spec").cloned().unwrap_or(Value::Null)) {
+            Ok(spec) => spec,
+            Err(_) => return false,
+        };
+    if spec.validate().is_err() || spec.root.uid != root.metadata.uid {
+        return false;
+    }
+    let Some(deletion) = spec.state.deletion.as_ref() else {
+        return false;
+    };
+    let Some(pending) = spec.state.pending_persist.as_ref() else {
+        return false;
+    };
+    let deletion_purpose = matches!(
+        pending.purpose,
+        PersistPurpose::DeletionStart
+            | PersistPurpose::DeletionPrepare
+            | PersistPurpose::DeletionMutationResult
+            | PersistPurpose::DeletionAutomationCleanup
+    ) || (pending.purpose == PersistPurpose::GenerationAdvanceClosure
+        && spec
+            .state
+            .generation_advance_closure
+            .as_ref()
+            .is_some_and(|closure| {
+                matches!(
+                    closure.purpose,
+                    GenerationAdvanceClosurePurpose::DeletionMutationResult
+                        | GenerationAdvanceClosurePurpose::DeletionAutomationCleanup
+                )
+            }));
+    deletion.id == receipt.deletion_id
+        && deletion.deletion_start_generation == receipt.deletion_start_generation
+        && pending.phase == pending.purpose.durable_phase()
+        && pending.root_generation == preconditions.root_generation
+        && deletion_purpose
+        && has_recovery_proof(state, &root.metadata.uid, &pending.token, &pending.token)
 }
 
 const BOOTSTRAP_AUTHORITY_ANNOTATIONS_V1: [&str; 8] = [
@@ -10041,6 +10219,108 @@ mod tests {
         (root, state)
     }
 
+    fn linked_deletion_fixture() -> (RootAddressV0, ObjectV0, ObjectV0, PreconditionsV0, String) {
+        let state_name = oxideloop_controller_api::state_name("root-uid")
+            .expect("fixture State name is deterministic");
+        let cleanup_token = "c".repeat(64);
+        let persist_token = "a".repeat(64);
+        let deletion_id = "d".repeat(64);
+        let root_annotations = BTreeMap::from([(ROOT_UID_ANNOTATION.into(), "root-uid".into())]);
+        let root = ObjectV0 {
+            reference: ObjectRefV0 {
+                resource: ResourceKindV0::WebApplication,
+                namespace: "ns".into(),
+                name: "app".into(),
+            },
+            metadata: ObjectMetaV0 {
+                uid: "root-uid".into(),
+                resource_version: "root-rv".into(),
+                annotations: root_annotations.clone(),
+                owner_uids: vec![],
+            },
+            value: json!({
+                "apiVersion":"demo.oxideloop.dev/v1alpha1",
+                "kind":"WebApplication",
+                "metadata":{
+                    "name":"app", "namespace":"ns", "uid":"root-uid",
+                    "resourceVersion":"root-rv", "generation":3,
+                    "annotations":root_annotations, "deletionTimestamp":"2026-08-31T00:00:00Z",
+                    "finalizers":[ROOT_FINALIZER],
+                },
+                "spec":{"message":"linked deletion", "expose":false,
+                    "program":{"configMapName":"bundle", "key":"program.mjs", "digest":"0".repeat(64)}},
+                "status":{
+                    "state":{"rootUid":"root-uid", "name":state_name, "uid":"state-uid"},
+                    "deletionCleanupReceipt":{
+                        "rootUid":"root-uid", "deletionId":deletion_id,
+                        "deletionStartGeneration":3, "stateName":state_name,
+                        "stateUid":"state-uid", "cleanupToken":cleanup_token,
+                    }
+                },
+            }),
+        };
+        let state_annotations = BTreeMap::from([
+            (ROOT_UID_ANNOTATION.into(), "root-uid".into()),
+            (TRANSACTION_ID_ANNOTATION.into(), persist_token.clone()),
+            (COMMAND_ID_ANNOTATION.into(), persist_token.clone()),
+        ]);
+        let state = ObjectV0 {
+            reference: ObjectRefV0 {
+                resource: ResourceKindV0::OxideLoopState,
+                namespace: "ns".into(),
+                name: state_name.clone(),
+            },
+            metadata: ObjectMetaV0 {
+                uid: "state-uid".into(),
+                resource_version: "state-rv".into(),
+                annotations: state_annotations.clone(),
+                owner_uids: vec!["root-uid".into()],
+            },
+            value: json!({
+                "apiVersion":"runtime.oxideloop.dev/v1alpha1", "kind":"OxideLoopState",
+                "metadata":{
+                    "name":state_name, "namespace":"ns", "uid":"state-uid",
+                    "resourceVersion":"state-rv", "annotations":state_annotations,
+                    "ownerReferences":[{"apiVersion":"demo.oxideloop.dev/v1alpha1",
+                        "kind":"WebApplication", "name":"app", "uid":"root-uid",
+                        "controller":true, "blockOwnerDeletion":false}],
+                    "finalizers":[STATE_FINALIZER],
+                },
+                "spec":{"stateVersion":1,
+                    "root":{"uid":"root-uid", "bootstrapId":oxideloop_controller_api::bootstrap_id("root-uid").expect("bootstrap id"), "bundleDigest":"0".repeat(64)},
+                    "state":{"pendingPersist":{"token":persist_token, "purpose":"DeletionStart", "phase":"DeletionStart", "oldStateResourceVersion":"state-rv-0", "rootGeneration":3},
+                        "deletion":{"id":deletion_id, "deletionStartGeneration":3}, "automation":{}}},
+                "status":{},
+            }),
+        };
+        let address = RootAddressV0 {
+            namespace: "ns".into(),
+            name: "app".into(),
+            state_name: state.reference.name.clone(),
+        };
+        let preconditions = PreconditionsV0 {
+            root_uid: root.metadata.uid.clone(),
+            root_generation: 3,
+            root_resource_version: root.metadata.resource_version.clone(),
+            state_uid: state.metadata.uid.clone(),
+            state_resource_version: state.metadata.resource_version.clone(),
+            observation_token: "observation".into(),
+            cache_epoch: "epoch".into(),
+        };
+        let token = linked_state_finalizer_command_token(
+            &preconditions.root_uid,
+            preconditions.root_generation,
+            &preconditions.root_resource_version,
+            &address.state_name,
+            &preconditions.state_uid,
+            &preconditions.state_resource_version,
+            &deletion_id,
+            3,
+            &cleanup_token,
+        );
+        (address, root, state, preconditions, token)
+    }
+
     fn test_object_response(object: &ObjectV0) -> Response<Body> {
         Response::builder()
             .header(http::header::CONTENT_TYPE, "application/json")
@@ -10919,30 +11199,46 @@ mod tests {
     }
 
     #[test]
-    fn deletion_state_finalizer_requires_the_complete_v1_bundle_and_both_tokens() {
-        let initial_root = bootstrap_authority_root("1");
-        let (root, state) = final_proof_fixture(&initial_root);
-        let address = RootAddressV0 {
-            namespace: "ns".into(),
-            name: "app".into(),
-            state_name: "state".into(),
-        };
-        let preconditions = PreconditionsV0 {
-            root_uid: root.metadata.uid.clone(),
-            root_generation: generation(&root).expect("fixture generation"),
-            root_resource_version: root.metadata.resource_version.clone(),
-            state_uid: state.metadata.uid.clone(),
-            state_resource_version: state.metadata.resource_version.clone(),
-            observation_token: "observation".into(),
-            cache_epoch: "epoch".into(),
-        };
+    fn linked_state_finalizer_requires_current_state_and_receipt_witnesses() {
+        let (address, root, state, preconditions, token) = linked_deletion_fixture();
         let fence = EffectFenceV0 {
             root: root.clone(),
             state: state.clone(),
             target: None,
         };
-        validate_bootstrap_deletion_state_authority(&address, &fence, &preconditions)
-            .expect("exact issued State and complete root bundle are deletable");
+        assert!(has_linked_deleting_root_authority(
+            &address,
+            &root,
+            &preconditions
+        ));
+        let receipt = linked_deletion_receipt(&root, &address, &preconditions)
+            .expect("fixture receipt is valid");
+        let fixture_spec: OxideLoopStateSpec = serde_json::from_value(
+            state
+                .value
+                .get("spec")
+                .cloned()
+                .expect("fixture State spec"),
+        )
+        .expect("fixture State spec deserializes");
+        assert!(
+            fixture_spec.validate().is_ok(),
+            "fixture State spec validates: {:?}",
+            fixture_spec.validate()
+        );
+        assert!(linked_deletion_state_spec_matches(
+            &root,
+            &state,
+            &preconditions,
+            &receipt
+        ));
+        validate_linked_deletion_state_finalizer_authority(
+            &address,
+            &fence,
+            &preconditions,
+            &token,
+        )
+        .expect("legacy linked State is deletable without a bootstrap-v1 bundle");
 
         let mut missing_command_token = state.clone();
         missing_command_token
@@ -10952,7 +11248,7 @@ mod tests {
         missing_command_token.value["metadata"]["annotations"][COMMAND_ID_ANNOTATION] =
             json!("other");
         assert!(
-            validate_bootstrap_deletion_state_authority(
+            validate_linked_deletion_state_finalizer_authority(
                 &address,
                 &EffectFenceV0 {
                     root: root.clone(),
@@ -10960,15 +11256,53 @@ mod tests {
                     target: None,
                 },
                 &preconditions,
+                &token,
             )
             .is_err()
         );
+
+        for (purpose, phase, closure) in [
+            ("MutationResult", "MutationResult", None),
+            ("AutomationPending", "AutomationPending", None),
+            (
+                "GenerationAdvanceClosure",
+                "GenerationAdvanceClosure",
+                Some(json!({
+                    "rootUid":"root-uid", "sourceGeneration":2,
+                    "sourceRootResourceVersion":"root-rv-previous",
+                    "sourceStateUid":"state-uid",
+                    "sourceStateResourceVersion":"state-rv-previous",
+                    "rebaseCount":0, "purpose":"MutationResult",
+                })),
+            ),
+        ] {
+            let mut unrelated_purpose = state.clone();
+            unrelated_purpose.value["spec"]["state"]["pendingPersist"]["purpose"] = json!(purpose);
+            unrelated_purpose.value["spec"]["state"]["pendingPersist"]["phase"] = json!(phase);
+            if let Some(closure) = closure {
+                unrelated_purpose.value["spec"]["state"]["generationAdvanceClosure"] = closure;
+            }
+            assert!(
+                validate_linked_deletion_state_finalizer_authority(
+                    &address,
+                    &EffectFenceV0 {
+                        root: root.clone(),
+                        state: unrelated_purpose,
+                        target: None,
+                    },
+                    &preconditions,
+                    &token,
+                )
+                .is_err(),
+                "non-deletion current persist purpose {purpose} cannot authorize finalization"
+            );
+        }
 
         let mut replacement = state.clone();
         replacement.metadata.uid = "replacement-uid".into();
         replacement.value["metadata"]["uid"] = json!("replacement-uid");
         assert!(
-            validate_bootstrap_deletion_state_authority(
+            validate_linked_deletion_state_finalizer_authority(
                 &address,
                 &EffectFenceV0 {
                     root: root.clone(),
@@ -10976,100 +11310,143 @@ mod tests {
                     target: None,
                 },
                 &preconditions,
+                &token,
             )
             .is_err()
         );
 
-        let mut changed_digest = root;
-        changed_digest.metadata.annotations.insert(
-            BOOTSTRAP_STATE_SPEC_DIGEST_ANNOTATION.into(),
-            "0".repeat(64),
-        );
-        changed_digest.value["metadata"]["annotations"][BOOTSTRAP_STATE_SPEC_DIGEST_ANNOTATION] =
-            json!("0".repeat(64));
+        let mut changed_receipt = root;
+        changed_receipt.value["status"]["deletionCleanupReceipt"]["cleanupToken"] =
+            json!("e".repeat(64));
         assert!(
-            validate_bootstrap_deletion_state_authority(
+            validate_linked_deletion_state_finalizer_authority(
                 &address,
                 &EffectFenceV0 {
-                    root: changed_digest,
+                    root: changed_receipt,
                     state,
                     target: None,
                 },
                 &preconditions,
+                &token,
             )
             .is_err()
         );
     }
 
     #[test]
-    fn root_finalizer_after_state_absence_keeps_the_original_bundle_identity() {
-        let initial_root = bootstrap_authority_root("1");
-        let (root, state) = final_proof_fixture(&initial_root);
-        let address = RootAddressV0 {
-            namespace: "ns".into(),
-            name: "app".into(),
-            state_name: "state".into(),
-        };
-        let preconditions = PreconditionsV0 {
-            root_uid: root.metadata.uid.clone(),
-            root_generation: generation(&root).expect("fixture generation"),
-            root_resource_version: root.metadata.resource_version.clone(),
-            state_uid: state.metadata.uid.clone(),
-            state_resource_version: state.metadata.resource_version.clone(),
-            observation_token: "observation".into(),
-            cache_epoch: "epoch".into(),
-        };
-        validate_root_finalizer_after_state_absence(&address, &root, &preconditions)
-            .expect("complete original bundle survives the State's absence");
+    fn linked_root_finalizer_after_state_absence_keeps_receipt_identity() {
+        let (address, root, _state, preconditions, _) = linked_deletion_fixture();
+        let token = linked_root_finalizer_command_token(
+            &preconditions.root_uid,
+            preconditions.root_generation,
+            &preconditions.root_resource_version,
+            &address.state_name,
+            &preconditions.state_uid,
+            &preconditions.state_resource_version,
+            &"d".repeat(64),
+            3,
+            &"c".repeat(64),
+        );
+        validate_linked_root_finalizer_after_state_absence(&address, &root, &preconditions, &token)
+            .expect("legacy linked root retains sufficient receipt authority");
 
         let mut replacement_pins = preconditions.clone();
         replacement_pins.state_uid = "replacement-uid".into();
         assert!(
-            validate_root_finalizer_after_state_absence(&address, &root, &replacement_pins,)
-                .is_err()
+            validate_linked_root_finalizer_after_state_absence(
+                &address,
+                &root,
+                &replacement_pins,
+                &token
+            )
+            .is_err()
         );
 
-        let mut missing_digest = root;
-        missing_digest
-            .metadata
-            .annotations
-            .remove(BOOTSTRAP_STATE_SPEC_DIGEST_ANNOTATION);
-        missing_digest.value["metadata"]["annotations"]
-            .as_object_mut()
-            .expect("fixture annotations object")
-            .remove(BOOTSTRAP_STATE_SPEC_DIGEST_ANNOTATION);
+        let mut malformed_receipt = root;
+        malformed_receipt.value["status"]["deletionCleanupReceipt"]["deletionId"] = json!("bad");
         assert!(
-            validate_root_finalizer_after_state_absence(&address, &missing_digest, &preconditions,)
-                .is_err()
+            validate_linked_root_finalizer_after_state_absence(
+                &address,
+                &malformed_receipt,
+                &preconditions,
+                &token
+            )
+            .is_err()
         );
+        let mut future_receipt = malformed_receipt;
+        future_receipt.value["status"]["deletionCleanupReceipt"]["deletionId"] =
+            json!("d".repeat(64));
+        future_receipt.value["status"]["deletionCleanupReceipt"]["deletionStartGeneration"] =
+            json!(4);
+        assert!(
+            validate_linked_root_finalizer_after_state_absence(
+                &address,
+                &future_receipt,
+                &preconditions,
+                &token
+            )
+            .is_err(),
+            "a receipt cannot begin after the fresh root generation"
+        );
+    }
+
+    #[test]
+    fn linked_finalizer_responses_may_change_only_finalizers_rv_and_managed_fields() {
+        let (_address, root, state, _preconditions, _token) = linked_deletion_fixture();
+        for (before, finalizer) in [(state, STATE_FINALIZER), (root, ROOT_FINALIZER)] {
+            let mut written = before.clone();
+            written.metadata.resource_version = "after-finalizer".into();
+            written.value["metadata"]["resourceVersion"] = json!("after-finalizer");
+            written.value["metadata"]["finalizers"] = json!(Vec::<String>::new());
+            written.value["metadata"]["managedFields"] = json!([{"manager":"server"}]);
+            assert!(finalizer_response_matches(&before, &written, finalizer));
+
+            written.value["spec"]["stateVersion"] = json!(2);
+            assert!(
+                !finalizer_response_matches(&before, &written, finalizer),
+                "a finalizer response cannot smuggle a spec mutation"
+            );
+
+            let mut malformed_prewrite = before.clone();
+            malformed_prewrite.value["metadata"]["finalizers"] = json!([finalizer, 7]);
+            let mut exact_response = before.clone();
+            exact_response.metadata.resource_version = "after-finalizer".into();
+            exact_response.value["metadata"]["resourceVersion"] = json!("after-finalizer");
+            exact_response.value["metadata"]["finalizers"] = json!(Vec::<String>::new());
+            assert!(
+                !finalizer_response_matches(&malformed_prewrite, &exact_response, finalizer),
+                "a malformed prewrite finalizer witness cannot authorize an acknowledgement"
+            );
+
+            let mut mirrored_malformed_response = malformed_prewrite.clone();
+            mirrored_malformed_response.metadata.resource_version = "after-finalizer".into();
+            mirrored_malformed_response.value["metadata"]["resourceVersion"] =
+                json!("after-finalizer");
+            mirrored_malformed_response.value["metadata"]["finalizers"] = json!([7]);
+            assert!(
+                !finalizer_response_matches(
+                    &malformed_prewrite,
+                    &mirrored_malformed_response,
+                    finalizer
+                ),
+                "a mirrored malformed finalizer pair cannot acknowledge removal"
+            );
+        }
     }
 
     #[tokio::test]
     async fn deletion_state_finalizer_response_loss_is_a_hold_not_an_ack() {
-        let initial_root = bootstrap_authority_root("1");
-        let (root, state) = final_proof_fixture(&initial_root);
-        let address = RootAddressV0 {
-            namespace: "ns".into(),
-            name: "app".into(),
-            state_name: "state".into(),
-        };
-        let preconditions = PreconditionsV0 {
-            root_uid: root.metadata.uid.clone(),
-            root_generation: generation(&root).expect("fixture generation"),
-            root_resource_version: root.metadata.resource_version.clone(),
-            state_uid: state.metadata.uid.clone(),
-            state_resource_version: state.metadata.resource_version.clone(),
-            observation_token: "observation".into(),
-            cache_epoch: "epoch".into(),
-        };
+        let (address, root, state, preconditions, token) = linked_deletion_fixture();
         let patch_calls = Arc::new(AtomicUsize::new(0));
         let service = service_fn({
             let root = root.clone();
             let state = state.clone();
+            let state_name = state.reference.name.clone();
             let patch_calls = Arc::clone(&patch_calls);
             move |request: Request<Body>| {
                 let root = root.clone();
                 let state = state.clone();
+                let state_name = state_name.clone();
                 let patch_calls = Arc::clone(&patch_calls);
                 async move {
                     let path = request.uri().path();
@@ -11078,11 +11455,11 @@ mod tests {
                     {
                         Ok::<_, Infallible>(test_object_response(&root))
                     } else if request.method() == http::Method::GET
-                        && path.ends_with("/oxideloopstates/state")
+                        && path.ends_with(&format!("/oxideloopstates/{state_name}"))
                     {
                         Ok(test_object_response(&state))
                     } else if request.method() == http::Method::PATCH
-                        && path.ends_with("/oxideloopstates/state")
+                        && path.ends_with(&format!("/oxideloopstates/{state_name}"))
                     {
                         patch_calls.fetch_add(1, Ordering::SeqCst);
                         std::future::pending::<Result<Response<Body>, Infallible>>().await
@@ -11104,7 +11481,7 @@ mod tests {
             0,
         );
         let command = CommandV0::RemoveStateFinalizer {
-            token: "state-finalizer-token".into(),
+            token,
             preconditions,
         };
 
@@ -11123,25 +11500,18 @@ mod tests {
 
     #[tokio::test]
     async fn crash_after_root_metadata_with_same_name_replacement_holds_root_delete() {
-        // This is the process-restart shape after the durable RootMetadata
-        // bundle was written: its old State UID is retained on the root, but
-        // the old child is gone and a same-name replacement has appeared.
-        let initial_root = bootstrap_authority_root("1");
-        let (root, original_state) = final_proof_fixture(&initial_root);
-        let address = RootAddressV0 {
-            namespace: "ns".into(),
-            name: "app".into(),
-            state_name: "state".into(),
-        };
-        let preconditions = PreconditionsV0 {
-            root_uid: root.metadata.uid.clone(),
-            root_generation: generation(&root).expect("fixture generation"),
-            root_resource_version: root.metadata.resource_version.clone(),
-            state_uid: original_state.metadata.uid.clone(),
-            state_resource_version: original_state.metadata.resource_version.clone(),
-            observation_token: "observation".into(),
-            cache_epoch: "epoch".into(),
-        };
+        let (address, root, original_state, preconditions, _) = linked_deletion_fixture();
+        let token = linked_root_finalizer_command_token(
+            &preconditions.root_uid,
+            preconditions.root_generation,
+            &preconditions.root_resource_version,
+            &address.state_name,
+            &preconditions.state_uid,
+            &preconditions.state_resource_version,
+            &"d".repeat(64),
+            3,
+            &"c".repeat(64),
+        );
         let mut replacement = original_state;
         replacement.metadata.uid = "replacement-state-uid".into();
         replacement.value["metadata"]["uid"] = json!("replacement-state-uid");
@@ -11151,10 +11521,12 @@ mod tests {
         let service = service_fn({
             let root = root.clone();
             let replacement = replacement.clone();
+            let state_name = address.state_name.clone();
             let patch_calls = Arc::clone(&patch_calls);
             move |request: Request<Body>| {
                 let root = root.clone();
                 let replacement = replacement.clone();
+                let state_name = state_name.clone();
                 let patch_calls = Arc::clone(&patch_calls);
                 async move {
                     let path = request.uri().path();
@@ -11163,7 +11535,7 @@ mod tests {
                     {
                         Ok::<_, Infallible>(test_object_response(&root))
                     } else if request.method() == http::Method::GET
-                        && path.ends_with("/oxideloopstates/state")
+                        && path.ends_with(&format!("/oxideloopstates/{state_name}"))
                     {
                         Ok(test_object_response(&replacement))
                     } else if request.method() == http::Method::PATCH {
@@ -11180,7 +11552,7 @@ mod tests {
         });
         let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
         let command = CommandV0::RemoveRootFinalizer {
-            token: "root-finalizer-token".into(),
+            token,
             preconditions,
         };
 
