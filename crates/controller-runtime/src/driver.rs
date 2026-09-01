@@ -6,9 +6,10 @@
 //! never adopts a replacement UID.  Kubernetes effects remain in the sealed
 //! dispatcher; renderer and action calls are delegated to their typed ports.
 
+#[cfg(all(feature = "test-failpoints", test))]
+use std::future::Future;
 use std::{
     collections::{BTreeMap, VecDeque},
-    future::Future,
     path::PathBuf,
     pin::Pin,
 };
@@ -20,7 +21,8 @@ use oxideloop_controller_api::PersistPurpose;
 use oxideloop_controller_api::{ObjectIdentity, ProgramBundleReference};
 use oxideloop_controller_core::{
     ActionTriggerV0, CommandV0, EventV0, MachineStateV0, PhaseV0, PreconditionsV0,
-    automation_source_transition_token,
+    automation_source_transition_token, retired_state_delete_command_token,
+    root_only_owned_children_verify_token,
 };
 use oxideloop_event_planner::{
     ObjectIdentity as PlannerIdentityV0, ObjectRef as PlannerObjectRefV0, RunCorrelationV0,
@@ -35,7 +37,7 @@ use oxideloop_renderer_abi::{
     model::{ABI_VERSION_V0, Dependency, RenderInputV0, RootProjection},
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-#[cfg(feature = "test-failpoints")]
+#[cfg(all(feature = "test-failpoints", test))]
 use tokio::time::{Instant as TokioInstant, sleep, timeout_at};
 
 #[cfg(feature = "test-failpoints")]
@@ -50,7 +52,7 @@ use crate::{
     fresh_root_snapshot_from_transport_prewrite_in_operation, load_machine_from_transport,
     load_machine_from_transport_in_operation,
 };
-#[cfg(feature = "test-failpoints")]
+#[cfg(all(feature = "test-failpoints", test))]
 use oxideloop_kube_transport::ObjectV0;
 
 /// Explicit production inputs.  There is no archive-file, TCP renderer, or
@@ -215,16 +217,11 @@ impl ControllerDriverV0 {
         let (mut root_watch, initial_machine) =
             establish_root_barrier(&self.transport, &self.config).await?;
         let mut actor = initial_machine.map(start_actor);
-        if let Some(active) = actor
+        if let Some(message) = actor
             .as_ref()
-            .filter(|active| active.state().is_root_only_deletion_recovery())
+            .and_then(|active| deletion_recovery_observability(&self.config, active.state()))
         {
-            eprintln!(
-                "oxideloop: entering receipt-bounded root-only deletion recovery for {}/{} uid={}",
-                self.config.namespace,
-                self.config.root_name,
-                active.state().root().uid
-            );
+            eprintln!("{message}");
         }
         let mut fixed_point: Option<KubeFixedPointPortV0<'_, UnixRendererPortV0>> = None;
         let mut automation_watch: Option<AutomationRunObservationBarrierV0> = None;
@@ -363,12 +360,13 @@ impl ControllerDriverV0 {
             let root_barrier_before_drain = active.barrier();
             match drain_root_watch(&mut root_watch, active, &self.transport, &self.config).await? {
                 RootWatchDrainV0::Current => {}
-                RootWatchDrainV0::RootOnlyRecovery => {
+                RootWatchDrainV0::DeletionRecovery => {
                     clear_root_only_recovery_ephemera(
                         &mut fixed_point,
                         &mut automation_watch,
                         &mut automation_candidates,
                     );
+                    descriptors.clear();
                     continue;
                 }
                 RootWatchDrainV0::Invalidated => {
@@ -381,6 +379,12 @@ impl ControllerDriverV0 {
                             &mut automation_watch,
                             &mut automation_candidates,
                         );
+                        descriptors.clear();
+                        if let Some(message) =
+                            deletion_recovery_observability(&self.config, active.state())
+                        {
+                            eprintln!("{message}");
+                        }
                         continue;
                     }
                 }
@@ -733,6 +737,7 @@ impl ControllerDriverV0 {
                                     &mut automation_watch,
                                     &mut automation_candidates,
                                 );
+                                descriptors.clear();
                             }
                             continue;
                         }
@@ -812,36 +817,133 @@ impl ControllerDriverV0 {
                             "Kubernetes command did not produce an acknowledgement".into(),
                         )
                     })?;
-                    #[cfg(feature = "test-failpoints")]
-                    if deletion_barrier.is_some()
-                        && matches!(command, CommandV0::RemoveStateFinalizer { .. })
-                    {
-                        if !is_exact_state_finalizer_result(&command, &event) {
-                            return Err(RuntimeErrorV0::Hold(
-                                "armed deletion barrier received a mismatched state-finalizer acknowledgement"
-                                    .into(),
-                            ));
-                        }
-                        let barrier = deletion_barrier.take().ok_or_else(|| {
-                            RuntimeErrorV0::Hold(
-                                "armed deletion barrier disappeared before interception".into(),
-                            )
-                        })?;
-                        verify_deletion_barrier_and_wait(
-                            barrier,
-                            &event,
-                            active,
-                            &self.transport,
-                            &self.config,
-                        )
-                        .await?;
-                        return Err(RuntimeErrorV0::InjectedCrash(
-                            crate::FailpointV0::AfterStateFinalizerBeforeRootFinalizer,
-                        ));
-                    }
                     // Exact effect acknowledgement is reducer authority and
                     // must reduce before an observed root closure/rebase.
+                    let is_state_finalizer_ack = matches!(
+                        (&command, &event),
+                        (
+                            CommandV0::RemoveStateFinalizer { .. },
+                            EventV0::StateFinalizerRemoved { .. }
+                        )
+                    );
+                    let is_retired_state_delete_ack = matches!(
+                        (&command, &event),
+                        (
+                            CommandV0::DeleteRetiredState { .. },
+                            EventV0::RetiredStateDeleted { .. }
+                        )
+                    );
                     active.acknowledge(event)?;
+                    if is_state_finalizer_ack {
+                        // Reduce the exact acknowledgement far enough to
+                        // establish the one pending tombstone DELETE, but do
+                        // not poll it. Reclassify raw Kubernetes state and
+                        // replace the whole actor so no linked renderer,
+                        // dependency, collision, automation, dispatch, or
+                        // mutation ephemera can cross the authority cut.
+                        let pending_delete = active.next_command()?.ok_or_else(|| {
+                            RuntimeErrorV0::Hold(
+                                "state-finalizer acknowledgement did not queue retired State DELETE"
+                                    .into(),
+                            )
+                        })?;
+                        let fresh = load_machine_from_transport(
+                            &self.transport,
+                            &self.config.namespace,
+                            &self.config.root_name,
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            RuntimeErrorV0::Hold(
+                                "root disappeared while classifying retired State".into(),
+                            )
+                        })?;
+                        validate_deletion_authority_cut(
+                            DeletionAuthorityCutV0::LinkedToRetired,
+                            active.state(),
+                            &fresh,
+                            &pending_delete,
+                        )?;
+                        #[cfg(feature = "test-failpoints")]
+                        if deletion_barrier.is_some() {
+                            if !is_exact_retired_state_delete(&pending_delete, active.state()) {
+                                return Err(RuntimeErrorV0::Hold(
+                                    "armed deletion barrier did not reach retired State authority"
+                                        .into(),
+                                ));
+                            }
+                            let barrier = deletion_barrier.take().ok_or_else(|| {
+                                RuntimeErrorV0::Hold(
+                                    "armed deletion barrier disappeared before interception".into(),
+                                )
+                            })?;
+                            verify_deletion_barrier_and_wait(
+                                barrier,
+                                &pending_delete,
+                                active,
+                                &fresh,
+                            )?;
+                            return Err(RuntimeErrorV0::InjectedCrash(
+                                crate::FailpointV0::AfterStateFinalizerBeforeRootFinalizer,
+                            ));
+                        }
+                        *active = start_actor(fresh);
+                        clear_root_only_recovery_ephemera(
+                            &mut fixed_point,
+                            &mut automation_watch,
+                            &mut automation_candidates,
+                        );
+                        descriptors.clear();
+                        if let Some(message) =
+                            deletion_recovery_observability(&self.config, active.state())
+                        {
+                            eprintln!("{message}");
+                        }
+                        continue;
+                    }
+                    if is_retired_state_delete_ack {
+                        // The 404-proven tombstone acknowledgement is the
+                        // retired-to-root-only cut. Reduce only enough to
+                        // observe the new root-only child proof, then reload
+                        // and replace the actor before that proof can poll.
+                        let pending_verify = active.next_command()?.ok_or_else(|| {
+                            RuntimeErrorV0::Hold(
+                                "retired State deletion acknowledgement did not queue root-only child proof"
+                                    .into(),
+                            )
+                        })?;
+                        let fresh = load_machine_from_transport(
+                            &self.transport,
+                            &self.config.namespace,
+                            &self.config.root_name,
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            RuntimeErrorV0::Hold(
+                                "root disappeared while classifying root-only deletion recovery"
+                                    .into(),
+                            )
+                        })?;
+                        validate_deletion_authority_cut(
+                            DeletionAuthorityCutV0::RetiredToRootOnly,
+                            active.state(),
+                            &fresh,
+                            &pending_verify,
+                        )?;
+                        *active = start_actor(fresh);
+                        clear_root_only_recovery_ephemera(
+                            &mut fixed_point,
+                            &mut automation_watch,
+                            &mut automation_candidates,
+                        );
+                        descriptors.clear();
+                        if let Some(message) =
+                            deletion_recovery_observability(&self.config, active.state())
+                        {
+                            eprintln!("{message}");
+                        }
+                        continue;
+                    }
                     #[cfg(feature = "test-failpoints")]
                     if prepare_barrier.is_some()
                         && matches!(
@@ -1114,6 +1216,7 @@ impl ControllerDriverV0 {
                             &mut automation_watch,
                             &mut automation_candidates,
                         );
+                        descriptors.clear();
                     }
                 }
             }
@@ -2692,6 +2795,28 @@ fn start_actor(machine: MachineStateV0) -> RootActorV0 {
     actor
 }
 
+/// Returns the operator-facing mode-transition record for either restricted
+/// deletion authority. The caller emits this after every whole-actor install,
+/// including the retired-State to root-only cut within one process.
+fn deletion_recovery_observability(
+    config: &DriverConfigV0,
+    state: &MachineStateV0,
+) -> Option<String> {
+    let mode = if state.is_root_only_deletion_recovery() {
+        "receipt-bounded root-only deletion recovery"
+    } else if state.is_retired_state_recovery() {
+        "exact retired-State deletion recovery"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "oxideloop: entering {mode} for {}/{} uid={}",
+        config.namespace,
+        config.root_name,
+        state.root().uid
+    ))
+}
+
 /// Establishes the root list/watch/exact-GET barrier. Every start and watch
 /// restart uses this one helper so a root that appeared or changed between
 /// list and watch is still observed without requiring another event.
@@ -2760,7 +2885,7 @@ async fn drain_root_watch(
                 if watch_targets_root(&event, &config.root_name)
                     && refresh_actor_from_transport(actor, transport, config).await?
                 {
-                    return Ok(RootWatchDrainV0::RootOnlyRecovery);
+                    return Ok(RootWatchDrainV0::DeletionRecovery);
                 }
             }
             Ok(None) => return Ok(RootWatchDrainV0::Current),
@@ -2785,12 +2910,12 @@ async fn drain_root_watch(
 }
 
 /// The exact root stream may either leave the current actor authoritative,
-/// require a new list/watch/GET epoch, or reveal that its linked state has
-/// vanished and only receipt-bounded deletion authority remains.
+/// require a new list/watch/GET epoch, or cross a restricted deletion
+/// authority boundary that requires whole-actor replacement.
 enum RootWatchDrainV0 {
     Current,
     Invalidated,
-    RootOnlyRecovery,
+    DeletionRecovery,
 }
 
 async fn refresh_actor_from_transport(
@@ -2809,7 +2934,7 @@ fn refresh_actor_from_machine(
 ) -> Result<bool, RuntimeErrorV0> {
     match fresh {
         Some(fresh) if fresh.root().uid == actor.state().root().uid => {
-            if replace_actor_with_root_only_recovery(actor, &fresh) {
+            if replace_actor_with_deletion_recovery(actor, &fresh) {
                 return Ok(true);
             }
             actor.root_observed(fresh.root().clone());
@@ -2837,11 +2962,13 @@ fn refresh_actor_from_machine(
 /// built through the loader's exact root/state rereads; it therefore replaces
 /// normal actor state instead of attempting to rebase stale state-backed
 /// commands across a deleted journal object.
-fn replace_actor_with_root_only_recovery(actor: &mut RootActorV0, fresh: &MachineStateV0) -> bool {
+fn replace_actor_with_deletion_recovery(actor: &mut RootActorV0, fresh: &MachineStateV0) -> bool {
+    let replace_retired = fresh.is_retired_state_recovery();
+    let replace_root_only =
+        fresh.is_root_only_deletion_recovery() && !actor.state().is_root_only_deletion_recovery();
     if fresh.root().uid == actor.state().root().uid
         && fresh.root().deleting
-        && fresh.is_root_only_deletion_recovery()
-        && !actor.state().is_root_only_deletion_recovery()
+        && (replace_retired || replace_root_only)
     {
         *actor = start_actor(fresh.clone());
         true
@@ -2854,7 +2981,7 @@ fn replace_actor_with_root_only_recovery(actor: &mut RootActorV0, fresh: &Machin
 /// absent state object. Receipt-bounded recovery starts a new restricted actor
 /// instead; all other same-UID stale roots retain the ordinary rebase path.
 fn recover_stale_command_actor(actor: &mut RootActorV0, fresh: &MachineStateV0) -> bool {
-    if replace_actor_with_root_only_recovery(actor, fresh) {
+    if replace_actor_with_deletion_recovery(actor, fresh) {
         true
     } else {
         actor.recover_stale_preflight(fresh.root().clone());
@@ -2936,7 +3063,167 @@ fn root_address(
     })
 }
 
-#[cfg(feature = "test-failpoints")]
+/// The two irreversible boundaries in the closed deletion-authority
+/// progression.  A replacement actor is allowed only after this validator
+/// binds the old actor, fresh raw classifier result, and the one pending
+/// effect to the same root and cleanup receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeletionAuthorityCutV0 {
+    LinkedToRetired,
+    RetiredToRootOnly,
+}
+
+fn recovery_preconditions_match(
+    preconditions: &PreconditionsV0,
+    root: &oxideloop_controller_core::RootSnapshotV0,
+) -> bool {
+    preconditions.root_uid == root.uid
+        && preconditions.root_generation == root.generation
+        && preconditions.root_resource_version == root.root_resource_version
+        && preconditions.state_uid == root.state_uid
+        && preconditions.state_resource_version == root.state_resource_version
+        && preconditions.observation_token.is_empty()
+        && preconditions.cache_epoch.is_empty()
+}
+
+fn exact_deletion_link(
+    root: &oxideloop_controller_core::RootSnapshotV0,
+) -> Result<
+    (
+        &oxideloop_controller_api::DeletionCleanupReceipt,
+        &oxideloop_controller_api::StateLink,
+    ),
+    RuntimeErrorV0,
+> {
+    let receipt =
+        oxideloop_controller_core::validate_deleting_root_receipt(root).map_err(|error| {
+            RuntimeErrorV0::Hold(format!("deletion cut receipt is invalid: {error}"))
+        })?;
+    let link =
+        root.status.state.as_ref().ok_or_else(|| {
+            RuntimeErrorV0::Hold("deletion cut root has no exact State link".into())
+        })?;
+    let deterministic_name = oxideloop_controller_api::state_name(&root.uid)
+        .map_err(|error| RuntimeErrorV0::Hold(error.to_string()))?;
+    if !root.deleting
+        || !root.root_finalizer_present
+        || root.state_name != deterministic_name
+        || root.state_uid.is_empty()
+        || link.root_uid != root.uid
+        || link.name != deterministic_name
+        || link.uid != root.state_uid
+        || receipt.root_uid != root.uid
+        || receipt.state_name != deterministic_name
+        || receipt.state_uid != root.state_uid
+    {
+        return Err(RuntimeErrorV0::Hold(
+            "deletion cut root, receipt, or State link is not exact".into(),
+        ));
+    }
+    Ok((receipt, link))
+}
+
+/// Validates the only two whole-actor replacement cuts.  This is production
+/// authority validation, not a failpoint assertion: no same-name root,
+/// receipt, State UID/RV, or pending effect may be adopted across either cut.
+fn validate_deletion_authority_cut(
+    cut: DeletionAuthorityCutV0,
+    active: &MachineStateV0,
+    fresh: &MachineStateV0,
+    pending: &CommandV0,
+) -> Result<(), RuntimeErrorV0> {
+    let active_root = active.root();
+    let fresh_root = fresh.root();
+    let (active_receipt, active_link) = exact_deletion_link(active_root)?;
+    let (fresh_receipt, fresh_link) = exact_deletion_link(fresh_root)?;
+    if active_root.uid != fresh_root.uid
+        || active_root.namespace != fresh_root.namespace
+        || active_root.name != fresh_root.name
+        || active_root.generation != fresh_root.generation
+        || active_root.root_resource_version != fresh_root.root_resource_version
+        || active_receipt != fresh_receipt
+        || active_link != fresh_link
+    {
+        return Err(RuntimeErrorV0::Hold(
+            "deletion authority cut changed root identity, version, receipt, or State link".into(),
+        ));
+    }
+
+    match cut {
+        DeletionAuthorityCutV0::LinkedToRetired => {
+            if !active.is_retired_state_recovery()
+                || !fresh.is_retired_state_recovery()
+                || active_root.state_resource_version.is_empty()
+                || active_root.state_resource_version != fresh_root.state_resource_version
+                || active_root.state_finalizer_present
+                || fresh_root.state_finalizer_present
+            {
+                return Err(RuntimeErrorV0::Hold(
+                    "linked-to-retired cut did not retain the exact finalizer-free State tombstone"
+                        .into(),
+                ));
+            }
+            let expected = retired_state_delete_command_token(
+                &fresh_root.uid,
+                fresh_root.generation,
+                &fresh_root.root_resource_version,
+                &fresh_root.state_name,
+                &fresh_root.state_uid,
+                &fresh_root.state_resource_version,
+                &fresh_receipt.deletion_id,
+                fresh_receipt.deletion_start_generation,
+                &fresh_receipt.cleanup_token,
+            );
+            if !matches!(
+                pending,
+                CommandV0::DeleteRetiredState { token, preconditions }
+                    if token == &expected
+                        && recovery_preconditions_match(preconditions, active_root)
+                        && recovery_preconditions_match(preconditions, fresh_root)
+            ) {
+                return Err(RuntimeErrorV0::Hold(
+                    "linked-to-retired cut pending delete does not match exact root and State pins"
+                        .into(),
+                ));
+            }
+        }
+        DeletionAuthorityCutV0::RetiredToRootOnly => {
+            if !active.is_root_only_deletion_recovery()
+                || !fresh.is_root_only_deletion_recovery()
+                || !active_root.state_resource_version.is_empty()
+                || !fresh_root.state_resource_version.is_empty()
+                || active_root.state_finalizer_present
+                || fresh_root.state_finalizer_present
+            {
+                return Err(RuntimeErrorV0::Hold(
+                    "retired-to-root-only cut did not prove State absence under the exact receipt"
+                        .into(),
+                ));
+            }
+            let expected = root_only_owned_children_verify_token(
+                &fresh_receipt.deletion_id,
+                fresh_receipt.deletion_start_generation,
+                &fresh_root.uid,
+                fresh_root.generation,
+                &fresh_root.root_resource_version,
+                &fresh_root.state_uid,
+            );
+            if !matches!(
+                pending,
+                CommandV0::VerifyOwnedChildrenAbsent { token, preconditions }
+                    if token == &expected && recovery_preconditions_match(preconditions, fresh_root)
+            ) {
+                return Err(RuntimeErrorV0::Hold(
+                    "retired-to-root-only cut pending child proof does not match exact root-only pins"
+                        .into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "test-failpoints", test))]
 fn is_exact_state_finalizer_result(command: &CommandV0, event: &EventV0) -> bool {
     matches!(
         (command, event),
@@ -2984,36 +3271,53 @@ fn reject_late_prepare_barrier(
     }
 }
 
-/// Proves the exact root-only deletion recovery state before exposing the
-/// midpoint to e2e. The direct state reread establishes absence first; the
-/// loader then validates the same deleting root, its finalizer, and complete
-/// cleanup receipt without allowing an arbitrary raw object to become proof.
+/// Proves the exact retired-State recovery boundary before exposing the H03
+/// midpoint. The actor already owns the exact pending DELETE but no request
+/// has been polled; the independently loaded machine proves the raw
+/// tombstone classifier accepted the same root/state pins.
 #[cfg(feature = "test-failpoints")]
-async fn verify_deletion_barrier_and_wait(
+fn verify_deletion_barrier_and_wait(
     barrier: EffectBarrierV0,
-    event: &EventV0,
+    pending_delete: &CommandV0,
     active: &RootActorV0,
-    transport: &KubeTransportV0,
-    config: &DriverConfigV0,
+    fresh: &MachineStateV0,
 ) -> Result<(), RuntimeErrorV0> {
-    let original = active.state().root();
-    let (_, state_ref) = root_address(active)?.references();
-    let EventV0::StateFinalizerRemoved {
-        state_uid: expected_state_uid,
-        ..
-    } = event
-    else {
+    validate_deletion_authority_cut(
+        DeletionAuthorityCutV0::LinkedToRetired,
+        active.state(),
+        fresh,
+        pending_delete,
+    )?;
+    if !is_exact_retired_state_delete(pending_delete, active.state()) {
         return Err(RuntimeErrorV0::Hold(
-            "deletion barrier received the wrong event".into(),
+            "deletion barrier did not retain exact retired State delete authority".into(),
         ));
-    };
-    wait_for_exact_state_absence(transport, &state_ref, expected_state_uid).await?;
-    let fresh = load_machine_from_transport(transport, &config.namespace, &config.root_name)
-        .await?
-        .ok_or_else(|| RuntimeErrorV0::Hold("deletion barrier root is absent".into()))?;
-    validate_deletion_barrier_root(original, fresh.root())?;
+    }
+    validate_deletion_barrier_root(active.state().root(), fresh.root())?;
+    if active.state().root().state_uid != fresh.root().state_uid
+        || active.state().root().state_resource_version != fresh.root().state_resource_version
+    {
+        return Err(RuntimeErrorV0::Hold(
+            "deletion barrier retired State pins changed during reclassification".into(),
+        ));
+    }
     tokio::task::block_in_place(|| barrier.reached_and_wait_for_release())
         .map_err(|error| RuntimeErrorV0::Hold(format!("deletion barrier failed: {error}")))
+}
+
+#[cfg(feature = "test-failpoints")]
+fn is_exact_retired_state_delete(command: &CommandV0, state: &MachineStateV0) -> bool {
+    let CommandV0::DeleteRetiredState { preconditions, .. } = command else {
+        return false;
+    };
+    let root = state.root();
+    state.is_retired_state_recovery()
+        && preconditions.root_uid == root.uid
+        && preconditions.root_generation == root.generation
+        && preconditions.root_resource_version == root.root_resource_version
+        && preconditions.state_uid == root.state_uid
+        && preconditions.state_resource_version == root.state_resource_version
+        && !preconditions.state_resource_version.is_empty()
 }
 
 #[cfg(feature = "test-failpoints")]
@@ -3038,35 +3342,10 @@ fn validate_deletion_barrier_root(
     Ok(())
 }
 
-#[cfg(feature = "test-failpoints")]
-const STATE_ABSENCE_TOTAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-#[cfg(feature = "test-failpoints")]
-const STATE_ABSENCE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
-
 /// Deletion of a state object can lag its successful finalizer patch. Only
 /// the exact state UID may remain during this bounded wait; a same-name
 /// replacement is never a reason to wait or continue the deletion protocol.
-#[cfg(feature = "test-failpoints")]
-async fn wait_for_exact_state_absence(
-    transport: &KubeTransportV0,
-    state_ref: &ObjectRefV0,
-    expected_uid: &str,
-) -> Result<(), RuntimeErrorV0> {
-    wait_for_exact_state_absence_with(
-        || async {
-            transport
-                .reread(state_ref)
-                .await
-                .map_err(RuntimeErrorV0::from)
-        },
-        expected_uid,
-        STATE_ABSENCE_TOTAL_DEADLINE,
-        STATE_ABSENCE_POLL_INTERVAL,
-    )
-    .await
-}
-
-#[cfg(feature = "test-failpoints")]
+#[cfg(all(feature = "test-failpoints", test))]
 async fn wait_for_exact_state_absence_with<F, Fut>(
     mut reread: F,
     expected_uid: &str,
@@ -3099,7 +3378,7 @@ where
 
 /// Returns true only for absence; the exact pre-delete UID is retryable and
 /// any replacement closes the failpoint without exposing a midpoint.
-#[cfg(feature = "test-failpoints")]
+#[cfg(all(feature = "test-failpoints", test))]
 fn state_absence_step(
     observed: Option<&ObjectV0>,
     expected_uid: &str,
@@ -3991,6 +4270,219 @@ mod tests {
         };
         MachineStateV0::recover_deleting_root_without_state(root)
             .expect("receipt-bounded root-only recovery")
+    }
+
+    fn receipt_bounded_retired_state_machine() -> MachineStateV0 {
+        let mut root = receipt_bounded_root_only_machine().root().clone();
+        let receipt = root
+            .status
+            .deletion_cleanup_receipt
+            .as_ref()
+            .expect("deletion receipt")
+            .clone();
+        root.state_name = receipt.state_name.clone();
+        root.state_uid = receipt.state_uid.clone();
+        root.state_resource_version = "retired-state-rv".into();
+        root.status.state = Some(StateLink {
+            root_uid: root.uid.clone(),
+            name: receipt.state_name,
+            uid: receipt.state_uid,
+        });
+        MachineStateV0::recover_deleting_root_with_retired_state(root)
+            .expect("receipt-bounded retired-State recovery")
+    }
+
+    fn root_only_machine_from_retired(retired: &MachineStateV0) -> MachineStateV0 {
+        let mut root = retired.root().clone();
+        root.state_resource_version.clear();
+        root.state_finalizer_present = false;
+        MachineStateV0::recover_deleting_root_without_state(root)
+            .expect("receipt-bounded root-only machine from retired State")
+    }
+
+    fn retired_machine_with(
+        mutator: impl FnOnce(&mut oxideloop_controller_core::RootSnapshotV0),
+    ) -> MachineStateV0 {
+        let mut root = receipt_bounded_retired_state_machine().root().clone();
+        mutator(&mut root);
+        MachineStateV0::recover_deleting_root_with_retired_state(root)
+            .expect("mutated fixture remains an internally valid retired State")
+    }
+
+    #[test]
+    fn deletion_recovery_replaces_actor_at_each_authority_boundary() {
+        let mut actor = automation_candidate_actor();
+        actor.start();
+        let retired = receipt_bounded_retired_state_machine();
+        assert!(replace_actor_with_deletion_recovery(&mut actor, &retired));
+        assert!(actor.state().is_retired_state_recovery());
+        assert!(matches!(
+            actor.next_command(),
+            Ok(Some(CommandV0::DeleteRetiredState { preconditions, .. }))
+                if preconditions.state_uid == "deleted-state-uid"
+                    && preconditions.state_resource_version == "retired-state-rv"
+        ));
+
+        let root_only = receipt_bounded_root_only_machine();
+        assert!(replace_actor_with_deletion_recovery(&mut actor, &root_only));
+        assert!(actor.state().is_root_only_deletion_recovery());
+        assert!(matches!(
+            actor.next_command(),
+            Ok(Some(CommandV0::VerifyOwnedChildrenAbsent { preconditions, .. }))
+                if preconditions.state_uid == "deleted-state-uid"
+                    && preconditions.state_resource_version.is_empty()
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn deletion_authority_cuts_require_the_same_root_receipt_link_and_state_pins() {
+        let started_retired = oxideloop_controller_core::reduce(
+            receipt_bounded_retired_state_machine(),
+            EventV0::Start,
+        )
+        .expect("retired State starts its one delete");
+        let delete = started_retired.commands[0].clone();
+        let active_retired = started_retired.state;
+        let fresh_retired = receipt_bounded_retired_state_machine();
+        assert!(
+            validate_deletion_authority_cut(
+                DeletionAuthorityCutV0::LinkedToRetired,
+                &active_retired,
+                &fresh_retired,
+                &delete,
+            )
+            .is_ok()
+        );
+
+        let (delete_token, delete_pins) = match &delete {
+            CommandV0::DeleteRetiredState {
+                token,
+                preconditions,
+            } => (token.clone(), preconditions.clone()),
+            command => panic!("unexpected retired State command: {command:?}"),
+        };
+        let started_root_only = oxideloop_controller_core::reduce(
+            active_retired,
+            EventV0::RetiredStateDeleted {
+                token: delete_token,
+                state_uid: delete_pins.state_uid,
+                state_resource_version: delete_pins.state_resource_version,
+            },
+        )
+        .expect("exact delete acknowledgement enters root-only recovery");
+        let verify = started_root_only.commands[0].clone();
+        let active_root_only = started_root_only.state;
+        let fresh_root_only = root_only_machine_from_retired(&fresh_retired);
+        assert!(
+            validate_deletion_authority_cut(
+                DeletionAuthorityCutV0::RetiredToRootOnly,
+                &active_root_only,
+                &fresh_root_only,
+                &verify,
+            )
+            .is_ok()
+        );
+
+        let root_uid_replacement = retired_machine_with(|root| {
+            let replacement_uid = "replacement-root-uid".to_owned();
+            let replacement_name = oxideloop_controller_api::state_name(&replacement_uid)
+                .expect("replacement deterministic name");
+            root.uid = replacement_uid.clone();
+            root.state_name = replacement_name.clone();
+            let link = root.status.state.as_mut().expect("State link");
+            link.root_uid = replacement_uid.clone();
+            link.name = replacement_name.clone();
+            let receipt = root
+                .status
+                .deletion_cleanup_receipt
+                .as_mut()
+                .expect("cleanup receipt");
+            receipt.root_uid = replacement_uid;
+            receipt.state_name = replacement_name;
+        });
+        assert!(
+            validate_deletion_authority_cut(
+                DeletionAuthorityCutV0::LinkedToRetired,
+                &fresh_retired,
+                &root_uid_replacement,
+                &delete,
+            )
+            .is_err()
+        );
+
+        let receipt_drift = retired_machine_with(|root| {
+            root.status
+                .deletion_cleanup_receipt
+                .as_mut()
+                .expect("cleanup receipt")
+                .cleanup_token = "f".repeat(64);
+        });
+        assert!(
+            validate_deletion_authority_cut(
+                DeletionAuthorityCutV0::LinkedToRetired,
+                &fresh_retired,
+                &receipt_drift,
+                &delete,
+            )
+            .is_err()
+        );
+
+        let state_uid_drift = retired_machine_with(|root| {
+            root.state_uid = "replacement-state-uid".into();
+            root.status.state.as_mut().expect("State link").uid = root.state_uid.clone();
+            root.status
+                .deletion_cleanup_receipt
+                .as_mut()
+                .expect("cleanup receipt")
+                .state_uid = root.state_uid.clone();
+        });
+        assert!(
+            validate_deletion_authority_cut(
+                DeletionAuthorityCutV0::LinkedToRetired,
+                &fresh_retired,
+                &state_uid_drift,
+                &delete,
+            )
+            .is_err()
+        );
+
+        let state_rv_drift = retired_machine_with(|root| {
+            root.state_resource_version = "replacement-state-rv".into();
+        });
+        assert!(
+            validate_deletion_authority_cut(
+                DeletionAuthorityCutV0::LinkedToRetired,
+                &fresh_retired,
+                &state_rv_drift,
+                &delete,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn deletion_recovery_observability_names_each_restricted_authority_cut() {
+        let config = drain_root_config();
+        let retired = receipt_bounded_retired_state_machine();
+        let root_only = receipt_bounded_root_only_machine();
+
+        assert_eq!(
+            deletion_recovery_observability(&config, &retired),
+            Some(format!(
+                "oxideloop: entering exact retired-State deletion recovery for ns/root uid={ROOT_UID}"
+            ))
+        );
+        assert_eq!(
+            deletion_recovery_observability(&config, &root_only),
+            Some(format!(
+                "oxideloop: entering receipt-bounded root-only deletion recovery for ns/root uid={ROOT_UID}"
+            ))
+        );
+        assert_eq!(
+            deletion_recovery_observability(&config, automation_candidate_actor().state()),
+            None
+        );
     }
 
     #[test]

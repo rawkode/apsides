@@ -108,6 +108,9 @@ pub enum PhaseV0 {
     DeletionObservationPending,
     OwnedChildrenVerifyPending,
     StateFinalizerPending,
+    /// The exact linked State finalizer has been removed. The only remaining
+    /// authority is a single exact-State DELETE followed by a 404 proof.
+    RetiredStateDeletePending,
     RootFinalizerPending,
     RootDeletionVerifyPending,
     RootStatusPersistPending,
@@ -118,6 +121,23 @@ pub enum PhaseV0 {
     BlockedForeignCollision,
     Terminal,
     Hold,
+}
+
+/// Closed deletion authority.  A deleting machine can move only forward from
+/// an ordinary linked State, through the exact retired State tombstone, to the
+/// receipt-bounded root-only tail.  Keeping the pins in the mode (rather than
+/// as independently combinable flags) prevents an empty State RV from being
+/// interpreted as either linked or absent authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum DeletionAuthorityModeV0 {
+    #[default]
+    Linked,
+    RetiredState {
+        state_uid: String,
+        state_resource_version: String,
+    },
+    RootOnly,
 }
 
 /// Never serialized as an executable continuation.  It is public (there is no
@@ -233,12 +253,10 @@ pub struct MachineStateV0 {
     journal: OxideLoopStateSpec,
     phase: PhaseV0,
     frozen: Option<FrozenInputV0>,
-    /// True only for the receipt-backed recovery path after the linked state
-    /// object is freshly observed absent. This mode can verify and remove the
-    /// root finalizer, but it can never bootstrap or persist a replacement
-    /// state object.
+    /// The only deletion authority that may issue commands. This is a closed
+    /// progression: `Linked -> RetiredState -> RootOnly`.
     #[serde(default)]
-    root_only_deletion_recovery: bool,
+    deletion_authority: DeletionAuthorityModeV0,
     #[serde(skip, default)]
     runtime: RuntimeStateV0,
 }
@@ -255,7 +273,7 @@ struct MachineStateWireV0 {
     #[allow(dead_code)]
     frozen: Option<FrozenInputV0>,
     #[serde(default)]
-    root_only_deletion_recovery: bool,
+    deletion_authority: DeletionAuthorityModeV0,
 }
 
 impl<'de> Deserialize<'de> for MachineStateV0 {
@@ -264,6 +282,17 @@ impl<'de> Deserialize<'de> for MachineStateV0 {
         D: serde::Deserializer<'de>,
     {
         let wire = MachineStateWireV0::deserialize(deserializer)?;
+        if matches!(
+            wire.deletion_authority,
+            DeletionAuthorityModeV0::RetiredState { .. }
+        ) {
+            // A retired State is raw-object authority, not durable reducer
+            // continuation. A restart must enter it only through the loader's
+            // exact fresh tombstone classifier.
+            return Err(serde::de::Error::custom(
+                "retired State authority requires fresh raw reclassification",
+            ));
+        }
         // Never revive a serialized phase, frozen input, or runtime issuance
         // capability. The first legal event after deserialization is Start.
         Ok(Self {
@@ -271,7 +300,7 @@ impl<'de> Deserialize<'de> for MachineStateV0 {
             journal: wire.journal,
             phase: PhaseV0::Recovery,
             frozen: None,
-            root_only_deletion_recovery: wire.root_only_deletion_recovery,
+            deletion_authority: wire.deletion_authority,
             runtime: RuntimeStateV0::default(),
         })
     }
@@ -286,7 +315,7 @@ impl MachineStateV0 {
             journal,
             phase: PhaseV0::Bootstrap,
             frozen: None,
-            root_only_deletion_recovery: false,
+            deletion_authority: DeletionAuthorityModeV0::Linked,
             runtime: RuntimeStateV0 {
                 requires_revalidation: false,
                 pending_automation: None,
@@ -337,7 +366,7 @@ impl MachineStateV0 {
             journal: state,
             phase: PhaseV0::Bootstrap,
             frozen: None,
-            root_only_deletion_recovery: false,
+            deletion_authority: DeletionAuthorityModeV0::Linked,
             runtime: RuntimeStateV0 {
                 requires_revalidation: false,
                 pending_automation: None,
@@ -398,10 +427,47 @@ impl MachineStateV0 {
             journal,
             phase: PhaseV0::Recovery,
             frozen: None,
-            root_only_deletion_recovery: true,
+            deletion_authority: DeletionAuthorityModeV0::RootOnly,
             runtime: RuntimeStateV0::default(),
         };
         validate_root_only_deletion_machine(&state)?;
+        Ok(state)
+    }
+
+    /// Creates the non-serializable tombstone authority after a fresh raw
+    /// classifier has established that the exact linked State is deleting,
+    /// finalizer-free, and still present. Its body is intentionally reduced
+    /// to the root receipt: callers must not deserialize State spec/status on
+    /// this recovery path.
+    pub fn recover_deleting_root_with_retired_state(
+        mut root: RootSnapshotV0,
+    ) -> Result<Self, ReconcileError> {
+        validate_bootstrap_root(&root)?;
+        let receipt = validate_deleting_root_receipt(&root)?.clone();
+        if root.state_name != receipt.state_name
+            || root.state_uid != receipt.state_uid
+            || root.state_resource_version.is_empty()
+            || root.state_finalizer_present
+        {
+            return Err(ReconcileError::Recovery(
+                "retired State pins do not match the cleanup receipt".into(),
+            ));
+        }
+        root.state_name.clone_from(&receipt.state_name);
+        root.state_uid.clone_from(&receipt.state_uid);
+        let journal = receipt_only_deletion_journal(&root, &receipt)?;
+        let state = Self {
+            deletion_authority: DeletionAuthorityModeV0::RetiredState {
+                state_uid: root.state_uid.clone(),
+                state_resource_version: root.state_resource_version.clone(),
+            },
+            root,
+            journal,
+            phase: PhaseV0::Recovery,
+            frozen: None,
+            runtime: RuntimeStateV0::default(),
+        };
+        validate_retired_state_machine(&state)?;
         Ok(state)
     }
 
@@ -409,7 +475,7 @@ impl MachineStateV0 {
     pub fn recover_json(serialized: &str) -> Result<Self, ReconcileError> {
         let state: Self = serde_json::from_str(serialized)
             .map_err(|e| ReconcileError::Recovery(e.to_string()))?;
-        if state.root_only_deletion_recovery {
+        if matches!(state.deletion_authority, DeletionAuthorityModeV0::RootOnly) {
             validate_root_only_deletion_machine(&state)?;
         } else if validate_root_and_journal(&state.root, &state.journal).is_err() {
             validate_bootstrap_machine(&state)?;
@@ -447,7 +513,23 @@ impl MachineStateV0 {
     /// before replacing an active actor with it.
     #[must_use]
     pub const fn is_root_only_deletion_recovery(&self) -> bool {
-        self.root_only_deletion_recovery
+        matches!(self.deletion_authority, DeletionAuthorityModeV0::RootOnly)
+    }
+
+    /// Whether this machine is at the exact-State tombstone boundary. The
+    /// actor must be replaced rather than projecting only a root snapshot so
+    /// no linked renderer or dispatch capability crosses this boundary.
+    #[must_use]
+    pub const fn is_retired_state_recovery(&self) -> bool {
+        matches!(
+            self.deletion_authority,
+            DeletionAuthorityModeV0::RetiredState { .. }
+        )
+    }
+
+    #[must_use]
+    pub const fn deletion_authority(&self) -> &DeletionAuthorityModeV0 {
+        &self.deletion_authority
     }
 
     /// Current reducer phase. A deserialized state always reports Recovery.
@@ -657,6 +739,13 @@ pub enum EventV0 {
         old_state_resource_version: String,
         new_state_resource_version: String,
     },
+    /// The one conditional DELETE of the exact retired State has been proven
+    /// absent. This acknowledgement carries no replacement State authority.
+    RetiredStateDeleted {
+        token: String,
+        state_uid: String,
+        state_resource_version: String,
+    },
     RootFinalizerRemoved {
         token: String,
         root_uid: String,
@@ -800,6 +889,17 @@ pub enum CommandV0 {
         token: String,
         preconditions: PreconditionsV0,
     },
+    /// Deletes one exact State tombstone after its finalizer has been
+    /// removed. Transport may issue it at most once per immutable operation
+    /// session and must prove 404 in that same session; it never replays a
+    /// DELETE within an ambiguous in-process attempt. A later process may
+    /// start another attempt only after fresh raw classification proves the
+    /// same finalizer-free, non-deleting-timestamp UID/RV tombstone and
+    /// unchanged root receipt/link.
+    DeleteRetiredState {
+        token: String,
+        preconditions: PreconditionsV0,
+    },
     RemoveRootFinalizer {
         token: String,
         preconditions: PreconditionsV0,
@@ -855,22 +955,29 @@ pub fn reduce(mut state: MachineStateV0, event: EventV0) -> Result<TransitionV0,
             "recovered state accepts only Start".into(),
         ));
     }
-    if state.root_only_deletion_recovery {
-        validate_root_only_deletion_machine(&state)?;
-    } else if matches!(
-        state.phase,
-        PhaseV0::Bootstrap | PhaseV0::BootstrapPending | PhaseV0::Recovery
-    ) {
+    match &state.deletion_authority {
+        DeletionAuthorityModeV0::RootOnly => validate_root_only_deletion_machine(&state)?,
+        DeletionAuthorityModeV0::RetiredState { .. } => {
+            validate_retired_state_machine(&state)?;
+        }
+        DeletionAuthorityModeV0::Linked => {}
+    }
+    if matches!(state.deletion_authority, DeletionAuthorityModeV0::Linked)
+        && matches!(
+            state.phase,
+            PhaseV0::Bootstrap | PhaseV0::BootstrapPending | PhaseV0::Recovery
+        )
+    {
         validate_bootstrap_machine(&state)?;
-    } else {
+    } else if matches!(state.deletion_authority, DeletionAuthorityModeV0::Linked) {
         validate_root_and_journal(&state.root, &state.journal)?;
     }
-    if state.root_only_deletion_recovery && !root_only_event_allowed(&event) {
+    if !deletion_authority_event_allowed(&state.deletion_authority, &event) {
         state.phase = PhaseV0::Hold;
         return finish(
             state,
             vec![CommandV0::Hold {
-                reason: "event is outside root-only deletion recovery authority".into(),
+                reason: "event is outside deletion recovery authority".into(),
             }],
         );
     }
@@ -1191,6 +1298,17 @@ pub fn reduce(mut state: MachineStateV0, event: EventV0) -> Result<TransitionV0,
             &new_state_resource_version,
             &mut commands,
         ),
+        EventV0::RetiredStateDeleted {
+            token,
+            state_uid,
+            state_resource_version,
+        } => retired_state_deleted(
+            &mut state,
+            &token,
+            &state_uid,
+            &state_resource_version,
+            &mut commands,
+        ),
         EventV0::RootFinalizerRemoved {
             token,
             root_uid,
@@ -1255,28 +1373,44 @@ fn effect_closure_purpose(purpose: PersistPurpose) -> Option<GenerationAdvanceCl
     }
 }
 
-fn root_only_event_allowed(event: &EventV0) -> bool {
-    matches!(
-        event,
-        EventV0::Start
-            | EventV0::RootRefreshed { .. }
-            | EventV0::OwnedChildrenVerifiedAbsent { .. }
-            | EventV0::OwnedChildrenVerificationFailed { .. }
-            | EventV0::RootFinalizerRemoved { .. }
-            | EventV0::RootUidVerifiedAbsent { .. }
-            | EventV0::RootUidAbsenceFailed { .. }
-    )
+fn deletion_authority_event_allowed(mode: &DeletionAuthorityModeV0, event: &EventV0) -> bool {
+    match mode {
+        DeletionAuthorityModeV0::Linked => true,
+        DeletionAuthorityModeV0::RetiredState { .. } => matches!(
+            event,
+            EventV0::Start | EventV0::RootRefreshed { .. } | EventV0::RetiredStateDeleted { .. }
+        ),
+        DeletionAuthorityModeV0::RootOnly => matches!(
+            event,
+            EventV0::Start
+                | EventV0::RootRefreshed { .. }
+                | EventV0::OwnedChildrenVerifiedAbsent { .. }
+                | EventV0::OwnedChildrenVerificationFailed { .. }
+                | EventV0::RootFinalizerRemoved { .. }
+                | EventV0::RootUidVerifiedAbsent { .. }
+                | EventV0::RootUidAbsenceFailed { .. }
+        ),
+    }
 }
 
-fn root_only_command_allowed(command: &CommandV0) -> bool {
-    matches!(
-        command,
-        CommandV0::VerifyOwnedChildrenAbsent { .. }
-            | CommandV0::RemoveRootFinalizer { .. }
-            | CommandV0::VerifyRootUidAbsent { .. }
-            | CommandV0::Hold { .. }
-            | CommandV0::IgnoredStale { .. }
-    )
+fn deletion_authority_command_allowed(mode: &DeletionAuthorityModeV0, command: &CommandV0) -> bool {
+    match mode {
+        DeletionAuthorityModeV0::Linked => true,
+        DeletionAuthorityModeV0::RetiredState { .. } => matches!(
+            command,
+            CommandV0::DeleteRetiredState { .. }
+                | CommandV0::Hold { .. }
+                | CommandV0::IgnoredStale { .. }
+        ),
+        DeletionAuthorityModeV0::RootOnly => matches!(
+            command,
+            CommandV0::VerifyOwnedChildrenAbsent { .. }
+                | CommandV0::RemoveRootFinalizer { .. }
+                | CommandV0::VerifyRootUidAbsent { .. }
+                | CommandV0::Hold { .. }
+                | CommandV0::IgnoredStale { .. }
+        ),
+    }
 }
 
 fn is_effect_ack_pending(phase: PhaseV0) -> bool {
@@ -1332,7 +1466,45 @@ fn root_refreshed(
     commands: &mut Vec<CommandV0>,
 ) -> Result<(), ReconcileError> {
     validate_bootstrap_root(&root)?;
-    if state.root_only_deletion_recovery {
+    if let DeletionAuthorityModeV0::RetiredState {
+        state_uid,
+        state_resource_version,
+    } = &state.deletion_authority
+    {
+        let current_receipt = validate_deleting_root_receipt(&state.root)?.clone();
+        let receipt = match validate_deleting_root_receipt(&root) {
+            Ok(receipt)
+                if root.uid == state.root.uid
+                    && root.namespace == state.root.namespace
+                    && root.root_finalizer_present == state.root.root_finalizer_present
+                    && root.state_name == state.root.state_name
+                    && root.state_uid == *state_uid
+                    && root.state_resource_version == *state_resource_version
+                    && !root.state_finalizer_present
+                    && receipt == &current_receipt =>
+            {
+                receipt.clone()
+            }
+            Ok(_) | Err(_) => {
+                state.phase = PhaseV0::Hold;
+                commands.push(CommandV0::Hold {
+                    reason: "retired State refresh changed root, receipt, or exact State pins"
+                        .into(),
+                });
+                return Ok(());
+            }
+        };
+        root.state_name.clone_from(&receipt.state_name);
+        root.state_uid.clone_from(&receipt.state_uid);
+        state.root = root;
+        state.phase = PhaseV0::RetiredStateDeletePending;
+        commands.push(CommandV0::DeleteRetiredState {
+            token: retired_state_delete_token(state),
+            preconditions: pins(&state.root),
+        });
+        return Ok(());
+    }
+    if matches!(state.deletion_authority, DeletionAuthorityModeV0::RootOnly) {
         if matches!(
             state.phase,
             PhaseV0::RootDeletionVerifyPending | PhaseV0::Terminal | PhaseV0::Hold
@@ -1591,7 +1763,24 @@ fn observation_superseded(
 }
 
 fn start(state: &mut MachineStateV0, commands: &mut Vec<CommandV0>) {
-    if state.root_only_deletion_recovery {
+    if matches!(
+        state.deletion_authority,
+        DeletionAuthorityModeV0::RetiredState { .. }
+    ) {
+        if state.phase != PhaseV0::Recovery {
+            stale(commands, "retired State recovery is already active");
+            return;
+        }
+        state.runtime = RuntimeStateV0::default();
+        state.frozen = None;
+        state.phase = PhaseV0::RetiredStateDeletePending;
+        commands.push(CommandV0::DeleteRetiredState {
+            token: retired_state_delete_token(state),
+            preconditions: pins(&state.root),
+        });
+        return;
+    }
+    if matches!(state.deletion_authority, DeletionAuthorityModeV0::RootOnly) {
         if state.phase != PhaseV0::Recovery {
             stale(commands, "root-only deletion recovery is already active");
             return;
@@ -3566,7 +3755,7 @@ fn deletion_advance(
 
 fn owned_children_token(state: &MachineStateV0) -> Option<String> {
     state.journal.state.deletion.as_ref().map(|deletion| {
-        if state.root_only_deletion_recovery {
+        if matches!(state.deletion_authority, DeletionAuthorityModeV0::RootOnly) {
             return root_only_owned_children_verify_token(
                 &deletion.id,
                 deletion.deletion_start_generation,
@@ -3643,11 +3832,12 @@ fn owned_children_verified(
         .deletion_cleanup_receipt
         .as_ref()
         .map(|receipt| receipt.cleanup_token.as_str());
-    let expected_cleanup_token = if state.root_only_deletion_recovery {
-        receipt_cleanup_token
-    } else {
-        Some(token)
-    };
+    let expected_cleanup_token =
+        if matches!(state.deletion_authority, DeletionAuthorityModeV0::RootOnly) {
+            receipt_cleanup_token
+        } else {
+            Some(token)
+        };
     if state.phase != PhaseV0::OwnedChildrenVerifyPending
         || owned_children_token(state).as_deref() != Some(token)
         || root_uid != state.root.uid
@@ -3722,7 +3912,7 @@ fn state_finalizer_token(state: &MachineStateV0) -> String {
 }
 
 fn root_finalizer_token(state: &MachineStateV0) -> String {
-    if state.root_only_deletion_recovery {
+    if matches!(state.deletion_authority, DeletionAuthorityModeV0::RootOnly) {
         let receipt = state
             .root
             .status
@@ -3817,6 +4007,55 @@ pub fn linked_state_finalizer_command_token(
     ])
 }
 
+/// Deterministic token for deleting the one exact State tombstone after its
+/// finalizer removal. The transport recomputes this from a fresh root,
+/// receipt, and raw State pin immediately before issuing its single DELETE.
+#[must_use]
+pub fn retired_state_delete_command_token(
+    root_uid: &str,
+    root_generation: i64,
+    root_resource_version: &str,
+    state_name: &str,
+    state_uid: &str,
+    state_resource_version: &str,
+    deletion_id: &str,
+    deletion_start_generation: i64,
+    cleanup_token: &str,
+) -> String {
+    hash(&[
+        "retired-state-delete/v0",
+        root_uid,
+        &root_generation.to_string(),
+        root_resource_version,
+        state_name,
+        state_uid,
+        state_resource_version,
+        deletion_id,
+        &deletion_start_generation.to_string(),
+        cleanup_token,
+    ])
+}
+
+fn retired_state_delete_token(state: &MachineStateV0) -> String {
+    let receipt = state
+        .root
+        .status
+        .deletion_cleanup_receipt
+        .as_ref()
+        .expect("retired State delete requires a durable cleanup receipt");
+    retired_state_delete_command_token(
+        &state.root.uid,
+        state.root.generation,
+        &state.root.root_resource_version,
+        &state.root.state_name,
+        &state.root.state_uid,
+        &state.root.state_resource_version,
+        &receipt.deletion_id,
+        receipt.deletion_start_generation,
+        &receipt.cleanup_token,
+    )
+}
+
 /// Deterministic token for the linked root-finalizer removal command after
 /// the exact original State has been proven absent.
 #[must_use]
@@ -3895,7 +4134,64 @@ fn state_finalizer_ack(
     }
     state.root.state_resource_version = new.into();
     state.root.state_finalizer_present = false;
-    let token = owned_children_token(state).expect("deletion record exists");
+    // The finalizer acknowledgement is the only linked-to-retired cut. Drop
+    // the now-unneeded State body atomically with the authority transition;
+    // a restart must reconstruct the tombstone from a fresh raw object.
+    let receipt = validate_deleting_root_receipt(&state.root)
+        .expect("linked State finalizer acknowledgement requires cleanup receipt")
+        .clone();
+    state.journal = receipt_only_deletion_journal(&state.root, &receipt)
+        .expect("cleanup receipt was validated");
+    state.deletion_authority = DeletionAuthorityModeV0::RetiredState {
+        state_uid: state.root.state_uid.clone(),
+        state_resource_version: state.root.state_resource_version.clone(),
+    };
+    state.runtime = RuntimeStateV0::default();
+    state.frozen = None;
+    state.phase = PhaseV0::RetiredStateDeletePending;
+    commands.push(CommandV0::DeleteRetiredState {
+        token: retired_state_delete_token(state),
+        preconditions: pins(&state.root),
+    });
+}
+
+fn retired_state_deleted(
+    state: &mut MachineStateV0,
+    token: &str,
+    state_uid: &str,
+    state_resource_version: &str,
+    commands: &mut Vec<CommandV0>,
+) {
+    let DeletionAuthorityModeV0::RetiredState {
+        state_uid: retired_uid,
+        state_resource_version: retired_rv,
+    } = &state.deletion_authority
+    else {
+        stale(
+            commands,
+            "retired State deletion acknowledgement mode mismatch",
+        );
+        return;
+    };
+    if state.phase != PhaseV0::RetiredStateDeletePending
+        || token != retired_state_delete_token(state)
+        || state_uid != retired_uid
+        || state_resource_version != retired_rv
+        || state_uid != state.root.state_uid
+        || state_resource_version != state.root.state_resource_version
+    {
+        stale(
+            commands,
+            "retired State deletion acknowledgement token/UID/RV mismatch",
+        );
+        return;
+    }
+    // This is an absence-only acknowledgement. Preserve the receipt-bound
+    // State name/UID but erase the State RV before entering root-only mode.
+    state.root.state_resource_version.clear();
+    state.root.state_finalizer_present = false;
+    state.deletion_authority = DeletionAuthorityModeV0::RootOnly;
+    let token = owned_children_token(state).expect("receipt recovery has deletion record");
     state.phase = PhaseV0::OwnedChildrenVerifyPending;
     commands.push(CommandV0::VerifyOwnedChildrenAbsent {
         token,
@@ -5183,6 +5479,65 @@ fn validate_root_and_journal(
     .map_err(|e| ReconcileError::Link(e.to_string()))
 }
 
+fn receipt_only_deletion_journal(
+    root: &RootSnapshotV0,
+    receipt: &DeletionCleanupReceipt,
+) -> Result<OxideLoopStateSpec, ReconcileError> {
+    let journal = OxideLoopStateSpec {
+        state_version: oxideloop_controller_api::STATE_VERSION_V1,
+        root: oxideloop_controller_api::RootBinding {
+            uid: root.uid.clone(),
+            bootstrap_id: bootstrap_id(&root.uid)
+                .map_err(|error| ReconcileError::Recovery(error.to_string()))?,
+            bundle_digest: root.bundle_digest.clone(),
+        },
+        state: StateBody {
+            deletion: Some(DeletionTransaction {
+                id: receipt.deletion_id.clone(),
+                deletion_start_generation: receipt.deletion_start_generation,
+            }),
+            ..StateBody::default()
+        },
+    };
+    journal
+        .validate()
+        .map_err(|error| ReconcileError::Recovery(error.to_string()))?;
+    Ok(journal)
+}
+
+fn validate_retired_state_machine(state: &MachineStateV0) -> Result<(), ReconcileError> {
+    validate_bootstrap_root(&state.root)?;
+    let receipt = validate_deleting_root_receipt(&state.root)?;
+    let DeletionAuthorityModeV0::RetiredState {
+        state_uid,
+        state_resource_version,
+    } = &state.deletion_authority
+    else {
+        return Err(ReconcileError::Recovery(
+            "retired State validator received another authority mode".into(),
+        ));
+    };
+    if state.root.state_name != receipt.state_name
+        || state.root.state_uid != receipt.state_uid
+        || state_uid != &receipt.state_uid
+        || state_resource_version.is_empty()
+        || state_resource_version != &state.root.state_resource_version
+        || state.root.state_finalizer_present
+        || !state.root.root_finalizer_present
+    {
+        return Err(ReconcileError::Recovery(
+            "retired State pins do not match the cleanup receipt".into(),
+        ));
+    }
+    let expected = receipt_only_deletion_journal(&state.root, receipt)?;
+    if state.journal != expected {
+        return Err(ReconcileError::Recovery(
+            "retired State journal exceeds receipt authority".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_root_only_deletion_machine(state: &MachineStateV0) -> Result<(), ReconcileError> {
     validate_bootstrap_root(&state.root)?;
     let receipt = validate_deleting_root_receipt(&state.root)?;
@@ -5195,21 +5550,8 @@ fn validate_root_only_deletion_machine(state: &MachineStateV0) -> Result<(), Rec
             "root-only deletion state pins do not match the cleanup receipt".into(),
         ));
     }
-    state
-        .journal
-        .validate()
-        .map_err(|error| ReconcileError::Recovery(error.to_string()))?;
-    if state.journal.root.uid != state.root.uid
-        || state.journal.root.bundle_digest != state.root.bundle_digest
-        || state.journal.state
-            != (StateBody {
-                deletion: Some(DeletionTransaction {
-                    id: receipt.deletion_id.clone(),
-                    deletion_start_generation: receipt.deletion_start_generation,
-                }),
-                ..StateBody::default()
-            })
-    {
+    let expected = receipt_only_deletion_journal(&state.root, receipt)?;
+    if state.journal != expected {
         return Err(ReconcileError::Recovery(
             "root-only deletion journal exceeds receipt authority".into(),
         ));
@@ -5337,22 +5679,29 @@ fn finish(state: MachineStateV0, commands: Vec<CommandV0>) -> Result<TransitionV
     if commands.len() > MAX_COMMANDS {
         Err(ReconcileError::CommandBound)
     } else {
-        if state.root_only_deletion_recovery {
-            validate_root_only_deletion_machine(&state)?;
-            if commands
-                .iter()
-                .any(|command| !root_only_command_allowed(command))
-            {
-                return Err(ReconcileError::Recovery(
-                    "command exceeds root-only deletion recovery authority".into(),
-                ));
+        match &state.deletion_authority {
+            DeletionAuthorityModeV0::RootOnly => validate_root_only_deletion_machine(&state)?,
+            DeletionAuthorityModeV0::RetiredState { .. } => {
+                validate_retired_state_machine(&state)?;
             }
-        } else if matches!(
-            state.phase,
-            PhaseV0::Bootstrap | PhaseV0::BootstrapPending | PhaseV0::Recovery
-        ) {
+            DeletionAuthorityModeV0::Linked => {}
+        }
+        if commands
+            .iter()
+            .any(|command| !deletion_authority_command_allowed(&state.deletion_authority, command))
+        {
+            return Err(ReconcileError::Recovery(
+                "command exceeds deletion recovery authority".into(),
+            ));
+        }
+        if matches!(state.deletion_authority, DeletionAuthorityModeV0::Linked)
+            && matches!(
+                state.phase,
+                PhaseV0::Bootstrap | PhaseV0::BootstrapPending | PhaseV0::Recovery
+            )
+        {
             validate_bootstrap_machine(&state)?;
-        } else {
+        } else if matches!(state.deletion_authority, DeletionAuthorityModeV0::Linked) {
             validate_root_and_journal(&state.root, &state.journal)?;
         }
         Ok(TransitionV0 { state, commands })
@@ -6493,26 +6842,56 @@ mod tests {
             },
         )
         .unwrap();
-        let second_token = match &root_finalizer.commands[0] {
-            CommandV0::VerifyOwnedChildrenAbsent {
+        let retired_delete_token = match &root_finalizer.commands[0] {
+            CommandV0::DeleteRetiredState {
                 token,
                 preconditions,
             } => {
                 assert_eq!(preconditions.state_resource_version, "14");
                 token.clone()
             }
-            _ => panic!("state acknowledgement must trigger a fresh absence barrier"),
+            _ => panic!("state acknowledgement must queue exact retired State deletion"),
         };
+        assert!(root_finalizer.state.is_retired_state_recovery());
+        let root_finalizer = reduce(
+            root_finalizer.state,
+            EventV0::RetiredStateDeleted {
+                token: retired_delete_token,
+                state_uid: "state-uid".into(),
+                state_resource_version: "14".into(),
+            },
+        )
+        .unwrap();
+        assert!(root_finalizer.state.is_root_only_deletion_recovery());
+        let second_token = match &root_finalizer.commands[0] {
+            CommandV0::VerifyOwnedChildrenAbsent {
+                token,
+                preconditions,
+            } => {
+                assert!(preconditions.state_resource_version.is_empty());
+                token.clone()
+            }
+            _ => panic!("retired State absence must enter root-only child proof"),
+        };
+        let receipt_cleanup_token = root_finalizer
+            .state
+            .root
+            .status
+            .deletion_cleanup_receipt
+            .as_ref()
+            .expect("cleanup receipt")
+            .cleanup_token
+            .clone();
         let root_finalizer = reduce(
             root_finalizer.state,
             EventV0::OwnedChildrenVerifiedAbsent {
-                token: second_token.clone(),
-                cleanup_token: second_token,
+                token: second_token,
+                cleanup_token: receipt_cleanup_token,
                 root_uid: "root-uid".into(),
                 root_generation: 7,
                 root_resource_version: "21".into(),
                 state_uid: "state-uid".into(),
-                state_resource_version: "14".into(),
+                state_resource_version: String::new(),
             },
         )
         .unwrap();
@@ -6521,7 +6900,7 @@ mod tests {
                 token,
                 preconditions,
             } => {
-                assert_eq!(preconditions.state_resource_version, "14");
+                assert!(preconditions.state_resource_version.is_empty());
                 token.clone()
             }
             _ => panic!("state acknowledgement must pin its new RV before root finalization"),
@@ -9488,6 +9867,67 @@ mod tests {
         .unwrap();
         assert_eq!(terminal.state.phase, PhaseV0::Terminal);
         assert!(terminal.commands.is_empty());
+    }
+
+    #[test]
+    fn retired_state_recovery_is_raw_only_and_allows_only_one_exact_delete() {
+        let mut root = root_only_deletion_snapshot(true);
+        root.state_resource_version = "retired-rv".into();
+        let machine = MachineStateV0::recover_deleting_root_with_retired_state(root).unwrap();
+        assert!(machine.is_retired_state_recovery());
+        assert_eq!(
+            machine.journal().state.inventory,
+            Vec::<InventoryEntry>::new()
+        );
+        assert!(machine.journal().state.apply_transaction.is_none());
+
+        // Retired State authority is never trusted from serialized reducer
+        // state; only the runtime raw classifier may reconstruct it.
+        assert!(MachineStateV0::recover_json(&serde_json::to_string(&machine).unwrap()).is_err());
+
+        let started = reduce(machine, EventV0::Start).unwrap();
+        let (delete_token, preconditions) = match started.commands.as_slice() {
+            [
+                CommandV0::DeleteRetiredState {
+                    token,
+                    preconditions,
+                },
+            ] => (token.clone(), preconditions.clone()),
+            commands => panic!("unexpected retired-State commands: {commands:?}"),
+        };
+        assert_eq!(preconditions.state_uid, "deleted-state-uid");
+        assert_eq!(preconditions.state_resource_version, "retired-rv");
+
+        let rejected = reduce(
+            started.state.clone(),
+            EventV0::Persisted {
+                token: "forged".into(),
+                old_state_resource_version: "retired-rv".into(),
+                new_state_resource_version: "forged-next".into(),
+                state_uid: "deleted-state-uid".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            rejected.commands.as_slice(),
+            [CommandV0::Hold { .. }]
+        ));
+
+        let root_only = reduce(
+            started.state,
+            EventV0::RetiredStateDeleted {
+                token: delete_token,
+                state_uid: "deleted-state-uid".into(),
+                state_resource_version: "retired-rv".into(),
+            },
+        )
+        .unwrap();
+        assert!(root_only.state.is_root_only_deletion_recovery());
+        assert!(matches!(
+            root_only.commands.as_slice(),
+            [CommandV0::VerifyOwnedChildrenAbsent { preconditions, .. }]
+                if preconditions.state_resource_version.is_empty()
+        ));
     }
 
     #[test]

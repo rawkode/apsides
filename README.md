@@ -42,6 +42,35 @@ OxideLoop makes no exactly-once claim for that unresolved window; exactly-once
 POST semantics require an admission-side idempotency/witness contract that is
 not yet implemented.
 
+## Retired-State deletion boundary
+
+During root deletion, the linked `OxideLoopState` is first proven to be the
+original object, then its finalizer is removed. The resulting
+`StateFinalizerRemoved` acknowledgement advances durable authority, but does
+not by itself authorize a delete: immediately before dispatch, the runtime
+must freshly classify the exact root and receipt together with the raw State
+UID, name, namespace, GVK, owner, annotation, and finalizer-free shape. That
+fresh proof authorizes at most one conditional `DeleteRetiredState` per
+immutable operation session. There is no in-process DELETE replay after an
+ambiguous response: only that session's exact `404` proof can acknowledge it.
+A later process may make a new attempt only after the full raw classifier
+again proves the same UID/RV, finalizer-free, non-deleting-timestamp tombstone
+and unchanged root receipt/link. A landed DELETE produces absence or a
+deletionTimestamp/resourceVersion change, which cannot reclassify as that
+tombstone or adopt a replacement. The deletion receipt remains on the deleting
+root until the root finalizer is removed. A crash at this seam first classifies
+the retained, unfinalized State as `RetiredState`, revalidates the receipt and
+performs its conditional delete (accepting an already-observed `404`), then
+enters root-only recovery to verify owned children are absent and remove the
+root finalizer.
+
+`cleanupToken` is a deterministic, public correlation value. It is not a
+secret, bearer credential, or proof against a principal that can alter the
+receipt. This demo trusts every principal authorized to patch
+`webapplications/status`; it makes no claim to defend against such a
+principal. RBAC is additive least privilege for the controller and is not
+proof that the controller is the only principal with these capabilities.
+
 ## Design boundary
 
 The spike selects an explicitly React-like TSX runtime for a future process-isolated worker. M0 evaluated its callable bundle in the deliberately rejected in-process harness. Ordinary React rendering works for the tested fixture, but unrestricted React is rejected because a layout-effect callback runs during commit. The current in-process `deno_core` host is rejected as a production boundary because it cannot enforce every memory and fatal-failure limit.

@@ -33,8 +33,8 @@ use oxideloop_controller_api::{
 };
 use oxideloop_controller_core::{
     CommandV0, MutationCommandV0, PreconditionsV0, linked_root_finalizer_command_token,
-    linked_state_finalizer_command_token, root_only_finalizer_command_token,
-    root_only_owned_children_verify_token,
+    linked_state_finalizer_command_token, retired_state_delete_command_token,
+    root_only_finalizer_command_token, root_only_owned_children_verify_token,
 };
 #[cfg(test)]
 use oxideloop_event_planner::semantically_equal;
@@ -2845,7 +2845,7 @@ pub const fn required_rbac_v0() -> &'static [RequiredRbacV0] {
         RequiredRbacV0 {
             resource: ResourceKindV0::OxideLoopState,
             subresource: None,
-            verbs: &["get", "list", "watch", "create", "patch"],
+            verbs: &["get", "list", "watch", "create", "patch", "delete"],
         },
         RequiredRbacV0 {
             resource: ResourceKindV0::AutomationRun,
@@ -4674,6 +4674,13 @@ impl KubeTransportV0 {
                         new_state_resource_version: written.metadata.resource_version,
                     },
                 )))
+            }
+            CommandV0::DeleteRetiredState {
+                token,
+                preconditions,
+            } => {
+                self.delete_retired_state(address, token, preconditions, session)
+                    .await
             }
             CommandV0::RemoveRootFinalizer {
                 token,
@@ -6685,6 +6692,197 @@ impl KubeTransportV0 {
             return Err(TransportErrorV0::ManualRecoveryHold);
         }
         Ok((root, receipt))
+    }
+
+    /// Fresh prewrite fence dedicated to the retired-State DELETE. This is
+    /// deliberately not the generic linked fence: the State body is no
+    /// longer authority, and both the root receipt and raw tombstone shape
+    /// must be re-established immediately before the one irreversible DELETE.
+    async fn retired_state_delete_fence(
+        &self,
+        address: &RootAddressV0,
+        token: &str,
+        preconditions: &PreconditionsV0,
+        session: &OperationSessionV0,
+    ) -> Result<(ObjectV0, ObjectV0, DeletionCleanupReceipt), TransportErrorV0> {
+        if preconditions.state_uid.is_empty() || preconditions.state_resource_version.is_empty() {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        let (root_ref, state_ref) = address.references();
+        let root = self
+            .reread_prewrite_in_operation(&root_ref, session)
+            .await?
+            .ok_or(TransportErrorV0::ManualRecoveryHold)?;
+        let root_metadata = root.value.get("metadata").and_then(Value::as_object);
+        if root.reference != root_ref
+            || root.value.get("apiVersion").and_then(Value::as_str)
+                != Some(ResourceKindV0::WebApplication.api_version())
+            || root.value.get("kind").and_then(Value::as_str)
+                != Some(ResourceKindV0::WebApplication.kind())
+            || root_metadata
+                .and_then(|metadata| metadata.get("name"))
+                .and_then(Value::as_str)
+                != Some(address.name.as_str())
+            || root_metadata
+                .and_then(|metadata| metadata.get("namespace"))
+                .and_then(Value::as_str)
+                != Some(address.namespace.as_str())
+            || root.metadata.uid != preconditions.root_uid
+            || root.metadata.resource_version != preconditions.root_resource_version
+            || generation(&root)? != preconditions.root_generation
+            || !raw_metadata_pins_match(&root)
+            || !has_finalizer(&root, ROOT_FINALIZER)
+            || root
+                .value
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        let status = serde_json::from_value::<WebApplicationStatus>(
+            root.value
+                .get("status")
+                .cloned()
+                .ok_or(TransportErrorV0::ManualRecoveryHold)?,
+        )
+        .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+        let receipt = status
+            .deletion_cleanup_receipt
+            .clone()
+            .ok_or(TransportErrorV0::ManualRecoveryHold)?;
+        receipt
+            .validate()
+            .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+        let expected_state_name = oxideloop_controller_api::state_name(&root.metadata.uid)
+            .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+        let Some(link) = status.state.as_ref() else {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        };
+        if receipt.root_uid != root.metadata.uid
+            || receipt.state_name != expected_state_name
+            || receipt.state_name != address.state_name
+            || receipt.state_uid != preconditions.state_uid
+            || receipt.deletion_start_generation > generation(&root)?
+            || link.root_uid != root.metadata.uid
+            || link.name != receipt.state_name
+            || link.uid != receipt.state_uid
+        {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        let state = self
+            .reread_prewrite_in_operation(&state_ref, session)
+            .await?
+            .ok_or(TransportErrorV0::ManualRecoveryHold)?;
+        let metadata = state
+            .value
+            .get("metadata")
+            .and_then(Value::as_object)
+            .ok_or(TransportErrorV0::ManualRecoveryHold)?;
+        let raw_finalizers = match metadata.get("finalizers") {
+            None => Some(Vec::new()),
+            Some(Value::Array(values)) => {
+                values.iter().map(Value::as_str).collect::<Option<Vec<_>>>()
+            }
+            Some(_) => None,
+        };
+        let root_uid_annotation = metadata
+            .get("annotations")
+            .and_then(Value::as_object)
+            .and_then(|annotations| annotations.get(ROOT_UID_ANNOTATION))
+            .and_then(Value::as_str);
+        if state.reference != state_ref
+            || state.metadata.uid != preconditions.state_uid
+            || state.metadata.resource_version != preconditions.state_resource_version
+            || !raw_metadata_pins_match(&state)
+            || state.value.get("apiVersion").and_then(Value::as_str)
+                != Some(ResourceKindV0::OxideLoopState.api_version())
+            || state.value.get("kind").and_then(Value::as_str)
+                != Some(ResourceKindV0::OxideLoopState.kind())
+            || metadata.get("name").and_then(Value::as_str) != Some(address.state_name.as_str())
+            || metadata.get("namespace").and_then(Value::as_str) != Some(address.namespace.as_str())
+            || metadata.contains_key("deletionTimestamp")
+            || raw_finalizers.is_none_or(|finalizers| !finalizers.is_empty())
+            || root_uid_annotation != Some(root.metadata.uid.as_str())
+            || state
+                .metadata
+                .annotations
+                .get(ROOT_UID_ANNOTATION)
+                .is_none_or(|value| value != root.metadata.uid.as_str())
+            || !has_exact_canonical_owner(&state, &root_ref, &root.metadata.uid)
+        {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        let expected_token = retired_state_delete_command_token(
+            &root.metadata.uid,
+            generation(&root)?,
+            &root.metadata.resource_version,
+            &receipt.state_name,
+            &state.metadata.uid,
+            &state.metadata.resource_version,
+            &receipt.deletion_id,
+            receipt.deletion_start_generation,
+            &receipt.cleanup_token,
+        );
+        if token != expected_token {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        Ok((root, state, receipt))
+    }
+
+    /// Deletes exactly one finalizer-free retired State in this immutable
+    /// operation session. A Kubernetes 2xx is not acknowledgement: both it
+    /// and every ambiguous result must be followed by an in-session 404
+    /// proof, and this method never replays the DELETE after the write poll.
+    /// A later process can make a new attempt only after its fresh raw
+    /// classifier proves the same UID/RV, finalizer-free tombstone and the
+    /// unchanged root receipt/link. A landed DELETE yields absence or a
+    /// deletionTimestamp/resourceVersion change, neither of which can
+    /// reclassify as a fresh tombstone.
+    async fn delete_retired_state(
+        &self,
+        address: &RootAddressV0,
+        token: &str,
+        preconditions: &PreconditionsV0,
+        session: &OperationSessionV0,
+    ) -> Result<CommandOutcomeV0, TransportErrorV0> {
+        let (_root, state, _receipt) = self
+            .retired_state_delete_fence(address, token, preconditions, session)
+            .await?;
+        let state_ref = ObjectRefV0 {
+            resource: ResourceKindV0::OxideLoopState,
+            namespace: address.namespace.clone(),
+            name: address.state_name.clone(),
+        };
+        let delete_result = self
+            .delete(
+                &state_ref,
+                ResourceKindV0::OxideLoopState,
+                &state.metadata.uid,
+                &state.metadata.resource_version,
+                session,
+            )
+            .await;
+        // Do not distinguish a 2xx from a lost/truncated result as an
+        // acknowledgement. In either case, exactly one bounded proof read is
+        // the only accepted evidence of deletion. No second DELETE exists.
+        let observed = self
+            .recovery_reread(&state_ref, session)
+            .await
+            .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
+        if observed.is_some() {
+            return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        if delete_result.is_err() {
+            session.prove_exact_response_loss_recovery()?;
+        }
+        Ok(CommandOutcomeV0::Event(Box::new(
+            oxideloop_controller_core::EventV0::RetiredStateDeleted {
+                token: token.into(),
+                state_uid: preconditions.state_uid.clone(),
+                state_resource_version: preconditions.state_resource_version.clone(),
+            },
+        )))
     }
 
     async fn verify_root_only_cleanup(
@@ -10007,6 +10205,7 @@ pub fn command_requires_effect_fence(command: &CommandV0) -> bool {
             | CommandV0::EnsureAutomationRun { .. }
             | CommandV0::DeleteAutomationRun { .. }
             | CommandV0::RemoveStateFinalizer { .. }
+            | CommandV0::DeleteRetiredState { .. }
             | CommandV0::RemoveRootFinalizer { .. }
     )
 }
@@ -13812,6 +14011,24 @@ mod tests {
     }
 
     #[test]
+    fn retired_state_delete_is_an_effect_fenced_command() {
+        assert!(command_requires_effect_fence(
+            &CommandV0::DeleteRetiredState {
+                token: "retired-delete".into(),
+                preconditions: PreconditionsV0 {
+                    root_uid: "root-uid".into(),
+                    root_generation: 1,
+                    root_resource_version: "9".into(),
+                    state_uid: "state-uid".into(),
+                    state_resource_version: "4".into(),
+                    observation_token: "observation".into(),
+                    cache_epoch: "epoch".into(),
+                },
+            }
+        ));
+    }
+
+    #[test]
     fn list_dto_retains_empty_collection_resource_version() {
         let list = ListV0 {
             items: vec![],
@@ -13852,7 +14069,7 @@ mod tests {
                 RequiredRbacV0 {
                     resource: ResourceKindV0::OxideLoopState,
                     subresource: None,
-                    verbs: &["get", "list", "watch", "create", "patch"]
+                    verbs: &["get", "list", "watch", "create", "patch", "delete"]
                 },
                 RequiredRbacV0 {
                     resource: ResourceKindV0::AutomationRun,

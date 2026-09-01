@@ -600,6 +600,23 @@ assert_container_restart_snapshot_stable() {
   after_snapshot=$(container_restart_snapshot "$2") || die 'blocked interval after container restart snapshot is invalid'
   jq -ne --argjson before "$before_snapshot" --argjson after "$after_snapshot" '$before == $after' >/dev/null || die 'controller or renderer restart count changed during blocked interval/live recovery'
 }
+assert_retired_state_recovery_log() {
+  log_file=$1
+  # The runtime's public observability contract uses the serialized command
+  # class, not a human-facing Rust enum/debug string. Keep this assertion
+  # scoped to the recovery log so startup prose cannot satisfy it.
+  started_line=$(awk 'length($0) > 0 { print NR "\t" $0 }' "$log_file" |
+    jq -Rr 'try (capture("^(?<line>[0-9]+)\\t(?<json>.*)$") as $line | ($line.json | fromjson) as $record | select($record.event == "effect_started" and $record.command_class == "delete_retired_state") | $line.line) catch empty' |
+    head -1)
+  acknowledged_line=$(awk 'length($0) > 0 { print NR "\t" $0 }' "$log_file" |
+    jq -Rr 'try (capture("^(?<line>[0-9]+)\\t(?<json>.*)$") as $line | ($line.json | fromjson) as $record | select($record.event == "effect_acknowledged" and $record.command_class == "delete_retired_state") | $line.line) catch empty' |
+    head -1)
+  [ -n "$started_line" ] || die 'retired-State recovery log is missing DeleteRetiredState effect start'
+  [ -n "$acknowledged_line" ] || die 'retired-State recovery log is missing RetiredStateDeleted acknowledgement'
+  [ "$started_line" -lt "$acknowledged_line" ] || die 'retired-State recovery log acknowledged DeleteRetiredState before it started'
+  grep -F "oxideloop: entering exact retired-State deletion recovery for $NAMESPACE/root uid=$ROOT_UID" "$log_file" >/dev/null || die 'post-crash process did not enter exact retired-State deletion recovery'
+  grep -F "oxideloop: entering receipt-bounded root-only deletion recovery for $NAMESPACE/root uid=$ROOT_UID" "$log_file" >/dev/null || die 'retired-State recovery did not transition to receipt-bounded root-only deletion recovery'
+}
 assert_collision_blocked_interval() {
   prefix=${1:-collision-blocked}
   for object in root state; do
@@ -1117,10 +1134,12 @@ assert_count "$(ctx get automationruns -n "$NAMESPACE" -o json | jq '.items | le
 assert_automation_transition 3 "$INPUT_UID" "$INPUT_RV" post-ordinary-restart
 capture_transition post-ordinary-restart
 
-# Deletion barrier: the parent owns an RDWR descriptor, so opening the FIFO
-# cannot deadlock if the client crashes before reading.  ARMED and REACHED are
-# emitted by the private controller/client protocol; RELEASE is the only byte
-# this parent can send after the midpoint snapshot has been captured.
+# H03 deletion barrier: the parent owns an RDWR descriptor, so opening the
+# FIFO cannot deadlock if the client crashes before reading. ARMED and REACHED
+# are emitted by the private controller/client protocol; RELEASE is the only
+# byte this parent can send after the exact retained-State midpoint (the
+# StateFinalizerRemoved acknowledgement, before DeleteRetiredState is polled)
+# has been captured.
 FIFO="$WORK/release.fifo"; mkfifo "$FIFO"; exec 9<>"$FIFO"; BARRIER_FD=9
 pod=$(controller_pod)
 DELETE_POD_UID=$(ctx get pod -n "$NAMESPACE" "$pod" -o jsonpath='{.metadata.uid}')
@@ -1137,10 +1156,16 @@ elapsed=0
 while ! grep -q '^REACHED$' "$EVIDENCE/deletion-barrier.txt" 2>/dev/null; do [ "$elapsed" -lt "$TIMEOUT" ] || die 'deletion barrier did not reach REACHED'; sleep 1; elapsed=$((elapsed + 1)); done
 sleep 2
 ctx get webapplication root -n "$NAMESPACE" -o json >"$EVIDENCE/deletion-midpoint-root.json"
-ctx get oxideloopstates -n "$NAMESPACE" -o json >"$EVIDENCE/deletion-midpoint-state.json"
+ctx get oxideloopstate "$STATE_NAME" -n "$NAMESPACE" -o json >"$EVIDENCE/deletion-midpoint-state.json"
 ctx get configmaps,services,automationruns -n "$NAMESPACE" -o json >"$EVIDENCE/deletion-midpoint-owned-children.json"
 jq -e --arg uid "$ROOT_UID" '(.metadata.uid == $uid) and (.metadata.deletionTimestamp != null) and ([.metadata.finalizers[]?] | length > 0)' "$EVIDENCE/deletion-midpoint-root.json" >/dev/null || die 'deletion midpoint lacks original deleting root/finalizer'
-assert_count "$(jq '.items | length' "$EVIDENCE/deletion-midpoint-state.json")" 0 'deletion midpoint state absence'
+jq -e --arg stateUid "$STATE_UID" --arg stateName "$STATE_NAME" --arg namespace "$NAMESPACE" --arg rootUid "$ROOT_UID" '
+  (.apiVersion == "runtime.oxideloop.dev/v1alpha1") and (.kind == "OxideLoopState") and
+  (.metadata.uid == $stateUid) and (.metadata.name == $stateName) and (.metadata.namespace == $namespace) and
+  ([.metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}]) and
+  (.metadata.annotations["runtime.oxideloop.dev/root-uid"] == $rootUid) and
+  (.metadata.deletionTimestamp == null) and ((.metadata.finalizers // []) | length == 0)
+' "$EVIDENCE/deletion-midpoint-state.json" >/dev/null || die 'deletion midpoint did not retain the exact unfinalized original State'
 jq -e --arg rootUid "$ROOT_UID" '[.items[] | select(any(.metadata.ownerReferences[]?; .uid == $rootUid))] | length == 0' "$EVIDENCE/deletion-midpoint-owned-children.json" >/dev/null || die 'deletion midpoint still has a ConfigMap, Service, or AutomationRun owned by the original root'
 jq -e --arg rootUid "$ROOT_UID" --arg stateUid "$STATE_UID" --arg stateName "$STATE_NAME" --argjson generation "$DELETE_ROOT_GENERATION" '
   .status.deletionCleanupReceipt as $receipt |
@@ -1155,6 +1180,10 @@ wait "$BARRIER_PID"; BARRIER_PID=''; exec 9>&-; BARRIER_FD=''
 test "$(controller_pod)" = "$pod" || die 'deletion barrier unexpectedly replaced controller pod'
 wait_for_exact_crash 'deletion barrier' "$pod" "$DELETE_POD_UID" "$((DELETE_RESTART + 1))"
 atomic_capture controller-deletion-previous.log ctx logs -n "$NAMESPACE" "$pod" -c controller --previous --tail=-1 || die 'missing deletion previous log'
+wait_json 'retired State deletion after RELEASE' '.items | length == 0' oxideloopstates
+if ctx get oxideloopstate "$STATE_NAME" -n "$NAMESPACE" >/dev/null 2>&1; then
+  die 'retired State GET did not return 404 after conditional deletion'
+fi
 wait_json 'original root absence after RELEASE' '.items | length == 0' webapplications
 if ctx get webapplication root -n "$NAMESPACE" >/dev/null 2>&1; then die 'original root still exists after deletion'; fi
 elapsed=0
@@ -1170,7 +1199,7 @@ while :; do
   sleep 1; elapsed=$((elapsed + 1))
 done
 atomic_capture controller-root-only-recovery-previous.log ctx logs -n "$NAMESPACE" "$pod" -c controller --previous --tail=-1 || die 'missing root-only recovery log'
-grep -F "oxideloop: entering receipt-bounded root-only deletion recovery for $NAMESPACE/root uid=$ROOT_UID" "$EVIDENCE/controller-root-only-recovery-previous.log" >/dev/null || die 'post-crash process did not enter receipt-bounded root-only recovery'
+assert_retired_state_recovery_log "$EVIDENCE/controller-root-only-recovery-previous.log"
 ctx get all -n "$NAMESPACE" -o yaml >"$EVIDENCE/post-delete-inventory.yaml"
 ctx get webapplications,oxideloopstates,automationruns -n "$NAMESPACE" -o json >"$EVIDENCE/post-delete-controller-inventory.json"
 if ctx get configmap root-config -n "$NAMESPACE" >/dev/null 2>&1; then die 'managed ConfigMap remains after deletion'; fi
@@ -1178,11 +1207,11 @@ assert_count "$(ctx get oxideloopstates -n "$NAMESPACE" -o json | jq '.items | l
 assert_count "$(ctx get automationruns -n "$NAMESPACE" -o json | jq '.items | length')" 0 'post-delete AutomationRun inventory'
 assert_count "$(ctx get service -n "$NAMESPACE" -o json | jq '.items | length')" 0 'post-delete Service inventory'
 wait_json 'post-delete InputChanged Event garbage collection' '[.items[] | select(.reason == "InputChanged")] | length == 0' events.events.k8s.io
-ctx get configmaps,services,automationruns,events.events.k8s.io -n "$NAMESPACE" -o json >"$EVIDENCE/post-delete-owned-objects.json"
+ctx get configmaps,services,automationruns,events.events.k8s.io -n "$NAMESPACE" -o json >"$EVIDENCE/post-delete-root-only-child-check.json"
 jq -e --arg rootUid "$ROOT_UID" '
   ([.items[] | select(any(.metadata.ownerReferences[]?; .uid == $rootUid))] | length == 0) and
   ([.items[] | select(.kind == "Event" and .reason == "InputChanged")] | length == 0)
-' "$EVIDENCE/post-delete-owned-objects.json" >/dev/null || die 'post-delete namespace retains an original-root child or action Event'
+' "$EVIDENCE/post-delete-root-only-child-check.json" >/dev/null || die 'post-delete root-only child check retains an original-root child or action Event'
 atomic_capture prepared-foreign-after-final-root-deletion.json ctx get configmap prepared-foreign-sentinel -n "$NAMESPACE" -o json || die 'final root deletion removed the foreign sentinel'
 cmp -s "$EVIDENCE/prepared-foreign-before.json" "$EVIDENCE/prepared-foreign-after-final-root-deletion.json" || die 'final root deletion mutated the foreign sentinel'
 jq -e '.metadata.ownerReferences == null or (.metadata.ownerReferences | length == 0)' "$EVIDENCE/prepared-foreign-after-final-root-deletion.json" >/dev/null || die 'final root deletion adopted the foreign sentinel'

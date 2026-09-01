@@ -46,7 +46,7 @@ abort invariant_errors.join("; ") unless invariant_errors.empty?
 expected = [
   { "apiGroups" => ["demo.oxideloop.dev"], "resources" => ["webapplications"], "verbs" => %w[get list watch patch] },
   { "apiGroups" => ["demo.oxideloop.dev"], "resources" => ["webapplications/status"], "verbs" => ["patch"] },
-  { "apiGroups" => ["runtime.oxideloop.dev"], "resources" => ["oxideloopstates"], "verbs" => %w[get list watch create patch] },
+  { "apiGroups" => ["runtime.oxideloop.dev"], "resources" => ["oxideloopstates"], "verbs" => %w[get list watch create patch delete] },
   { "apiGroups" => ["runtime.oxideloop.dev"], "resources" => ["automationruns"], "verbs" => %w[get list watch create delete] },
   { "apiGroups" => ["runtime.oxideloop.dev"], "resources" => ["automationruns/status"], "verbs" => ["patch"] },
   { "apiGroups" => [""], "resources" => ["configmaps"], "verbs" => %w[get list watch create patch delete] },

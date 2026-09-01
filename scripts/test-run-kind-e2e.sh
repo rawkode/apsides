@@ -483,6 +483,15 @@ rg -Fq 'terminationMessagePolicy: FallbackToLogsOnError' "$ROOT/deploy/e2e/patch
 rendered_e2e=$(kubectl kustomize "$ROOT/deploy/e2e")
 printf '%s\n' "$rendered_e2e" | grep -Fq 'terminationMessagePolicy: FallbackToLogsOnError' || { echo 'E2E render lost controller termination message policy' >&2; exit 1; }
 
+# Retired-State cleanup is a narrow additive permission, and the public
+# boundary text must make clear that its correlation token is not a secret or
+# an exclusivity proof.
+rg -Fq 'resources: [oxideloopstates]' "$ROOT/deploy/controller/role.yaml" || { echo 'controller Role lost oxideloopstates resource' >&2; exit 1; }
+rg -Fq 'verbs: [get, list, watch, create, patch, delete]' "$ROOT/deploy/controller/role.yaml" || { echo 'controller Role lost additive oxideloopstates delete permission' >&2; exit 1; }
+rg -Fq '"resources" => ["oxideloopstates"], "verbs" => %w[get list watch create patch delete]' "$ROOT/deploy/scripts/check-rbac.rb" || { echo 'adversarial RBAC checker lost oxideloopstates delete permission' >&2; exit 1; }
+rg -Fq '`cleanupToken` is a deterministic, public correlation value' "$ROOT/README.md" || { echo 'README lost cleanupToken threat boundary' >&2; exit 1; }
+rg -Fq 'RBAC is additive least privilege' "$ROOT/README.md" || { echo 'README lost additive RBAC boundary' >&2; exit 1; }
+
 production_inspect_line=$(rg -n -F 'docker-image-production.inspect.json' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 kind_load_line=$(rg -n -F 'kind load docker-image --name "$CLUSTER_NAME"' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 [ "$production_inspect_line" -lt "$kind_load_line" ] || { echo 'Docker inspect must be captured before kind loads the tag' >&2; exit 1; }
@@ -495,6 +504,17 @@ recovery_no_pod_line=$(rg -n -F "wait_for_no_controller_pod 'controller deployme
 recovery_stopped_empty_line=$(rg -n -F 'capture_empty_journal foreign-collision-stopped' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 recovery_scale_one_line=$(rg -n -F 'ctx scale deployment/oxideloop-controller -n "$NAMESPACE" --replicas=1' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 [ "$recovery_scale_zero_line" -lt "$recovery_no_pod_line" ] && [ "$recovery_no_pod_line" -lt "$recovery_stopped_empty_line" ] && [ "$recovery_stopped_empty_line" -lt "$recovery_delete_line" ] && [ "$recovery_delete_line" -lt "$recovery_scale_one_line" ] && [ "$recovery_scale_one_line" -lt "$recovery_config_wait_line" ] && [ "$recovery_config_wait_line" -lt "$recovery_direct_assert_line" ] || { echo 'restart recovery must scale to zero, prove no pod and empty journal, delete while stopped, scale up, then wait for exact ConfigMap ownership' >&2; exit 1; }
+
+# H03 must expose the retained original State at the failpoint seam. The
+# conditional delete is released only after that exact midpoint proof, and
+# the post-release checks must observe its 404 before root-only finalization.
+midpoint_state_line=$(rg -n -F 'ctx get oxideloopstate "$STATE_NAME" -n "$NAMESPACE" -o json >"$EVIDENCE/deletion-midpoint-state.json"' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+midpoint_state_assert_line=$(rg -n -F 'deletion midpoint did not retain the exact unfinalized original State' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+midpoint_release_line=$(rg -n -F "printf 'RELEASE\\n' >&9" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+retired_wait_line=$(rg -n -F "wait_json 'retired State deletion after RELEASE' '.items | length == 0' oxideloopstates" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+retired_404_line=$(rg -n -F 'retired State GET did not return 404 after conditional deletion' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+root_absence_line=$(rg -n -F "wait_json 'original root absence after RELEASE' '.items | length == 0' webapplications" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+[ -n "$midpoint_state_line" ] && [ "$midpoint_state_line" -lt "$midpoint_state_assert_line" ] && [ "$midpoint_state_assert_line" -lt "$midpoint_release_line" ] && [ "$midpoint_release_line" -lt "$retired_wait_line" ] && [ "$retired_wait_line" -lt "$retired_404_line" ] && [ "$retired_404_line" -lt "$root_absence_line" ] || { echo 'H03 must prove exact retained State, then RELEASE, conditional State delete+404, then root absence' >&2; exit 1; }
 recovery_wait_line=$(sed -n "${recovery_config_wait_line}p" "$ROOT/scripts/run-kind-e2e.sh")
 assert_recovery_wait_contains() { printf '%s\n' "$recovery_wait_line" | grep -Fq "$1" || { echo "recovery ownership wait is missing: $1" >&2; exit 1; }; }
 for recovery_owner_field in \
@@ -649,6 +669,16 @@ for token in \
   'AutomationRuns before source creation' \
   'first present observation establishes the durable baseline' \
   'deletionCleanupReceipt' \
+  'DeleteRetiredState' \
+  'delete_retired_state' \
+  'RetiredStateDeleted acknowledgement' \
+  'effect_started' \
+  'effect_acknowledged' \
+  'deletion midpoint did not retain the exact unfinalized original State' \
+  '.metadata.annotations["runtime.oxideloop.dev/root-uid"] == $rootUid' \
+  'retired State deletion after RELEASE' \
+  'retired State GET did not return 404 after conditional deletion' \
+  'post-delete-root-only-child-check.json' \
   'root-only deletion recovery' \
   'source revision changed during run' \
   'kind cluster deletion failed' \
@@ -659,6 +689,8 @@ for token in \
   assert_contains "$token"
 done
 assert_not_contains 'required capture was empty'
+assert_not_contains 'deletion midpoint state absence'
+assert_not_contains 'ctx get oxideloopstates -n "$NAMESPACE" -o json >"$EVIDENCE/deletion-midpoint-state.json"'
 assert_not_contains 'map(select(.name == "controller") | .imageID | contains($expected)) | all'
 assert_not_contains 'docker image inspect "$PRODUCTION_IMAGE" --format '\''{{.Id}}'\'''
 assert_not_contains 'docker image inspect "$FAILPOINT_IMAGE" --format '\''{{.Id}}'\'''

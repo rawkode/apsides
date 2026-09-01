@@ -24,8 +24,8 @@ use oxideloop_controller_api::{
     StateLink, WebApplicationStatus, automation_run_name, bootstrap_id,
 };
 use oxideloop_controller_core::{
-    CommandV0, MutationCommandV0, PreconditionsV0, root_only_finalizer_command_token,
-    root_only_owned_children_verify_token,
+    CommandV0, MutationCommandV0, PreconditionsV0, retired_state_delete_command_token,
+    root_only_finalizer_command_token, root_only_owned_children_verify_token,
 };
 use oxideloop_event_planner::{
     ObjectIdentity as PlannerObjectIdentity, ObjectRef as PlannerObjectRef, RunCorrelationV0,
@@ -430,6 +430,101 @@ fn root_only_json(
             }
         }
     })
+}
+
+fn retired_state_setup() -> (RootAddressV0, CommandV0, Value, Value) {
+    let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
+    let deletion_id = "d".repeat(64);
+    let cleanup_token = "e".repeat(64);
+    let root = json!({
+        "apiVersion":"demo.oxideloop.dev/v1alpha1",
+        "kind":"WebApplication",
+        "metadata":{
+            "name":"app-a",
+            "namespace":"tenant-a",
+            "uid":"root-uid",
+            "resourceVersion":"9",
+            "generation":3,
+            "deletionTimestamp":"2026-01-01T00:00:00Z",
+            "finalizers":[ROOT_FINALIZER],
+            "annotations":{ROOT_UID_ANNOTATION:"root-uid"}
+        },
+        "status":{
+            "state":{"rootUid":"root-uid","name":state_name,"uid":"state-uid"},
+            "deletionCleanupReceipt":{
+                "rootUid":"root-uid",
+                "deletionId":deletion_id,
+                "deletionStartGeneration":3,
+                "stateName":state_name,
+                "stateUid":"state-uid",
+                "cleanupToken":cleanup_token
+            }
+        }
+    });
+    let state = json!({
+        "apiVersion":"runtime.oxideloop.dev/v1alpha1",
+        "kind":"OxideLoopState",
+        "metadata":{
+            "name":state_name,
+            "namespace":"tenant-a",
+            "uid":"state-uid",
+            "resourceVersion":"4",
+            "annotations":{ROOT_UID_ANNOTATION:"root-uid"},
+            "ownerReferences":[{
+                "apiVersion":"demo.oxideloop.dev/v1alpha1",
+                "kind":"WebApplication",
+                "name":"app-a",
+                "uid":"root-uid",
+                "controller":true,
+                "blockOwnerDeletion":false
+            }]
+        },
+        "spec":{"intentionally":"ignored-by-retired-delete"}
+    });
+    let token = retired_state_delete_command_token(
+        "root-uid",
+        3,
+        "9",
+        &state_name,
+        "state-uid",
+        "4",
+        &deletion_id,
+        3,
+        &cleanup_token,
+    );
+    let command = CommandV0::DeleteRetiredState {
+        token,
+        preconditions: PreconditionsV0 {
+            root_uid: "root-uid".into(),
+            root_generation: 3,
+            root_resource_version: "9".into(),
+            state_uid: "state-uid".into(),
+            state_resource_version: "4".into(),
+            observation_token: "retired-observation".into(),
+            cache_epoch: "retired-cache".into(),
+        },
+    };
+    (
+        RootAddressV0 {
+            namespace: "tenant-a".into(),
+            name: "app-a".into(),
+            state_name,
+        },
+        command,
+        root,
+        state,
+    )
+}
+
+fn retired_state_path(state_name: &str) -> String {
+    format!("/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/{state_name}")
+}
+
+fn state_absent_response() -> Response<Body> {
+    status(
+        StatusCode::NOT_FOUND,
+        json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}),
+    )
 }
 
 fn root_only_finalizer_token(
@@ -4064,5 +4159,212 @@ async fn owned_child_verification_blocks_an_automation_run_by_owner_uid_alone() 
     assert!(
         matches!(outcome, super::CommandOutcomeV0::Event(event) if matches!(*event, oxideloop_controller_core::EventV0::OwnedChildrenVerificationFailed { .. }))
     );
+    api.assert_drained();
+}
+
+fn retired_delete_script(
+    state_name: &str,
+    root: Value,
+    state: Value,
+    delete_response: Response<Body>,
+    proof_response: Response<Body>,
+) -> Vec<Expected> {
+    let state_path = retired_state_path(state_name);
+    let delete_path = format!("{state_path}?");
+    vec![
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a",
+            content_type: None,
+            body: None,
+            response: response(root),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: Box::leak(state_path.clone().into_boxed_str()),
+            content_type: None,
+            body: None,
+            response: response(state),
+        },
+        Expected {
+            method: Method::DELETE,
+            path_and_query: Box::leak(delete_path.into_boxed_str()),
+            content_type: Some("application/json"),
+            body: Some(json!({"preconditions":{"uid":"state-uid","resourceVersion":"4"}})),
+            response: delete_response,
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: Box::leak(state_path.into_boxed_str()),
+            content_type: None,
+            body: None,
+            response: proof_response,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn retired_state_delete_is_uid_rv_fenced_and_2xx_requires_a_404_proof() {
+    let (address, command, root, state) = retired_state_setup();
+    let (transport, api) = ScriptedApi::transport(retired_delete_script(
+        &address.state_name,
+        root,
+        state,
+        response(json!({"kind":"Status","apiVersion":"v1","status":"Success"})),
+        state_absent_response(),
+    ));
+    let outcome = transport
+        .dispatch(&address, &command)
+        .await
+        .expect("the only acknowledgement is the in-session 404 proof");
+    assert!(matches!(
+        outcome,
+        super::CommandOutcomeV0::Event(event)
+            if matches!(&*event, oxideloop_controller_core::EventV0::RetiredStateDeleted {
+                state_uid, state_resource_version, ..
+            } if state_uid == "state-uid" && state_resource_version == "4")
+    ));
+    // `ScriptedApi` has exactly one DELETE and no root PATCH expectation:
+    // draining proves both at-most-one deletion and no root write.
+    api.assert_drained();
+}
+
+#[tokio::test]
+async fn retired_state_delete_recovers_an_ambiguous_response_only_with_the_same_404_proof() {
+    let (address, command, root, state) = retired_state_setup();
+    let (transport, api) = ScriptedApi::transport(retired_delete_script(
+        &address.state_name,
+        root,
+        state,
+        lost_response(),
+        state_absent_response(),
+    ));
+    assert!(matches!(
+        transport.dispatch(&address, &command).await,
+        Ok(super::CommandOutcomeV0::Event(event))
+            if matches!(&*event, oxideloop_controller_core::EventV0::RetiredStateDeleted { .. })
+    ));
+    // A second DELETE or any root PATCH would be an unexpected scripted call.
+    api.assert_drained();
+}
+
+#[tokio::test]
+async fn retired_state_delete_ambiguous_response_with_a_present_proof_holds_without_replay() {
+    let (address, command, root, state) = retired_state_setup();
+    let (transport, api) = ScriptedApi::transport(retired_delete_script(
+        &address.state_name,
+        root,
+        state.clone(),
+        lost_response(),
+        response(state),
+    ));
+    assert_eq!(
+        transport.dispatch(&address, &command).await,
+        Err(TransportErrorV0::ManualRecoveryHold)
+    );
+    // The script contains one DELETE and one proof GET. Draining it proves an
+    // ambiguous in-process attempt is held rather than issuing a retry.
+    api.assert_drained();
+}
+
+#[tokio::test]
+async fn retired_state_delete_holds_for_present_or_replaced_proof_without_a_replay_or_root_write() {
+    for replacement_uid in ["state-uid", "replacement-state-uid"] {
+        let (address, command, root, state) = retired_state_setup();
+        let mut proof = state.clone();
+        proof["metadata"]["uid"] = json!(replacement_uid);
+        let (transport, api) = ScriptedApi::transport(retired_delete_script(
+            &address.state_name,
+            root,
+            state,
+            response(json!({"kind":"Status","apiVersion":"v1","status":"Success"})),
+            response(proof),
+        ));
+        assert_eq!(
+            transport.dispatch(&address, &command).await,
+            Err(TransportErrorV0::ManualRecoveryHold)
+        );
+        api.assert_drained();
+    }
+}
+
+#[tokio::test]
+async fn retired_state_delete_rejects_metadata_mismatch_before_delete_or_root_write() {
+    let (address, command, root, mut state) = retired_state_setup();
+    state["metadata"]["annotations"][ROOT_UID_ANNOTATION] = json!("other-root");
+    let (transport, api) = ScriptedApi::transport([
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a",
+            content_type: None,
+            body: None,
+            response: response(root),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: Box::leak(retired_state_path(&address.state_name).into_boxed_str()),
+            content_type: None,
+            body: None,
+            response: response(state),
+        },
+    ]);
+    assert_eq!(
+        transport.dispatch(&address, &command).await,
+        Err(TransportErrorV0::ManualRecoveryHold)
+    );
+    // The fence fails before DELETE; the script intentionally permits neither
+    // a retry nor a root PATCH.
+    api.assert_drained();
+}
+
+#[tokio::test]
+async fn retired_state_delete_rejects_root_or_receipt_drift_before_state_delete() {
+    let mutations: [fn(&mut Value); 2] = [
+        |root: &mut Value| {
+            root["status"]["state"]["uid"] = json!("replacement-state-uid");
+        },
+        |root: &mut Value| {
+            root["status"]["deletionCleanupReceipt"]["stateUid"] = json!("replacement-state-uid");
+        },
+    ];
+    for mutate in mutations {
+        let (address, command, mut root, _state) = retired_state_setup();
+        mutate(&mut root);
+        let (transport, api) = ScriptedApi::transport([Expected {
+            method: Method::GET,
+            path_and_query: "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a",
+            content_type: None,
+            body: None,
+            response: response(root),
+        }]);
+        assert_eq!(
+            transport.dispatch(&address, &command).await,
+            Err(TransportErrorV0::ManualRecoveryHold)
+        );
+        // No State DELETE, retry, or root PATCH is authorized after either
+        // the link or the receipt loses its exact root correlation.
+        api.assert_drained();
+    }
+}
+
+#[tokio::test]
+async fn retired_state_delete_holds_when_the_bounded_404_proof_errors() {
+    let (address, command, root, state) = retired_state_setup();
+    let (transport, api) = ScriptedApi::transport(retired_delete_script(
+        &address.state_name,
+        root,
+        state,
+        response(json!({"kind":"Status","apiVersion":"v1","status":"Success"})),
+        status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"kind":"Status","apiVersion":"v1","status":"Failure","code":500}),
+        ),
+    ));
+    assert_eq!(
+        transport.dispatch(&address, &command).await,
+        Err(TransportErrorV0::ManualRecoveryHold)
+    );
+    // The proof error consumes the one bounded recovery read; the delete is
+    // never replayed and no root mutation follows.
     api.assert_drained();
 }

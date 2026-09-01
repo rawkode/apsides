@@ -914,6 +914,7 @@ impl RootActorV0 {
             | PhaseV0::DeletionObservationPending
             | PhaseV0::OwnedChildrenVerifyPending
             | PhaseV0::StateFinalizerPending
+            | PhaseV0::RetiredStateDeletePending
             | PhaseV0::RootFinalizerPending
             | PhaseV0::RootDeletionVerifyPending
             | PhaseV0::RootStatusPersistPending
@@ -2415,6 +2416,21 @@ impl RootActorV0 {
                     && old_state_resource_version == &preconditions.state_resource_version
             }
             (
+                CommandV0::DeleteRetiredState {
+                    token,
+                    preconditions,
+                },
+                EventV0::RetiredStateDeleted {
+                    token: event_token,
+                    state_uid,
+                    state_resource_version,
+                },
+            ) => {
+                token == event_token
+                    && state_uid == &preconditions.state_uid
+                    && state_resource_version == &preconditions.state_resource_version
+            }
+            (
                 CommandV0::RemoveRootFinalizer {
                     token,
                     preconditions,
@@ -2650,6 +2666,7 @@ fn command_class(command: &CommandV0) -> &'static str {
         CommandV0::DeleteAutomationRun { .. } => "delete_automation_run",
         CommandV0::VerifyOwnedChildrenAbsent { .. } => "verify_owned_children_absent",
         CommandV0::RemoveStateFinalizer { .. } => "remove_state_finalizer",
+        CommandV0::DeleteRetiredState { .. } => "delete_retired_state",
         CommandV0::RemoveRootFinalizer { .. } => "remove_root_finalizer",
         CommandV0::VerifyRootUidAbsent { .. } => "verify_root_uid_absent",
         CommandV0::Hold { .. } => "hold",
@@ -2675,6 +2692,7 @@ fn effect_acknowledgement_class(event: &EventV0) -> EffectAcknowledgementClassV0
         | EventV0::OwnedChildrenVerifiedAbsent { .. }
         | EventV0::OwnedChildrenVerificationFailed { .. }
         | EventV0::StateFinalizerRemoved { .. }
+        | EventV0::RetiredStateDeleted { .. }
         | EventV0::RootFinalizerRemoved { .. }
         | EventV0::RootUidVerifiedAbsent { .. }
         | EventV0::RootUidAbsenceFailed { .. }
@@ -2723,6 +2741,7 @@ fn specialized_effect_acknowledgement_event(
             | CommandV0::DeleteAutomationRun { .. }
             | CommandV0::VerifyOwnedChildrenAbsent { .. }
             | CommandV0::RemoveStateFinalizer { .. }
+            | CommandV0::DeleteRetiredState { .. }
             | CommandV0::RemoveRootFinalizer { .. }
             | CommandV0::VerifyRootUidAbsent { .. }
             | CommandV0::Hold { .. }
@@ -2777,6 +2796,7 @@ fn command_detail(command: &CommandV0) -> serde_json::Value {
         | CommandV0::DeleteAutomationRun { .. }
         | CommandV0::VerifyOwnedChildrenAbsent { .. }
         | CommandV0::RemoveStateFinalizer { .. }
+        | CommandV0::DeleteRetiredState { .. }
         | CommandV0::RemoveRootFinalizer { .. }
         | CommandV0::VerifyRootUidAbsent { .. }
         | CommandV0::Hold { .. }
@@ -2806,6 +2826,7 @@ fn command_preconditions(command: &CommandV0) -> Option<&PreconditionsV0> {
         | CommandV0::DeleteAutomationRun { preconditions, .. }
         | CommandV0::VerifyOwnedChildrenAbsent { preconditions, .. }
         | CommandV0::RemoveStateFinalizer { preconditions, .. }
+        | CommandV0::DeleteRetiredState { preconditions, .. }
         | CommandV0::RemoveRootFinalizer { preconditions, .. }
         | CommandV0::VerifyRootUidAbsent { preconditions, .. } => Some(preconditions),
         CommandV0::EnsureBootstrap { .. }
@@ -3404,6 +3425,110 @@ fn install_linked_state_pins(
     Ok(())
 }
 
+/// Classifies the one raw State shape that may survive the linked finalizer
+/// acknowledgement. This happens before any State spec/status deserialization:
+/// a tombstone's body is intentionally irrelevant and may be malformed, but
+/// every identity/ownership/receipt pin must be exact.
+fn classify_retired_state_tombstone(
+    snapshot: &mut RootSnapshotV0,
+    namespace: &str,
+    link: &oxideloop_controller_api::StateLink,
+    state_ref: &ObjectRefV0,
+    state: &oxideloop_kube_transport::ObjectV0,
+) -> Result<bool, RuntimeErrorV0> {
+    let metadata = state
+        .value
+        .get("metadata")
+        .and_then(Value::as_object)
+        .ok_or_else(|| RuntimeErrorV0::Hold("linked state metadata is invalid".into()))?;
+    let finalizers = metadata_finalizers(metadata, "linked state finalizers are invalid")?;
+    if !finalizers.is_empty() {
+        return Ok(false);
+    }
+    // A finalizer-free linked State is never normal linked authority. It can
+    // proceed only as the exact deleting-root tombstone below.
+    if !snapshot.deleting {
+        return Ok(false);
+    }
+    let deterministic_name = oxideloop_controller_api::state_name(&snapshot.uid)
+        .map_err(|error| RuntimeErrorV0::Hold(error.to_string()))?;
+    let receipt = oxideloop_controller_core::validate_deleting_root_receipt(snapshot)
+        .map_err(|error| RuntimeErrorV0::Hold(error.to_string()))?
+        .clone();
+    if !snapshot.root_finalizer_present
+        || link.root_uid != snapshot.uid
+        || link.name != deterministic_name
+        || link.uid.is_empty()
+        || link.name != receipt.state_name
+        || link.uid != receipt.state_uid
+        || state.reference != *state_ref
+        || state.metadata.uid != link.uid
+        || state.metadata.resource_version.is_empty()
+        || state.value.get("apiVersion").and_then(Value::as_str)
+            != Some(ResourceKindV0::OxideLoopState.api_version())
+        || state.value.get("kind").and_then(Value::as_str)
+            != Some(ResourceKindV0::OxideLoopState.kind())
+        || metadata.get("name").and_then(Value::as_str) != Some(link.name.as_str())
+        || metadata.get("namespace").and_then(Value::as_str) != Some(namespace)
+        || metadata.get("uid").and_then(Value::as_str) != Some(state.metadata.uid.as_str())
+        || metadata.get("resourceVersion").and_then(Value::as_str)
+            != Some(state.metadata.resource_version.as_str())
+        || metadata.contains_key("deletionTimestamp")
+    {
+        return Err(RuntimeErrorV0::Hold(
+            "retired State tombstone identity or deletion authority is invalid".into(),
+        ));
+    }
+    let annotations = metadata
+        .get("annotations")
+        .and_then(Value::as_object)
+        .ok_or_else(|| RuntimeErrorV0::Hold("retired State annotations are invalid".into()))?;
+    let raw_root_uid = annotations
+        .get(oxideloop_kube_transport::ROOT_UID_ANNOTATION)
+        .and_then(Value::as_str)
+        .filter(|value| *value == snapshot.uid)
+        .ok_or_else(|| {
+            RuntimeErrorV0::Hold("retired State root UID annotation is invalid".into())
+        })?;
+    if state
+        .metadata
+        .annotations
+        .get(oxideloop_kube_transport::ROOT_UID_ANNOTATION)
+        .is_none_or(|value| value != raw_root_uid)
+    {
+        return Err(RuntimeErrorV0::Hold(
+            "retired State root UID annotation is invalid".into(),
+        ));
+    }
+    let owners = metadata
+        .get("ownerReferences")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RuntimeErrorV0::Hold("retired State owner is invalid".into()))?;
+    if owners.len() != 1
+        || !owners[0].as_object().is_some_and(|owner| {
+            owner.get("apiVersion").and_then(Value::as_str)
+                == Some(ResourceKindV0::WebApplication.api_version())
+                && owner.get("kind").and_then(Value::as_str)
+                    == Some(ResourceKindV0::WebApplication.kind())
+                && owner.get("name").and_then(Value::as_str) == Some(snapshot.name.as_str())
+                && owner.get("uid").and_then(Value::as_str) == Some(snapshot.uid.as_str())
+                && owner.get("controller").and_then(Value::as_bool) == Some(true)
+                && owner.get("blockOwnerDeletion").and_then(Value::as_bool) == Some(false)
+        })
+    {
+        return Err(RuntimeErrorV0::Hold(
+            "retired State owner is invalid".into(),
+        ));
+    }
+    snapshot.state_name.clone_from(&link.name);
+    snapshot.state_uid.clone_from(&state.metadata.uid);
+    snapshot
+        .state_resource_version
+        .clone_from(&state.metadata.resource_version);
+    snapshot.state_finalizer_present = false;
+    Ok(true)
+}
+
 /// Obtains only fresh object identity and resource-version pins after a stale
 /// write preflight. The state journal is deliberately not deserialized here:
 /// accepted acknowledgement facts remain in the actor's in-memory journal and
@@ -3482,6 +3607,11 @@ async fn fresh_root_snapshot_from_reader<P: LoaderRereadPortV0>(
         }
         return Err(RuntimeErrorV0::Hold("linked state is absent".into()));
     };
+    if classify_retired_state_tombstone(&mut snapshot, namespace, &link, &state_ref, &state)? {
+        return MachineStateV0::recover_deleting_root_with_retired_state(snapshot)
+            .map(|machine| machine.root().clone())
+            .map_err(|error| RuntimeErrorV0::Hold(error.to_string()));
+    }
     install_linked_state_pins(&mut snapshot, namespace, &link, &state_ref, &state)?;
     Ok(snapshot)
 }
@@ -3669,6 +3799,11 @@ async fn load_machine_from_root_reader<P: LoaderRereadPortV0>(
         }
         return Err(RuntimeErrorV0::Hold("linked state is absent".into()));
     };
+    if classify_retired_state_tombstone(&mut snapshot, namespace, &link, &state_ref, &state)? {
+        return MachineStateV0::recover_deleting_root_with_retired_state(snapshot)
+            .map(Some)
+            .map_err(|error| RuntimeErrorV0::Hold(error.to_string()));
+    }
     install_linked_state_pins(&mut snapshot, namespace, &link, &state_ref, &state)?;
     let journal: oxideloop_controller_api::OxideLoopStateSpec = serde_json::from_value(
         state
@@ -4587,7 +4722,7 @@ mod tests {
             .expect("not-found response")
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct LoaderPort {
         objects: Vec<ObjectV0>,
     }
@@ -4930,6 +5065,143 @@ mod tests {
             load_machine_from_reader(&loader, "ns", "demo").await,
             Err(RuntimeErrorV0::Hold(error)) if error == "linked state finalizer is absent"
         ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn retired_state_classifier_accepts_only_exact_raw_tombstone_and_never_parses_its_body() {
+        let mut root = root_only_deletion_snapshot(true);
+        let receipt = root
+            .status
+            .deletion_cleanup_receipt
+            .as_ref()
+            .expect("receipt")
+            .clone();
+        root.status.state = Some(oxideloop_controller_api::StateLink {
+            root_uid: root.uid.clone(),
+            name: receipt.state_name.clone(),
+            uid: receipt.state_uid.clone(),
+        });
+        root.state_name = receipt.state_name;
+        root.state_uid = receipt.state_uid;
+        root.state_resource_version = "retired-rv".into();
+        let retired = MachineStateV0::recover_deleting_root_with_retired_state(root).unwrap();
+        let mut accepted = loader_port_for_machine(&retired, "retired-rv");
+        // The retired branch deliberately does not deserialize State spec or
+        // status. Full raw identity/ownership/receipt classification is the
+        // sole authority for this body-independent deletion tail.
+        accepted.objects[1].value["spec"] = serde_json::json!({"malformed": true});
+        accepted.objects[1].value["status"] = serde_json::json!({"malformed": true});
+        let loaded = load_machine_from_reader(&accepted, "ns", "demo")
+            .await
+            .expect("exact retired State tombstone is accepted")
+            .expect("root remains present");
+        assert!(loaded.is_retired_state_recovery());
+        assert_eq!(loaded.root().state_resource_version, "retired-rv");
+
+        let mut omitted_finalizers = accepted.clone();
+        omitted_finalizers.objects[1]
+            .value
+            .get_mut("metadata")
+            .and_then(Value::as_object_mut)
+            .expect("state metadata")
+            .remove("finalizers");
+        assert!(
+            load_machine_from_reader(&omitted_finalizers, "ns", "demo")
+                .await
+                .expect("omitted finalizers retain the retired tombstone classification")
+                .expect("root remains present")
+                .is_retired_state_recovery()
+        );
+
+        macro_rules! retired_tombstone_holds {
+            ($fixture:ident, $mutate:expr) => {{
+                let mut $fixture = accepted.clone();
+                $mutate(&mut $fixture);
+                assert!(matches!(
+                    load_machine_from_reader(&$fixture, "ns", "demo").await,
+                    Err(RuntimeErrorV0::Hold(_))
+                ));
+            }};
+        }
+
+        let mut deletion_timestamp = accepted.clone();
+        deletion_timestamp.objects[1].value["metadata"]["deletionTimestamp"] =
+            serde_json::json!("2026-08-30T00:00:00Z");
+        assert!(matches!(
+            load_machine_from_reader(&deletion_timestamp, "ns", "demo").await,
+            Err(RuntimeErrorV0::Hold(error)) if error.contains("retired State tombstone")
+        ));
+
+        let mut wrong_annotation = accepted.clone();
+        wrong_annotation.objects[1].value["metadata"]["annotations"]
+            [oxideloop_kube_transport::ROOT_UID_ANNOTATION] = serde_json::json!("other-root");
+        assert!(matches!(
+            load_machine_from_reader(&wrong_annotation, "ns", "demo").await,
+            Err(RuntimeErrorV0::Hold(error)) if error.contains("retired State root UID annotation")
+        ));
+
+        let mut extra_owner = accepted.clone();
+        extra_owner.objects[1].value["metadata"]["ownerReferences"]
+            .as_array_mut()
+            .expect("owners")
+            .push(serde_json::json!({"uid": "other"}));
+        assert!(matches!(
+            load_machine_from_reader(&extra_owner, "ns", "demo").await,
+            Err(RuntimeErrorV0::Hold(error)) if error.contains("retired State owner")
+        ));
+
+        let mut missing_root_finalizer = accepted.clone();
+        missing_root_finalizer.objects[0].value["metadata"]["finalizers"] = serde_json::json!([]);
+        assert!(matches!(
+            load_machine_from_reader(&missing_root_finalizer, "ns", "demo").await,
+            Err(RuntimeErrorV0::Hold(error)) if error.contains("retired State tombstone")
+        ));
+
+        // The following table covers pins which must be rejected before a
+        // tombstone can gain deletion authority.  Keep the raw JSON and the
+        // normalized ObjectV0 metadata independently mutable: both forms are
+        // part of the classifier's exact identity proof.
+        retired_tombstone_holds!(wrong_state_uid, |loader: &mut LoaderPort| {
+            loader.objects[1].value["metadata"]["uid"] = serde_json::json!("other-state-uid");
+        });
+        retired_tombstone_holds!(wrong_gvk, |loader: &mut LoaderPort| {
+            loader.objects[1].value["apiVersion"] = serde_json::json!("v1");
+        });
+        retired_tombstone_holds!(wrong_state_name, |loader: &mut LoaderPort| {
+            loader.objects[1].value["metadata"]["name"] = serde_json::json!("other-state");
+        });
+        retired_tombstone_holds!(wrong_state_namespace, |loader: &mut LoaderPort| {
+            loader.objects[1].value["metadata"]["namespace"] = serde_json::json!("other-ns");
+        });
+        retired_tombstone_holds!(
+            raw_rv_disagrees_with_domain_pin,
+            |loader: &mut LoaderPort| {
+                loader.objects[1].value["metadata"]["resourceVersion"] =
+                    serde_json::json!("other-rv");
+            }
+        );
+        retired_tombstone_holds!(
+            domain_annotation_disagrees_with_raw_pin,
+            |loader: &mut LoaderPort| {
+                loader.objects[1].metadata.annotations.insert(
+                    oxideloop_kube_transport::ROOT_UID_ANNOTATION.into(),
+                    "other-root".into(),
+                );
+            }
+        );
+        retired_tombstone_holds!(foreign_nonempty_finalizer, |loader: &mut LoaderPort| {
+            loader.objects[1].value["metadata"]["finalizers"] =
+                serde_json::json!(["foreign.example/finalizer"]);
+        });
+        retired_tombstone_holds!(root_link_mismatch, |loader: &mut LoaderPort| {
+            loader.objects[0].value["status"]["state"]["uid"] =
+                serde_json::json!("other-state-uid");
+        });
+        retired_tombstone_holds!(root_receipt_mismatch, |loader: &mut LoaderPort| {
+            loader.objects[0].value["status"]["deletionCleanupReceipt"]["stateUid"] =
+                serde_json::json!("other-state-uid");
+        });
     }
 
     #[tokio::test]
@@ -6357,6 +6629,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn state_backed_root_finalizer_pending() -> (MachineStateV0, EventV0) {
         let prepared = reduce(deleting_machine(vec![], vec![]), EventV0::Start).unwrap();
         let observation = acknowledge_persist(prepared, "state-rv-4");
@@ -6398,7 +6671,7 @@ mod tests {
             } => (token.clone(), preconditions.state_resource_version.clone()),
             command => panic!("unexpected state finalizer command: {command:?}"),
         };
-        let verify_root = reduce(
+        let retired = reduce(
             state_finalizer.state,
             EventV0::StateFinalizerRemoved {
                 token: state_token,
@@ -6408,9 +6681,48 @@ mod tests {
             },
         )
         .unwrap();
+        let (retired_delete_token, retired_preconditions) = match &retired.commands[0] {
+            CommandV0::DeleteRetiredState {
+                token,
+                preconditions,
+            } => (token.clone(), preconditions.clone()),
+            command => panic!("unexpected retired State delete command: {command:?}"),
+        };
+        let verify_root = reduce(
+            retired.state,
+            EventV0::RetiredStateDeleted {
+                token: retired_delete_token,
+                state_uid: retired_preconditions.state_uid,
+                state_resource_version: retired_preconditions.state_resource_version,
+            },
+        )
+        .unwrap();
+        let root_only_cleanup_token = verify_root
+            .state
+            .root()
+            .status
+            .deletion_cleanup_receipt
+            .as_ref()
+            .expect("receipt")
+            .cleanup_token
+            .clone();
         let root_finalizer = reduce(
             verify_root.state,
-            acknowledge_owned_children(&verify_root.commands[0]),
+            match &verify_root.commands[0] {
+                CommandV0::VerifyOwnedChildrenAbsent {
+                    token,
+                    preconditions,
+                } => EventV0::OwnedChildrenVerifiedAbsent {
+                    token: token.clone(),
+                    root_uid: preconditions.root_uid.clone(),
+                    root_generation: preconditions.root_generation,
+                    root_resource_version: preconditions.root_resource_version.clone(),
+                    state_uid: preconditions.state_uid.clone(),
+                    state_resource_version: preconditions.state_resource_version.clone(),
+                    cleanup_token: root_only_cleanup_token,
+                },
+                command => panic!("unexpected root-only child proof command: {command:?}"),
+            },
         )
         .unwrap();
         let (token, old_root_rv) = match &root_finalizer.commands[0] {
