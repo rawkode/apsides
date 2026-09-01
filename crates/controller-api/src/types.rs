@@ -865,6 +865,14 @@ pub struct ApplyTransaction {
     /// Hash of the desired graph prepared from `frozenRenderInputHash`.
     #[schemars(length(min = 64, max = 64), regex(pattern = "^[0-9a-f]{64}$"))]
     pub desired_graph_hash: String,
+    /// Durable algorithm that defines the graph and command identities in this
+    /// transaction. Omission is the legacy algorithm so pre-existing journals
+    /// remain loadable for fail-closed recovery.
+    #[serde(
+        default,
+        skip_serializing_if = "TransactionGraphIdentityAlgorithm::is_legacy"
+    )]
+    pub graph_identity_algorithm: TransactionGraphIdentityAlgorithm,
     /// Declares the only safe restart behavior when desired bytes are absent.
     pub recovery_policy: ApplyRecoveryPolicy,
     /// Exact token attached to the one issued effect batch.  It is persisted
@@ -888,6 +896,26 @@ pub struct ApplyTransaction {
     pub results: Vec<ApplyResult>,
     #[schemars(length(max = 1024))]
     pub unresolved_identities: Vec<ObjectIdentity>,
+}
+
+/// Versioned transaction graph and command-identity contract.
+///
+/// `LegacyV0` is deliberately the serde-default for journals written before
+/// this discriminator existed. New transactions must explicitly use
+/// `MutationGraphV1`; callers may never infer V1 semantics from a missing
+/// field.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub enum TransactionGraphIdentityAlgorithm {
+    #[default]
+    LegacyV0,
+    MutationGraphV1,
+}
+
+impl TransactionGraphIdentityAlgorithm {
+    #[must_use]
+    pub fn is_legacy(&self) -> bool {
+        *self == Self::LegacyV0
+    }
 }
 
 impl ApplyTransaction {
@@ -2144,6 +2172,7 @@ mod tests {
             generation: 7,
             frozen_render_input_hash: "a".repeat(64),
             desired_graph_hash: "b".repeat(64),
+            graph_identity_algorithm: TransactionGraphIdentityAlgorithm::LegacyV0,
             recovery_policy: ApplyRecoveryPolicy::ReplanAndRevalidateBeforeEffect,
             attempt_token: "c".repeat(64),
             prepared_intents: vec![],
@@ -2176,12 +2205,13 @@ mod tests {
     }
 
     #[test]
-    fn next_command_lifecycle_is_additive_but_correlated_to_the_result_prefix() {
+    fn transaction_algorithm_and_next_command_lifecycle_are_additive() {
         let transaction = ApplyTransaction {
             id: "transaction-1".into(),
             generation: 7,
             frozen_render_input_hash: "a".repeat(64),
             desired_graph_hash: "b".repeat(64),
+            graph_identity_algorithm: TransactionGraphIdentityAlgorithm::LegacyV0,
             recovery_policy: ApplyRecoveryPolicy::ReplanAndRevalidateBeforeEffect,
             attempt_token: "c".repeat(64),
             prepared_intents: vec![],
@@ -2190,7 +2220,10 @@ mod tests {
             results: vec![],
             unresolved_identities: vec![],
         };
-        let mut legacy_json = serde_json::to_value(&transaction).unwrap();
+        let serialized_legacy = serde_json::to_value(&transaction).unwrap();
+        assert!(serialized_legacy.get("graphIdentityAlgorithm").is_none());
+
+        let mut legacy_json = serialized_legacy;
         legacy_json
             .as_object_mut()
             .unwrap()
@@ -2200,6 +2233,28 @@ mod tests {
             legacy.next_command_lifecycle.state,
             NextCommandLifecycleStateV0::LegacyUnknown
         );
+        assert_eq!(
+            legacy.graph_identity_algorithm,
+            TransactionGraphIdentityAlgorithm::LegacyV0
+        );
+
+        let mut v1_json = serde_json::to_value(&transaction).unwrap();
+        v1_json["graphIdentityAlgorithm"] = serde_json::json!("MutationGraphV1");
+        let v1: ApplyTransaction = serde_json::from_value(v1_json).unwrap();
+        assert_eq!(
+            v1.graph_identity_algorithm,
+            TransactionGraphIdentityAlgorithm::MutationGraphV1
+        );
+        assert_eq!(
+            serde_json::to_value(&v1)
+                .unwrap()
+                .get("graphIdentityAlgorithm"),
+            Some(&serde_json::json!("MutationGraphV1"))
+        );
+
+        let mut unknown_json = serde_json::to_value(&transaction).unwrap();
+        unknown_json["graphIdentityAlgorithm"] = serde_json::json!("FutureMutationGraphV2");
+        assert!(serde_json::from_value::<ApplyTransaction>(unknown_json).is_err());
 
         let mut invalid = transaction;
         invalid.next_command_lifecycle = NextCommandLifecycleV0::prepared("d".repeat(64));
@@ -2321,6 +2376,7 @@ mod tests {
             generation: 1,
             frozen_render_input_hash: "d".repeat(64),
             desired_graph_hash: "e".repeat(64),
+            graph_identity_algorithm: TransactionGraphIdentityAlgorithm::LegacyV0,
             recovery_policy: ApplyRecoveryPolicy::ReplanAndRevalidateBeforeEffect,
             attempt_token: "f".repeat(64),
             prepared_intents: vec![ApplyIntent {

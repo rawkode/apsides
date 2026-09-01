@@ -274,6 +274,15 @@ spec:
                       generation:
                         format: int64
                         type: integer
+                      graphIdentityAlgorithm:
+                        description: |-
+                          Durable algorithm that defines the graph and command identities in this
+                          transaction. Omission is the legacy algorithm so pre-existing journals
+                          remain loadable for fail-closed recovery.
+                        enum:
+                        - LegacyV0
+                        - MutationGraphV1
+                        type: string
                       id:
                         maxLength: 128
                         minLength: 1

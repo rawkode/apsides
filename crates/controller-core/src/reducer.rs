@@ -22,16 +22,17 @@ use oxideloop_controller_api::{
     GenerationAdvanceClosurePurpose, InventoryEntry, MAX_ACTION_INPUT_CANONICAL_BYTES,
     MAX_CLOSURE_REBASES, MAX_IDENTIFIER_BYTES, MAX_LIST_ENTRIES, NextCommandLifecycleStateV0,
     NextCommandLifecycleV0, ObjectIdentity, OxideLoopStateSpec, PersistOperation, PersistPurpose,
-    PreparedRecoveryClaim, PruneCandidate, PruneObservation, StateBody, WebApplicationSpec,
-    WebApplicationStatus, automation_run_name, bootstrap_id, state_name,
-    validate_automation_run_name, validate_root_state_link,
+    PreparedRecoveryClaim, PruneCandidate, PruneObservation, StateBody,
+    TransactionGraphIdentityAlgorithm, WebApplicationSpec, WebApplicationStatus,
+    automation_run_name, bootstrap_id, state_name, validate_automation_run_name,
+    validate_root_state_link,
 };
 use oxideloop_mutation_model::{
     APPLY_PATCH_CONTENT_TYPE, BackendQualification, CONTROLLER_FIELD_MANAGER, HttpMethod,
     MutationDecision, MutationIntent, MutationPlanInputV0, ObjectIdentity as MutationIdentity,
     Observation, PROBE_VERSION_V0, plan,
 };
-use oxideloop_renderer_abi::model::{Dependency, RenderDisposition};
+use oxideloop_renderer_abi::model::{Dependency, RenderDisposition, ResourceDeclaration};
 use oxideloop_renderer_abi::{
     ActionInputV0, RenderInputV0, canonical_bytes, parse_validate_render_input,
     parse_validate_render_output, sha256_hex,
@@ -2699,6 +2700,7 @@ fn deletion_prepare(
     state.journal.state.apply_transaction = Some(ApplyTransaction {
         id: deletion_id,
         generation: deletion_start_generation,
+        graph_identity_algorithm: TransactionGraphIdentityAlgorithm::LegacyV0,
         frozen_render_input_hash: "0".repeat(64),
         desired_graph_hash: hash(&[
             "deletion-graph/v0",
@@ -2950,6 +2952,28 @@ fn revalidate(
         .ok_or_else(|| ReconcileError::Mutation("revalidation has no transaction".into()))?;
     let exact_effect_recovery = tx.generation != state.root.generation || state.frozen.is_none();
     let lifecycle = tx.next_command_lifecycle.state;
+    // Missing discriminator values deserialize as LegacyV0. They are never
+    // interpreted with the V1 semantic graph/command identity rules: an
+    // issued-or-unknown legacy effect remains an unreplayable boundary, while
+    // an unissued or complete legacy journal can be durably discarded and
+    // rebuilt by the next V1 prepare.
+    if tx.graph_identity_algorithm == TransactionGraphIdentityAlgorithm::LegacyV0 {
+        return match lifecycle {
+            NextCommandLifecycleStateV0::PreparedNotIssued
+            | NextCommandLifecycleStateV0::AllCommandsRecorded => {
+                safely_invalidate_transaction(state, commands)
+            }
+            NextCommandLifecycleStateV0::LegacyUnknown
+            | NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued => {
+                state.phase = PhaseV0::Hold;
+                commands.push(CommandV0::Hold {
+                    reason: "legacy transaction cannot establish V1 recovery identity; retaining journal"
+                        .into(),
+                });
+                Ok(())
+            }
+        };
+    }
     if lifecycle == NextCommandLifecycleStateV0::LegacyUnknown {
         state.phase = PhaseV0::Hold;
         commands.push(CommandV0::Hold {
@@ -3021,6 +3045,7 @@ fn revalidate(
             }
             state.journal.state.apply_transaction = None;
             state.frozen = Some(frozen);
+            state.journal.state.pending_dependencies = plan.dependencies;
             state.journal.state.committed_dependencies =
                 std::mem::take(&mut state.journal.state.pending_dependencies);
             return queue_persist(
@@ -3055,6 +3080,7 @@ fn revalidate(
         ) {
             state.frozen = Some(frozen);
             record_mutation_results(state, &recovered)?;
+            state.journal.state.pending_dependencies = plan.dependencies;
             advance_next_command_lifecycle(state)?;
             return queue_persist(
                 state,
@@ -3086,6 +3112,7 @@ fn revalidate(
         }
         state.journal.state.apply_transaction = None;
         state.frozen = Some(frozen);
+        state.journal.state.pending_dependencies = plan.dependencies;
         state.journal.state.committed_dependencies =
             std::mem::take(&mut state.journal.state.pending_dependencies);
         return queue_persist(
@@ -3143,6 +3170,7 @@ fn revalidate(
     if !recovered.is_empty() {
         state.frozen = Some(frozen);
         record_mutation_results(state, &recovered)?;
+        state.journal.state.pending_dependencies = plan.dependencies;
         advance_next_command_lifecycle(state)?;
         return queue_persist(
             state,
@@ -3164,6 +3192,7 @@ fn revalidate(
     if effects.is_empty() {
         return safely_invalidate_transaction(state, commands);
     }
+    state.journal.state.pending_dependencies = plan.dependencies;
     authorize_dispatch(state, &tx, effects, commands)
 }
 
@@ -5017,6 +5046,40 @@ fn plan_graph(
         ));
     }
     let mut observations = observations.into_iter().collect::<BTreeMap<_, _>>();
+    // The durable V1 graph is deliberately derived before any mutation intent
+    // is planned. A render cannot acquire a graph identity until every desired
+    // resource has passed the duplicate logical-ID and physical-target checks.
+    // The physical key participates only in a deterministic sort; the hashed
+    // entries remain the exact renderer declarations (logicalId/object/
+    // readiness), plus the disposition.
+    let mut graph_identities = BTreeSet::new();
+    let mut graph_logical_ids = BTreeSet::new();
+    let mut graph_resources = Vec::new();
+    if output.document.disposition != RenderDisposition::Hold {
+        for resource in &output.document.resources {
+            let identity = identity_from_object(&resource.object, &state.root.namespace)?;
+            let key = identity_key(&identity);
+            if !graph_identities.insert(key.clone())
+                || !graph_logical_ids.insert(resource.logical_id.clone())
+            {
+                return Err(ReconcileError::Desired(
+                    "duplicate logical ID or physical identity".into(),
+                ));
+            }
+            graph_resources.push((key, resource.logical_id.clone(), resource.clone()));
+        }
+    }
+    graph_resources.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let desired_graph = serde_json::json!({
+        "disposition": output.document.disposition,
+        "resources": graph_resources
+            .iter()
+            .map(|(_, _, resource)| resource)
+            .collect::<Vec<&ResourceDeclaration>>(),
+    });
+    let graph_hash = sha256_hex(
+        &canonical_bytes(&desired_graph).map_err(|e| ReconcileError::Renderer(e.to_string()))?,
+    );
     let mut identities = BTreeSet::new();
     let mut logical = BTreeSet::new();
     let mut intents = Vec::new();
@@ -5111,9 +5174,10 @@ fn plan_graph(
                 foreign_collision = None;
             }
             let command_id = hash(&[
-                "apply-command/v0",
+                "apply-command/v1",
                 &state.root.uid,
-                &frozen.observation_token,
+                &graph_hash,
+                "Apply",
                 &key,
                 &resource.logical_id,
             ]);
@@ -5251,18 +5315,9 @@ fn plan_graph(
     }
     intents.sort_by(|a, b| a.command_id.cmp(&b.command_id));
     foreign_collisions.sort_by_key(|collision| identity_key(&collision.identity));
-    // The durable graph pin deliberately excludes live inventory,
-    // observations, effects and prune progress. Those evolve after each
-    // command acknowledgement; remaining prepared intents are checked below
-    // against a fresh plan before an additional effect can issue.
-    let desired_graph = serde_json::to_value(&output.document)
-        .map_err(|e| ReconcileError::Renderer(e.to_string()))?;
-    let hash = sha256_hex(
-        &canonical_bytes(&desired_graph).map_err(|e| ReconcileError::Renderer(e.to_string()))?,
-    );
     Ok(Plan {
         disposition: output.document.disposition,
-        hash,
+        hash: graph_hash,
         intents,
         decisions,
         foreign_collisions,
@@ -5306,7 +5361,7 @@ fn prepare(
         &plan.hash,
     ]);
     let transaction_id = hash(&[
-        "transaction/v0",
+        "transaction/v1",
         &state.root.uid,
         &frozen.observation_token,
         &plan.hash,
@@ -5327,6 +5382,7 @@ fn prepare(
     state.journal.state.apply_transaction = Some(ApplyTransaction {
         id: transaction_id,
         generation: frozen.root_generation,
+        graph_identity_algorithm: TransactionGraphIdentityAlgorithm::MutationGraphV1,
         frozen_render_input_hash: frozen.render_input_hash.clone(),
         desired_graph_hash: plan.hash,
         recovery_policy: ApplyRecoveryPolicy::ReplanAndRevalidateBeforeEffect,
@@ -7198,6 +7254,216 @@ mod tests {
         assert!(matches!(held.commands.as_slice(), [CommandV0::Hold { .. }]));
     }
 
+    #[test]
+    fn mutation_graph_v1_is_order_and_token_stable_but_semantic_changes_rehash() {
+        let machine = boot_to_render(state());
+        let (frozen, input, output, mut observed) = rendered(&machine.root, vec![]);
+        let mut ordered: RenderOutputV0 = serde_json::from_str(&output).unwrap();
+        ordered.resources.push(ResourceDeclaration {
+            logical_id: "service".into(),
+            object: serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {"namespace": "demo", "name": "service"},
+            }),
+            readiness: None,
+        });
+        observed.push(DesiredObservationV0 {
+            identity: ObjectIdentity {
+                api_version: "v1".into(),
+                kind: "Service".into(),
+                namespace: "demo".into(),
+                name: "service".into(),
+            },
+            observation: Observation::Absent,
+            qualification: BackendQualification::BuiltInTested {
+                kubernetes_minor: "1.36".into(),
+                gvr: "services".into(),
+            },
+            recovery_proof: None,
+            deletion_recovery_proof: None,
+        });
+        let ordered_json = serde_json::to_string(&ordered).unwrap();
+        let ordered_plan =
+            plan_graph(&machine, &frozen, &input, &ordered_json, observed.clone()).unwrap();
+
+        ordered.resources.reverse();
+        let reordered_plan = plan_graph(
+            &machine,
+            &frozen,
+            &input,
+            &serde_json::to_string(&ordered).unwrap(),
+            observed,
+        )
+        .unwrap();
+        assert_eq!(ordered_plan.hash, reordered_plan.hash);
+        assert_eq!(ordered_plan.intents, reordered_plan.intents);
+
+        ordered.resources[0].logical_id.push_str("-changed");
+        let changed = plan_graph(
+            &machine,
+            &frozen,
+            &input,
+            &serde_json::to_string(&ordered).unwrap(),
+            vec![
+                DesiredObservationV0 {
+                    identity: ObjectIdentity {
+                        api_version: "v1".into(),
+                        kind: "ConfigMap".into(),
+                        namespace: "demo".into(),
+                        name: "object".into(),
+                    },
+                    observation: Observation::Absent,
+                    qualification: BackendQualification::BuiltInTested {
+                        kubernetes_minor: "1.36".into(),
+                        gvr: "configmaps".into(),
+                    },
+                    recovery_proof: None,
+                    deletion_recovery_proof: None,
+                },
+                DesiredObservationV0 {
+                    identity: ObjectIdentity {
+                        api_version: "v1".into(),
+                        kind: "Service".into(),
+                        namespace: "demo".into(),
+                        name: "service".into(),
+                    },
+                    observation: Observation::Absent,
+                    qualification: BackendQualification::BuiltInTested {
+                        kubernetes_minor: "1.36".into(),
+                        gvr: "services".into(),
+                    },
+                    recovery_proof: None,
+                    deletion_recovery_proof: None,
+                },
+            ],
+        )
+        .unwrap();
+        assert_ne!(ordered_plan.hash, changed.hash);
+    }
+
+    #[test]
+    fn transaction_v1_binds_the_original_observation_token_not_apply_ids() {
+        let first_machine = boot_to_render(state());
+        let (first_frozen, first_input, output, observed) = rendered(&first_machine.root, vec![]);
+        let first = reduce(
+            first_machine,
+            EventV0::Rendered {
+                frozen: first_frozen,
+                render_input_json: first_input,
+                render_output_json: output.clone(),
+                observed: observed.clone(),
+            },
+        )
+        .unwrap();
+        let first_tx = first.state.journal.state.apply_transaction.unwrap();
+
+        let second_machine = boot_to_render(state());
+        let mut second_machine = second_machine;
+        second_machine.root.status.input_token = Some("observation-2".into());
+        let (mut second_frozen, second_input, _, _) = rendered(&second_machine.root, vec![]);
+        let mut second_input: RenderInputV0 = serde_json::from_str(&second_input).unwrap();
+        second_input.observation_token = "observation-2".into();
+        let second_input = serde_json::to_string(&second_input).unwrap();
+        second_frozen.observation_token = "observation-2".into();
+        second_frozen.render_input_hash =
+            parse_validate_render_input(&second_input).unwrap().sha256;
+        let second = reduce(
+            second_machine,
+            EventV0::Rendered {
+                frozen: second_frozen,
+                render_input_json: second_input,
+                render_output_json: output,
+                observed,
+            },
+        )
+        .unwrap();
+        let second_tx = second.state.journal.state.apply_transaction.unwrap();
+
+        assert_eq!(
+            first_tx.graph_identity_algorithm,
+            TransactionGraphIdentityAlgorithm::MutationGraphV1
+        );
+        assert_eq!(first_tx.desired_graph_hash, second_tx.desired_graph_hash);
+        assert_eq!(first_tx.prepared_intents, second_tx.prepared_intents);
+        assert_ne!(first_tx.id, second_tx.id);
+    }
+
+    #[test]
+    fn legacy_transactions_only_invalidate_unissued_or_complete_lifecycles() {
+        let fixture = issued_ssa_response_loss_fixture(false);
+        for lifecycle in [
+            NextCommandLifecycleV0::prepared(fixture.first_command_id.clone()),
+            NextCommandLifecycleV0::complete(),
+        ] {
+            let complete = lifecycle.state == NextCommandLifecycleStateV0::AllCommandsRecorded;
+            let mut legacy = fixture.issued.clone();
+            legacy.phase = PhaseV0::RevalidatePending;
+            legacy
+                .frozen
+                .as_mut()
+                .unwrap()
+                .state_resource_version
+                .clone_from(&legacy.root.state_resource_version);
+            let tx = legacy.journal.state.apply_transaction.as_mut().unwrap();
+            tx.graph_identity_algorithm = TransactionGraphIdentityAlgorithm::LegacyV0;
+            tx.next_command_lifecycle = lifecycle;
+            if complete {
+                let intent = tx.prepared_intents[0].clone();
+                tx.results = vec![ApplyResult {
+                    command_id: intent.command_id,
+                    attempt_token: tx.attempt_token.clone(),
+                    identity: intent.identity,
+                    outcome: ApplyOutcome::Applied,
+                    uid: intent.expected_uid,
+                    resource_version: Some("30".into()),
+                }];
+            }
+            let fresh_frozen = legacy.frozen.clone().unwrap();
+            let invalidated = reduce(
+                legacy,
+                EventV0::Revalidated {
+                    frozen: fresh_frozen,
+                    render_input_json: fixture.input.clone(),
+                    render_output_json: fixture.output.clone(),
+                    observed: fixture.response_observed.clone(),
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                invalidated.commands.as_slice(),
+                [CommandV0::Persist { operation, .. }]
+                    if operation.purpose == PersistPurpose::Invalidate
+            ));
+        }
+
+        let mut legacy = fixture.issued.clone();
+        legacy.phase = PhaseV0::RevalidatePending;
+        legacy
+            .frozen
+            .as_mut()
+            .unwrap()
+            .state_resource_version
+            .clone_from(&legacy.root.state_resource_version);
+        let tx = legacy.journal.state.apply_transaction.as_mut().unwrap();
+        tx.graph_identity_algorithm = TransactionGraphIdentityAlgorithm::LegacyV0;
+        let before = legacy.journal.state.apply_transaction.clone();
+        let fresh_frozen = legacy.frozen.clone().unwrap();
+        let held = reduce(
+            legacy,
+            EventV0::Revalidated {
+                frozen: fresh_frozen,
+                render_input_json: fixture.input,
+                render_output_json: fixture.output,
+                observed: fixture.response_observed,
+            },
+        )
+        .unwrap();
+        assert_eq!(held.state.phase, PhaseV0::Hold);
+        assert_eq!(held.state.journal.state.apply_transaction, before);
+        assert!(matches!(held.commands.as_slice(), [CommandV0::Hold { .. }]));
+    }
+
     fn acknowledge_dispatch_authorization(
         authorized: TransitionV0,
         new_state_resource_version: &str,
@@ -7636,6 +7902,7 @@ mod tests {
         machine.journal.state.apply_transaction = Some(ApplyTransaction {
             id: "d".repeat(64),
             generation: 7,
+            graph_identity_algorithm: TransactionGraphIdentityAlgorithm::LegacyV0,
             frozen_render_input_hash: "0".repeat(64),
             desired_graph_hash: "e".repeat(64),
             recovery_policy: ApplyRecoveryPolicy::ReplanAndRevalidateBeforeEffect,
@@ -9492,6 +9759,7 @@ mod tests {
         let tx = ApplyTransaction {
             id: transaction_id.clone(),
             generation: 7,
+            graph_identity_algorithm: TransactionGraphIdentityAlgorithm::LegacyV0,
             frozen_render_input_hash: "a".repeat(64),
             desired_graph_hash: "b".repeat(64),
             recovery_policy: ApplyRecoveryPolicy::ReplanAndRevalidateBeforeEffect,
@@ -9579,7 +9847,7 @@ mod tests {
         if multi_intent {
             let second_identity = ObjectIdentity {
                 api_version: "v1".into(),
-                kind: "ConfigMap".into(),
+                kind: "Service".into(),
                 namespace: "demo".into(),
                 name: "object-two".into(),
             };
@@ -9594,7 +9862,7 @@ mod tests {
                 logical_id: "object-two".into(),
                 object: serde_json::json!({
                     "apiVersion": "v1",
-                    "kind": "ConfigMap",
+                    "kind": "Service",
                     "metadata": {"namespace": "demo", "name": "object-two"},
                 }),
                 readiness: None,
@@ -9609,7 +9877,7 @@ mod tests {
                 },
                 qualification: BackendQualification::BuiltInTested {
                     kubernetes_minor: "1.36".into(),
-                    gvr: "configmaps".into(),
+                    gvr: "services".into(),
                 },
                 recovery_proof: None,
                 deletion_recovery_proof: None,
@@ -9793,6 +10061,16 @@ mod tests {
     #[test]
     fn normal_response_loss_revalidation_persists_a_correlated_complete_result() {
         let fixture = issued_ssa_response_loss_fixture(false);
+        let mut fresh_output: RenderOutputV0 = serde_json::from_str(&fixture.output).unwrap();
+        fresh_output.dependencies.push(Dependency::Collection {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: "demo".into(),
+            selector: "app=fresh".into(),
+            collection_revision: "fresh-revision".into(),
+            observation_token: "fresh-dependency-token".into(),
+        });
+        let fresh_output = serde_json::to_string(&fresh_output).unwrap();
         let mut normal = fixture.issued;
         normal.phase = PhaseV0::RevalidatePending;
         let current_state_resource_version = normal.root.state_resource_version.clone();
@@ -9812,7 +10090,7 @@ mod tests {
             EventV0::Revalidated {
                 frozen: fresh_frozen,
                 render_input_json: fixture.input,
-                render_output_json: fixture.output,
+                render_output_json: fresh_output,
                 observed: fixture.response_observed,
             },
         )
@@ -9836,6 +10114,23 @@ mod tests {
             .as_ref()
             .unwrap();
         assert_eq!(tx.results.len(), 1);
+        assert_eq!(
+            recovered.state.journal.state.pending_dependencies,
+            vec![DependencySnapshot {
+                type_: DependencySnapshotType::Collection,
+                identity: ObjectIdentity {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: "demo".into(),
+                    name: "collection".into(),
+                },
+                uid: None,
+                resource_version: None,
+                selector: Some("app=fresh".into()),
+                collection_revision: Some("fresh-revision".into()),
+                observation_token: "fresh-dependency-token".into(),
+            }]
+        );
         assert!(matches!(
             tx.next_command_lifecycle,
             NextCommandLifecycleV0 {
@@ -9863,12 +10158,14 @@ mod tests {
             .clone();
         let mut fresh_input: RenderInputV0 = serde_json::from_str(&fixture.input).unwrap();
         fresh_input.cache_epoch = "recovery-epoch".into();
+        fresh_input.observation_token = "recovery-observation-token".into();
         let fresh_input = serde_json::to_string(&fresh_input).unwrap();
         let fresh_input_hash = parse_validate_render_input(&fresh_input).unwrap().sha256;
         assert_ne!(original_audit_hash, fresh_input_hash);
         let fresh_frozen = FrozenInputV0 {
             state_resource_version: recovery.root.state_resource_version.clone(),
             cache_epoch: "recovery-epoch".into(),
+            observation_token: "recovery-observation-token".into(),
             final_observation_fence_token: "e".repeat(64),
             render_input_hash: fresh_input_hash.clone(),
             ..fixture.dispatch_frozen

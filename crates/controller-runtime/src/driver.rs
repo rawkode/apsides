@@ -1438,6 +1438,8 @@ impl QueuedAutomationV0 {
         self.root_uid == actor.state().root().uid
             && self.barrier == actor.barrier()
             && !self.render_observation_token.is_empty()
+            && actor.active_render_observation_token()
+                == Some(self.render_observation_token.as_str())
             && !actor.state().root().deleting
     }
 }
@@ -6883,6 +6885,7 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         let expected = automation_source_transition_token(&candidates[0].trigger);
         assert_eq!(candidates[0].trigger.observation_token, expected);
+        actor.active_render_input = Some((actor.barrier(), input.clone()));
 
         // Regression for the single-item queue: it reports a delivery even
         // though popping it leaves the queue empty, so the driver re-enters
@@ -6897,6 +6900,51 @@ mod tests {
         changed.root_resource_version = "2".into();
         assert!(actor.root_observed(changed));
         assert!(!stale_candidate.matches(&actor));
+    }
+
+    #[test]
+    fn superseded_final_render_automation_candidate_cannot_materialize() {
+        let mut actor = ready_actor();
+        let initial_input = final_automation_input(&actor);
+        let dependency = final_automation_dependency();
+        let output = final_automation_output(dependency.clone());
+        let mut stale = automation_candidates_from_final_render(
+            &actor,
+            &initial_input,
+            &output,
+            std::slice::from_ref(&dependency),
+            &final_automation_descriptor(),
+        )
+        .expect("initial candidate is authorized");
+
+        let mut latest_input = initial_input.clone();
+        latest_input.observation_token = "latest-final-render-token".into();
+        actor.active_render_input = Some((actor.barrier(), latest_input.clone()));
+        assert!(
+            !enqueue_next_automation_candidate(&mut actor, &mut stale),
+            "the earlier render declaration must be dropped before TriggerAutomation"
+        );
+        assert!(
+            actor
+                .next_command()
+                .expect("stale candidate is internal")
+                .is_none()
+        );
+
+        let mut latest = automation_candidates_from_final_render(
+            &actor,
+            &latest_input,
+            &output,
+            &[dependency],
+            &final_automation_descriptor(),
+        )
+        .expect("latest candidate is authorized");
+        assert!(enqueue_next_automation_candidate(&mut actor, &mut latest));
+        assert!(matches!(
+            actor.next_command(),
+            Ok(Some(CommandV0::Persist { operation, .. }))
+                if operation.purpose == PersistPurpose::AutomationBaseline
+        ));
     }
 
     #[test]

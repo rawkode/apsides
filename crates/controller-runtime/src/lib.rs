@@ -799,6 +799,17 @@ impl RootActorV0 {
     pub fn barrier(&self) -> BarrierV0 {
         self.barrier
     }
+
+    /// The locally sealed input that currently authorizes post-render work.
+    /// This is intentionally narrower than the barrier: distinct completed
+    /// renders can share a barrier while carrying different dependency
+    /// snapshots and observation tokens.
+    pub(crate) fn active_render_observation_token(&self) -> Option<&str> {
+        self.active_render_input
+            .as_ref()
+            .map(|(_, input)| input.observation_token.as_str())
+    }
+
     pub fn mode(&self) -> &ModeV0 {
         &self.mode
     }

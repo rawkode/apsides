@@ -697,6 +697,8 @@ fn authorized_dispatch_state(
             apply_transaction: Some(ApplyTransaction {
                 id: transaction_id.into(),
                 generation: 1,
+                graph_identity_algorithm:
+                    oxideloop_controller_api::TransactionGraphIdentityAlgorithm::LegacyV0,
                 frozen_render_input_hash: "d".repeat(64),
                 desired_graph_hash: "e".repeat(64),
                 recovery_policy: ApplyRecoveryPolicy::ReplanAndRevalidateBeforeEffect,
