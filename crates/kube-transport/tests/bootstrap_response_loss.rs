@@ -8,11 +8,19 @@ use std::{
 
 use http::{Method, Request, Response, StatusCode};
 use kube::{Client, client::Body};
-use oxideloop_controller_api::{OxideLoopStateSpec, RootBinding, StateBody, bootstrap_id};
+use oxideloop_controller_api::{
+    OxideLoopStateSpec, RootBinding, StateBody, bootstrap_id,
+    state_name as deterministic_state_name,
+};
 use oxideloop_controller_core::CommandV0;
 use oxideloop_kube_transport::{
-    CommandOutcomeV0, KubeTransportV0, RootAddressV0, TransportErrorV0,
+    BOOTSTRAP_AUTHORITY_VERSION_ANNOTATION, BOOTSTRAP_AUTHORITY_VERSION_V1,
+    BOOTSTRAP_PROOF_TOKEN_ANNOTATION, BOOTSTRAP_STATE_NAME_ANNOTATION,
+    BOOTSTRAP_STATE_SPEC_DIGEST_ANNOTATION, BOOTSTRAP_STATE_UID_ANNOTATION, COMMAND_ID_ANNOTATION,
+    CommandOutcomeV0, KubeTransportV0, ROOT_UID_ANNOTATION, RootAddressV0,
+    TRANSACTION_ID_ANNOTATION, TransportErrorV0,
 };
+use oxideloop_renderer_abi::{canonical_bytes, sha256_hex};
 use serde_json::{Value, json};
 use tower::service_fn;
 
@@ -20,9 +28,11 @@ const ROOT_GET: &str =
     "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a";
 const ROOT_STATUS: &str =
     "/apis/demo.oxideloop.dev/v1alpha1/namespaces/tenant-a/webapplications/app-a/status?";
-const STATE_GET: &str =
-    "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/state-a";
 const CONTROLLER_FIELD_MANAGER_QUERY: &str = "&fieldManager=oxideloop-controller";
+const ROOT_UID: &str = "root-uid";
+const STATE_UID: &str = "state-uid";
+const PROOF_TOKEN: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const BOOTSTRAP_SPEC_DIGEST_DOMAIN_V1: &[u8] = b"oxideloop.bootstrap-authority/v1\0";
 
 fn response(value: impl serde::Serialize) -> Response<Body> {
     Response::builder()
@@ -47,27 +57,96 @@ fn lost() -> Response<Body> {
         .body(Body::from(b"{".to_vec()))
         .expect("lost response")
 }
-fn root(metadata: bool, link: bool, rv: &str, divergent: bool) -> Value {
+
+fn state_name() -> String {
+    let derived = deterministic_state_name(ROOT_UID).expect("fixture State name");
+    assert_eq!(
+        derived,
+        deterministic_state_name(ROOT_UID).expect("fixture State name remains derivable"),
+        "fixture State name must remain derived from ROOT_UID"
+    );
+    derived
+}
+
+fn state_get() -> String {
+    format!(
+        "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates/{}",
+        state_name()
+    )
+}
+
+fn bootstrap_state_spec(divergent: bool) -> Value {
+    let state = OxideLoopStateSpec {
+        state_version: 1,
+        root: RootBinding {
+            uid: ROOT_UID.into(),
+            bootstrap_id: bootstrap_id(ROOT_UID).expect("bootstrap id"),
+            bundle_digest: "bundle".into(),
+        },
+        state: if divergent {
+            StateBody {
+                committed_dependencies: vec![],
+                ..StateBody::default()
+            }
+        } else {
+            StateBody::default()
+        },
+    };
+    serde_json::to_value(state).expect("fixture State spec JSON")
+}
+
+fn bootstrap_spec_digest(spec: &Value) -> String {
+    let canonical = canonical_bytes(spec).expect("fixture State spec canonicalizes");
+    let mut bytes = Vec::with_capacity(BOOTSTRAP_SPEC_DIGEST_DOMAIN_V1.len() + canonical.len());
+    bytes.extend_from_slice(BOOTSTRAP_SPEC_DIGEST_DOMAIN_V1);
+    bytes.extend_from_slice(&canonical);
+    sha256_hex(&bytes)
+}
+
+fn bootstrap_authority_annotations(
+    root_uid: &str,
+    state_name: &str,
+    state_uid: &str,
+    state_spec: &Value,
+    proof_token: &str,
+) -> serde_json::Map<String, Value> {
     let mut annotations = serde_json::Map::new();
-    if metadata {
-        annotations.insert("runtime.oxideloop.dev/root-uid".into(), json!("root-uid"));
-        annotations.insert(
-            "runtime.oxideloop.dev/transaction-id".into(),
-            json!("b".repeat(64)),
-        );
-        annotations.insert(
-            "runtime.oxideloop.dev/command-id".into(),
-            json!("b".repeat(64)),
-        );
-    }
+    annotations.insert(ROOT_UID_ANNOTATION.into(), json!(root_uid));
+    annotations.insert(TRANSACTION_ID_ANNOTATION.into(), json!(proof_token));
+    annotations.insert(COMMAND_ID_ANNOTATION.into(), json!(proof_token));
+    annotations.insert(
+        BOOTSTRAP_AUTHORITY_VERSION_ANNOTATION.into(),
+        json!(BOOTSTRAP_AUTHORITY_VERSION_V1),
+    );
+    annotations.insert(BOOTSTRAP_STATE_NAME_ANNOTATION.into(), json!(state_name));
+    annotations.insert(BOOTSTRAP_STATE_UID_ANNOTATION.into(), json!(state_uid));
+    annotations.insert(
+        BOOTSTRAP_STATE_SPEC_DIGEST_ANNOTATION.into(),
+        json!(bootstrap_spec_digest(state_spec)),
+    );
+    annotations.insert(BOOTSTRAP_PROOF_TOKEN_ANNOTATION.into(), json!(proof_token));
+    annotations
+}
+
+fn root(metadata: bool, link: bool, rv: &str, divergent: bool) -> Value {
+    let state_name = state_name();
+    let annotations = metadata.then(|| {
+        bootstrap_authority_annotations(
+            ROOT_UID,
+            &state_name,
+            STATE_UID,
+            &bootstrap_state_spec(false),
+            PROOF_TOKEN,
+        )
+    });
     let status = if link {
-        json!({"state":{"rootUid":"root-uid","name":"state-a","uid":"state-uid"}})
+        json!({"state":{"rootUid":ROOT_UID,"name":state_name,"uid":STATE_UID}})
     } else {
         json!({})
     };
     json!({"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication",
-        "metadata":{"name":"app-a","namespace":"tenant-a","uid":"root-uid","resourceVersion":rv,"generation":1,
-          "finalizers":if metadata { json!(["demo.oxideloop.dev/finalizer"]) } else { json!([]) },"annotations":annotations},
+        "metadata":{"name":"app-a","namespace":"tenant-a","uid":ROOT_UID,"resourceVersion":rv,"generation":1,
+          "finalizers":if metadata { json!(["demo.oxideloop.dev/finalizer"]) } else { json!([]) },"annotations":annotations.unwrap_or_default()},
         "spec":if divergent { json!({"changed":true}) } else { json!({"message":"hello","expose":false,"program":{"configMapName":"bundle","key":"bundle","digest":"b".repeat(64)}}) },"status":status})
 }
 
@@ -215,32 +294,18 @@ fn root_with_foreign_state_link_mutation(mutation: &str) -> Value {
     root
 }
 fn state(finalizer: bool, rv: &str, divergent: bool) -> Value {
+    let state_name = state_name();
     let transaction_id = if divergent {
         "changed".to_owned()
     } else {
-        "b".repeat(64)
+        PROOF_TOKEN.to_owned()
     };
-    let spec = OxideLoopStateSpec {
-        state_version: 1,
-        root: RootBinding {
-            uid: "root-uid".into(),
-            bootstrap_id: bootstrap_id("root-uid").expect("bootstrap id"),
-            bundle_digest: "bundle".into(),
-        },
-        state: if divergent {
-            StateBody {
-                committed_dependencies: vec![],
-                ..StateBody::default()
-            }
-        } else {
-            StateBody::default()
-        },
-    };
+    let spec = bootstrap_state_spec(divergent);
     json!({"apiVersion":"runtime.oxideloop.dev/v1alpha1","kind":"OxideLoopState",
-      "metadata":{"name":"state-a","namespace":"tenant-a","uid":"state-uid","resourceVersion":rv,
+      "metadata":{"name":state_name,"namespace":"tenant-a","uid":STATE_UID,"resourceVersion":rv,
         "finalizers":if finalizer { json!(["runtime.oxideloop.dev/state-finalizer"]) } else { json!([]) },
-        "annotations":{"runtime.oxideloop.dev/root-uid":"root-uid","runtime.oxideloop.dev/transaction-id":transaction_id,"runtime.oxideloop.dev/command-id":"b".repeat(64)},
-        "ownerReferences":[{"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication","name":"app-a","uid":"root-uid","controller":true,"blockOwnerDeletion":false}]},"spec":spec})
+        "annotations":{"runtime.oxideloop.dev/root-uid":ROOT_UID,"runtime.oxideloop.dev/transaction-id":transaction_id,"runtime.oxideloop.dev/command-id":PROOF_TOKEN},
+        "ownerReferences":[{"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication","name":"app-a","uid":ROOT_UID,"controller":true,"blockOwnerDeletion":false}]},"spec":spec})
 }
 
 fn state_with_apply_managed_fields(finalizer: bool, rv: &str, divergent: bool) -> Value {
@@ -303,28 +368,29 @@ fn root_status_patch_count(calls: &[(Method, String)]) -> usize {
 }
 
 fn state_finalizer_patch_count(calls: &[(Method, String)]) -> usize {
+    let state_get = state_get();
     calls
         .iter()
-        .filter(|(method, path)| *method == Method::PATCH && path.starts_with(STATE_GET))
+        .filter(|(method, path)| *method == Method::PATCH && path.starts_with(&state_get))
         .count()
 }
 fn command() -> CommandV0 {
     let state = OxideLoopStateSpec {
         state_version: 1,
         root: RootBinding {
-            uid: "root-uid".into(),
-            bootstrap_id: bootstrap_id("root-uid").expect("bootstrap id"),
+            uid: ROOT_UID.into(),
+            bootstrap_id: bootstrap_id(ROOT_UID).expect("bootstrap id"),
             bundle_digest: "bundle".into(),
         },
         state: StateBody::default(),
     };
     CommandV0::EnsureBootstrap {
-        token: "b".repeat(64),
+        token: PROOF_TOKEN.into(),
         state,
-        root_uid: "root-uid".into(),
+        root_uid: ROOT_UID.into(),
         root_generation: 1,
         root_resource_version: "1".into(),
-        state_name: "state-a".into(),
+        state_name: state_name(),
     }
 }
 async fn run_async(
@@ -357,10 +423,79 @@ async fn run_async(
     let address = RootAddressV0 {
         namespace: "tenant-a".into(),
         name: "app-a".into(),
-        state_name: "state-a".into(),
+        state_name: state_name(),
     };
     let result = transport.dispatch(&address, &command()).await;
     (result, calls.lock().expect("calls").clone())
+}
+
+/// A complete direct `EnsureBootstrap` transaction under the R17 phase order:
+/// State POST, root metadata bundle, State finalizer, then root `StateLink`.
+/// The first three response parameters are the raw responses to those last
+/// three writes, so each caller can vary exactly one response-proof surface.
+fn fresh_bootstrap_success_responses(
+    root_after_metadata: Value,
+    state_after_finalizer: Value,
+    root_after_link: Value,
+) -> Vec<Response<Body>> {
+    let root_before = root_with_apply_managed_fields(false, false, "1");
+    let state_created = state_with_apply_managed_fields(false, "2", false);
+    vec![
+        response(root_before.clone()),
+        not_found(),
+        response(root_before.clone()),
+        response(state_created),
+        response(root_before.clone()),
+        response(root_before),
+        response(root_after_metadata.clone()),
+        response(root_after_metadata.clone()),
+        response(state_after_finalizer.clone()),
+        response(root_after_metadata),
+        response(root_after_link.clone()),
+        response(state_after_finalizer),
+        response(root_after_link),
+    ]
+}
+
+fn fresh_bootstrap_through_state_finalizer_preflight(
+    root_after_metadata: Value,
+) -> Vec<Response<Body>> {
+    let root_before = root_with_apply_managed_fields(false, false, "1");
+    let state_created = state_with_apply_managed_fields(false, "2", false);
+    vec![
+        response(root_before.clone()),
+        not_found(),
+        response(root_before.clone()),
+        response(state_created),
+        response(root_before.clone()),
+        response(root_before),
+        response(root_after_metadata.clone()),
+        response(root_after_metadata),
+    ]
+}
+
+fn fresh_bootstrap_through_metadata_preflight() -> Vec<Response<Body>> {
+    let root_before = root_with_apply_managed_fields(false, false, "1");
+    let state_created = state_with_apply_managed_fields(false, "2", false);
+    vec![
+        response(root_before.clone()),
+        not_found(),
+        response(root_before.clone()),
+        response(state_created),
+        response(root_before.clone()),
+        response(root_before),
+    ]
+}
+
+fn fresh_bootstrap_through_root_link_preflight(
+    root_after_metadata: Value,
+    state_after_finalizer: Value,
+) -> Vec<Response<Body>> {
+    let mut responses =
+        fresh_bootstrap_through_state_finalizer_preflight(root_after_metadata.clone());
+    responses.push(response(state_after_finalizer));
+    responses.push(response(root_after_metadata));
+    responses
 }
 
 #[tokio::test]
@@ -373,6 +508,7 @@ async fn state_create_response_loss_holds_without_name_adoption_or_proof_get() {
     ])
     .await;
     assert_eq!(result, Err(TransportErrorV0::ManualRecoveryHold));
+    let state_get = state_get();
     assert_eq!(
         calls
             .iter()
@@ -380,7 +516,7 @@ async fn state_create_response_loss_holds_without_name_adoption_or_proof_get() {
             .collect::<Vec<_>>(),
         vec![
             ROOT_GET,
-            STATE_GET,
+            state_get.as_str(),
             ROOT_GET,
             "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/tenant-a/oxideloopstates?"
         ]
@@ -389,59 +525,51 @@ async fn state_create_response_loss_holds_without_name_adoption_or_proof_get() {
 
 #[tokio::test]
 async fn state_finalizer_direct_response_normalizes_controller_managed_fields() {
-    let root = root_with_apply_managed_fields(true, true, "1");
-    let before = state_with_apply_managed_fields(false, "2", false);
-    let written = state_with_controller_finalizer_managed_fields(true, "3", false);
-    let (result, calls) = run_async(vec![
-        response(root.clone()),
-        response(before),
-        response(root.clone()),
-        response(written.clone()),
-        response(root.clone()),
-        response(written),
-        response(root),
-    ])
+    let root_after_metadata = root(true, false, "2", false);
+    let state_after_finalizer = state_with_controller_finalizer_managed_fields(true, "3", false);
+    let root_after_link = root(true, true, "3", false);
+    let (result, calls) = run_async(fresh_bootstrap_success_responses(
+        root_after_metadata,
+        state_after_finalizer,
+        root_after_link,
+    ))
     .await;
 
     assert!(matches!(result, Ok(CommandOutcomeV0::Event(_))));
     assert_eq!(state_finalizer_patch_count(&calls), 1);
+    let state_get = state_get();
     assert!(calls.iter().any(|(method, path)| {
         *method == Method::PATCH
-            && path.starts_with(STATE_GET)
+            && path.starts_with(&state_get)
             && path.ends_with(CONTROLLER_FIELD_MANAGER_QUERY)
     }));
-    assert_eq!(root_status_patch_count(&calls), 0);
+    assert_eq!(
+        root_status_patch_count(&calls),
+        1,
+        "R17 links only after the State-finalizer response"
+    );
 }
 
 #[tokio::test]
-async fn state_finalizer_recovery_normalizes_controller_managed_fields() {
-    let root = root_with_apply_managed_fields(true, true, "1");
-    let before = state_with_apply_managed_fields(false, "2", false);
-    let proof = state_with_controller_finalizer_managed_fields(true, "3", false);
-    let (result, calls) = run_async(vec![
-        response(root.clone()),
-        response(before),
-        response(root.clone()),
-        lost(),
-        response(proof.clone()),
-        response(root.clone()),
-        response(proof),
-        response(root),
-    ])
-    .await;
+async fn state_finalizer_response_loss_holds_without_a_proof_get() {
+    let root_after_metadata = root(true, false, "2", false);
+    let mut responses = fresh_bootstrap_through_state_finalizer_preflight(root_after_metadata);
+    responses.push(lost());
+    let (result, calls) = run_async(responses).await;
 
-    assert!(matches!(result, Ok(CommandOutcomeV0::Event(_))));
+    assert_eq!(result, Err(TransportErrorV0::ManualRecoveryHold));
     assert_eq!(state_finalizer_patch_count(&calls), 1);
-    assert!(calls.iter().any(|(method, path)| {
-        *method == Method::PATCH
-            && path.starts_with(STATE_GET)
-            && path.ends_with(CONTROLLER_FIELD_MANAGER_QUERY)
-    }));
     assert_eq!(root_status_patch_count(&calls), 0);
+    let state_get = state_get();
+    assert_eq!(
+        calls.iter().filter(|(_, path)| path == &state_get).count(),
+        1,
+        "a direct bootstrap has no collected raw barrier to turn a lost State-finalizer response into a proof GET"
+    );
 }
 
 #[tokio::test]
-async fn state_finalizer_recovery_rejects_any_foreign_semantic_mutation() {
+async fn state_finalizer_direct_response_rejects_any_foreign_semantic_mutation() {
     for mutation in [
         "annotation",
         "finalizer",
@@ -452,15 +580,10 @@ async fn state_finalizer_recovery_rejects_any_foreign_semantic_mutation() {
         "status",
         "identity",
     ] {
-        let root = root_with_apply_managed_fields(true, true, "1");
-        let (result, calls) = run_async(vec![
-            response(root.clone()),
-            response(state_with_apply_managed_fields(false, "2", false)),
-            response(root),
-            lost(),
-            response(state_with_foreign_finalizer_mutation(mutation)),
-        ])
-        .await;
+        let root_after_metadata = root(true, false, "2", false);
+        let mut responses = fresh_bootstrap_through_state_finalizer_preflight(root_after_metadata);
+        responses.push(response(state_with_foreign_finalizer_mutation(mutation)));
+        let (result, calls) = run_async(responses).await;
 
         assert_eq!(
             result,
@@ -474,91 +597,41 @@ async fn state_finalizer_recovery_rejects_any_foreign_semantic_mutation() {
                 .iter()
                 .filter(|(method, _)| *method == Method::PATCH)
                 .count(),
-            1,
-            "a rejected State-finalizer proof must make no later bootstrap write for {mutation}"
+            2,
+            "only RootMetadata and the rejected State-finalizer PATCH may be polled for {mutation}"
         );
     }
 }
 
 #[tokio::test]
-async fn state_finalizer_loss_uses_one_exact_proof_and_holds_on_divergence() {
-    for divergent in [false, true] {
-        let (result, calls) = run_async(vec![
-            response(root(true, true, "1", false)),
-            response(state(false, "2", false)),
-            response(root(true, true, "1", false)),
-            lost(),
-            response(state(true, "3", divergent)),
-            response(root(true, true, "2", false)),
-            response(state(true, "3", false)),
-            response(root(true, true, "2", false)),
-        ])
-        .await;
-        if divergent {
-            assert_eq!(result, Err(TransportErrorV0::ManualRecoveryHold));
-        } else {
-            assert!(matches!(result, Ok(CommandOutcomeV0::Event(_))));
-        }
-        assert_eq!(
-            calls
-                .iter()
-                .filter(|(method, _)| *method == Method::PATCH)
-                .count(),
-            1
-        );
-        assert_eq!(
-            calls.iter().filter(|(_, path)| path == STATE_GET).count(),
-            if divergent { 2 } else { 3 }
-        );
-    }
-}
+async fn root_metadata_response_loss_holds_without_a_collected_raw_barrier() {
+    let mut responses = fresh_bootstrap_through_metadata_preflight();
+    responses.push(lost());
+    let (result, calls) = run_async(responses).await;
 
-#[tokio::test]
-async fn root_metadata_loss_uses_exact_proof_and_holds_on_divergence() {
-    for divergent in [false, true] {
-        let (result, calls) = run_async(vec![
-            response(root(false, true, "1", false)),
-            response(state(true, "2", false)),
-            response(root(false, true, "1", false)),
-            response(root(false, true, "1", false)),
-            lost(),
-            response(root(true, true, "2", divergent)),
-            response(state(true, "2", false)),
-            response(root(true, true, "2", false)),
-        ])
-        .await;
-        if divergent {
-            assert_eq!(result, Err(TransportErrorV0::ManualRecoveryHold));
-        } else {
-            assert!(matches!(result, Ok(CommandOutcomeV0::Event(_))));
-        }
-        assert_eq!(
-            calls
-                .iter()
-                .filter(|(method, _)| *method == Method::PATCH)
-                .count(),
-            1
-        );
-    }
+    assert_eq!(result, Err(TransportErrorV0::ManualRecoveryHold));
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|(method, _)| *method == Method::PATCH)
+            .count(),
+        1,
+        "the response-lost metadata write is not replayed by a direct dispatcher"
+    );
+    assert_eq!(state_finalizer_patch_count(&calls), 0);
+    assert_eq!(root_status_patch_count(&calls), 0);
 }
 
 #[tokio::test]
 async fn root_metadata_direct_response_normalizes_controller_managed_fields() {
-    let (result, calls) = run_async(vec![
-        response(root_with_apply_managed_fields(false, false, "1")),
-        not_found(),
-        response(root_with_apply_managed_fields(false, false, "1")),
-        response(state(false, "2", false)),
-        response(root_with_apply_managed_fields(false, false, "1")),
-        response(state(true, "3", false)),
-        response(root_with_apply_managed_fields(false, false, "1")),
-        response(root_with_apply_managed_fields(false, false, "1")),
-        response(root_with_controller_managed_fields(true, false, "2")),
-        response(root_with_controller_managed_fields(true, false, "2")),
-        response(root_with_controller_managed_fields(true, true, "3")),
-        response(state(true, "3", false)),
-        response(root_with_controller_managed_fields(true, true, "3")),
-    ])
+    let root_after_metadata = root_with_controller_managed_fields(true, false, "2");
+    let state_after_finalizer = state(true, "3", false);
+    let root_after_link = root(true, true, "3", false);
+    let (result, calls) = run_async(fresh_bootstrap_success_responses(
+        root_after_metadata,
+        state_after_finalizer,
+        root_after_link,
+    ))
     .await;
     assert!(matches!(result, Ok(CommandOutcomeV0::Event(_))));
     assert_eq!(
@@ -577,42 +650,7 @@ async fn root_metadata_direct_response_normalizes_controller_managed_fields() {
 }
 
 #[tokio::test]
-async fn root_metadata_recovery_normalizes_controller_managed_fields() {
-    let (result, calls) = run_async(vec![
-        response(root_with_apply_managed_fields(false, false, "1")),
-        not_found(),
-        response(root_with_apply_managed_fields(false, false, "1")),
-        response(state(false, "2", false)),
-        response(root_with_apply_managed_fields(false, false, "1")),
-        response(state(true, "3", false)),
-        response(root_with_apply_managed_fields(false, false, "1")),
-        response(root_with_apply_managed_fields(false, false, "1")),
-        lost(),
-        response(root_with_controller_managed_fields(true, false, "2")),
-        response(root_with_controller_managed_fields(true, false, "2")),
-        response(root_with_controller_managed_fields(true, true, "3")),
-        response(state(true, "3", false)),
-        response(root_with_controller_managed_fields(true, true, "3")),
-    ])
-    .await;
-    assert!(matches!(result, Ok(CommandOutcomeV0::Event(_))));
-    assert_eq!(
-        root_status_patch_count(&calls),
-        1,
-        "the exact response-loss proof permits exactly one State-link PATCH"
-    );
-    assert!(
-        calls.iter().any(|(method, path)| {
-            *method == Method::PATCH
-                && path.starts_with(ROOT_GET)
-                && path.ends_with(CONTROLLER_FIELD_MANAGER_QUERY)
-        }),
-        "the ambiguous JSON metadata patch names the controller field manager"
-    );
-}
-
-#[tokio::test]
-async fn root_metadata_loss_rejects_any_foreign_metadata_before_state_link() {
+async fn root_metadata_direct_response_rejects_any_foreign_semantic_mutation() {
     for mutation in [
         "annotation",
         "finalizer",
@@ -624,25 +662,9 @@ async fn root_metadata_loss_rejects_any_foreign_metadata_before_state_link() {
         "identity",
     ] {
         let foreign = root_with_foreign_metadata(mutation);
-        let (result, calls) = run_async(vec![
-            response(root(false, false, "1", false)),
-            not_found(),
-            response(root(false, false, "1", false)),
-            response(state(false, "2", false)),
-            response(root(false, false, "1", false)),
-            response(state(true, "3", false)),
-            response(root(false, false, "1", false)),
-            response(root(false, false, "1", false)),
-            lost(),
-            response(foreign.clone()),
-            // These replies make an accidental admission observable as a
-            // later status PATCH, rather than hiding it behind fixture EOF.
-            response(foreign),
-            response(root(true, true, "3", false)),
-            response(state(true, "2", false)),
-            response(root(true, true, "3", false)),
-        ])
-        .await;
+        let mut responses = fresh_bootstrap_through_metadata_preflight();
+        responses.push(response(foreign));
+        let (result, calls) = run_async(responses).await;
         assert_eq!(
             result,
             Err(TransportErrorV0::ManualRecoveryHold),
@@ -653,8 +675,8 @@ async fn root_metadata_loss_rejects_any_foreign_metadata_before_state_link() {
                 .iter()
                 .filter(|(method, _)| *method == Method::PATCH)
                 .count(),
-            2,
-            "only State finalization and the ambiguous metadata PATCH may be polled for {mutation}"
+            1,
+            "a rejected metadata response must make no later bootstrap write for {mutation}"
         );
         assert_eq!(
             root_status_patch_count(&calls),
@@ -666,26 +688,14 @@ async fn root_metadata_loss_rejects_any_foreign_metadata_before_state_link() {
 
 #[tokio::test]
 async fn root_state_link_direct_response_normalizes_controller_managed_fields() {
-    let root_before = root_with_apply_managed_fields(false, false, "1");
-    let state_before = state_with_apply_managed_fields(false, "2", false);
-    let state_after = state_with_controller_finalizer_managed_fields(true, "3", false);
     let root_after_metadata = root_with_controller_managed_fields(true, false, "2");
+    let state_after = state_with_controller_finalizer_managed_fields(true, "3", false);
     let root_after_link = root_with_controller_status_managed_fields(true, true, "3");
-    let (result, calls) = run_async(vec![
-        response(root_before.clone()),
-        not_found(),
-        response(root_before.clone()),
-        response(state_before),
-        response(root_before.clone()),
-        response(state_after.clone()),
-        response(root_before.clone()),
-        response(root_before),
-        response(root_after_metadata.clone()),
-        response(root_after_metadata),
-        response(root_after_link.clone()),
-        response(state_after),
-        response(root_after_link),
-    ])
+    let (result, calls) = run_async(fresh_bootstrap_success_responses(
+        root_after_metadata,
+        state_after,
+        root_after_link,
+    ))
     .await;
 
     assert!(matches!(result, Ok(CommandOutcomeV0::Event(_))));
@@ -698,41 +708,28 @@ async fn root_state_link_direct_response_normalizes_controller_managed_fields() 
 }
 
 #[tokio::test]
-async fn root_state_link_recovery_normalizes_controller_managed_fields() {
-    let root_before = root_with_apply_managed_fields(false, false, "1");
-    let state_before = state_with_apply_managed_fields(false, "2", false);
-    let state_after = state_with_controller_finalizer_managed_fields(true, "3", false);
-    let root_after_metadata = root_with_controller_managed_fields(true, false, "2");
-    let root_after_link = root_with_controller_status_managed_fields(true, true, "3");
-    let (result, calls) = run_async(vec![
-        response(root_before.clone()),
-        not_found(),
-        response(root_before.clone()),
-        response(state_before),
-        response(root_before.clone()),
-        response(state_after.clone()),
-        response(root_before.clone()),
-        response(root_before),
-        response(root_after_metadata.clone()),
-        response(root_after_metadata),
-        lost(),
-        response(root_after_link.clone()),
-        response(state_after),
-        response(root_after_link),
-    ])
-    .await;
+async fn root_state_link_response_loss_holds_without_replaying_the_final_write() {
+    let root_after_metadata = root(true, false, "2", false);
+    let state_after_finalizer = state(true, "3", false);
+    let mut responses =
+        fresh_bootstrap_through_root_link_preflight(root_after_metadata, state_after_finalizer);
+    responses.push(lost());
+    let (result, calls) = run_async(responses).await;
 
-    assert!(matches!(result, Ok(CommandOutcomeV0::Event(_))));
+    assert_eq!(result, Err(TransportErrorV0::ManualRecoveryHold));
     assert_eq!(root_status_patch_count(&calls), 1);
-    assert!(calls.iter().any(|(method, path)| {
-        *method == Method::PATCH
-            && path.starts_with(ROOT_STATUS)
-            && path.ends_with(CONTROLLER_FIELD_MANAGER_QUERY)
-    }));
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|(method, _)| *method == Method::PATCH)
+            .count(),
+        3,
+        "the final State-link PATCH is polled once and never replayed"
+    );
 }
 
 #[tokio::test]
-async fn root_state_link_recovery_rejects_any_foreign_semantic_mutation() {
+async fn root_state_link_direct_response_rejects_any_foreign_semantic_mutation() {
     for mutation in [
         "annotation",
         "finalizer",
@@ -743,25 +740,12 @@ async fn root_state_link_recovery_rejects_any_foreign_semantic_mutation() {
         "status",
         "identity",
     ] {
-        let root_before = root_with_apply_managed_fields(false, false, "1");
-        let state_before = state_with_apply_managed_fields(false, "2", false);
-        let state_after = state_with_controller_finalizer_managed_fields(true, "3", false);
-        let root_after_metadata = root_with_controller_managed_fields(true, false, "2");
-        let (result, calls) = run_async(vec![
-            response(root_before.clone()),
-            not_found(),
-            response(root_before.clone()),
-            response(state_before),
-            response(root_before.clone()),
-            response(state_after),
-            response(root_before.clone()),
-            response(root_before),
-            response(root_after_metadata.clone()),
-            response(root_after_metadata),
-            lost(),
-            response(root_with_foreign_state_link_mutation(mutation)),
-        ])
-        .await;
+        let root_after_metadata = root(true, false, "2", false);
+        let state_after_finalizer = state(true, "3", false);
+        let mut responses =
+            fresh_bootstrap_through_root_link_preflight(root_after_metadata, state_after_finalizer);
+        responses.push(response(root_with_foreign_state_link_mutation(mutation)));
+        let (result, calls) = run_async(responses).await;
 
         assert_eq!(
             result,
@@ -781,37 +765,20 @@ async fn root_state_link_recovery_rejects_any_foreign_semantic_mutation() {
 }
 
 #[tokio::test]
-async fn root_link_loss_uses_exact_proof_and_holds_on_divergence() {
-    for divergent in [false, true] {
-        let (result, calls) = run_async(vec![
-            response(root(false, false, "1", false)),
-            not_found(),
-            response(root(false, false, "1", false)),
-            response(state(false, "2", false)),
-            response(root(false, false, "1", false)),
-            response(state(true, "3", false)),
-            response(root(false, false, "1", false)),
-            response(root(false, false, "1", false)),
-            response(root(true, false, "2", false)),
-            response(root(true, false, "2", false)),
-            lost(),
-            response(root(true, !divergent, "3", false)),
-            response(state(true, "3", false)),
-            response(root(true, true, "3", false)),
-        ])
-        .await;
-        if divergent {
-            assert_eq!(result, Err(TransportErrorV0::ManualRecoveryHold));
-        } else {
-            assert!(matches!(result, Ok(CommandOutcomeV0::Event(_))));
-        }
-        assert_eq!(
-            calls
-                .iter()
-                .filter(|(method, _)| *method == Method::PATCH)
-                .count(),
-            3
-        );
-        assert_eq!(root_status_patch_count(&calls), 1);
-    }
+async fn partial_v1_authority_bundle_holds_before_any_bootstrap_write() {
+    let mut partial = root(true, false, "1", false);
+    partial["metadata"]["annotations"]
+        .as_object_mut()
+        .expect("fixture annotations")
+        .remove(BOOTSTRAP_STATE_SPEC_DIGEST_ANNOTATION);
+    let (result, calls) =
+        run_async(vec![response(partial), response(state(false, "2", false))]).await;
+
+    assert_eq!(result, Err(TransportErrorV0::ManualRecoveryHold));
+    assert!(
+        calls
+            .iter()
+            .all(|(method, _)| *method != Method::POST && *method != Method::PATCH),
+        "a partial R17 v1 bundle is never overwritten or resumed"
+    );
 }

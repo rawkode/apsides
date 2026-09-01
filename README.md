@@ -115,6 +115,7 @@ loads separate production and E2E-failpoint images, installs the CRDs and E2E
 overlay, and runs the serialized ownership/recovery/deletion matrix:
 
 ```sh
+scripts/verify-production-no-failpoint.sh
 scripts/run-kind-e2e.sh
 ```
 
@@ -134,6 +135,12 @@ deleted even after failure; use `KEEP_CLUSTER=1` only to inspect a failure. The
 runner refuses every nonignored working-tree change; commit or stash all source
 changes before starting it. Its own ignored evidence directory is the only
 run-time write.
+
+The fresh kind run proves controller/renderer process separation and rendered
+Kubernetes lifecycle behavior. Finite renderer protocol framing, EOF,
+deadlines, and response-identity guarantees are covered by the Rust protocol
+tests and `scripts/verify-production-no-failpoint.sh`; they are not claims made
+by kind lifecycle evidence alone.
 
 For OrbStack, start its Docker-compatible engine and run the same command. The
 runner detects OrbStack only within its own process and selects Docker; callers

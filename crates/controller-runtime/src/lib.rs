@@ -44,8 +44,10 @@ use oxideloop_event_planner::{
     semantically_equal,
 };
 use oxideloop_kube_transport::{
-    BootstrapRootEchoAuthenticationV0, DiscoveryPortV0, KubeTransportV0, ListV0, ObjectRefV0,
-    OperationSessionV0, ResourceKindV0, TransportErrorV0, WatchEventV0, WatchHandleV0,
+    DiscoveryPortV0, KubeTransportV0, ListV0, ObjectRefV0, OperationSessionV0, ResourceKindV0,
+    TransportErrorV0, UnlinkedBootstrapDeletionCleanupV0, WatchEventV0, WatchHandleV0,
+    bootstrap_authority_bundle_v1, bootstrap_authority_bundle_v1_matches_state,
+    completed_unlinked_bootstrap_cleanup_bundle_v1,
 };
 use oxideloop_renderer_abi::{
     model::{ActionInputV0, ActionOutputV0, Dependency, RenderInputV0, RenderOutputV0},
@@ -669,16 +671,11 @@ pub(crate) enum PrewriteRootWitnessV0 {
         root: Box<RootSnapshotV0>,
         pending_status: Box<Option<WebApplicationStatus>>,
     },
-    /// Bootstrap owns a multi-write root authority sequence. Its dynamic
-    /// phase witness lives in the transport session, preventing a status
-    /// shape from being mistaken for an owned bootstrap echo.
-    Bootstrap { operation: OperationSessionV0 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PrewriteRootAuthenticationV0 {
     ExactOwnedStatusEcho,
-    DuplicateOwnedBootstrapEcho,
     GenuineOrAmbiguous,
 }
 
@@ -690,22 +687,9 @@ impl PrewriteRootWitnessV0 {
     pub(crate) fn authenticate(
         &self,
         fresh: &RootSnapshotV0,
-        epoch: u32,
+        _epoch: u32,
     ) -> PrewriteRootAuthenticationV0 {
         match self {
-            Self::Bootstrap { operation } => {
-                match operation.authenticate_bootstrap_root_echo(fresh, epoch) {
-                    BootstrapRootEchoAuthenticationV0::ExactFirstUse => {
-                        PrewriteRootAuthenticationV0::ExactOwnedStatusEcho
-                    }
-                    BootstrapRootEchoAuthenticationV0::ExactDuplicate => {
-                        PrewriteRootAuthenticationV0::DuplicateOwnedBootstrapEcho
-                    }
-                    BootstrapRootEchoAuthenticationV0::GenuineOrAmbiguous => {
-                        PrewriteRootAuthenticationV0::GenuineOrAmbiguous
-                    }
-                }
-            }
             Self::PendingStatus {
                 root,
                 pending_status,
@@ -2793,6 +2777,39 @@ async fn recover_unlinked_deleting_root<P: LoaderRereadPortV0>(
     recover_deleting_root_without_state(snapshot).map(Some)
 }
 
+/// Recognizes only the completed tail of unlinked-v1 deletion cleanup. The
+/// durable bundle survives because another controller may still retain the
+/// deleting root, but it grants no new mutation authority: the exact bundled
+/// State name must be absent before a restart may treat the cleanup as done.
+async fn completed_unlinked_bootstrap_cleanup_v1<P: LoaderRereadPortV0>(
+    transport: &P,
+    root: &oxideloop_kube_transport::ObjectV0,
+) -> Result<bool, RuntimeErrorV0> {
+    let bundle = completed_unlinked_bootstrap_cleanup_bundle_v1(root).map_err(|_| {
+        RuntimeErrorV0::Hold("completed unlinked bootstrap cleanup bundle is malformed".into())
+    })?;
+    let Some(bundle) = bundle else {
+        return Ok(false);
+    };
+    let state_ref = ObjectRefV0 {
+        resource: ResourceKindV0::OxideLoopState,
+        namespace: root.reference.namespace.clone(),
+        name: bundle.state_name.clone(),
+    };
+    match transport.reread_object(&state_ref).await? {
+        None => Ok(true),
+        Some(state) if bootstrap_authority_bundle_v1_matches_state(root, &state, &bundle) => {
+            Err(RuntimeErrorV0::Hold(
+                "completed unlinked bootstrap cleanup still has its original State UID".into(),
+            ))
+        }
+        Some(_) => Err(RuntimeErrorV0::Hold(
+            "completed unlinked bootstrap cleanup State does not match its durable authority bundle"
+                .into(),
+        )),
+    }
+}
+
 fn validate_state_status(state: &oxideloop_kube_transport::ObjectV0) -> Result<(), RuntimeErrorV0> {
     serde_json::from_value::<oxideloop_controller_api::OxideLoopStateStatus>(
         state
@@ -2915,6 +2932,29 @@ async fn fresh_root_snapshot_from_reader<P: LoaderRereadPortV0>(
     })?;
     let mut snapshot = root_snapshot_from_object(&root, namespace, name)?;
     let Some(link) = snapshot.status.state.clone() else {
+        if completed_unlinked_bootstrap_cleanup_v1(transport, &root).await? {
+            // A stale prewrite authentication must not turn a completed
+            // deletion tail into a recoverable root snapshot. Rebarriering
+            // is the only safe continuation; this carries no root/state
+            // mutation authority.
+            return Err(RuntimeErrorV0::Discovery(
+                TransportErrorV0::PreWriteInvalidated,
+            ));
+        }
+        // A root-UID annotation is normal linked-State ownership metadata,
+        // but on an *unlinked* root it is part of the all-or-nothing v1
+        // bootstrap bundle.  Parse only this unlinked branch so legacy
+        // linked roots remain loadable while every partial unlinked bundle
+        // is held before it can mint bootstrap authority.
+        let bootstrap_bundle = bootstrap_authority_bundle_v1(&root).map_err(|_| {
+            RuntimeErrorV0::Hold("root bootstrap authority annotations are malformed".into())
+        })?;
+        if bootstrap_bundle.is_some() {
+            return Err(RuntimeErrorV0::Hold(
+                "unlinked root carries bootstrap authority and requires bounded deletion cleanup"
+                    .into(),
+            ));
+        }
         if !snapshot.deleting {
             return Ok(snapshot);
         }
@@ -3018,15 +3058,55 @@ pub(crate) async fn load_machine_from_transport_in_operation(
     name: &str,
     operation: &OperationSessionV0,
 ) -> Result<Option<MachineStateV0>, RuntimeErrorV0> {
-    load_machine_from_reader(
-        &OperationLoaderRereadPortV0 {
-            transport,
-            operation,
-        },
-        namespace,
-        name,
-    )
-    .await
+    let reader = OperationLoaderRereadPortV0 {
+        transport,
+        operation,
+    };
+    let root_ref = ObjectRefV0 {
+        resource: ResourceKindV0::WebApplication,
+        namespace: namespace.into(),
+        name: name.into(),
+    };
+    let Some(root) = reader.reread_object(&root_ref).await? else {
+        return Ok(None);
+    };
+
+    // Do not turn every ordinary load into a second root GET merely to ask
+    // whether it is an unlinked deleting v1 bootstrap.  The already-pinned
+    // raw root decides whether the dedicated cleanup protocol is applicable;
+    // only that exceptional path gets its own bounded cleanup rereads.
+    let snapshot = root_snapshot_from_object(&root, namespace, name)?;
+    if snapshot.status.state.is_none() {
+        if completed_unlinked_bootstrap_cleanup_v1(&reader, &root).await? {
+            return Ok(None);
+        }
+        let bootstrap_bundle = bootstrap_authority_bundle_v1(&root).map_err(|_| {
+            RuntimeErrorV0::Hold("root bootstrap authority annotations are malformed".into())
+        })?;
+        if snapshot.deleting && bootstrap_bundle.is_some() {
+            match transport
+                .cleanup_unlinked_deleting_bootstrap_v1(namespace, name)
+                .await
+            {
+                Ok(UnlinkedBootstrapDeletionCleanupV0::Completed) => return Ok(None),
+                // The root changed between the inspected raw snapshot and the
+                // cleanup cut.  Re-read rather than interpreting stale bootstrap
+                // authority as a current machine state.
+                Ok(UnlinkedBootstrapDeletionCleanupV0::NotApplicable) => {
+                    return load_machine_from_reader(&reader, namespace, name).await;
+                }
+                Err(TransportErrorV0::ManualRecoveryHold) => {
+                    return Err(RuntimeErrorV0::Hold(
+                        "unlinked deleting bootstrap bundle cannot prove exact cleanup authority"
+                            .into(),
+                    ));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    load_machine_from_root_reader(&reader, namespace, name, root).await
 }
 
 async fn load_machine_from_reader<P: LoaderRereadPortV0>(
@@ -3042,8 +3122,33 @@ async fn load_machine_from_reader<P: LoaderRereadPortV0>(
     let Some(root) = transport.reread_object(&root_ref).await? else {
         return Ok(None);
     };
+    load_machine_from_root_reader(transport, namespace, name, root).await
+}
+
+/// Continues a load from an exact raw root that has already been acquired
+/// under the caller's read authority.  Keeping this separate from the root
+/// GET is what lets the operation-owned v1 deletion discriminator avoid a
+/// normal-path reread while retaining all raw-object validation below.
+async fn load_machine_from_root_reader<P: LoaderRereadPortV0>(
+    transport: &P,
+    namespace: &str,
+    name: &str,
+    root: oxideloop_kube_transport::ObjectV0,
+) -> Result<Option<MachineStateV0>, RuntimeErrorV0> {
     let mut snapshot = root_snapshot_from_object(&root, namespace, name)?;
     let Some(link) = snapshot.status.state.clone() else {
+        if completed_unlinked_bootstrap_cleanup_v1(transport, &root).await? {
+            return Ok(None);
+        }
+        let bootstrap_bundle = bootstrap_authority_bundle_v1(&root).map_err(|_| {
+            RuntimeErrorV0::Hold("root bootstrap authority annotations are malformed".into())
+        })?;
+        if bootstrap_bundle.is_some() {
+            return Err(RuntimeErrorV0::Hold(
+                "unlinked root carries bootstrap authority and requires bounded deletion cleanup"
+                    .into(),
+            ));
+        }
         if snapshot.deleting {
             return recover_unlinked_deleting_root(transport, namespace, snapshot).await;
         }
@@ -3928,7 +4033,10 @@ mod tests {
     use std::{
         collections::VecDeque,
         convert::Infallible,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
     };
 
     use super::*;
@@ -3975,6 +4083,17 @@ mod tests {
                 serde_json::to_vec(&value).expect("wire response serializes"),
             ))
             .expect("wire response")
+    }
+
+    fn wire_not_found_response() -> Response<Body> {
+        Response::builder()
+            .status(http::StatusCode::NOT_FOUND)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                br#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","code":404}"#
+                    .to_vec(),
+            ))
+            .expect("not-found response")
     }
 
     #[derive(Default)]
@@ -4102,6 +4221,189 @@ mod tests {
             .expect("root exists");
         assert!(!machine.root().root_finalizer_present);
         assert!(machine.root().status.state.is_none());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn loader_recognizes_completed_unlinked_v1_cleanup_and_rejects_nondeterministic_tail_state_name()
+     {
+        let root_uid = "root-uid";
+        let state_name = oxideloop_controller_api::state_name(root_uid)
+            .expect("fixture UID has a deterministic State name");
+        let annotations = BTreeMap::from([
+            (
+                oxideloop_kube_transport::ROOT_UID_ANNOTATION.into(),
+                root_uid.into(),
+            ),
+            (
+                oxideloop_kube_transport::TRANSACTION_ID_ANNOTATION.into(),
+                "bootstrap-token".into(),
+            ),
+            (
+                oxideloop_kube_transport::COMMAND_ID_ANNOTATION.into(),
+                "bootstrap-token".into(),
+            ),
+            (
+                oxideloop_kube_transport::BOOTSTRAP_AUTHORITY_VERSION_ANNOTATION.into(),
+                oxideloop_kube_transport::BOOTSTRAP_AUTHORITY_VERSION_V1.into(),
+            ),
+            (
+                oxideloop_kube_transport::BOOTSTRAP_STATE_NAME_ANNOTATION.into(),
+                state_name,
+            ),
+            (
+                oxideloop_kube_transport::BOOTSTRAP_STATE_UID_ANNOTATION.into(),
+                "old-state-uid".into(),
+            ),
+            (
+                oxideloop_kube_transport::BOOTSTRAP_STATE_SPEC_DIGEST_ANNOTATION.into(),
+                "a".repeat(64),
+            ),
+            (
+                oxideloop_kube_transport::BOOTSTRAP_PROOF_TOKEN_ANNOTATION.into(),
+                "bootstrap-token".into(),
+            ),
+        ]);
+        let root = ObjectV0 {
+            reference: ObjectRefV0 {
+                resource: ResourceKindV0::WebApplication,
+                namespace: "ns".into(),
+                name: "demo".into(),
+            },
+            metadata: ObjectMetaV0 {
+                uid: root_uid.into(),
+                resource_version: "root-rv".into(),
+                annotations: annotations.clone(),
+                owner_uids: vec![],
+            },
+            value: serde_json::json!({
+                "apiVersion": "demo.oxideloop.dev/v1alpha1",
+                "kind": "WebApplication",
+                "metadata": {
+                    "name": "demo", "namespace": "ns", "uid": root_uid,
+                    "resourceVersion": "root-rv", "generation": 1,
+                    "deletionTimestamp": "2026-08-31T00:00:00Z",
+                    "finalizers": [
+                        oxideloop_controller_api::ROOT_FINALIZER,
+                        "example.test/other-finalizer"
+                    ],
+                    "annotations": annotations,
+                },
+                "spec": root_spec("a".repeat(64)),
+                "status": {},
+            }),
+        };
+        let wire = Arc::new(Mutex::new((root, 0_usize)));
+        let state_replaced = Arc::new(AtomicBool::new(false));
+        let state_reads = Arc::new(AtomicUsize::new(0));
+        let replacement_state = serde_json::json!({
+            "apiVersion": "runtime.oxideloop.dev/v1alpha1",
+            "kind": "OxideLoopState",
+            "metadata": {
+                "name": oxideloop_controller_api::state_name(root_uid)
+                    .expect("fixture root UID has a deterministic State name"),
+                "namespace": "ns",
+                "uid": "replacement-state-uid",
+                "resourceVersion": "replacement-state-rv",
+            },
+            "spec": {},
+        });
+        let service = service_fn({
+            let wire = Arc::clone(&wire);
+            let state_replaced = Arc::clone(&state_replaced);
+            let state_reads = Arc::clone(&state_reads);
+            let replacement_state = replacement_state.clone();
+            move |request: Request<Body>| {
+                let wire = Arc::clone(&wire);
+                let state_replaced = Arc::clone(&state_replaced);
+                let state_reads = Arc::clone(&state_reads);
+                let replacement_state = replacement_state.clone();
+                async move {
+                    let path = request.uri().path();
+                    if request.method() == Method::GET && path.ends_with("/webapplications/demo") {
+                        let root = wire.lock().expect("wire is readable").0.clone();
+                        return Ok::<_, Infallible>(wire_response(root.value));
+                    }
+                    if request.method() == Method::GET && path.contains("/oxideloopstates/") {
+                        state_reads.fetch_add(1, Ordering::SeqCst);
+                        if state_replaced.load(Ordering::SeqCst) {
+                            return Ok::<_, Infallible>(wire_response(replacement_state));
+                        }
+                        return Ok::<_, Infallible>(wire_not_found_response());
+                    }
+                    if request.method() == Method::PATCH && path.ends_with("/webapplications/demo")
+                    {
+                        let mut wire = wire.lock().expect("wire is writable");
+                        wire.1 += 1;
+                        wire.0.metadata.resource_version = "root-after-finalizer".into();
+                        wire.0.value["metadata"]["resourceVersion"] =
+                            serde_json::json!("root-after-finalizer");
+                        // A separate controller still retains the deleting
+                        // root. A restart must recognize our exact completed
+                        // v1 cleanup instead of requiring our now-absent
+                        // finalizer or attempting bootstrap again.
+                        wire.0.value["metadata"]["finalizers"] =
+                            serde_json::json!(["example.test/other-finalizer"]);
+                        return Ok(wire_response(wire.0.value.clone()));
+                    }
+                    panic!(
+                        "unexpected unlinked-delete loader request: {} {path}",
+                        request.method()
+                    );
+                }
+            }
+        });
+        let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
+
+        assert!(
+            load_machine_from_transport(&transport, "ns", "demo")
+                .await
+                .expect("the loader must complete bounded cleanup")
+                .is_none(),
+            "the loader must never synthesize a StateLink or restart bootstrap after root deletion"
+        );
+        assert!(
+            load_machine_from_transport(&transport, "ns", "demo")
+                .await
+                .expect(
+                    "a restart must recognize completed cleanup while another finalizer remains"
+                )
+                .is_none(),
+            "completed cleanup is a read-only terminal tail, not new bootstrap authority"
+        );
+        state_replaced.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            load_machine_from_transport(&transport, "ns", "demo").await,
+            Err(RuntimeErrorV0::Hold(reason))
+                if reason.contains("State does not match its durable authority bundle")
+        ));
+        let reads_before_nondeterministic_tail = state_reads.load(Ordering::SeqCst);
+        {
+            let mut wire = wire.lock().expect("wire is writable");
+            let alternate_state_name = "another-valid-state";
+            wire.0.metadata.annotations.insert(
+                oxideloop_kube_transport::BOOTSTRAP_STATE_NAME_ANNOTATION.into(),
+                alternate_state_name.into(),
+            );
+            wire.0.value["metadata"]["annotations"]
+                [oxideloop_kube_transport::BOOTSTRAP_STATE_NAME_ANNOTATION] =
+                serde_json::json!(alternate_state_name);
+        }
+        assert!(matches!(
+            load_machine_from_transport(&transport, "ns", "demo").await,
+            Err(RuntimeErrorV0::Hold(reason))
+                if reason.contains("completed unlinked bootstrap cleanup bundle is malformed")
+        ));
+        assert_eq!(
+            state_reads.load(Ordering::SeqCst),
+            reads_before_nondeterministic_tail,
+            "a mismatched v1 tail State name must hold before it can abandon the deterministic child"
+        );
+        let wire = wire.lock().expect("wire is readable");
+        assert_eq!(
+            wire.1, 1,
+            "reload must not patch the surviving root or recreate the State"
+        );
     }
 
     #[test]

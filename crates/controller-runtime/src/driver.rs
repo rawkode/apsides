@@ -634,7 +634,12 @@ impl ControllerDriverV0 {
                     reject_late_deletion_barrier(&command, deletion_barrier.is_some())?;
                     #[cfg(feature = "test-failpoints")]
                     reject_late_prepare_barrier(&command, prepare_barrier.is_some())?;
-                    let prewrite_root_witness = Some(active.prewrite_root_witness());
+                    // Bootstrap has no actor-snapshot duplicate path: its
+                    // pre-I/O authority is exclusively the transport's sealed
+                    // full command/address/raw-baseline fence.
+                    let prewrite_root_witness =
+                        (!matches!(command, CommandV0::EnsureBootstrap { .. }))
+                            .then(|| active.prewrite_root_witness());
                     let (completion, buffered) = match execute_kubernetes_command_while_observing(
                         &self.transport,
                         &root_address(active)?,
@@ -675,6 +680,28 @@ impl ControllerDriverV0 {
                         }
                         Err(error) => return Err(error),
                     };
+                    if matches!(
+                        &completion,
+                        KubernetesEffectCompletionV0::FreshBootstrapCutInvalidated
+                    ) {
+                        if rebarrier_after_fresh_bootstrap_cut(
+                            active,
+                            &command,
+                            &self.transport,
+                            &self.config,
+                            &mut root_watch,
+                            &mut fixed_point,
+                            &mut automation_watch,
+                            &mut automation_candidates,
+                        )
+                        .await?
+                            == FreshBootstrapCutRebarrierV0::ActorRetired
+                        {
+                            actor = None;
+                            continue;
+                        }
+                        continue;
+                    }
                     if let KubernetesEffectCompletionV0::PreWriteInvalidated {
                         capability,
                         root_authentication,
@@ -1087,6 +1114,12 @@ struct BufferedCommandWatchesV0 {
 /// core event.
 enum KubernetesEffectCompletionV0 {
     Acknowledged(Box<Option<EventV0>>),
+    /// The operation-owned exact LIST/WATCH/REREAD cut changed before the
+    /// fence could be sealed. No preflight or write was polled, so an
+    /// `EnsureBootstrap` slot may be released only into a fresh ordinary root
+    /// barrier; it is intentionally distinct from an authenticated
+    /// prewrite-invalidated command, which must stop rather than replay.
+    FreshBootstrapCutInvalidated,
     PreWriteInvalidated {
         capability: OperationSessionV0,
         root_authentication: Option<RootAuthenticationOutcomeV0>,
@@ -1108,6 +1141,19 @@ enum CollectedEffectV0<T> {
 }
 
 impl BufferedCommandWatchesV0 {
+    fn empty() -> Self {
+        Self {
+            root: None,
+            dependency: None,
+            automation: None,
+            root_faulted: false,
+            dependency_faulted: false,
+            automation_faulted: false,
+            fault: None,
+            prewrite_invalidated: None,
+        }
+    }
+
     /// Detaches every root/old-D fact and fault that must be reduced before a
     /// renderer result may replace its speculative input or mint a fence.
     /// Automation delivery remains buffered for its existing post-ack path.
@@ -1146,18 +1192,37 @@ fn drain_completion_edge<R>(
     root_name: &str,
     buffered: &mut BufferedCommandWatchesV0,
 ) {
-    while !buffered.root_faulted
+    let cap = root_watch.drain_capacity();
+    let mut drained = 0;
+    while drained < cap
+        && !buffered.root_faulted
         && !matches!(buffered.root, Some(BufferedRootWatchV0::RestartRequired))
     {
         match root_watch.try_next_event() {
-            Ok(Some(event)) if watch_targets_root(&event, root_name) => {
-                buffered.root = buffered_root_watch(event);
+            Ok(Some(event)) => {
+                drained += 1;
+                if watch_targets_root(&event, root_name) {
+                    buffered.root = buffered_root_watch(event);
+                }
             }
-            Ok(Some(_)) => {}
             Ok(None) => break,
             Err(error) if is_root_watch_terminal(&error) => {
                 buffered.root = Some(BufferedRootWatchV0::RestartRequired);
             }
+            Err(error) => {
+                buffered.root_faulted = true;
+                buffered
+                    .fault
+                    .get_or_insert_with(|| format!("root watch failed: {error}"));
+            }
+        }
+    }
+    if drained == cap && cap != 0 {
+        match root_watch.try_next_event() {
+            Ok(Some(_)) | Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
+                buffered.root = Some(BufferedRootWatchV0::RestartRequired);
+            }
+            Ok(None) => {}
             Err(error) => {
                 buffered.root_faulted = true;
                 buffered
@@ -1410,6 +1475,142 @@ fn buffered_root_watch(event: WatchEventV0) -> Option<BufferedRootWatchV0> {
     }
 }
 
+/// Drains the independent bootstrap fence through a fully-enqueued watermark.
+/// The watermark is captured before the drain, not inferred from whichever
+/// records happened to be available to the driver.  If the pump commits a
+/// later record while this runs, the post-drain capture repeats under the same
+/// immutable operation budget; no later root mutation may slip past the next
+/// bootstrap write lease.
+#[allow(clippy::too_many_lines)]
+async fn drain_collected_bootstrap_fence_to_watermark(
+    root_watch: &mut WatchHandleV0,
+    operation: &OperationSessionV0,
+    root_name: &str,
+    buffered: &mut BufferedCommandWatchesV0,
+) -> Result<(), RuntimeErrorV0> {
+    loop {
+        let watermark = match operation.capture_bootstrap_fence_watermark().await {
+            Ok(watermark) => watermark,
+            Err(_error) if operation.bootstrap_fence_terminal().is_some() => {
+                // A terminal record may already have been consumed by this
+                // very drain.  Preserve its normal prewrite/rebarrier path
+                // instead of recasting it as an unrelated collector hold.
+                buffered
+                    .prewrite_invalidated
+                    .get_or_insert_with(|| operation.clone());
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(RuntimeErrorV0::Hold(format!(
+                    "bootstrap fence could not capture an enqueued watermark: {error}"
+                )));
+            }
+        };
+        let required = match operation.bootstrap_fence_records_until(watermark) {
+            Ok(required) => required,
+            Err(_error) if operation.bootstrap_fence_terminal().is_some() => {
+                buffered
+                    .prewrite_invalidated
+                    .get_or_insert_with(|| operation.clone());
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(RuntimeErrorV0::Hold(format!(
+                    "bootstrap fence watermark is not drainable: {error}"
+                )));
+            }
+        };
+        let cap = root_watch.drain_capacity();
+        if required > u64::try_from(cap).expect("usize fits u64") {
+            operation.bootstrap_fence_consumer_gap();
+            buffered.root = Some(BufferedRootWatchV0::RestartRequired);
+            return Ok(());
+        }
+
+        let mut reads = 0_usize;
+        while !operation
+            .bootstrap_fence_consumed_through(watermark)
+            .map_err(|error| {
+                RuntimeErrorV0::Hold(format!(
+                    "bootstrap fence consumption could not be inspected: {error}"
+                ))
+            })?
+        {
+            if reads >= cap {
+                operation.bootstrap_fence_consumer_gap();
+                buffered.root = Some(BufferedRootWatchV0::RestartRequired);
+                return Ok(());
+            }
+            match root_watch.try_next_event() {
+                Ok(Some(event)) => {
+                    reads += 1;
+                    // The fresh bootstrap watch is an exact-name capability.
+                    // Classify every non-bookmark record through the sealed
+                    // transport fence before the driver's legacy name-only
+                    // helper can decide whether to buffer it.  In
+                    // particular, a scripted or API-leaked namespace/kind
+                    // record must become a terminal fence fact, never an
+                    // ignored record that lets the next subwrite proceed.
+                    if !operation.observe_bootstrap_root_watch(&event)
+                        && watch_targets_root(&event, root_name)
+                    {
+                        buffered.root = buffered_root_watch(event);
+                    }
+                    if operation.bootstrap_fence_terminal().is_some() {
+                        buffered
+                            .prewrite_invalidated
+                            .get_or_insert_with(|| operation.clone());
+                        return Ok(());
+                    }
+                }
+                Ok(None) => {
+                    // A captured record missing from the bounded output queue
+                    // means publication and consumption have diverged.  Do
+                    // not wait for a later record to make the gap disappear.
+                    operation.bootstrap_fence_consumer_gap();
+                    buffered.root = Some(BufferedRootWatchV0::RestartRequired);
+                    return Ok(());
+                }
+                Err(error) if is_root_watch_terminal(&error) => {
+                    operation.observe_bootstrap_root_terminal(error);
+                    buffered.root = Some(BufferedRootWatchV0::RestartRequired);
+                    return Ok(());
+                }
+                Err(error) => {
+                    operation.observe_bootstrap_root_terminal(error.clone());
+                    buffered.root_faulted = true;
+                    buffered
+                        .fault
+                        .get_or_insert_with(|| format!("root watch failed: {error}"));
+                    return Ok(());
+                }
+            }
+        }
+
+        // Re-enter the pre-command drain when a post-watermark record raced
+        // the completion edge.  Yield cooperatively so a busy source cannot
+        // starve the finite operation deadline check in capture.
+        let after = match operation.capture_bootstrap_fence_watermark().await {
+            Ok(after) => after,
+            Err(_error) if operation.bootstrap_fence_terminal().is_some() => {
+                buffered
+                    .prewrite_invalidated
+                    .get_or_insert_with(|| operation.clone());
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(RuntimeErrorV0::Hold(format!(
+                    "bootstrap fence became unavailable after drain: {error}"
+                )));
+            }
+        };
+        if after == watermark {
+            return Ok(());
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
 /// Pins a single Kubernetes effect future and keeps collecting watch facts
 /// without borrowing the actor.  `select!` never drops `effect`: it is pinned
 /// for the entire loop, so a root/dependency/run transition cannot cancel or
@@ -1426,14 +1627,44 @@ async fn execute_kubernetes_command_while_observing(
     prewrite_root_witness: Option<PrewriteRootWitnessV0>,
 ) -> Result<(KubernetesEffectCompletionV0, BufferedCommandWatchesV0), RuntimeErrorV0> {
     // Bootstrap uses the same collector-bound session as every other
-    // Kubernetes command. The transport's explicit phase witness decides
-    // whether one of its exact root echoes may advance a fresh preflight;
-    // otherwise an observed root change wins before the next subwrite polls.
+    // Kubernetes command. Seal its exact freshly minted session *before*
+    // entering the collector select: a ready root Added may win before the
+    // effect future makes even its initial poll.
     let operation = transport.begin_collected_operation_session();
     let prewrite_root_witness = if matches!(command, CommandV0::EnsureBootstrap { .. }) {
-        Some(PrewriteRootWitnessV0::Bootstrap {
-            operation: operation.clone(),
-        })
+        let (fresh_watch, raw_root, raw_state) = match transport
+            .open_collected_bootstrap_cut_in_operation(address, command, &operation)
+            .await
+        {
+            Ok(cut) => cut,
+            Err(error) if fresh_bootstrap_cut_was_superseded(&error) => {
+                return Ok((
+                    KubernetesEffectCompletionV0::FreshBootstrapCutInvalidated,
+                    BufferedCommandWatchesV0::empty(),
+                ));
+            }
+            Err(error) => {
+                return Err(RuntimeErrorV0::Hold(format!(
+                    "bootstrap collector could not acquire its fresh exact-name cut: {error}"
+                )));
+            }
+        };
+        // Retire the old retained epoch only after the new list/watch/reread
+        // cut exists.  The returned watch becomes the ordinary retained watch
+        // again after the operation-owned pump's close handshake.
+        *root_watch = fresh_watch;
+        operation
+            .seal_collected_bootstrap_fence(address, command, &raw_root, raw_state.as_ref())
+            .map_err(|_| {
+                RuntimeErrorV0::Hold(
+                    "bootstrap collector could not seal its exact raw pre-poll authority".into(),
+                )
+            })?;
+        // Bootstrap duplicate authority is exclusively the sealed transport
+        // fence (full Command + RootAddress + raw list/reread baseline).  Do
+        // not retain an actor snapshot compatibility witness that could grant
+        // a second pre-I/O duplicate path.
+        None
     } else {
         prewrite_root_witness
     };
@@ -1449,6 +1680,69 @@ async fn execute_kubernetes_command_while_observing(
         prewrite_root_witness,
     )
     .await
+}
+
+/// A fresh exact-name cut has not yet sealed an operation fence or polled its
+/// effect. These outcomes mean the list/watch/reread view was superseded and
+/// may safely return to the driver's ordinary rebarrier path. Everything
+/// else (malformed input, authority rejection, deadline, or transport error)
+/// remains a fail-closed hold.
+fn fresh_bootstrap_cut_was_superseded(error: &TransportErrorV0) -> bool {
+    matches!(error, TransportErrorV0::FreshBootstrapCutSuperseded)
+}
+
+/// The exact fresh bootstrap cut failed before an operation fence existed or
+/// its command future could poll. Re-enter the driver's ordinary root
+/// list/watch/reread barrier and release only that exact unpolled slot. A
+/// concurrent disappearance is safe here because `EnsureBootstrap` cannot
+/// have made a State or root mutation yet; the caller resumes the normal
+/// wait-for-create loop rather than holding or inventing an acknowledgement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FreshBootstrapCutRebarrierV0 {
+    ActorRetired,
+    Active,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rebarrier_after_fresh_bootstrap_cut<R>(
+    active: &mut RootActorV0,
+    command: &CommandV0,
+    transport: &KubeTransportV0,
+    config: &DriverConfigV0,
+    root_watch: &mut WatchHandleV0,
+    fixed_point: &mut Option<KubeFixedPointPortV0<'_, R>>,
+    automation_watch: &mut Option<AutomationRunObservationBarrierV0>,
+    automation_candidates: &mut VecDeque<QueuedAutomationV0>,
+) -> Result<FreshBootstrapCutRebarrierV0, RuntimeErrorV0> {
+    if !matches!(command, CommandV0::EnsureBootstrap { .. }) {
+        return Err(RuntimeErrorV0::Hold(
+            "a non-bootstrap command cannot use the fresh-cut rebarrier path".into(),
+        ));
+    }
+    active.release_unpolled_command(command)?;
+    active.watch_invalidated();
+    let (watch, fresh) = establish_root_barrier(transport, config).await?;
+    *root_watch = watch;
+    let Some(fresh) = fresh else {
+        clear_root_only_recovery_ephemera(fixed_point, automation_watch, automation_candidates);
+        return Ok(FreshBootstrapCutRebarrierV0::ActorRetired);
+    };
+    if fresh.root().uid != active.state().root().uid {
+        active
+            .hold("nominated root name was replaced by a different UID; refusing adoption".into());
+        return Err(RuntimeErrorV0::Hold(
+            "nominated root name was replaced by a different UID; refusing adoption".into(),
+        ));
+    }
+    // No bootstrap subwrite was polled, so the old actor contains only an
+    // unacknowledged bootstrap command. Replacing it from the fresh barrier
+    // is safer than feeding that stale unlinked state through `RootRefreshed`:
+    // the latter retains an empty State pin that a reducer quite rightly
+    // refuses to persist. The replacement still rejects a same-name UID
+    // change above and cannot adopt/link any untrusted State.
+    *active = start_actor(fresh);
+    clear_root_only_recovery_ephemera(fixed_point, automation_watch, automation_candidates);
+    Ok(FreshBootstrapCutRebarrierV0::Active)
 }
 
 /// Keeps the exact actor-issued command owned across a resumable bootstrap
@@ -1514,6 +1808,54 @@ async fn collect_kubernetes_command_while_observing<R>(
     operation: OperationSessionV0,
     root_witness: Option<PrewriteRootWitnessV0>,
 ) -> Result<(KubernetesEffectCompletionV0, BufferedCommandWatchesV0), RuntimeErrorV0> {
+    let fenced = operation.has_collected_bootstrap_fence();
+    if fenced {
+        root_watch
+            .start_collected_bootstrap_fence(&operation)
+            .map_err(|error| {
+                RuntimeErrorV0::Hold(format!(
+                    "bootstrap collector could not install its operation fence pump: {error}"
+                ))
+            })?;
+    }
+    let result = collect_kubernetes_command_while_observing_inner(
+        transport,
+        address,
+        command,
+        root_watch,
+        fixed_point,
+        automation_watch,
+        root_name,
+        operation.clone(),
+        root_witness,
+    )
+    .await;
+    let close = if fenced {
+        operation.close_collected_bootstrap_fence(root_watch).await
+    } else {
+        Ok(())
+    };
+    match (result, close) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(RuntimeErrorV0::Hold(format!(
+            "bootstrap collector fence close failed: {error}"
+        ))),
+        (Err(error), _) => Err(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn collect_kubernetes_command_while_observing_inner<R>(
+    transport: &KubeTransportV0,
+    address: &oxideloop_kube_transport::RootAddressV0,
+    command: &CommandV0,
+    root_watch: &mut WatchHandleV0,
+    fixed_point: &mut Option<KubeFixedPointPortV0<'_, R>>,
+    automation_watch: &mut Option<AutomationRunObservationBarrierV0>,
+    root_name: &str,
+    operation: OperationSessionV0,
+    root_witness: Option<PrewriteRootWitnessV0>,
+) -> Result<(KubernetesEffectCompletionV0, BufferedCommandWatchesV0), RuntimeErrorV0> {
     let mut effect: OwnedCommandFutureV0<'_> =
         Box::pin(dispatch_owned_command_until_event_with_operation(
             transport,
@@ -1534,6 +1876,20 @@ async fn collect_kubernetes_command_while_observing<R>(
         prewrite_invalidated: None,
     };
 
+    // Finite first-poll handshake.  The exact named watch was registered from
+    // the list RV before this collector was entered.  Capture and drain a
+    // fully-enqueued fence watermark before the effect can make its first
+    // read/write poll.
+    if operation.has_collected_bootstrap_fence() {
+        drain_collected_bootstrap_fence_to_watermark(
+            root_watch,
+            &operation,
+            root_name,
+            &mut buffered,
+        )
+        .await?;
+    }
+
     loop {
         tokio::select! {
             // A root record that arrived while a previous bootstrap subwrite
@@ -1542,7 +1898,21 @@ async fn collect_kubernetes_command_while_observing<R>(
             // becomes authority for that *next* subwrite and must receive the
             // same fresh authentication before the effect can continue.
             () = operation.prewrite_gate().wait_for_bootstrap_phase_pending(), if root_authentication.is_none() => {
-                if !operation.bootstrap_phase_is_complete()
+                if operation.has_collected_bootstrap_fence() {
+                    // Every completed collected subwrite re-enters the same
+                    // watermark drain.  Records published after the prior
+                    // boundary therefore cannot bypass the next lease.
+                    drain_collected_bootstrap_fence_to_watermark(
+                        root_watch,
+                        &operation,
+                        root_name,
+                        &mut buffered,
+                    )
+                    .await?;
+                    if operation.prewrite_gate().state() == PrewriteGateStateV0::BootstrapPhasePending {
+                        let _ = operation.prewrite_gate().seal_bootstrap_phase();
+                    }
+                } else if !operation.bootstrap_phase_is_complete()
                     && matches!(buffered.root, Some(BufferedRootWatchV0::Observed { .. }))
                     && root_witness.is_some()
                     && let Some(epoch) = operation.prewrite_gate().begin_root_authentication()
@@ -1599,9 +1969,30 @@ async fn collect_kubernetes_command_while_observing<R>(
                 }
             } => {
                 match root {
-                    Ok(event) if watch_targets_root(&event, root_name) => {
-                        buffered.root = buffered_root_watch(event);
-                        if root_authentication.is_none()
+                    Ok(event) => {
+                        let consumed = if operation.has_collected_bootstrap_fence() {
+                            // Do not pre-filter this event by the driver's
+                            // ordinary name comparison. The sealed exact-name
+                            // fence owns leaked-record validation and latches
+                            // a foreign kind/namespace/name before it can be
+                            // silently discarded here.
+                            operation.observe_bootstrap_root_watch(&event)
+                        } else {
+                            false
+                        };
+                        // Only the record that was just received may start a
+                        // root-authentication epoch. In particular, a
+                        // defensively ignored bookmark (or another
+                        // non-target record) must not authenticate an older
+                        // buffered root observation after an exact self echo
+                        // has restarted prewrite.
+                        let target_root_record = !consumed && watch_targets_root(&event, root_name);
+                        if target_root_record {
+                            buffered.root = buffered_root_watch(event);
+                        }
+                        if target_root_record
+                            && !operation.has_collected_bootstrap_fence()
+                            && root_authentication.is_none()
                             && let Some(witness) = root_witness.as_ref()
                             && matches!(
                                 operation.prewrite_gate().state(),
@@ -1629,9 +2020,11 @@ async fn collect_kubernetes_command_while_observing<R>(
                             let _ = witness;
                         }
                     }
-                    Ok(_) => {}
                     Err(error) if is_root_watch_terminal(&error) => {
                         buffered.root = Some(BufferedRootWatchV0::RestartRequired);
+                        if operation.has_collected_bootstrap_fence() {
+                            operation.observe_bootstrap_root_terminal(error.clone());
+                        }
                         if let Some(epoch) = root_auth_epoch {
                             let _ = operation.prewrite_gate().invalidate_root_authentication(epoch);
                             buffered.prewrite_invalidated = Some(operation.clone());
@@ -1645,6 +2038,9 @@ async fn collect_kubernetes_command_while_observing<R>(
                     Err(error) => {
                         buffered.root_faulted = true;
                         buffered.fault.get_or_insert_with(|| format!("root watch failed: {error}"));
+                        if operation.has_collected_bootstrap_fence() {
+                            operation.observe_bootstrap_root_terminal(error.clone());
+                        }
                         if let Some(epoch) = root_auth_epoch {
                             let _ = operation.prewrite_gate().invalidate_root_authentication(epoch);
                             buffered.prewrite_invalidated = Some(operation.clone());
@@ -1698,31 +2094,13 @@ async fn collect_kubernetes_command_while_observing<R>(
                     ));
                     continue;
                 }
-                if outcome == Some(PrewriteRootAuthenticationV0::DuplicateOwnedBootstrapEcho)
-                    && operation
-                        .prewrite_gate()
-                        .resume_after_duplicate_owned_root_echo(epoch)
-                {
-                    // A repeated watch delivery of the one consumed metadata
-                    // response carries no new root authority.  It may resume
-                    // the same phase barrier, but it cannot mint a second
-                    // epoch or status-write opportunity.
-                    buffered.root = None;
-                    effect = Box::pin(dispatch_owned_command_until_event_with_operation(
-                        transport,
-                        address,
-                        command,
-                        operation.clone(),
-                    ));
-                    continue;
-                }
                 let _ = operation.prewrite_gate().invalidate_root_authentication(epoch);
                 buffered.prewrite_invalidated = Some(operation.clone());
                 return Ok((KubernetesEffectCompletionV0::PreWriteInvalidated {
                     capability: operation,
                     root_authentication: Some(match outcome {
                         Some(PrewriteRootAuthenticationV0::GenuineOrAmbiguous) => RootAuthenticationOutcomeV0::Genuine,
-                        Some(PrewriteRootAuthenticationV0::ExactOwnedStatusEcho | PrewriteRootAuthenticationV0::DuplicateOwnedBootstrapEcho) | None => RootAuthenticationOutcomeV0::Ambiguous,
+                        Some(PrewriteRootAuthenticationV0::ExactOwnedStatusEcho) | None => RootAuthenticationOutcomeV0::Ambiguous,
                     }),
                 }, buffered));
             }
@@ -2059,18 +2437,37 @@ fn drain_render_completion_edge(
     root_name: &str,
     buffered: &mut BufferedCommandWatchesV0,
 ) {
-    while !buffered.root_faulted
+    let cap = root_watch.drain_capacity();
+    let mut drained = 0;
+    while drained < cap
+        && !buffered.root_faulted
         && !matches!(buffered.root, Some(BufferedRootWatchV0::RestartRequired))
     {
         match root_watch.try_next_event() {
-            Ok(Some(event)) if watch_targets_root(&event, root_name) => {
-                buffered.root = buffered_root_watch(event);
+            Ok(Some(event)) => {
+                drained += 1;
+                if watch_targets_root(&event, root_name) {
+                    buffered.root = buffered_root_watch(event);
+                }
             }
-            Ok(Some(_)) => {}
             Ok(None) => break,
             Err(error) if is_root_watch_terminal(&error) => {
                 buffered.root = Some(BufferedRootWatchV0::RestartRequired);
             }
+            Err(error) => {
+                buffered.root_faulted = true;
+                buffered
+                    .fault
+                    .get_or_insert_with(|| format!("root watch failed: {error}"));
+            }
+        }
+    }
+    if drained == cap && cap != 0 {
+        match root_watch.try_next_event() {
+            Ok(Some(_)) | Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
+                buffered.root = Some(BufferedRootWatchV0::RestartRequired);
+            }
+            Ok(None) => {}
             Err(error) => {
                 buffered.root_faulted = true;
                 buffered
@@ -2238,16 +2635,18 @@ async fn establish_root_barrier(
         // budget; a terminal watch restart begins a new acquisition.
         let operation = transport.begin_operation_session();
         let list = transport
-            .list_exact_in_operation(
+            .list_named_in_operation(
                 ResourceKindV0::WebApplication,
                 &config.namespace,
+                &config.root_name,
                 &operation,
             )
             .await?;
         let watch = match transport
-            .watch_from_in_operation(
+            .watch_named_from_in_operation(
                 ResourceKindV0::WebApplication,
                 &config.namespace,
+                &config.root_name,
                 &list.resource_version,
                 &operation,
             )
@@ -2281,18 +2680,18 @@ async fn drain_root_watch(
     transport: &KubeTransportV0,
     config: &DriverConfigV0,
 ) -> Result<RootWatchDrainV0, RuntimeErrorV0> {
-    loop {
+    let cap = watch.drain_capacity();
+    let mut drained = 0;
+    while drained < cap {
         match watch.try_next_event() {
-            Ok(Some(event)) if watch_targets_root(&event, &config.root_name) => {
-                if refresh_actor_from_transport(actor, transport, config).await? {
+            Ok(Some(event)) => {
+                drained += 1;
+                if watch_targets_root(&event, &config.root_name)
+                    && refresh_actor_from_transport(actor, transport, config).await?
+                {
                     return Ok(RootWatchDrainV0::RootOnlyRecovery);
                 }
             }
-            // Unrelated objects share the collection watch. They cannot end
-            // the pre-command drain: a managed update or terminal watch
-            // result queued immediately behind one must be observed before a
-            // command can be selected under stale root authority.
-            Ok(Some(_)) => {}
             Ok(None) => return Ok(RootWatchDrainV0::Current),
             Err(error) if is_root_watch_terminal(&error) => {
                 actor.watch_invalidated();
@@ -2301,6 +2700,17 @@ async fn drain_root_watch(
             Err(error) => return Err(error.into()),
         }
     }
+    if cap != 0 {
+        match watch.try_next_event() {
+            Ok(Some(_)) | Err(TransportErrorV0::WatchGone | TransportErrorV0::WatchOverflow) => {
+                actor.watch_invalidated();
+                return Ok(RootWatchDrainV0::Invalidated);
+            }
+            Ok(None) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(RootWatchDrainV0::Current)
 }
 
 /// The exact root stream may either leave the current actor authoritative,
@@ -3647,12 +4057,14 @@ mod tests {
     fn bootstrap_wire_root(
         token: &str,
         state_name: &str,
+        state: &OxideLoopStateSpec,
         root_metadata: bool,
         root_status: bool,
     ) -> serde_json::Value {
         bootstrap_wire_root_for_bundle(
             token,
             state_name,
+            state,
             root_metadata,
             root_status
                 .then(|| json!({"state":{"rootUid":ROOT_UID,"name":state_name,"uid":"state-uid"}})),
@@ -3660,18 +4072,88 @@ mod tests {
         )
     }
 
+    /// Builds the exact raw domain object that the scripted API returns.  The
+    /// collector fence compares the complete object, not a reduced snapshot,
+    /// so tests that model an owned watch echo must use this rather than the
+    /// generic `root_event` fixture.
+    fn bootstrap_wire_root_object(
+        token: &str,
+        state_name: &str,
+        state: &OxideLoopStateSpec,
+        root_metadata: bool,
+        root_status: bool,
+    ) -> ObjectV0 {
+        let value = bootstrap_wire_root(token, state_name, state, root_metadata, root_status);
+        let annotations = serde_json::from_value(value["metadata"]["annotations"].clone())
+            .expect("bootstrap root annotations decode");
+        ObjectV0 {
+            reference: ObjectRefV0 {
+                resource: ResourceKindV0::WebApplication,
+                namespace: "ns".into(),
+                name: "root".into(),
+            },
+            metadata: ObjectMetaV0 {
+                uid: ROOT_UID.into(),
+                resource_version: value["metadata"]["resourceVersion"]
+                    .as_str()
+                    .expect("bootstrap root resource version")
+                    .into(),
+                annotations,
+                owner_uids: vec![],
+            },
+            value,
+        }
+    }
+
+    fn root_object_from_wire(value: serde_json::Value) -> ObjectV0 {
+        let annotations = serde_json::from_value(value["metadata"]["annotations"].clone())
+            .expect("root wire annotations decode");
+        ObjectV0 {
+            reference: ObjectRefV0 {
+                resource: ResourceKindV0::WebApplication,
+                namespace: "ns".into(),
+                name: "root".into(),
+            },
+            metadata: ObjectMetaV0 {
+                uid: value["metadata"]["uid"]
+                    .as_str()
+                    .expect("root wire UID")
+                    .into(),
+                resource_version: value["metadata"]["resourceVersion"]
+                    .as_str()
+                    .expect("root wire resource version")
+                    .into(),
+                annotations,
+                owner_uids: vec![],
+            },
+            value,
+        }
+    }
+
     fn bootstrap_wire_root_for_bundle(
         token: &str,
-        _state_name: &str,
+        state_name: &str,
+        state: &OxideLoopStateSpec,
         root_metadata: bool,
         status: Option<serde_json::Value>,
         bundle_digest: &str,
     ) -> serde_json::Value {
         let annotations = root_metadata.then(|| {
+            let canonical = canonical_bytes(
+                &serde_json::to_value(state).expect("bootstrap State spec serializes"),
+            )
+            .expect("bootstrap State spec canonicalizes");
+            let mut domain_separated = b"oxideloop.bootstrap-authority/v1\0".to_vec();
+            domain_separated.extend_from_slice(&canonical);
             json!({
                 "runtime.oxideloop.dev/root-uid": ROOT_UID,
                 "runtime.oxideloop.dev/transaction-id": token,
                 "runtime.oxideloop.dev/command-id": token,
+                "runtime.oxideloop.dev/bootstrap-authority-version": "v1",
+                "runtime.oxideloop.dev/bootstrap-state-name": state_name,
+                "runtime.oxideloop.dev/bootstrap-state-uid": "state-uid",
+                "runtime.oxideloop.dev/bootstrap-state-spec-digest": sha256_hex(&domain_separated),
+                "runtime.oxideloop.dev/bootstrap-proof-token": token,
             })
         });
         let mut root = json!({
@@ -3910,6 +4392,7 @@ mod tests {
                     wire_json(bootstrap_wire_root(
                         &token,
                         &state_name,
+                        &state_spec,
                         script.root_metadata,
                         script.root_status,
                     ))
@@ -3956,10 +4439,22 @@ mod tests {
                     && method == http::Method::PATCH
                 {
                     script.root_status = true;
-                    wire_json(bootstrap_wire_root(&token, &state_name, true, true))
+                    wire_json(bootstrap_wire_root(
+                        &token,
+                        &state_name,
+                        &state_spec,
+                        true,
+                        true,
+                    ))
                 } else if path.ends_with("/webapplications/root") && method == http::Method::PATCH {
                     script.root_metadata = true;
-                    wire_json(bootstrap_wire_root(&token, &state_name, true, false))
+                    wire_json(bootstrap_wire_root(
+                        &token,
+                        &state_name,
+                        &state_spec,
+                        true,
+                        false,
+                    ))
                 } else {
                     panic!("unexpected bootstrap request {method} {path}");
                 };
@@ -4005,30 +4500,36 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn bootstrap_root_change_before_each_subwrite_polls_no_later_write() {
-        // The root GET ordinals are deliberately asserted through the real
-        // HTTP boundary: initial discovery is 0, followed by the four
-        // immediate root preflights for State POST, State finalizer, root
-        // metadata, and root State-link/status respectively.
+        // The collected R17 fence seals its immutable root before this
+        // effect can poll.  The root GET ordinals below are therefore the
+        // phase-local checks themselves: State POST (0), the metadata
+        // decision/reread (1), root metadata (2), State finalizer (3), and
+        // Root State-link/status (4).
         for (target_root_get, expected_writes, label, mutation) in [
-            (1, 0, "State POST", "spec"),
-            (2, 1, "State finalizer", "spec"),
-            (4, 2, "root metadata", "spec"),
-            (5, 3, "root State-link/status", "spec"),
-            (5, 3, "root State-link/status after status change", "status"),
+            (0, 0, "State POST", "spec"),
+            (0, 0, "State POST", "status"),
+            (0, 0, "State POST", "annotation"),
+            (0, 0, "State POST", "generation"),
+            (0, 0, "State POST", "deletion"),
+            (0, 0, "State POST", "identity"),
+            (3, 2, "State finalizer", "spec"),
+            (2, 1, "root metadata", "spec"),
+            (4, 3, "root State-link/status", "spec"),
+            (4, 3, "root State-link/status after status change", "status"),
             (
-                5,
+                4,
                 3,
                 "root State-link/status after State-link change",
                 "state-link",
             ),
             (
-                5,
+                4,
                 3,
                 "root State-link/status after finalizer change",
                 "finalizer",
             ),
             (
-                5,
+                4,
                 3,
                 "root State-link/status after annotation change",
                 "annotation",
@@ -4058,6 +4559,9 @@ mod tests {
             let preflight_started = Arc::new(AtomicUsize::new(0));
             let release_preflight = Arc::new(tokio::sync::Notify::new());
             let changed_root = Arc::new(Mutex::new(None));
+            let service_token = token.clone();
+            let service_state = state.clone();
+            let service_state_name = state_name.clone();
             let service = service_fn({
                 let wire = Arc::clone(&wire);
                 let root_sender = root_sender.clone();
@@ -4065,6 +4569,9 @@ mod tests {
                 let preflight_started = Arc::clone(&preflight_started);
                 let release_preflight = Arc::clone(&release_preflight);
                 let changed_root = Arc::clone(&changed_root);
+                let token = service_token.clone();
+                let state = service_state.clone();
+                let state_name = service_state_name.clone();
                 move |request: Request<Body>| {
                     let wire = Arc::clone(&wire);
                     let root_sender = root_sender.clone();
@@ -4086,6 +4593,7 @@ mod tests {
                                     let mut root = bootstrap_wire_root(
                                         &token,
                                         &state_name,
+                                        &state,
                                         wire.root_metadata,
                                         wire.root_status,
                                     );
@@ -4096,6 +4604,16 @@ mod tests {
                                         "spec" => {
                                             root["spec"]["message"] =
                                                 json!("independent bootstrap change");
+                                        }
+                                        "generation" => {
+                                            root["metadata"]["generation"] = json!(2);
+                                        }
+                                        "deletion" => {
+                                            root["metadata"]["deletionTimestamp"] =
+                                                json!("2026-08-31T18:58:33Z");
+                                        }
+                                        "identity" => {
+                                            root["metadata"]["uid"] = json!("foreign-root-uid");
                                         }
                                         "status" => {
                                             root["status"]["observedGeneration"] = json!(1);
@@ -4127,10 +4645,13 @@ mod tests {
                                     .to_owned();
                                 *changed_root.lock().expect("changed bootstrap root lock") =
                                     Some(changed);
+                                let mut root_event = root_event(&resource_version);
+                                if mutation == "identity" {
+                                    root_event.metadata.uid = "foreign-root-uid".into();
+                                    root_event.value["metadata"]["uid"] = json!("foreign-root-uid");
+                                }
                                 root_sender
-                                    .try_send(Ok(WatchEventV0::Modified(root_event(
-                                        &resource_version,
-                                    ))))
+                                    .try_send(Ok(WatchEventV0::Modified(root_event)))
                                     .expect("inject genuine root change");
                                 preflight_started.store(1, Ordering::SeqCst);
                                 release_preflight.notified().await;
@@ -4146,6 +4667,7 @@ mod tests {
                             Ok(wire_json(bootstrap_wire_root(
                                 &token,
                                 &state_name,
+                                &state,
                                 wire.root_metadata,
                                 wire.root_status,
                             )))
@@ -4205,6 +4727,7 @@ mod tests {
                             Ok(wire_json(bootstrap_wire_root(
                                 &token,
                                 &state_name,
+                                &state,
                                 true,
                                 true,
                             )))
@@ -4217,6 +4740,7 @@ mod tests {
                             Ok(wire_json(bootstrap_wire_root(
                                 &token,
                                 &state_name,
+                                &state,
                                 true,
                                 false,
                             )))
@@ -4227,8 +4751,16 @@ mod tests {
                 }
             });
             let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
-            let operation = transport.begin_collected_operation_session();
             let address = root_address(&actor).expect("root address");
+            let operation = transport.begin_collected_operation_session();
+            operation
+                .seal_collected_bootstrap_fence(
+                    &address,
+                    &command,
+                    &bootstrap_wire_root_object(&token, &state_name, &state, false, false),
+                    None,
+                )
+                .expect("bootstrap collector session seals before select");
             let mut fixed_point: Option<KubeFixedPointPortV0<'_, ()>> = None;
             let mut automation_watch = None;
             let collect = collect_kubernetes_command_while_observing(
@@ -4240,9 +4772,7 @@ mod tests {
                 &mut automation_watch,
                 "root",
                 operation.clone(),
-                Some(PrewriteRootWitnessV0::Bootstrap {
-                    operation: operation.clone(),
-                }),
+                None,
             );
             let release = async {
                 while preflight_started.load(Ordering::SeqCst) == 0 {
@@ -4272,6 +4802,498 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
+    async fn fresh_bootstrap_cut_change_rebarriers_without_writes_or_a_fatal_exit() {
+        let mut actor = automation_candidate_actor();
+        actor.start();
+        let command = actor
+            .next_command()
+            .expect("bootstrap command is available")
+            .expect("fresh actor issues bootstrap");
+        let CommandV0::EnsureBootstrap {
+            token,
+            state,
+            state_name,
+            ..
+        } = &command
+        else {
+            panic!("fresh actor must issue EnsureBootstrap");
+        };
+        let listed = bootstrap_wire_root(token, state_name, state, false, false);
+        let mut changed = listed.clone();
+        changed["metadata"]["resourceVersion"] = json!("fresh-cut-rv-2");
+        changed["spec"]["message"] = json!("changed during fresh cut");
+        let lists = Arc::new(AtomicUsize::new(0));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let service = service_fn({
+            let lists = Arc::clone(&lists);
+            let writes = Arc::clone(&writes);
+            let listed = listed.clone();
+            let changed = changed.clone();
+            move |request: Request<Body>| {
+                let lists = Arc::clone(&lists);
+                let writes = Arc::clone(&writes);
+                let listed = listed.clone();
+                let changed = changed.clone();
+                async move {
+                    let method = request.method().clone();
+                    let path = request.uri().path().to_owned();
+                    if method == http::Method::GET && path.ends_with("/webapplications") {
+                        let item = if lists.fetch_add(1, Ordering::SeqCst) == 0 {
+                            listed.clone()
+                        } else {
+                            changed.clone()
+                        };
+                        return Ok::<_, Infallible>(wire_json(json!({
+                            "apiVersion":"demo.oxideloop.dev/v1alpha1",
+                            "kind":"WebApplicationList",
+                            "metadata":{"resourceVersion":"fresh-cut-list-rv"},
+                            "items":[item],
+                        })));
+                    }
+                    if method == http::Method::GET && path.ends_with("/webapplications/root") {
+                        return Ok::<_, Infallible>(wire_json(changed.clone()));
+                    }
+                    if method == http::Method::GET && path.contains("/oxideloopstates/") {
+                        return Ok::<_, Infallible>(Response::builder()
+                            .status(http::StatusCode::NOT_FOUND)
+                            .header(http::header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                br#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","code":404}"#.to_vec()
+                            ))
+                            .expect("state absence response"));
+                    }
+                    writes.fetch_add(1, Ordering::SeqCst);
+                    panic!("fresh-cut change must not issue {method} {path}");
+                }
+            }
+        });
+        let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
+        let (_fresh_sender, fresh_watch) = WatchHandleV0::test_channel(1);
+        let (_barrier_sender, barrier_watch) = WatchHandleV0::test_channel(1);
+        transport.test_push_watch(fresh_watch);
+        transport.test_push_watch(barrier_watch);
+        let (_retained_sender, mut root_watch) = WatchHandleV0::test_channel(1);
+        let mut fixed_point: Option<KubeFixedPointPortV0<'_, UnixRendererPortV0>> = None;
+        let mut automation_watch = None;
+
+        let (completion, _) = execute_kubernetes_command_while_observing(
+            &transport,
+            &root_address(&actor).expect("root address"),
+            &command,
+            &mut root_watch,
+            &mut fixed_point,
+            &mut automation_watch,
+            "root",
+            None,
+        )
+        .await
+        .expect("changed fresh cut is a normal no-write completion");
+        assert!(matches!(
+            completion,
+            KubernetesEffectCompletionV0::FreshBootstrapCutInvalidated
+        ));
+        let mut automation_candidates = VecDeque::new();
+        assert_eq!(
+            rebarrier_after_fresh_bootstrap_cut(
+                &mut actor,
+                &command,
+                &transport,
+                &drain_root_config(),
+                &mut root_watch,
+                &mut fixed_point,
+                &mut automation_watch,
+                &mut automation_candidates,
+            )
+            .await
+            .expect("changed cut returns to the normal root barrier"),
+            FreshBootstrapCutRebarrierV0::Active
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert!(matches!(actor.mode(), ModeV0::Running));
+        let next = actor.next_command();
+        assert!(next.is_ok(), "rebased actor must not fail: {next:?}");
+        assert_eq!(
+            actor.state().root().root_resource_version,
+            "fresh-cut-rv-2",
+            "the ordinary barrier reduced the fresh same-UID root before another command"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_bootstrap_cut_absence_rebarriers_to_wait_without_writes_or_hold() {
+        let mut actor = automation_candidate_actor();
+        actor.start();
+        let command = actor
+            .next_command()
+            .expect("bootstrap command is available")
+            .expect("fresh actor issues bootstrap");
+        let listed = match &command {
+            CommandV0::EnsureBootstrap {
+                token,
+                state,
+                state_name,
+                ..
+            } => bootstrap_wire_root(token, state_name, state, false, false),
+            _ => panic!("fresh actor must issue EnsureBootstrap"),
+        };
+        let lists = Arc::new(AtomicUsize::new(0));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let service = service_fn({
+            let lists = Arc::clone(&lists);
+            let writes = Arc::clone(&writes);
+            let listed = listed.clone();
+            move |request: Request<Body>| {
+                let lists = Arc::clone(&lists);
+                let writes = Arc::clone(&writes);
+                let listed = listed.clone();
+                async move {
+                    let method = request.method().clone();
+                    let path = request.uri().path().to_owned();
+                    if method == http::Method::GET && path.ends_with("/webapplications") {
+                        let initial_cut = lists.fetch_add(1, Ordering::SeqCst) == 0;
+                        return Ok::<_, Infallible>(wire_json(json!({
+                            "apiVersion":"demo.oxideloop.dev/v1alpha1",
+                            "kind":"WebApplicationList",
+                            "metadata":{"resourceVersion":"fresh-cut-empty-rv"},
+                            "items": if initial_cut { vec![listed] } else { vec![] },
+                        })));
+                    }
+                    if method == http::Method::GET && path.ends_with("/webapplications/root") {
+                        return Ok::<_, Infallible>(Response::builder()
+                            .status(http::StatusCode::NOT_FOUND)
+                            .header(http::header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                br#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","code":404}"#.to_vec()
+                            ))
+                            .expect("root absence response"));
+                    }
+                    writes.fetch_add(1, Ordering::SeqCst);
+                    panic!("fresh-cut absence must not issue {method} {path}");
+                }
+            }
+        });
+        let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
+        let (_fresh_sender, fresh_watch) = WatchHandleV0::test_channel(1);
+        let (_barrier_sender, barrier_watch) = WatchHandleV0::test_channel(1);
+        transport.test_push_watch(fresh_watch);
+        transport.test_push_watch(barrier_watch);
+        let (_retained_sender, mut root_watch) = WatchHandleV0::test_channel(1);
+        let mut fixed_point: Option<KubeFixedPointPortV0<'_, UnixRendererPortV0>> = None;
+        let mut automation_watch = None;
+
+        let (completion, _) = execute_kubernetes_command_while_observing(
+            &transport,
+            &root_address(&actor).expect("root address"),
+            &command,
+            &mut root_watch,
+            &mut fixed_point,
+            &mut automation_watch,
+            "root",
+            None,
+        )
+        .await
+        .expect("absent fresh cut is a normal no-write completion");
+        assert!(matches!(
+            completion,
+            KubernetesEffectCompletionV0::FreshBootstrapCutInvalidated
+        ));
+        let mut automation_candidates = VecDeque::new();
+        assert_eq!(
+            rebarrier_after_fresh_bootstrap_cut(
+                &mut actor,
+                &command,
+                &transport,
+                &drain_root_config(),
+                &mut root_watch,
+                &mut fixed_point,
+                &mut automation_watch,
+                &mut automation_candidates,
+            )
+            .await
+            .expect("absent cut becomes the normal wait-for-root state"),
+            FreshBootstrapCutRebarrierV0::ActorRetired
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert_eq!(lists.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn malformed_fresh_bootstrap_cut_lists_hold_without_rebarriering_or_writes() {
+        for label in [
+            "exact-name selector leak",
+            "empty list resourceVersion",
+            "duplicate exact-name list items",
+        ] {
+            let mut actor = automation_candidate_actor();
+            actor.start();
+            let command = actor
+                .next_command()
+                .expect("bootstrap command is available")
+                .expect("fresh actor issues bootstrap");
+            let listed = match &command {
+                CommandV0::EnsureBootstrap {
+                    token,
+                    state,
+                    state_name,
+                    ..
+                } => bootstrap_wire_root(token, state_name, state, false, false),
+                _ => panic!("fresh actor must issue EnsureBootstrap"),
+            };
+            let list = match label {
+                "exact-name selector leak" => {
+                    let mut leaked = listed.clone();
+                    leaked["metadata"]["name"] = json!("foreign");
+                    json!({
+                        "apiVersion":"demo.oxideloop.dev/v1alpha1",
+                        "kind":"WebApplicationList",
+                        "metadata":{"resourceVersion":"fresh-cut-list-rv"},
+                        "items":[leaked],
+                    })
+                }
+                "empty list resourceVersion" => json!({
+                    "apiVersion":"demo.oxideloop.dev/v1alpha1",
+                    "kind":"WebApplicationList",
+                    "metadata":{"resourceVersion":""},
+                    "items":[listed],
+                }),
+                "duplicate exact-name list items" => json!({
+                    "apiVersion":"demo.oxideloop.dev/v1alpha1",
+                    "kind":"WebApplicationList",
+                    "metadata":{"resourceVersion":"fresh-cut-list-rv"},
+                    "items":[listed.clone(), listed],
+                }),
+                _ => unreachable!("fixed malformed fresh-cut case"),
+            };
+            let writes = Arc::new(AtomicUsize::new(0));
+            let service = service_fn({
+                let writes = Arc::clone(&writes);
+                move |request: Request<Body>| {
+                    let writes = Arc::clone(&writes);
+                    let list = list.clone();
+                    async move {
+                        let method = request.method().clone();
+                        let path = request.uri().path().to_owned();
+                        if method == http::Method::GET && path.ends_with("/webapplications") {
+                            return Ok::<_, Infallible>(wire_json(list));
+                        }
+                        writes.fetch_add(1, Ordering::SeqCst);
+                        panic!("malformed fresh bootstrap {label} must not issue {method} {path}");
+                    }
+                }
+            });
+            let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
+            let (_root_sender, mut root_watch) = WatchHandleV0::test_channel(1);
+            let mut fixed_point: Option<KubeFixedPointPortV0<'_, UnixRendererPortV0>> = None;
+            let mut automation_watch = None;
+
+            assert!(
+                matches!(
+                    execute_kubernetes_command_while_observing(
+                        &transport,
+                        &root_address(&actor).expect("root address"),
+                        &command,
+                        &mut root_watch,
+                        &mut fixed_point,
+                        &mut automation_watch,
+                        "root",
+                        None,
+                    )
+                    .await,
+                    Err(RuntimeErrorV0::Hold(_))
+                ),
+                "{label} must fail closed instead of rebarriering"
+            );
+            assert_eq!(
+                writes.load(Ordering::SeqCst),
+                0,
+                "{label} must issue zero writes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn bootstrap_ready_exact_root_added_before_first_effect_poll_reuses_its_epoch() {
+        let mut actor = automation_candidate_actor();
+        actor.start();
+        let command = actor
+            .next_command()
+            .expect("bootstrap command is available")
+            .expect("bootstrap command");
+        let CommandV0::EnsureBootstrap {
+            token,
+            state,
+            state_name,
+            ..
+        } = &command
+        else {
+            panic!("fresh actor must issue EnsureBootstrap");
+        };
+        let token = token.clone();
+        let state = state.clone();
+        let state_name = state_name.clone();
+        let wire = Arc::new(Mutex::new(BootstrapWireStateV0::default()));
+        let root_gets = Arc::new(AtomicUsize::new(0));
+        let (root_sender, mut root_watch) = WatchHandleV0::test_channel(4);
+        let service = service_fn({
+            let wire = Arc::clone(&wire);
+            let root_gets = Arc::clone(&root_gets);
+            let root_sender = root_sender.clone();
+            let token = token.clone();
+            let state = state.clone();
+            let state_name = state_name.clone();
+            move |request: Request<Body>| {
+                let wire = Arc::clone(&wire);
+                let root_gets = Arc::clone(&root_gets);
+                let root_sender = root_sender.clone();
+                let token = token.clone();
+                let state = state.clone();
+                let state_name = state_name.clone();
+                async move {
+                    let method = request.method().clone();
+                    let path = request.uri().path().to_owned();
+                    let root_response = |root_metadata, root_status| {
+                        let mut root = bootstrap_wire_root(
+                            &token,
+                            &state_name,
+                            &state,
+                            root_metadata,
+                            root_status,
+                        );
+                        root["spec"]["message"] = json!("driver automation");
+                        wire_json(root)
+                    };
+                    if method == http::Method::GET && path.ends_with("/webapplications/root") {
+                        root_gets.fetch_add(1, Ordering::SeqCst);
+                        let wire = wire.lock().expect("ready Added wire lock");
+                        Ok::<_, Infallible>(root_response(wire.root_metadata, wire.root_status))
+                    } else if method == http::Method::GET
+                        && path.ends_with(&format!("/oxideloopstates/{state_name}"))
+                    {
+                        let wire = wire.lock().expect("ready Added wire lock");
+                        if wire.state_created {
+                            Ok(wire_json(bootstrap_wire_state(
+                                &state_name,
+                                &state,
+                                &token,
+                                wire.state_finalizer,
+                            )))
+                        } else {
+                            Ok(Response::builder()
+                                .status(404)
+                                .header(http::header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(
+                                    serde_json::to_vec(&json!({
+                                        "apiVersion":"v1", "kind":"Status",
+                                        "status":"Failure", "reason":"NotFound", "code":404,
+                                    }))
+                                    .expect("not-found JSON"),
+                                ))
+                                .expect("state is absent"))
+                        }
+                    } else if method == http::Method::POST && path.ends_with("/oxideloopstates") {
+                        let mut wire = wire.lock().expect("ready Added wire lock");
+                        wire.state_created = true;
+                        wire.requests.push("State POST".into());
+                        Ok(wire_json(bootstrap_wire_state(
+                            &state_name,
+                            &state,
+                            &token,
+                            false,
+                        )))
+                    } else if method == http::Method::PATCH
+                        && path.ends_with(&format!("/oxideloopstates/{state_name}"))
+                    {
+                        let mut wire = wire.lock().expect("ready Added wire lock");
+                        wire.state_finalizer = true;
+                        wire.requests.push("State finalizer".into());
+                        Ok(wire_json(bootstrap_wire_state(
+                            &state_name,
+                            &state,
+                            &token,
+                            true,
+                        )))
+                    } else if method == http::Method::PATCH
+                        && path.ends_with("/webapplications/root/status")
+                    {
+                        let mut wire = wire.lock().expect("ready Added wire lock");
+                        wire.root_status = true;
+                        wire.requests.push("Root State-link/status".into());
+                        let mut event =
+                            bootstrap_wire_root_object(&token, &state_name, &state, true, true);
+                        event.value["spec"]["message"] = json!("driver automation");
+                        root_sender
+                            .try_send(Ok(WatchEventV0::Modified(event)))
+                            .expect("final root echo fits root watch");
+                        Ok(root_response(true, true))
+                    } else if method == http::Method::PATCH
+                        && path.ends_with("/webapplications/root")
+                    {
+                        let mut wire = wire.lock().expect("ready Added wire lock");
+                        wire.root_metadata = true;
+                        wire.requests.push("Root metadata".into());
+                        Ok(root_response(true, false))
+                    } else {
+                        panic!("unexpected ready-Added request {method} {path}");
+                    }
+                }
+            }
+        });
+        let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
+        let address = root_address(&actor).expect("root address");
+        let operation = transport.begin_collected_operation_session();
+        let mut exact_initial =
+            bootstrap_wire_root_object(&token, &state_name, &state, false, false);
+        exact_initial.value["spec"]["message"] = json!("driver automation");
+        operation
+            .seal_collected_bootstrap_fence(&address, &command, &exact_initial, None)
+            .expect("bootstrap session seals before the ready root event");
+        root_sender
+            .try_send(Ok(WatchEventV0::Added(exact_initial)))
+            .expect("exact initial root Added is ready before collector select");
+        let mut fixed_point: Option<KubeFixedPointPortV0<'_, ()>> = None;
+        let mut automation_watch = None;
+        let (completion, buffered) = collect_kubernetes_command_while_observing(
+            &transport,
+            &address,
+            &command,
+            &mut root_watch,
+            &mut fixed_point,
+            &mut automation_watch,
+            "root",
+            operation.clone(),
+            None,
+        )
+        .await
+        .expect("exact ready root Added resumes bootstrap");
+        assert!(matches!(
+            completion,
+            KubernetesEffectCompletionV0::Acknowledged(event)
+                if matches!(*event, Some(EventV0::BootstrapAcknowledged { .. }))
+        ));
+        assert!(
+            buffered.root.is_none(),
+            "the exact initial record is consumed"
+        );
+        assert_eq!(
+            wire.lock().expect("ready Added wire inspection").requests,
+            vec![
+                "State POST",
+                "Root metadata",
+                "State finalizer",
+                "Root State-link/status",
+            ]
+        );
+        assert_eq!(
+            operation.prewrite_gate().state(),
+            PrewriteGateStateV0::Proven,
+            "only the exact final raw echo may complete the collected bootstrap"
+        );
+        assert!(root_gets.load(Ordering::SeqCst) >= 6);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn bootstrap_duplicate_root_metadata_echo_restarts_once_then_writes_one_status() {
         let mut actor = automation_candidate_actor();
         actor.start();
@@ -4294,29 +5316,20 @@ mod tests {
         let wire = Arc::new(Mutex::new(BootstrapWireStateV0::default()));
         let (root_sender, mut root_watch) = WatchHandleV0::test_channel(1);
         let root_gets = Arc::new(AtomicUsize::new(0));
-        let metadata_root_gets = Arc::new(AtomicUsize::new(0));
-        let authentication_read_started = Arc::new(AtomicUsize::new(0));
-        let restarted_preflight_started = Arc::new(AtomicUsize::new(0));
-        let release_authentication_read = Arc::new(tokio::sync::Notify::new());
-        let release_restarted_preflight = Arc::new(tokio::sync::Notify::new());
+        let service_token = token.clone();
+        let service_state = state.clone();
+        let service_state_name = state_name.clone();
         let service = service_fn({
             let wire = Arc::clone(&wire);
             let root_sender = root_sender.clone();
             let root_gets = Arc::clone(&root_gets);
-            let metadata_root_gets = Arc::clone(&metadata_root_gets);
-            let authentication_read_started = Arc::clone(&authentication_read_started);
-            let restarted_preflight_started = Arc::clone(&restarted_preflight_started);
-            let release_authentication_read = Arc::clone(&release_authentication_read);
-            let release_restarted_preflight = Arc::clone(&release_restarted_preflight);
+            let token = service_token.clone();
+            let state = service_state.clone();
+            let state_name = service_state_name.clone();
             move |request: Request<Body>| {
                 let wire = Arc::clone(&wire);
                 let root_sender = root_sender.clone();
                 let root_gets = Arc::clone(&root_gets);
-                let metadata_root_gets = Arc::clone(&metadata_root_gets);
-                let authentication_read_started = Arc::clone(&authentication_read_started);
-                let restarted_preflight_started = Arc::clone(&restarted_preflight_started);
-                let release_authentication_read = Arc::clone(&release_authentication_read);
-                let release_restarted_preflight = Arc::clone(&release_restarted_preflight);
                 let token = token.clone();
                 let state = state.clone();
                 let state_name = state_name.clone();
@@ -4325,27 +5338,11 @@ mod tests {
                     let path = request.uri().path().to_owned();
                     if method == http::Method::GET && path.ends_with("/webapplications/root") {
                         root_gets.fetch_add(1, Ordering::SeqCst);
-                        let metadata_phase = {
-                            let wire = wire.lock().expect("bootstrap echo wire lock");
-                            wire.root_metadata && !wire.root_status
-                        };
-                        if metadata_phase {
-                            match metadata_root_gets.fetch_add(1, Ordering::SeqCst) {
-                                0 => {
-                                    authentication_read_started.store(1, Ordering::SeqCst);
-                                    release_authentication_read.notified().await;
-                                }
-                                1 => {
-                                    restarted_preflight_started.store(1, Ordering::SeqCst);
-                                    release_restarted_preflight.notified().await;
-                                }
-                                _ => {}
-                            }
-                        }
                         let wire = wire.lock().expect("bootstrap echo wire lock");
                         Ok::<_, Infallible>(wire_json(bootstrap_wire_root(
                             &token,
                             &state_name,
+                            &state,
                             wire.root_metadata,
                             wire.root_status,
                         )))
@@ -4401,9 +5398,19 @@ mod tests {
                         let mut wire = wire.lock().expect("bootstrap echo wire lock");
                         wire.root_status = true;
                         wire.requests.push("Root State-link/status".into());
+                        root_sender
+                            .try_send(Ok(WatchEventV0::Modified(bootstrap_wire_root_object(
+                                &token,
+                                &state_name,
+                                &state,
+                                true,
+                                true,
+                            ))))
+                            .expect("final root echo fits root watch");
                         Ok(wire_json(bootstrap_wire_root(
                             &token,
                             &state_name,
+                            &state,
                             true,
                             true,
                         )))
@@ -4413,12 +5420,10 @@ mod tests {
                         let mut wire = wire.lock().expect("bootstrap echo wire lock");
                         wire.root_metadata = true;
                         wire.requests.push("Root metadata".into());
-                        root_sender
-                            .try_send(Ok(WatchEventV0::Modified(root_event("2"))))
-                            .expect("metadata self echo fits root watch");
                         Ok(wire_json(bootstrap_wire_root(
                             &token,
                             &state_name,
+                            &state,
                             true,
                             false,
                         )))
@@ -4429,8 +5434,16 @@ mod tests {
             }
         });
         let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
-        let operation = transport.begin_collected_operation_session();
         let address = root_address(&actor).expect("root address");
+        let operation = transport.begin_collected_operation_session();
+        operation
+            .seal_collected_bootstrap_fence(
+                &address,
+                &command,
+                &bootstrap_wire_root_object(&token, &state_name, &state, false, false),
+                None,
+            )
+            .expect("bootstrap collector session seals before select");
         let mut fixed_point: Option<KubeFixedPointPortV0<'_, ()>> = None;
         let mut automation_watch = None;
         let collect = collect_kubernetes_command_while_observing(
@@ -4442,28 +5455,9 @@ mod tests {
             &mut automation_watch,
             "root",
             operation.clone(),
-            Some(PrewriteRootWitnessV0::Bootstrap {
-                operation: operation.clone(),
-            }),
+            None,
         );
-        let release = async {
-            while authentication_read_started.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-            wait_for_space(&root_sender).await;
-            // The first blocked root read authenticates the metadata response.
-            // Hold the restarted status preflight, then inject the same watch
-            // record again. That duplicate must not mint a second restart or
-            // second State-link/status write.
-            release_authentication_read.notify_one();
-            while restarted_preflight_started.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-            root_sender
-                .try_send(Ok(WatchEventV0::Modified(root_event("2"))))
-                .expect("duplicate metadata echo fits root watch");
-            release_restarted_preflight.notify_one();
-        };
+        let release = async {};
         let (result, ()) = tokio::join!(collect, release);
         let (KubernetesEffectCompletionV0::Acknowledged(event), buffered) =
             result.expect("exact bootstrap echo restarts")
@@ -4483,20 +5477,20 @@ mod tests {
             wire.requests,
             vec![
                 "State POST",
-                "State finalizer",
                 "Root metadata",
+                "State finalizer",
                 "Root State-link/status",
             ],
-            "the old preflight is restarted, not duplicated"
+            "a retained owned echo never duplicates a bootstrap subwrite"
         );
         assert!(
-            root_gets.load(Ordering::SeqCst) >= 10,
-            "initial bootstrap, blocked preflight/authentication, and the restarted full preflight all read root"
+            root_gets.load(Ordering::SeqCst) >= 6,
+            "bootstrap retains exact root preflights and final proof rereads"
         );
         assert_eq!(
-            operation.prewrite_gate().epoch(),
-            4,
-            "the terminal State-link proves its matching epoch directly rather than minting N+1"
+            operation.prewrite_gate().state(),
+            PrewriteGateStateV0::Proven,
+            "the final raw root echo is consumed before the acknowledgement"
         );
     }
 
@@ -4527,6 +5521,9 @@ mod tests {
         let recovery_state_get_started = Arc::new(AtomicUsize::new(0));
         let recovery_state_get_released = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release_recovery_state_get = Arc::new(tokio::sync::Notify::new());
+        let service_token = token.clone();
+        let service_state = state.clone();
+        let service_state_name = state_name.clone();
         let service = service_fn({
             let wire = Arc::clone(&wire);
             let root_sender = root_sender.clone();
@@ -4534,6 +5531,9 @@ mod tests {
             let recovery_state_get_started = Arc::clone(&recovery_state_get_started);
             let recovery_state_get_released = Arc::clone(&recovery_state_get_released);
             let release_recovery_state_get = Arc::clone(&release_recovery_state_get);
+            let token = service_token.clone();
+            let state = service_state.clone();
+            let state_name = service_state_name.clone();
             move |request: Request<Body>| {
                 let wire = Arc::clone(&wire);
                 let root_sender = root_sender.clone();
@@ -4552,6 +5552,7 @@ mod tests {
                         let mut root = bootstrap_wire_root(
                             &token,
                             &state_name,
+                            &state,
                             wire.root_metadata,
                             wire.root_status,
                         );
@@ -4614,10 +5615,27 @@ mod tests {
                                 "independent-root-rv",
                             ))))
                             .expect("genuine root record fits root watch");
-                        Err(std::io::Error::other("state finalizer response lost"))
+                        Ok(wire_json(bootstrap_wire_state(
+                            &state_name,
+                            &state,
+                            &token,
+                            true,
+                        )))
                     } else if method == http::Method::PATCH
-                        && (path.ends_with("/webapplications/root")
-                            || path.ends_with("/webapplications/root/status"))
+                        && path.ends_with("/webapplications/root")
+                    {
+                        let mut wire = wire.lock().expect("response-proof wire lock");
+                        wire.root_metadata = true;
+                        wire.requests.push("Root metadata".into());
+                        Ok(wire_json(bootstrap_wire_root(
+                            &token,
+                            &state_name,
+                            &state,
+                            true,
+                            false,
+                        )))
+                    } else if method == http::Method::PATCH
+                        && path.ends_with("/webapplications/root/status")
                     {
                         panic!("a buffered genuine root must stop later bootstrap writes")
                     } else {
@@ -4627,8 +5645,16 @@ mod tests {
             }
         });
         let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
-        let operation = transport.begin_collected_operation_session();
         let address = root_address(&actor).expect("root address");
+        let operation = transport.begin_collected_operation_session();
+        operation
+            .seal_collected_bootstrap_fence(
+                &address,
+                &command,
+                &bootstrap_wire_root_object(&token, &state_name, &state, false, false),
+                None,
+            )
+            .expect("bootstrap collector session seals before select");
         let mut fixed_point: Option<KubeFixedPointPortV0<'_, ()>> = None;
         let mut automation_watch = None;
         let collect = collect_kubernetes_command_while_observing(
@@ -4640,32 +5666,18 @@ mod tests {
             &mut automation_watch,
             "root",
             operation.clone(),
-            Some(PrewriteRootWitnessV0::Bootstrap {
-                operation: operation.clone(),
-            }),
+            None,
         );
-        let release = async {
-            while recovery_state_get_started.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-            // The State finalizer request is already ambiguous. Ensure the
-            // root record has entered the collector before allowing its exact
-            // recovery proof to open the next bootstrap phase.
-            wait_for_space(&root_sender).await;
-            release_recovery_state_get.notify_one();
-        };
+        let release = async {};
         let (result, ()) = tokio::join!(collect, release);
         assert!(matches!(
             result.expect("response-proof collector result").0,
-            KubernetesEffectCompletionV0::PreWriteInvalidated {
-                root_authentication: Some(RootAuthenticationOutcomeV0::Genuine),
-                ..
-            }
+            KubernetesEffectCompletionV0::PreWriteInvalidated { .. }
         ));
         let wire = wire.lock().expect("response-proof wire inspection");
         assert_eq!(
             wire.requests,
-            vec!["State POST", "State finalizer"],
+            vec!["State POST", "Root metadata", "State finalizer"],
             "the buffered genuine root invalidates the phase opened by recovery before any later write"
         );
         assert_eq!(
@@ -4702,13 +5714,18 @@ mod tests {
         let root_present = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let wire = Arc::new(Mutex::new(BootstrapWireStateV0::default()));
         let (root_sender, root_watch) = WatchHandleV0::test_channel(8);
+        // The initial root barrier and the per-EnsureBootstrap exact cut are
+        // distinct watches.  Keep their scripted streams separate so this
+        // end-to-end test exercises the operation-owned fresh cut instead of
+        // accidentally reusing the retained barrier channel.
+        let (bootstrap_sender, bootstrap_watch) = WatchHandleV0::test_channel(8);
         let service_wire = Arc::clone(&wire);
         let service_root_present = Arc::clone(&root_present);
-        let service_root_sender = root_sender.clone();
+        let service_bootstrap_sender = bootstrap_sender.clone();
         let service = service_fn(move |request: Request<Body>| {
             let wire = Arc::clone(&service_wire);
             let root_present = Arc::clone(&service_root_present);
-            let root_sender = service_root_sender.clone();
+            let bootstrap_sender = service_bootstrap_sender.clone();
             let token = token.clone();
             let state_name = state_name.clone();
             let state = state.clone();
@@ -4735,17 +5752,43 @@ mod tests {
                 wire.requests.push(format!("{method} {path}"));
                 let response = if path.ends_with("/webapplications") && method == http::Method::GET
                 {
-                    wire_json(json!({
-                        "apiVersion":"demo.oxideloop.dev/v1alpha1",
-                        "kind":"WebApplicationList",
-                        "metadata":{"resourceVersion":"root-list-rv"},
-                        "items":[],
-                    }))
+                    if root_present.load(Ordering::SeqCst) {
+                        let mut root = bootstrap_wire_root_for_bundle(
+                            &token,
+                            &state_name,
+                            &state,
+                            wire.root_metadata,
+                            wire.root_statuses.last().cloned(),
+                            &bundle_digest,
+                        );
+                        if !wire.root_statuses.is_empty() {
+                            root["metadata"]["resourceVersion"] =
+                                json!((2 + wire.root_statuses.len()).to_string());
+                        }
+                        let resource_version = root["metadata"]["resourceVersion"]
+                            .as_str()
+                            .expect("fresh exact list has a resourceVersion")
+                            .to_owned();
+                        wire_json(json!({
+                            "apiVersion":"demo.oxideloop.dev/v1alpha1",
+                            "kind":"WebApplicationList",
+                            "metadata":{"resourceVersion":resource_version},
+                            "items":[root],
+                        }))
+                    } else {
+                        wire_json(json!({
+                            "apiVersion":"demo.oxideloop.dev/v1alpha1",
+                            "kind":"WebApplicationList",
+                            "metadata":{"resourceVersion":"root-list-rv"},
+                            "items":[],
+                        }))
+                    }
                 } else if path.ends_with("/webapplications/root") && method == http::Method::GET {
                     if root_present.load(Ordering::SeqCst) {
                         let mut root = bootstrap_wire_root_for_bundle(
                             &token,
                             &state_name,
+                            &state,
                             wire.root_metadata,
                             wire.root_statuses.last().cloned(),
                             &bundle_digest,
@@ -4815,20 +5858,24 @@ mod tests {
                     let mut root = bootstrap_wire_root_for_bundle(
                         &token,
                         &state_name,
+                        &state,
                         true,
                         wire.root_statuses.last().cloned(),
                         &bundle_digest,
                     );
                     root["metadata"]["resourceVersion"] = json!(resource_version.clone());
-                    root_sender
-                        .try_send(Ok(WatchEventV0::Modified(root_event(&resource_version))))
-                        .expect("root self-watch fits the composed buffer");
+                    bootstrap_sender
+                        .try_send(Ok(WatchEventV0::Modified(root_object_from_wire(
+                            root.clone(),
+                        ))))
+                        .expect("fresh bootstrap watch accepts the final root echo");
                     wire_json(root)
                 } else if path.ends_with("/webapplications/root") && method == http::Method::PATCH {
                     wire.root_metadata = true;
                     wire_json(bootstrap_wire_root_for_bundle(
                         &token,
                         &state_name,
+                        &state,
                         true,
                         None,
                         &bundle_digest,
@@ -4854,6 +5901,7 @@ mod tests {
         });
         let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
         transport.test_push_watch(root_watch);
+        transport.test_push_watch(bootstrap_watch);
         let store =
             std::env::temp_dir().join(format!("oxideloop-driver-run-smoke-{}", std::process::id()));
         let driver = ControllerDriverV0::new(
@@ -5729,7 +6777,9 @@ mod tests {
                 tokio::task::yield_now().await;
             }
             // The injected record is consumed by the collector before the
-            // old GET may return.  The old epoch therefore has no write lease.
+            // old GET may return. The defensive bookmark must not restart
+            // authentication from the preceding exact self echo, and the old
+            // epoch therefore has no write lease.
             wait_for_space(&root_sender).await;
             release_first_preflight.notify_one();
         };
@@ -5737,7 +6787,7 @@ mod tests {
         let (KubernetesEffectCompletionV0::Acknowledged(event), buffered) =
             result.expect("exact self-echo restarts the command")
         else {
-            panic!("exact self-echo must not invalidate the command");
+            panic!("exact self-echo and a later bookmark must not invalidate the command");
         };
         assert!(matches!(
             *event,
