@@ -547,6 +547,10 @@ struct BootstrapFenceStateV0 {
     enqueued: u64,
     consumed: u64,
     metadata_echo: Option<ObjectV0>,
+    /// A single sequenced record may acknowledge the exact `RootMetadata`
+    /// response.  It is intentionally independent of publication: recording
+    /// an HTTP response does not consume a watch record.
+    metadata_echo_consumed: bool,
     /// Exact State-finalizer PATCH response. Final proof requires this full
     /// raw object unchanged; UID/digest alone would permit ownership, token,
     /// deletion, or resource-version drift between the finalizer write and
@@ -604,6 +608,7 @@ impl BootstrapFenceStateV0 {
             enqueued: 0,
             consumed: 0,
             metadata_echo: None,
+            metadata_echo_consumed: false,
             final_state: None,
             final_echo: None,
             final_echo_consumed: false,
@@ -692,6 +697,14 @@ impl BootstrapFenceStateV0 {
                         self.final_echo_consumed = true;
                         continue;
                     }
+                    WatchEventV0::Modified(observed)
+                        if !self.metadata_echo_consumed
+                            && !self.final_echo_consumed
+                            && self.metadata_echo.as_ref() == Some(&observed) =>
+                    {
+                        self.metadata_echo_consumed = true;
+                        continue;
+                    }
                     WatchEventV0::Bookmark { .. } => continue,
                     WatchEventV0::Added(_)
                     | WatchEventV0::Modified(_)
@@ -704,14 +717,17 @@ impl BootstrapFenceStateV0 {
             }
             match event {
                 WatchEventV0::Bookmark { .. } => {}
+                WatchEventV0::Modified(observed)
+                    if !self.metadata_echo_consumed
+                        && self.metadata_echo.as_ref() == Some(&observed) =>
+                {
+                    self.metadata_echo_consumed = true;
+                }
                 WatchEventV0::Added(observed) | WatchEventV0::Modified(observed)
                     if self
                         .baseline
                         .as_ref()
-                        .is_some_and(|baseline| baseline.root == observed)
-                        || self.metadata_echo.as_ref() == Some(&observed) => {}
-                WatchEventV0::Added(observed) | WatchEventV0::Modified(observed)
-                    if phase == BootstrapRootPhaseV0::RootMetadata && observed == *response => {}
+                        .is_some_and(|baseline| baseline.root == observed) => {}
                 WatchEventV0::Added(_) | WatchEventV0::Modified(_) | WatchEventV0::Deleted(_) => {
                     self.terminal
                         .get_or_insert(TransportErrorV0::PreWriteInvalidated);
@@ -1700,12 +1716,13 @@ impl OperationSessionV0 {
                         }
                         WatchEventV0::Added(observed) | WatchEventV0::Modified(observed) => {
                             // Final proof has a deliberately tiny consumer
-                            // language: only the exact `Modified` record
-                            // carrying the full final State-link response is
-                            // admissible. Delayed baseline or RootMetadata
-                            // echoes are not phase-neutral here; accepting
-                            // them would let an old response cross the final
-                            // watermark and acknowledge a later mutation.
+                            // language. It accepts the exact `Modified`
+                            // record carrying the full final State-link
+                            // response, plus one earlier exact RootMetadata
+                            // echo. The latter is only a response ordering
+                            // allowance: it cannot change the phase or final
+                            // acknowledgement, and is closed once either
+                            // echo has been consumed.
                             if self.gate.state() == PrewriteGateStateV0::FinalProofPending {
                                 if matches!(event, WatchEventV0::Modified(_))
                                     && fence.final_echo.as_ref().is_some_and(|final_echo| {
@@ -1713,6 +1730,14 @@ impl OperationSessionV0 {
                                     })
                                 {
                                     fence.final_echo_consumed = true;
+                                    notify_fence = true;
+                                    true
+                                } else if matches!(event, WatchEventV0::Modified(_))
+                                    && !fence.metadata_echo_consumed
+                                    && !fence.final_echo_consumed
+                                    && fence.metadata_echo.as_ref() == Some(observed)
+                                {
+                                    fence.metadata_echo_consumed = true;
                                     notify_fence = true;
                                     true
                                 } else {
@@ -1728,11 +1753,17 @@ impl OperationSessionV0 {
                                 fence.pending.push_back(record);
                                 notify_fence = true;
                                 true
+                            } else if matches!(event, WatchEventV0::Modified(_))
+                                && !fence.metadata_echo_consumed
+                                && fence.metadata_echo.as_ref() == Some(observed)
+                            {
+                                fence.metadata_echo_consumed = true;
+                                notify_fence = true;
+                                true
                             } else if fence
                                 .baseline
                                 .as_ref()
                                 .is_some_and(|baseline| baseline.root == *observed)
-                                || fence.metadata_echo.as_ref() == Some(observed)
                             {
                                 notify_fence = true;
                                 true
@@ -10687,6 +10718,7 @@ mod tests {
             let root = root.clone();
             let state = state.clone();
             async move {
+                assert_eq!(request.method(), http::Method::GET);
                 let object = if request.uri().path().ends_with("/oxideloopstates/state") {
                     state
                 } else if request.uri().path().ends_with("/webapplications/app") {
@@ -10854,8 +10886,31 @@ mod tests {
         assert!(fence.terminal.is_none());
     }
 
+    fn complete_root_metadata_write_with_pending_exact_echo(
+        session: &OperationSessionV0,
+        root: &ObjectV0,
+    ) -> ObjectV0 {
+        {
+            let mut authority = session.bootstrap.lock().expect("bootstrap authority lock");
+            authority.phase = Some(BootstrapAuthorityPhaseV0::Active(
+                BootstrapRootPhaseV0::RootMetadata,
+            ));
+        }
+        let mut metadata_echo = root.clone();
+        metadata_echo.metadata.resource_version = "root-metadata-rv".into();
+        metadata_echo.value["metadata"]["resourceVersion"] = json!("root-metadata-rv");
+        let permit = claim_first_write(session).expect("metadata write polls once");
+        assert!(
+            session.observe_bootstrap_root_watch(&WatchEventV0::Modified(metadata_echo.clone(),))
+        );
+        session
+            .complete_bootstrap_subwrite(permit, BootstrapRootPhaseV0::RootMetadata, &metadata_echo)
+            .expect("the queued exact metadata echo is consumed after response publication");
+        metadata_echo
+    }
+
     #[test]
-    fn collected_final_echo_before_response_is_held_until_the_response_is_published() {
+    fn collected_root_metadata_echo_before_response_is_classified_once() {
         let mut session = test_session(
             Duration::from_millis(5),
             Duration::from_millis(30),
@@ -10865,32 +10920,121 @@ mod tests {
         );
         let root = bootstrap_authority_root("1");
         arm_test_collected_bootstrap(&mut session, &root);
-        {
-            let mut authority = session.bootstrap.lock().expect("bootstrap authority lock");
-            authority.phase = Some(BootstrapAuthorityPhaseV0::Active(
-                BootstrapRootPhaseV0::RootStateLink,
-            ));
-        }
-        let mut final_root = root.clone();
-        final_root.metadata.resource_version = "2".into();
-        final_root.value["metadata"]["resourceVersion"] = json!("2");
-        final_root.value["status"]["state"] = json!({
-            "rootUid":"root-uid", "name":"state", "uid":"state-uid"
-        });
-
-        let permit = claim_first_write(&session).expect("final write polls once");
-        assert!(session.observe_bootstrap_root_watch(&WatchEventV0::Modified(final_root.clone(),)));
-        session
-            .complete_bootstrap_subwrite(permit, BootstrapRootPhaseV0::RootStateLink, &final_root)
-            .expect("the queued exact final echo is consumed after response publication");
-        assert_eq!(session.gate.state(), PrewriteGateStateV0::FinalProofPending);
+        let metadata_echo = complete_root_metadata_write_with_pending_exact_echo(&session, &root);
+        assert_eq!(
+            session.gate.state(),
+            PrewriteGateStateV0::BootstrapPhasePending
+        );
         let fence = session
             .bootstrap_fence
             .lock()
             .expect("fence remains usable");
-        assert_eq!(fence.final_echo.as_ref(), Some(&final_root));
-        assert!(fence.final_echo_consumed);
+        assert_eq!(fence.metadata_echo.as_ref(), Some(&metadata_echo));
+        assert!(fence.metadata_echo_consumed);
         assert!(fence.terminal.is_none());
+    }
+
+    #[test]
+    fn classified_root_metadata_echo_rejects_a_second_modified_or_added_record() {
+        for record_kind in ["modified", "added"] {
+            let mut session = test_session(
+                Duration::from_millis(5),
+                Duration::from_millis(30),
+                Duration::from_millis(40),
+                Duration::from_millis(50),
+                3,
+            );
+            let root = bootstrap_authority_root("1");
+            arm_test_collected_bootstrap(&mut session, &root);
+            {
+                let mut authority = session.bootstrap.lock().expect("bootstrap authority lock");
+                authority.phase = Some(BootstrapAuthorityPhaseV0::Active(
+                    BootstrapRootPhaseV0::RootMetadata,
+                ));
+            }
+            let mut metadata_echo = root.clone();
+            metadata_echo.metadata.resource_version = "root-metadata-rv".into();
+            metadata_echo.value["metadata"]["resourceVersion"] = json!("root-metadata-rv");
+            let permit = claim_first_write(&session).expect("metadata write polls once");
+            assert!(
+                session
+                    .observe_bootstrap_root_watch(&WatchEventV0::Modified(metadata_echo.clone(),))
+            );
+            let second = match record_kind {
+                "modified" => WatchEventV0::Modified(metadata_echo.clone()),
+                "added" => WatchEventV0::Added(metadata_echo.clone()),
+                _ => unreachable!("test table is exhaustive"),
+            };
+            assert!(
+                session.observe_bootstrap_root_watch(&second),
+                "an in-flight record remains sequenced until its response classifies it"
+            );
+            assert!(matches!(
+                session.complete_bootstrap_subwrite(
+                    permit,
+                    BootstrapRootPhaseV0::RootMetadata,
+                    &metadata_echo
+                ),
+                Err(TransportErrorV0::ManualRecoveryHold)
+            ));
+            assert!(
+                session
+                    .bootstrap_fence
+                    .lock()
+                    .expect("fence is readable")
+                    .metadata_echo_consumed,
+                "the first exact Modified record was consumed before the second was rejected"
+            );
+            assert_eq!(
+                session.bootstrap_fence_terminal(),
+                Some(TransportErrorV0::PreWriteInvalidated)
+            );
+        }
+    }
+
+    #[test]
+    fn consumed_root_metadata_echo_cannot_cross_later_root_state_link_or_final_proof() {
+        for later_phase in ["root-state-link", "final-proof"] {
+            let mut session = test_session(
+                Duration::from_millis(5),
+                Duration::from_millis(30),
+                Duration::from_millis(40),
+                Duration::from_millis(50),
+                3,
+            );
+            let root = bootstrap_authority_root("1");
+            arm_test_collected_bootstrap(&mut session, &root);
+            let metadata_echo =
+                complete_root_metadata_write_with_pending_exact_echo(&session, &root);
+            {
+                let mut authority = session.bootstrap.lock().expect("bootstrap authority lock");
+                authority.phase = Some(BootstrapAuthorityPhaseV0::Active(
+                    if later_phase == "root-state-link" {
+                        BootstrapRootPhaseV0::RootStateLink
+                    } else {
+                        BootstrapRootPhaseV0::FinalProofPending
+                    },
+                ));
+            }
+            if later_phase == "final-proof" {
+                let (final_root, _) = final_proof_fixture(&root);
+                let mut fence = session.bootstrap_fence.lock().expect("fence is writable");
+                fence.final_echo = Some(final_root);
+                fence.final_echo_consumed = false;
+                session.gate.state.store(
+                    PrewriteGateV0::encode(1, PrewriteGateV0::FINAL_PROOF_PENDING),
+                    Ordering::Release,
+                );
+            }
+            assert!(
+                !session.observe_bootstrap_root_watch(&WatchEventV0::Modified(metadata_echo)),
+                "a consumed metadata echo cannot cross {later_phase}"
+            );
+            assert_eq!(
+                session.bootstrap_fence_terminal(),
+                Some(TransportErrorV0::PreWriteInvalidated)
+            );
+        }
     }
 
     #[test]
@@ -13403,62 +13547,185 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_proof_rejects_delayed_baseline_or_metadata_echo_before_or_after_final_echo() {
-        for delayed_kind in ["baseline", "root-metadata"] {
-            for before_final_echo in [true, false] {
-                let (session, address, command, initial_root) = sealed_test_collected_bootstrap();
-                let (final_root, final_state) = final_proof_fixture(&initial_root);
-                let (source, mut watch) = WatchHandleV0::test_channel(3);
-                watch
-                    .start_collected_bootstrap_fence(&session)
-                    .expect("final-proof pump installs");
-                stage_final_proof(
-                    &session,
-                    &address,
-                    &command,
-                    &initial_root,
-                    &final_root,
-                    &final_state,
-                )
-                .await;
+    async fn final_proof_consumes_one_delayed_metadata_echo_then_proves_from_exact_rereads() {
+        let (session, address, command, initial_root) = sealed_test_collected_bootstrap();
+        let (final_root, final_state) = final_proof_fixture(&initial_root);
+        let transport = final_proof_transport(final_root.clone(), final_state.clone());
+        let (source, mut watch) = WatchHandleV0::test_channel(3);
+        watch
+            .start_collected_bootstrap_fence(&session)
+            .expect("final-proof pump installs");
+        stage_final_proof(
+            &session,
+            &address,
+            &command,
+            &initial_root,
+            &final_root,
+            &final_state,
+        )
+        .await;
 
-                let delayed = if delayed_kind == "baseline" {
-                    initial_root.clone()
-                } else {
-                    let mut metadata_echo = final_root.clone();
-                    metadata_echo.metadata.resource_version = "root-metadata-rv".into();
-                    metadata_echo.value["metadata"]["resourceVersion"] = json!("root-metadata-rv");
-                    metadata_echo.value["status"] = json!({});
-                    metadata_echo
-                };
-                if !before_final_echo {
-                    source
-                        .send(Ok(WatchEventV0::Modified(final_root.clone())))
-                        .await
-                        .expect("exact final echo fits source");
-                    let exact = watch.next_event().await.expect("exact final echo is data");
-                    assert!(session.observe_bootstrap_root_watch(&exact));
-                }
+        let mut metadata_echo = final_root.clone();
+        metadata_echo.metadata.resource_version = "root-metadata-rv".into();
+        metadata_echo.value["metadata"]["resourceVersion"] = json!("root-metadata-rv");
+        metadata_echo.value["status"] = json!({});
+        session
+            .bootstrap_fence
+            .lock()
+            .expect("fence is writable")
+            .metadata_echo = Some(metadata_echo.clone());
+
+        for event in [
+            WatchEventV0::Modified(metadata_echo.clone()),
+            WatchEventV0::Modified(final_root.clone()),
+        ] {
+            source.send(Ok(event)).await.expect("echo fits source");
+            let observed = watch.next_event().await.expect("echo is data");
+            assert!(session.observe_bootstrap_root_watch(&observed));
+        }
+        let (root_ref, state_ref) = address.references();
+        let (root, state) = session
+            .complete_collected_bootstrap_final_proof(
+                &transport,
+                &root_ref,
+                &state_ref,
+                "bootstrap-token",
+            )
+            .await
+            .expect("one delayed metadata echo and exact rereads prove without another write");
+        assert_eq!((root, state), (final_root, final_state));
+        assert_eq!(session.prewrite_gate().state(), PrewriteGateStateV0::Proven);
+        {
+            let fence = session.bootstrap_fence.lock().expect("fence is readable");
+            assert!(fence.metadata_echo_consumed && fence.final_echo_consumed);
+            assert_eq!((fence.committed, fence.enqueued, fence.consumed), (2, 2, 2));
+        }
+        session
+            .close_collected_bootstrap_fence(&mut watch)
+            .await
+            .expect("proven pump closes cleanly");
+    }
+
+    #[tokio::test]
+    async fn final_proof_rejects_duplicate_or_after_final_metadata_echoes() {
+        for after_final in [false, true] {
+            let (session, address, command, initial_root) = sealed_test_collected_bootstrap();
+            let (final_root, final_state) = final_proof_fixture(&initial_root);
+            let (source, mut watch) = WatchHandleV0::test_channel(3);
+            watch
+                .start_collected_bootstrap_fence(&session)
+                .expect("final-proof pump installs");
+            stage_final_proof(
+                &session,
+                &address,
+                &command,
+                &initial_root,
+                &final_root,
+                &final_state,
+            )
+            .await;
+
+            let mut metadata_echo = final_root.clone();
+            metadata_echo.metadata.resource_version = "root-metadata-rv".into();
+            metadata_echo.value["metadata"]["resourceVersion"] = json!("root-metadata-rv");
+            metadata_echo.value["status"] = json!({});
+            session
+                .bootstrap_fence
+                .lock()
+                .expect("fence is writable")
+                .metadata_echo = Some(metadata_echo.clone());
+
+            if after_final {
                 source
-                    .send(Ok(WatchEventV0::Modified(delayed)))
+                    .send(Ok(WatchEventV0::Modified(final_root)))
                     .await
-                    .expect("delayed nonfinal echo fits source");
-                let observed = watch
-                    .next_event()
+                    .expect("final echo fits source");
+                let final_event = watch.next_event().await.expect("final echo is data");
+                assert!(session.observe_bootstrap_root_watch(&final_event));
+            } else {
+                source
+                    .send(Ok(WatchEventV0::Modified(metadata_echo.clone())))
                     .await
-                    .expect("delayed nonfinal echo is data");
-                assert!(
-                    !session.observe_bootstrap_root_watch(&observed),
-                    "{delayed_kind} must reject when it arrives {} the final echo",
-                    if before_final_echo { "before" } else { "after" }
-                );
-                assert_eq!(
-                    session.bootstrap_fence_terminal(),
-                    Some(TransportErrorV0::PreWriteInvalidated)
-                );
-                assert_ne!(session.prewrite_gate().state(), PrewriteGateStateV0::Proven);
-                let _ = session.close_collected_bootstrap_fence(&mut watch).await;
+                    .expect("first metadata echo fits source");
+                let first_metadata = watch.next_event().await.expect("metadata echo is data");
+                assert!(session.observe_bootstrap_root_watch(&first_metadata));
             }
+            source
+                .send(Ok(WatchEventV0::Modified(metadata_echo)))
+                .await
+                .expect("repeated metadata echo fits source");
+            let repeated = watch.next_event().await.expect("repeated echo is data");
+            assert!(
+                !session.observe_bootstrap_root_watch(&repeated),
+                "metadata echo must be rejected after {}",
+                if after_final {
+                    "the final echo"
+                } else {
+                    "its own consumption"
+                }
+            );
+            assert_eq!(
+                session.bootstrap_fence_terminal(),
+                Some(TransportErrorV0::PreWriteInvalidated)
+            );
+            assert_eq!(
+                session.prewrite_gate().state(),
+                PrewriteGateStateV0::FinalProofPending
+            );
+            let _ = session.close_collected_bootstrap_fence(&mut watch).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn final_proof_rejects_baseline_added_and_forged_metadata_records() {
+        for record_kind in ["baseline", "added-metadata", "forged-metadata"] {
+            let (session, address, command, initial_root) = sealed_test_collected_bootstrap();
+            let (final_root, final_state) = final_proof_fixture(&initial_root);
+            let (source, mut watch) = WatchHandleV0::test_channel(2);
+            watch
+                .start_collected_bootstrap_fence(&session)
+                .expect("final-proof pump installs");
+            stage_final_proof(
+                &session,
+                &address,
+                &command,
+                &initial_root,
+                &final_root,
+                &final_state,
+            )
+            .await;
+
+            let mut metadata_echo = final_root.clone();
+            metadata_echo.metadata.resource_version = "root-metadata-rv".into();
+            metadata_echo.value["metadata"]["resourceVersion"] = json!("root-metadata-rv");
+            metadata_echo.value["status"] = json!({});
+            session
+                .bootstrap_fence
+                .lock()
+                .expect("fence is writable")
+                .metadata_echo = Some(metadata_echo.clone());
+            let event = match record_kind {
+                "baseline" => WatchEventV0::Modified(initial_root),
+                "added-metadata" => WatchEventV0::Added(metadata_echo),
+                "forged-metadata" => {
+                    let mut forged = metadata_echo;
+                    forged.metadata.resource_version = "forged-rv".into();
+                    forged.value["metadata"]["resourceVersion"] = json!("forged-rv");
+                    WatchEventV0::Modified(forged)
+                }
+                _ => unreachable!("test table is exhaustive"),
+            };
+            source.send(Ok(event)).await.expect("record fits source");
+            let observed = watch.next_event().await.expect("record is data");
+            assert!(
+                !session.observe_bootstrap_root_watch(&observed),
+                "{record_kind} is not final-proof acknowledgement authority"
+            );
+            assert_eq!(
+                session.bootstrap_fence_terminal(),
+                Some(TransportErrorV0::PreWriteInvalidated)
+            );
+            let _ = session.close_collected_bootstrap_fence(&mut watch).await;
         }
     }
 
