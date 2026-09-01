@@ -79,6 +79,10 @@ write_parser_record mutation_post_acknowledged mutation_acknowledged mutate "$mu
 write_parser_record mutation_result_persist_acknowledged other persist "$result_detail" null null
 write_parser_record ready null none null null null
 collision_event_stream "$TEMP/parser-valid.jsonl" "$parser_root" "$parser_pod" "$parser_pod_uid" "$parser_foreign_uid" "$parser_foreign_rv" >/dev/null
+if ! jq -s -e --arg foreignUid "$parser_foreign_uid" --arg foreignRv "$parser_foreign_rv" 'any(.[]; .event == "watching_blocked_foreign_collision" and (.collision | type == "array") and any(.collision[]; .foreign_uid == $foreignUid and .foreign_resource_version == $foreignRv))' "$WORK/collision-event-stream.tmp" >/dev/null; then
+  echo 'valid JSONL blocked-collision stream was not recognized' >&2
+  exit 1
+fi
 parser_rejects() {
   if (collision_event_stream "$1" "$parser_root" "$parser_pod" "$parser_pod_uid" "$parser_foreign_uid" "$parser_foreign_rv" > /dev/null 2>"$TEMP/parser-error.log"); then
     echo "parser accepted invalid fixture: $1" >&2
@@ -628,6 +632,7 @@ for token in \
   'collision-regression-tests.txt' \
   'raw stale tombstone injection is not deterministic in kind' \
   'grep -c "^running 1 test$"' \
+  'jq -s -e --arg foreignUid "$FOREIGN_UID"' \
   'reducer::tests::blocked_foreign_collision_root_deletion_preempts_through_normal_deletion_boundary' \
   'driver::tests::driver_root_deletion_preempts_blocked_collision_and_jsonl_is_correlated_and_deduped' \
   'adapters::tests::stale_or_unpinned_delete_never_erases_a_replacement' \

@@ -547,7 +547,7 @@ wait_for_blocked_collision() {
     [ "$collision_restarts" = "$COLLISION_RESTART" ] || die 'foreign collision incremented controller restartCount or restarted the controller'
     ctx logs -n "$NAMESPACE" "$COLLISION_POD" -c controller --tail=-1 >"$WORK/foreign-collision-blocked.log" 2>&1 || true
     collision_event_stream "$WORK/foreign-collision-blocked.log" "$ROOT_UID" "$COLLISION_POD" "$COLLISION_POD_UID" "$FOREIGN_UID" "$FOREIGN_RV" >"$WORK/foreign-collision-blocked-events.jsonl" 2>/dev/null || true
-    if jq -e --arg foreignUid "$FOREIGN_UID" --arg foreignRv "$FOREIGN_RV" 'any(.event == "watching_blocked_foreign_collision" and (.collision | type == "array") and any(.collision[]; .foreign_uid == $foreignUid and .foreign_resource_version == $foreignRv))' "$WORK/collision-event-stream.tmp" >/dev/null 2>&1; then
+    if jq -s -e --arg foreignUid "$FOREIGN_UID" --arg foreignRv "$FOREIGN_RV" 'any(.[]; .event == "watching_blocked_foreign_collision" and (.collision | type == "array") and any(.collision[]; .foreign_uid == $foreignUid and .foreign_resource_version == $foreignRv))' "$WORK/collision-event-stream.tmp" >/dev/null 2>&1; then
       return 0
     fi
     [ "$ticks" -lt "$max_ticks" ] || die 'timed out waiting for the blocked foreign collision watch state'
