@@ -2995,7 +2995,14 @@ fn revalidate(
         .apply_transaction
         .clone()
         .ok_or_else(|| ReconcileError::Mutation("revalidation has no transaction".into()))?;
-    let exact_effect_recovery = tx.generation != state.root.generation || state.frozen.is_none();
+    // `FrozenInputV0` is an in-memory observation fence, so a State reload
+    // after a successful result persist legitimately loses it.  That must
+    // not discard a durable result prefix: the fresh completed observation
+    // below can still prove the unchanged graph and each unissued remaining
+    // command.  Before the first recorded result, absence of the fence
+    // remains an exact recovery boundary and cannot authorize a replay.
+    let exact_effect_recovery =
+        tx.generation != state.root.generation || (state.frozen.is_none() && tx.results.is_empty());
     let lifecycle = tx.next_command_lifecycle.state;
     // Missing discriminator values deserialize as LegacyV0. They are never
     // interpreted with the V1 semantic graph/command identity rules: an
@@ -11201,6 +11208,30 @@ mod tests {
                 .sha256,
             ..after_first.state.frozen.clone().unwrap()
         };
+        // A State PATCH acknowledgement can be followed by an actor reload;
+        // its durable journal has the accepted result, but the in-memory
+        // completed-observation fence is intentionally not serialized.  A
+        // fresh fence must advance the remaining unissued intent instead of
+        // discarding the recorded prefix and starting the first effect again.
+        let mut reloaded_after_first = after_first.state.clone();
+        reloaded_after_first.frozen = None;
+        let resumed_after_reload = reduce(
+            reloaded_after_first,
+            EventV0::Revalidated {
+                frozen: child_echo_frozen.clone(),
+                render_input_json: child_echo_input.clone(),
+                render_output_json: output_json.clone(),
+                observed: after_first_observed.clone(),
+            },
+        )
+        .unwrap();
+        let resumed_after_reload =
+            acknowledge_dispatch_authorization(resumed_after_reload, "reload-15");
+        assert!(matches!(
+            resumed_after_reload.commands.as_slice(),
+            [CommandV0::Mutate { commands, .. }]
+                if commands.len() == 1 && commands[0].command_id != command.command_id
+        ));
         let mut changed_output: RenderOutputV0 = serde_json::from_str(&output_json).unwrap();
         changed_output
             .resources
