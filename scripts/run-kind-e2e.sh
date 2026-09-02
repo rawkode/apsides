@@ -468,7 +468,7 @@ collision_event_stream() {
     # Controller logs can contain unrelated structured diagnostics. Preserve
     # them separately, but keep rejecting malformed records that identify as
     # this runtime's collision-observability stream.
-    if printf '%s\n' "$line" | jq -e 'try fromjson catch false | (type == "object" and (.component? != "oxideloop-controller-runtime"))' >/dev/null 2>&1; then
+    if printf '%s\n' "$line" | jq -e '(type == "object" and ((has("component") | not) or .component != "oxideloop-controller-runtime"))' >/dev/null 2>&1; then
       printf '%s\n' "$line" >>"$unrelated_log"
       continue
     fi

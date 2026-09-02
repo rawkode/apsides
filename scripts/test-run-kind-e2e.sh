@@ -111,6 +111,7 @@ parser_rejects() {
 }
 {
   head -1 "$TEMP/parser-valid.jsonl"
+  printf '%s\n' '{"collectedBootstrapFence":true,"error":"delete/finalizer response is ambiguous and requires manual recovery","event":"oxideloop_bootstrap_diagnostic_v1","prewriteGate":"AmbiguousHeld","stage":"root_metadata_patch_or_proof"}'
   printf '%s\n' 'controller stopped: discovery: delete/finalizer response is ambiguous and requires manual recovery'
 } >"$TEMP/parser-controller-stopped.log"
 FAILURE=''
