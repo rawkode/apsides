@@ -3039,12 +3039,19 @@ fn revalidate(
         });
         return Ok(());
     }
+    // Before the first accepted effect, a changed observation baseline must
+    // discard the prepared graph. After a result is durably recorded, however,
+    // that result's own child watch echo naturally creates a new observation
+    // token. Rebuild and compare the fresh graph below: it still invalidates
+    // a changed desired graph or remaining intent, while allowing an
+    // unchanged multi-resource transaction to advance to its next command.
     let non_exact_baseline_mismatch = !exact_effect_recovery
+        && tx.results.is_empty()
         && (!state
             .frozen
             .as_ref()
             .is_some_and(|previous| same_revalidation_stable_baseline(previous, &frozen))
-            || (tx.results.is_empty() && tx.frozen_render_input_hash != frozen.render_input_hash));
+            || tx.frozen_render_input_hash != frozen.render_input_hash);
     if non_exact_baseline_mismatch {
         return safely_invalidate_transaction(state, commands);
     }
@@ -11170,6 +11177,30 @@ mod tests {
             uid: "uid-one".into(),
             resource_version: "30".into(),
         });
+        after_first_observed
+            .iter_mut()
+            .find(|item| item.identity == command.identity)
+            .unwrap()
+            .ordinary_proof = Some(OrdinaryProofV0 {
+            root_uid: after_first.state.root.uid.clone(),
+            uid: "uid-one".into(),
+            resource_version: "30".into(),
+            desired_projection: DesiredProjectionV0::Matches,
+        });
+        // The first object's owned echo advances the retained observation
+        // barrier. Its new render token must not discard this already
+        // recorded result before the unchanged remaining intent is compared.
+        let mut child_echo_input: RenderInputV0 = serde_json::from_str(&input).unwrap();
+        child_echo_input.observation_token = "after-first-child-echo".into();
+        let child_echo_input = serde_json::to_string(&child_echo_input).unwrap();
+        let child_echo_frozen = FrozenInputV0 {
+            observation_token: "after-first-child-echo".into(),
+            final_observation_fence_token: "d".repeat(64),
+            render_input_hash: parse_validate_render_input(&child_echo_input)
+                .unwrap()
+                .sha256,
+            ..after_first.state.frozen.clone().unwrap()
+        };
         let mut changed_output: RenderOutputV0 = serde_json::from_str(&output_json).unwrap();
         changed_output
             .resources
@@ -11180,8 +11211,8 @@ mod tests {
         let invalidated = reduce(
             after_first.state.clone(),
             EventV0::Revalidated {
-                frozen: after_first.state.frozen.clone().unwrap(),
-                render_input_json: input.clone(),
+                frozen: child_echo_frozen.clone(),
+                render_input_json: child_echo_input.clone(),
                 render_output_json: serde_json::to_string(&changed_output).unwrap(),
                 observed: after_first_observed.clone(),
             },
@@ -11206,8 +11237,8 @@ mod tests {
         let second_issued = reduce(
             after_first.state.clone(),
             EventV0::Revalidated {
-                frozen: after_first.state.frozen.clone().unwrap(),
-                render_input_json: input.clone(),
+                frozen: child_echo_frozen,
+                render_input_json: child_echo_input.clone(),
                 render_output_json: output_json.clone(),
                 observed: after_first_observed.clone(),
             },
@@ -11285,7 +11316,7 @@ mod tests {
             after_second.state.clone(),
             EventV0::Revalidated {
                 frozen: after_second.state.frozen.clone().unwrap(),
-                render_input_json: input,
+                render_input_json: child_echo_input,
                 render_output_json: output_json,
                 observed: after_first_observed,
             },
