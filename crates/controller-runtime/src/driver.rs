@@ -18,7 +18,7 @@ use oxideloop_bundle_archive::install_archive;
 use oxideloop_bundle_contract::{BundleDescriptorV0, BundleStore, MAX_BUNDLE_BYTES};
 #[cfg(feature = "test-failpoints")]
 use oxideloop_controller_api::PersistPurpose;
-use oxideloop_controller_api::{ObjectIdentity, ProgramBundleReference};
+use oxideloop_controller_api::{ObjectIdentity, PersistPurpose, ProgramBundleReference};
 use oxideloop_controller_core::{
     ActionTriggerV0, CommandV0, EventV0, MachineStateV0, PhaseV0, PreconditionsV0,
     automation_source_transition_token, retired_state_delete_command_token,
@@ -2071,6 +2071,18 @@ async fn collect_kubernetes_command_while_observing_inner<R>(
     operation: OperationSessionV0,
     root_witness: Option<PrewriteRootWitnessV0>,
 ) -> Result<(KubernetesEffectCompletionV0, BufferedCommandWatchesV0), RuntimeErrorV0> {
+    // A mutation result is already an exact reducer acceptance.  A retained
+    // child transition can invalidate the next desired graph, but it cannot
+    // invalidate the still-unpersisted acceptance without losing the only
+    // durable record of that acknowledged Kubernetes write.  Keep that child
+    // transition buffered until the result PATCH is acknowledged; root
+    // authentication and the State PATCH's own UID/RV preconditions remain
+    // pre-write authority for this command.
+    let defer_retained_change_until_result_persisted = matches!(
+        command,
+        CommandV0::Persist { operation, .. }
+            if operation.purpose == PersistPurpose::MutationResult
+    );
     let mut effect: OwnedCommandFutureV0<'_> =
         Box::pin(dispatch_owned_command_until_event_with_operation(
             transport,
@@ -2331,12 +2343,16 @@ async fn collect_kubernetes_command_while_observing_inner<R>(
                 match dependency {
                     Ok(record) => {
                         buffered.dependency = Some(record);
-                        invalidate_prewrite_gate(Some(&operation));
+                        if !defer_retained_change_until_result_persisted {
+                            invalidate_prewrite_gate(Some(&operation));
+                        }
                     }
                     Err(error) => {
                         buffered.dependency_faulted = true;
                         buffered.fault.get_or_insert_with(|| format!("dependency watch failed: {error}"));
-                        invalidate_prewrite_gate(Some(&operation));
+                        if !defer_retained_change_until_result_persisted {
+                            invalidate_prewrite_gate(Some(&operation));
+                        }
                     }
                 }
             }
@@ -7291,6 +7307,139 @@ mod tests {
             Some(BufferedAutomationWatchV0::Changed(ref run)) if run.resource_version() == "32"
         ));
         assert!(buffered.prewrite_invalidated.is_some());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn ready_child_watch_does_not_preempt_an_accepted_mutation_result_persist() {
+        // This is the live ordering from kind: an owned child Apply has
+        // already acknowledged into `MutationResult`, then its retained
+        // desired/inventory watch is ready before the State PATCH gets its
+        // first poll. The accepted result must reach durable State before
+        // that authenticated child change is reduced.
+        let (actor, _) = prewrite_status_actor();
+        let root = actor.state().root().clone();
+        let operation = oxideloop_controller_api::PersistOperation {
+            token: "c".repeat(64),
+            purpose: PersistPurpose::MutationResult,
+            phase: oxideloop_controller_api::DurablePhase::MutationResult,
+            old_state_resource_version: root.state_resource_version.clone(),
+            root_generation: root.generation,
+        };
+        let mut state = actor.state().journal().clone();
+        state.state.pending_persist = Some(operation.clone());
+        let command = CommandV0::Persist {
+            state: state.clone(),
+            preconditions: PreconditionsV0 {
+                root_uid: root.uid.clone(),
+                root_generation: root.generation,
+                root_resource_version: root.root_resource_version.clone(),
+                state_uid: root.state_uid.clone(),
+                state_resource_version: root.state_resource_version.clone(),
+                observation_token: "accepted-mutation-result".into(),
+                cache_epoch: actor.barrier().cache_epoch.to_string(),
+            },
+            operation: operation.clone(),
+        };
+        let initial_root =
+            prewrite_wire_root(&actor, &root.status, &root.root_resource_version, None);
+        let mut initial_state = prewrite_wire_state(&actor, &root.state_resource_version);
+        initial_state["spec"] = serde_json::to_value(&state).expect("result state serializes");
+        let (dependency_sender, dependency_watch) = WatchHandleV0::test_channel(1);
+        let retained = crate::ObservationBarrierV0 {
+            generation: actor.barrier(),
+            dependencies: vec![Dependency::Collection {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: "ns".into(),
+                selector: String::new(),
+                collection_revision: "collection-rv".into(),
+                observation_token: "child-watch".into(),
+            }],
+            collections: BTreeMap::new(),
+            objects: vec![],
+            watches: vec![dependency_watch],
+        };
+        let mut fixed_point = Some(KubeFixedPointPortV0::<()>::retained_for_test(
+            actor.barrier(),
+            retained,
+        ));
+        dependency_sender
+            .try_send(Ok(WatchEventV0::Modified(dependency_event("child-rv-2"))))
+            .expect("child watch is ready before the persistence poll");
+        let (_root_sender, mut root_watch) = WatchHandleV0::test_channel(1);
+        let writes = Arc::new(AtomicUsize::new(0));
+        let state_name = root.state_name.clone();
+        let state_uid = root.state_uid.clone();
+        let service = service_fn({
+            let writes = Arc::clone(&writes);
+            move |request: Request<Body>| {
+                let writes = Arc::clone(&writes);
+                let initial_root = initial_root.clone();
+                let initial_state = initial_state.clone();
+                let state_name = state_name.clone();
+                let state_uid = state_uid.clone();
+                async move {
+                    let method = request.method().clone();
+                    let path = request.uri().path().to_owned();
+                    if method == http::Method::GET && path.ends_with("/webapplications/root") {
+                        Ok::<_, Infallible>(wire_json(initial_root))
+                    } else if method == http::Method::GET
+                        && path.ends_with(&format!("/oxideloopstates/{state_name}"))
+                    {
+                        Ok(wire_json(initial_state))
+                    } else if method == http::Method::PATCH
+                        && path.ends_with(&format!("/oxideloopstates/{state_name}"))
+                    {
+                        let body = request
+                            .into_body()
+                            .collect()
+                            .await
+                            .expect("result-persist body");
+                        let mut body: serde_json::Value =
+                            serde_json::from_slice(&body.to_bytes()).expect("result-persist JSON");
+                        assert_eq!(
+                            body.pointer("/spec/state/pendingPersist/purpose"),
+                            Some(&json!("MutationResult"))
+                        );
+                        body["metadata"]["uid"] = json!(state_uid);
+                        body["metadata"]["resourceVersion"] = json!("state-rv-after-result");
+                        writes.fetch_add(1, Ordering::SeqCst);
+                        Ok(wire_json(body))
+                    } else {
+                        panic!("unexpected accepted-result request {method} {path}");
+                    }
+                }
+            }
+        });
+        let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
+        let address = root_address(&actor).expect("root address");
+        let mut automation_watch = None;
+        let operation_session = transport.begin_collected_operation_session();
+        let (completion, buffered) = collect_kubernetes_command_while_observing(
+            &transport,
+            &address,
+            &command,
+            &mut root_watch,
+            &mut fixed_point,
+            &mut automation_watch,
+            "root",
+            operation_session.clone(),
+            Some(actor.prewrite_root_witness()),
+        )
+        .await
+        .expect("accepted result persists despite ready child watch");
+        assert!(matches!(
+            completion,
+            KubernetesEffectCompletionV0::Acknowledged(event)
+                if matches!(*event, Some(EventV0::Persisted { ref token, .. }) if token == &operation.token)
+        ));
+        assert!(matches!(
+            buffered.dependency,
+            Some(BufferedRetainedWatchV0::Change { .. })
+        ));
+        assert!(buffered.prewrite_invalidated.is_none());
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
