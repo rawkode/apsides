@@ -2822,6 +2822,93 @@ async fn stale_delete_target_is_non_mutating_and_not_response_loss_recovery() {
 }
 
 #[tokio::test]
+async fn managed_owner_and_root_near_misses_are_correlated_no_write_events() {
+    let address = RootAddressV0 {
+        namespace: "tenant-a".into(),
+        name: "app-a".into(),
+        state_name: "state-a".into(),
+    };
+    let (_, _, child) = force_fence_objects();
+    for target in [
+        {
+            let mut target = child.clone();
+            target["metadata"]["ownerReferences"][0]["uid"] = json!("other-root");
+            target
+        },
+        {
+            let mut target = child.clone();
+            target["metadata"]["annotations"][ROOT_UID_ANNOTATION] = json!("other-root");
+            target
+        },
+    ] {
+        let (transport, api) = ScriptedApi::transport(force_fence_script(target));
+        let outcome = transport
+            .dispatch(
+                &address,
+                &conditional_apply_command(
+                    Some(oxideloop_mutation_model::ObjectIdentity {
+                        uid: "child-uid".into(),
+                        resource_version: "7".into(),
+                    }),
+                    "application/apply-patch+yaml",
+                    "oxideloop-controller",
+                    true,
+                ),
+            )
+            .await
+            .expect("pre-write mismatch is an event");
+        assert!(matches!(outcome, super::CommandOutcomeV0::Event(event)
+            if matches!(event.as_ref(), oxideloop_controller_core::EventV0::MutationNotIssued {
+                transaction_id, attempt_token, command_id, ..
+            } if transaction_id == "tx" && attempt_token == &"a".repeat(64) && *command_id == "c".repeat(64))));
+        api.assert_drained();
+    }
+
+    for mutate in [
+        |target: &mut Value| target["metadata"]["ownerReferences"][0]["uid"] = json!("other-root"),
+        |target: &mut Value| {
+            target["metadata"]["annotations"][ROOT_UID_ANNOTATION] = json!("other-root");
+        },
+    ] {
+        let mut script = delete_fence_script(
+            ResourceKindV0::ConfigMap,
+            "cm-a",
+            "prepared-uid",
+            "prepared-rv",
+            false,
+        );
+        let mut target = object_json(
+            ResourceKindV0::ConfigMap,
+            "cm-a",
+            "prepared-uid",
+            "prepared-rv",
+        );
+        target["metadata"]["annotations"] = json!({ROOT_UID_ANNOTATION:"root-uid"});
+        target["metadata"]["ownerReferences"] = json!([{"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication","name":"app-a","uid":"root-uid","controller":true,"blockOwnerDeletion":false}]);
+        mutate(&mut target);
+        script[2].response = response(target);
+        let (transport, api) = ScriptedApi::transport(script);
+        let outcome = transport
+            .dispatch(
+                &address,
+                &delete_command(
+                    ResourceKindV0::ConfigMap,
+                    "cm-a",
+                    "prepared-uid",
+                    "prepared-rv",
+                ),
+            )
+            .await
+            .expect("pre-write mismatch event");
+        assert!(matches!(outcome, super::CommandOutcomeV0::Event(event)
+            if matches!(event.as_ref(), oxideloop_controller_core::EventV0::MutationNotIssued {
+                transaction_id, attempt_token, command_id, ..
+            } if transaction_id == "tx" && attempt_token == &"a".repeat(64) && *command_id == "c".repeat(64))));
+        api.assert_drained();
+    }
+}
+
+#[tokio::test]
 async fn root_only_verify_uses_receipt_state_identity_and_empty_state_rv() {
     let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
     let token =

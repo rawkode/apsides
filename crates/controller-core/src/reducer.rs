@@ -10241,6 +10241,63 @@ mod tests {
             CommandV0::Mutate { .. } | CommandV0::RequestRender { .. }
         )));
 
+        // A crash before Invalidate is durable leaves the old authorized
+        // may-have-issued journal intact. Recovery may only re-establish
+        // observation authority; it must not replay the child mutation.
+        let pre_invalidation = MachineStateV0::recover_json(
+            &serde_json::to_string(&fixture.issued).expect("serialize issued state"),
+        )
+        .expect("recover issued state");
+        let recovered = reduce(pre_invalidation, EventV0::Start).unwrap();
+        assert!(matches!(
+            recovered.commands.as_slice(),
+            [CommandV0::RequestDescriptor { .. }]
+        ));
+        assert!(
+            !recovered
+                .commands
+                .iter()
+                .any(|command| matches!(command, CommandV0::Mutate { .. }))
+        );
+
+        let operation = match &exact.commands[0] {
+            CommandV0::Persist { operation, .. } => operation.clone(),
+            command => panic!("Invalidate must persist, got {command:?}"),
+        };
+        let invalidated = reduce(
+            exact.state,
+            EventV0::Persisted {
+                token: operation.token,
+                old_state_resource_version: operation.old_state_resource_version,
+                new_state_resource_version: "after-invalidate".into(),
+                state_uid: "state-uid".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            invalidated.commands.as_slice(),
+            [CommandV0::RequestDescriptor { .. }]
+        ));
+        assert!(invalidated.state.journal.state.apply_transaction.is_none());
+        // The same invariant survives a process recreation after the durable
+        // invalidation acknowledgement: descriptor then a fresh observation,
+        // never an old command replay.
+        let reloaded = MachineStateV0::recover_json(
+            &serde_json::to_string(&invalidated.state).expect("serialize invalidated state"),
+        )
+        .expect("recover invalidated state");
+        let restarted = reduce(reloaded, EventV0::Start).unwrap();
+        assert!(matches!(
+            restarted.commands.as_slice(),
+            [CommandV0::RequestDescriptor { .. }]
+        ));
+        assert!(
+            !restarted
+                .commands
+                .iter()
+                .any(|command| matches!(command, CommandV0::Mutate { .. }))
+        );
+
         for event in [
             EventV0::MutationNotIssued {
                 transaction_id: "wrong".into(),

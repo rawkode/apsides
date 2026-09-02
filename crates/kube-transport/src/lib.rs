@@ -10841,7 +10841,7 @@ fn fields_cover_value(
     }
 }
 
-/// `{}` in FieldsV1 owns an atomic value, not every descendant of a map or
+/// `{}` in `FieldsV1` owns an atomic value, not every descendant of a map or
 /// associative-list member. For an atomic object we must compare the whole
 /// value so an owned selector/member cannot silently retain removed fields.
 fn owned_atomic_object_diff(
@@ -11260,7 +11260,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use tower::service_fn;
 
-    /// Produces a captured-style FieldsV1 shape for the sealed test object:
+    /// Produces a captured-style `FieldsV1` shape for the sealed test object:
     /// maps recurse by `f:` fields and supported associative lists use `k:`
     /// members plus `.` membership. Identity is intentionally absent because
     /// Kubernetes does not normally attribute it to an Apply manager.
@@ -11276,7 +11276,7 @@ mod tests {
                             Value::Object(_) | Value::Array(_) => fields_v1_for(value, &next),
                             _ => json!({}),
                         };
-                        if path == "" && key == "metadata" && child == json!({}) {
+                        if path.is_empty() && key == "metadata" && child == json!({}) {
                             None
                         } else {
                             Some((format!("f:{key}"), child))
@@ -15479,6 +15479,46 @@ mod tests {
             "manager":CONTROLLER_FIELD_MANAGER, "operation":"Apply", "fieldsType":"FieldsV1", "apiVersion":"apps/v1",
             "fieldsV1":fields_v1_for(&observed, "")
         }]);
+        assert!(!same_desired_semantics(&observed, &desired));
+    }
+
+    #[test]
+    fn captured_deployment_fields_require_our_owned_child_not_a_co_writer() {
+        let desired = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"web","namespace":"demo","labels":{"app":"web"}},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"web"}},"template":{"metadata":{"labels":{"app":"web"}},"spec":{"containers":[{"name":"web","image":"example/web","env":[{"name":"MESSAGE","value":"hello"}],"ports":[{"name":"http","containerPort":8080}]}]}}}});
+        let fields: Value = serde_json::from_str(r#"
+        {
+          "f:metadata": {"f:labels": {"f:app": {}}},
+          "f:spec": {
+            "f:replicas": {}, "f:selector": {},
+            "f:template": {
+              "f:metadata": {"f:labels": {"f:app": {}}},
+              "f:spec": {"f:containers": {
+                "k:{\"name\":\"web\"}": {
+                  ".": {}, "f:image": {}, "f:name": {},
+                  "f:env": {"k:{\"name\":\"MESSAGE\"}": {".": {}, "f:name": {}, "f:value": {}}},
+                  "f:ports": {"k:{\"containerPort\":8080,\"protocol\":\"TCP\"}": {".": {}, "f:containerPort": {}, "f:name": {}}}
+                }
+              }}
+            }
+          }
+        }
+        "#).expect("captured fields JSON");
+        let mut observed = desired.clone();
+        observed["metadata"]["managedFields"] = json!([{"manager":CONTROLLER_FIELD_MANAGER,"operation":"Apply","fieldsType":"FieldsV1","apiVersion":"apps/v1","fieldsV1":fields.clone()}]);
+        assert!(same_desired_semantics(&observed, &desired));
+        // A matching value claimed only by another manager cannot establish
+        // our projection equality after our leaf ownership disappears.
+        let mut ours = fields;
+        ours["f:spec"]["f:template"]["f:spec"]["f:containers"]["k:{\"name\":\"web\"}"]["f:image"] =
+            Value::Null;
+        ours["f:spec"]["f:template"]["f:spec"]["f:containers"]["k:{\"name\":\"web\"}"]
+            .as_object_mut()
+            .unwrap()
+            .remove("f:image");
+        observed["metadata"]["managedFields"] = json!([
+            {"manager":CONTROLLER_FIELD_MANAGER,"operation":"Apply","fieldsType":"FieldsV1","apiVersion":"apps/v1","fieldsV1":ours},
+            {"manager":"co-writer","operation":"Apply","fieldsType":"FieldsV1","apiVersion":"apps/v1","fieldsV1":{"f:spec":{"f:template":{"f:spec":{"f:containers":{"k:{\"name\":\"web\"}":{"f:image":{}}}}}}}}
+        ]);
         assert!(!same_desired_semantics(&observed, &desired));
     }
 
