@@ -698,7 +698,7 @@ impl BootstrapFenceStateV0 {
             if phase == BootstrapRootPhaseV0::RootStateLink {
                 match event {
                     WatchEventV0::Modified(observed)
-                        if final_response_matches(&observed, response) =>
+                        if bootstrap_response_matches(&observed, response) =>
                     {
                         self.final_echo_consumed = true;
                         continue;
@@ -706,7 +706,9 @@ impl BootstrapFenceStateV0 {
                     WatchEventV0::Modified(observed)
                         if !self.metadata_echo_consumed
                             && !self.final_echo_consumed
-                            && self.metadata_echo.as_ref() == Some(&observed) =>
+                            && self.metadata_echo.as_ref().is_some_and(|response| {
+                                bootstrap_response_matches(&observed, response)
+                            }) =>
                     {
                         self.metadata_echo_consumed = true;
                         continue;
@@ -725,7 +727,9 @@ impl BootstrapFenceStateV0 {
                 WatchEventV0::Bookmark { .. } => {}
                 WatchEventV0::Modified(observed)
                     if !self.metadata_echo_consumed
-                        && self.metadata_echo.as_ref() == Some(&observed) =>
+                        && self.metadata_echo.as_ref().is_some_and(|response| {
+                            bootstrap_response_matches(&observed, response)
+                        }) =>
                 {
                     self.metadata_echo_consumed = true;
                 }
@@ -768,17 +772,21 @@ fn complete_bootstrap_first_poll(
     notify_bootstrap_fence(wake);
 }
 
-/// The final acknowledgement is deliberately stronger than a shaped root
-/// snapshot comparison.  The watch must carry the exact raw object returned by
-/// the final State-link PATCH, including its UID and resourceVersion.  This
-/// makes an independently generated root update (even one with equivalent
-/// `StateLink` fields) a terminal observation instead of an acknowledgement.
-fn final_response_matches(observed: &ObjectV0, response: &ObjectV0) -> bool {
+/// A bootstrap echo is deliberately stronger than a shaped root snapshot
+/// comparison. Its raw UID/resourceVersion and every authority-bearing field
+/// must match the write response. Kubernetes owns only `managedFields`, whose
+/// watch serialization can differ from the PATCH response without changing
+/// the stored object or granting a concurrent writer any authority.
+fn bootstrap_response_matches(observed: &ObjectV0, response: &ObjectV0) -> bool {
     !response.metadata.uid.is_empty()
         && !response.metadata.resource_version.is_empty()
+        && observed.reference == response.reference
         && observed.metadata.uid == response.metadata.uid
         && observed.metadata.resource_version == response.metadata.resource_version
-        && observed == response
+        && raw_metadata_pins_match(observed)
+        && raw_metadata_pins_match(response)
+        && bootstrap_response_projection(&observed.value)
+            == bootstrap_response_projection(&response.value)
 }
 
 /// An operation-owned bootstrap watch is an exact-name capability.  Keep the
@@ -1732,7 +1740,7 @@ impl OperationSessionV0 {
                             if self.gate.state() == PrewriteGateStateV0::FinalProofPending {
                                 if matches!(event, WatchEventV0::Modified(_))
                                     && fence.final_echo.as_ref().is_some_and(|final_echo| {
-                                        final_response_matches(observed, final_echo)
+                                        bootstrap_response_matches(observed, final_echo)
                                     })
                                 {
                                     fence.final_echo_consumed = true;
@@ -1741,7 +1749,9 @@ impl OperationSessionV0 {
                                 } else if matches!(event, WatchEventV0::Modified(_))
                                     && !fence.metadata_echo_consumed
                                     && !fence.final_echo_consumed
-                                    && fence.metadata_echo.as_ref() == Some(observed)
+                                    && fence.metadata_echo.as_ref().is_some_and(|response| {
+                                        bootstrap_response_matches(observed, response)
+                                    })
                                 {
                                     fence.metadata_echo_consumed = true;
                                     notify_fence = true;
@@ -1761,7 +1771,9 @@ impl OperationSessionV0 {
                                 true
                             } else if matches!(event, WatchEventV0::Modified(_))
                                 && !fence.metadata_echo_consumed
-                                && fence.metadata_echo.as_ref() == Some(observed)
+                                && fence.metadata_echo.as_ref().is_some_and(|response| {
+                                    bootstrap_response_matches(observed, response)
+                                })
                             {
                                 fence.metadata_echo_consumed = true;
                                 notify_fence = true;
@@ -2339,7 +2351,7 @@ impl OperationSessionV0 {
                     || !fence
                         .final_echo
                         .as_ref()
-                        .is_some_and(|response| final_response_matches(&root, response))
+                        .is_some_and(|response| bootstrap_response_matches(&root, response))
                     || fence.committed != watermark
                     || fence.enqueued != watermark
                     || fence.consumed != watermark
@@ -2487,7 +2499,10 @@ impl OperationSessionV0 {
                 .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
             if fence.terminal.is_some()
                 || fence.disarmed
-                || fence.metadata_echo.as_ref() != Some(root)
+                || !fence
+                    .metadata_echo
+                    .as_ref()
+                    .is_some_and(|response| bootstrap_response_matches(root, response))
             {
                 return Err(TransportErrorV0::Stale("bootstrap root metadata response"));
             }
@@ -2507,7 +2522,8 @@ impl OperationSessionV0 {
         }
         let exact = authority.exact_owned_root_echo.as_ref();
         if exact.is_some_and(|echo| {
-            echo.phase == BootstrapRootPhaseV0::RootStateLink && echo.response == *root
+            echo.phase == BootstrapRootPhaseV0::RootStateLink
+                && bootstrap_response_matches(root, &echo.response)
         }) {
             Ok(())
         } else {
@@ -11707,7 +11723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_proof_accepts_only_the_exact_echo_between_response_and_rereads() {
+    async fn final_proof_accepts_the_final_watch_echo_after_server_owned_metadata_reshaping() {
         let (session, address, command, initial_root) = sealed_test_collected_bootstrap();
         let (final_root, final_state) = final_proof_fixture(&initial_root);
         let transport = final_proof_transport(final_root.clone(), final_state.clone());
@@ -11725,10 +11741,39 @@ mod tests {
         )
         .await;
 
+        // The API server may serialize `managedFields` differently in the
+        // delayed watch event than in the PATCH response. This is the live
+        // response-before-watch ordering: UID/RV and every authority-bearing
+        // field remain exact, while server-owned bookkeeping is reshaped.
+        let mut watch_echo = final_root.clone();
+        watch_echo.value["metadata"]["managedFields"] = json!([{
+            "manager":"watch-cache",
+            "operation":"Update",
+            "apiVersion":"demo.oxideloop.dev/v1alpha1",
+            "fieldsType":"FieldsV1",
+            "fieldsV1":{"f:status":{"f:state":{}}},
+        }]);
+        assert!(bootstrap_response_matches(&watch_echo, &final_root));
+        for changed_field in ["resourceVersion", "status", "spec"] {
+            let mut forged = watch_echo.clone();
+            match changed_field {
+                "resourceVersion" => {
+                    forged.metadata.resource_version = "forged-rv".into();
+                    forged.value["metadata"]["resourceVersion"] = json!("forged-rv");
+                }
+                "status" => forged.value["status"]["state"]["uid"] = json!("forged-state"),
+                "spec" => forged.value["spec"]["image"] = json!("foreign.invalid/app:latest"),
+                _ => unreachable!("test mutations are exhaustive"),
+            }
+            assert!(
+                !bootstrap_response_matches(&forged, &final_root),
+                "{changed_field} remains acknowledgement-critical"
+            );
+        }
         source
-            .send(Ok(WatchEventV0::Modified(final_root.clone())))
+            .send(Ok(WatchEventV0::Modified(watch_echo)))
             .await
-            .expect("exact final echo fits the source");
+            .expect("server-shaped final echo fits the source");
         let event = tokio::time::timeout(Duration::from_millis(100), watch.next_event())
             .await
             .expect("pump forwards final echo")
@@ -11743,7 +11788,7 @@ mod tests {
                 "bootstrap-token",
             )
             .await
-            .expect("exact echo plus exact rereads prove final acknowledgement");
+            .expect("server-owned watch reshaping plus exact rereads proves final acknowledgement");
         assert_eq!(root, final_root);
         assert_eq!(state, final_state);
         assert_eq!(session.prewrite_gate().state(), PrewriteGateStateV0::Proven);
