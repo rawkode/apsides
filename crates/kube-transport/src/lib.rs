@@ -734,10 +734,9 @@ impl BootstrapFenceStateV0 {
                     self.metadata_echo_consumed = true;
                 }
                 WatchEventV0::Added(observed) | WatchEventV0::Modified(observed)
-                    if self
-                        .baseline
-                        .as_ref()
-                        .is_some_and(|baseline| baseline.root == observed) => {}
+                    if self.baseline.as_ref().is_some_and(|baseline| {
+                        bootstrap_response_matches(&observed, &baseline.root)
+                    }) => {}
                 WatchEventV0::Added(_) | WatchEventV0::Modified(_) | WatchEventV0::Deleted(_) => {
                     self.terminal
                         .get_or_insert(TransportErrorV0::PreWriteInvalidated);
@@ -1563,10 +1562,9 @@ impl OperationSessionV0 {
             };
             match event {
                 WatchEventV0::Added(observed) | WatchEventV0::Modified(observed)
-                    if fence
-                        .baseline
-                        .as_ref()
-                        .is_some_and(|baseline| observed == baseline.root) => {}
+                    if fence.baseline.as_ref().is_some_and(|baseline| {
+                        bootstrap_response_matches(&observed, &baseline.root)
+                    }) => {}
                 // Bookmarks never become bootstrap authority.  The retained
                 // named watch has bookmarks disabled, but tolerate an injected
                 // one as a no-op rather than promoting it into a freshness
@@ -1778,11 +1776,9 @@ impl OperationSessionV0 {
                                 fence.metadata_echo_consumed = true;
                                 notify_fence = true;
                                 true
-                            } else if fence
-                                .baseline
-                                .as_ref()
-                                .is_some_and(|baseline| baseline.root == *observed)
-                            {
+                            } else if fence.baseline.as_ref().is_some_and(|baseline| {
+                                bootstrap_response_matches(observed, &baseline.root)
+                            }) {
                                 notify_fence = true;
                                 true
                             } else if self.gate.state() == PrewriteGateStateV0::WritePolled {
@@ -11443,6 +11439,163 @@ mod tests {
             .complete_bootstrap_subwrite(permit, BootstrapRootPhaseV0::RootMetadata, &metadata_echo)
             .expect("the queued exact metadata echo is consumed after response publication");
         metadata_echo
+    }
+
+    #[test]
+    fn delayed_server_shaped_baseline_echoes_do_not_make_root_metadata_ambiguous() {
+        let mut session = test_session(
+            Duration::from_millis(5),
+            Duration::from_millis(30),
+            Duration::from_millis(40),
+            Duration::from_millis(50),
+            3,
+        );
+        let root = bootstrap_authority_root("1");
+        arm_test_collected_bootstrap(&mut session, &root);
+        {
+            let mut authority = session.bootstrap.lock().expect("bootstrap authority lock");
+            authority.phase = Some(BootstrapAuthorityPhaseV0::Active(
+                BootstrapRootPhaseV0::RootMetadata,
+            ));
+        }
+        let permit = claim_first_write(&session).expect("metadata write polls once");
+
+        // Kubernetes may deliver the list/RV's initial Added or Modified
+        // after the PATCH has polled, with only server-owned managedFields
+        // reshaped. Both remain the same sealed baseline and are idempotent.
+        for (event_kind, manager) in [("added", "watch-cache-a"), ("modified", "watch-cache-b")] {
+            let mut delayed_baseline = root.clone();
+            delayed_baseline.value["metadata"]["managedFields"] = json!([{
+                "manager": manager,
+                "operation":"Update",
+                "apiVersion":"demo.oxideloop.dev/v1alpha1",
+                "fieldsType":"FieldsV1",
+                "fieldsV1":{"f:metadata":{}},
+            }]);
+            let event = if event_kind == "added" {
+                WatchEventV0::Added(delayed_baseline)
+            } else {
+                WatchEventV0::Modified(delayed_baseline)
+            };
+            assert!(
+                session.observe_bootstrap_root_watch(&event),
+                "the delayed {event_kind} baseline echo is idempotent"
+            );
+        }
+
+        let mut metadata_response = root.clone();
+        metadata_response.metadata.resource_version = "root-metadata-rv".into();
+        metadata_response.value["metadata"]["resourceVersion"] = json!("root-metadata-rv");
+        metadata_response.value["metadata"]["managedFields"] = json!([{
+            "manager":"oxideloop-controller",
+            "operation":"Update",
+            "apiVersion":"demo.oxideloop.dev/v1alpha1",
+            "fieldsType":"FieldsV1",
+            "fieldsV1":{"f:metadata":{"f:annotations":{},"f:finalizers":{}}},
+        }]);
+        let mut metadata_watch_echo = metadata_response.clone();
+        metadata_watch_echo.value["metadata"]["managedFields"] = json!([{
+            "manager":"watch-cache",
+            "operation":"Update",
+            "apiVersion":"demo.oxideloop.dev/v1alpha1",
+            "fieldsType":"FieldsV1",
+            "fieldsV1":{"f:metadata":{"f:annotations":{},"f:finalizers":{}}},
+        }]);
+        assert!(
+            session.observe_bootstrap_root_watch(&WatchEventV0::Modified(metadata_watch_echo)),
+            "the in-flight metadata echo is sequenced until its response arrives"
+        );
+        session
+            .complete_bootstrap_subwrite(
+                permit,
+                BootstrapRootPhaseV0::RootMetadata,
+                &metadata_response,
+            )
+            .expect("baseline and matching metadata echo prove the metadata write");
+        let fence = session
+            .bootstrap_fence
+            .lock()
+            .expect("fence remains usable");
+        assert!(fence.metadata_echo_consumed);
+        assert!(fence.terminal.is_none());
+        assert_eq!(
+            session.gate.state(),
+            PrewriteGateStateV0::BootstrapPhasePending
+        );
+    }
+
+    #[test]
+    fn server_shaped_baseline_echoes_reject_authority_bearing_drift() {
+        for changed_field in [
+            "resourceVersion",
+            "spec",
+            "status",
+            "annotation",
+            "finalizer",
+        ] {
+            let mut session = test_session(
+                Duration::from_millis(5),
+                Duration::from_millis(30),
+                Duration::from_millis(40),
+                Duration::from_millis(50),
+                3,
+            );
+            let root = bootstrap_authority_root("1");
+            arm_test_collected_bootstrap(&mut session, &root);
+            {
+                let mut authority = session.bootstrap.lock().expect("bootstrap authority lock");
+                authority.phase = Some(BootstrapAuthorityPhaseV0::Active(
+                    BootstrapRootPhaseV0::RootMetadata,
+                ));
+            }
+            let permit = claim_first_write(&session).expect("metadata write polls once");
+            let mut drifted = root.clone();
+            drifted.value["metadata"]["managedFields"] = json!([{"manager":"watch-cache"}]);
+            match changed_field {
+                "resourceVersion" => {
+                    drifted.metadata.resource_version = "forged-rv".into();
+                    drifted.value["metadata"]["resourceVersion"] = json!("forged-rv");
+                }
+                "spec" => drifted.value["spec"]["image"] = json!("foreign.invalid/app:latest"),
+                "status" => drifted.value["status"]["observedGeneration"] = json!(1),
+                "annotation" => {
+                    drifted
+                        .metadata
+                        .annotations
+                        .insert("foreign".into(), "changed".into());
+                    drifted.value["metadata"]["annotations"]["foreign"] = json!("changed");
+                }
+                "finalizer" => {
+                    drifted.value["metadata"]["finalizers"] = json!([ROOT_FINALIZER, "foreign"]);
+                }
+                _ => unreachable!("test mutations are exhaustive"),
+            }
+            assert!(
+                session.observe_bootstrap_root_watch(&WatchEventV0::Modified(drifted)),
+                "{changed_field} drift remains sequenced until the polled response classifies it"
+            );
+            let mut metadata_response = root.clone();
+            metadata_response.metadata.resource_version = "root-metadata-rv".into();
+            metadata_response.value["metadata"]["resourceVersion"] = json!("root-metadata-rv");
+            assert!(matches!(
+                session.complete_bootstrap_subwrite(
+                    permit,
+                    BootstrapRootPhaseV0::RootMetadata,
+                    &metadata_response,
+                ),
+                Err(TransportErrorV0::ManualRecoveryHold)
+            ));
+            assert_eq!(
+                session.prewrite_gate().state(),
+                PrewriteGateStateV0::AmbiguousHeld,
+                "{changed_field} cannot reopen the phase gate after an ambiguous response"
+            );
+            assert_eq!(
+                session.bootstrap_fence_terminal(),
+                Some(TransportErrorV0::PreWriteInvalidated),
+                "{changed_field} drift stays terminal while the write is polled"
+            );
+        }
     }
 
     #[test]
