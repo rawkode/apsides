@@ -3545,6 +3545,17 @@ fn recovered_observation_projection(
                             (None, None) => Observation::Absent,
                             _ => return item,
                         };
+                    // `planning_observed` is deliberately projected back to
+                    // the prepared UID/RV while the original observation is
+                    // retained for recovery-result proof. Keep its ordinary
+                    // ownership witness on that same planning fence; leaving
+                    // it at the live returned RV makes `plan_graph` lose
+                    // ordinary proof and recast this exact Apply as Create.
+                    if let Some(proof) = item.ordinary_proof.as_mut() {
+                        proof.uid = intent.expected_uid.clone().unwrap_or_default();
+                        proof.resource_version =
+                            intent.expected_resource_version.clone().unwrap_or_default();
+                    }
                 }
                 (ApplyOperation::Delete, Observation::Absent)
                     if deletion_recovery_matches(state, tx, intent, &item) =>
@@ -3720,6 +3731,27 @@ fn ordinary_proof_matches(
             && !proof.uid.is_empty()
             && !proof.resource_version.is_empty())
         .then_some(proof.desired_projection)
+    })
+}
+
+fn prepared_apply_still_current(
+    state: &MachineStateV0,
+    identity: &ObjectIdentity,
+    actual: &MutationIdentity,
+) -> bool {
+    let Some(tx) = state.journal.state.apply_transaction.as_ref() else {
+        return false;
+    };
+    if tx.next_command_lifecycle.state
+        != NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued
+    {
+        return false;
+    }
+    next_unrecorded_intent(tx).is_some_and(|intent| {
+        intent.operation == ApplyOperation::Apply
+            && intent.identity == *identity
+            && intent.expected_uid.as_deref() == Some(actual.uid.as_str())
+            && intent.expected_resource_version.as_deref() == Some(actual.resource_version.as_str())
     })
 }
 
@@ -5239,8 +5271,24 @@ fn plan_graph(
                     if actual.uid == known.uid
                         && projection == Some(DesiredProjectionV0::Matches) =>
                 {
-                    inventory_refreshes.push((identity.clone(), actual.resource_version.clone()));
-                    continue;
+                    // A restarted dispatch may revalidate before its first
+                    // request reached Kubernetes. Keep that exact prepared
+                    // SSA intent in the graph when its original UID/RV fence
+                    // is still current; otherwise `remaining_effects` would
+                    // see a harmless projection match as a missing intent and
+                    // hold instead of completing the durable recovery path.
+                    if prepared_apply_still_current(state, &identity, actual) {
+                        MutationIntent::Apply {
+                            observation: observed.observation.clone(),
+                            expected: actual.clone(),
+                            field_manager: "oxideloop-controller".into(),
+                            object: resource.object.clone(),
+                        }
+                    } else {
+                        inventory_refreshes
+                            .push((identity.clone(), actual.resource_version.clone()));
+                        continue;
+                    }
                 }
                 (Observation::Existing { identity: actual }, Some(known))
                     if actual.uid == known.uid
@@ -10375,6 +10423,58 @@ mod tests {
                     | CommandV0::RequestRender { .. }
             )));
         }
+    }
+
+    #[test]
+    fn revalidation_keeps_current_prepared_apply_when_projection_already_matches() {
+        let fixture = issued_ssa_response_loss_fixture(false);
+        let mut observed = fixture.response_observed.clone();
+        let identity = match &mut observed[0].observation {
+            Observation::Existing { identity } => identity,
+            Observation::Absent => panic!("SSA fixture is present"),
+        };
+        identity.resource_version = "10".into();
+        observed[0].ordinary_proof = Some(OrdinaryProofV0 {
+            root_uid: fixture.issued.root.uid.clone(),
+            uid: identity.uid.clone(),
+            resource_version: identity.resource_version.clone(),
+            desired_projection: DesiredProjectionV0::Matches,
+        });
+        observed[0].recovery_proof = None;
+        let plan = plan_graph(
+            &fixture.issued,
+            &fixture.dispatch_frozen,
+            &fixture.input,
+            &fixture.output,
+            observed,
+        )
+        .expect("current prepared Apply remains representable");
+        assert_eq!(plan.intents.len(), 1);
+        assert_eq!(plan.intents[0].command_id, fixture.first_command_id);
+    }
+
+    #[test]
+    fn recovered_apply_projection_keeps_ordinary_proof_on_prepared_rv() {
+        let fixture = issued_ssa_response_loss_fixture(false);
+        let tx = fixture
+            .issued
+            .journal
+            .state
+            .apply_transaction
+            .as_ref()
+            .expect("issued transaction");
+        let projected =
+            recovered_observation_projection(&fixture.issued, tx, &fixture.response_observed);
+        let Observation::Existing { identity } = &projected[0].observation else {
+            panic!("recovered Apply is projected to an existing prepared target");
+        };
+        let proof = projected[0]
+            .ordinary_proof
+            .as_ref()
+            .expect("ordinary proof");
+        assert_eq!(identity.resource_version, "10");
+        assert_eq!(proof.resource_version, "10");
+        assert_eq!(proof.uid, identity.uid);
     }
 
     fn restart_to_revalidation(state: MachineStateV0) -> MachineStateV0 {
