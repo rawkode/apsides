@@ -452,10 +452,26 @@ collision_event_stream() {
   log_file=$1; expected_root_uid=$2; expected_pod_name=$3; expected_pod_uid=$4
   expected_foreign_uid=$5; expected_foreign_rv=$6
   : >"$WORK/collision-event-stream.tmp"
+  unrelated_log="$WORK/collision-unrelated.log"
+  : >"$unrelated_log"
   line_number=0
   while IFS= read -r line || [ -n "$line" ]; do
     line_number=$((line_number + 1))
     [ -n "$line" ] || die "collision observability line $line_number is empty"
+    case "$line" in
+      'controller stopped: '*)
+        printf '%s\n' "$line" >>"$unrelated_log"
+        FAILURE="$line"
+        return 1
+        ;;
+    esac
+    # Controller logs can contain unrelated structured diagnostics. Preserve
+    # them separately, but keep rejecting malformed records that identify as
+    # this runtime's collision-observability stream.
+    if printf '%s\n' "$line" | jq -e 'try fromjson catch false | (type == "object" and (.component? != "oxideloop-controller-runtime"))' >/dev/null 2>&1; then
+      printf '%s\n' "$line" >>"$unrelated_log"
+      continue
+    fi
     printf '%s\n' "$line" | jq -Rce --arg rootUid "$expected_root_uid" --arg podName "$expected_pod_name" --arg podUid "$expected_pod_uid" --arg foreignUid "$expected_foreign_uid" --arg foreignRv "$expected_foreign_rv" '
       def nonempty: type == "string" and length > 0;
       def hash_or_null: . == null or (type == "string" and test("^[0-9a-f]{64}$"));

@@ -109,6 +109,20 @@ parser_rejects() {
   fi
   [ -s "$TEMP/parser-error.log" ] || { echo "invalid parser fixture failed without a diagnostic: $1" >&2; exit 1; }
 }
+{
+  head -1 "$TEMP/parser-valid.jsonl"
+  printf '%s\n' 'controller stopped: discovery: delete/finalizer response is ambiguous and requires manual recovery'
+} >"$TEMP/parser-controller-stopped.log"
+FAILURE=''
+set +e
+collision_event_stream "$TEMP/parser-controller-stopped.log" "$parser_root" "$parser_pod" "$parser_pod_uid" "$parser_foreign_uid" "$parser_foreign_rv" >/dev/null 2>"$TEMP/controller-stopped-error.log"
+controller_stopped_result=$?
+set -e
+[ "$controller_stopped_result" -ne 0 ]
+[ "$FAILURE" = 'controller stopped: discovery: delete/finalizer response is ambiguous and requires manual recovery' ] || {
+  echo 'controller stopped diagnostic was not preserved as the primary failure' >&2
+  exit 1
+}
 sed 's/"root_uid":"root-uid"/"root_uid":"foreign-root"/' "$TEMP/parser-valid.jsonl" >"$TEMP/parser-foreign-root.jsonl"; parser_rejects "$TEMP/parser-foreign-root.jsonl"
 printf '%s\n' 'not-json' >"$TEMP/parser-malformed.jsonl"; parser_rejects "$TEMP/parser-malformed.jsonl"
 jq -c 'if .event == "effect_acknowledged" and .command_detail.persist_purpose == "prepare" then .command_detail.persist_purpose = "wrong" else . end' "$TEMP/parser-valid.jsonl" >"$TEMP/parser-wrong-purpose.jsonl"; parser_rejects "$TEMP/parser-wrong-purpose.jsonl"
