@@ -10734,7 +10734,22 @@ fn owned_field_omitted(
             let actual = observed.get(field);
             let wanted = desired.get(field);
             match (actual, wanted) {
-                (Some(actual), None) => !actual.is_null(),
+                (Some(actual), None) => {
+                    // A parent may be present only because all of its owned
+                    // children are transport runtime fields. Recurse into a
+                    // synthetic empty desired map so those child-level
+                    // exclusions are considered. An empty fieldset is still
+                    // an atomic ownership claim and therefore an omission.
+                    match child.as_object() {
+                        Some(child) if !child.is_empty() => owned_field_omitted(
+                            child,
+                            actual,
+                            &Value::Object(serde_json::Map::new()),
+                            &field_path,
+                        ),
+                        _ => !actual.is_null(),
+                    }
+                }
                 (Some(actual), Some(wanted)) => child
                     .as_object()
                     .is_none_or(|child| owned_field_omitted(child, actual, wanted, &field_path)),
@@ -15410,6 +15425,43 @@ mod tests {
             "manager":CONTROLLER_FIELD_MANAGER, "operation":"Apply", "fieldsType":"FieldsV1", "apiVersion":"v1",
             "fieldsV1":{"f:metadata":{"f:labels":{"f:wanted":{},"f:retired":{}}},"f:data":{"f:wanted":{},"f:retired":{}}}
         }]);
+        assert!(!same_desired_semantics(&observed, &desired));
+    }
+
+    #[test]
+    fn runtime_annotation_parent_does_not_make_a_settled_projection_differ() {
+        let desired = json!({
+            "apiVersion":"v1", "kind":"ConfigMap",
+            "metadata":{"name":"config","namespace":"demo","labels":{"app":"demo"}},
+            "data":{"message":"hello"}
+        });
+        let mut observed = desired.clone();
+        observed["metadata"]["annotations"] = json!({
+            ROOT_UID_ANNOTATION:"root-uid",
+            TRANSACTION_ID_ANNOTATION:"transaction",
+            COMMAND_ID_ANNOTATION:"command"
+        });
+        observed["metadata"]["ownerReferences"] = json!([{"uid":"root-uid"}]);
+        observed["metadata"]["managedFields"] = json!([{
+            "manager":CONTROLLER_FIELD_MANAGER, "operation":"Apply", "fieldsType":"FieldsV1", "apiVersion":"v1",
+            "fieldsV1":{
+                "f:data":{"f:message":{}},
+                "f:metadata":{
+                    "f:annotations":{
+                        "f:runtime.oxideloop.dev/root-uid":{},
+                        "f:runtime.oxideloop.dev/transaction-id":{},
+                        "f:runtime.oxideloop.dev/command-id":{}
+                    },
+                    "f:labels":{"f:app":{}},
+                    "f:ownerReferences":{"k:{\"uid\":\"root-uid\"}":{}}
+                }
+            }
+        }]);
+        assert!(same_desired_semantics(&observed, &desired));
+
+        observed["metadata"]["annotations"]["renderer-owned"] = json!("remove");
+        observed["metadata"]["managedFields"][0]["fieldsV1"]["f:metadata"]["f:annotations"]["f:renderer-owned"] =
+            json!({});
         assert!(!same_desired_semantics(&observed, &desired));
     }
 
