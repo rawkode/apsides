@@ -3628,7 +3628,14 @@ fn planner_ref(
 }
 
 fn event_time() -> Result<String, RuntimeErrorV0> {
-    OffsetDateTime::now_utc()
+    event_time_at(OffsetDateTime::now_utc())
+}
+
+/// Kubernetes Events use `MicroTime`; RFC3339 nanoseconds are rejected by the
+/// API server even though they are valid RFC3339.
+fn event_time_at(time: OffsetDateTime) -> Result<String, RuntimeErrorV0> {
+    time.replace_nanosecond(time.nanosecond() / 1_000 * 1_000)
+        .map_err(|_| RuntimeErrorV0::Hold("cannot normalize Event timestamp".into()))?
         .format(&Rfc3339)
         .map_err(|_| RuntimeErrorV0::Hold("cannot format Event timestamp".into()))
 }
@@ -4371,6 +4378,18 @@ mod tests {
         mutator(&mut root);
         MachineStateV0::recover_deleting_root_with_retired_state(root)
             .expect("mutated fixture remains an internally valid retired State")
+    }
+
+    #[test]
+    fn event_time_is_kubernetes_microtime_precision() {
+        let timestamp = OffsetDateTime::from_unix_timestamp(0)
+            .expect("Unix epoch is valid")
+            .replace_nanosecond(748_345_115)
+            .expect("nanoseconds are in range");
+        assert_eq!(
+            event_time_at(timestamp).expect("timestamp formats"),
+            "1970-01-01T00:00:00.748345Z"
+        );
     }
 
     #[test]
