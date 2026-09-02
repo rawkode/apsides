@@ -42,6 +42,24 @@ for command in kubectl pnpm; do
 done
 chmod +x "$TEMP/bin/"*
 
+# Cleanup captures controller logs after the primary assertion. A failed log
+# capture (including controller fatal stderr) must not overwrite that reason.
+capture_start=$(rg -n '^atomic_capture\(\) \{' "$ROOT/scripts/run-kind-e2e.sh" | cut -d: -f1)
+capture_end=$(rg -n '^atomic_capture_ownership\(\) \{' "$ROOT/scripts/run-kind-e2e.sh" | cut -d: -f1)
+sed -n "${capture_start},$((capture_end - 1))p" "$ROOT/scripts/run-kind-e2e.sh" >"$TEMP/atomic-capture.sh"
+hash_file() { printf '%s\n' test-hash; }
+EVIDENCE="$TEMP/capture-evidence"; ARTIFACTS=''; FAILURE='collision observability line 4 is malformed'
+mkdir -p "$EVIDENCE"
+. "$TEMP/atomic-capture.sh"
+if (atomic_capture controller.log bash -c 'printf "%s\\n" "controller stopped: fatal" >&2; exit 1'); then
+  echo 'failed controller capture unexpectedly succeeded' >&2
+  exit 1
+fi
+[ "$FAILURE" = 'collision observability line 4 is malformed' ] || {
+  echo 'controller capture overwrote the primary failure reason' >&2
+  exit 1
+}
+
 # The runtime emits strict JSONL observability records. Exercise the actual
 # runner parser with valid records and mutations that must be rejected.
 WORK="$TEMP/parser-work"

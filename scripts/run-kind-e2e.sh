@@ -87,7 +87,10 @@ OWNERSHIP_ARTIFACTS=''
 atomic_capture() {
   name=$1; shift
   temporary="$EVIDENCE/.${name}.tmp"
-  "$@" >"$temporary" 2>&1 || { rm -f "$temporary"; FAILURE="required capture failed: $name"; return 1; }
+  # Preserve the first failure: cleanup captures controller stderr after the
+  # primary assertion fails, and a fatal process exit there must not obscure
+  # the original reason (for example, a malformed collision record).
+  "$@" >"$temporary" 2>&1 || { rm -f "$temporary"; FAILURE=${FAILURE:-"required capture failed: $name"}; return 1; }
   mv "$temporary" "$EVIDENCE/$name"
   hash_file "$EVIDENCE/$name" >"$EVIDENCE/$name.sha256"
   ARTIFACTS="$ARTIFACTS $name"
