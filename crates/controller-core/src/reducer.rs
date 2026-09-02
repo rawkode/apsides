@@ -10454,8 +10454,22 @@ mod tests {
     }
 
     #[test]
-    fn recovered_apply_projection_keeps_ordinary_proof_on_prepared_rv() {
-        let fixture = issued_ssa_response_loss_fixture(false);
+    fn live_response_loss_revalidation_projects_current_ordinary_proof_without_replay() {
+        let mut fixture = issued_ssa_response_loss_fixture(true);
+        // Model the live transport adapter: the recovery proof refers to the
+        // returned post-write RV, and ordinary ownership is naturally stamped
+        // with that same live RV before planning projects it back to 10.
+        fixture.response_observed[0]
+            .ordinary_proof
+            .as_mut()
+            .expect("ordinary proof")
+            .resource_version = "30".into();
+        let recovery_proof = fixture.response_observed[0]
+            .recovery_proof
+            .as_ref()
+            .expect("exact post-write recovery proof");
+        assert_eq!(recovery_proof.uid, "first-uid");
+        assert_eq!(recovery_proof.resource_version, "30");
         let tx = fixture
             .issued
             .journal
@@ -10475,6 +10489,49 @@ mod tests {
         assert_eq!(identity.resource_version, "10");
         assert_eq!(proof.resource_version, "10");
         assert_eq!(proof.uid, identity.uid);
+
+        let recovery = restart_to_revalidation(fixture.issued);
+        let fresh_frozen = FrozenInputV0 {
+            state_resource_version: recovery.root.state_resource_version.clone(),
+            final_observation_fence_token: "e".repeat(64),
+            ..fixture.dispatch_frozen
+        };
+        let recovered = reduce(
+            recovery,
+            EventV0::Revalidated {
+                frozen: fresh_frozen,
+                render_input_json: fixture.input,
+                render_output_json: fixture.output,
+                observed: fixture.response_observed,
+            },
+        )
+        .expect("live-RV proof revalidates");
+        assert!(matches!(
+            recovered.commands.as_slice(),
+            [CommandV0::Persist { operation, .. }]
+                if operation.purpose == PersistPurpose::MutationResult
+        ));
+        assert!(
+            !recovered.commands.iter().any(|command| matches!(
+                command,
+                CommandV0::Hold { .. } | CommandV0::Mutate { .. }
+            ))
+        );
+        let transaction = recovered
+            .state
+            .journal
+            .state
+            .apply_transaction
+            .as_ref()
+            .expect("the remaining intent remains durable");
+        assert_eq!(transaction.results.len(), 1);
+        assert!(matches!(
+            transaction.next_command_lifecycle,
+            NextCommandLifecycleV0 {
+                state: NextCommandLifecycleStateV0::PreparedNotIssued,
+                command_id: Some(_),
+            }
+        ));
     }
 
     fn restart_to_revalidation(state: MachineStateV0) -> MachineStateV0 {
