@@ -1365,6 +1365,7 @@ fn drain_completion_edge<R>(
     root_watch: &mut WatchHandleV0,
     fixed_point: &mut Option<KubeFixedPointPortV0<'_, R>>,
     root_name: &str,
+    operation: Option<&OperationSessionV0>,
     buffered: &mut BufferedCommandWatchesV0,
 ) {
     let cap = root_watch.drain_capacity();
@@ -1376,7 +1377,18 @@ fn drain_completion_edge<R>(
         match root_watch.try_next_event() {
             Ok(Some(event)) => {
                 drained += 1;
-                if watch_targets_root(&event, root_name) {
+                // The completion edge races the last response with already
+                // queued retained-watch records.  A collected bootstrap
+                // fence owns those records until the operation closes: do
+                // not let this convenient nonblocking drain publish an exact
+                // RootMetadata self-echo as actor input (or leave its fence
+                // sequence unconsumed).  This is the same classifier used by
+                // the select branch and watermark drain above.
+                let consumed = operation.is_some_and(|operation| {
+                    operation.has_collected_bootstrap_fence()
+                        && operation.observe_bootstrap_root_watch(&event)
+                });
+                if !consumed && watch_targets_root(&event, root_name) {
                     buffered.root = buffered_root_watch(event);
                 }
             }
@@ -2163,7 +2175,13 @@ async fn collect_kubernetes_command_while_observing_inner<R>(
                 }
             }
             result = &mut effect, if root_authentication.is_none() => {
-                drain_completion_edge(root_watch, fixed_point, root_name, &mut buffered);
+                drain_completion_edge(
+                    root_watch,
+                    fixed_point,
+                    root_name,
+                    Some(&operation),
+                    &mut buffered,
+                );
                 record_prewrite_invalidation(Some(&operation), &mut buffered);
                 match result {
                     Ok(event) => return Ok((KubernetesEffectCompletionV0::Acknowledged(Box::new(event)), buffered)),
@@ -2445,7 +2463,13 @@ where
     loop {
         tokio::select! {
             result = &mut effect => {
-                drain_completion_edge(root_watch, fixed_point, root_name, &mut buffered);
+                drain_completion_edge(
+                    root_watch,
+                    fixed_point,
+                    root_name,
+                    operation.as_ref(),
+                    &mut buffered,
+                );
                 record_prewrite_invalidation(operation.as_ref(), &mut buffered);
                 match result {
                     Ok(value) => return Ok((CollectedEffectV0::Completed(value), buffered)),

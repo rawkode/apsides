@@ -557,6 +557,10 @@ struct BootstrapFenceStateV0 {
     /// response.  It is intentionally independent of publication: recording
     /// an HTTP response does not consume a watch record.
     metadata_echo_consumed: bool,
+    /// One exact `RootMetadata` watch echo may arrive after its PATCH response
+    /// but before this same sealed operation has finalized and linked State.
+    /// It is not actor input and cannot cross an operation boundary.
+    deferred_metadata_echo: Option<ObjectV0>,
     /// Exact State-finalizer PATCH response. Final proof requires this full
     /// raw object unchanged; UID/digest alone would permit ownership, token,
     /// deletion, or resource-version drift between the finalizer write and
@@ -615,6 +619,7 @@ impl BootstrapFenceStateV0 {
             consumed: 0,
             metadata_echo: None,
             metadata_echo_consumed: false,
+            deferred_metadata_echo: None,
             final_state: None,
             final_echo: None,
             final_echo_consumed: false,
@@ -676,6 +681,25 @@ impl BootstrapFenceStateV0 {
         self.committed == self.enqueued && self.enqueued == self.consumed && self.records.is_empty()
     }
 
+    fn defer_exact_metadata_echo(&mut self, observed: &ObjectV0) -> bool {
+        let exact = !self.metadata_echo_consumed
+            && self.deferred_metadata_echo.is_none()
+            && self
+                .metadata_echo
+                .as_ref()
+                .is_some_and(|response| bootstrap_response_matches(observed, response));
+        if exact {
+            self.deferred_metadata_echo = Some(observed.clone());
+        }
+        exact
+    }
+
+    fn consume_deferred_metadata_echo(&mut self) {
+        if self.deferred_metadata_echo.take().is_some() {
+            self.metadata_echo_consumed = true;
+        }
+    }
+
     /// Resolves records held while the current PATCH was already in flight.
     /// A root watch can precede its HTTP response, so only the response owner
     /// is allowed to decide whether the raw record was that response's echo.
@@ -706,11 +730,8 @@ impl BootstrapFenceStateV0 {
                     WatchEventV0::Modified(observed)
                         if !self.metadata_echo_consumed
                             && !self.final_echo_consumed
-                            && self.metadata_echo.as_ref().is_some_and(|response| {
-                                bootstrap_response_matches(&observed, response)
-                            }) =>
+                            && self.defer_exact_metadata_echo(&observed) =>
                     {
-                        self.metadata_echo_consumed = true;
                         continue;
                     }
                     WatchEventV0::Bookmark { .. } => continue,
@@ -725,6 +746,11 @@ impl BootstrapFenceStateV0 {
             }
             match event {
                 WatchEventV0::Bookmark { .. } => {}
+                WatchEventV0::Modified(observed)
+                    if matches!(
+                        phase,
+                        BootstrapRootPhaseV0::StateFinalizer | BootstrapRootPhaseV0::RootStateLink
+                    ) && self.defer_exact_metadata_echo(&observed) => {}
                 WatchEventV0::Modified(observed)
                     if !self.metadata_echo_consumed
                         && self.metadata_echo.as_ref().is_some_and(|response| {
@@ -1767,6 +1793,21 @@ impl OperationSessionV0 {
                                 fence.pending.push_back(record);
                                 notify_fence = true;
                                 true
+                            } else if matches!(
+                                authority.phase,
+                                Some(BootstrapAuthorityPhaseV0::Active(
+                                    BootstrapRootPhaseV0::StateFinalizer
+                                        | BootstrapRootPhaseV0::RootStateLink
+                                ))
+                            ) && matches!(event, WatchEventV0::Modified(_))
+                                && fence.defer_exact_metadata_echo(observed)
+                            {
+                                // This exact own echo is ordering evidence
+                                // for the running operation, not a root fact.
+                                // Keep it private until its already-authorized
+                                // State finalizer and root link have completed.
+                                notify_fence = true;
+                                true
                             } else if matches!(event, WatchEventV0::Modified(_))
                                 && !fence.metadata_echo_consumed
                                 && fence.metadata_echo.as_ref().is_some_and(|response| {
@@ -2146,6 +2187,9 @@ impl OperationSessionV0 {
         // generic freshness exemption to another root mutation.
         if !fence.classify_write_polled_records(phase, response) || fence.terminal.is_some() {
             return Err(TransportErrorV0::ManualRecoveryHold);
+        }
+        if phase == BootstrapRootPhaseV0::RootStateLink {
+            fence.consume_deferred_metadata_echo();
         }
 
         // Publication above precedes this CAS under the same fence.  No
@@ -12211,6 +12255,161 @@ mod tests {
         assert_eq!(fence.metadata_echo.as_ref(), Some(&metadata_echo));
         assert!(fence.metadata_echo_consumed);
         assert!(fence.terminal.is_none());
+    }
+
+    #[test]
+    fn exact_metadata_echo_between_authorized_subwrites_is_deferred_until_root_link() {
+        let mut session = test_session(
+            Duration::from_millis(5),
+            Duration::from_millis(30),
+            Duration::from_millis(40),
+            Duration::from_millis(50),
+            3,
+        );
+        let root = bootstrap_authority_root("1");
+        arm_test_collected_bootstrap(&mut session, &root);
+        {
+            let mut authority = session.bootstrap.lock().expect("bootstrap authority lock");
+            authority.phase = Some(BootstrapAuthorityPhaseV0::Active(
+                BootstrapRootPhaseV0::RootMetadata,
+            ));
+        }
+        let mut metadata = root.clone();
+        metadata.metadata.resource_version = "root-metadata-rv".into();
+        metadata.value["metadata"]["resourceVersion"] = json!("root-metadata-rv");
+        let permit = claim_first_write(&session).expect("metadata write polls once");
+        session
+            .complete_bootstrap_subwrite(permit, BootstrapRootPhaseV0::RootMetadata, &metadata)
+            .expect("metadata response opens State finalizer phase");
+        assert!(session.prewrite_gate().seal_bootstrap_phase());
+        assert!(session.observe_bootstrap_root_watch(&WatchEventV0::Modified(metadata.clone())));
+        {
+            let fence = session.bootstrap_fence.lock().expect("fence is readable");
+            assert_eq!(fence.deferred_metadata_echo.as_ref(), Some(&metadata));
+            assert!(!fence.metadata_echo_consumed);
+            assert!(fence.terminal.is_none());
+        }
+
+        let state = bootstrap_test_state();
+        let permit = claim_first_write(&session).expect("State finalizer polls once");
+        session
+            .complete_bootstrap_subwrite(permit, BootstrapRootPhaseV0::StateFinalizer, &state)
+            .expect("State finalizer remains authorized by the same operation");
+        assert!(session.prewrite_gate().seal_bootstrap_phase());
+        let permit = claim_first_write(&session).expect("root link polls once");
+        session
+            .complete_bootstrap_subwrite(permit, BootstrapRootPhaseV0::RootStateLink, &metadata)
+            .expect("root link consumes deferred own metadata echo");
+        let fence = session.bootstrap_fence.lock().expect("fence is readable");
+        assert!(fence.deferred_metadata_echo.is_none());
+        assert!(fence.metadata_echo_consumed);
+        assert!(fence.terminal.is_none());
+    }
+
+    #[test]
+    fn exact_metadata_echo_during_state_finalizer_write_is_deferred_after_its_response() {
+        let mut session = test_session(
+            Duration::from_millis(5),
+            Duration::from_millis(30),
+            Duration::from_millis(40),
+            Duration::from_millis(50),
+            3,
+        );
+        let root = bootstrap_authority_root("1");
+        arm_test_collected_bootstrap(&mut session, &root);
+        {
+            let mut authority = session.bootstrap.lock().expect("bootstrap authority lock");
+            authority.phase = Some(BootstrapAuthorityPhaseV0::Active(
+                BootstrapRootPhaseV0::RootMetadata,
+            ));
+        }
+        let mut metadata = root.clone();
+        metadata.metadata.resource_version = "root-metadata-rv".into();
+        metadata.value["metadata"]["resourceVersion"] = json!("root-metadata-rv");
+        let permit = claim_first_write(&session).expect("metadata write polls once");
+        session
+            .complete_bootstrap_subwrite(permit, BootstrapRootPhaseV0::RootMetadata, &metadata)
+            .expect("metadata response opens State finalizer phase");
+        assert!(session.prewrite_gate().seal_bootstrap_phase());
+        let permit = claim_first_write(&session).expect("State finalizer polls once");
+        assert!(session.observe_bootstrap_root_watch(&WatchEventV0::Modified(metadata.clone())));
+        session
+            .complete_bootstrap_subwrite(
+                permit,
+                BootstrapRootPhaseV0::StateFinalizer,
+                &bootstrap_test_state(),
+            )
+            .expect("State finalizer response classifies the exact metadata echo");
+        let fence = session.bootstrap_fence.lock().expect("fence is readable");
+        assert_eq!(fence.deferred_metadata_echo.as_ref(), Some(&metadata));
+        assert!(!fence.metadata_echo_consumed);
+        assert!(fence.terminal.is_none());
+    }
+
+    #[test]
+    fn deferred_metadata_echo_rejects_every_authority_near_miss() {
+        for changed in [
+            "resource-version",
+            "uid",
+            "spec",
+            "status",
+            "finalizer",
+            "authority",
+        ] {
+            let mut session = test_session(
+                Duration::from_millis(5),
+                Duration::from_millis(30),
+                Duration::from_millis(40),
+                Duration::from_millis(50),
+                3,
+            );
+            let root = bootstrap_authority_root("1");
+            arm_test_collected_bootstrap(&mut session, &root);
+            {
+                let mut authority = session.bootstrap.lock().expect("bootstrap authority lock");
+                authority.phase = Some(BootstrapAuthorityPhaseV0::Active(
+                    BootstrapRootPhaseV0::RootMetadata,
+                ));
+            }
+            let mut metadata = root.clone();
+            metadata.metadata.resource_version = "root-metadata-rv".into();
+            metadata.value["metadata"]["resourceVersion"] = json!("root-metadata-rv");
+            let permit = claim_first_write(&session).expect("metadata write polls once");
+            session
+                .complete_bootstrap_subwrite(permit, BootstrapRootPhaseV0::RootMetadata, &metadata)
+                .expect("metadata response opens State finalizer phase");
+            assert!(session.prewrite_gate().seal_bootstrap_phase());
+
+            let mut observed = metadata.clone();
+            match changed {
+                "resource-version" => {
+                    observed.metadata.resource_version = "other-rv".into();
+                    observed.value["metadata"]["resourceVersion"] = json!("other-rv");
+                }
+                "uid" => {
+                    observed.metadata.uid = "other-uid".into();
+                    observed.value["metadata"]["uid"] = json!("other-uid");
+                }
+                "spec" => observed.value["spec"]["image"] = json!("other.invalid/image"),
+                "status" => observed.value["status"] = json!({"state":{"name":"other"}}),
+                "finalizer" => {
+                    observed.value["metadata"]["finalizers"] = json!([ROOT_FINALIZER, "other"]);
+                }
+                "authority" => {
+                    set_test_annotation(&mut observed, ROOT_UID_ANNOTATION, "other-root");
+                }
+                _ => unreachable!("test table is exhaustive"),
+            }
+            assert!(
+                !session.observe_bootstrap_root_watch(&WatchEventV0::Modified(observed)),
+                "{changed} must not borrow the own-echo ordering allowance"
+            );
+            assert_eq!(
+                session.bootstrap_fence_terminal(),
+                Some(TransportErrorV0::PreWriteInvalidated),
+                "{changed} stays terminal before State finalizer can write"
+            );
+        }
     }
 
     #[test]
