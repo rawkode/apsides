@@ -5234,21 +5234,6 @@ fn plan_graph(
                 },
                 (Observation::Existing { identity: actual }, Some(known))
                     if actual.uid == known.uid
-                        && actual.resource_version == known.resource_version
-                        && projection.is_some() =>
-                {
-                    MutationIntent::Apply {
-                        observation: observed.observation.clone(),
-                        expected: MutationIdentity {
-                            uid: known.uid.clone(),
-                            resource_version: known.resource_version.clone(),
-                        },
-                        field_manager: "oxideloop-controller".into(),
-                        object: resource.object.clone(),
-                    }
-                }
-                (Observation::Existing { identity: actual }, Some(known))
-                    if actual.uid == known.uid
                         && projection == Some(DesiredProjectionV0::Matches) =>
                 {
                     inventory_refreshes.push((identity.clone(), actual.resource_version.clone()));
@@ -8681,7 +8666,7 @@ mod tests {
             root_uid: machine.root.uid.clone(),
             uid: "existing-uid".into(),
             resource_version: "10".into(),
-            desired_projection: DesiredProjectionV0::Untrusted,
+            desired_projection: DesiredProjectionV0::Differs,
         });
         let ready = complete_single_apply_to_ready(
             machine,
@@ -8694,6 +8679,35 @@ mod tests {
         );
         assert_eq!(ready.phase, PhaseV0::Ready);
         assert_eq!(ready.journal.state.inventory[0].resource_version, "11");
+    }
+
+    #[test]
+    fn equal_rv_matching_projection_does_not_issue_an_ssa_loop() {
+        let mut machine = boot_to_render(state());
+        let (frozen, input, output, mut observed) = rendered(&machine.root, vec![]);
+        let identity = observed[0].identity.clone();
+        machine.journal.state.inventory.push(InventoryEntry {
+            identity: identity.clone(),
+            logical_id: "object".into(),
+            uid: "existing-uid".into(),
+            resource_version: "10".into(),
+            bundle_digest: "a".repeat(64),
+        });
+        observed[0].observation = Observation::Existing {
+            identity: MutationIdentity {
+                uid: "existing-uid".into(),
+                resource_version: "10".into(),
+            },
+        };
+        observed[0].ordinary_proof = Some(OrdinaryProofV0 {
+            root_uid: machine.root.uid.clone(),
+            uid: "existing-uid".into(),
+            resource_version: "10".into(),
+            desired_projection: DesiredProjectionV0::Matches,
+        });
+        let plan = plan_graph(&machine, &frozen, &input, &output, observed).unwrap();
+        assert!(plan.intents.is_empty());
+        assert_eq!(plan.inventory_refreshes, vec![(identity, "10".into())]);
     }
 
     #[test]
@@ -10057,7 +10071,7 @@ mod tests {
             root_uid: machine.root.uid.clone(),
             uid: "first-uid".into(),
             resource_version: "10".into(),
-            desired_projection: DesiredProjectionV0::Untrusted,
+            desired_projection: DesiredProjectionV0::Differs,
         });
         let mut output: RenderOutputV0 = serde_json::from_str(&output).unwrap();
         if multi_intent {
@@ -10099,7 +10113,7 @@ mod tests {
                     root_uid: machine.root.uid.clone(),
                     uid: "second-uid".into(),
                     resource_version: "20".into(),
-                    desired_projection: DesiredProjectionV0::Untrusted,
+                    desired_projection: DesiredProjectionV0::Differs,
                 }),
                 recovery_proof: None,
                 deletion_recovery_proof: None,
@@ -10512,7 +10526,7 @@ mod tests {
             root_uid: machine.root.uid.clone(),
             uid: "original-uid".into(),
             resource_version: "10".into(),
-            desired_projection: DesiredProjectionV0::Untrusted,
+            desired_projection: DesiredProjectionV0::Differs,
         });
         let prepared = reduce(
             machine,

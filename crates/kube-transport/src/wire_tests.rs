@@ -1112,6 +1112,15 @@ fn delete_fence_script(
     target_resource_version: &str,
     authorize: bool,
 ) -> Vec<Expected> {
+    // Delete now has the same pre-write root/owner proof as Apply.  Keep the
+    // scripted object canonical so this helper models an owned managed child;
+    // mismatch cases deliberately override this baseline.
+    let mut target = object_json(kind, name, target_uid, target_resource_version);
+    target["metadata"]["annotations"] = json!({ROOT_UID_ANNOTATION:"root-uid"});
+    target["metadata"]["ownerReferences"] = json!([{
+        "apiVersion":"demo.oxideloop.dev/v1alpha1", "kind":"WebApplication", "name":"app-a",
+        "uid":"root-uid", "controller":true, "blockOwnerDeletion":false
+    }]);
     let mut script = vec![
         Expected {
             method: Method::GET,
@@ -1148,7 +1157,7 @@ fn delete_fence_script(
             },
             content_type: None,
             body: None,
-            response: response(object_json(kind, name, target_uid, target_resource_version)),
+            response: response(target),
         },
     ];
     if authorize {
@@ -2247,7 +2256,9 @@ async fn conditional_apply_authority_mismatches_issue_no_patch() {
     api.assert_drained();
     let mut foreign_owner = child;
     foreign_owner["metadata"]["ownerReferences"][0]["uid"] = json!("foreign-root");
-    let (transport, api) = ScriptedApi::transport(authorized_force_fence_script(foreign_owner));
+    // Owner validation is a definitive pre-write check, so the final State
+    // authorization reread must not occur for this near miss.
+    let (transport, api) = ScriptedApi::transport(force_fence_script(foreign_owner));
     assert!(matches!(
         transport
             .dispatch(

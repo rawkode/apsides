@@ -6862,7 +6862,12 @@ mod tests {
                     kubernetes_minor: "1.36".into(),
                     gvr: "configmaps".into(),
                 },
-                ordinary_proof: None,
+                ordinary_proof: Some(oxideloop_controller_core::OrdinaryProofV0 {
+                    root_uid: root.uid.clone(),
+                    uid: "managed-uid".into(),
+                    resource_version: "managed-rv-1".into(),
+                    desired_projection: oxideloop_controller_core::DesiredProjectionV0::Untrusted,
+                }),
                 recovery_proof: None,
                 deletion_recovery_proof: None,
             }],

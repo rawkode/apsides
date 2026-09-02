@@ -5364,6 +5364,28 @@ impl KubeTransportV0 {
                     "conditional apply target identity is stale",
                 ));
             }
+            MutationDecision::ConditionalApply { .. }
+            | MutationDecision::PreconditionedDelete { .. }
+                if fence.target.as_ref().is_some_and(|target| {
+                    !has_root_uid_annotation(target, &fence.root.metadata.uid)
+                        || !has_exact_canonical_owner(
+                            target,
+                            &fence.root.reference,
+                            &fence.root.metadata.uid,
+                        )
+                }) =>
+            {
+                // This is still before durable dispatch authorization and the
+                // sole child write.  A near-miss is definitive no-write
+                // evidence, so it must invalidate rather than entering the
+                // response-loss path.
+                return Ok(mutation_not_issued_outcome(
+                    transaction_id,
+                    attempt_token,
+                    &command.command_id,
+                    "managed target owner/root proof mismatch",
+                ));
+            }
             _ => {}
         }
         if matches!(
@@ -10525,34 +10547,64 @@ pub fn same_desired_semantics(observed: &Value, desired: &Value) -> bool {
         // baseline: force the first SSA after POST or a watch/status echo.
         return false;
     };
+    // Evaluate omission against the raw API objects.  Canonicalizing defaults
+    // before this step would turn a previously controller-owned default into
+    // an invisible omission, leaving the manager unable to relinquish it.
+    if owned_field_omitted(&fields, observed, desired, "") {
+        return false;
+    }
     let (observed, desired) = canonical_semantic_pair(observed, desired);
-    desired_is_subset(&observed, &desired) && !owned_field_omitted(fields, &observed, &desired)
+    fields_cover_desired(&fields, &desired, "") && desired_is_subset(&observed, &desired, "")
 }
 
-fn controller_apply_fields(observed: &Value) -> Option<&serde_json::Map<String, Value>> {
+/// Returns the union of every applicable controller Apply fieldset.  A
+/// controller entry that looks applicable but is malformed, has the wrong
+/// version, or targets a subresource poisons the proof instead of allowing a
+/// convenient sibling entry to mint authority.
+fn controller_apply_fields(observed: &Value) -> Option<serde_json::Map<String, Value>> {
     let api_version = observed.get("apiVersion")?.as_str()?;
-    observed
-        .pointer("/metadata/managedFields")?
-        .as_array()?
-        .iter()
-        .find_map(|entry| {
-            let entry = entry.as_object()?;
-            (entry.get("manager")?.as_str() == Some("oxideloop-controller")
-                && entry.get("operation")?.as_str() == Some("Apply")
-                && entry.get("fieldsType")?.as_str() == Some("FieldsV1")
-                && entry.get("apiVersion")?.as_str() == Some(api_version)
-                && entry
-                    .get("subresource")
-                    .is_none_or(|v| v.is_null() || v.as_str() == Some("")))
-            .then(|| entry.get("fieldsV1")?.as_object())
-            .flatten()
-            .filter(|fields| {
-                valid_fields_v1(fields)
-                    && fields
-                        .keys()
-                        .any(|key| key.starts_with("f:") && key != "f:status")
-            })
-        })
+    let entries = observed.pointer("/metadata/managedFields")?.as_array()?;
+    let mut result = serde_json::Map::new();
+    let mut found = false;
+    for entry in entries {
+        let entry = entry.as_object()?;
+        if entry.get("manager")?.as_str() != Some(CONTROLLER_FIELD_MANAGER)
+            || entry.get("operation")?.as_str() != Some("Apply")
+        {
+            continue;
+        }
+        found = true;
+        if entry.get("fieldsType")?.as_str() != Some("FieldsV1")
+            || entry.get("apiVersion")?.as_str() != Some(api_version)
+            || !entry
+                .get("subresource")
+                .is_none_or(|value| value.is_null() || value.as_str() == Some(""))
+        {
+            return None;
+        }
+        let fields = entry.get("fieldsV1")?.as_object()?;
+        if !valid_fields_v1(fields) {
+            return None;
+        }
+        merge_fields_v1(&mut result, fields);
+    }
+    found.then_some(result)
+}
+
+fn merge_fields_v1(
+    into: &mut serde_json::Map<String, Value>,
+    from: &serde_json::Map<String, Value>,
+) {
+    for (key, value) in from {
+        match (into.get_mut(key), value.as_object()) {
+            (Some(existing), Some(child)) if existing.as_object().is_some() => {
+                merge_fields_v1(existing.as_object_mut().expect("checked object"), child);
+            }
+            _ => {
+                into.insert(key.clone(), value.clone());
+            }
+        }
+    }
 }
 
 fn valid_fields_v1(fields: &serde_json::Map<String, Value>) -> bool {
@@ -10627,17 +10679,28 @@ fn canonical_semantic_pair(observed: &Value, desired: &Value) -> (Value, Value) 
     (observed, desired)
 }
 
-fn desired_is_subset(observed: &Value, desired: &Value) -> bool {
+fn desired_is_subset(observed: &Value, desired: &Value, path: &str) -> bool {
     match (observed, desired) {
         (_, Value::Null) => observed.is_null(),
         (Value::Object(observed), Value::Object(desired)) => {
             desired.iter().all(|(key, desired)| {
                 observed
                     .get(key)
-                    .is_some_and(|actual| desired_is_subset(actual, desired))
+                    .is_some_and(|actual| desired_is_subset(actual, desired, &join_path(path, key)))
             })
         }
-        (Value::Array(observed), Value::Array(desired)) => observed == desired,
+        (Value::Array(observed), Value::Array(desired)) => {
+            let item_path = format!("{path}[]");
+            match associative_keys(path) {
+                Some(keys) => desired.iter().all(|wanted| {
+                    observed
+                        .iter()
+                        .find(|actual| keyed_match(actual, wanted, keys))
+                        .is_some_and(|actual| desired_is_subset(actual, wanted, &item_path))
+                }),
+                None => observed == desired,
+            }
+        }
         _ => observed == desired,
     }
 }
@@ -10646,6 +10709,7 @@ fn owned_field_omitted(
     fields: &serde_json::Map<String, Value>,
     observed: &Value,
     desired: &Value,
+    path: &str,
 ) -> bool {
     fields.iter().any(|(key, child)| {
         if key == "." {
@@ -10654,7 +10718,8 @@ fn owned_field_omitted(
         if let Some(field) = key.strip_prefix("f:") {
             // Metadata identity and the transport's runtime annotations are
             // not renderer semantics, even if older SSA entries claim them.
-            if field == "status" {
+            let field_path = join_path(path, field);
+            if ignored_semantic_path(&field_path) {
                 return false;
             }
             let actual = observed.get(field);
@@ -10663,7 +10728,7 @@ fn owned_field_omitted(
                 (Some(actual), None) => !actual.is_null(),
                 (Some(actual), Some(wanted)) => child
                     .as_object()
-                    .is_none_or(|child| owned_field_omitted(child, actual, wanted)),
+                    .is_none_or(|child| owned_field_omitted(child, actual, wanted, &field_path)),
                 _ => false,
             }
         } else if let Some(selector) = key.strip_prefix("k:") {
@@ -10673,26 +10738,134 @@ fn owned_field_omitted(
             let Some(selector) = selector.as_object() else {
                 return true;
             };
-            let Some(actual) = observed.as_array().and_then(|items| {
-                items
-                    .iter()
-                    .find(|item| selector.iter().all(|(k, v)| item.get(k) == Some(v)))
-            }) else {
+            let Some(actual) = observed
+                .as_array()
+                .and_then(|items| items.iter().find(|item| selector_match(item, selector)))
+            else {
                 return false;
             };
-            let wanted = desired.as_array().and_then(|items| {
-                items
-                    .iter()
-                    .find(|item| selector.iter().all(|(k, v)| item.get(k) == Some(v)))
-            });
+            let wanted = desired
+                .as_array()
+                .and_then(|items| items.iter().find(|item| selector_match(item, selector)));
             wanted.is_none()
-                || child
-                    .as_object()
-                    .is_none_or(|child| owned_field_omitted(child, actual, wanted.unwrap()))
+                || child.as_object().is_none_or(|child| {
+                    owned_field_omitted(child, actual, wanted.unwrap(), &format!("{path}[]"))
+                })
         } else {
             true
         }
     })
+}
+
+fn fields_cover_desired(
+    fields: &serde_json::Map<String, Value>,
+    desired: &Value,
+    path: &str,
+) -> bool {
+    let Some(desired) = desired.as_object() else {
+        return true;
+    };
+    desired
+        .iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "apiVersion" | "kind" | "status"))
+        .all(|(key, value)| {
+            let Some(field) = fields.get(&format!("f:{key}")) else {
+                return false;
+            };
+            let Some(children) = field.as_object() else {
+                return false;
+            };
+            children.is_empty()
+                || children.contains_key(".")
+                || fields_cover_value(children, value, &join_path(path, key))
+        })
+}
+
+fn fields_cover_value(
+    fields: &serde_json::Map<String, Value>,
+    desired: &Value,
+    path: &str,
+) -> bool {
+    match desired {
+        Value::Object(_) => fields_cover_desired(fields, desired, path),
+        Value::Array(items) => match associative_keys(path) {
+            Some(_) => items.iter().all(|item| {
+                fields
+                    .iter()
+                    .filter_map(|(key, value)| key.strip_prefix("k:").zip(value.as_object()))
+                    .any(|(selector, child)| {
+                        serde_json::from_str::<Value>(selector)
+                            .ok()
+                            .and_then(|v| v.as_object().cloned())
+                            .is_some_and(|selector| {
+                                selector_match(item, &selector)
+                                    && (child.is_empty()
+                                        || child.contains_key(".")
+                                        || fields_cover_value(child, item, &format!("{path}[]")))
+                            })
+                    })
+            }),
+            None => fields.is_empty() || fields.contains_key("."),
+        },
+        _ => true,
+    }
+}
+
+fn join_path(path: &str, field: &str) -> String {
+    format!("{path}/{field}")
+}
+
+fn associative_keys(path: &str) -> Option<&'static [&'static str]> {
+    match path {
+        "/spec/template/spec/containers" | "/spec/template/spec/containers[]/env" => {
+            Some(&["name"])
+        }
+        "/spec/template/spec/containers[]/ports" => Some(&["containerPort", "protocol"]),
+        "/spec/ports" => Some(&["port", "protocol"]),
+        _ => None,
+    }
+}
+
+fn selector_match(item: &Value, selector: &serde_json::Map<String, Value>) -> bool {
+    selector
+        .iter()
+        .all(|(key, value)| semantic_field_eq(item.get(key), Some(value), key))
+}
+
+fn keyed_match(actual: &Value, desired: &Value, keys: &[&str]) -> bool {
+    keys.iter()
+        .all(|key| semantic_field_eq(actual.get(key), desired.get(key), key))
+}
+
+fn semantic_field_eq(actual: Option<&Value>, desired: Option<&Value>, key: &str) -> bool {
+    actual == desired
+        || (key == "protocol"
+            && protocol_is_tcp_or_missing(actual)
+            && protocol_is_tcp_or_missing(desired))
+}
+
+fn protocol_is_tcp_or_missing(value: Option<&Value>) -> bool {
+    value.is_none() || value.and_then(Value::as_str) == Some("TCP")
+}
+
+fn ignored_semantic_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/status"
+            | "/metadata/uid"
+            | "/metadata/resourceVersion"
+            | "/metadata/generation"
+            | "/metadata/creationTimestamp"
+            | "/metadata/deletionTimestamp"
+            | "/metadata/managedFields"
+            | "/metadata/ownerReferences"
+            | "/metadata/selfLink"
+            | "/metadata/finalizers"
+            | "/metadata/annotations/runtime.oxideloop.dev/root-uid"
+            | "/metadata/annotations/runtime.oxideloop.dev/transaction-id"
+            | "/metadata/annotations/runtime.oxideloop.dev/command-id"
+            | "/metadata/annotations/deployment.kubernetes.io/revision"
+    )
 }
 
 fn normalize_deployment_lists(value: &mut Value) {
@@ -15034,6 +15207,117 @@ mod tests {
                 Err(TransportErrorV0::UnsupportedTarget)
             );
         }
+    }
+
+    #[test]
+    fn managed_fields_projection_requires_complete_unambiguous_controller_coverage() {
+        let desired = json!({
+            "apiVersion":"v1", "kind":"ConfigMap",
+            "metadata":{"name":"config","namespace":"demo","labels":{"owned":"yes"}},
+            "data":{"message":"hello"}
+        });
+        let fields = json!({
+            "f:metadata":{"f:name":{},"f:namespace":{},"f:labels":{"f:owned":{}}},
+            "f:data":{"f:message":{}}
+        });
+        let observed = |managed_fields: Value| {
+            json!({
+                "apiVersion":"v1", "kind":"ConfigMap",
+                "metadata":{"name":"config","namespace":"demo","labels":{"owned":"yes","co-writer":"kept"},"managedFields":managed_fields},
+                "data":{"message":"hello","co-writer":"kept"}
+            })
+        };
+        let entry = |fields: Value| {
+            json!({
+                "manager":CONTROLLER_FIELD_MANAGER, "operation":"Apply", "fieldsType":"FieldsV1",
+                "apiVersion":"v1", "fieldsV1":fields
+            })
+        };
+
+        assert!(same_desired_semantics(
+            &observed(json!([
+                entry(
+                    json!({"f:metadata":{"f:name":{},"f:namespace":{},"f:labels":{"f:owned":{}}}})
+                ),
+                entry(json!({"f:data":{"f:message":{}}}))
+            ])),
+            &desired
+        ));
+        assert!(!same_desired_semantics(
+            &observed(json!([entry(json!({"f:metadata":{}}))])),
+            &desired
+        ));
+        assert!(!same_desired_semantics(
+            &observed(json!([{
+                "manager":"other", "operation":"Apply", "fieldsType":"FieldsV1", "apiVersion":"v1", "fieldsV1":fields
+            }])),
+            &desired
+        ));
+        assert!(!same_desired_semantics(
+            &observed(json!([{
+                "manager":CONTROLLER_FIELD_MANAGER, "operation":"Apply", "fieldsType":"FieldsV1", "apiVersion":"v2", "fieldsV1":fields
+            }])),
+            &desired
+        ));
+        assert!(!same_desired_semantics(
+            &observed(json!([{
+                "manager":CONTROLLER_FIELD_MANAGER, "operation":"Apply", "fieldsType":"FieldsV1", "apiVersion":"v1", "subresource":"status", "fieldsV1":fields
+            }])),
+            &desired
+        ));
+        assert!(!same_desired_semantics(
+            &observed(json!([{
+                "manager":CONTROLLER_FIELD_MANAGER, "operation":"Apply", "fieldsType":"FieldsV1", "apiVersion":"v1", "fieldsV1":{"bad":{}}
+            }])),
+            &desired
+        ));
+    }
+
+    #[test]
+    fn managed_fields_omission_uses_raw_values_before_default_canonicalization() {
+        let desired = json!({
+            "apiVersion":"v1", "kind":"ConfigMap",
+            "metadata":{"name":"config","namespace":"demo","labels":{"wanted":"yes"}},
+            "data":{"wanted":"yes"}
+        });
+        let mut observed = desired.clone();
+        observed["metadata"]["labels"]["retired"] = json!("remove");
+        observed["data"]["retired"] = json!("remove");
+        observed["metadata"]["managedFields"] = json!([{
+            "manager":CONTROLLER_FIELD_MANAGER, "operation":"Apply", "fieldsType":"FieldsV1", "apiVersion":"v1",
+            "fieldsV1":{"f:metadata":{"f:name":{},"f:namespace":{},"f:labels":{"f:wanted":{},"f:retired":{}}},"f:data":{"f:wanted":{},"f:retired":{}}}
+        }]);
+        assert!(!same_desired_semantics(&observed, &desired));
+    }
+
+    #[test]
+    fn associative_lists_ignore_unowned_co_writer_members() {
+        let desired = json!({
+            "apiVersion":"apps/v1", "kind":"Deployment",
+            "metadata":{"name":"web","namespace":"demo"},
+            "spec":{"replicas":1,"template":{"spec":{"containers":[{
+                "name":"web", "image":"example/web",
+                "env":[{"name":"MESSAGE","value":"hello"}],
+                "ports":[{"containerPort":8080}]
+            }]}}}
+        });
+        let mut observed = desired.clone();
+        observed["spec"]["template"]["spec"]["containers"].as_array_mut().unwrap().push(json!({
+            "name":"sidecar", "image":"example/sidecar", "env":[{"name":"EXTRA","value":"kept"}], "ports":[{"containerPort":9090}]
+        }));
+        observed["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name":"EXTRA","value":"kept"}));
+        observed["spec"]["template"]["spec"]["containers"][0]["ports"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"containerPort":9090}));
+        observed["metadata"]["managedFields"] = json!([{
+            "manager":CONTROLLER_FIELD_MANAGER, "operation":"Apply", "fieldsType":"FieldsV1", "apiVersion":"apps/v1",
+            "fieldsV1":{"f:metadata":{},"f:spec":{}}
+        }]);
+        assert!(same_desired_semantics(&observed, &desired));
     }
 
     #[test]
