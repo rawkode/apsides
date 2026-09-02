@@ -10776,7 +10776,10 @@ fn fields_cover_desired(
     };
     desired
         .iter()
-        .filter(|(key, value)| !unmanaged_declared_field(path, key, value))
+        .filter(|(key, value)| {
+            !unmanaged_declared_field(path, key, value)
+                && !ignored_semantic_path(&join_path(path, key))
+        })
         .all(|(key, value)| {
             let Some(field) = fields.get(&format!("f:{key}")) else {
                 return false;

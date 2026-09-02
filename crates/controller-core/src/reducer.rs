@@ -10325,6 +10325,56 @@ mod tests {
             ));
             assert_eq!(rejected.state.journal, fixture.issued.journal);
         }
+
+        for mutate in [
+            |state: &mut MachineStateV0| {
+                state
+                    .journal
+                    .state
+                    .apply_transaction
+                    .as_mut()
+                    .expect("transaction")
+                    .next_command_lifecycle =
+                    NextCommandLifecycleV0::prepared("other-command".into());
+            },
+            |state: &mut MachineStateV0| {
+                state
+                    .journal
+                    .state
+                    .apply_transaction
+                    .as_mut()
+                    .expect("transaction")
+                    .prepared_intents[0]
+                    .command_id = "other-command".into();
+            },
+        ] {
+            let mut malformed_authority = fixture.issued.clone();
+            mutate(&mut malformed_authority);
+            let retained = malformed_authority.journal.clone();
+            // These malformed durable states cannot pass `reduce` recovery
+            // validation; call the guard directly to prove its predicate.
+            let mut commands = Vec::new();
+            mutation_not_issued(
+                &mut malformed_authority,
+                &tx.attempt_token,
+                &tx.id,
+                &fixture.first_command_id,
+                "near miss".into(),
+                &mut commands,
+            )
+            .unwrap();
+            assert!(matches!(
+                commands.as_slice(),
+                [CommandV0::IgnoredStale { .. }]
+            ));
+            assert_eq!(malformed_authority.journal, retained);
+            assert!(!commands.iter().any(|command| matches!(
+                command,
+                CommandV0::Persist { .. }
+                    | CommandV0::Mutate { .. }
+                    | CommandV0::RequestRender { .. }
+            )));
+        }
     }
 
     fn restart_to_revalidation(state: MachineStateV0) -> MachineStateV0 {
