@@ -12,7 +12,8 @@ use futures_util::future::select_all;
 use oxideloop_bundle_contract::BundleDescriptorV0;
 use oxideloop_controller_api::{AutomationRunSpec, InventoryEntry, ObjectIdentity, StateBody};
 use oxideloop_controller_core::{
-    AutomationRunCleanupV0, DesiredObservationV0, PhaseV0 as CorePhaseV0, RecoveryProofV0,
+    AutomationRunCleanupV0, DesiredObservationV0, DesiredProjectionV0, PhaseV0 as CorePhaseV0,
+    RecoveryProofV0,
 };
 use oxideloop_kube_transport::{
     AutomationCompletionAckV0, AutomationRunExpectationV0, AutomationRunObservationBarrierV0,
@@ -1758,6 +1759,7 @@ impl RetainedObservationBarrierV0 {
         root: &ObjectRefV0,
         root_uid: &str,
         desired_identities: &[ObjectIdentity],
+        desired_resources: &[oxideloop_renderer_abi::model::ResourceDeclaration],
         durable_inventory: &[InventoryEntry],
     ) -> Result<Vec<DesiredObservationV0>, RuntimeErrorV0> {
         let mut requested = BTreeMap::new();
@@ -1777,7 +1779,25 @@ impl RetainedObservationBarrierV0 {
                 ));
             }
             match final_objects.get(&key).and_then(Option::as_ref) {
-                Some(object) => observations.push(desired_observation(root, root_uid, object)?),
+                Some(object) => observations.push(desired_observation_with_desired(
+                    root,
+                    root_uid,
+                    object,
+                    desired_resources.iter().find_map(|resource| {
+                        let metadata = resource.object.get("metadata")?.as_object()?;
+                        (resource.object.get("apiVersion")?.as_str()
+                            == Some(identity.api_version.as_str())
+                            && resource.object.get("kind")?.as_str()
+                                == Some(identity.kind.as_str())
+                            && metadata.get("name")?.as_str() == Some(identity.name.as_str())
+                            && metadata
+                                .get("namespace")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or(root.namespace.as_str())
+                                == identity.namespace)
+                            .then_some(&resource.object)
+                    }),
+                )?),
                 None => observations.push(absent_desired_observation(identity)?),
             }
         }
@@ -1842,6 +1862,7 @@ impl RetainedObservationBarrierV0 {
             &session.root,
             &session.root_uid,
             &session.desired_identities,
+            &session.desired_resources,
             &session.durable_inventory,
         )?;
         let (sequence, token) = loop {
@@ -2012,6 +2033,15 @@ pub fn desired_observation(
     root_uid: &str,
     object: &ObjectV0,
 ) -> Result<DesiredObservationV0, RuntimeErrorV0> {
+    desired_observation_with_desired(root, root_uid, object, None)
+}
+
+fn desired_observation_with_desired(
+    root: &ObjectRefV0,
+    root_uid: &str,
+    object: &ObjectV0,
+    desired: Option<&serde_json::Value>,
+) -> Result<DesiredObservationV0, RuntimeErrorV0> {
     if root.resource != ResourceKindV0::WebApplication
         || root.namespace.is_empty()
         || root.name.is_empty()
@@ -2027,17 +2057,43 @@ pub fn desired_observation(
         ResourceKindV0::Service => "v1/services",
         _ => return Err(RuntimeErrorV0::Hold("unsupported observed resource".into())),
     };
-    let recovery_proof = match exact_recovery_annotations(object, root_uid) {
-        Some((transaction_id, command_id)) if exact_controller_owner(object, root, root_uid) => {
-            Some(RecoveryProofV0 {
-                root_uid: root_uid.into(),
-                transaction_id,
-                command_id,
-                uid: object.metadata.uid.clone(),
-                resource_version: object.metadata.resource_version.clone(),
-            })
-        }
-        _ => None,
+    let response_annotations_present = object
+        .metadata
+        .annotations
+        .contains_key(oxideloop_kube_transport::TRANSACTION_ID_ANNOTATION)
+        || object
+            .metadata
+            .annotations
+            .contains_key(oxideloop_kube_transport::COMMAND_ID_ANNOTATION);
+    let response_annotations = exact_recovery_annotations(object, root_uid);
+    let ordinary_owner = exact_controller_owner(object, root, root_uid)
+        && object
+            .metadata
+            .annotations
+            .get(oxideloop_kube_transport::ROOT_UID_ANNOTATION)
+            == Some(&root_uid.to_string())
+        && (!response_annotations_present || response_annotations.is_some());
+    let recovery_proof = if ordinary_owner {
+        let (transaction_id, command_id) = response_annotations.unwrap_or_default();
+        let desired_projection = match desired {
+            Some(desired)
+                if oxideloop_kube_transport::same_desired_semantics(&object.value, desired) =>
+            {
+                DesiredProjectionV0::Matches
+            }
+            Some(_) => DesiredProjectionV0::Differs,
+            None => DesiredProjectionV0::Untrusted,
+        };
+        Some(RecoveryProofV0 {
+            root_uid: root_uid.into(),
+            transaction_id,
+            command_id,
+            uid: object.metadata.uid.clone(),
+            resource_version: object.metadata.resource_version.clone(),
+            desired_projection,
+        })
+    } else {
+        None
     };
     Ok(DesiredObservationV0 {
         identity: ObjectIdentity {

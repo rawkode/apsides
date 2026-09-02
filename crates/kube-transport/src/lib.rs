@@ -5309,14 +5309,30 @@ impl KubeTransportV0 {
             MutationDecision::Post { .. } => None,
             _ => Some(reference.clone()),
         };
-        let fence = self
+        let fence = match self
             .reread_fence_with_target_in_operation(
                 address,
                 &command.preconditions,
                 target.as_ref(),
                 session,
             )
-            .await?;
+            .await
+        {
+            Ok(fence) => fence,
+            // The target/root/state fence is entirely before
+            // `authorize_dispatch` and before the transport claims its one
+            // child write. A stale read is therefore definitive no-write
+            // evidence for this exact command, not a response-loss boundary.
+            Err(TransportErrorV0::Stale(reason)) => {
+                return Ok(mutation_not_issued_outcome(
+                    transaction_id,
+                    attempt_token,
+                    &command.command_id,
+                    reason,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         // Reject stale target identity claims before the final State gate. No
         // authorization read is needed when the command is already known to
         // be non-mutating, and this preserves the zero-write stale-target
@@ -5328,7 +5344,12 @@ impl KubeTransportV0 {
                         || target.metadata.resource_version != preconditions.resource_version
                 }) =>
             {
-                return Err(TransportErrorV0::Stale("mutation delete pins"));
+                return Ok(mutation_not_issued_outcome(
+                    transaction_id,
+                    attempt_token,
+                    &command.command_id,
+                    "mutation delete pins",
+                ));
             }
             MutationDecision::ConditionalApply { expected, .. }
                 if fence.target.as_ref().is_some_and(|target| {
@@ -5336,9 +5357,10 @@ impl KubeTransportV0 {
                         || target.metadata.resource_version != expected.resource_version
                 }) =>
             {
-                return Ok(mutation_failed_outcome(
+                return Ok(mutation_not_issued_outcome(
                     transaction_id,
                     attempt_token,
+                    &command.command_id,
                     "conditional apply target identity is stale",
                 ));
             }
@@ -9034,6 +9056,22 @@ fn mutation_failed_outcome(
     ))
 }
 
+fn mutation_not_issued_outcome(
+    transaction_id: &str,
+    attempt_token: &str,
+    command_id: &str,
+    reason: &str,
+) -> CommandOutcomeV0 {
+    CommandOutcomeV0::Event(Box::new(
+        oxideloop_controller_core::EventV0::MutationNotIssued {
+            transaction_id: transaction_id.into(),
+            attempt_token: attempt_token.into(),
+            command_id: command_id.into(),
+            reason: reason.into(),
+        },
+    ))
+}
+
 fn owned_by(object: &ObjectV0, root_uid: &str) -> bool {
     object.metadata.owner_uids.iter().any(|uid| uid == root_uid)
 }
@@ -10474,7 +10512,10 @@ fn has_exact_canonical_owner(object: &ObjectV0, root: &ObjectRefV0, root_uid: &s
                 })
         })
 }
-fn same_desired_semantics(observed: &Value, desired: &Value) -> bool {
+/// Compares only controller-owned desired fields after callers have separately
+/// authenticated the exact controller owner and root-UID annotation. Runtime
+/// annotations are write/recovery plumbing, not renderer semantics.
+pub fn same_desired_semantics(observed: &Value, desired: &Value) -> bool {
     let kind = observed.get("kind").and_then(Value::as_str);
     let metadata_matches = if kind == Some("Deployment") {
         exact_deployment_metadata(observed, desired)
@@ -10503,10 +10544,18 @@ fn exact_deployment_metadata(observed: &Value, desired: &Value) -> bool {
         return false;
     };
     annotations.remove("deployment.kubernetes.io/revision");
-    let desired_annotations = desired
+    annotations.remove(ROOT_UID_ANNOTATION);
+    annotations.remove(TRANSACTION_ID_ANNOTATION);
+    annotations.remove(COMMAND_ID_ANNOTATION);
+    let mut desired_annotations = desired
         .pointer("/metadata/annotations")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(annotations) = desired_annotations.as_object_mut() {
+        annotations.remove(ROOT_UID_ANNOTATION);
+        annotations.remove(TRANSACTION_ID_ANNOTATION);
+        annotations.remove(COMMAND_ID_ANNOTATION);
+    }
     let labels = |value: &Value| {
         value
             .pointer("/metadata/labels")
@@ -10674,8 +10723,17 @@ fn exact_metadata(observed: &Value, desired: &Value) -> bool {
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}))
     };
+    let strip_runtime_annotations = |mut annotations: Value| {
+        if let Some(annotations) = annotations.as_object_mut() {
+            annotations.remove(ROOT_UID_ANNOTATION);
+            annotations.remove(TRANSACTION_ID_ANNOTATION);
+            annotations.remove(COMMAND_ID_ANNOTATION);
+        }
+        annotations
+    };
     map(observed, "labels") == map(desired, "labels")
-        && map(observed, "annotations") == map(desired, "annotations")
+        && strip_runtime_annotations(map(observed, "annotations"))
+            == strip_runtime_annotations(map(desired, "annotations"))
 }
 
 fn may_recover_response_loss(error: &TransportErrorV0) -> bool {

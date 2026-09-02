@@ -50,7 +50,10 @@ use oxideloop_kube_transport::{
     completed_unlinked_bootstrap_cleanup_bundle_v1,
 };
 use oxideloop_renderer_abi::{
-    model::{ActionInputV0, ActionOutputV0, Dependency, RenderInputV0, RenderOutputV0},
+    model::{
+        ActionInputV0, ActionOutputV0, Dependency, RenderInputV0, RenderOutputV0,
+        ResourceDeclaration,
+    },
     parse_validate_action_output, parse_validate_render_output,
 };
 use oxideloop_renderer_protocol::{
@@ -223,6 +226,7 @@ pub(crate) enum EffectAcknowledgementClassV0 {
     Revalidated,
     MutationAcknowledged,
     MutationFailed,
+    MutationNotIssued,
     Other,
 }
 
@@ -233,6 +237,7 @@ impl EffectAcknowledgementClassV0 {
             Self::Revalidated => "revalidated",
             Self::MutationAcknowledged => "mutation_acknowledged",
             Self::MutationFailed => "mutation_failed",
+            Self::MutationNotIssued => "mutation_not_issued",
             Self::Other => "other",
         }
     }
@@ -1120,6 +1125,7 @@ impl RootActorV0 {
             dependencies: final_result.dependencies.clone(),
             coverage_dependencies,
             desired_identities,
+            desired_resources: final_result.output.resources.clone(),
             durable_inventory: durable.inventory.clone(),
             durable_prune_tokens,
             retained_barrier,
@@ -2341,6 +2347,23 @@ impl RootActorV0 {
                 },
             ) => transaction_id == event_transaction_id && attempt_token == event_attempt_token,
             (
+                CommandV0::Mutate {
+                    transaction_id,
+                    attempt_token,
+                    commands,
+                },
+                EventV0::MutationNotIssued {
+                    transaction_id: event_transaction_id,
+                    attempt_token: event_attempt_token,
+                    command_id,
+                    ..
+                },
+            ) => {
+                transaction_id == event_transaction_id
+                    && attempt_token == event_attempt_token
+                    && matches!(commands.as_slice(), [command] if command.command_id == *command_id)
+            }
+            (
                 CommandV0::EnsureAutomationRun {
                     token, name, spec, ..
                 },
@@ -2691,6 +2714,7 @@ fn effect_acknowledgement_class(event: &EventV0) -> EffectAcknowledgementClassV0
         EventV0::Revalidated { .. } => EffectAcknowledgementClassV0::Revalidated,
         EventV0::MutationAcknowledged { .. } => EffectAcknowledgementClassV0::MutationAcknowledged,
         EventV0::MutationFailed { .. } => EffectAcknowledgementClassV0::MutationFailed,
+        EventV0::MutationNotIssued { .. } => EffectAcknowledgementClassV0::MutationNotIssued,
         EventV0::BootstrapAcknowledged { .. }
         | EventV0::Persisted { .. }
         | EventV0::RootStatusPersisted { .. }
@@ -4191,6 +4215,7 @@ struct CompletedObservationSessionV0 {
     dependencies: Vec<Dependency>,
     coverage_dependencies: Vec<Dependency>,
     desired_identities: Vec<ObjectIdentity>,
+    desired_resources: Vec<ResourceDeclaration>,
     durable_inventory: Vec<InventoryEntry>,
     durable_prune_tokens: Vec<String>,
     retained_barrier: BarrierV0,
@@ -8215,6 +8240,7 @@ mod tests {
                         .clone(),
                     uid: entry.uid.clone(),
                     resource_version: entry.resource_version.clone(),
+                    desired_projection: oxideloop_controller_core::DesiredProjectionV0::Untrusted,
                 }),
                 deletion_recovery_proof: None,
             })

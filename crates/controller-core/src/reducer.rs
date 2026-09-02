@@ -572,6 +572,21 @@ pub struct RecoveryProofV0 {
     pub command_id: String,
     pub uid: String,
     pub resource_version: String,
+    /// The adapter's sealed comparison of the current object and the final
+    /// renderer body. Transaction/command annotations below remain solely for
+    /// response-loss recovery; normal desired reconciliation uses this
+    /// projection plus the inventory UID.
+    #[serde(default)]
+    pub desired_projection: DesiredProjectionV0,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DesiredProjectionV0 {
+    #[default]
+    Untrusted,
+    Matches,
+    Differs,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -670,6 +685,15 @@ pub enum EventV0 {
     MutationFailed {
         attempt_token: String,
         transaction_id: String,
+        reason: String,
+    },
+    /// Transport proved it had not claimed a child write for this exact
+    /// dispatch. Unlike `MutationFailed`, this is safe to discard durably and
+    /// re-observe even though dispatch authorization was already persisted.
+    MutationNotIssued {
+        attempt_token: String,
+        transaction_id: String,
+        command_id: String,
         reason: String,
     },
     EstablishAutomationBaseline {
@@ -1145,6 +1169,19 @@ pub fn reduce(mut state: MachineStateV0, event: EventV0) -> Result<TransitionV0,
             reason,
             &mut commands,
         ),
+        EventV0::MutationNotIssued {
+            attempt_token,
+            transaction_id,
+            command_id,
+            reason,
+        } => mutation_not_issued(
+            &mut state,
+            &attempt_token,
+            &transaction_id,
+            &command_id,
+            reason,
+            &mut commands,
+        )?,
         EventV0::EstablishAutomationBaseline { trigger } => {
             if state.phase != PhaseV0::Ready {
                 stale(&mut commands, "automation baseline phase mismatch");
@@ -3807,6 +3844,53 @@ fn mutation_failed(
     }
 }
 
+fn mutation_not_issued(
+    state: &mut MachineStateV0,
+    attempt: &str,
+    id: &str,
+    command_id: &str,
+    _reason: String,
+    commands: &mut Vec<CommandV0>,
+) -> Result<(), ReconcileError> {
+    let exact_unissued = matches!(
+        state.phase,
+        PhaseV0::MutationPending | PhaseV0::DeletionMutationPending
+    ) && state
+        .journal
+        .state
+        .apply_transaction
+        .as_ref()
+        .is_some_and(|tx| {
+            tx.id == id
+                && tx.attempt_token == attempt
+                && matches!(
+                    &tx.next_command_lifecycle,
+                    NextCommandLifecycleV0 {
+                        state: NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued,
+                        command_id: Some(next),
+                    } if next == command_id
+                )
+                && next_unrecorded_intent(tx).is_some_and(|intent| intent.command_id == command_id)
+        });
+    if !exact_unissued {
+        stale(
+            commands,
+            "mutation-not-issued identifiers do not match the authorized command",
+        );
+        return Ok(());
+    }
+    // This closed event is emitted only by transport before its write claim.
+    // It is therefore the one exception to the normal may-have-issued hold.
+    state
+        .journal
+        .state
+        .apply_transaction
+        .as_mut()
+        .expect("checked above")
+        .next_command_lifecycle = NextCommandLifecycleV0::prepared(command_id.into());
+    safely_invalidate_transaction(state, commands)
+}
+
 fn deletion_advance(
     state: &mut MachineStateV0,
     commands: &mut Vec<CommandV0>,
@@ -4897,6 +4981,10 @@ struct Plan {
     /// prepare or issue an effect. This is intentionally populated only from
     /// the typed mutation-model path below, never an error string.
     foreign_collisions: Vec<ForeignCollisionTargetV0>,
+    /// Same-incarnation, projection-equal observations whose RV is a benign
+    /// server/co-writer advance. These are persisted with Prepare but never
+    /// turn into a child mutation.
+    inventory_refreshes: Vec<(ObjectIdentity, String)>,
     dependencies: Vec<DependencySnapshot>,
     candidate: Option<PruneCandidate>,
     absent: Vec<ObjectIdentity>,
@@ -5085,6 +5173,7 @@ fn plan_graph(
     let mut intents = Vec::new();
     let mut decisions = BTreeMap::new();
     let mut foreign_collisions = Vec::new();
+    let mut inventory_refreshes = Vec::new();
     if output.document.disposition != RenderDisposition::Hold {
         for resource in &output.document.resources {
             let identity = identity_from_object(&resource.object, &state.root.namespace)?;
@@ -5105,6 +5194,19 @@ fn plan_graph(
                 .inventory
                 .iter()
                 .find(|item| item.identity == identity);
+            let projection =
+                observed
+                    .recovery_proof
+                    .as_ref()
+                    .and_then(|proof| match &observed.observation {
+                        Observation::Existing { identity }
+                            if proof.uid == identity.uid
+                                && proof.resource_version == identity.resource_version =>
+                        {
+                            Some(proof.desired_projection)
+                        }
+                        _ => None,
+                    });
             let intent = match (&observed.observation, inventory) {
                 (Observation::Absent, _) => MutationIntent::Create {
                     observation: observed.observation.clone(),
@@ -5120,6 +5222,24 @@ fn plan_graph(
                             uid: known.uid.clone(),
                             resource_version: known.resource_version.clone(),
                         },
+                        field_manager: "oxideloop-controller".into(),
+                        object: resource.object.clone(),
+                    }
+                }
+                (Observation::Existing { identity: actual }, Some(known))
+                    if actual.uid == known.uid
+                        && projection == Some(DesiredProjectionV0::Matches) =>
+                {
+                    inventory_refreshes.push((identity.clone(), actual.resource_version.clone()));
+                    continue;
+                }
+                (Observation::Existing { identity: actual }, Some(known))
+                    if actual.uid == known.uid
+                        && projection == Some(DesiredProjectionV0::Differs) =>
+                {
+                    MutationIntent::Apply {
+                        observation: observed.observation.clone(),
+                        expected: actual.clone(),
                         field_manager: "oxideloop-controller".into(),
                         object: resource.object.clone(),
                     }
@@ -5209,10 +5329,11 @@ fn plan_graph(
             };
             match observed.observation {
                 Observation::Absent => absent.push(inventory.identity.clone()),
-                Observation::Existing { identity: actual }
-                    if actual.uid == inventory.uid
-                        && actual.resource_version == inventory.resource_version =>
-                {
+                Observation::Existing { identity: actual } if actual.uid == inventory.uid => {
+                    let current_inventory = InventoryEntry {
+                        resource_version: actual.resource_version.clone(),
+                        ..inventory.clone()
+                    };
                     let complete_key = prune_key(state, inventory);
                     let matching_candidate = state
                         .journal
@@ -5221,7 +5342,8 @@ fn plan_graph(
                         .as_ref()
                         .is_some_and(|old| {
                             old.complete_key == complete_key
-                                && old.inventory == *inventory
+                                && old.inventory.identity == inventory.identity
+                                && old.inventory.uid == inventory.uid
                                 && old.first_observation.observed_resource_version
                                     == actual.resource_version
                                 && old.first_observation.observed_generation
@@ -5253,16 +5375,16 @@ fn plan_graph(
                             operation: ApplyOperation::Delete,
                             identity: inventory.identity.clone(),
                             logical_id: inventory.logical_id.clone(),
-                            expected_uid: Some(inventory.uid.clone()),
-                            expected_resource_version: Some(inventory.resource_version.clone()),
+                            expected_uid: Some(actual.uid.clone()),
+                            expected_resource_version: Some(actual.resource_version.clone()),
                         });
                         decisions.insert(
                             command_id,
                             MutationDecision::PreconditionedDelete {
                                 method: HttpMethod::Delete,
                                 preconditions: MutationIdentity {
-                                    uid: inventory.uid.clone(),
-                                    resource_version: inventory.resource_version.clone(),
+                                    uid: actual.uid.clone(),
+                                    resource_version: actual.resource_version.clone(),
                                 },
                             },
                         );
@@ -5273,7 +5395,7 @@ fn plan_graph(
                         candidate = Some(state.journal.state.prune_candidate.clone().map_or_else(
                             || PruneCandidate {
                                 complete_key,
-                                inventory: inventory.clone(),
+                                inventory: current_inventory.clone(),
                                 first_observation: PruneObservation {
                                     observed_resource_version: actual.resource_version.clone(),
                                     observed_generation: frozen.root_generation,
@@ -5286,6 +5408,7 @@ fn plan_graph(
                                 }),
                             },
                             |mut old| {
+                                old.inventory = current_inventory.clone();
                                 old.second_observation = Some(PruneObservation {
                                     observed_resource_version: actual.resource_version.clone(),
                                     observed_generation: frozen.root_generation,
@@ -5294,10 +5417,10 @@ fn plan_graph(
                                 old
                             },
                         ));
-                    } else if candidate.is_none() {
+                    } else {
                         candidate = Some(PruneCandidate {
                             complete_key,
-                            inventory: inventory.clone(),
+                            inventory: current_inventory,
                             first_observation: PruneObservation {
                                 observed_resource_version: actual.resource_version,
                                 observed_generation: frozen.root_generation,
@@ -5321,6 +5444,7 @@ fn plan_graph(
         intents,
         decisions,
         foreign_collisions,
+        inventory_refreshes,
         dependencies,
         candidate,
         absent,
@@ -5349,6 +5473,20 @@ fn prepare(
         .state
         .inventory
         .retain(|item| !plan.absent.contains(&item.identity));
+    for (identity, resource_version) in &plan.inventory_refreshes {
+        let Some(entry) = state
+            .journal
+            .state
+            .inventory
+            .iter_mut()
+            .find(|entry| entry.identity == *identity)
+        else {
+            return Err(ReconcileError::Mutation(
+                "projection refresh lost its durable inventory entry".into(),
+            ));
+        };
+        entry.resource_version.clone_from(resource_version);
+    }
     // An absent or UID/RV-mismatched object explicitly removes a candidate;
     // only this plan's exact observation may establish a new first/second one.
     state.journal.state.prune_candidate = plan.candidate;
@@ -6779,6 +6917,7 @@ mod tests {
             command_id: result.command_id.clone(),
             uid: uid.into(),
             resource_version: resource_version.into(),
+            desired_projection: DesiredProjectionV0::Untrusted,
         });
         let completion = reduce(
             revalidate_completion.state.clone(),
@@ -9453,6 +9592,7 @@ mod tests {
             command_id,
             uid: "created-uid".into(),
             resource_version: "30".into(),
+            desired_projection: DesiredProjectionV0::Untrusted,
         });
         let recovery_state_resource_version = render.state.root.state_resource_version.clone();
         let recovered_result = reduce(
@@ -9958,6 +10098,7 @@ mod tests {
                             }
                         },
                         resource_version: "30".into(),
+                        desired_projection: DesiredProjectionV0::Untrusted,
                     });
                 }
                 observation
@@ -10364,6 +10505,7 @@ mod tests {
                 command_id: command_id.clone(),
                 uid: "replacement-uid".into(),
                 resource_version: "11".into(),
+                desired_projection: DesiredProjectionV0::Untrusted,
             }),
             deletion_recovery_proof: None,
         };
@@ -10600,6 +10742,7 @@ mod tests {
             command_id: first_result.command_id.clone(),
             uid: "uid-one".into(),
             resource_version: "30".into(),
+            desired_projection: DesiredProjectionV0::Untrusted,
         });
         let mut changed_output: RenderOutputV0 = serde_json::from_str(&output_json).unwrap();
         changed_output
@@ -10711,6 +10854,7 @@ mod tests {
             command_id: second_result.command_id.clone(),
             uid: "uid-two".into(),
             resource_version: "31".into(),
+            desired_projection: DesiredProjectionV0::Untrusted,
         });
         let completion = reduce(
             after_second.state.clone(),

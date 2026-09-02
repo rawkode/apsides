@@ -10,7 +10,7 @@ mod reducer;
 
 pub use reducer::{
     ActionTriggerV0, AutomationRunCleanupV0, CommandV0, DeletionAuthorityModeV0,
-    DeletionRecoveryProofV0, DesiredObservationV0, EventV0, FrozenInputV0,
+    DeletionRecoveryProofV0, DesiredObservationV0, DesiredProjectionV0, EventV0, FrozenInputV0,
     InternalReconcileCauseV0, MachineStateV0, MutationCommandV0, PendingAutomationV0,
     PendingRootStatusV0, PhaseV0, PreconditionsV0, ReconcileError, RecoveryProofV0, RootSnapshotV0,
     RootStatusContinuationPayloadV0, RootStatusContinuationV0, RuntimeStateV0, TransitionV0,

@@ -537,6 +537,7 @@ fn changed_graph_and_wrong_or_a_b_a_proof_hold_without_mutation() {
         command_id: "c".repeat(64),
         uid: "wrong-uid".into(),
         resource_version: "99".into(),
+        desired_projection: oxideloop_controller_core::DesiredProjectionV0::Untrusted,
     });
     let proof = reduce(
         render.state.clone(),
@@ -566,6 +567,7 @@ fn changed_graph_and_wrong_or_a_b_a_proof_hold_without_mutation() {
         command_id: "c".repeat(64),
         uid: "created-uid".into(),
         resource_version: "30".into(),
+        desired_projection: oxideloop_controller_core::DesiredProjectionV0::Untrusted,
     });
     let proof = reduce(
         render.state.clone(),

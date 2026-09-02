@@ -2790,24 +2790,30 @@ async fn stale_delete_target_is_non_mutating_and_not_response_loss_recovery() {
         "observed-rv",
         false,
     ));
-    assert_eq!(
-        transport
-            .dispatch(
-                &RootAddressV0 {
-                    namespace: "tenant-a".into(),
-                    name: "app-a".into(),
-                    state_name: "state-a".into(),
-                },
-                &delete_command(
-                    ResourceKindV0::ConfigMap,
-                    "cm-a",
-                    "prepared-uid",
-                    "prepared-rv"
-                ),
-            )
-            .await,
-        Err(TransportErrorV0::Stale("mutation delete pins"))
-    );
+    let outcome = transport
+        .dispatch(
+            &RootAddressV0 {
+                namespace: "tenant-a".into(),
+                name: "app-a".into(),
+                state_name: "state-a".into(),
+            },
+            &delete_command(
+                ResourceKindV0::ConfigMap,
+                "cm-a",
+                "prepared-uid",
+                "prepared-rv",
+            ),
+        )
+        .await
+        .expect("pre-write target mismatch emits a closed no-write event");
+    assert!(matches!(
+        outcome,
+        super::CommandOutcomeV0::Event(event)
+            if matches!(event.as_ref(), oxideloop_controller_core::EventV0::MutationNotIssued {
+                transaction_id, attempt_token, reason, ..
+            } if transaction_id == "tx" && attempt_token == &"a".repeat(64)
+                && reason == "mutation delete pins")
+    ));
     api.assert_drained();
 }
 

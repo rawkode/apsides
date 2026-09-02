@@ -1,4 +1,4 @@
-use oxideloop_controller_core::{AutomationRunCleanupV0, RecoveryProofV0};
+use oxideloop_controller_core::{AutomationRunCleanupV0, DesiredProjectionV0, RecoveryProofV0};
 
 #[test]
 fn downstream_can_construct_recovery_and_cleanup_protocol_types() {
@@ -8,6 +8,7 @@ fn downstream_can_construct_recovery_and_cleanup_protocol_types() {
         command_id: "a".repeat(64),
         uid: "uid".into(),
         resource_version: "7".into(),
+        desired_projection: DesiredProjectionV0::Untrusted,
     };
     let cleanup = AutomationRunCleanupV0 {
         occurrence_id: "occurrence".into(),
