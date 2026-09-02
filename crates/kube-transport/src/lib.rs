@@ -10550,11 +10550,20 @@ pub fn same_desired_semantics(observed: &Value, desired: &Value) -> bool {
     // Evaluate omission against the raw API objects.  Canonicalizing defaults
     // before this step would turn a previously controller-owned default into
     // an invisible omission, leaving the manager unable to relinquish it.
-    if owned_field_omitted(&fields, observed, desired, "") {
+    if owned_field_omitted(&fields, observed, desired, "")
+        || owned_atomic_object_diff(&fields, observed, desired, "")
+    {
+        return false;
+    }
+    // Coverage is measured against the authored object, rather than its
+    // default-expanded projection. Kubernetes owns many defaulted fields;
+    // requiring our fieldset to cover those would make an unchanged Service
+    // or Deployment apply forever after the first successful SSA.
+    if !fields_cover_desired(&fields, desired, "") {
         return false;
     }
     let (observed, desired) = canonical_semantic_pair(observed, desired);
-    fields_cover_desired(&fields, &desired, "") && desired_is_subset(&observed, &desired, "")
+    desired_is_subset(&observed, &desired, "")
 }
 
 /// Returns the union of every applicable controller Apply fieldset.  A
@@ -10767,7 +10776,7 @@ fn fields_cover_desired(
     };
     desired
         .iter()
-        .filter(|(key, _)| !matches!(key.as_str(), "apiVersion" | "kind" | "status"))
+        .filter(|(key, value)| !unmanaged_declared_field(path, key, value))
         .all(|(key, value)| {
             let Some(field) = fields.get(&format!("f:{key}")) else {
                 return false;
@@ -10775,10 +10784,29 @@ fn fields_cover_desired(
             let Some(children) = field.as_object() else {
                 return false;
             };
-            children.is_empty()
-                || children.contains_key(".")
-                || fields_cover_value(children, value, &join_path(path, key))
+            match value {
+                Value::Object(_) | Value::Array(_) => {
+                    fields_cover_value(children, value, &join_path(path, key))
+                }
+                _ => true,
+            }
         })
+}
+
+fn unmanaged_identity_field(path: &str, field: &str) -> bool {
+    matches!(field, "apiVersion" | "kind" | "status")
+        || (path == "/metadata" && matches!(field, "name" | "namespace"))
+}
+
+fn unmanaged_declared_field(path: &str, field: &str, value: &Value) -> bool {
+    unmanaged_identity_field(path, field)
+        || (path.is_empty()
+            && field == "metadata"
+            && value.as_object().is_some_and(|metadata| {
+                metadata
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "name" | "namespace"))
+            }))
 }
 
 fn fields_cover_value(
@@ -10787,6 +10815,10 @@ fn fields_cover_value(
     path: &str,
 ) -> bool {
     match desired {
+        // An empty map is FieldsV1's atomic-object ownership form (for
+        // example Deployment.spec.selector). `owned_atomic_object_diff`
+        // supplies the required exact comparison for that case.
+        Value::Object(_) if fields.is_empty() => true,
         Value::Object(_) => fields_cover_desired(fields, desired, path),
         Value::Array(items) => match associative_keys(path) {
             Some(_) => items.iter().all(|item| {
@@ -10799,9 +10831,7 @@ fn fields_cover_value(
                             .and_then(|v| v.as_object().cloned())
                             .is_some_and(|selector| {
                                 selector_match(item, &selector)
-                                    && (child.is_empty()
-                                        || child.contains_key(".")
-                                        || fields_cover_value(child, item, &format!("{path}[]")))
+                                    && fields_cover_value(child, item, &format!("{path}[]"))
                             })
                     })
             }),
@@ -10809,6 +10839,46 @@ fn fields_cover_value(
         },
         _ => true,
     }
+}
+
+/// `{}` in FieldsV1 owns an atomic value, not every descendant of a map or
+/// associative-list member. For an atomic object we must compare the whole
+/// value so an owned selector/member cannot silently retain removed fields.
+fn owned_atomic_object_diff(
+    fields: &serde_json::Map<String, Value>,
+    observed: &Value,
+    desired: &Value,
+    path: &str,
+) -> bool {
+    fields.iter().any(|(key, child)| {
+        if key == "." {
+            return false;
+        }
+        if let Some(field) = key.strip_prefix("f:") {
+            let field_path = join_path(path, field);
+            if ignored_semantic_path(&field_path) {
+                return false;
+            }
+            let actual = observed.get(field);
+            let wanted = desired.get(field);
+            let Some(child) = child.as_object() else { return true; };
+            if child.is_empty() {
+                return matches!((actual, wanted), (Some(Value::Object(actual)), Some(Value::Object(wanted))) if actual != wanted);
+            }
+            match (actual, wanted) {
+                (Some(actual), Some(wanted)) => owned_atomic_object_diff(child, actual, wanted, &field_path),
+                _ => false,
+            }
+        } else if let Some(selector) = key.strip_prefix("k:") {
+            let Ok(selector) = serde_json::from_str::<Value>(selector) else { return true; };
+            let Some(selector) = selector.as_object() else { return true; };
+            let Some(actual) = observed.as_array().and_then(|items| items.iter().find(|item| selector_match(item, selector))) else { return false; };
+            let Some(wanted) = desired.as_array().and_then(|items| items.iter().find(|item| selector_match(item, selector))) else { return false; };
+            child.as_object().is_none_or(|child| owned_atomic_object_diff(child, actual, wanted, &format!("{path}[]")))
+        } else {
+            true
+        }
+    })
 }
 
 fn join_path(path: &str, field: &str) -> String {
@@ -11189,6 +11259,58 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::atomic::AtomicUsize;
     use tower::service_fn;
+
+    /// Produces a captured-style FieldsV1 shape for the sealed test object:
+    /// maps recurse by `f:` fields and supported associative lists use `k:`
+    /// members plus `.` membership. Identity is intentionally absent because
+    /// Kubernetes does not normally attribute it to an Apply manager.
+    fn fields_v1_for(value: &Value, path: &str) -> Value {
+        match value {
+            Value::Object(object) => Value::Object(
+                object
+                    .iter()
+                    .filter(|(key, _)| !unmanaged_identity_field(path, key))
+                    .filter_map(|(key, value)| {
+                        let next = join_path(path, key);
+                        let child = match value {
+                            Value::Object(_) | Value::Array(_) => fields_v1_for(value, &next),
+                            _ => json!({}),
+                        };
+                        if path == "" && key == "metadata" && child == json!({}) {
+                            None
+                        } else {
+                            Some((format!("f:{key}"), child))
+                        }
+                    })
+                    .collect(),
+            ),
+            Value::Array(items) => match associative_keys(path) {
+                Some(keys) => Value::Object(
+                    items
+                        .iter()
+                        .filter_map(|item| {
+                            let item = item.as_object()?;
+                            let selector =
+                                keys.iter()
+                                    .try_fold(serde_json::Map::new(), |mut out, key| {
+                                        let value = item.get(*key).cloned().or_else(|| {
+                                            (*key == "protocol").then(|| json!("TCP"))
+                                        })?;
+                                        out.insert((*key).into(), value);
+                                        Some(out)
+                                    })?;
+                            let mut child =
+                                fields_v1_for(&Value::Object(item.clone()), &format!("{path}[]"));
+                            child.as_object_mut()?.insert(".".into(), json!({}));
+                            Some((format!("k:{}", Value::Object(selector)), child))
+                        })
+                        .collect(),
+                ),
+                None => json!({}),
+            },
+            _ => json!({}),
+        }
+    }
 
     struct FakePort(Vec<ObjectV0>);
 
@@ -15179,7 +15301,7 @@ mod tests {
             json!("TCP");
         observed["metadata"]["managedFields"] = json!([{
             "manager":"oxideloop-controller", "operation":"Apply", "fieldsType":"FieldsV1",
-            "apiVersion":"apps/v1", "fieldsV1":{"f:metadata":{},"f:spec":{}}
+            "apiVersion":"apps/v1", "fieldsV1":fields_v1_for(&desired, "")
         }]);
         assert!(same_desired_semantics(&observed, &desired));
         observed["spec"]["template"]["spec"]["containers"][0]["image"] = json!("other");
@@ -15217,7 +15339,7 @@ mod tests {
             "data":{"message":"hello"}
         });
         let fields = json!({
-            "f:metadata":{"f:name":{},"f:namespace":{},"f:labels":{"f:owned":{}}},
+            "f:metadata":{"f:labels":{"f:owned":{}}},
             "f:data":{"f:message":{}}
         });
         let observed = |managed_fields: Value| {
@@ -15236,9 +15358,7 @@ mod tests {
 
         assert!(same_desired_semantics(
             &observed(json!([
-                entry(
-                    json!({"f:metadata":{"f:name":{},"f:namespace":{},"f:labels":{"f:owned":{}}}})
-                ),
+                entry(json!({"f:metadata":{"f:labels":{"f:owned":{}}}})),
                 entry(json!({"f:data":{"f:message":{}}}))
             ])),
             &desired
@@ -15285,7 +15405,7 @@ mod tests {
         observed["data"]["retired"] = json!("remove");
         observed["metadata"]["managedFields"] = json!([{
             "manager":CONTROLLER_FIELD_MANAGER, "operation":"Apply", "fieldsType":"FieldsV1", "apiVersion":"v1",
-            "fieldsV1":{"f:metadata":{"f:name":{},"f:namespace":{},"f:labels":{"f:wanted":{},"f:retired":{}}},"f:data":{"f:wanted":{},"f:retired":{}}}
+            "fieldsV1":{"f:metadata":{"f:labels":{"f:wanted":{},"f:retired":{}}},"f:data":{"f:wanted":{},"f:retired":{}}}
         }]);
         assert!(!same_desired_semantics(&observed, &desired));
     }
@@ -15315,9 +15435,51 @@ mod tests {
             .push(json!({"containerPort":9090}));
         observed["metadata"]["managedFields"] = json!([{
             "manager":CONTROLLER_FIELD_MANAGER, "operation":"Apply", "fieldsType":"FieldsV1", "apiVersion":"apps/v1",
-            "fieldsV1":{"f:metadata":{},"f:spec":{}}
+            "fieldsV1":fields_v1_for(&desired, "")
         }]);
         assert!(same_desired_semantics(&observed, &desired));
+    }
+
+    #[test]
+    fn captured_service_fields_ignore_kubernetes_defaults_and_tcp_selector_default() {
+        let desired = json!({
+            "apiVersion":"v1", "kind":"Service", "metadata":{"name":"web","namespace":"demo"},
+            "spec":{"selector":{"app":"web"},"ports":[{"name":"http","port":80,"targetPort":80}]}
+        });
+        let mut observed = desired.clone();
+        observed["spec"]["type"] = json!("ClusterIP");
+        observed["spec"]["sessionAffinity"] = json!("None");
+        observed["spec"]["internalTrafficPolicy"] = json!("Cluster");
+        observed["spec"]["ports"][0]["protocol"] = json!("TCP");
+        observed["metadata"]["managedFields"] = json!([{
+            "manager":CONTROLLER_FIELD_MANAGER, "operation":"Apply", "fieldsType":"FieldsV1", "apiVersion":"v1",
+            "fieldsV1":{"f:spec":{"f:selector":{},"f:ports":{"k:{\"port\":80,\"protocol\":\"TCP\"}":{".":{},"f:name":{},"f:port":{},"f:targetPort":{}}}}}
+        }]);
+        assert!(same_desired_semantics(&observed, &desired));
+        observed["spec"]["selector"]["app"] = json!("other");
+        assert!(!same_desired_semantics(&observed, &desired));
+    }
+
+    #[test]
+    fn prior_owned_associative_env_and_port_removals_do_not_match() {
+        let desired = json!({
+            "apiVersion":"apps/v1", "kind":"Deployment", "metadata":{"name":"web","namespace":"demo"},
+            "spec":{"replicas":1,"template":{"spec":{"containers":[{"name":"web","image":"example/web","env":[{"name":"KEEP","value":"yes"}],"ports":[{"containerPort":8080}]}]}}}
+        });
+        let mut observed = desired.clone();
+        observed["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name":"RETIRED","value":"remove"}));
+        observed["spec"]["template"]["spec"]["containers"][0]["ports"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"containerPort":9090}));
+        observed["metadata"]["managedFields"] = json!([{
+            "manager":CONTROLLER_FIELD_MANAGER, "operation":"Apply", "fieldsType":"FieldsV1", "apiVersion":"apps/v1",
+            "fieldsV1":fields_v1_for(&observed, "")
+        }]);
+        assert!(!same_desired_semantics(&observed, &desired));
     }
 
     #[test]
@@ -15377,7 +15539,7 @@ mod tests {
         observed.value["spec"]["replicas"] = json!(1);
         observed.value["metadata"]["managedFields"] = json!([{
             "manager":"oxideloop-controller", "operation":"Apply", "fieldsType":"FieldsV1",
-            "apiVersion":"apps/v1", "fieldsV1":{"f:metadata":{},"f:spec":{}}
+            "apiVersion":"apps/v1", "fieldsV1":fields_v1_for(&desired.value, "")
         }]);
         assert!(
             recover_dropped_write_exact(

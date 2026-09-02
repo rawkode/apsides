@@ -695,8 +695,8 @@ pub enum EventV0 {
         transaction_id: String,
         reason: String,
     },
-    /// Transport proved it had not claimed a child write for this exact
-    /// dispatch. Unlike `MutationFailed`, this is safe to discard durably and
+    /// Transport proved this exact, non-retried request did not change its
+    /// target. Unlike `MutationFailed`, this is safe to discard durably and
     /// re-observe even though dispatch authorization was already persisted.
     MutationNotIssued {
         attempt_token: String,
@@ -3906,8 +3906,11 @@ fn mutation_not_issued(
         );
         return Ok(());
     }
-    // This closed event is emitted only by transport before its write claim.
-    // It is therefore the one exception to the normal may-have-issued hold.
+    // This closed event proves the exact request did not mutate its target.
+    // Most paths establish that before the child-write claim; an HTTP 409 is
+    // observed after claiming/polling the one request slot, but is still a
+    // definitive rejection of that non-retried request. It is therefore the
+    // one exception to the normal may-have-issued hold.
     state
         .journal
         .state
@@ -10204,6 +10207,66 @@ mod tests {
             output,
             response_observed,
             first_command_id,
+        }
+    }
+
+    #[test]
+    fn mutation_not_issued_requires_exact_authorized_command_before_invalidation() {
+        let fixture = issued_ssa_response_loss_fixture(false);
+        let tx = fixture
+            .issued
+            .journal
+            .state
+            .apply_transaction
+            .as_ref()
+            .expect("issued transaction")
+            .clone();
+        let exact = reduce(
+            fixture.issued.clone(),
+            EventV0::MutationNotIssued {
+                transaction_id: tx.id.clone(),
+                attempt_token: tx.attempt_token.clone(),
+                command_id: fixture.first_command_id.clone(),
+                reason: "definitive pre-write rejection".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            exact.commands.as_slice(),
+            [CommandV0::Persist { operation, .. }]
+                if operation.purpose == PersistPurpose::Invalidate
+        ));
+        assert!(!exact.commands.iter().any(|command| matches!(
+            command,
+            CommandV0::Mutate { .. } | CommandV0::RequestRender { .. }
+        )));
+
+        for event in [
+            EventV0::MutationNotIssued {
+                transaction_id: "wrong".into(),
+                attempt_token: tx.attempt_token.clone(),
+                command_id: fixture.first_command_id.clone(),
+                reason: "x".into(),
+            },
+            EventV0::MutationNotIssued {
+                transaction_id: tx.id.clone(),
+                attempt_token: "wrong".into(),
+                command_id: fixture.first_command_id.clone(),
+                reason: "x".into(),
+            },
+            EventV0::MutationNotIssued {
+                transaction_id: tx.id.clone(),
+                attempt_token: tx.attempt_token.clone(),
+                command_id: "wrong".into(),
+                reason: "x".into(),
+            },
+        ] {
+            let rejected = reduce(fixture.issued.clone(), event).unwrap();
+            assert!(matches!(
+                rejected.commands.as_slice(),
+                [CommandV0::IgnoredStale { .. }]
+            ));
+            assert_eq!(rejected.state.journal, fixture.issued.journal);
         }
     }
 
