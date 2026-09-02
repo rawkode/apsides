@@ -2798,6 +2798,9 @@ pub enum ResourceKindV0 {
     OxideLoopState,
     AutomationRun,
     ConfigMap,
+    /// Exactly the constrained apps/v1 Deployment v1 projection emitted by
+    /// the controller TSX compiler.
+    Deployment,
     /// v0 supports only `ClusterIP` Services (including headless `clusterIP:
     /// None`); external and node-port modes are rejected before any request.
     Service,
@@ -2894,6 +2897,11 @@ pub const fn required_rbac_v0() -> &'static [RequiredRbacV0] {
             verbs: &["get", "list", "watch", "create", "patch", "delete"],
         },
         RequiredRbacV0 {
+            resource: ResourceKindV0::Deployment,
+            subresource: None,
+            verbs: &["get", "list", "watch", "create", "patch", "delete"],
+        },
+        RequiredRbacV0 {
             resource: ResourceKindV0::Service,
             subresource: None,
             verbs: &["get", "list", "watch", "create", "patch", "delete"],
@@ -2913,6 +2921,7 @@ impl ResourceKindV0 {
             Self::WebApplication => "demo.oxideloop.dev/v1alpha1",
             Self::OxideLoopState | Self::AutomationRun => "runtime.oxideloop.dev/v1alpha1",
             Self::ConfigMap | Self::Service => "v1",
+            Self::Deployment => "apps/v1",
             Self::Event => "events.k8s.io/v1",
         }
     }
@@ -2924,6 +2933,7 @@ impl ResourceKindV0 {
             Self::OxideLoopState => "OxideLoopState",
             Self::AutomationRun => "AutomationRun",
             Self::ConfigMap => "ConfigMap",
+            Self::Deployment => "Deployment",
             Self::Service => "Service",
             Self::Event => "Event",
         }
@@ -3287,7 +3297,10 @@ impl DeletionWatchFilterV0 {
         match resource {
             ResourceKindV0::WebApplication => object.reference.name == self.root_name,
             ResourceKindV0::OxideLoopState => object.reference.name == self.state_name,
-            ResourceKindV0::ConfigMap | ResourceKindV0::Service | ResourceKindV0::AutomationRun => {
+            ResourceKindV0::ConfigMap
+            | ResourceKindV0::Deployment
+            | ResourceKindV0::Service
+            | ResourceKindV0::AutomationRun => {
                 object
                     .metadata
                     .owner_uids
@@ -4647,6 +4660,7 @@ impl KubeTransportV0 {
                     .await?;
                 for resource in [
                     ResourceKindV0::ConfigMap,
+                    ResourceKindV0::Deployment,
                     ResourceKindV0::Service,
                     ResourceKindV0::AutomationRun,
                 ] {
@@ -5752,6 +5766,9 @@ impl KubeTransportV0 {
             ResourceKindV0::ConfigMap => {
                 self.create_config_map_in_operation(&desired, session).await
             }
+            ResourceKindV0::Deployment => {
+                self.create_deployment_in_operation(&desired, session).await
+            }
             ResourceKindV0::Service => self.create_service_in_operation(&desired, session).await,
             _ => return Err(TransportErrorV0::UnsupportedTarget),
         };
@@ -5788,6 +5805,16 @@ impl KubeTransportV0 {
                 self.apply(
                     &desired,
                     ResourceKindV0::ConfigMap,
+                    &target.metadata.resource_version,
+                    true,
+                    session,
+                )
+                .await
+            }
+            ResourceKindV0::Deployment => {
+                self.apply(
+                    &desired,
+                    ResourceKindV0::Deployment,
                     &target.metadata.resource_version,
                     true,
                     session,
@@ -5866,6 +5893,16 @@ impl KubeTransportV0 {
                 self.delete(
                     reference,
                     ResourceKindV0::ConfigMap,
+                    &expected.uid,
+                    &expected.resource_version,
+                    session,
+                )
+                .await
+            }
+            ResourceKindV0::Deployment => {
+                self.delete(
+                    reference,
+                    ResourceKindV0::Deployment,
                     &expected.uid,
                     &expected.resource_version,
                     session,
@@ -6148,6 +6185,7 @@ impl KubeTransportV0 {
             ResourceKindV0::WebApplication,
             ResourceKindV0::OxideLoopState,
             ResourceKindV0::ConfigMap,
+            ResourceKindV0::Deployment,
             ResourceKindV0::Service,
             ResourceKindV0::AutomationRun,
         ];
@@ -6171,6 +6209,7 @@ impl KubeTransportV0 {
                 if matches!(
                     resource,
                     ResourceKindV0::ConfigMap
+                        | ResourceKindV0::Deployment
                         | ResourceKindV0::Service
                         | ResourceKindV0::AutomationRun
                 ) {
@@ -6231,7 +6270,11 @@ impl KubeTransportV0 {
         }
 
         let mut inventory = Vec::new();
-        for resource in [ResourceKindV0::ConfigMap, ResourceKindV0::Service] {
+        for resource in [
+            ResourceKindV0::ConfigMap,
+            ResourceKindV0::Deployment,
+            ResourceKindV0::Service,
+        ] {
             let listed = self
                 .list_exact_in_operation(resource, &address.namespace, operation)
                 .await?;
@@ -6934,6 +6977,7 @@ impl KubeTransportV0 {
             .await?;
         for resource in [
             ResourceKindV0::ConfigMap,
+            ResourceKindV0::Deployment,
             ResourceKindV0::Service,
             ResourceKindV0::AutomationRun,
         ] {
@@ -6986,6 +7030,7 @@ impl KubeTransportV0 {
             .await?;
         for resource in [
             ResourceKindV0::ConfigMap,
+            ResourceKindV0::Deployment,
             ResourceKindV0::Service,
             ResourceKindV0::AutomationRun,
         ] {
@@ -7539,6 +7584,14 @@ impl KubeTransportV0 {
         self.create(object, ResourceKindV0::ConfigMap, operation)
             .await
     }
+    async fn create_deployment_in_operation(
+        &self,
+        object: &ObjectV0,
+        operation: &OperationSessionV0,
+    ) -> Result<ObjectV0, TransportErrorV0> {
+        self.create(object, ResourceKindV0::Deployment, operation)
+            .await
+    }
     /// Creates only core `Service` objects.
     #[cfg(test)]
     #[allow(dead_code)]
@@ -7913,6 +7966,7 @@ fn api_resource(resource: ResourceKindV0) -> ApiResource {
         ResourceKindV0::OxideLoopState => ("runtime.oxideloop.dev", "v1alpha1", "oxideloopstates"),
         ResourceKindV0::AutomationRun => ("runtime.oxideloop.dev", "v1alpha1", "automationruns"),
         ResourceKindV0::ConfigMap => ("", "v1", "configmaps"),
+        ResourceKindV0::Deployment => ("apps", "v1", "deployments"),
         ResourceKindV0::Service => ("", "v1", "services"),
         ResourceKindV0::Event => ("events.k8s.io", "v1", "events"),
     };
@@ -9657,6 +9711,7 @@ fn bootstrap_root_link_proof(observed: &ObjectV0, before: &ObjectV0, state: &Obj
 fn reference_from_identity(identity: &ObjectIdentity) -> Result<ObjectRefV0, TransportErrorV0> {
     let resource = match (identity.api_version.as_str(), identity.kind.as_str()) {
         ("v1", "ConfigMap") => ResourceKindV0::ConfigMap,
+        ("apps/v1", "Deployment") => ResourceKindV0::Deployment,
         ("v1", "Service") => ResourceKindV0::Service,
         _ => return Err(TransportErrorV0::UnsupportedTarget),
     };
@@ -9950,10 +10005,211 @@ pub fn validate_desired_object(
     {
         return Err(TransportErrorV0::MetadataSmuggling);
     }
-    if expected.resource == ResourceKindV0::Service && !is_supported_service_v0(object) {
-        return Err(TransportErrorV0::UnsupportedTarget);
+    match expected.resource {
+        ResourceKindV0::Service if !is_supported_service_v0(object) => {
+            return Err(TransportErrorV0::UnsupportedTarget);
+        }
+        ResourceKindV0::Deployment if !is_supported_deployment_v1(object) => {
+            return Err(TransportErrorV0::UnsupportedTarget);
+        }
+        _ => {}
     }
     Ok(())
+}
+
+fn only_keys(map: &serde_json::Map<String, Value>, allowed: &[&str]) -> bool {
+    map.keys().all(|key| allowed.contains(&key.as_str()))
+}
+
+fn nonempty_string_map(value: Option<&Value>) -> Option<&serde_json::Map<String, Value>> {
+    let map = value?.as_object()?;
+    if map.is_empty()
+        || map
+            .iter()
+            .any(|(key, value)| key.is_empty() || value.as_str().is_none_or(str::is_empty))
+    {
+        None
+    } else {
+        Some(map)
+    }
+}
+
+/// Admission for precisely the Deployment shape emitted by controller.tsx/v1.
+/// It deliberately rejects the broader Kubernetes Deployment surface: new
+/// fields must first gain an explicit compiler and projection contract.
+fn is_supported_deployment_v1(object: &Value) -> bool {
+    let Some(root) = object.as_object() else {
+        return false;
+    };
+    if !only_keys(root, &["apiVersion", "kind", "metadata", "spec"]) {
+        return false;
+    }
+    let Some(metadata) = root.get("metadata").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(labels) = nonempty_string_map(metadata.get("labels")) else {
+        return false;
+    };
+    let Some(spec) = root.get("spec").and_then(Value::as_object) else {
+        return false;
+    };
+    if !only_keys(spec, &["replicas", "selector", "template"])
+        || spec
+            .get("replicas")
+            .is_some_and(|value| value.as_u64().is_none())
+    {
+        return false;
+    }
+    let Some(selector) = spec.get("selector").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(match_labels) = selector.get("matchLabels").and_then(Value::as_object) else {
+        return false;
+    };
+    if !only_keys(selector, &["matchLabels"]) || match_labels != labels {
+        return false;
+    }
+    let Some(template) = spec.get("template").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(template_metadata) = template.get("metadata").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(template_labels) = template_metadata.get("labels").and_then(Value::as_object) else {
+        return false;
+    };
+    if !only_keys(template, &["metadata", "spec"])
+        || !only_keys(template_metadata, &["labels"])
+        || template_labels != labels
+    {
+        return false;
+    }
+    let Some(pod) = template.get("spec").and_then(Value::as_object) else {
+        return false;
+    };
+    if !only_keys(pod, &["securityContext", "containers"]) {
+        return false;
+    }
+    if let Some(security) = pod.get("securityContext") {
+        let Some(security) = security.as_object() else {
+            return false;
+        };
+        if !only_keys(security, &["runAsNonRoot"])
+            || security
+                .get("runAsNonRoot")
+                .and_then(Value::as_bool)
+                .is_none()
+        {
+            return false;
+        }
+    }
+    let Some(containers) = pod.get("containers").and_then(Value::as_array) else {
+        return false;
+    };
+    if containers.is_empty() {
+        return false;
+    }
+    let mut names = BTreeSet::new();
+    containers.iter().all(|container| {
+        let Some(container) = container.as_object() else {
+            return false;
+        };
+        if !only_keys(container, &["name", "image", "ports", "env", "resources"])
+            || container
+                .get("name")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || container
+                .get("image")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || !names.insert(
+                container
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+        {
+            return false;
+        }
+        if let Some(ports) = container.get("ports") {
+            let Some(ports) = ports.as_array() else {
+                return false;
+            };
+            let mut port_names = BTreeSet::new();
+            if ports.is_empty()
+                || !ports.iter().all(|port| {
+                    let Some(port) = port.as_object() else {
+                        return false;
+                    };
+                    only_keys(port, &["name", "containerPort"])
+                        && port
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| !name.is_empty() && port_names.insert(name))
+                        && port
+                            .get("containerPort")
+                            .and_then(Value::as_u64)
+                            .is_some_and(|number| (1..=65_535).contains(&number))
+                })
+            {
+                return false;
+            }
+        }
+        if let Some(environment) = container.get("env") {
+            let Some(environment) = environment.as_array() else {
+                return false;
+            };
+            let mut environment_names = BTreeSet::new();
+            if environment.is_empty()
+                || !environment.iter().all(|entry| {
+                    let Some(entry) = entry.as_object() else {
+                        return false;
+                    };
+                    let reference = entry
+                        .get("valueFrom")
+                        .and_then(|value| value.get("configMapKeyRef"))
+                        .and_then(Value::as_object);
+                    only_keys(entry, &["name", "valueFrom"])
+                        && entry
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| !name.is_empty() && environment_names.insert(name))
+                        && reference.is_some_and(|reference| {
+                            only_keys(reference, &["name", "key"])
+                                && reference
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|name| !name.is_empty())
+                                && reference
+                                    .get("key")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|key| !key.is_empty())
+                        })
+                })
+            {
+                return false;
+            }
+        }
+        if let Some(resources) = container.get("resources") {
+            let Some(resources) = resources.as_object() else {
+                return false;
+            };
+            if !only_keys(resources, &["requests", "limits"])
+                || resources.is_empty()
+                || !resources.values().all(|requirements| {
+                    nonempty_string_map(Some(requirements)).is_some_and(|requirements| {
+                        requirements
+                            .keys()
+                            .all(|key| matches!(key.as_str(), "cpu" | "memory"))
+                    })
+                })
+            {
+                return false;
+            }
+        }
+        true
+    })
 }
 
 /// Conditional-apply inputs may carry only the observed UID/RV supplied by
@@ -10110,15 +10366,45 @@ fn has_exact_canonical_owner(object: &ObjectV0, root: &ObjectRefV0, root_uid: &s
         })
 }
 fn same_desired_semantics(observed: &Value, desired: &Value) -> bool {
-    exact_metadata(observed, desired)
+    let kind = observed.get("kind").and_then(Value::as_str);
+    let metadata_matches = if kind == Some("Deployment") {
+        exact_deployment_metadata(observed, desired)
+    } else {
+        exact_metadata(observed, desired)
+    };
+    metadata_matches
         && ["data", "binaryData", "immutable"]
             .iter()
             .all(|field| observed.get(*field) == desired.get(*field))
-        && if observed.get("kind").and_then(Value::as_str) == Some("Service") {
+        && if kind == Some("Service") {
             same_service_semantics(observed, desired)
+        } else if kind == Some("Deployment") {
+            same_deployment_semantics(observed, desired)
         } else {
             observed.get("spec") == desired.get("spec")
         }
+}
+
+fn exact_deployment_metadata(observed: &Value, desired: &Value) -> bool {
+    let mut observed_annotations = observed
+        .pointer("/metadata/annotations")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(annotations) = observed_annotations.as_object_mut() else {
+        return false;
+    };
+    annotations.remove("deployment.kubernetes.io/revision");
+    let desired_annotations = desired
+        .pointer("/metadata/annotations")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let labels = |value: &Value| {
+        value
+            .pointer("/metadata/labels")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}))
+    };
+    observed_annotations == desired_annotations && labels(observed) == labels(desired)
 }
 
 // Kubernetes allocates only these Service fields. Every other field remains
@@ -10131,6 +10417,100 @@ fn same_service_semantics(observed: &Value, desired: &Value) -> bool {
         return observed.get("spec").is_none();
     };
     canonical_service_spec(observed, Some(&desired)) == Some(desired)
+}
+
+fn same_deployment_semantics(observed: &Value, desired: &Value) -> bool {
+    let Some(desired) = canonical_deployment_spec(desired, None) else {
+        return observed.get("spec").is_none();
+    };
+    canonical_deployment_spec(observed, Some(&desired)) == Some(desired)
+}
+
+/// Removes only Kubernetes' documented default fields from an observed v1
+/// Deployment. DSL-owned fields remain exact; the projection is therefore
+/// suitable for both a harmless fresh-RV acknowledgement and response-loss
+/// recovery, never for adoption of a different Deployment.
+fn canonical_deployment_spec(value: &Value, desired: Option<&Value>) -> Option<Value> {
+    let mut spec = value.get("spec")?.clone();
+    let fields = spec.as_object_mut()?;
+    if desired.is_none() {
+        fields
+            .entry("replicas")
+            .or_insert_with(|| serde_json::json!(1));
+    } else {
+        let desired = desired?.as_object()?;
+        for (field, default) in [
+            ("progressDeadlineSeconds", serde_json::json!(600)),
+            ("revisionHistoryLimit", serde_json::json!(10)),
+            (
+                "strategy",
+                serde_json::json!({"type":"RollingUpdate","rollingUpdate":{"maxSurge":"25%","maxUnavailable":"25%"}}),
+            ),
+        ] {
+            if !desired.contains_key(field) && fields.get(field) == Some(&default) {
+                fields.remove(field);
+            }
+        }
+    }
+    let desired_template = desired.and_then(|desired| desired.pointer("/template/spec"));
+    let pod = fields
+        .get_mut("template")?
+        .get_mut("spec")?
+        .as_object_mut()?;
+    for (field, default) in [
+        ("dnsPolicy", serde_json::json!("ClusterFirst")),
+        ("restartPolicy", serde_json::json!("Always")),
+        ("schedulerName", serde_json::json!("default-scheduler")),
+        ("terminationGracePeriodSeconds", serde_json::json!(30)),
+        ("enableServiceLinks", serde_json::json!(true)),
+    ] {
+        if desired_template.is_none_or(|desired| desired.get(field).is_none())
+            && pod.get(field) == Some(&default)
+        {
+            pod.remove(field);
+        }
+    }
+    let desired_containers = desired_template
+        .and_then(|template| template.get("containers"))
+        .and_then(Value::as_array);
+    if let Some(containers) = pod.get_mut("containers").and_then(Value::as_array_mut) {
+        for (index, container) in containers.iter_mut().enumerate() {
+            let container = container.as_object_mut()?;
+            let desired_container = desired_containers.and_then(|items| items.get(index));
+            for (field, default) in [
+                (
+                    "terminationMessagePath",
+                    serde_json::json!("/dev/termination-log"),
+                ),
+                ("terminationMessagePolicy", serde_json::json!("File")),
+            ] {
+                if desired_container.is_none_or(|desired| desired.get(field).is_none())
+                    && container.get(field) == Some(&default)
+                {
+                    container.remove(field);
+                }
+            }
+            if desired_container.is_none_or(|desired| desired.get("imagePullPolicy").is_none()) {
+                container.remove("imagePullPolicy");
+            }
+            let desired_ports = desired_container
+                .and_then(|container| container.get("ports"))
+                .and_then(Value::as_array);
+            if let Some(ports) = container.get_mut("ports").and_then(Value::as_array_mut) {
+                for (port_index, port) in ports.iter_mut().enumerate() {
+                    let port = port.as_object_mut()?;
+                    if desired_ports
+                        .and_then(|ports| ports.get(port_index))
+                        .is_none_or(|desired| desired.get("protocol").is_none())
+                        && port.get("protocol") == Some(&serde_json::json!("TCP"))
+                    {
+                        port.remove("protocol");
+                    }
+                }
+            }
+        }
+    }
+    Some(spec)
 }
 
 /// Canonicalizes omission-only Kubernetes Service defaults. Allocations are
@@ -10342,6 +10722,7 @@ mod tests {
                     "annotations":annotations, "finalizers":[ROOT_FINALIZER],
                 },
                 "spec":{
+                    "image":"example.invalid/web:latest", "replicas":1,
                     "message":"bootstrap authority", "expose":false,
                     "program":{"configMapName":"bundle", "key":"program.mjs", "digest":"0000000000000000000000000000000000000000000000000000000000000000"}
                 },
@@ -10477,7 +10858,7 @@ mod tests {
                     "annotations":root_annotations, "deletionTimestamp":"2026-08-31T00:00:00Z",
                     "finalizers":[ROOT_FINALIZER],
                 },
-                "spec":{"message":"linked deletion", "expose":false,
+                "spec":{"image":"example.invalid/web:latest", "replicas":1, "message":"linked deletion", "expose":false,
                     "program":{"configMapName":"bundle", "key":"program.mjs", "digest":"0".repeat(64)}},
                 "status":{
                     "state":{"rootUid":"root-uid", "name":state_name, "uid":"state-uid"},
@@ -12543,7 +12924,7 @@ mod tests {
                 annotations: BTreeMap::new(),
                 owner_uids: vec![],
             },
-            value: json!({"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication","metadata":{"name":"app","namespace":"ns","uid":"root-uid","resourceVersion":"1","generation":1,"annotations":{},"finalizers":[]},"spec":{"program":{"digest":"bundle"}},"status":{}}),
+            value: json!({"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication","metadata":{"name":"app","namespace":"ns","uid":"root-uid","resourceVersion":"1","generation":1,"annotations":{},"finalizers":[]},"spec":{"image":"example.invalid/web:latest","expose":false,"program":{"digest":"bundle"}},"status":{}}),
         };
         let mut state_before = ObjectV0 {
             reference: state_ref.clone(),
@@ -12836,6 +13217,14 @@ mod tests {
         assert!(filter.relevant(
             ResourceKindV0::Service,
             &event(ResourceKindV0::Service, "owned", vec!["root-uid".into()])
+        ));
+        assert!(filter.relevant(
+            ResourceKindV0::Deployment,
+            &event(
+                ResourceKindV0::Deployment,
+                "owned-deployment",
+                vec!["root-uid".into()]
+            )
         ));
         assert!(filter.relevant(
             ResourceKindV0::AutomationRun,
@@ -13950,6 +14339,181 @@ mod tests {
     }
 
     #[test]
+    fn v1_deployment_admission_and_projection_are_sealed_to_the_generated_shape() {
+        let expected = ObjectRefV0 {
+            resource: ResourceKindV0::Deployment,
+            namespace: "demo".into(),
+            name: "portal".into(),
+        };
+        let desired = json!({
+            "apiVersion":"apps/v1",
+            "kind":"Deployment",
+            "metadata":{"name":"portal","namespace":"demo","labels":{"app":"portal"}},
+            "spec":{
+                "replicas":2,
+                "selector":{"matchLabels":{"app":"portal"}},
+                "template":{
+                    "metadata":{"labels":{"app":"portal"}},
+                    "spec":{
+                        "securityContext":{"runAsNonRoot":true},
+                        "containers":[{
+                            "name":"web",
+                            "image":"ghcr.io/example/web:v1",
+                            "ports":[{"name":"http","containerPort":8080}],
+                            "env":[{"name":"MESSAGE","valueFrom":{"configMapKeyRef":{"name":"portal-config","key":"message"}}}],
+                            "resources":{"requests":{"cpu":"10m","memory":"32Mi"},"limits":{"memory":"64Mi"}}
+                        }]
+                    }
+                }
+            }
+        });
+        assert_eq!(validate_desired_object(&desired, &expected), Ok(()));
+
+        let mut observed = desired.clone();
+        observed["metadata"]["uid"] = json!("deployment-uid");
+        observed["metadata"]["resourceVersion"] = json!("99");
+        observed["metadata"]["annotations"] = json!({"deployment.kubernetes.io/revision":"4"});
+        observed["status"] = json!({"readyReplicas":2});
+        observed["spec"]["progressDeadlineSeconds"] = json!(600);
+        observed["spec"]["revisionHistoryLimit"] = json!(10);
+        observed["spec"]["strategy"] = json!({"type":"RollingUpdate","rollingUpdate":{"maxSurge":"25%","maxUnavailable":"25%"}});
+        observed["spec"]["template"]["spec"]["dnsPolicy"] = json!("ClusterFirst");
+        observed["spec"]["template"]["spec"]["restartPolicy"] = json!("Always");
+        observed["spec"]["template"]["spec"]["schedulerName"] = json!("default-scheduler");
+        observed["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = json!(30);
+        observed["spec"]["template"]["spec"]["enableServiceLinks"] = json!(true);
+        observed["spec"]["template"]["spec"]["containers"][0]["imagePullPolicy"] =
+            json!("IfNotPresent");
+        observed["spec"]["template"]["spec"]["containers"][0]["terminationMessagePath"] =
+            json!("/dev/termination-log");
+        observed["spec"]["template"]["spec"]["containers"][0]["terminationMessagePolicy"] =
+            json!("File");
+        observed["spec"]["template"]["spec"]["containers"][0]["ports"][0]["protocol"] =
+            json!("TCP");
+        assert!(same_desired_semantics(&observed, &desired));
+        observed["spec"]["template"]["spec"]["containers"][0]["image"] = json!("other");
+        assert!(!same_desired_semantics(&observed, &desired));
+
+        for mutate in [
+            |value: &mut Value| value["spec"]["unexpected"] = json!(true),
+            |value: &mut Value| value["spec"]["selector"]["matchLabels"] = json!({"app":"other"}),
+            |value: &mut Value| {
+                value["spec"]["template"]["spec"]["containers"][0]["command"] = json!(["sh"]);
+            },
+            |value: &mut Value| {
+                value["spec"]["template"]["spec"]["containers"][0]["env"][0]["value"] =
+                    json!("smuggled");
+            },
+            |value: &mut Value| {
+                value["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]["nvidia.com/gpu"] =
+                    json!(1);
+            },
+        ] {
+            let mut invalid = desired.clone();
+            mutate(&mut invalid);
+            assert_eq!(
+                validate_desired_object(&invalid, &expected),
+                Err(TransportErrorV0::UnsupportedTarget)
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_response_loss_recovers_only_the_same_uid_projected_deployment() {
+        let root = ObjectV0 {
+            reference: ObjectRefV0 {
+                resource: ResourceKindV0::WebApplication,
+                namespace: "demo".into(),
+                name: "portal".into(),
+            },
+            metadata: ObjectMetaV0 {
+                uid: "root-uid".into(),
+                resource_version: "1".into(),
+                annotations: BTreeMap::new(),
+                owner_uids: vec![],
+            },
+            value: json!({}),
+        };
+        let reference = ObjectRefV0 {
+            resource: ResourceKindV0::Deployment,
+            namespace: "demo".into(),
+            name: "portal".into(),
+        };
+        let proof = json!({
+            "oxideloop.dev/root-uid":"root-uid",
+            "oxideloop.dev/transaction-id":"tx",
+            "oxideloop.dev/command-id":"command"
+        });
+        let body = json!({
+            "apiVersion":"apps/v1", "kind":"Deployment",
+            "metadata":{
+                "name":"portal", "namespace":"demo", "labels":{"app":"portal"},
+                "annotations":proof,
+                "ownerReferences":[{"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication","name":"portal","uid":"root-uid","controller":true,"blockOwnerDeletion":false}]
+            },
+            "spec":{"selector":{"matchLabels":{"app":"portal"}},"template":{"metadata":{"labels":{"app":"portal"}},"spec":{"containers":[{"name":"web","image":"ghcr.io/example/web:v1"}]}}}
+        });
+        let desired = ObjectV0 {
+            reference: reference.clone(),
+            metadata: ObjectMetaV0 {
+                uid: "deployment-uid".into(),
+                resource_version: "1".into(),
+                annotations: BTreeMap::from([
+                    (ROOT_UID_ANNOTATION.into(), "root-uid".into()),
+                    (TRANSACTION_ID_ANNOTATION.into(), "tx".into()),
+                    (COMMAND_ID_ANNOTATION.into(), "command".into()),
+                ]),
+                owner_uids: vec!["root-uid".into()],
+            },
+            value: body.clone(),
+        };
+        let mut observed = desired.clone();
+        observed.metadata.resource_version = "2".into();
+        observed.value["metadata"]["resourceVersion"] = json!("2");
+        observed.value["metadata"]["annotations"]["deployment.kubernetes.io/revision"] = json!("1");
+        observed.value["status"] = json!({"readyReplicas":1});
+        observed.value["spec"]["replicas"] = json!(1);
+        assert!(
+            recover_dropped_write_exact(
+                Some(&observed),
+                &desired,
+                &root,
+                Some("deployment-uid"),
+                "tx",
+                "command"
+            )
+            .is_ok()
+        );
+
+        let mut wrong_uid = observed.clone();
+        wrong_uid.metadata.uid = "replacement".into();
+        assert!(
+            recover_dropped_write_exact(
+                Some(&wrong_uid),
+                &desired,
+                &root,
+                Some("deployment-uid"),
+                "tx",
+                "command"
+            )
+            .is_err()
+        );
+        let mut drift = observed;
+        drift.value["spec"]["template"]["spec"]["containers"][0]["image"] = json!("other");
+        assert!(
+            recover_dropped_write_exact(
+                Some(&drift),
+                &desired,
+                &root,
+                Some("deployment-uid"),
+                "tx",
+                "command"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn recovery_needs_all_three_exact_annotations() {
         let mut actual = object();
         actual
@@ -14350,6 +14914,11 @@ mod tests {
                 },
                 RequiredRbacV0 {
                     resource: ResourceKindV0::ConfigMap,
+                    subresource: None,
+                    verbs: &["get", "list", "watch", "create", "patch", "delete"]
+                },
+                RequiredRbacV0 {
+                    resource: ResourceKindV0::Deployment,
                     subresource: None,
                     verbs: &["get", "list", "watch", "create", "patch", "delete"]
                 },

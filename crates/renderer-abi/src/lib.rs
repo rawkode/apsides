@@ -1,3 +1,4 @@
+mod action_context;
 mod canonical;
 pub mod generate;
 pub mod limits;
@@ -8,6 +9,10 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror::Error;
 
+pub use action_context::{
+    ACTION_CONTEXT_KEY_V1, ActionContextSourceV1, ActionContextV1, action_context_source_matches,
+    action_context_v1,
+};
 pub use canonical::{canonical_bytes, sha256_hex};
 pub use model::{ActionInputV0, ActionOutputV0, RenderInputV0, RenderOutputV0};
 pub use strict_json::parse_strict_value;
@@ -217,6 +222,7 @@ fn validate_render_output(output: &RenderOutputV0) -> Result<(), AbiError> {
             &automation.action_module_digest,
         )?;
         limits::validate_event_metadata(&automation.event_metadata)?;
+        action_context_v1(&automation.event_metadata)?;
         validate_automation_source_dependency(&automation.source_dependency)?;
     }
     Ok(())
@@ -291,6 +297,7 @@ fn validate_action_input(input: &ActionInputV0) -> Result<(), AbiError> {
     require_raw_digest("bundleDigest", &input.bundle_digest)?;
     require_raw_digest("actionModuleDigest", &input.action_module_digest)?;
     limits::validate_event_metadata(&input.event_metadata)?;
+    action_context_v1(&input.event_metadata)?;
     Ok(())
 }
 

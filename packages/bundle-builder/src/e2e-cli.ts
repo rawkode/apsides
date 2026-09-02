@@ -5,12 +5,13 @@ import { publishE2EBundle } from "./e2e-publish.js";
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
 function usage(): string {
-  return "Usage: pnpm bundle:e2e -- --out <archive> --metadata <metadata.json>";
+  return "Usage: pnpm bundle:e2e -- --out <archive> --metadata <metadata.json> [--source <controller-directory>]";
 }
 
-function parseArgs(args: readonly string[]): { outPath: string; metadataPath: string } {
+function parseArgs(args: readonly string[]): { outPath: string; metadataPath: string; sourceRoot: string } {
   let outPath: string | undefined;
   let metadataPath: string | undefined;
+  let sourceRoot: string | undefined;
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === "--") continue;
@@ -20,19 +21,24 @@ function parseArgs(args: readonly string[]): { outPath: string; metadataPath: st
     }
     if (argument === "--out") outPath = args[++index];
     else if (argument === "--metadata") metadataPath = args[++index];
+    else if (argument === "--source") sourceRoot = args[++index];
     else throw new Error(`unknown or incomplete argument: ${argument}`);
   }
   if (!outPath || !metadataPath) throw new Error(usage());
-  return { outPath: resolve(process.cwd(), outPath), metadataPath: resolve(process.cwd(), metadataPath) };
+  return {
+    outPath: resolve(process.cwd(), outPath),
+    metadataPath: resolve(process.cwd(), metadataPath),
+    sourceRoot: resolve(process.cwd(), sourceRoot ?? join(repositoryRoot, "packages/example-bundle/src")),
+  };
 }
 
 try {
-  const { outPath, metadataPath } = parseArgs(process.argv.slice(2));
+  const { outPath, metadataPath, sourceRoot } = parseArgs(process.argv.slice(2));
   await publishE2EBundle({
     repositoryRoot,
     outPath,
     metadataPath,
-    sourceRoot: join(repositoryRoot, "packages/example-bundle/src"),
+    sourceRoot,
   });
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));

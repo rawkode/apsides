@@ -1,23 +1,77 @@
-import { render } from "./render.js";
-import { action } from "./action.js";
-import type { RenderInputV0 } from "@oxideloop/sdk";
-import { readFileSync } from "node:fs";
+import { renderController } from "@oxideloop/kubernetes";
+import controller from "./controller.js";
 
-const BUNDLE_DIGEST = "a".repeat(64);
-const ACTION_DIGEST = "b".repeat(64);
-(globalThis as { __OXIDELOOP_ACTION_MODULE_DIGEST__?: string }).__OXIDELOOP_ACTION_MODULE_DIGEST__ = ACTION_DIGEST;
-const input = (spec: unknown, observations: RenderInputV0["observations"] = []): RenderInputV0 => ({ abiVersion: "renderer.oxideloop.dev/v0", root: { apiVersion: "demo.oxideloop.dev/v1alpha1", kind: "WebApplication", namespace: "demo", name: "portal", uid: "root-1", generation: 1, spec: spec as never }, bundleDigest: BUNDLE_DIGEST, cacheEpoch: "0", observationToken: "0", observations });
-const absent = render(input({ message: "hello", expose: false }));
-if (absent.resources.length !== 1 || absent.resources[0]?.logicalId !== "configmap/portal-config") throw new Error("absent input/expose false graph mismatch");
-if (absent.dependencies.length !== 1 || absent.automations.length !== 0) throw new Error("absent observations must not create an automation");
-const present = render(input({ message: "updated", expose: true }, [{ apiVersion: "v1", kind: "ConfigMap", namespace: "demo", name: "demo-input", uid: "input-1", resourceVersion: "2", value: { data: { flavor: "vanilla" } } }]));
-if (present.resources.length !== 2 || (present.resources[0]?.object as never as { data: Record<string, string> }).data.flavor !== "vanilla") throw new Error("present input enrichment mismatch");
-if (present.resources[1]?.logicalId !== "service/portal-service") throw new Error("expose true service mismatch");
-if (present.automations.length !== 1 || present.automations[0]?.bundleDigest !== BUNDLE_DIGEST || present.automations[0]?.actionModuleDigest !== ACTION_DIGEST) throw new Error("automation pinning mismatch");
-const tombstone = render(input({ message: "deleted", expose: true }, [{ apiVersion: "v1", kind: "ConfigMap", namespace: "demo", name: "demo-input", uid: "input-gone", resourceVersion: "3", value: null }]));
-if (tombstone.automations.length !== 0) throw new Error("tombstones must not create an automation");
-const tombstoneDependency = tombstone.dependencies[0];
-if (tombstone.dependencies.length !== 1 || tombstoneDependency?.type !== "object" || tombstoneDependency.uid !== null || tombstoneDependency.resourceVersion !== null) throw new Error("tombstone dependency must be absent");
-const expectedAction = JSON.parse(readFileSync(new URL("../fixtures/input-changed-action-output.json", import.meta.url), "utf8"));
-const actualAction = action({ occurrenceId: "occurrence-1", eventMetadata: { source: { namespace: "demo", name: "input" }, note: "updated" }, canonical: {} as never });
-if (JSON.stringify(actualAction) !== JSON.stringify(expectedAction)) throw new Error("checked-in action fixture mismatch");
+const baseInput = {
+  abiVersion: "renderer.oxideloop.dev/v0",
+  bundleDigest: "0".repeat(64),
+  cacheEpoch: "1",
+  observationToken: "token",
+  root: {
+    apiVersion: "demo.oxideloop.dev/v1alpha1",
+    kind: "WebApplication",
+    namespace: "demo",
+    name: "portal",
+    uid: "root-uid",
+    generation: 1,
+    spec: { image: "example/web:v1", replicas: 2, expose: true },
+  },
+  observations: [],
+};
+
+function render(input = baseInput) {
+  return renderController(controller, input);
+}
+
+interface RenderedObject {
+  readonly metadata?: { readonly name?: string };
+  readonly data?: { readonly message?: string };
+  readonly spec?: {
+    readonly replicas?: number;
+    readonly template?: { readonly spec?: { readonly containers?: ReadonlyArray<{ readonly image?: string }> } };
+    readonly ports?: ReadonlyArray<{ readonly targetPort?: string | number }>;
+  };
+}
+
+function resource(output: ReturnType<typeof render>, logicalId: string) {
+  const found = output.resources.find((candidate) => candidate.logicalId === logicalId);
+  if (!found) throw new Error(`missing ${logicalId} resource`);
+  return found.object as RenderedObject;
+}
+
+const exposed = render();
+if (exposed.resources.length !== 3) throw new Error("exposed controller must render three resources");
+const config = resource(exposed, "config");
+const deployment = resource(exposed, "deployment");
+const service = resource(exposed, "service");
+if (config.metadata?.name !== "portal-config" || config.data?.message !== "Hello from OxideLoop") {
+  throw new Error("controller did not render the expected fallback ConfigMap");
+}
+if (deployment.spec?.replicas !== 2 || deployment.spec?.template?.spec?.containers?.[0]?.image !== "example/web:v1") {
+  throw new Error("controller did not render the expected Deployment");
+}
+if (service.metadata?.name !== "portal-service" || service.spec?.ports?.[0]?.targetPort !== "http") {
+  throw new Error("controller did not render the expected Service");
+}
+if (exposed.dependencies.length !== 1 || (exposed.dependencies[0] as { name?: string } | undefined)?.name !== "demo-input") {
+  throw new Error("controller did not retain the demo-input dependency");
+}
+if (exposed.automations.length !== 0) throw new Error("absent demo-input must not create an automation");
+
+const hiddenService = render({
+  ...baseInput,
+  root: { ...baseInput.root, spec: { ...baseInput.root.spec, expose: false } },
+});
+if (hiddenService.resources.some((candidate) => candidate.logicalId === "service")) {
+  throw new Error("expose=false must omit the Service");
+}
+
+const zeroReplicas = render({
+  ...baseInput,
+  root: { ...baseInput.root, spec: { ...baseInput.root.spec, replicas: 0 } },
+});
+if (resource(zeroReplicas, "deployment").spec?.replicas !== 0) {
+  throw new Error("replicas=0 must remain zero");
+}
+
+// The action descriptor stays private to controller.tsx. Bundle-builder tests
+// execute it through the same compiler binding used by the renderer.

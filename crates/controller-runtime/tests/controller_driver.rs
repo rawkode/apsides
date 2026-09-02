@@ -105,6 +105,8 @@ fn receipt_bounded_root(
             },
         },
         "spec":{
+            "image":"example.invalid/web:latest",
+            "replicas":1,
             "message":"receipt-bounded deletion",
             "expose":false,
             "program":{
@@ -163,6 +165,8 @@ fn deleting_linked_root(
             "finalizers":["demo.oxideloop.dev/finalizer"],
         },
         "spec":{
+            "image":"example.invalid/web:latest",
+            "replicas":1,
             "message":"deletion barrier", "expose":false,
             "program":{"configMapName":"bundle","key":"program.mjs","digest":ROOT_ONLY_DIGEST},
         },
@@ -336,6 +340,7 @@ async fn root_only_deletion_composes_loader_reducer_transport_and_original_uid_a
             } else if matches!(
                 path.as_str(),
                 "/api/v1/namespaces/ns/configmaps"
+                    | "/apis/apps/v1/namespaces/ns/deployments"
                     | "/api/v1/namespaces/ns/services"
                     | "/apis/runtime.oxideloop.dev/v1alpha1/namespaces/ns/automationruns"
             ) && method == http::Method::GET

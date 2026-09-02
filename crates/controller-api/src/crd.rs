@@ -112,8 +112,70 @@ fn verify_generated_schema_contracts(document: &Value) -> Result<(), CrdError> {
                 ));
             }
         }
-        "WebApplication" => {}
+        "WebApplication" => verify_web_application_schema(document)?,
         _ => return Err(CrdError::Contract("unexpected generated CRD kind")),
+    }
+    Ok(())
+}
+
+fn verify_web_application_schema(document: &Value) -> Result<(), CrdError> {
+    let spec = document.pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec");
+    let required = spec
+        .and_then(|value| value.get("required"))
+        .and_then(Value::as_array)
+        .ok_or(CrdError::Contract(
+            "WebApplication required root fields are missing",
+        ))?;
+    let mut required: Vec<&str> = required.iter().filter_map(Value::as_str).collect();
+    required.sort_unstable();
+    if required != ["expose", "image", "program"] {
+        return Err(CrdError::Contract(
+            "WebApplication required root fields must be expose, image, and program",
+        ));
+    }
+
+    let properties = spec
+        .and_then(|value| value.get("properties"))
+        .and_then(Value::as_object)
+        .ok_or(CrdError::Contract(
+            "WebApplication root properties are missing",
+        ))?;
+    let image = properties
+        .get("image")
+        .ok_or(CrdError::Contract("WebApplication image schema is missing"))?;
+    if image.get("type").and_then(Value::as_str) != Some("string")
+        || image.get("minLength").and_then(Value::as_u64) != Some(1)
+        || image.get("maxLength").and_then(Value::as_u64) != Some(2_048)
+    {
+        return Err(CrdError::Contract(
+            "WebApplication image must be a nonempty string bounded to 2048 bytes",
+        ));
+    }
+
+    let replicas = properties.get("replicas").ok_or(CrdError::Contract(
+        "WebApplication replicas schema is missing",
+    ))?;
+    if replicas.get("type").and_then(Value::as_str) != Some("integer")
+        || replicas.get("format").and_then(Value::as_str) != Some("uint32")
+        || replicas.get("minimum").and_then(Value::as_f64) != Some(0.0)
+        || replicas.get("maximum").and_then(Value::as_f64) != Some(2_147_483_647.0)
+        || replicas.get("default").is_some()
+    {
+        return Err(CrdError::Contract(
+            "WebApplication replicas must be an optional 0..i32::MAX integer without a default",
+        ));
+    }
+
+    let message = properties.get("message").ok_or(CrdError::Contract(
+        "WebApplication legacy message schema is missing",
+    ))?;
+    if message.get("type").and_then(Value::as_str) != Some("string")
+        || message.get("minLength").and_then(Value::as_u64) != Some(1)
+        || message.get("maxLength").and_then(Value::as_u64) != Some(1_024)
+    {
+        return Err(CrdError::Contract(
+            "WebApplication legacy message must remain an optional bounded string",
+        ));
     }
     Ok(())
 }

@@ -2957,7 +2957,7 @@ fn desired_resource_identities(
                 .into(),
         };
         match (identity.api_version.as_str(), identity.kind.as_str()) {
-            ("v1", "ConfigMap" | "Service") => {}
+            ("v1", "ConfigMap" | "Service") | ("apps/v1", "Deployment") => {}
             _ => {
                 return Err(RuntimeErrorV0::Hold(
                     "completed observation fence contains an unsupported desired identity".into(),
@@ -3001,7 +3001,7 @@ pub(crate) fn coverage_dependencies(
             || identity.namespace != root_namespace
             || !matches!(
                 (identity.api_version.as_str(), identity.kind.as_str()),
-                ("v1", "ConfigMap" | "Service")
+                ("v1", "ConfigMap" | "Service") | ("apps/v1", "Deployment")
             )
         {
             return Err(RuntimeErrorV0::Hold(
@@ -4631,6 +4631,7 @@ pub async fn drive_automation<P: AutomationPortV0, R: RendererPortV0>(
 fn resource(api_version: &str, kind: &str) -> Result<ResourceKindV0, RuntimeErrorV0> {
     match (api_version, kind) {
         ("v1", "ConfigMap") => Ok(ResourceKindV0::ConfigMap),
+        ("apps/v1", "Deployment") => Ok(ResourceKindV0::Deployment),
         ("v1", "Service") => Ok(ResourceKindV0::Service),
         ("demo.oxideloop.dev/v1alpha1", "WebApplication") => Ok(ResourceKindV0::WebApplication),
         ("runtime.oxideloop.dev/v1alpha1", "OxideLoopState") => Ok(ResourceKindV0::OxideLoopState),
@@ -4700,7 +4701,9 @@ mod tests {
 
     fn root_spec(digest: impl Into<String>) -> WebApplicationSpec {
         WebApplicationSpec {
-            message: "hello".into(),
+            image: "example.invalid/web:latest".into(),
+            replicas: Some(1),
+            message: None,
             expose: false,
             program: ProgramBundleReference {
                 config_map_name: "bundle".into(),
@@ -6283,6 +6286,10 @@ mod tests {
                 response: deletion_response(deletion_list("ConfigMap", vec![])),
             },
             DeletionWireExpectation {
+                path: "/apis/apps/v1/namespaces/ns/deployments?".into(),
+                response: deletion_response(deletion_list("Deployment", vec![])),
+            },
+            DeletionWireExpectation {
                 path: "/api/v1/namespaces/ns/services?".into(),
                 response: deletion_response(deletion_list("Service", vec![])),
             },
@@ -6390,6 +6397,10 @@ mod tests {
             DeletionWireExpectation {
                 path: "/api/v1/namespaces/ns/configmaps/owned-config".into(),
                 response: deletion_response(config_value),
+            },
+            DeletionWireExpectation {
+                path: "/apis/apps/v1/namespaces/ns/deployments?".into(),
+                response: deletion_response(deletion_list("Deployment", vec![])),
             },
             DeletionWireExpectation {
                 path: "/api/v1/namespaces/ns/services?".into(),
@@ -8038,7 +8049,7 @@ mod tests {
         let mut independent = actor.state().root().clone();
         independent.root_resource_version = "root-rv-after-status".into();
         independent.status = persisted_status.clone();
-        independent.spec.message = "independent root change".into();
+        independent.spec.image = "example.invalid/independent:v2".into();
         assert!(
             actor.root_observed(independent),
             "only the complete exact self-echo is suppressible"
@@ -8061,7 +8072,7 @@ mod tests {
         );
 
         let mut changed = exact;
-        changed.spec.message = "independent edit".into();
+        changed.spec.replicas = Some(2);
         assert_eq!(
             witness.authenticate(&changed, 0),
             PrewriteRootAuthenticationV0::GenuineOrAmbiguous
@@ -10663,10 +10674,19 @@ mod tests {
             }),
             readiness: None,
         };
+        let deployment = ResourceDeclaration {
+            logical_id: "deployment".into(),
+            object: serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": "portal", "namespace": "ns"},
+            }),
+            readiness: None,
+        };
         let mut output = RenderOutputV0 {
             abi_version: ABI_VERSION_V0.into(),
             disposition: RenderDisposition::Apply,
-            resources: vec![config, service("managed")],
+            resources: vec![config, deployment, service("managed")],
             dependencies: vec![],
             automations: vec![],
             diagnostics: vec![],
@@ -10701,11 +10721,15 @@ mod tests {
             .expect("desired and durable inventory coverage is valid");
         assert_eq!(
             coverage.len(),
-            3,
+            4,
             "desired/inventory overlap is deduplicated"
         );
         assert!(coverage.iter().any(|dependency| matches!(dependency,
             Dependency::Object { kind, name, .. } if kind == "ConfigMap" && name == "removed"
+        )));
+        assert!(coverage.iter().any(|dependency| matches!(dependency,
+            Dependency::Object { api_version, kind, name, .. }
+                if api_version == "apps/v1" && kind == "Deployment" && name == "portal"
         )));
 
         output.resources.push(service("managed"));

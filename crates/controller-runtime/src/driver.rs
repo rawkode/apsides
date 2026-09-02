@@ -33,6 +33,7 @@ use oxideloop_kube_transport::{
     TransportErrorV0, WatchEventV0, WatchHandleV0,
 };
 use oxideloop_renderer_abi::{
+    action_context_source_matches, action_context_v1,
     limits::validate_event_metadata,
     model::{ABI_VERSION_V0, Dependency, RenderInputV0, RootProjection},
 };
@@ -1078,7 +1079,7 @@ impl ControllerDriverV0 {
                     if !blocked_foreign_collision
                         && active.state().phase() == PhaseV0::Ready
                         && !active.state().root().deleting
-                        && enqueue_next_automation_candidate(active, &mut automation_candidates)
+                        && enqueue_next_automation_candidate(active, &mut automation_candidates)?
                     {
                         // A candidate was just queued into the actor; do not
                         // consume another one until it completes its own
@@ -1444,6 +1445,25 @@ impl QueuedAutomationV0 {
     }
 }
 
+fn validate_action_context_trigger(trigger: &ActionTriggerV0) -> Result<(), RuntimeErrorV0> {
+    if let Some(context) = action_context_v1(&trigger.event_metadata).map_err(|error| {
+        RuntimeErrorV0::Hold(format!("queued v1 action-context is invalid: {error}"))
+    })? && !action_context_source_matches(
+        &context,
+        &trigger.source.api_version,
+        &trigger.source.kind,
+        &trigger.source.namespace,
+        &trigger.source.name,
+        &trigger.source_uid,
+        &trigger.source_resource_version,
+    ) {
+        return Err(RuntimeErrorV0::Hold(
+            "queued v1 action-context source does not match the durable automation trigger".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Moves exactly one still-pinned declaration into the actor. Callers must
 /// establish `Ready` before using it; returning `true` is independent of the
 /// number of candidates left, so a single declaration cannot strand a queued
@@ -1451,16 +1471,17 @@ impl QueuedAutomationV0 {
 fn enqueue_next_automation_candidate(
     actor: &mut RootActorV0,
     candidates: &mut VecDeque<QueuedAutomationV0>,
-) -> bool {
+) -> Result<bool, RuntimeErrorV0> {
     while let Some(candidate) = candidates.pop_front() {
         if candidate.matches(actor) {
+            validate_action_context_trigger(&candidate.trigger)?;
             actor.enqueue(EventV0::TriggerAutomation {
                 trigger: candidate.trigger,
             });
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 /// Converts only the stabilized, fence-complete render output into action
@@ -1558,6 +1579,24 @@ fn automation_candidates_from_final_render(
         if observation.value.is_null() {
             return Err(RuntimeErrorV0::Hold(
                 "final render automation source observation is absent".into(),
+            ));
+        }
+        if let Some(context) = action_context_v1(&declaration.event_metadata).map_err(|error| {
+            RuntimeErrorV0::Hold(format!(
+                "final render v1 action-context is invalid: {error}"
+            ))
+        })? && !action_context_source_matches(
+            &context,
+            api_version,
+            kind,
+            namespace,
+            name,
+            source_uid,
+            source_resource_version,
+        ) {
+            return Err(RuntimeErrorV0::Hold(
+                "final render v1 action-context source does not match the exact stabilized dependency"
+                    .into(),
             ));
         }
         let source = ObjectIdentity {
@@ -3039,6 +3078,7 @@ fn is_automation_watch_terminal(error: &TransportErrorV0) -> bool {
 
 fn is_dependency_watch_terminal(error: &TransportErrorV0) -> bool {
     is_watch_terminal_for(error, ResourceKindV0::ConfigMap)
+        || is_watch_terminal_for(error, ResourceKindV0::Deployment)
         || is_watch_terminal_for(error, ResourceKindV0::Service)
         || is_watch_terminal_for(error, ResourceKindV0::WebApplication)
         || is_watch_terminal_for(error, ResourceKindV0::OxideLoopState)
@@ -3950,7 +3990,9 @@ mod tests {
                 name: "root".into(),
                 generation: 1,
                 spec: WebApplicationSpec {
-                    message: "driver automation".into(),
+                    image: "example.invalid/web:latest".into(),
+                    replicas: Some(1),
+                    message: None,
                     expose: false,
                     program,
                 },
@@ -3984,7 +4026,9 @@ mod tests {
                     name: "root".into(),
                     generation: 1,
                     spec: WebApplicationSpec {
-                        message: "pending automation".into(),
+                        image: "example.invalid/web:latest".into(),
+                        replicas: Some(1),
+                        message: None,
                         expose: false,
                         program: ProgramBundleReference {
                             config_map_name: "bundle".into(),
@@ -4047,7 +4091,9 @@ mod tests {
                 name: "root".into(),
                 generation: 1,
                 spec: WebApplicationSpec {
-                    message: "coverage race".into(),
+                    image: "example.invalid/web:latest".into(),
+                    replicas: Some(1),
+                    message: None,
                     expose: false,
                     program: ProgramBundleReference {
                         config_map_name: "bundle".into(),
@@ -4598,6 +4644,24 @@ mod tests {
         }
     }
 
+    fn action_context_metadata() -> serde_json::Value {
+        json!({
+            "$oxideloop": {
+                "kind": "action-context",
+                "version": "v1",
+                "source": {
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "namespace": "ns",
+                    "name": "source",
+                    "uid": "source-uid",
+                    "resourceVersion": "7"
+                },
+                "metadata": {"$oxideloop": {"user": true}, "reason": "source transition"}
+            }
+        })
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     fn wire_json(value: serde_json::Value) -> Response<Body> {
         Response::builder()
@@ -4735,6 +4799,8 @@ mod tests {
                 "finalizers":if root_metadata { vec!["demo.oxideloop.dev/finalizer"] } else { vec![] },
             },
             "spec": {
+                "image":"example.invalid/web:latest",
+                "replicas":1,
                 "message":"fresh bootstrap",
                 "expose":false,
                 "program": {"configMapName":"bundle","key":"program.mjs","digest":bundle_digest}
@@ -6589,6 +6655,8 @@ mod tests {
                 "finalizers":[]
             },
             "spec": {
+                "image":"example.invalid/web:latest",
+                "replicas":1,
                 "message":"appeared in list/watch gap",
                 "expose":false,
                 "program": {
@@ -6769,6 +6837,8 @@ mod tests {
                 "resourceVersion":resource_version, "generation":1, "finalizers":[]
             },
             "spec": {
+                "image":"example.invalid/web:latest",
+                "replicas":1,
                 "message":"drain root", "expose":false,
                 "program": {"configMapName":"bundle", "key":"program.mjs", "digest":BUNDLE_DIGEST}
             }
@@ -6890,10 +6960,10 @@ mod tests {
         // Regression for the single-item queue: it reports a delivery even
         // though popping it leaves the queue empty, so the driver re-enters
         // `next_command` instead of blocking in its watch select.
-        assert!(enqueue_next_automation_candidate(
-            &mut actor,
-            &mut candidates
-        ));
+        assert!(
+            enqueue_next_automation_candidate(&mut actor, &mut candidates)
+                .expect("exact candidate queues")
+        );
         assert!(candidates.is_empty());
 
         let mut changed = actor.state().root().clone();
@@ -6921,7 +6991,8 @@ mod tests {
         latest_input.observation_token = "latest-final-render-token".into();
         actor.active_render_input = Some((actor.barrier(), latest_input.clone()));
         assert!(
-            !enqueue_next_automation_candidate(&mut actor, &mut stale),
+            !enqueue_next_automation_candidate(&mut actor, &mut stale)
+                .expect("stale candidate is discarded"),
             "the earlier render declaration must be dropped before TriggerAutomation"
         );
         assert!(
@@ -6939,7 +7010,10 @@ mod tests {
             &final_automation_descriptor(),
         )
         .expect("latest candidate is authorized");
-        assert!(enqueue_next_automation_candidate(&mut actor, &mut latest));
+        assert!(
+            enqueue_next_automation_candidate(&mut actor, &mut latest)
+                .expect("latest candidate queues")
+        );
         assert!(matches!(
             actor.next_command(),
             Ok(Some(CommandV0::Persist { operation, .. }))
@@ -6964,6 +7038,82 @@ mod tests {
             ),
             Err(RuntimeErrorV0::Hold(_))
         ));
+    }
+
+    #[test]
+    fn final_render_v1_action_context_must_match_the_exact_stabilized_source() {
+        let mut actor = automation_candidate_actor();
+        let input = final_automation_input(&actor);
+        let dependency = final_automation_dependency();
+        let mut output = final_automation_output(dependency.clone());
+        output.automations[0].event_metadata = action_context_metadata();
+        assert!(
+            automation_candidates_from_final_render(
+                &actor,
+                &input,
+                &output,
+                std::slice::from_ref(&dependency),
+                &final_automation_descriptor(),
+            )
+            .is_ok()
+        );
+
+        let mut substituted_action = output.clone();
+        substituted_action.automations[0].action_module_digest = "f".repeat(64);
+        assert!(matches!(
+            automation_candidates_from_final_render(
+                &actor,
+                &input,
+                &substituted_action,
+                std::slice::from_ref(&dependency),
+                &final_automation_descriptor(),
+            ),
+            Err(RuntimeErrorV0::Hold(_))
+        ));
+
+        let mut queued = automation_candidates_from_final_render(
+            &actor,
+            &input,
+            &output,
+            std::slice::from_ref(&dependency),
+            &final_automation_descriptor(),
+        )
+        .expect("valid candidate is queued only in memory");
+        actor.active_render_input = Some((actor.barrier(), input.clone()));
+        queued[0].trigger.event_metadata["$oxideloop"]["source"]["uid"] = json!("other");
+        assert!(matches!(
+            enqueue_next_automation_candidate(&mut actor, &mut queued),
+            Err(RuntimeErrorV0::Hold(_))
+        ));
+        assert!(
+            actor
+                .next_command()
+                .expect("failed promotion cannot fabricate a command")
+                .is_none()
+        );
+
+        let mutations: [fn(&mut serde_json::Value); 6] = [
+            |source: &mut serde_json::Value| source["apiVersion"] = json!("v2"),
+            |source: &mut serde_json::Value| source["kind"] = json!("Secret"),
+            |source: &mut serde_json::Value| source["namespace"] = json!("other"),
+            |source: &mut serde_json::Value| source["name"] = json!("other"),
+            |source: &mut serde_json::Value| source["uid"] = json!("other"),
+            |source: &mut serde_json::Value| source["resourceVersion"] = json!("8"),
+        ];
+        for mutate in mutations {
+            let mut mismatched = output.clone();
+            mutate(&mut mismatched.automations[0].event_metadata["$oxideloop"]["source"]);
+            assert!(matches!(
+                automation_candidates_from_final_render(
+                    &actor,
+                    &input,
+                    &mismatched,
+                    std::slice::from_ref(&dependency),
+                    &final_automation_descriptor(),
+                ),
+                Err(RuntimeErrorV0::Hold(_))
+            ));
+        }
     }
 
     async fn wait_for_space(

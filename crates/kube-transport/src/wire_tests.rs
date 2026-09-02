@@ -215,7 +215,7 @@ fn generated_event_plan() -> oxideloop_event_planner::PlannedEventV0 {
         ),
     };
     let output = parse_validate_action_output(
-        &include_str!("../../../packages/example-bundle/fixtures/input-changed-action-output.json")
+        &include_str!("../../../packages/fixtures/golden/v0/action-output.valid.json")
             .replace("\"demo\"", "\"tenant-a\""),
     )
     .expect("valid P7 action output");
@@ -1378,7 +1378,7 @@ async fn watch_open_and_stream_conflicts_retain_stage_and_resource() {
 #[tokio::test]
 async fn deletion_barrier_scripted_live_root_watch_invalidates_before_seal() {
     // This keeps the real deletion acquisition/seal algorithm intact.  Only
-    // the five retained watch sources are injected, so no test-only
+    // the six retained watch sources are injected, so no test-only
     // no-stream path is exercised.
     let address = RootAddressV0 {
         namespace: "tenant-a".into(),
@@ -1431,6 +1431,13 @@ async fn deletion_barrier_scripted_live_root_watch_invalidates_before_seal() {
             },
             Expected {
                 method: Method::GET,
+                path_and_query: "/apis/apps/v1/namespaces/tenant-a/deployments?",
+                content_type: None,
+                body: None,
+                response: response(empty()),
+            },
+            Expected {
+                method: Method::GET,
                 path_and_query: "/api/v1/namespaces/tenant-a/services?",
                 content_type: None,
                 body: None,
@@ -1466,6 +1473,13 @@ async fn deletion_barrier_scripted_live_root_watch_invalidates_before_seal() {
             },
             Expected {
                 method: Method::GET,
+                path_and_query: "/apis/apps/v1/namespaces/tenant-a/deployments?",
+                content_type: None,
+                body: None,
+                response: response(empty()),
+            },
+            Expected {
+                method: Method::GET,
                 path_and_query: "/api/v1/namespaces/tenant-a/services?",
                 content_type: None,
                 body: None,
@@ -1482,7 +1496,7 @@ async fn deletion_barrier_scripted_live_root_watch_invalidates_before_seal() {
     };
     let (transport, api) = scripted(empty(), empty());
     let mut senders = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..6 {
         let (sender, watch) = WatchHandleV0::test_channel(1);
         transport.test_push_watch(watch);
         senders.push(sender);
@@ -1577,7 +1591,7 @@ async fn deletion_barrier_scripted_live_root_watch_invalidates_before_seal() {
     ] {
         let (transport, api) = scripted(empty(), empty());
         let mut senders = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..6 {
             let (sender, watch) = WatchHandleV0::test_channel(1);
             transport.test_push_watch(watch);
             senders.push(sender);
@@ -1605,12 +1619,12 @@ async fn deletion_barrier_scripted_live_root_watch_invalidates_before_seal() {
     ] {
         let (transport, api) = scripted(empty(), empty());
         let mut senders = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..6 {
             let (sender, watch) = WatchHandleV0::test_channel(1);
             transport.test_push_watch(watch);
             senders.push(sender);
         }
-        senders[4]
+        senders[5]
             .send(Err(terminal.clone()))
             .await
             .expect("terminal scripted watch record is buffered");
@@ -1626,7 +1640,7 @@ async fn deletion_barrier_scripted_live_root_watch_invalidates_before_seal() {
 
     let (overflow_transport, overflow_api) = scripted(empty(), empty());
     let mut overflow_senders = Vec::new();
-    for index in 0..5 {
+    for index in 0..6 {
         let (sender, watch) = WatchHandleV0::test_channel(1);
         if index == 3 {
             watch.test_mark_overflow();
@@ -1645,7 +1659,7 @@ async fn deletion_barrier_scripted_live_root_watch_invalidates_before_seal() {
 
     let (eof_transport, eof_api) = scripted(empty(), empty());
     let mut eof_senders = Vec::new();
-    for index in 0..5 {
+    for index in 0..6 {
         let (sender, watch) = WatchHandleV0::test_channel(1);
         eof_transport.test_push_watch(watch);
         if index != 2 {
@@ -1673,7 +1687,7 @@ async fn deletion_barrier_scripted_live_root_watch_invalidates_before_seal() {
     });
     let (tracked_transport, tracked_api) = scripted(collection_json(json!([tracked])), empty());
     let mut tracked_senders = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..6 {
         let (sender, watch) = WatchHandleV0::test_channel(1);
         tracked_transport.test_push_watch(watch);
         tracked_senders.push(sender);
@@ -1709,7 +1723,7 @@ async fn deletion_barrier_scripted_live_root_watch_invalidates_before_seal() {
 
     let (quiet_transport, quiet_api) = scripted(empty(), empty());
     let mut quiet_senders = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..6 {
         let (sender, watch) = WatchHandleV0::test_channel(1);
         quiet_transport.test_push_watch(watch);
         quiet_senders.push(sender);
@@ -2839,6 +2853,13 @@ async fn root_only_verify_uses_receipt_state_identity_and_empty_state_rv() {
         },
         Expected {
             method: Method::GET,
+            path_and_query: "/apis/apps/v1/namespaces/tenant-a/deployments?",
+            content_type: None,
+            body: None,
+            response: response(collection_json(json!([]))),
+        },
+        Expected {
+            method: Method::GET,
             path_and_query: "/api/v1/namespaces/tenant-a/services?",
             content_type: None,
             body: None,
@@ -2929,6 +2950,13 @@ async fn root_only_remove_rechecks_children_before_exact_finalizer_patch() {
         Expected {
             method: Method::GET,
             path_and_query: "/api/v1/namespaces/tenant-a/configmaps?",
+            content_type: None,
+            body: None,
+            response: response(collection_json(json!([]))),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/apps/v1/namespaces/tenant-a/deployments?",
             content_type: None,
             body: None,
             response: response(collection_json(json!([]))),
@@ -4116,6 +4144,13 @@ async fn owned_child_verification_blocks_an_automation_run_by_owner_uid_alone() 
         Expected {
             method: Method::GET,
             path_and_query: "/api/v1/namespaces/tenant-a/configmaps?",
+            content_type: None,
+            body: None,
+            response: list(json!([])),
+        },
+        Expected {
+            method: Method::GET,
+            path_and_query: "/apis/apps/v1/namespaces/tenant-a/deployments?",
             content_type: None,
             body: None,
             response: list(json!([])),

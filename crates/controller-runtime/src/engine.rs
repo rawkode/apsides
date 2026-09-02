@@ -42,6 +42,7 @@ fn is_dependency_watch_terminal(error: &TransportErrorV0) -> bool {
             if matches!(
                 resource,
                 ResourceKindV0::ConfigMap
+                    | ResourceKindV0::Deployment
                     | ResourceKindV0::Service
                     | ResourceKindV0::WebApplication
                     | ResourceKindV0::OxideLoopState

@@ -3,6 +3,7 @@
 set -euo pipefail
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 bash -n "$ROOT/scripts/run-kind-e2e.sh"
+bash -n "$ROOT/examples/web-application/run-kind-e2e.sh"
 
 TEMP=$(mktemp -d /tmp/oxideloop-kind-e2e-test.XXXXXX)
 trap 'rm -rf "$TEMP"' EXIT
@@ -161,6 +162,31 @@ run_guard() {
 
 assert_contains() { grep -Fq -- "$1" "$ROOT/scripts/run-kind-e2e.sh" || { echo "missing runner contract: $1" >&2; exit 1; }; }
 assert_not_contains() { ! grep -Fq -- "$1" "$ROOT/scripts/run-kind-e2e.sh" || { echo "obsolete or vacuous runner contract: $1" >&2; exit 1; }; }
+assert_wrapper_contains() { grep -Fq -- "$1" "$ROOT/examples/web-application/run-kind-e2e.sh" || { echo "missing example wrapper contract: $1" >&2; exit 1; }; }
+assert_wrapper_contains 'git status --porcelain --untracked-files=all'
+assert_wrapper_contains 'refusing nonignored working-tree changes'
+assert_wrapper_contains 'exec "$ROOT/scripts/run-kind-e2e.sh" "$@"'
+for canonical_contract in \
+  'image: $PRODUCTION_IMAGE' \
+  'replicas: 0' \
+  'expose: true' \
+  'ConfigurationChanged' \
+  '--from-literal=message=vanilla' \
+  '.data.message == "chocolate"' \
+  '(.spec.state.inventory | length == 3)' \
+  '(.spec.state.inventory | length == 2)' \
+  '.logicalId == "config"' \
+  '.logicalId == "deployment"' \
+  '.logicalId == "service"' \
+  'capture_managed_field_ownership deployment deployment/root main '\''f:spec'\''' \
+  'managed Deployment remains after deletion' \
+  'Deployment ConditionalApply ownership transition changed its UID' \
+  'ordinary restart changed the Deployment UID'; do
+  assert_contains "$canonical_contract"
+done
+assert_not_contains 'message: hello'
+assert_not_contains 'InputChanged'
+assert_not_contains 'data.flavor'
 assert_collision_deletion_spans_clean() {
   runner_file=$1
   while IFS= read -r deletion_line; do
@@ -444,6 +470,13 @@ jq '.metadata.managedFields[0].manager = "other"' "$TEMP/managed-config-valid.js
 jq '.metadata.managedFields[0].operation = "Update"' "$TEMP/managed-config-valid.json" >"$TEMP/managed-update.json"; assert_managed_fields_rejected "$TEMP/managed-update.json"
 jq '.metadata.managedFields[0].subresource = "status"' "$TEMP/managed-config-valid.json" >"$TEMP/managed-main-status.json"; assert_managed_fields_rejected "$TEMP/managed-main-status.json"
 jq 'del(.metadata.managedFields[0].fieldsV1["f:data"])' "$TEMP/managed-config-valid.json" >"$TEMP/managed-no-data.json"; assert_managed_fields_rejected "$TEMP/managed-no-data.json"
+write_managed_fields_fixture "$TEMP/managed-deployment-valid.json" absent 'f:spec'
+managed_field_ownership_from_json "$TEMP/managed-deployment-valid.json" deployment/root main 'f:spec' >"$TEMP/managed-deployment-assertion.json"
+jq -e '.resource == "deployment/root" and .manager == "oxideloop-controller" and .operation == "Apply" and .subresource == null and .representativeField == "f:spec"' "$TEMP/managed-deployment-assertion.json" >/dev/null
+if managed_field_ownership_from_json "$TEMP/managed-deployment-valid.json" deployment/root status 'f:spec' >/dev/null 2>&1; then
+  echo 'Deployment main-resource SSA ownership was accepted as status ownership' >&2
+  exit 1
+fi
 write_managed_fields_fixture "$TEMP/managed-root-status-valid.json" status 'f:status'
 managed_field_ownership_from_json "$TEMP/managed-root-status-valid.json" webapplication/root status 'f:status' >"$TEMP/managed-root-status-assertion.json"
 jq -e '.resource == "webapplication/root" and .subresource == "status" and .representativeField == "f:status"' "$TEMP/managed-root-status-assertion.json" >/dev/null
@@ -453,7 +486,7 @@ if managed_field_ownership_from_json "$TEMP/managed-root-status-valid.json" weba
 fi
 
 # The restart snapshot has no dependency on list order or resourceVersion; it
-# accepts exactly one UID-bearing root, state, ConfigMap, and Service.
+# accepts exactly one UID-bearing root, state, ConfigMap, Deployment, and Service.
 sed -n '/^ownership_restart_identities() {/,/^}/p' "$ROOT/scripts/run-kind-e2e.sh" >"$TEMP/ownership-restart-identities.sh"
 . "$TEMP/ownership-restart-identities.sh"
 STATE_NAME=state-for-root
@@ -463,16 +496,29 @@ jq -n '
   {items:[
     {kind:"Service",metadata:{name:"root-service",uid:"service-uid"}},
     {kind:"ConfigMap",metadata:{name:"root-config",uid:"config-uid"}},
+    {kind:"Deployment",metadata:{name:"root",uid:"deployment-uid"}},
     {kind:"WebApplication",metadata:{name:"root",uid:"root-uid"}},
     {kind:"OxideLoopState",metadata:{name:"state-for-root",uid:"state-uid"}}
   ]}
 ' >"$TEMP/ownership-restart-fixture.json"
 ownership_restart_identities >"$TEMP/ownership-restart-identities.json"
-jq -e '. == {root:{name:"root",uid:"root-uid"},state:{name:"state-for-root",uid:"state-uid"},config:{name:"root-config",uid:"config-uid"},service:{name:"root-service",uid:"service-uid"}}' "$TEMP/ownership-restart-identities.json" >/dev/null
+jq -e '. == {root:{name:"root",uid:"root-uid"},state:{name:"state-for-root",uid:"state-uid"},config:{name:"root-config",uid:"config-uid"},deployment:{name:"root",uid:"deployment-uid"},service:{name:"root-service",uid:"service-uid"}}' "$TEMP/ownership-restart-identities.json" >/dev/null
 jq 'del(.items[] | select(.kind == "Service"))' "$TEMP/ownership-restart-fixture.json" >"$TEMP/ownership-restart-missing-service.json"
 mv "$TEMP/ownership-restart-missing-service.json" "$TEMP/ownership-restart-fixture.json"
 if ownership_restart_identities >/dev/null 2>&1; then
   echo 'restart identity snapshot accepted a missing Service' >&2
+  exit 1
+fi
+jq -n '
+  {items:[
+    {kind:"Service",metadata:{name:"root-service",uid:"service-uid"}},
+    {kind:"ConfigMap",metadata:{name:"root-config",uid:"config-uid"}},
+    {kind:"WebApplication",metadata:{name:"root",uid:"root-uid"}},
+    {kind:"OxideLoopState",metadata:{name:"state-for-root",uid:"state-uid"}}
+  ]}
+' >"$TEMP/ownership-restart-fixture.json"
+if ownership_restart_identities >/dev/null 2>&1; then
+  echo 'restart identity snapshot accepted a missing Deployment' >&2
   exit 1
 fi
 
@@ -586,20 +632,22 @@ after_status_arm_line=$(rg -n -F 'arm_crash AfterStatusBeforeAck' "$ROOT/scripts
 after_status_await_line=$(rg -n -F 'await_crash AfterStatusBeforeAck' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 [ -n "$after_status_arm_line" ] && [ "$after_status_arm_line" -lt "$after_status_await_line" ] || { echo 'AfterStatusBeforeAck recovery failpoint must remain exercised' >&2; exit 1; }
 
-# P13-D must run after initial ConfigMap+Service convergence and before the
-# independent prune gate. It captures raw managed-fields documents, records
-# their hashes through atomic capture, and restarts while the Service exists.
+# P13-D must run after initial ConfigMap+Deployment+Service convergence and
+# before the independent prune gate. It captures raw managed-fields documents,
+# records their hashes through atomic capture, and restarts while the Service exists.
 ownership_transition_line=$(rg -n -F 'e2e-ownership-transition=$RUN_ID' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 ownership_config_wait_line=$(rg -n -F "wait_for_same_uid_changed_rv 'ConfigMap ConditionalApply ownership transition'" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+ownership_deployment_wait_line=$(rg -n -F "wait_for_same_uid_changed_rv 'Deployment ConditionalApply ownership transition'" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 ownership_service_wait_line=$(rg -n -F "wait_for_same_uid_changed_rv 'Service ConditionalApply ownership transition'" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 ownership_state_capture_line=$(rg -n -F 'capture_managed_field_ownership state "oxideloopstate/$STATE_NAME" main '\''f:spec'\''' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 ownership_config_capture_line=$(rg -n -F 'capture_managed_field_ownership config configmap/root-config main '\''f:data'\''' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
+ownership_deployment_capture_line=$(rg -n -F 'capture_managed_field_ownership deployment deployment/root main '\''f:spec'\''' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 ownership_service_capture_line=$(rg -n -F 'capture_managed_field_ownership service service/root-service main '\''f:spec'\''' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 ownership_root_capture_line=$(rg -n -F 'capture_managed_field_ownership root-status webapplication/root status '\''f:status'\''' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 ownership_restart_line=$(rg -n -F "restart_controller 'ownership transition'" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 ownership_service_present_line=$(rg -n -F "wait_json 'ownership restart Service remains present'" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 prune_line=$(rg -n -F 'ctx patch webapplication root -n "$NAMESPACE" --type merge -p '\''{"spec":{"expose":false}}'\''' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
-[ "$ownership_transition_line" -lt "$ownership_config_wait_line" ] && [ "$ownership_config_wait_line" -lt "$ownership_service_wait_line" ] && [ "$ownership_service_wait_line" -lt "$ownership_state_capture_line" ] && [ "$ownership_state_capture_line" -lt "$ownership_config_capture_line" ] && [ "$ownership_config_capture_line" -lt "$ownership_service_capture_line" ] && [ "$ownership_service_capture_line" -lt "$ownership_root_capture_line" ] && [ "$ownership_root_capture_line" -lt "$ownership_restart_line" ] && [ "$ownership_restart_line" -lt "$ownership_service_present_line" ] && [ "$ownership_service_present_line" -lt "$prune_line" ] || { echo 'ownership transition must reconcile, capture all main/status ownership, restart with Service present, then prune' >&2; exit 1; }
+[ "$ownership_transition_line" -lt "$ownership_config_wait_line" ] && [ "$ownership_config_wait_line" -lt "$ownership_deployment_wait_line" ] && [ "$ownership_deployment_wait_line" -lt "$ownership_service_wait_line" ] && [ "$ownership_service_wait_line" -lt "$ownership_state_capture_line" ] && [ "$ownership_state_capture_line" -lt "$ownership_config_capture_line" ] && [ "$ownership_config_capture_line" -lt "$ownership_deployment_capture_line" ] && [ "$ownership_deployment_capture_line" -lt "$ownership_service_capture_line" ] && [ "$ownership_service_capture_line" -lt "$ownership_root_capture_line" ] && [ "$ownership_root_capture_line" -lt "$ownership_restart_line" ] && [ "$ownership_restart_line" -lt "$ownership_service_present_line" ] && [ "$ownership_service_present_line" -lt "$prune_line" ] || { echo 'ownership transition must reconcile, capture all main/status ownership, restart with Service present, then prune' >&2; exit 1; }
 automation_completion_line=$(rg -n -F "assert_automation_transition 1 \"\$INPUT_UID\" \"\$INPUT_RV\" chocolate" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 automation_ownership_line=$(rg -n -F "capture_managed_field_ownership automationrun-status \"automationrun/\$AUTOMATION_RUN_NAME\" status 'f:status'" "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
 automation_capture_line=$(rg -n -F 'capture_transition chocolate' "$ROOT/scripts/run-kind-e2e.sh" | head -1 | cut -d: -f1)
@@ -614,8 +662,9 @@ for ownership_contract in \
   'ambiguous-post-window.json' \
   'ownership-restart-identities-after.json' \
   'ConfigMap ConditionalApply ownership transition changed its UID' \
+  'Deployment ConditionalApply ownership transition changed its UID' \
   'Service ConditionalApply ownership transition changed its UID' \
-  'ownership restart changed root, state, ConfigMap, or Service identities' \
+  'ownership restart changed root, state, ConfigMap, Deployment, or Service identities' \
   '--show-managed-fields' \
   'ownershipEvidence:$ownershipEvidence' \
   'missing oxideloop-controller Apply ownership' \

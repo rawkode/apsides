@@ -42,7 +42,9 @@ fn linked() -> MachineStateV0 {
             name: "demo".into(),
             generation: 1,
             spec: WebApplicationSpec {
-                message: "hello".into(),
+                image: "example.invalid/web:latest".into(),
+                replicas: Some(1),
+                message: None,
                 expose: false,
                 program: ProgramBundleReference {
                     config_map_name: "bundle".into(),

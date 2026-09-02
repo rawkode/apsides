@@ -147,7 +147,7 @@ fn root(metadata: bool, link: bool, rv: &str, divergent: bool) -> Value {
     json!({"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication",
         "metadata":{"name":"app-a","namespace":"tenant-a","uid":ROOT_UID,"resourceVersion":rv,"generation":1,
           "finalizers":if metadata { json!(["demo.oxideloop.dev/finalizer"]) } else { json!([]) },"annotations":annotations.unwrap_or_default()},
-        "spec":if divergent { json!({"changed":true}) } else { json!({"message":"hello","expose":false,"program":{"configMapName":"bundle","key":"bundle","digest":"b".repeat(64)}}) },"status":status})
+        "spec":if divergent { json!({"changed":true}) } else { json!({"image":"example.invalid/web:latest","replicas":1,"message":"hello","expose":false,"program":{"configMapName":"bundle","key":"bundle","digest":"b".repeat(64)}}) },"status":status})
 }
 
 fn apply_managed_fields() -> Value {

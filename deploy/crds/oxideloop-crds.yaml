@@ -1151,9 +1151,17 @@ spec:
             properties:
               expose:
                 type: boolean
+              image:
+                maxLength: 2048
+                minLength: 1
+                type: string
               message:
+                description: |-
+                  Compatibility-only input retained for existing roots. The v1 example
+                  derives its displayed message from the watched `ConfigMap` instead.
                 maxLength: 1024
                 minLength: 1
+                nullable: true
                 type: string
               program:
                 description: Immutable reference to an already verified program bundle in a `ConfigMap`.
@@ -1176,9 +1184,15 @@ spec:
                 - digest
                 - key
                 type: object
+              replicas:
+                format: uint32
+                maximum: 2147483647.0
+                minimum: 0.0
+                nullable: true
+                type: integer
             required:
             - expose
-            - message
+            - image
             - program
             type: object
           status:

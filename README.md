@@ -10,7 +10,7 @@ The name and every `v0` interface remain provisional through M1 and until a late
 
 Create remains `POST` with strict no-adoption. Lazy SSA ownership acquisition may
 use force only for a fully fenced State Persist write, an inventory-pinned
-ConfigMap/Service ConditionalApply, or normal WebApplication status after its
+ConfigMap/Deployment/Service ConditionalApply, or normal WebApplication status after its
 bootstrap Merge. AutomationRun status and every POST, delete, finalizer,
 metadata, and bootstrap path remain non-force.
 
@@ -87,6 +87,9 @@ An empty desired graph is destructive intent, so ordinary `null`, booleans, prim
 - `crates/mutation-model`: model-only conditional mutation planner.
 - `crates/spike-runner`: integrated M0 evidence runner.
 - `packages/sdk`: generated types and the TypeScript authoring surface.
+- `packages/kubernetes`: the public v1 components, hooks, and controller/action adapters.
+- `packages/bundle-builder`: static compiler and immutable bundle builder for `controller.tsx`.
+- `packages/example-bundle`: the canonical user-authored controller.
 - `packages/react-renderer`: real React feasibility adapter.
 - `packages/react-like-runtime`: deterministic fallback JSX runtime.
 - `packages/fixtures`: shared transform, bundle, and runtime fixtures.
@@ -101,47 +104,93 @@ declares a dependency, and `useAutomation` declares one immutable action for a
 particular observed transition.
 
 ```tsx
-import { Fragment, jsx } from "@oxideloop/react-like-runtime/jsx-runtime";
-import { createRenderer } from "@oxideloop/react-like-runtime";
-import { createHookSession, useAutomation, useResource } from "@oxideloop/sdk/hooks";
-import { defineAction } from "@oxideloop/sdk";
+import {
+  ConfigMap,
+  Container,
+  Data,
+  Deployment,
+  Event,
+  Port,
+  Service,
+  defineAction,
+  defineController,
+  useAutomation,
+  useEnrichment,
+  useResource,
+} from "@oxideloop/kubernetes";
 
-export const action = defineAction(({ eventMetadata }) => ({
-  abiVersion: "renderer.oxideloop.dev/v0",
-  actions: [{
-    logicalId: "dependency-changed",
-    kind: "Event",
-    specification: { apiVersion: "events.k8s.io/v1", kind: "Event",
-      metadata: { namespace: eventMetadata.namespace },
-      reason: "InputChanged", type: "Normal", note: "dependency changed" },
-  }], diagnostics: [],
-}));
-
-export function render(input) {
-  const session = createHookSession({
-    observationToken: input.observationToken,
-    read: (ref) => input.observations.find((o) => o.name === ref.name) ?? { ref, present: false },
-  });
-  const inputConfig = useResource(session, { apiVersion: "v1", kind: "ConfigMap", namespace: input.root.namespace, name: "demo-input" });
-  if (inputConfig.observation?.uid) {
-    useAutomation(session, { identity: "example.input-changed", version: "1",
-      sourceDependency: { type: "object", apiVersion: "v1", kind: "ConfigMap", namespace: input.root.namespace, name: "demo-input", uid: inputConfig.observation.uid, resourceVersion: inputConfig.observation.resourceVersion, observationToken: input.observationToken },
-      eventMetadata: { namespace: input.root.namespace }, bundleDigest: input.bundleDigest,
-      actionModuleIdentity: "example.input-changed", actionModuleDigest: "<build-time digest>", rendererAbiVersion: "renderer.oxideloop.dev/v0" });
-  }
-  const tree = jsx(Fragment, { children: [jsx("ConfigMap", { apiVersion: "v1", kind: "ConfigMap", metadata: { name: `${input.root.name}-config`, namespace: input.root.namespace }, data: { value: "managed" } })] });
-  const rendered = createRenderer(session).render(tree);
-  return { abiVersion: "renderer.oxideloop.dev/v0", disposition: rendered.disposition, resources: rendered.resources.map((object) => ({ logicalId: `configmap/${object.metadata.name}`, object, readiness: null })), dependencies: rendered.dependencies, automations: rendered.automations, diagnostics: [] };
+interface WebApplicationSpec {
+  image: string;
+  replicas?: number;
+  expose?: boolean;
 }
+
+const configurationChanged = defineAction<{ message: string }>({
+  id: "configuration-changed",
+  version: "v1",
+  run: ({ source, metadata }) => (
+    <Event
+      id="notification"
+      regarding={source}
+      reason="ConfigurationChanged"
+      action="ConfigurationChanged"
+      note={metadata.message}
+    />
+  ),
+});
+
+export default defineController<WebApplicationSpec>(({ root }) => {
+  const name = root.metadata.name;
+  const labels = { app: name };
+  const settings = useResource(ConfigMap, { name: "demo-input" });
+  const message = settings.current?.data?.message ?? "Hello from OxideLoop";
+  const Defaults = useEnrichment({
+    labels,
+    podSecurityContext: { runAsNonRoot: true },
+  });
+
+  useAutomation({
+    when: settings.changed(),
+    action: configurationChanged,
+    metadata: { message },
+  });
+
+  return (
+    <Defaults>
+      <ConfigMap id="config" name={`${name}-config`}>
+        <Data name="message" value={message} />
+      </ConfigMap>
+      <Deployment
+        id="deployment"
+        name={name}
+        replicas={root.spec.replicas ?? 1}
+        selector={labels}
+      >
+        <Container name="web" image={root.spec.image} />
+      </Deployment>
+      {root.spec.expose ? (
+        <Service id="service" name={`${name}-service`} selector={labels}>
+          <Port name="http" port={80} targetPort="http" />
+        </Service>
+      ) : null}
+    </Defaults>
+  );
+});
 ```
 
-The complete, typechecked version lives in [packages/example-bundle/src/render.tsx](packages/example-bundle/src/render.tsx); its paired action is [packages/example-bundle/src/action.ts](packages/example-bundle/src/action.ts).
+The complete, typechecked version includes ports, environment wiring, resource
+requests and limits, replica handling, and exact Service selectors. It lives in
+[packages/example-bundle/src/controller.tsx](packages/example-bundle/src/controller.tsx),
+the single-file controller compiled into the bundle. See
+[examples/web-application](examples/web-application/README.md) for focused build
+and fresh-kind instructions.
 
 ## Fresh kind E2E acceptance
 
-One public command builds a new bundle, creates a new kind cluster, builds and
-loads separate production and E2E-failpoint images, installs the CRDs and E2E
-overlay, and runs the serialized ownership/recovery/deletion matrix:
+The production-image guard and the lifecycle runner together build a new
+bundle, create a fresh kind cluster, load separate production and E2E-failpoint
+images, install the CRDs and E2E overlay, and run the serialized
+ownership/recovery/deletion matrix:
 
 ```sh
 scripts/verify-production-no-failpoint.sh

@@ -1,6 +1,6 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, rename, rm, symlink } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
@@ -13,8 +13,18 @@ const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryRoot = resolve(packageRoot, "../..");
 const cliPath = join(packageRoot, "src/e2e-cli.ts");
 const tsxPath = join(packageRoot, "node_modules/.bin/tsx");
-const sourceRoot = join(repositoryRoot, "packages/example-bundle/src");
 const temporaryRoot = await mkdtemp(join(tmpdir(), "oxideloop-e2e-cli-test-"));
+const sourceRoot = await mkdtemp(join(packageRoot, ".bundle-builder-e2e-source-"));
+
+await writeFile(join(sourceRoot, "controller.tsx"), `
+import { Event, defineAction, defineController } from "@oxideloop/kubernetes";
+const configurationChanged = defineAction({
+  id: "configuration-changed",
+  version: "v1",
+  run: ({ source, metadata }) => <Event id="notification" regarding={source} reason="ConfigurationChanged" action="ConfigurationChanged" note={metadata.message} />,
+});
+export default defineController(({ root }) => root.metadata.name);
+`);
 
 async function mustNotExist(path: string): Promise<void> {
   const result = await Promise.allSettled([access(path)]);
@@ -26,13 +36,11 @@ try {
   const firstMetadata = join(temporaryRoot, "first.json");
   const secondArchive = join(temporaryRoot, "second.olba");
   const secondMetadata = join(temporaryRoot, "second.json");
-  const cliArgs = (archive: string, metadata: string) => ["--out", archive, "--metadata", metadata];
+  const cliArgs = (archive: string, metadata: string) => ["--out", archive, "--metadata", metadata, "--source", sourceRoot];
 
-  // Run from a directory unrelated to the repository: the authored source
-  // root must still be found from e2e-cli.ts, not from process.cwd().
-  // Exercise the advertised workspace-root command.
-  await execFile("pnpm", ["bundle:e2e", "--", ...cliArgs(firstArchive, firstMetadata)], { cwd: repositoryRoot });
-  // The same CLI must remain independent of the caller's working directory.
+  // Run from both the repository and an unrelated directory: source resolution
+  // is explicit and must not depend on the caller's working directory.
+  await execFile(tsxPath, [cliPath, ...cliArgs(firstArchive, firstMetadata)], { cwd: repositoryRoot });
   await execFile(tsxPath, [cliPath, ...cliArgs(secondArchive, secondMetadata)], { cwd: temporaryRoot });
   const firstBytes = await readFile(firstArchive);
   const secondBytes = await readFile(secondArchive);
@@ -65,9 +73,12 @@ try {
   if (JSON.stringify(first.buildBundle.compiler) !== JSON.stringify(built.manifest.compiler)) throw new Error("metadata compiler is incorrect");
   if (JSON.stringify(first.buildBundle.bundler) !== JSON.stringify(built.manifest.bundler)) throw new Error("metadata bundler is incorrect");
   if (first.buildBundle.rendererAbiVersion !== built.manifest.rendererAbiVersion) throw new Error("metadata ABI version is incorrect");
-  if (first.buildBundle.authoredSource.location !== "packages/example-bundle/src") throw new Error("metadata authored source location is incorrect");
-  if (first.buildBundle.authoredSource.action !== "packages/example-bundle/src/action.ts") throw new Error("metadata action source location is incorrect");
-  if (first.buildBundle.authoredSource.render !== "packages/example-bundle/src/render.tsx") throw new Error("metadata render source location is incorrect");
+  if (!first.buildBundle.authoredSource.location.startsWith("packages/bundle-builder/.bundle-builder-e2e-source-")) {
+    throw new Error("metadata authored source location is incorrect");
+  }
+  if (`${first.buildBundle.authoredSource.location}/controller.tsx` !== first.buildBundle.authoredSource.controller) {
+    throw new Error("metadata controller source location is incorrect");
+  }
 
   let existingBuildCalled = false;
   const existing = await Promise.allSettled([publishE2EBundle({
@@ -102,6 +113,7 @@ try {
   const renameFailureMetadata = join(temporaryRoot, "rename-failure.json");
   const renameFailure = await Promise.allSettled([publishE2EBundle({
     repositoryRoot,
+    sourceRoot,
     outPath: renameFailureArchive,
     metadataPath: renameFailureMetadata,
     renameFile: async (source, destination) => {
@@ -163,4 +175,5 @@ try {
   await rm(externalSource, { recursive: true, force: true });
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
+  await rm(sourceRoot, { recursive: true, force: true });
 }

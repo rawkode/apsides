@@ -23,8 +23,7 @@ export interface E2EBundleMetadata {
     readonly rendererAbiVersion: string;
     readonly authoredSource: {
       readonly location: string;
-      readonly action: string;
-      readonly render: string;
+      readonly controller: string;
     };
   };
 }
@@ -76,8 +75,7 @@ function createMetadata(result: BuiltBundle, repositoryRoot: string, sourceRoot:
   const action = moduleFor(result.manifest, "action");
   const render = moduleFor(result.manifest, "render");
   const sourceLocation = repositoryRelative(repositoryRoot, sourceRoot);
-  const actionSource = `${sourceLocation}/action.ts`;
-  const renderSource = `${sourceLocation}/render.tsx`;
+  const controllerSource = `${sourceLocation}/controller.tsx`;
   return {
     metadataVersion: "oxideloop.dev/e2e-bundle-metadata/v0",
     buildBundle: {
@@ -96,7 +94,7 @@ function createMetadata(result: BuiltBundle, repositoryRoot: string, sourceRoot:
       compiler: result.manifest.compiler,
       bundler: result.manifest.bundler,
       rendererAbiVersion: result.manifest.rendererAbiVersion,
-      authoredSource: { location: sourceLocation, action: actionSource, render: renderSource },
+      authoredSource: { location: sourceLocation, controller: controllerSource },
     },
   };
 }

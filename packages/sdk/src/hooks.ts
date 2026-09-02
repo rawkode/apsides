@@ -1,15 +1,33 @@
+import {
+  compilerActionBindingFor,
+  isDefinedAction,
+} from "./index.js";
 import type {
+  ActionDescriptor,
   AutomationDeclaration,
+  CompilerActionBindings,
+  DeepReadonly,
+  EnrichmentComponent,
+  Json,
+  ResourceDescriptor,
   ResourceDependency,
   ResourceHandle,
   ResourceObject,
+  ResourceRequest,
   ResourceRef,
 } from "./index.js";
 
 const MAX_EVENT_METADATA_CANONICAL_BYTES = 512 * 1024;
+const MAX_JSON_CANONICAL_BYTES = 2 * 1024 * 1024;
+declare const resourceChangeType: unique symbol;
+
+let activeHookSession: MutableHookSession | undefined;
+const resourceChanges = new WeakMap<object, ResourceChangeState>();
 
 export interface HookEnvironment {
   readonly observationToken: string;
+  /** Compiler/runtime-injected action module bindings for this render. */
+  readonly compilerActionBindings?: CompilerActionBindings;
   read<T extends ResourceObject>(ref: ResourceRef): ResourceHandle<T>;
 }
 
@@ -25,6 +43,26 @@ interface MutableHookSession extends HookSession {
   readonly automationMap: Map<string, AutomationDeclaration>;
 }
 
+/** A render-local resource result returned by descriptor-form useResource. */
+export interface ResourceRead<T extends ResourceObject = ResourceObject> {
+  readonly current: T | undefined;
+  /** Opaque capability valid only for this synchronous render invocation. */
+  changed(): ResourceChange;
+}
+
+/**
+ * A session-bound automation source capability. Its representation is not part
+ * of the authoring API: only useAutomation may consume it.
+ */
+export interface ResourceChange {
+  readonly [resourceChangeType]: never;
+}
+
+interface ResourceChangeState {
+  readonly session: MutableHookSession;
+  readonly dependency: ResourceDependency;
+}
+
 export function createHookSession(environment: HookEnvironment): HookSession {
   const session: MutableHookSession = {
     environment,
@@ -36,9 +74,22 @@ export function createHookSession(environment: HookEnvironment): HookSession {
   return session;
 }
 
-/** A synchronous convenience that keeps the session explicit to the callback. */
+/**
+ * Enters the synchronous render dispatcher. The explicit session callback is
+ * retained for the legacy authoring API; descriptor hooks use the active
+ * stack-scoped session instead.
+ */
 export function withHookEnvironment<T>(environment: HookEnvironment, render: (session: HookSession) => T): T {
-  return render(createHookSession(environment));
+  if (activeHookSession) throw new Error("OxideLoop hook rendering is not reentrant");
+  const session = mutable(createHookSession(environment));
+  activeHookSession = session;
+  try {
+    const result = render(session);
+    if (isThenable(result)) throw new Error("OxideLoop hook rendering must be synchronous");
+    return result;
+  } finally {
+    activeHookSession = undefined;
+  }
 }
 
 function mutable(session: HookSession): MutableHookSession {
@@ -53,7 +104,29 @@ function dependencyKey(dependency: ResourceDependency | ResourceRef): string {
   return canonicalJson([dependency.apiVersion, dependency.kind, dependency.namespace ?? "", dependency.name]);
 }
 
-export function useResource<T extends ResourceObject>(session: HookSession, ref: ResourceRef): ResourceHandle<T> {
+export function useResource<T extends ResourceObject>(session: HookSession, ref: ResourceRef): ResourceHandle<T>;
+export function useResource<T extends ResourceObject>(descriptor: ResourceDescriptor<T>, request: ResourceRequest): ResourceRead<T>;
+export function useResource<T extends ResourceObject>(
+  sessionOrDescriptor: HookSession | ResourceDescriptor<T>,
+  refOrRequest: ResourceRef | ResourceRequest,
+): ResourceHandle<T> | ResourceRead<T> {
+  if (isHookSession(sessionOrDescriptor)) {
+    return useResourceWithSession<T>(sessionOrDescriptor, refOrRequest as ResourceRef);
+  }
+
+  const session = requireActiveHookSession("useResource");
+  const ref = requestResource(sessionOrDescriptor, refOrRequest as ResourceRequest);
+  const handle = useResourceWithSession<T>(session, ref);
+  const dependency = session.dependencyMap.get(dependencyKey(handle.ref));
+  if (!dependency) throw new Error("OxideLoop failed to retain the resource observation");
+  const change = resourceChange(session, dependency);
+  return Object.freeze({
+    current: handle.value,
+    changed: () => change,
+  });
+}
+
+function useResourceWithSession<T extends ResourceObject>(session: HookSession, ref: ResourceRef): ResourceHandle<T> {
   const handle = session.environment.read<T>(ref);
   const observation = handle.observation ?? {
     uid: handle.value?.uid ?? null,
@@ -79,12 +152,168 @@ export function useResource<T extends ResourceObject>(session: HookSession, ref:
   return handle;
 }
 
+function isHookSession(value: unknown): value is HookSession {
+  return value !== null && typeof value === "object" && "environment" in value;
+}
+
+function requireActiveHookSession(hook: string): MutableHookSession {
+  if (!activeHookSession) throw new Error(`${hook}() may only run during a synchronous defineController render`);
+  return activeHookSession;
+}
+
+function requestResource<T extends ResourceObject>(
+  descriptor: ResourceDescriptor<T>,
+  request: ResourceRequest,
+): ResourceRef {
+  if (!isPlainRecord(descriptor) || !isNonemptyString(descriptor.apiVersion) || !isNonemptyString(descriptor.kind)) {
+    throw new Error("useResource() requires a valid resource descriptor");
+  }
+  if (!isPlainRecord(request)) throw new Error("useResource() requires a plain resource request");
+  const keys = Object.keys(request).sort(compareUtf8);
+  if (keys.length < 1 || keys.length > 2 || keys[0] !== "name" || (keys.length === 2 && keys[1] !== "namespace")) {
+    throw new Error("useResource() accepts only name and optional namespace");
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(request);
+  for (const key of keys) {
+    const field = descriptors[key];
+    if (!field || !field.enumerable || !("value" in field) || !isNonemptyString(field.value)) {
+      throw new Error(`useResource() request.${key} must be a nonempty string`);
+    }
+  }
+  return Object.freeze({
+    apiVersion: descriptor.apiVersion,
+    kind: descriptor.kind,
+    name: request.name,
+    ...(request.namespace === undefined ? {} : { namespace: request.namespace }),
+  });
+}
+
+function resourceChange(session: MutableHookSession, dependency: ResourceDependency): ResourceChange {
+  const state: ResourceChangeState = Object.freeze({ session, dependency });
+  const capability = Object.freeze(Object.create(null)) as ResourceChange;
+  resourceChanges.set(capability, state);
+  return capability;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function hasExactDataFields(value: object, expected: readonly string[]): boolean {
+  const keys = Reflect.ownKeys(value);
+  if (keys.some(key => typeof key !== "string") || keys.length !== expected.length) return false;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  return expected.every((key) => {
+    const descriptor = descriptors[key];
+    return descriptor !== undefined && descriptor.enumerable && "value" in descriptor;
+  });
+}
+
+function isNonemptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return value !== null && (typeof value === "object" || typeof value === "function") &&
+    typeof (value as { then?: unknown }).then === "function";
+}
+
 export function useEnriched<T>(value: T | undefined, enrich: (value: T) => T): T | undefined {
   return value === undefined ? undefined : enrich(value);
 }
 
-/** Declare a durable automation with a render-local identity registry. */
-export function useAutomation(session: HookSession, declaration: AutomationDeclaration): AutomationDeclaration {
+/**
+ * Creates a render-local enrichment wrapper with a deep-frozen strict-JSON
+ * configuration snapshot. Config is copied before the controller returns, so
+ * later caller mutation cannot alter the rendered graph.
+ */
+export function useEnrichment<Config extends Json>(config: Config): EnrichmentComponent<Config> {
+  requireActiveHookSession("useEnrichment");
+  const normalized = snapshotJson(config);
+  if (utf8Bytes(normalized.canonical).length > MAX_JSON_CANONICAL_BYTES) {
+    throw new Error("useEnrichment() config exceeds the canonical byte limit");
+  }
+  const snapshot = normalized.value as DeepReadonly<Config>;
+  const component = (props: { readonly children?: unknown }) => props.children;
+  return Object.freeze(Object.assign(component, { config: snapshot })) as EnrichmentComponent<Config>;
+}
+
+/** Object-form automation authoring accepted inside a controller render only. */
+export interface AutomationOptions<Metadata extends Json = Json> {
+  readonly when: ResourceChange;
+  readonly action: ActionDescriptor<Metadata>;
+  readonly metadata: Metadata;
+}
+
+export function useAutomation(session: HookSession, declaration: AutomationDeclaration): AutomationDeclaration;
+export function useAutomation<Metadata extends Json>(options: AutomationOptions<Metadata>): AutomationDeclaration | undefined;
+export function useAutomation<Metadata extends Json>(
+  sessionOrOptions: HookSession | AutomationOptions<Metadata>,
+  declaration?: AutomationDeclaration,
+): AutomationDeclaration | undefined {
+  if (isHookSession(sessionOrOptions)) {
+    if (declaration === undefined) throw new Error("useAutomation() requires an automation declaration");
+    return useAutomationWithSession(sessionOrOptions, declaration);
+  }
+
+  const session = requireActiveHookSession("useAutomation");
+  return lowerAutomation(session, sessionOrOptions);
+}
+
+function lowerAutomation<Metadata extends Json>(
+  session: MutableHookSession,
+  options: AutomationOptions<Metadata>,
+): AutomationDeclaration | undefined {
+  if (!isPlainRecord(options) || !hasExactDataFields(options, ["action", "metadata", "when"]) || !isDefinedAction(options.action)) {
+    throw new Error("useAutomation() requires a defined action descriptor");
+  }
+  if (options.when === null || (typeof options.when !== "object" && typeof options.when !== "function")) {
+    throw new Error("useAutomation() requires a changed() trigger from useResource()");
+  }
+  const sourceState = resourceChanges.get(options.when as unknown as object);
+  if (!sourceState) throw new Error("useAutomation() requires a changed() trigger from useResource()");
+  if (sourceState.session !== session) {
+    throw new Error("useAutomation() changed() triggers cannot cross render invocations");
+  }
+  const source = sourceState.dependency;
+  if (source.uid === null || source.resourceVersion === null) return undefined;
+
+  const binding = compilerActionBindingFor(session.environment.compilerActionBindings, options.action);
+  if (!binding) throw new Error("useAutomation() action is not bound by the compiler/runtime");
+
+  const metadata = snapshotJson(options.metadata).value;
+  const eventMetadata = snapshotJson({
+    $oxideloop: {
+      kind: "action-context",
+      version: "v1",
+      source: {
+        apiVersion: source.apiVersion,
+        kind: source.kind,
+        namespace: source.namespace,
+        name: source.name,
+        uid: source.uid,
+        resourceVersion: source.resourceVersion,
+      },
+      metadata,
+    },
+  }).value as AutomationDeclaration["eventMetadata"];
+
+  return useAutomationWithSession(session, {
+    identity: options.action.id,
+    version: options.action.version,
+    sourceDependency: source,
+    eventMetadata,
+    bundleDigest: binding.bundleDigest,
+    actionModuleIdentity: binding.actionModuleIdentity,
+    actionModuleDigest: binding.actionModuleDigest,
+    rendererAbiVersion: "renderer.oxideloop.dev/v0",
+  });
+}
+
+/** Declare a durable low-level automation with a render-local identity registry. */
+function useAutomationWithSession(session: HookSession, declaration: AutomationDeclaration): AutomationDeclaration {
   const accepted = validateAutomation(declaration);
   const hooks = mutable(session);
   const existing = hooks.automationMap.get(accepted.identity);

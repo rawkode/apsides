@@ -246,11 +246,11 @@ capture_managed_field_ownership() {
   atomic_capture_ownership "$assertion" managed_field_ownership_from_json "$EVIDENCE/$raw" "$resource" "$expected_subresource" "$representative_field" || die "$label managed-fields ownership is not controller Apply/$expected_subresource/$representative_field"
 }
 ownership_restart_identities() {
-  ctx get webapplication/root,oxideloopstate/"$STATE_NAME",configmap/root-config,service/root-service -n "$NAMESPACE" -o json | jq -Sec --arg stateName "$STATE_NAME" '
+  ctx get webapplication/root,oxideloopstate/"$STATE_NAME",configmap/root-config,deployment/root,service/root-service -n "$NAMESPACE" -o json | jq -Sec --arg stateName "$STATE_NAME" '
     def exact($kind; $name):
       [.items[] | select(.kind == $kind and .metadata.name == $name)] |
       if (length == 1 and (.[0].metadata.uid | type == "string")) then .[0] | {name:.metadata.name,uid:.metadata.uid} else error("missing exact " + $kind + "/" + $name + " identity") end;
-    {root:exact("WebApplication"; "root"),state:exact("OxideLoopState"; $stateName),config:exact("ConfigMap"; "root-config"),service:exact("Service"; "root-service")}
+    {root:exact("WebApplication"; "root"),state:exact("OxideLoopState"; $stateName),config:exact("ConfigMap"; "root-config"),deployment:exact("Deployment"; "root"),service:exact("Service"; "root-service")}
   '
 }
 restart_controller() {
@@ -304,7 +304,7 @@ assert_automation_transition() {
     if jq -e --argjson expected "$expected_total" --arg rootUid "$ROOT_UID" --arg namespace "$NAMESPACE" --arg sourceUid "$source_uid" --arg sourceRv "$source_rv" --arg bundleDigest "$BUNDLE_DIGEST" '
     .items as $runs |
     ($runs | length == $expected) and
-    ($runs | all(.[]; .spec.rootUid == $rootUid and .spec.bundleDigest == $bundleDigest and .spec.program.digest == $bundleDigest and .spec.source == {apiVersion:"v1",kind:"ConfigMap",namespace:$namespace,name:"demo-input"} and .spec.sourceUid == $sourceUid and (.spec.sourceResourceVersion | type == "string") and (.spec.sourceTransitionId | test("^[0-9a-f]{64}$")) and (.spec.occurrenceId | test("^[0-9a-f]{64}$")) and (.metadata.uid | type == "string") and ([.metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}]) and .status.attempts == 1 and (.status.completion.state == "Succeeded") and (.status.materializationName | type == "string") and (.status.materializationUid | type == "string"))) and
+    ($runs | all(.[]; .spec.rootUid == $rootUid and .spec.automationId == "configuration-changed" and .spec.automationVersion == "v1" and .spec.bundleDigest == $bundleDigest and .spec.program.digest == $bundleDigest and .spec.source == {apiVersion:"v1",kind:"ConfigMap",namespace:$namespace,name:"demo-input"} and .spec.sourceUid == $sourceUid and (.spec.sourceResourceVersion | type == "string") and (.spec.sourceTransitionId | test("^[0-9a-f]{64}$")) and (.spec.occurrenceId | test("^[0-9a-f]{64}$")) and (.metadata.uid | type == "string") and ([.metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}]) and .status.attempts == 1 and (.status.completion.state == "Succeeded") and (.status.materializationName | type == "string") and (.status.materializationUid | type == "string"))) and
     ([ $runs[].spec.occurrenceId ] | unique | length == $expected) and
     ([ $runs[].spec.sourceTransitionId ] | unique | length == $expected) and
     ([ $runs[].spec.sourceResourceVersion ] | unique | length == $expected) and
@@ -312,7 +312,7 @@ assert_automation_transition() {
     ([ $runs[].status.materializationUid ] | unique | length == $expected) and
     ([ $runs[] | select(.spec.sourceResourceVersion == $sourceRv) ] | length == (if $expected == 0 then 0 else 1 end))
   ' "$WORK/automationruns-${label}.json" >/dev/null && jq -e --slurpfile runs "$WORK/automationruns-${label}.json" --argjson expected "$expected_total" --arg namespace "$NAMESPACE" --arg rootUid "$ROOT_UID" --arg sourceUid "$source_uid" '
-    [.items[] | select(.reason == "InputChanged")] as $events |
+    [.items[] | select(.reason == "ConfigurationChanged" and .action == "ConfigurationChanged")] as $events |
     ($events | length == $expected) and
     ($events | all(.[]; .metadata.uid | type == "string")) and
     ([ $events[].metadata.uid ] | unique | length == $expected) and
@@ -332,7 +332,7 @@ assert_automation_transition() {
     ((.spec.state.pendingDependencies // []) | length == 0) and
     (.spec.state.applyTransaction == null and .spec.state.pendingPersist == null and .spec.state.pruneCandidate == null and .spec.state.generationAdvanceClosure == null and .spec.state.deletion == null) and
     (($automation.baselines // []) | length == 1) and
-    (($automation.baselines // [])[0].automationId == "demo.web-application.input-changed") and
+    (($automation.baselines // [])[0].automationId == "configuration-changed") and
     (($automation.baselines // [])[0].source == {apiVersion:"v1",kind:"ConfigMap",namespace:$namespace,name:"demo-input"}) and
     (($automation.pending // []) | length == 0) and
     (($automation.completions // []) | length == $expected) and
@@ -364,7 +364,8 @@ metadata:
   name: root
   namespace: $NAMESPACE
 spec:
-  message: hello
+  image: $PRODUCTION_IMAGE
+  replicas: 0
   expose: true
   program:
     configMapName: oxideloop-e2e-bundle
@@ -414,10 +415,11 @@ wait_for_preemption_controller_rotation() {
   done
 }
 identity_snapshot() {
-  ctx get webapplications,oxideloopstates,configmaps,services -n "$NAMESPACE" -o json | jq -S '
+  ctx get webapplications,oxideloopstates,configmaps,deployments,services -n "$NAMESPACE" -o json | jq -S '
     {root:([.items[] | select(.kind == "WebApplication" and .metadata.name == "root") | {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name)),
      state:([.items[] | select(.kind == "OxideLoopState") | {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name)),
      config:([.items[] | select(.kind == "ConfigMap" and .metadata.name == "root-config") | {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name)),
+     deployment:([.items[] | select(.kind == "Deployment" and .metadata.name == "root") | {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name)),
      service:([.items[] | select(.kind == "Service" and .metadata.name == "root-service") | {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name))}
   '
 }
@@ -631,7 +633,7 @@ assert_collision_blocked_interval() {
 }
 wait_for_collision_recovery_quiescence() {
   wait_json 'collision recovery recreated ConfigMap ownership' '(.metadata.uid | type == "string") and ([.metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}])' configmap/root-config --arg rootUid "$ROOT_UID"
-  wait_json 'collision recovery state quiescence' '(.spec.state.inventory | length == 2) and ((.spec.state.pendingDependencies // []) | length == 0) and (.spec.state.applyTransaction == null) and (.spec.state.pendingPersist == null) and (.spec.state.pruneCandidate == null) and (.spec.state.generationAdvanceClosure == null) and (.spec.state.deletion == null) and ((.spec.state.automation.pending // []) | length == 0)' "oxideloopstate/$COLLISION_STATE_NAME"
+  wait_json 'collision recovery state quiescence' '(.spec.state.inventory | length == 3) and ((.spec.state.pendingDependencies // []) | length == 0) and (.spec.state.applyTransaction == null) and (.spec.state.pendingPersist == null) and (.spec.state.pruneCandidate == null) and (.spec.state.generationAdvanceClosure == null) and (.spec.state.deletion == null) and ((.spec.state.automation.pending // []) | length == 0)' "oxideloopstate/$COLLISION_STATE_NAME"
   wait_json 'collision recovery root quiescence' '(.status.state.rootUid == .metadata.uid) and (.status.state.name == $stateName) and (.status.state.uid | type == "string") and (.status.observedGeneration == .metadata.generation) and (.status.verifiedBundleDigest == .spec.program.digest) and (.status.inputToken | type == "string") and (.status.cacheEpoch | type == "number")' webapplication/root --arg stateName "$COLLISION_STATE_NAME"
 }
 wait_for_prepared_not_issued() {
@@ -929,28 +931,34 @@ test "$(root_uid)" = "$ROOT_UID" || die 'collision recovery changed the root ide
 assert_count "$(ctx get configmap root-config -n "$NAMESPACE" -o json | jq --arg uid "$ROOT_UID" '[.metadata.ownerReferences[]? | select(.uid == $uid)] | length')" 1 'managed ConfigMap owner reference'
 ctx get webapplication root -n "$NAMESPACE" -o json >"$EVIDENCE/initial-root.json"
 STATE_NAME=$(jq -er '.status.state.name' "$EVIDENCE/initial-root.json")
-wait_json 'initial state final convergence' '(.spec.state.inventory | length == 2) and ((.spec.state.pendingDependencies // []) | length == 0) and (.spec.state.applyTransaction == null) and (.spec.state.pendingPersist == null) and (.spec.state.pruneCandidate == null) and (.spec.state.generationAdvanceClosure == null) and (.spec.state.deletion == null) and ((.spec.state.automation.pending // []) | length == 0)' "oxideloopstate/$STATE_NAME"
+wait_json 'initial state final convergence' '(.spec.state.inventory | length == 3) and ((.spec.state.pendingDependencies // []) | length == 0) and (.spec.state.applyTransaction == null) and (.spec.state.pendingPersist == null) and (.spec.state.pruneCandidate == null) and (.spec.state.generationAdvanceClosure == null) and (.spec.state.deletion == null) and ((.spec.state.automation.pending // []) | length == 0)' "oxideloopstate/$STATE_NAME"
 wait_json 'initial root current render status' '(.status.state.rootUid == .metadata.uid) and (.status.observedGeneration == .metadata.generation) and (.status.verifiedBundleDigest == .spec.program.digest) and (.status.inputToken | type == "string") and (.status.cacheEpoch | type == "number")' webapplication/root
 ctx get webapplication root -n "$NAMESPACE" -o json >"$EVIDENCE/initial-root.json"
 STATE_UID=$(jq -er '.status.state.uid' "$EVIDENCE/initial-root.json")
 ctx get oxideloopstate "$STATE_NAME" -n "$NAMESPACE" -o json >"$EVIDENCE/initial-state.json"
 ctx get configmap root-config -n "$NAMESPACE" -o json >"$EVIDENCE/initial-config.json"
+ctx get deployment root -n "$NAMESPACE" -o json >"$EVIDENCE/initial-deployment.json"
 ctx get service root-service -n "$NAMESPACE" -o json >"$EVIDENCE/initial-service.json"
-jq -e --slurpfile root "$EVIDENCE/initial-root.json" --slurpfile config "$EVIDENCE/initial-config.json" --slurpfile service "$EVIDENCE/initial-service.json" --arg stateUid "$STATE_UID" --arg rootUid "$ROOT_UID" --arg stateName "$STATE_NAME" '
+jq -e --slurpfile root "$EVIDENCE/initial-root.json" --slurpfile config "$EVIDENCE/initial-config.json" --slurpfile deployment "$EVIDENCE/initial-deployment.json" --slurpfile service "$EVIDENCE/initial-service.json" --arg stateUid "$STATE_UID" --arg rootUid "$ROOT_UID" --arg stateName "$STATE_NAME" '
   (.metadata.uid == $stateUid) and (.spec.root.uid == $rootUid) and (.spec.root.bundleDigest == $root[0].spec.program.digest) and
   ([.metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}]) and
-  (.spec.state.inventory | length == 2) and
-  ([.spec.state.inventory[] | select(.logicalId == "configmap/root-config" and .identity == {apiVersion:"v1",kind:"ConfigMap",namespace:$config[0].metadata.namespace,name:$config[0].metadata.name} and .uid == $config[0].metadata.uid and .resourceVersion == $config[0].metadata.resourceVersion and .bundleDigest == $root[0].spec.program.digest)] | length == 1) and
-  ([.spec.state.inventory[] | select(.logicalId == "service/root-service" and .identity == {apiVersion:"v1",kind:"Service",namespace:$service[0].metadata.namespace,name:$service[0].metadata.name} and .uid == $service[0].metadata.uid and .resourceVersion == $service[0].metadata.resourceVersion and .bundleDigest == $root[0].spec.program.digest)] | length == 1) and
+  (.spec.state.inventory | length == 3) and
+  ([.spec.state.inventory[] | select(.logicalId == "config" and .identity == {apiVersion:"v1",kind:"ConfigMap",namespace:$config[0].metadata.namespace,name:$config[0].metadata.name} and .uid == $config[0].metadata.uid and .resourceVersion == $config[0].metadata.resourceVersion and .bundleDigest == $root[0].spec.program.digest)] | length == 1) and
+  ([.spec.state.inventory[] | select(.logicalId == "deployment" and .identity == {apiVersion:"apps/v1",kind:"Deployment",namespace:$deployment[0].metadata.namespace,name:$deployment[0].metadata.name} and .uid == $deployment[0].metadata.uid and .resourceVersion == $deployment[0].metadata.resourceVersion and .bundleDigest == $root[0].spec.program.digest)] | length == 1) and
+  ([.spec.state.inventory[] | select(.logicalId == "service" and .identity == {apiVersion:"v1",kind:"Service",namespace:$service[0].metadata.namespace,name:$service[0].metadata.name} and .uid == $service[0].metadata.uid and .resourceVersion == $service[0].metadata.resourceVersion and .bundleDigest == $root[0].spec.program.digest)] | length == 1) and
   ((.spec.state.pendingDependencies // []) | length == 0) and
   (.spec.state.applyTransaction == null and .spec.state.pendingPersist == null and .spec.state.pruneCandidate == null and .spec.state.generationAdvanceClosure == null and .spec.state.deletion == null) and
   ((.spec.state.automation.pending // []) | length == 0) and ((.spec.state.automation.completions // []) | length == 0) and
   ($root[0].metadata.uid == $rootUid and $root[0].status.state == {rootUid:$rootUid,name:$stateName,uid:$stateUid}) and
   ($root[0].status.observedGeneration == $root[0].metadata.generation and $root[0].status.verifiedBundleDigest == $root[0].spec.program.digest) and
+  ($root[0].spec.image | type == "string" and length > 0) and ($root[0].spec.replicas == 0 and $root[0].spec.expose == true) and
+  ($deployment[0].spec.replicas == 0 and ([$deployment[0].spec.template.spec.containers[] | select(.name == "web") | .image] == [$root[0].spec.image])) and
   ($root[0].metadata.finalizers | index("demo.oxideloop.dev/finalizer") != null) and
   ([$config[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}]) and
+  ([$deployment[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}]) and
   ([$service[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}])
 ' "$EVIDENCE/initial-state.json" >/dev/null || die 'bootstrap root, state, inventory, or ownership is not exact'
+DEPLOYMENT_UID=$(jq -er '.metadata.uid' "$EVIDENCE/initial-deployment.json")
 
 # P14-E durable preparation boundary. This deliberately uses already-owned
 # children, so every prepared intent is UID/RV-pinned and the boundary cannot
@@ -958,7 +966,7 @@ jq -e --slurpfile root "$EVIDENCE/initial-root.json" --slurpfile config "$EVIDEN
 # before dispatch authorization is persisted; restart must invalidate/replan.
 ctx create configmap prepared-foreign-sentinel -n "$NAMESPACE" --from-literal=foreign=true
 atomic_capture prepared-foreign-before.json ctx get configmap prepared-foreign-sentinel -n "$NAMESPACE" -o json || die 'failed to capture prepared-boundary foreign sentinel'
-wait_json 'journal quiescence before PreparedNotIssued barrier' '(.spec.state.inventory | length == 2) and (.spec.state.applyTransaction == null) and (.spec.state.pendingPersist == null)' "oxideloopstate/$STATE_NAME"
+wait_json 'journal quiescence before PreparedNotIssued barrier' '(.spec.state.inventory | length == 3) and (.spec.state.applyTransaction == null) and (.spec.state.pendingPersist == null)' "oxideloopstate/$STATE_NAME"
 atomic_capture prepared-not-issued-identities-before.json identity_snapshot || die 'failed to capture PreparedNotIssued identities before restart'
 PREPARE_FIFO="$WORK/prepare-release.fifo"; mkfifo "$PREPARE_FIFO"; exec 8<>"$PREPARE_FIFO"; BARRIER_FD=8
 PREPARE_POD=$(controller_pod)
@@ -989,10 +997,10 @@ test "$(controller_pod)" = "$PREPARE_POD" || die 'PreparedNotIssued barrier unex
 wait_for_exact_crash 'AfterPrepareBeforeDispatchAuthorization' "$PREPARE_POD" "$PREPARE_POD_UID" "$((PREPARE_RESTART + 1))"
 atomic_capture controller-AfterPrepareBeforeDispatchAuthorization-previous.log ctx logs -n "$NAMESPACE" "$PREPARE_POD" -c controller --previous --tail=-1 || die 'missing PreparedNotIssued previous controller log'
 ctx rollout status deployment/oxideloop-controller -n "$NAMESPACE" --timeout="${TIMEOUT}s"
-wait_json 'PreparedNotIssued invalidation returned to empty journal' '(.spec.state.inventory | length == 2) and ((.spec.state.pendingDependencies // []) | length == 0) and (.spec.state.applyTransaction == null) and (.spec.state.pendingPersist == null) and (.spec.state.pruneCandidate == null) and (.spec.state.generationAdvanceClosure == null) and (.spec.state.deletion == null)' "oxideloopstate/$STATE_NAME"
+wait_json 'PreparedNotIssued invalidation returned to empty journal' '(.spec.state.inventory | length == 3) and ((.spec.state.pendingDependencies // []) | length == 0) and (.spec.state.applyTransaction == null) and (.spec.state.pendingPersist == null) and (.spec.state.pruneCandidate == null) and (.spec.state.generationAdvanceClosure == null) and (.spec.state.deletion == null)' "oxideloopstate/$STATE_NAME"
 atomic_capture prepared-not-issued-after-state.json ctx get oxideloopstate "$STATE_NAME" -n "$NAMESPACE" -o json || die 'failed to capture post-restart PreparedNotIssued state'
 atomic_capture prepared-not-issued-identities-after.json identity_snapshot || die 'failed to capture PreparedNotIssued identities after restart'
-cmp -s "$EVIDENCE/prepared-not-issued-identities-before.json" "$EVIDENCE/prepared-not-issued-identities-after.json" || die 'PreparedNotIssued recovery changed an existing root, state, ConfigMap, or Service identity'
+cmp -s "$EVIDENCE/prepared-not-issued-identities-before.json" "$EVIDENCE/prepared-not-issued-identities-after.json" || die 'PreparedNotIssued recovery changed an existing root, state, ConfigMap, Deployment, or Service identity'
 atomic_capture prepared-foreign-after.json ctx get configmap prepared-foreign-sentinel -n "$NAMESPACE" -o json || die 'failed to capture prepared-boundary foreign sentinel after restart'
 cmp -s "$EVIDENCE/prepared-foreign-before.json" "$EVIDENCE/prepared-foreign-after.json" || die 'PreparedNotIssued restart touched or adopted the foreign sentinel'
 
@@ -1001,19 +1009,24 @@ cmp -s "$EVIDENCE/prepared-foreign-before.json" "$EVIDENCE/prepared-foreign-afte
 # per run and only retriggers reconciliation.
 CONFIG_UID=$(ctx get configmap root-config -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')
 CONFIG_RV=$(ctx get configmap root-config -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
+DEPLOYMENT_RV=$(ctx get deployment root -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
 SERVICE_UID=$(ctx get service root-service -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')
 SERVICE_RV=$(ctx get service root-service -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
 ctx annotate webapplication root -n "$NAMESPACE" "oxideloop.dev/e2e-ownership-transition=$RUN_ID" --overwrite
 wait_for_same_uid_changed_rv 'ConfigMap ConditionalApply ownership transition' configmap/root-config "$CONFIG_UID" "$CONFIG_RV"
+wait_for_same_uid_changed_rv 'Deployment ConditionalApply ownership transition' deployment/root "$DEPLOYMENT_UID" "$DEPLOYMENT_RV"
 wait_for_same_uid_changed_rv 'Service ConditionalApply ownership transition' service/root-service "$SERVICE_UID" "$SERVICE_RV"
-wait_json 'ownership transition state final convergence' '(.metadata.uid == $stateUid) and (.spec.state.inventory | length == 2) and ((.spec.state.pendingDependencies // []) | length == 0) and (.spec.state.applyTransaction == null and .spec.state.pendingPersist == null and .spec.state.pruneCandidate == null and .spec.state.generationAdvanceClosure == null and .spec.state.deletion == null)' "oxideloopstate/$STATE_NAME" --arg stateUid "$STATE_UID"
+wait_json 'ownership transition state final convergence' '(.metadata.uid == $stateUid) and (.spec.state.inventory | length == 3) and ((.spec.state.pendingDependencies // []) | length == 0) and (.spec.state.applyTransaction == null and .spec.state.pendingPersist == null and .spec.state.pruneCandidate == null and .spec.state.generationAdvanceClosure == null and .spec.state.deletion == null)' "oxideloopstate/$STATE_NAME" --arg stateUid "$STATE_UID"
 wait_json 'ownership transition root current status' '(.metadata.uid == $rootUid) and (.status.state == {rootUid:$rootUid,name:$stateName,uid:$stateUid}) and (.status.observedGeneration == .metadata.generation) and (.status.verifiedBundleDigest == .spec.program.digest)' webapplication/root --arg rootUid "$ROOT_UID" --arg stateName "$STATE_NAME" --arg stateUid "$STATE_UID"
 test "$(ctx get configmap root-config -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')" = "$CONFIG_UID" || die 'ConfigMap ConditionalApply ownership transition changed its UID'
+test "$(ctx get deployment root -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')" = "$DEPLOYMENT_UID" || die 'Deployment ConditionalApply ownership transition changed its UID'
 test "$(ctx get service root-service -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')" = "$SERVICE_UID" || die 'Service ConditionalApply ownership transition changed its UID'
 OWNERSHIP_CONFIG_RV=$(ctx get configmap root-config -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
+OWNERSHIP_DEPLOYMENT_RV=$(ctx get deployment root -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
 OWNERSHIP_SERVICE_RV=$(ctx get service root-service -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
 capture_managed_field_ownership state "oxideloopstate/$STATE_NAME" main 'f:spec'
 capture_managed_field_ownership config configmap/root-config main 'f:data'
+capture_managed_field_ownership deployment deployment/root main 'f:spec'
 capture_managed_field_ownership service service/root-service main 'f:spec'
 capture_managed_field_ownership root-status webapplication/root status 'f:status'
 
@@ -1025,56 +1038,60 @@ restart_controller 'ownership transition'
 wait_json 'ownership restart Service remains present' '(.metadata.uid == $serviceUid)' service/root-service --arg serviceUid "$SERVICE_UID"
 ctx annotate webapplication root -n "$NAMESPACE" "oxideloop.dev/e2e-ownership-restart=$RUN_ID" --overwrite
 wait_for_same_uid_changed_rv 'ConfigMap ConditionalApply after ownership restart' configmap/root-config "$CONFIG_UID" "$OWNERSHIP_CONFIG_RV"
+wait_for_same_uid_changed_rv 'Deployment ConditionalApply after ownership restart' deployment/root "$DEPLOYMENT_UID" "$OWNERSHIP_DEPLOYMENT_RV"
 wait_for_same_uid_changed_rv 'Service ConditionalApply after ownership restart' service/root-service "$SERVICE_UID" "$OWNERSHIP_SERVICE_RV"
 wait_json 'ownership restart root current status' '(.metadata.uid == $rootUid) and (.status.state == {rootUid:$rootUid,name:$stateName,uid:$stateUid}) and (.status.observedGeneration == .metadata.generation) and (.status.verifiedBundleDigest == .spec.program.digest)' webapplication/root --arg rootUid "$ROOT_UID" --arg stateName "$STATE_NAME" --arg stateUid "$STATE_UID"
 atomic_capture_ownership ownership-restart-identities-after.json ownership_restart_identities || die 'failed to capture ownership restart identities after restart'
-cmp -s "$EVIDENCE/ownership-restart-identities-before.json" "$EVIDENCE/ownership-restart-identities-after.json" || die 'ownership restart changed root, state, ConfigMap, or Service identities'
+cmp -s "$EVIDENCE/ownership-restart-identities-before.json" "$EVIDENCE/ownership-restart-identities-after.json" || die 'ownership restart changed root, state, ConfigMap, Deployment, or Service identities'
 
-# Pruning a service must retain the same root/state identity.
+# Pruning a service must retain the same root/state/deployment identity.
 ctx patch webapplication root -n "$NAMESPACE" --type merge -p '{"spec":{"expose":false}}'
 wait_json 'service pruned' '.items | length == 0' service
 test "$(root_uid)" = "$ROOT_UID" || die 'prune changed the root identity'
-wait_json 'prune state final convergence' '(.spec.state.inventory | length == 1) and ((.spec.state.pendingDependencies // []) | length == 0) and (.spec.state.applyTransaction == null) and (.spec.state.pendingPersist == null) and (.spec.state.pruneCandidate == null) and (.spec.state.generationAdvanceClosure == null) and (.spec.state.deletion == null) and ((.spec.state.automation.pending // []) | length == 0)' "oxideloopstate/$STATE_NAME"
+wait_json 'prune state final convergence' '(.spec.state.inventory | length == 2) and ((.spec.state.pendingDependencies // []) | length == 0) and (.spec.state.applyTransaction == null) and (.spec.state.pendingPersist == null) and (.spec.state.pruneCandidate == null) and (.spec.state.generationAdvanceClosure == null) and (.spec.state.deletion == null) and ((.spec.state.automation.pending // []) | length == 0)' "oxideloopstate/$STATE_NAME"
 wait_json 'prune root current render status' '(.status.state.rootUid == .metadata.uid) and (.status.observedGeneration == .metadata.generation) and (.status.verifiedBundleDigest == .spec.program.digest) and (.status.inputToken | type == "string") and (.status.cacheEpoch | type == "number")' webapplication/root
 ctx get oxideloopstate -n "$NAMESPACE" -o json >"$EVIDENCE/post-prune-state.json"
 ctx get webapplication root -n "$NAMESPACE" -o json >"$EVIDENCE/post-prune-root.json"
 ctx get configmap root-config -n "$NAMESPACE" -o json >"$EVIDENCE/post-prune-config.json"
-jq -e --slurpfile root "$EVIDENCE/post-prune-root.json" --slurpfile config "$EVIDENCE/post-prune-config.json" --arg stateUid "$STATE_UID" --arg rootUid "$ROOT_UID" --arg stateName "$STATE_NAME" --arg configUid "$CONFIG_UID" '
+ctx get deployment root -n "$NAMESPACE" -o json >"$EVIDENCE/post-prune-deployment.json"
+jq -e --slurpfile root "$EVIDENCE/post-prune-root.json" --slurpfile config "$EVIDENCE/post-prune-config.json" --slurpfile deployment "$EVIDENCE/post-prune-deployment.json" --arg stateUid "$STATE_UID" --arg rootUid "$ROOT_UID" --arg stateName "$STATE_NAME" --arg configUid "$CONFIG_UID" --arg deploymentUid "$DEPLOYMENT_UID" '
   (.items | length == 1) and (.items[0].metadata.uid == $stateUid) and (.items[0].spec.root.uid == $rootUid) and
   ([.items[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}]) and
-  (.items[0].spec.state.inventory | length == 1) and
-  (.items[0].spec.state.inventory[0].logicalId == "configmap/root-config") and
-  (.items[0].spec.state.inventory[0].identity == {apiVersion:"v1",kind:"ConfigMap",namespace:$config[0].metadata.namespace,name:$config[0].metadata.name}) and
-  (.items[0].spec.state.inventory[0].uid == $configUid and .items[0].spec.state.inventory[0].resourceVersion == $config[0].metadata.resourceVersion and .items[0].spec.state.inventory[0].bundleDigest == $root[0].spec.program.digest) and
+  (.items[0].spec.state.inventory | length == 2) and
+  ([.items[0].spec.state.inventory[] | select(.logicalId == "config" and .identity == {apiVersion:"v1",kind:"ConfigMap",namespace:$config[0].metadata.namespace,name:$config[0].metadata.name} and .uid == $configUid and .resourceVersion == $config[0].metadata.resourceVersion and .bundleDigest == $root[0].spec.program.digest)] | length == 1) and
+  ([.items[0].spec.state.inventory[] | select(.logicalId == "deployment" and .identity == {apiVersion:"apps/v1",kind:"Deployment",namespace:$deployment[0].metadata.namespace,name:$deployment[0].metadata.name} and .uid == $deploymentUid and .resourceVersion == $deployment[0].metadata.resourceVersion and .bundleDigest == $root[0].spec.program.digest)] | length == 1) and
   ((.items[0].spec.state.pendingDependencies // []) | length == 0) and
   (.items[0].spec.state.applyTransaction == null and .items[0].spec.state.pendingPersist == null and .items[0].spec.state.pruneCandidate == null and .items[0].spec.state.generationAdvanceClosure == null and .items[0].spec.state.deletion == null) and
   ((.items[0].spec.state.automation.pending // []) | length == 0) and
   ($root[0].metadata.uid == $rootUid and $root[0].status.state == {rootUid:$rootUid,name:$stateName,uid:$stateUid}) and
   ($root[0].status.observedGeneration == $root[0].metadata.generation and $root[0].status.verifiedBundleDigest == $root[0].spec.program.digest) and
-  ([$config[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}])
-' "$EVIDENCE/post-prune-state.json" >/dev/null || die 'prune did not leave exact root, state, config inventory, and ownership'
+  ([$config[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}]) and
+  ([$deployment[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}])
+' "$EVIDENCE/post-prune-state.json" >/dev/null || die 'prune did not leave exact root, state, ConfigMap/Deployment inventory, and ownership'
 
 # No source means no baseline and no action.
 assert_count "$(ctx get automationruns -n "$NAMESPACE" -o json | jq '.items | length')" 0 'AutomationRuns before source creation'
-assert_count "$(ctx get events.events.k8s.io -n "$NAMESPACE" -o json | jq '[.items[] | select(.reason == "InputChanged")] | length')" 0 'InputChanged Events before source creation'
+assert_count "$(ctx get events.events.k8s.io -n "$NAMESPACE" -o json | jq '[.items[] | select(.reason == "ConfigurationChanged" and .action == "ConfigurationChanged")] | length')" 0 'ConfigurationChanged Events before source creation'
 
 # The first present observation establishes the durable baseline and produces
 # no run or Event. Only later source transitions are automations.
-ctx create configmap demo-input -n "$NAMESPACE" --from-literal=flavor=vanilla
-wait_json 'dependency baseline rerender' '.data.flavor == "vanilla"' configmap/root-config
+ctx create configmap demo-input -n "$NAMESPACE" --from-literal=message=vanilla
+wait_json 'dependency baseline rerender' '.data.message == "vanilla"' configmap/root-config
 wait_json 'durable automation baseline' '(.spec.state.automation.baselines // [] | length == 1) and (.spec.state.automation.pending // [] | length == 0) and (.spec.state.automation.completions // [] | length == 0)' "oxideloopstate/$STATE_NAME"
 INPUT_UID=$(ctx get configmap demo-input -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')
 INPUT_RV=$(ctx get configmap demo-input -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
 assert_automation_transition 0 "$INPUT_UID" "$INPUT_RV" baseline
+test "$(ctx get deployment root -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')" = "$DEPLOYMENT_UID" || die 'dependency baseline rerender changed the Deployment UID'
 capture_transition baseline
 
 # Every later observed source RV creates exactly one uniquely linked run and
 # Event and one matching durable completion.
-ctx patch configmap demo-input -n "$NAMESPACE" --type merge -p '{"data":{"flavor":"chocolate"}}'
-wait_json 'rerendered dependency value' '.data.flavor == "chocolate"' configmap/root-config
+ctx patch configmap demo-input -n "$NAMESPACE" --type merge -p '{"data":{"message":"chocolate"}}'
+wait_json 'rerendered dependency value' '.data.message == "chocolate"' configmap/root-config
 wait_json 'first dependency automation' '.items | length == 1' automationrun
 INPUT_RV=$(ctx get configmap demo-input -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
 assert_automation_transition 1 "$INPUT_UID" "$INPUT_RV" chocolate
+test "$(ctx get deployment root -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')" = "$DEPLOYMENT_UID" || die 'dependency rerender changed the Deployment UID'
 AUTOMATION_RUN_NAME=$(ctx get automationruns -n "$NAMESPACE" -o json | jq -er '[.items[] | select(.status.completion.state == "Succeeded") | .metadata.name] | if length == 1 then .[0] else error("expected exactly one completed AutomationRun for managed-fields evidence") end')
 capture_managed_field_ownership automationrun-status "automationrun/$AUTOMATION_RUN_NAME" status 'f:status'
 capture_transition chocolate
@@ -1084,13 +1101,13 @@ capture_transition chocolate
 # admission witness, so it holds and requires operator intervention. Record
 # that boundary while continuing with the declarative action flow.
 atomic_capture ambiguous-post-window.json jq -n '{schema:"oxideloop.dev/kind-e2e-ambiguous-post-window/v1",status:"not-recoverable",successfulRecovery:false,requiresIntervention:true,reason:"event materialization may have accepted a POST before status persistence; without an admission witness, automatic recovery is unsafe"}' || die 'failed to capture ambiguous POST window statement'
-ctx patch configmap demo-input -n "$NAMESPACE" --type merge -p '{"data":{"flavor":"strawberry"}}'
+ctx patch configmap demo-input -n "$NAMESPACE" --type merge -p '{"data":{"message":"strawberry"}}'
 wait_json 'action after ambiguous POST window statement creates one durable action' '(.items | length == 2) and ([.items[].status.completion.state] | all(. == "Succeeded"))' automationrun
 INPUT_RV=$(ctx get configmap demo-input -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
 assert_automation_transition 2 "$INPUT_UID" "$INPUT_RV" strawberry
 capture_transition strawberry
 arm_crash AfterStatusBeforeAck
-ctx patch configmap demo-input -n "$NAMESPACE" --type merge -p '{"data":{"flavor":"mint"}}'
+ctx patch configmap demo-input -n "$NAMESPACE" --type merge -p '{"data":{"message":"mint"}}'
 await_crash AfterStatusBeforeAck
 wait_json 'second crash recovery creates one durable action' '(.items | length == 3) and ([.items[].status.completion.state] | all(. == "Succeeded"))' automationrun
 INPUT_RV=$(ctx get configmap demo-input -n "$NAMESPACE" -o jsonpath='{.metadata.resourceVersion}')
@@ -1100,12 +1117,13 @@ capture_transition mint
 # An ordinary pod restart is a separate recovery proof.
 RESTART_OLD_POD=$(controller_pod)
 RESTART_OLD_POD_UID=$(ctx get pod -n "$NAMESPACE" "$RESTART_OLD_POD" -o jsonpath='{.metadata.uid}')
-ctx get webapplications,oxideloopstates,configmaps,automationruns,events.events.k8s.io -n "$NAMESPACE" -o json | jq -S '
+ctx get webapplications,oxideloopstates,configmaps,deployments,automationruns,events.events.k8s.io -n "$NAMESPACE" -o json | jq -S '
   {root:[.items[] | select(.kind == "WebApplication" and .metadata.name == "root") | {name:.metadata.name,uid:.metadata.uid}],
    state:[.items[] | select(.kind == "OxideLoopState") | {name:.metadata.name,uid:.metadata.uid}],
    config:[.items[] | select(.kind == "ConfigMap" and .metadata.name == "root-config") | {name:.metadata.name,uid:.metadata.uid}],
+   deployment:[.items[] | select(.kind == "Deployment" and .metadata.name == "root") | {name:.metadata.name,uid:.metadata.uid}],
    runs:([.items[] | select(.kind == "AutomationRun") | {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name)),
-   events:([.items[] | select(.kind == "Event" and .reason == "InputChanged") | {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name))}
+   events:([.items[] | select(.kind == "Event" and .reason == "ConfigurationChanged" and .action == "ConfigurationChanged") | {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name))}
 ' >"$EVIDENCE/ordinary-restart-identities-before.json"
 ctx delete pod -n "$NAMESPACE" "$RESTART_OLD_POD" --wait=false
 elapsed=0; RESTART_NEW_POD=''; RESTART_NEW_POD_UID=''
@@ -1122,16 +1140,18 @@ while [ -z "$RESTART_NEW_POD" ]; do
 done
 [ "$RESTART_NEW_POD_UID" != "$RESTART_OLD_POD_UID" ] || die 'ordinary restart reused the controller pod UID'
 ctx rollout status deployment/oxideloop-controller -n "$NAMESPACE" --timeout="${TIMEOUT}s"
-ctx get webapplications,oxideloopstates,configmaps,automationruns,events.events.k8s.io -n "$NAMESPACE" -o json | jq -S '
+ctx get webapplications,oxideloopstates,configmaps,deployments,automationruns,events.events.k8s.io -n "$NAMESPACE" -o json | jq -S '
   {root:[.items[] | select(.kind == "WebApplication" and .metadata.name == "root") | {name:.metadata.name,uid:.metadata.uid}],
    state:[.items[] | select(.kind == "OxideLoopState") | {name:.metadata.name,uid:.metadata.uid}],
    config:[.items[] | select(.kind == "ConfigMap" and .metadata.name == "root-config") | {name:.metadata.name,uid:.metadata.uid}],
+   deployment:[.items[] | select(.kind == "Deployment" and .metadata.name == "root") | {name:.metadata.name,uid:.metadata.uid}],
    runs:([.items[] | select(.kind == "AutomationRun") | {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name)),
-   events:([.items[] | select(.kind == "Event" and .reason == "InputChanged") | {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name))}
+   events:([.items[] | select(.kind == "Event" and .reason == "ConfigurationChanged" and .action == "ConfigurationChanged") | {name:.metadata.name,uid:.metadata.uid}] | sort_by(.name))}
 ' >"$EVIDENCE/ordinary-restart-identities-after.json"
 cmp -s "$EVIDENCE/ordinary-restart-identities-before.json" "$EVIDENCE/ordinary-restart-identities-after.json" || die 'ordinary restart changed durable or managed object identities'
 assert_count "$(ctx get automationruns -n "$NAMESPACE" -o json | jq '.items | length')" 3 'AutomationRuns after ordinary restart'
 assert_automation_transition 3 "$INPUT_UID" "$INPUT_RV" post-ordinary-restart
+test "$(ctx get deployment root -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')" = "$DEPLOYMENT_UID" || die 'ordinary restart changed the Deployment UID'
 capture_transition post-ordinary-restart
 
 # H03 deletion barrier: the parent owns an RDWR descriptor, so opening the
@@ -1157,7 +1177,7 @@ while ! grep -q '^REACHED$' "$EVIDENCE/deletion-barrier.txt" 2>/dev/null; do [ "
 sleep 2
 ctx get webapplication root -n "$NAMESPACE" -o json >"$EVIDENCE/deletion-midpoint-root.json"
 ctx get oxideloopstate "$STATE_NAME" -n "$NAMESPACE" -o json >"$EVIDENCE/deletion-midpoint-state.json"
-ctx get configmaps,services,automationruns -n "$NAMESPACE" -o json >"$EVIDENCE/deletion-midpoint-owned-children.json"
+ctx get configmaps,deployments,services,automationruns -n "$NAMESPACE" -o json >"$EVIDENCE/deletion-midpoint-owned-children.json"
 jq -e --arg uid "$ROOT_UID" '(.metadata.uid == $uid) and (.metadata.deletionTimestamp != null) and ([.metadata.finalizers[]?] | length > 0)' "$EVIDENCE/deletion-midpoint-root.json" >/dev/null || die 'deletion midpoint lacks original deleting root/finalizer'
 jq -e --arg stateUid "$STATE_UID" --arg stateName "$STATE_NAME" --arg namespace "$NAMESPACE" --arg rootUid "$ROOT_UID" '
   (.apiVersion == "runtime.oxideloop.dev/v1alpha1") and (.kind == "OxideLoopState") and
@@ -1166,7 +1186,7 @@ jq -e --arg stateUid "$STATE_UID" --arg stateName "$STATE_NAME" --arg namespace 
   (.metadata.annotations["runtime.oxideloop.dev/root-uid"] == $rootUid) and
   (.metadata.deletionTimestamp == null) and ((.metadata.finalizers // []) | length == 0)
 ' "$EVIDENCE/deletion-midpoint-state.json" >/dev/null || die 'deletion midpoint did not retain the exact unfinalized original State'
-jq -e --arg rootUid "$ROOT_UID" '[.items[] | select(any(.metadata.ownerReferences[]?; .uid == $rootUid))] | length == 0' "$EVIDENCE/deletion-midpoint-owned-children.json" >/dev/null || die 'deletion midpoint still has a ConfigMap, Service, or AutomationRun owned by the original root'
+jq -e --arg rootUid "$ROOT_UID" '[.items[] | select(any(.metadata.ownerReferences[]?; .uid == $rootUid))] | length == 0' "$EVIDENCE/deletion-midpoint-owned-children.json" >/dev/null || die 'deletion midpoint still has a ConfigMap, Deployment, Service, or AutomationRun owned by the original root'
 jq -e --arg rootUid "$ROOT_UID" --arg stateUid "$STATE_UID" --arg stateName "$STATE_NAME" --argjson generation "$DELETE_ROOT_GENERATION" '
   .status.deletionCleanupReceipt as $receipt |
   (.metadata.uid == $rootUid) and (.metadata.deletionTimestamp != null) and
@@ -1203,15 +1223,16 @@ assert_retired_state_recovery_log "$EVIDENCE/controller-root-only-recovery-previ
 ctx get all -n "$NAMESPACE" -o yaml >"$EVIDENCE/post-delete-inventory.yaml"
 ctx get webapplications,oxideloopstates,automationruns -n "$NAMESPACE" -o json >"$EVIDENCE/post-delete-controller-inventory.json"
 if ctx get configmap root-config -n "$NAMESPACE" >/dev/null 2>&1; then die 'managed ConfigMap remains after deletion'; fi
+if ctx get deployment root -n "$NAMESPACE" >/dev/null 2>&1; then die 'managed Deployment remains after deletion'; fi
 assert_count "$(ctx get oxideloopstates -n "$NAMESPACE" -o json | jq '.items | length')" 0 'post-delete durable inventory'
 assert_count "$(ctx get automationruns -n "$NAMESPACE" -o json | jq '.items | length')" 0 'post-delete AutomationRun inventory'
 assert_count "$(ctx get service -n "$NAMESPACE" -o json | jq '.items | length')" 0 'post-delete Service inventory'
-wait_json 'post-delete InputChanged Event garbage collection' '[.items[] | select(.reason == "InputChanged")] | length == 0' events.events.k8s.io
-ctx get configmaps,services,automationruns,events.events.k8s.io -n "$NAMESPACE" -o json >"$EVIDENCE/post-delete-root-only-child-check.json"
+wait_json 'post-delete ConfigurationChanged Event garbage collection' '[.items[] | select(.reason == "ConfigurationChanged" and .action == "ConfigurationChanged")] | length == 0' events.events.k8s.io
+ctx get configmaps,deployments,services,automationruns,events.events.k8s.io -n "$NAMESPACE" -o json >"$EVIDENCE/post-delete-root-only-child-check.json"
 jq -e --arg rootUid "$ROOT_UID" '
   ([.items[] | select(any(.metadata.ownerReferences[]?; .uid == $rootUid))] | length == 0) and
-  ([.items[] | select(.kind == "Event" and .reason == "InputChanged")] | length == 0)
-' "$EVIDENCE/post-delete-root-only-child-check.json" >/dev/null || die 'post-delete root-only child check retains an original-root child or action Event'
+  ([.items[] | select(.kind == "Event" and .reason == "ConfigurationChanged" and .action == "ConfigurationChanged")] | length == 0)
+' "$EVIDENCE/post-delete-root-only-child-check.json" >/dev/null || die 'post-delete root-only child check retains an original-root child or ConfigurationChanged Event'
 atomic_capture prepared-foreign-after-final-root-deletion.json ctx get configmap prepared-foreign-sentinel -n "$NAMESPACE" -o json || die 'final root deletion removed the foreign sentinel'
 cmp -s "$EVIDENCE/prepared-foreign-before.json" "$EVIDENCE/prepared-foreign-after-final-root-deletion.json" || die 'final root deletion mutated the foreign sentinel'
 jq -e '.metadata.ownerReferences == null or (.metadata.ownerReferences | length == 0)' "$EVIDENCE/prepared-foreign-after-final-root-deletion.json" >/dev/null || die 'final root deletion adopted the foreign sentinel'
@@ -1224,28 +1245,33 @@ REPLACEMENT_UID=$(root_uid)
 ctx get webapplication root -n "$NAMESPACE" -o json >"$EVIDENCE/replacement-root.json"
 REPLACEMENT_STATE_NAME=$(jq -er '.status.state.name' "$EVIDENCE/replacement-root.json")
 REPLACEMENT_STATE_UID=$(jq -er '.status.state.uid' "$EVIDENCE/replacement-root.json")
-wait_json 'replacement state and baseline final convergence' '(.spec.state.inventory | length == 2) and ((.spec.state.pendingDependencies // []) | length == 0) and (.spec.state.applyTransaction == null) and (.spec.state.pendingPersist == null) and (.spec.state.pruneCandidate == null) and (.spec.state.generationAdvanceClosure == null) and (.spec.state.deletion == null) and ((.spec.state.automation.baselines // []) | length == 1) and ((.spec.state.automation.pending // []) | length == 0) and ((.spec.state.automation.completions // []) | length == 0)' "oxideloopstate/$REPLACEMENT_STATE_NAME"
+wait_json 'replacement state and baseline final convergence' '(.spec.state.inventory | length == 3) and ((.spec.state.pendingDependencies // []) | length == 0) and (.spec.state.applyTransaction == null) and (.spec.state.pendingPersist == null) and (.spec.state.pruneCandidate == null) and (.spec.state.generationAdvanceClosure == null) and (.spec.state.deletion == null) and ((.spec.state.automation.baselines // []) | length == 1) and ((.spec.state.automation.pending // []) | length == 0) and ((.spec.state.automation.completions // []) | length == 0)' "oxideloopstate/$REPLACEMENT_STATE_NAME"
 wait_json 'replacement root current render status' '(.status.state.rootUid == .metadata.uid) and (.status.observedGeneration == .metadata.generation) and (.status.verifiedBundleDigest == .spec.program.digest) and (.status.inputToken | type == "string") and (.status.cacheEpoch | type == "number")' webapplication/root
 ctx get webapplication root -n "$NAMESPACE" -o json >"$EVIDENCE/replacement-root.json"
 ctx get oxideloopstate -n "$NAMESPACE" -o json >"$EVIDENCE/replacement-inventory.json"
 ctx get configmap root-config -n "$NAMESPACE" -o json >"$EVIDENCE/replacement-config.json"
+ctx get deployment root -n "$NAMESPACE" -o json >"$EVIDENCE/replacement-deployment.json"
 ctx get service root-service -n "$NAMESPACE" -o json >"$EVIDENCE/replacement-service.json"
-jq -e --slurpfile root "$EVIDENCE/replacement-root.json" --slurpfile config "$EVIDENCE/replacement-config.json" --slurpfile service "$EVIDENCE/replacement-service.json" --arg namespace "$NAMESPACE" --arg oldRootUid "$ROOT_UID" --arg oldStateUid "$STATE_UID" --arg rootUid "$REPLACEMENT_UID" --arg stateName "$REPLACEMENT_STATE_NAME" --arg stateUid "$REPLACEMENT_STATE_UID" '
+jq -e --slurpfile root "$EVIDENCE/replacement-root.json" --slurpfile config "$EVIDENCE/replacement-config.json" --slurpfile deployment "$EVIDENCE/replacement-deployment.json" --slurpfile service "$EVIDENCE/replacement-service.json" --arg namespace "$NAMESPACE" --arg oldRootUid "$ROOT_UID" --arg oldStateUid "$STATE_UID" --arg rootUid "$REPLACEMENT_UID" --arg stateName "$REPLACEMENT_STATE_NAME" --arg stateUid "$REPLACEMENT_STATE_UID" '
   (.items | length == 1) and (.items[0].metadata.name == $stateName and .items[0].metadata.uid == $stateUid and .items[0].metadata.uid != $oldStateUid) and
   (.items[0].spec.root.uid == $rootUid and .items[0].spec.root.uid != $oldRootUid and .items[0].spec.root.bundleDigest == $root[0].spec.program.digest) and
   ([.items[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}]) and
-  (.items[0].spec.state.inventory | length == 2) and
-  ([.items[0].spec.state.inventory[] | select(.logicalId == "configmap/root-config" and .identity == {apiVersion:"v1",kind:"ConfigMap",namespace:$namespace,name:"root-config"} and .uid == $config[0].metadata.uid and .resourceVersion == $config[0].metadata.resourceVersion and .bundleDigest == $root[0].spec.program.digest)] | length == 1) and
-  ([.items[0].spec.state.inventory[] | select(.logicalId == "service/root-service" and .identity == {apiVersion:"v1",kind:"Service",namespace:$namespace,name:"root-service"} and .uid == $service[0].metadata.uid and .resourceVersion == $service[0].metadata.resourceVersion and .bundleDigest == $root[0].spec.program.digest)] | length == 1) and
+  (.items[0].spec.state.inventory | length == 3) and
+  ([.items[0].spec.state.inventory[] | select(.logicalId == "config" and .identity == {apiVersion:"v1",kind:"ConfigMap",namespace:$namespace,name:"root-config"} and .uid == $config[0].metadata.uid and .resourceVersion == $config[0].metadata.resourceVersion and .bundleDigest == $root[0].spec.program.digest)] | length == 1) and
+  ([.items[0].spec.state.inventory[] | select(.logicalId == "deployment" and .identity == {apiVersion:"apps/v1",kind:"Deployment",namespace:$namespace,name:"root"} and .uid == $deployment[0].metadata.uid and .resourceVersion == $deployment[0].metadata.resourceVersion and .bundleDigest == $root[0].spec.program.digest)] | length == 1) and
+  ([.items[0].spec.state.inventory[] | select(.logicalId == "service" and .identity == {apiVersion:"v1",kind:"Service",namespace:$namespace,name:"root-service"} and .uid == $service[0].metadata.uid and .resourceVersion == $service[0].metadata.resourceVersion and .bundleDigest == $root[0].spec.program.digest)] | length == 1) and
   ((.items[0].spec.state.pendingDependencies // []) | length == 0) and
   (.items[0].spec.state.applyTransaction == null and .items[0].spec.state.pendingPersist == null and .items[0].spec.state.pruneCandidate == null and .items[0].spec.state.generationAdvanceClosure == null and .items[0].spec.state.deletion == null) and
   ((.items[0].spec.state.automation.baselines // []) | length == 1) and ((.items[0].spec.state.automation.pending // []) | length == 0) and ((.items[0].spec.state.automation.completions // []) | length == 0) and
   ($root[0].metadata.uid == $rootUid and $root[0].status.state == {rootUid:$rootUid,name:$stateName,uid:$stateUid}) and
   ($root[0].status.observedGeneration == $root[0].metadata.generation and $root[0].status.verifiedBundleDigest == $root[0].spec.program.digest) and
-  ($config[0].data.flavor == "mint") and
+  ($root[0].spec.replicas == 0 and $root[0].spec.expose == true) and
+  ($deployment[0].spec.replicas == 0 and ([$deployment[0].spec.template.spec.containers[] | select(.name == "web") | .image] == [$root[0].spec.image])) and
+  ($config[0].data.message == "mint") and
   ([$config[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}]) and
+  ([$deployment[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}]) and
   ([$service[0].metadata.ownerReferences[]?] == [{apiVersion:"demo.oxideloop.dev/v1alpha1",kind:"WebApplication",name:"root",uid:$rootUid,controller:true,blockOwnerDeletion:false}])
 ' "$EVIDENCE/replacement-inventory.json" >/dev/null || die 'replacement did not prove a new root/state/owned inventory without original identities'
 assert_count "$(ctx get automationruns -n "$NAMESPACE" -o json | jq '.items | length')" 0 'replacement fresh baseline AutomationRun inventory'
-assert_count "$(ctx get events.events.k8s.io -n "$NAMESPACE" -o json | jq '[.items[] | select(.reason == "InputChanged")] | length')" 0 'replacement fresh baseline Event inventory'
+assert_count "$(ctx get events.events.k8s.io -n "$NAMESPACE" -o json | jq '[.items[] | select(.reason == "ConfigurationChanged" and .action == "ConfigurationChanged")] | length')" 0 'replacement fresh baseline Event inventory'
 note 'matrix passed'

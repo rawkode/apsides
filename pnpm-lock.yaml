@@ -35,12 +35,9 @@ importers:
 
   packages/example-bundle:
     dependencies:
-      '@oxideloop/react-like-runtime':
+      '@oxideloop/kubernetes':
         specifier: workspace:*
-        version: link:../react-like-runtime
-      '@oxideloop/sdk':
-        specifier: workspace:*
-        version: link:../sdk
+        version: link:../kubernetes
     devDependencies:
       tsx:
         specifier: 4.19.2
@@ -76,6 +73,22 @@ importers:
       rolldown:
         specifier: 1.0.0-beta.35
         version: 1.0.0-beta.35(@emnapi/core@1.11.3)(@emnapi/runtime@1.11.3)
+      tsx:
+        specifier: 4.19.2
+        version: 4.19.2
+      typescript:
+        specifier: 5.8.3
+        version: 5.8.3
+
+  packages/kubernetes:
+    dependencies:
+      '@oxideloop/react-like-runtime':
+        specifier: workspace:*
+        version: link:../react-like-runtime
+      '@oxideloop/sdk':
+        specifier: workspace:*
+        version: link:../sdk
+    devDependencies:
       tsx:
         specifier: 4.19.2
         version: 4.19.2

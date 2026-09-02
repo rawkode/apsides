@@ -1,0 +1,107 @@
+{
+  "contract": "oxideloop-controller-tsx/v1",
+  "root": {
+    "namespace": "demo",
+    "name": "portal",
+    "spec": {
+      "image": "ghcr.io/example/web:v1",
+      "replicas": 2,
+      "expose": true
+    },
+    "observations": {
+      "demo-input": { "data": { "message": "from-input" } }
+    }
+  },
+  "expected": {
+    "disposition": "apply",
+    "resources": [
+      {
+        "logicalId": "deployment",
+        "object": {
+          "apiVersion": "apps/v1",
+          "kind": "Deployment",
+          "metadata": {
+            "name": "portal",
+            "namespace": "demo",
+            "labels": { "app": "portal" }
+          },
+          "spec": {
+            "replicas": 2,
+            "selector": { "matchLabels": { "app": "portal" } },
+            "template": {
+              "metadata": { "labels": { "app": "portal" } },
+              "spec": {
+                "securityContext": { "runAsNonRoot": true },
+                "containers": [
+                  {
+                    "name": "web",
+                    "image": "ghcr.io/example/web:v1",
+                    "ports": [{ "name": "http", "containerPort": 8080 }],
+                    "env": [{
+                      "name": "MESSAGE",
+                      "valueFrom": { "configMapKeyRef": { "name": "portal-config", "key": "message" } }
+                    }],
+                    "resources": {
+                      "requests": { "cpu": "10m", "memory": "32Mi" },
+                      "limits": { "memory": "64Mi" }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "logicalId": "config",
+        "object": {
+          "apiVersion": "v1",
+          "kind": "ConfigMap",
+          "metadata": {
+            "name": "portal-config",
+            "namespace": "demo",
+            "labels": { "app": "portal" }
+          },
+          "data": { "message": "from-input" }
+        }
+      },
+      {
+        "logicalId": "service",
+        "object": {
+          "apiVersion": "v1",
+          "kind": "Service",
+          "metadata": {
+            "name": "portal-service",
+            "namespace": "demo",
+            "labels": { "app": "portal" }
+          },
+          "spec": {
+            "selector": { "app": "portal" },
+            "ports": [{ "name": "http", "port": 80, "targetPort": "http" }]
+          }
+        }
+      }
+    ],
+    "dependency": {
+      "component": "ConfigMap",
+      "name": "demo-input",
+      "current": { "data": { "message": "from-input" } }
+    },
+    "automation": {
+      "id": "configuration-changed",
+      "version": "v1",
+      "when": "ResourceHandle.changed()",
+      "metadata": { "message": "from-input" },
+      "event": {
+        "id": "notification",
+        "regarding": "exact ConfigMap source from ResourceHandle.changed()",
+        "reason": "ConfigurationChanged",
+        "action": "ConfigurationChanged",
+        "note": "from-input"
+      },
+      "absentSource": "omit",
+      "firstPresent": "baseline-only",
+      "laterExactTransition": "at-most-one-event"
+    }
+  }
+}

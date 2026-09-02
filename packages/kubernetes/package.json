@@ -1,0 +1,10 @@
+{
+  "name": "@oxideloop/kubernetes",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts", "./jsx-runtime": "./src/jsx-runtime.ts" },
+  "dependencies": { "@oxideloop/sdk": "workspace:*", "@oxideloop/react-like-runtime": "workspace:*" },
+  "devDependencies": { "typescript": "5.8.3", "tsx": "4.19.2" },
+  "scripts": { "typecheck": "tsc -p tsconfig.json", "test": "tsx src/kubernetes.test.ts" }
+}

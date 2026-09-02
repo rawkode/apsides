@@ -20,6 +20,11 @@ pub const ANNOTATION_LOGICAL_ID: &str = "runtime.oxideloop.dev/logical-id";
 pub const STATE_VERSION_V1: u16 = 1;
 
 pub const MAX_MESSAGE_BYTES: usize = 1_024;
+pub const MAX_IMAGE_BYTES: usize = 2_048;
+/// Kubernetes Deployments represent replicas as a signed 32-bit integer.
+/// Keep the root API within that interoperable range even though the Rust
+/// representation is unsigned.
+pub const MAX_REPLICAS: u32 = i32::MAX as u32;
 pub const MAX_IDENTIFIER_BYTES: usize = 253;
 pub const MAX_DIGEST_BYTES: usize = 128;
 pub const MAX_LIST_ENTRIES: usize = 1_024;
@@ -36,6 +41,8 @@ pub enum SpecValidationError {
     Empty { field: &'static str },
     #[error("{field} exceeds its {maximum}-byte limit")]
     TooLong { field: &'static str, maximum: usize },
+    #[error("replicas exceeds its maximum of {maximum}")]
+    ReplicaLimit { maximum: u32 },
     #[error("unsupported OxideLoopState state version {actual}; supported version is {supported}")]
     UnsupportedStateVersion { actual: u16, supported: u16 },
     #[error("state root UID and bootstrap ID do not agree")]
@@ -157,8 +164,16 @@ impl ProgramBundleReference {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct WebApplicationSpec {
+    #[schemars(length(min = 1, max = 2048))]
+    pub image: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 2_147_483_647))]
+    pub replicas: Option<u32>,
+    /// Compatibility-only input retained for existing roots. The v1 example
+    /// derives its displayed message from the watched `ConfigMap` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = 1024))]
-    pub message: String,
+    pub message: Option<String>,
     pub expose: bool,
     pub program: ProgramBundleReference,
 }
@@ -170,7 +185,18 @@ impl WebApplicationSpec {
     ///
     /// Returns an error when a required field is empty or exceeds its bound.
     pub fn validate(&self) -> Result<(), SpecValidationError> {
-        non_empty_within(&self.message, "message", MAX_MESSAGE_BYTES)?;
+        non_empty_within(&self.image, "image", MAX_IMAGE_BYTES)?;
+        if self
+            .replicas
+            .is_some_and(|replicas| replicas > MAX_REPLICAS)
+        {
+            return Err(SpecValidationError::ReplicaLimit {
+                maximum: MAX_REPLICAS,
+            });
+        }
+        if let Some(message) = &self.message {
+            non_empty_within(message, "message", MAX_MESSAGE_BYTES)?;
+        }
         self.program.validate()
     }
 }
@@ -1711,6 +1737,20 @@ impl AutomationRunSpec {
         {
             return Err(SpecValidationError::ActionInputPinMismatch);
         }
+        if let Some(context) = oxideloop_renderer_abi::action_context_v1(&input.event_metadata)
+            .map_err(|error| SpecValidationError::InvalidActionInput(error.to_string()))?
+            && !oxideloop_renderer_abi::action_context_source_matches(
+                &context,
+                &self.source.api_version,
+                &self.source.kind,
+                &self.source.namespace,
+                &self.source.name,
+                &self.source_uid,
+                &self.source_resource_version,
+            )
+        {
+            return Err(SpecValidationError::ActionInputPinMismatch);
+        }
         Ok(())
     }
 
@@ -1953,6 +1993,37 @@ mod tests {
         }
     }
 
+    fn set_event_metadata(run: &mut AutomationRunSpec, event_metadata: &serde_json::Value) {
+        let mut action_input: serde_json::Value =
+            serde_json::from_str(&run.action_input_v0).expect("canonical action input");
+        action_input["eventMetadata"] = event_metadata.clone();
+        run.action_input_v0 =
+            String::from_utf8(oxideloop_renderer_abi::canonical_bytes(&action_input).unwrap())
+                .unwrap();
+        run.action_input_hash = oxideloop_renderer_abi::sha256_hex(run.action_input_v0.as_bytes());
+        run.event_metadata_hash = oxideloop_renderer_abi::sha256_hex(
+            &oxideloop_renderer_abi::canonical_bytes(event_metadata).unwrap(),
+        );
+    }
+
+    fn action_context_metadata() -> serde_json::Value {
+        serde_json::json!({
+            "$oxideloop": {
+                "kind": "action-context",
+                "version": "v1",
+                "source": {
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "namespace": "demo",
+                    "name": "input",
+                    "uid": "source-uid",
+                    "resourceVersion": "7"
+                },
+                "metadata": {"$oxideloop": {"user": true}, "reason": "changed"}
+            }
+        })
+    }
+
     #[test]
     fn validation_rejects_unknown_state_versions() {
         assert_eq!(
@@ -1966,15 +2037,23 @@ mod tests {
 
     #[test]
     fn web_application_bounds_are_enforced() {
-        let spec = WebApplicationSpec {
-            message: "x".repeat(MAX_MESSAGE_BYTES + 1),
+        let mut spec = WebApplicationSpec {
+            image: "x".repeat(MAX_IMAGE_BYTES + 1),
+            replicas: None,
+            message: None,
             expose: false,
             program: ProgramBundleReference {
                 config_map_name: "bundle".into(),
                 key: "program.mjs".into(),
-                digest: "sha256:x".into(),
+                digest: "a".repeat(64),
             },
         };
+        assert!(matches!(
+            spec.validate(),
+            Err(SpecValidationError::TooLong { field: "image", .. })
+        ));
+        spec.image = "example.invalid/web:latest".into();
+        spec.message = Some("x".repeat(MAX_MESSAGE_BYTES + 1));
         assert!(matches!(
             spec.validate(),
             Err(SpecValidationError::TooLong {
@@ -1982,6 +2061,120 @@ mod tests {
                 ..
             })
         ));
+        spec.message = None;
+        spec.replicas = Some(MAX_REPLICAS + 1);
+        assert_eq!(
+            spec.validate(),
+            Err(SpecValidationError::ReplicaLimit {
+                maximum: MAX_REPLICAS
+            })
+        );
+    }
+
+    #[test]
+    fn web_application_image_is_required_but_legacy_fields_are_optional() {
+        let required = serde_json::json!({
+            "image": "ghcr.io/example/web:v1",
+            "expose": true,
+            "program": {
+                "configMapName": "bundle",
+                "key": "program.mjs",
+                "digest": "a".repeat(64),
+            },
+        });
+        let parsed: WebApplicationSpec = serde_json::from_value(required.clone()).unwrap();
+        assert_eq!(parsed.replicas, None);
+        assert_eq!(parsed.message, None);
+        assert_eq!(serde_json::to_value(parsed).unwrap(), required);
+
+        let legacy: WebApplicationSpec = serde_json::from_value(serde_json::json!({
+            "image": "ghcr.io/example/web:v1",
+            "replicas": 2,
+            "message": "legacy message",
+            "expose": true,
+            "program": {
+                "configMapName": "bundle",
+                "key": "program.mjs",
+                "digest": "a".repeat(64),
+            },
+        }))
+        .unwrap();
+        assert_eq!(legacy.replicas, Some(2));
+        assert_eq!(legacy.message.as_deref(), Some("legacy message"));
+        assert!(legacy.validate().is_ok());
+
+        let missing_image = serde_json::json!({
+            "expose": true,
+            "program": {
+                "configMapName": "bundle",
+                "key": "program.mjs",
+                "digest": "a".repeat(64),
+            },
+        });
+        assert!(serde_json::from_value::<WebApplicationSpec>(missing_image).is_err());
+    }
+
+    #[test]
+    fn root_spec_canonical_projection_and_hash_are_exact() {
+        let spec = WebApplicationSpec {
+            image: "ghcr.io/example/web:v1".into(),
+            replicas: None,
+            message: None,
+            expose: true,
+            program: ProgramBundleReference {
+                config_map_name: "bundle".into(),
+                key: "program.mjs".into(),
+                digest: "a".repeat(64),
+            },
+        };
+        let root_projection = |spec: WebApplicationSpec| {
+            serde_json::json!({
+                "apiVersion": "demo.oxideloop.dev/v1alpha1",
+                "kind": "WebApplication",
+                "namespace": "demo",
+                "name": "portal",
+                "uid": "root-uid",
+                "generation": 1,
+                "spec": spec,
+            })
+        };
+        let projection = root_projection(spec.clone());
+        let serialized_spec = projection
+            .get("spec")
+            .and_then(serde_json::Value::as_object)
+            .unwrap();
+        assert!(!serialized_spec.contains_key("message"));
+        assert!(!serialized_spec.contains_key("replicas"));
+
+        let canonical = oxideloop_renderer_abi::canonical_bytes(&projection).unwrap();
+        let canonical = String::from_utf8(canonical).unwrap();
+        assert_eq!(
+            canonical,
+            concat!(
+                r#"{"apiVersion":"demo.oxideloop.dev/v1alpha1","generation":1,"kind":"WebApplication","name":"portal","namespace":"demo","spec":{"expose":true,"image":"ghcr.io/example/web:v1","program":{"configMapName":"bundle","digest":""#,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                r#"","key":"program.mjs"}},"uid":"root-uid"}"#,
+            )
+        );
+        let base_hash = oxideloop_renderer_abi::sha256_hex(canonical.as_bytes());
+        assert_eq!(
+            base_hash,
+            "437a5cc166ddee7faf80f4103a09003fa350aac1abbaad68bf0753a0b9657917"
+        );
+
+        let mut image_changed = spec.clone();
+        image_changed.image = "ghcr.io/example/web:v2".into();
+        let image_hash = oxideloop_renderer_abi::sha256_hex(
+            &oxideloop_renderer_abi::canonical_bytes(&root_projection(image_changed)).unwrap(),
+        );
+        assert_ne!(image_hash, base_hash);
+
+        let mut replicas_changed = spec;
+        replicas_changed.replicas = Some(2);
+        let replicas_hash = oxideloop_renderer_abi::sha256_hex(
+            &oxideloop_renderer_abi::canonical_bytes(&root_projection(replicas_changed)).unwrap(),
+        );
+        assert_ne!(replicas_hash, base_hash);
     }
 
     #[test]
@@ -2117,6 +2310,32 @@ mod tests {
             validate_automation_run_name("forged-run-name", &run),
             Err(SpecValidationError::AutomationRunNameMismatch)
         );
+    }
+
+    #[test]
+    fn tagged_action_context_must_match_the_immutable_automation_run_source() {
+        let mut valid = run_spec();
+        set_event_metadata(&mut valid, &action_context_metadata());
+        assert!(valid.validate().is_ok());
+
+        let mutations: [fn(&mut serde_json::Value); 6] = [
+            |source| source["apiVersion"] = serde_json::json!("v2"),
+            |source| source["kind"] = serde_json::json!("Secret"),
+            |source| source["namespace"] = serde_json::json!("other"),
+            |source| source["name"] = serde_json::json!("other"),
+            |source| source["uid"] = serde_json::json!("other"),
+            |source| source["resourceVersion"] = serde_json::json!("8"),
+        ];
+        for mutate in mutations {
+            let mut invalid = valid.clone();
+            let mut metadata = action_context_metadata();
+            mutate(&mut metadata["$oxideloop"]["source"]);
+            set_event_metadata(&mut invalid, &metadata);
+            assert_eq!(
+                invalid.validate(),
+                Err(SpecValidationError::ActionInputPinMismatch)
+            );
+        }
     }
 
     #[test]

@@ -1957,6 +1957,7 @@ fn observation_sort_key(left: &Observation, right: &Observation) -> std::cmp::Or
 fn object_reference(identity: &ObjectIdentity) -> Result<ObjectRefV0, RuntimeErrorV0> {
     let resource = match (identity.api_version.as_str(), identity.kind.as_str()) {
         ("v1", "ConfigMap") => ResourceKindV0::ConfigMap,
+        ("apps/v1", "Deployment") => ResourceKindV0::Deployment,
         ("v1", "Service") => ResourceKindV0::Service,
         _ => {
             return Err(RuntimeErrorV0::Hold(
@@ -1981,6 +1982,7 @@ fn absent_desired_observation(
 ) -> Result<DesiredObservationV0, RuntimeErrorV0> {
     let gvr = match (identity.api_version.as_str(), identity.kind.as_str()) {
         ("v1", "ConfigMap") => "v1/configmaps",
+        ("apps/v1", "Deployment") => "apps/v1/deployments",
         ("v1", "Service") => "v1/services",
         _ => {
             return Err(RuntimeErrorV0::Hold(
@@ -2001,7 +2003,7 @@ fn absent_desired_observation(
 }
 
 /// Converts exact Kubernetes observations for reducer reconciliation. Only
-/// built-in ConfigMap/Service objects qualify at Kubernetes v1.34. Recovery
+/// built-in ConfigMap/Deployment/Service objects qualify at Kubernetes v1.34. Recovery
 /// proof is issued only for one exact controller owner reference plus all
 /// proof annotations; a same-name foreign object therefore has no adoption
 /// path.
@@ -2021,6 +2023,7 @@ pub fn desired_observation(
     }
     let gvr = match object.reference.resource {
         ResourceKindV0::ConfigMap => "v1/configmaps",
+        ResourceKindV0::Deployment => "apps/v1/deployments",
         ResourceKindV0::Service => "v1/services",
         _ => return Err(RuntimeErrorV0::Hold("unsupported observed resource".into())),
     };
@@ -2299,6 +2302,17 @@ mod tests {
         inventory: Vec<InventoryEntry>,
         prior_prune_token: Option<String>,
     ) -> RootActorV0 {
+        let machine = fenced_machine(inventory, prior_prune_token);
+        let mut actor = RootActorV0::new(machine);
+        actor.start();
+        advance_fenced_actor_to_informer(&mut actor);
+        actor
+    }
+
+    fn fenced_machine(
+        inventory: Vec<InventoryEntry>,
+        prior_prune_token: Option<String>,
+    ) -> MachineStateV0 {
         let root_uid = "root-uid";
         let state_name = state_name(root_uid).expect("state name");
         let prune_candidate = prior_prune_token.map(|barrier_token| PruneCandidate {
@@ -2311,14 +2325,16 @@ mod tests {
             },
             second_observation: None,
         });
-        let machine = MachineStateV0::new(
+        MachineStateV0::new(
             RootSnapshotV0 {
                 uid: root_uid.into(),
                 namespace: "ns".into(),
                 name: "root".into(),
                 generation: 1,
                 spec: WebApplicationSpec {
-                    message: "hello".into(),
+                    image: "example.invalid/web:latest".into(),
+                    replicas: Some(1),
+                    message: None,
                     expose: false,
                     program: ProgramBundleReference {
                         config_map_name: "bundle".into(),
@@ -2357,9 +2373,10 @@ mod tests {
                 },
             },
         )
-        .expect("valid durable actor state");
-        let mut actor = RootActorV0::new(machine);
-        actor.start();
+        .expect("valid durable actor state")
+    }
+
+    fn advance_fenced_actor_to_informer(actor: &mut RootActorV0) {
         let descriptor = actor
             .next_command()
             .expect("fenced actor descriptor request")
@@ -2398,7 +2415,6 @@ mod tests {
             .next_command()
             .expect("fenced actor informer transition");
         assert!(next.is_none(), "unexpected fenced actor command: {next:?}");
-        actor
     }
 
     fn fixed_final_result(dependencies: Vec<Dependency>) -> FixedPointResultV0 {
@@ -2413,7 +2429,8 @@ mod tests {
                     uid: "root-uid".into(),
                     generation: 1,
                     spec: json!({
-                        "message": "hello",
+                        "image": "example.invalid/web:latest",
+                        "replicas": 1,
                         "expose": false,
                         "program": {
                             "configMapName": "bundle",
@@ -4991,6 +5008,23 @@ mod tests {
             }
         );
         assert_eq!(desired.recovery_proof.unwrap().transaction_id, "tx-1");
+    }
+
+    #[test]
+    fn deployment_observation_uses_the_same_exact_owner_and_recovery_proof() {
+        let mut object = owned_proven_object();
+        object.reference.resource = ResourceKindV0::Deployment;
+        object.value["apiVersion"] = json!("apps/v1");
+        object.value["kind"] = json!("Deployment");
+        let desired = desired_observation(&root(), "root-uid", &object).unwrap();
+        assert_eq!(
+            desired.qualification,
+            BackendQualification::BuiltInTested {
+                kubernetes_minor: "1.34".into(),
+                gvr: "apps/v1/deployments".into(),
+            }
+        );
+        assert_eq!(desired.recovery_proof.unwrap().uid, "child-uid");
     }
 
     #[test]

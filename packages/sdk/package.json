@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "exports": { ".": "./src/index.ts", "./hooks": "./src/hooks.ts", "./abi": "./src/abi.ts" },
-  "scripts": { "typecheck": "tsc -p tsconfig.json" },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.test.json && node .test-output/p2.test.js && rm -rf .test-output"
+  },
   "devDependencies": { "typescript": "5.8.3" }
 }

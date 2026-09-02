@@ -308,6 +308,22 @@ fn check_input(
             "ActionInputV0 does not match immutable run correlation",
         ));
     }
+    if let Some(context) = oxideloop_renderer_abi::action_context_v1(&i.event_metadata)
+        .map_err(|error| bad(error.to_string()))?
+        && !oxideloop_renderer_abi::action_context_source_matches(
+            &context,
+            &corr.source.api_version,
+            &corr.source.kind,
+            &corr.source.namespace,
+            &corr.source.name,
+            &corr.source_uid,
+            &corr.source_resource_version,
+        )
+    {
+        return Err(bad(
+            "v1 action-context source does not match immutable run correlation",
+        ));
+    }
     Ok(())
 }
 
@@ -590,6 +606,30 @@ mod tests {
     fn input() -> Validated<ActionInputV0> {
         parse_validate_action_input(&json!({"abiVersion":"renderer.oxideloop.dev/v0","bundleDigest":"a".repeat(64),"automationIdentity":"changed","automationVersion":"v1","actionModuleIdentity":"demo.action","actionModuleDigest":"b".repeat(64),"occurrenceId":"occurrence-1","sourceTransitionId":"transition-1","sourceUid":"source-uid","sourceResourceVersion":"7","eventMetadata":{"note":"changed"}}).to_string()).unwrap()
     }
+
+    fn action_context_metadata() -> Value {
+        json!({
+            "$oxideloop": {
+                "kind": "action-context",
+                "version": "v1",
+                "source": {
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "namespace": "demo",
+                    "name": "input",
+                    "uid": "source-uid",
+                    "resourceVersion": "7"
+                },
+                "metadata": {"$oxideloop": {"user": true}, "note": "changed"}
+            }
+        })
+    }
+
+    fn input_with_action_context(metadata: Value) -> Validated<ActionInputV0> {
+        let mut document = serde_json::to_value(input().document).unwrap();
+        document["eventMetadata"] = metadata;
+        parse_validate_action_input(&document.to_string()).unwrap()
+    }
     fn corr(i: &Validated<ActionInputV0>) -> RunCorrelationV0 {
         let x = &i.document;
         RunCorrelationV0 {
@@ -612,7 +652,7 @@ mod tests {
     }
     fn output() -> Validated<ActionOutputV0> {
         parse_validate_action_output(include_str!(
-            "../../../packages/example-bundle/fixtures/input-changed-action-output.json"
+            "../../../packages/fixtures/golden/v0/action-output.valid.json"
         ))
         .unwrap()
     }
@@ -686,6 +726,39 @@ mod tests {
             let mut c = corr(&i);
             change(&mut c);
             assert!(plan_event(&i, &output(), &root(), &source(), &run(), &c).is_err());
+        }
+    }
+
+    #[test]
+    fn tagged_action_context_cannot_retarget_the_event_source() {
+        let valid = input_with_action_context(action_context_metadata());
+        let valid_corr = corr(&valid);
+        assert!(plan_event(&valid, &output(), &root(), &source(), &run(), &valid_corr).is_ok());
+
+        let mutations: [fn(&mut Value); 6] = [
+            |source| source["apiVersion"] = json!("v2"),
+            |source| source["kind"] = json!("Secret"),
+            |source| source["namespace"] = json!("other"),
+            |source| source["name"] = json!("other"),
+            |source| source["uid"] = json!("other"),
+            |source| source["resourceVersion"] = json!("8"),
+        ];
+        for mutate in mutations {
+            let mut metadata = action_context_metadata();
+            mutate(&mut metadata["$oxideloop"]["source"]);
+            let retargeted = input_with_action_context(metadata);
+            let correlation = corr(&retargeted);
+            assert!(
+                plan_event(
+                    &retargeted,
+                    &output(),
+                    &root(),
+                    &source(),
+                    &run(),
+                    &correlation
+                )
+                .is_err()
+            );
         }
     }
     #[test]

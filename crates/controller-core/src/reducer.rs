@@ -5934,7 +5934,9 @@ mod tests {
 
     fn web_application_spec(digest: impl Into<String>) -> WebApplicationSpec {
         WebApplicationSpec {
-            message: "hello".into(),
+            image: "example.invalid/web:latest".into(),
+            replicas: Some(1),
+            message: None,
             expose: false,
             program: ProgramBundleReference {
                 config_map_name: "bundle".into(),
@@ -10856,7 +10858,7 @@ mod tests {
         advanced.generation += 1;
         advanced.root_resource_version = "31".into();
         advanced.status.observed_generation = Some(advanced.generation);
-        advanced.spec.message = "refreshed root spec".into();
+        advanced.spec.replicas = Some(2);
         let refreshed = reduce(
             ready.clone(),
             EventV0::RootRefreshed {

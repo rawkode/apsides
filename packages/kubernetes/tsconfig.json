@@ -1,0 +1,1 @@
+{ "extends": "../../tsconfig.base.json", "compilerOptions": { "baseUrl": ".", "paths": { "@oxideloop/sdk": ["../sdk/src/index.ts"], "@oxideloop/sdk/hooks": ["../sdk/src/hooks.ts"], "@oxideloop/react-like-runtime": ["../react-like-runtime/src/index.ts"], "@oxideloop/react-like-runtime/jsx-runtime": ["../react-like-runtime/src/jsx-runtime.ts"] } }, "include": ["src"] }
