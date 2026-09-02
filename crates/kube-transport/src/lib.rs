@@ -14,6 +14,12 @@
     clippy::unnecessary_wraps
 )]
 
+// Bootstrap diagnostics deliberately travel only through the runtime's
+// debug-only test-failpoint feature. They are not part of the production
+// transport surface, where a failure must remain the unadorned domain error.
+#[cfg(all(feature = "bootstrap-diagnostics", not(debug_assertions)))]
+compile_error!("bootstrap diagnostics are only available in debug builds");
+
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
@@ -5108,34 +5114,58 @@ impl KubeTransportV0 {
                     session,
                 )
                 .await?;
-            match self
+            let metadata_result = match self
                 .bootstrap_root_metadata(&before, &state, token, session)
                 .await
             {
-                Ok(written) => written,
+                Ok(written) => Ok(written),
                 Err(error) if bootstrap_write_response_lost(&error) => {
                     self.recover_collected_bootstrap_root_metadata_response_loss(
                         &before, &state, token, session,
                     )
-                    .await?
+                    .await
                 }
-                Err(error) => return Err(error),
+                Err(error) => Err(error),
+            };
+            match metadata_result {
+                Ok(written) => written,
+                Err(error) => {
+                    emit_bootstrap_diagnostic(
+                        "root_metadata_patch_or_proof",
+                        &error,
+                        Some(&before),
+                        Some(&state),
+                        session,
+                    );
+                    return Err(error);
+                }
             }
         };
 
         if !has_finalizer(&state, STATE_FINALIZER) {
-            self.bootstrap_root_preflight(
-                &root_ref,
-                root_uid,
-                *root_generation,
-                root_rv,
-                token,
-                BootstrapRootPhaseV0::StateFinalizer,
-                session,
-            )
-            .await?;
+            if let Err(error) = self
+                .bootstrap_root_preflight(
+                    &root_ref,
+                    root_uid,
+                    *root_generation,
+                    root_rv,
+                    token,
+                    BootstrapRootPhaseV0::StateFinalizer,
+                    session,
+                )
+                .await
+            {
+                emit_bootstrap_diagnostic(
+                    "state_finalizer_preflight",
+                    &error,
+                    Some(&root),
+                    Some(&state),
+                    session,
+                );
+                return Err(error);
+            }
             let before = state.clone();
-            state = self
+            let finalizer_result = self
                 .bootstrap_ensure_state_finalizer(&before, session)
                 .await
                 .map_err(|error| {
@@ -5144,7 +5174,20 @@ impl KubeTransportV0 {
                     } else {
                         error
                     }
-                })?;
+                });
+            state = match finalizer_result {
+                Ok(written) => written,
+                Err(error) => {
+                    emit_bootstrap_diagnostic(
+                        "state_finalizer_patch_or_proof",
+                        &error,
+                        Some(&root),
+                        Some(&before),
+                        session,
+                    );
+                    return Err(error);
+                }
+            };
         }
 
         if has_state_link(&root, &state) {
@@ -9348,6 +9391,60 @@ fn has_bootstrap_root_metadata(root: &ObjectV0, token: &str) -> bool {
         .is_some_and(|bundle| bundle.proof_token == token)
 }
 
+/// Emits a minimal, machine-readable witness for a bootstrap error in the
+/// debug-only failpoint build. The domain error is deliberately not wrapped or
+/// otherwise changed: callers still receive exactly the error that caused the
+/// controller to hold.
+#[cfg(feature = "bootstrap-diagnostics")]
+fn emit_bootstrap_diagnostic(
+    boundary: &str,
+    error: &TransportErrorV0,
+    root: Option<&ObjectV0>,
+    state: Option<&ObjectV0>,
+    session: &OperationSessionV0,
+) {
+    eprintln!(
+        "{}",
+        bootstrap_diagnostic_value(boundary, error, root, state, session)
+    );
+}
+
+#[cfg(feature = "bootstrap-diagnostics")]
+fn bootstrap_diagnostic_value(
+    boundary: &str,
+    error: &TransportErrorV0,
+    root: Option<&ObjectV0>,
+    state: Option<&ObjectV0>,
+    session: &OperationSessionV0,
+) -> Value {
+    let object_summary = |object: &ObjectV0, finalizer: &str| {
+        serde_json::json!({
+            "uid": object.metadata.uid.as_str(),
+            "resourceVersion": object.metadata.resource_version.as_str(),
+            "finalizerPresent": has_finalizer(object, finalizer),
+        })
+    };
+    serde_json::json!({
+        "event": "oxideloop_bootstrap_diagnostic_v1",
+        "stage": boundary,
+        "error": error.to_string(),
+        "collectedBootstrapFence": session.has_collected_bootstrap_fence(),
+        "prewriteGate": format!("{:?}", session.prewrite_gate().state()),
+        "root": root.map(|object| object_summary(object, ROOT_FINALIZER)),
+        "state": state.map(|object| object_summary(object, STATE_FINALIZER)),
+    })
+}
+
+#[cfg(not(feature = "bootstrap-diagnostics"))]
+fn emit_bootstrap_diagnostic(
+    _boundary: &str,
+    _error: &TransportErrorV0,
+    _root: Option<&ObjectV0>,
+    _state: Option<&ObjectV0>,
+    _session: &OperationSessionV0,
+) {
+}
+
 /// Confirms the durable v1 bootstrap bundle against the exact State response
 /// issued by this operation.  A same-name child, a token-only annotation, or
 /// an unbound digest is deliberately not recovery/link authority.
@@ -10807,6 +10904,48 @@ mod tests {
                 "spec":{"stateVersion":1}
             }),
         }
+    }
+
+    #[cfg(feature = "bootstrap-diagnostics")]
+    #[test]
+    fn bootstrap_diagnostic_marks_finalizer_preflight_without_serializing_authority() {
+        let root = bootstrap_authority_root("root-rv");
+        let state = bootstrap_test_state();
+        let session = test_session(
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+            Duration::from_millis(500),
+            3,
+        );
+
+        let diagnostic = bootstrap_diagnostic_value(
+            "state_finalizer_preflight",
+            &TransportErrorV0::ManualRecoveryHold,
+            Some(&root),
+            Some(&state),
+            &session,
+        );
+
+        assert_eq!(
+            diagnostic.pointer("/event").and_then(Value::as_str),
+            Some("oxideloop_bootstrap_diagnostic_v1")
+        );
+        assert_eq!(
+            diagnostic.pointer("/stage").and_then(Value::as_str),
+            Some("state_finalizer_preflight")
+        );
+        assert_eq!(
+            diagnostic.pointer("/root/uid").and_then(Value::as_str),
+            Some("root-uid")
+        );
+        assert_eq!(
+            diagnostic
+                .pointer("/state/finalizerPresent")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(!diagnostic.to_string().contains("bootstrap-token"));
     }
 
     fn final_proof_fixture(initial_root: &ObjectV0) -> (ObjectV0, ObjectV0) {

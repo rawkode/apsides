@@ -4678,6 +4678,7 @@ mod tests {
         state_created: bool,
         state_finalizer: bool,
         root_metadata: bool,
+        metadata_echo_sent: bool,
         root_status: bool,
         root_statuses: Vec<serde_json::Value>,
         descriptor_reads: usize,
@@ -5797,8 +5798,27 @@ mod tests {
                     };
                     if method == http::Method::GET && path.ends_with("/webapplications/root") {
                         root_gets.fetch_add(1, Ordering::SeqCst);
-                        let wire = wire.lock().expect("ready Added wire lock");
-                        Ok::<_, Infallible>(root_response(wire.root_metadata, wire.root_status))
+                        let (root_metadata, root_status, send_metadata_echo) = {
+                            let mut wire = wire.lock().expect("ready Added wire lock");
+                            let send_metadata_echo =
+                                wire.root_metadata && !wire.root_status && !wire.metadata_echo_sent;
+                            wire.metadata_echo_sent |= send_metadata_echo;
+                            (wire.root_metadata, wire.root_status, send_metadata_echo)
+                        };
+                        if send_metadata_echo {
+                            let mut event = bootstrap_wire_root_object(
+                                &token,
+                                &state_name,
+                                &state,
+                                true,
+                                false,
+                            );
+                            event.value["spec"]["message"] = json!("driver automation");
+                            root_sender
+                                .try_send(Ok(WatchEventV0::Modified(event)))
+                                .expect("delayed metadata root echo fits root watch");
+                        }
+                        Ok::<_, Infallible>(root_response(root_metadata, root_status))
                     } else if method == http::Method::GET
                         && path.ends_with(&format!("/oxideloopstates/{state_name}"))
                     {

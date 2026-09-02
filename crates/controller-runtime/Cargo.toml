@@ -9,7 +9,7 @@ publish = false
 
 [features]
 default = []
-test-failpoints = ["dep:rustix"]
+test-failpoints = ["dep:rustix", "oxideloop-kube-transport/bootstrap-diagnostics"]
 
 [[bin]]
 name = "oxideloop-e2e-failpoint-control"

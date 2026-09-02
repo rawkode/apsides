@@ -8,6 +8,7 @@ repository.workspace = true
 publish = false
 
 [features]
+bootstrap-diagnostics = []
 test-support = []
 
 [dependencies]
