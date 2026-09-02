@@ -3,8 +3,8 @@
 This example is a complete TypeScript-authored Kubernetes controller. Its
 single source file is
 [`packages/example-bundle/src/controller.tsx`](../../packages/example-bundle/src/controller.tsx).
-That file is also checked byte-for-byte against the frozen v1 fixture used by
-the compiler tests.
+That exact file is compiled by the bundle builder and exercised by the example
+tests.
 
 The controller declares:
 
@@ -16,6 +16,39 @@ The controller declares:
   `ConfigurationChanged` Event for each observed source transition.
 
 Run the commands below from the repository root.
+
+## Run the short live demo
+
+The presenter-friendly demo creates a fresh kind cluster, compiles this exact
+TSX controller, installs the Rust controller and isolated renderer, and shows
+the three rendered resources. It then creates and changes a watched ConfigMap
+so you can see both the hook-driven rerender and the resulting Kubernetes
+Event automation.
+
+Prerequisites are a running Docker-compatible daemon plus `kind`, `kubectl`,
+`jq`, `pnpm`, `rg`, and `shasum`.
+
+```sh
+examples/web-application/deploy.sh
+```
+
+The cluster is deleted when the script finishes. Useful presentation options
+are:
+
+```sh
+# Pause between each visible step. The authored TSX is printed by default.
+DEMO_PAUSE=1 examples/web-application/deploy.sh
+
+# Skip printing the authored TSX.
+SHOW_SOURCE=0 examples/web-application/deploy.sh
+
+# Leave the cluster running for exploration after the demo.
+KEEP_CLUSTER=1 examples/web-application/deploy.sh
+```
+
+This is the happy-path demo, not the exhaustive acceptance suite. It skips
+collision injection, crash recovery, pruning, and artifact-integrity checks;
+those remain in `run-kind-e2e.sh` below.
 
 ## Check and compile the controller
 
