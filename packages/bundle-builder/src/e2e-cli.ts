@@ -1,5 +1,5 @@
 import { fileURLToPath } from "node:url";
-import { dirname, join, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { publishE2EBundle } from "./e2e-publish.js";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -26,9 +26,9 @@ function parseArgs(args: readonly string[]): { outPath: string; metadataPath: st
   }
   if (!outPath || !metadataPath) throw new Error(usage());
   return {
-    outPath: resolve(process.cwd(), outPath),
-    metadataPath: resolve(process.cwd(), metadataPath),
-    sourceRoot: resolve(process.cwd(), sourceRoot ?? join(repositoryRoot, "packages/example-bundle/src")),
+    outPath: resolve(repositoryRoot, outPath),
+    metadataPath: resolve(repositoryRoot, metadataPath),
+    sourceRoot: resolve(repositoryRoot, sourceRoot ?? "packages/example-bundle/src"),
   };
 }
 

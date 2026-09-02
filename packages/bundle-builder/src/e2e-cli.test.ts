@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { buildBundle } from "./index.js";
 import { publishE2EBundle, readPublishedMetadata } from "./e2e-publish.js";
@@ -15,6 +15,8 @@ const cliPath = join(packageRoot, "src/e2e-cli.ts");
 const tsxPath = join(packageRoot, "node_modules/.bin/tsx");
 const temporaryRoot = await mkdtemp(join(tmpdir(), "oxideloop-e2e-cli-test-"));
 const sourceRoot = await mkdtemp(join(packageRoot, ".bundle-builder-e2e-source-"));
+await mkdir(join(repositoryRoot, "work"), { recursive: true });
+const relativeOutputRoot = await mkdtemp(join(repositoryRoot, "work/bundle-builder-cli-test-"));
 
 await writeFile(join(sourceRoot, "controller.tsx"), `
 import { Event, defineAction, defineController } from "@oxideloop/kubernetes";
@@ -79,6 +81,18 @@ try {
   if (`${first.buildBundle.authoredSource.location}/controller.tsx` !== first.buildBundle.authoredSource.controller) {
     throw new Error("metadata controller source location is incorrect");
   }
+
+  // The documented root-level command is executed by pnpm with the package as
+  // its cwd. Relative destinations must still be repository-relative.
+  const relativeArchive = join(relativeOutputRoot, "relative.olba");
+  const relativeMetadata = join(relativeOutputRoot, "relative.json");
+  await execFile(
+    tsxPath,
+    [cliPath, ...cliArgs(relative(repositoryRoot, relativeArchive), relative(repositoryRoot, relativeMetadata))],
+    { cwd: temporaryRoot },
+  );
+  await access(relativeArchive);
+  await access(relativeMetadata);
 
   let existingBuildCalled = false;
   const existing = await Promise.allSettled([publishE2EBundle({
@@ -176,4 +190,5 @@ try {
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
   await rm(sourceRoot, { recursive: true, force: true });
+  await rm(relativeOutputRoot, { recursive: true, force: true });
 }

@@ -27,6 +27,7 @@ controller:
 pnpm install --frozen-lockfile
 pnpm --filter @oxideloop/example-bundle typecheck
 pnpm --filter @oxideloop/example-bundle test
+mkdir -p work/example
 pnpm bundle:e2e -- \
   --out work/example/bundle.archive \
   --metadata work/example/bundle-metadata.json
