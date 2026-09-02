@@ -557,11 +557,25 @@ pub struct DesiredObservationV0 {
     /// controller labels/owner identity. A same-name foreign object has no
     /// proof and is never adopted by recovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinary_proof: Option<OrdinaryProofV0>,
+    /// Transaction-scoped proof is deliberately separate from ordinary
+    /// ownership. It can recover a response-lost command, but is never a
+    /// prerequisite for ordinary desired reconciliation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_proof: Option<RecoveryProofV0>,
     /// Explicit proof for a response-lost DELETE which observed absence. An
     /// absent name alone is never evidence that this transaction deleted it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_recovery_proof: Option<DeletionRecoveryProofV0>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OrdinaryProofV0 {
+    pub root_uid: String,
+    pub uid: String,
+    pub resource_version: String,
+    pub desired_projection: DesiredProjectionV0,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -572,12 +586,6 @@ pub struct RecoveryProofV0 {
     pub command_id: String,
     pub uid: String,
     pub resource_version: String,
-    /// The adapter's sealed comparison of the current object and the final
-    /// renderer body. Transaction/command annotations below remain solely for
-    /// response-loss recovery; normal desired reconciliation uses this
-    /// projection plus the inventory UID.
-    #[serde(default)]
-    pub desired_projection: DesiredProjectionV0,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3696,6 +3704,25 @@ fn apply_recovery_matches(
     }
 }
 
+/// A live child is usable for ordinary reconciliation only when the adapter
+/// proved the exact root binding at the same UID/RV observed by this reducer.
+/// Recovery annotations are intentionally irrelevant here: they expire with a
+/// transaction and must not strand normal reconciliation.
+fn ordinary_proof_matches(
+    state: &MachineStateV0,
+    observation: &DesiredObservationV0,
+    identity: &MutationIdentity,
+) -> Option<DesiredProjectionV0> {
+    observation.ordinary_proof.as_ref().and_then(|proof| {
+        (proof.root_uid == state.root.uid
+            && proof.uid == identity.uid
+            && proof.resource_version == identity.resource_version
+            && !proof.uid.is_empty()
+            && !proof.resource_version.is_empty())
+        .then_some(proof.desired_projection)
+    })
+}
+
 fn deletion_recovery_matches(
     state: &MachineStateV0,
     tx: &ApplyTransaction,
@@ -5194,19 +5221,12 @@ fn plan_graph(
                 .inventory
                 .iter()
                 .find(|item| item.identity == identity);
-            let projection =
-                observed
-                    .recovery_proof
-                    .as_ref()
-                    .and_then(|proof| match &observed.observation {
-                        Observation::Existing { identity }
-                            if proof.uid == identity.uid
-                                && proof.resource_version == identity.resource_version =>
-                        {
-                            Some(proof.desired_projection)
-                        }
-                        _ => None,
-                    });
+            let projection = match &observed.observation {
+                Observation::Existing { identity } => {
+                    ordinary_proof_matches(state, &observed, identity)
+                }
+                Observation::Absent => None,
+            };
             let intent = match (&observed.observation, inventory) {
                 (Observation::Absent, _) => MutationIntent::Create {
                     observation: observed.observation.clone(),
@@ -5214,7 +5234,8 @@ fn plan_graph(
                 },
                 (Observation::Existing { identity: actual }, Some(known))
                     if actual.uid == known.uid
-                        && actual.resource_version == known.resource_version =>
+                        && actual.resource_version == known.resource_version
+                        && projection.is_some() =>
                 {
                     MutationIntent::Apply {
                         observation: observed.observation.clone(),
@@ -5244,6 +5265,8 @@ fn plan_graph(
                         object: resource.object.clone(),
                     }
                 }
+                // A same-name object without ordinary ownership proof is a
+                // collision/no-adopt case; never issue an Apply against it.
                 (Observation::Existing { .. }, _) => MutationIntent::Create {
                     observation: observed.observation.clone(),
                     object: resource.object.clone(),
@@ -5329,7 +5352,10 @@ fn plan_graph(
             };
             match observed.observation {
                 Observation::Absent => absent.push(inventory.identity.clone()),
-                Observation::Existing { identity: actual } if actual.uid == inventory.uid => {
+                Observation::Existing { identity: actual }
+                    if actual.uid == inventory.uid
+                        && ordinary_proof_matches(state, &observed, &actual).is_some() =>
+                {
                     let current_inventory = InventoryEntry {
                         resource_version: actual.resource_version.clone(),
                         ..inventory.clone()
@@ -6334,6 +6360,7 @@ mod tests {
                     kubernetes_minor: "1.36".into(),
                     gvr: "configmaps".into(),
                 },
+                ordinary_proof: None,
                 recovery_proof: None,
                 deletion_recovery_proof: None,
             }],
@@ -6509,6 +6536,7 @@ mod tests {
             qualification: BackendQualification::Unsupported {
                 reason: "untrusted backend proof".into(),
             },
+            ordinary_proof: None,
             recovery_proof: None,
             deletion_recovery_proof: None,
         });
@@ -6556,6 +6584,12 @@ mod tests {
                 kubernetes_minor: "1.36".into(),
                 gvr: "configmaps".into(),
             },
+            ordinary_proof: Some(OrdinaryProofV0 {
+                root_uid: machine.root.uid.clone(),
+                uid: "old-uid".into(),
+                resource_version: "10".into(),
+                desired_projection: DesiredProjectionV0::Untrusted,
+            }),
             recovery_proof: None,
             deletion_recovery_proof: None,
         });
@@ -6703,6 +6737,12 @@ mod tests {
                 kubernetes_minor: "1.36".into(),
                 gvr: "configmaps".into(),
             },
+            ordinary_proof: Some(OrdinaryProofV0 {
+                root_uid: machine.root.uid.clone(),
+                uid: "old-uid".into(),
+                resource_version: "old-rv".into(),
+                desired_projection: DesiredProjectionV0::Untrusted,
+            }),
             recovery_proof: None,
             deletion_recovery_proof: None,
         });
@@ -6917,7 +6957,6 @@ mod tests {
             command_id: result.command_id.clone(),
             uid: uid.into(),
             resource_version: resource_version.into(),
-            desired_projection: DesiredProjectionV0::Untrusted,
         });
         let completion = reduce(
             revalidate_completion.state.clone(),
@@ -7203,6 +7242,7 @@ mod tests {
                         kubernetes_minor: "1.36".into(),
                         gvr: "configmaps".into(),
                     },
+                    ordinary_proof: None,
                     recovery_proof: None,
                     deletion_recovery_proof: None,
                 }],
@@ -7421,6 +7461,7 @@ mod tests {
                 kubernetes_minor: "1.36".into(),
                 gvr: "services".into(),
             },
+            ordinary_proof: None,
             recovery_proof: None,
             deletion_recovery_proof: None,
         });
@@ -7459,6 +7500,7 @@ mod tests {
                         kubernetes_minor: "1.36".into(),
                         gvr: "configmaps".into(),
                     },
+                    ordinary_proof: None,
                     recovery_proof: None,
                     deletion_recovery_proof: None,
                 },
@@ -7474,6 +7516,7 @@ mod tests {
                         kubernetes_minor: "1.36".into(),
                         gvr: "services".into(),
                     },
+                    ordinary_proof: None,
                     recovery_proof: None,
                     deletion_recovery_proof: None,
                 },
@@ -8634,6 +8677,12 @@ mod tests {
                 resource_version: "10".into(),
             },
         };
+        observed[0].ordinary_proof = Some(OrdinaryProofV0 {
+            root_uid: machine.root.uid.clone(),
+            uid: "existing-uid".into(),
+            resource_version: "10".into(),
+            desired_projection: DesiredProjectionV0::Untrusted,
+        });
         let ready = complete_single_apply_to_ready(
             machine,
             frozen,
@@ -8730,6 +8779,12 @@ mod tests {
                 kubernetes_minor: "1.36".into(),
                 gvr: "configmaps".into(),
             },
+            ordinary_proof: Some(OrdinaryProofV0 {
+                root_uid: machine.root.uid.clone(),
+                uid: "old-uid".into(),
+                resource_version: "10".into(),
+                desired_projection: DesiredProjectionV0::Untrusted,
+            }),
             recovery_proof: None,
             deletion_recovery_proof: None,
         }];
@@ -8831,6 +8886,12 @@ mod tests {
                 kubernetes_minor: "1.36".into(),
                 gvr: "configmaps".into(),
             },
+            ordinary_proof: Some(OrdinaryProofV0 {
+                root_uid: machine.root.uid.clone(),
+                uid: "old-uid".into(),
+                resource_version: "old-rv".into(),
+                desired_projection: DesiredProjectionV0::Untrusted,
+            }),
             recovery_proof: None,
             deletion_recovery_proof: None,
         }];
@@ -8975,6 +9036,12 @@ mod tests {
                 kubernetes_minor: "1.36".into(),
                 gvr: "configmaps".into(),
             },
+            ordinary_proof: Some(OrdinaryProofV0 {
+                root_uid: machine.root.uid.clone(),
+                uid: "old-uid".into(),
+                resource_version: "10".into(),
+                desired_projection: DesiredProjectionV0::Untrusted,
+            }),
             recovery_proof: None,
             deletion_recovery_proof: None,
         }];
@@ -9234,6 +9301,7 @@ mod tests {
                         kubernetes_minor: "1.36".into(),
                         gvr: "configmaps".into(),
                     },
+                    ordinary_proof: None,
                     recovery_proof: None,
                     deletion_recovery_proof: None,
                 }],
@@ -9592,7 +9660,6 @@ mod tests {
             command_id,
             uid: "created-uid".into(),
             resource_version: "30".into(),
-            desired_projection: DesiredProjectionV0::Untrusted,
         });
         let recovery_state_resource_version = render.state.root.state_resource_version.clone();
         let recovered_result = reduce(
@@ -9930,6 +9997,7 @@ mod tests {
                 kubernetes_minor: "1.36".into(),
                 gvr: "configmaps".into(),
             },
+            ordinary_proof: None,
             recovery_proof: None,
             deletion_recovery_proof: None,
         };
@@ -9985,6 +10053,12 @@ mod tests {
                 resource_version: "10".into(),
             },
         };
+        observed[0].ordinary_proof = Some(OrdinaryProofV0 {
+            root_uid: machine.root.uid.clone(),
+            uid: "first-uid".into(),
+            resource_version: "10".into(),
+            desired_projection: DesiredProjectionV0::Untrusted,
+        });
         let mut output: RenderOutputV0 = serde_json::from_str(&output).unwrap();
         if multi_intent {
             let second_identity = ObjectIdentity {
@@ -10021,6 +10095,12 @@ mod tests {
                     kubernetes_minor: "1.36".into(),
                     gvr: "services".into(),
                 },
+                ordinary_proof: Some(OrdinaryProofV0 {
+                    root_uid: machine.root.uid.clone(),
+                    uid: "second-uid".into(),
+                    resource_version: "20".into(),
+                    desired_projection: DesiredProjectionV0::Untrusted,
+                }),
                 recovery_proof: None,
                 deletion_recovery_proof: None,
             });
@@ -10098,7 +10178,6 @@ mod tests {
                             }
                         },
                         resource_version: "30".into(),
-                        desired_projection: DesiredProjectionV0::Untrusted,
                     });
                 }
                 observation
@@ -10429,6 +10508,12 @@ mod tests {
                 resource_version: "10".into(),
             },
         };
+        observed[0].ordinary_proof = Some(OrdinaryProofV0 {
+            root_uid: machine.root.uid.clone(),
+            uid: "original-uid".into(),
+            resource_version: "10".into(),
+            desired_projection: DesiredProjectionV0::Untrusted,
+        });
         let prepared = reduce(
             machine,
             EventV0::Rendered {
@@ -10499,13 +10584,13 @@ mod tests {
                 kubernetes_minor: "1.36".into(),
                 gvr: "configmaps".into(),
             },
+            ordinary_proof: None,
             recovery_proof: Some(RecoveryProofV0 {
                 root_uid: "root-uid".into(),
                 transaction_id: transaction_id.clone(),
                 command_id: command_id.clone(),
                 uid: "replacement-uid".into(),
                 resource_version: "11".into(),
-                desired_projection: DesiredProjectionV0::Untrusted,
             }),
             deletion_recovery_proof: None,
         };
@@ -10612,6 +10697,7 @@ mod tests {
                 kubernetes_minor: "1.36".into(),
                 gvr: "configmaps".into(),
             },
+            ordinary_proof: None,
             recovery_proof: None,
             deletion_recovery_proof: None,
         });
@@ -10742,7 +10828,6 @@ mod tests {
             command_id: first_result.command_id.clone(),
             uid: "uid-one".into(),
             resource_version: "30".into(),
-            desired_projection: DesiredProjectionV0::Untrusted,
         });
         let mut changed_output: RenderOutputV0 = serde_json::from_str(&output_json).unwrap();
         changed_output
@@ -10854,7 +10939,6 @@ mod tests {
             command_id: second_result.command_id.clone(),
             uid: "uid-two".into(),
             resource_version: "31".into(),
-            desired_projection: DesiredProjectionV0::Untrusted,
         });
         let completion = reduce(
             after_second.state.clone(),

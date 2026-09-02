@@ -8424,6 +8424,7 @@ mod tests {
                         kubernetes_minor: "1.36".into(),
                         gvr: "configmaps".into(),
                     },
+                    ordinary_proof: None,
                     recovery_proof: None,
                     deletion_recovery_proof: None,
                 }],

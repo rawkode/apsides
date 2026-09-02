@@ -12,8 +12,8 @@ use futures_util::future::select_all;
 use oxideloop_bundle_contract::BundleDescriptorV0;
 use oxideloop_controller_api::{AutomationRunSpec, InventoryEntry, ObjectIdentity, StateBody};
 use oxideloop_controller_core::{
-    AutomationRunCleanupV0, DesiredObservationV0, DesiredProjectionV0, PhaseV0 as CorePhaseV0,
-    RecoveryProofV0,
+    AutomationRunCleanupV0, DesiredObservationV0, DesiredProjectionV0, OrdinaryProofV0,
+    PhaseV0 as CorePhaseV0, RecoveryProofV0,
 };
 use oxideloop_kube_transport::{
     AutomationCompletionAckV0, AutomationRunExpectationV0, AutomationRunObservationBarrierV0,
@@ -2018,6 +2018,7 @@ fn absent_desired_observation(
             kubernetes_minor: "1.34".into(),
             gvr: gvr.into(),
         },
+        ordinary_proof: None,
         recovery_proof: None,
         deletion_recovery_proof: None,
     })
@@ -2057,24 +2058,14 @@ fn desired_observation_with_desired(
         ResourceKindV0::Service => "v1/services",
         _ => return Err(RuntimeErrorV0::Hold("unsupported observed resource".into())),
     };
-    let response_annotations_present = object
-        .metadata
-        .annotations
-        .contains_key(oxideloop_kube_transport::TRANSACTION_ID_ANNOTATION)
-        || object
-            .metadata
-            .annotations
-            .contains_key(oxideloop_kube_transport::COMMAND_ID_ANNOTATION);
     let response_annotations = exact_recovery_annotations(object, root_uid);
     let ordinary_owner = exact_controller_owner(object, root, root_uid)
         && object
             .metadata
             .annotations
             .get(oxideloop_kube_transport::ROOT_UID_ANNOTATION)
-            == Some(&root_uid.to_string())
-        && (!response_annotations_present || response_annotations.is_some());
-    let recovery_proof = if ordinary_owner {
-        let (transaction_id, command_id) = response_annotations.unwrap_or_default();
+            == Some(&root_uid.to_string());
+    let ordinary_proof = if ordinary_owner {
         let desired_projection = match desired {
             Some(desired)
                 if oxideloop_kube_transport::same_desired_semantics(&object.value, desired) =>
@@ -2084,10 +2075,8 @@ fn desired_observation_with_desired(
             Some(_) => DesiredProjectionV0::Differs,
             None => DesiredProjectionV0::Untrusted,
         };
-        Some(RecoveryProofV0 {
+        Some(OrdinaryProofV0 {
             root_uid: root_uid.into(),
-            transaction_id,
-            command_id,
             uid: object.metadata.uid.clone(),
             resource_version: object.metadata.resource_version.clone(),
             desired_projection,
@@ -2095,6 +2084,17 @@ fn desired_observation_with_desired(
     } else {
         None
     };
+    let recovery_proof = ordinary_owner
+        .then(|| {
+            response_annotations.map(|(transaction_id, command_id)| RecoveryProofV0 {
+                root_uid: root_uid.into(),
+                transaction_id,
+                command_id,
+                uid: object.metadata.uid.clone(),
+                resource_version: object.metadata.resource_version.clone(),
+            })
+        })
+        .flatten();
     Ok(DesiredObservationV0 {
         identity: ObjectIdentity {
             api_version: object.reference.resource.api_version().into(),
@@ -2112,6 +2112,7 @@ fn desired_observation_with_desired(
             kubernetes_minor: "1.34".into(),
             gvr: gvr.into(),
         },
+        ordinary_proof,
         recovery_proof,
         deletion_recovery_proof: None,
     })

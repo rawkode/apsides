@@ -128,6 +128,7 @@ fn observed(name: &str, current: Option<(&str, &str)>) -> Vec<DesiredObservation
             kubernetes_minor: "1.36".into(),
             gvr: "configmaps".into(),
         },
+        ordinary_proof: None,
         recovery_proof: None,
         deletion_recovery_proof: None,
     }]
@@ -537,7 +538,6 @@ fn changed_graph_and_wrong_or_a_b_a_proof_hold_without_mutation() {
         command_id: "c".repeat(64),
         uid: "wrong-uid".into(),
         resource_version: "99".into(),
-        desired_projection: oxideloop_controller_core::DesiredProjectionV0::Untrusted,
     });
     let proof = reduce(
         render.state.clone(),
@@ -567,7 +567,6 @@ fn changed_graph_and_wrong_or_a_b_a_proof_hold_without_mutation() {
         command_id: "c".repeat(64),
         uid: "created-uid".into(),
         resource_version: "30".into(),
-        desired_projection: oxideloop_controller_core::DesiredProjectionV0::Untrusted,
     });
     let proof = reduce(
         render.state.clone(),

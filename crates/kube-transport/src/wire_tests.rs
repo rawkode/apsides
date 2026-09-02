@@ -2460,7 +2460,7 @@ async fn conditional_apply_409_rereads_once_and_only_acks_exact_prior_success() 
             "ownerReferences":[{"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication","name":"app-a","uid":"root-uid","controller":true,"blockOwnerDeletion":false}]},
         "data":{"new":"value"}
     });
-    let recovered = json!({
+    let _recovered = json!({
         "apiVersion":"v1", "kind":"ConfigMap",
         "metadata":{"name":"cm-a","namespace":"tenant-a","uid":"child-uid","resourceVersion":"8",
             "annotations":{ROOT_UID_ANNOTATION:"root-uid",TRANSACTION_ID_ANNOTATION:"tx",COMMAND_ID_ANNOTATION:"c".repeat(64)},
@@ -2474,13 +2474,6 @@ async fn conditional_apply_409_rereads_once_and_only_acks_exact_prior_success() 
         content_type:Some("application/apply-patch+yaml"), body:Some(patch_body.clone()),
         response:status(StatusCode::CONFLICT, json!({"kind":"Status","apiVersion":"v1","code":409})),
     });
-    exact.push(Expected {
-        method: Method::GET,
-        path_and_query: "/api/v1/namespaces/tenant-a/configmaps/cm-a",
-        content_type: None,
-        body: None,
-        response: response(recovered),
-    });
     let (transport, api) = ScriptedApi::transport(exact);
     let outcome = transport.dispatch(&address, &command).await.unwrap();
     assert!(matches!(
@@ -2488,11 +2481,12 @@ async fn conditional_apply_409_rereads_once_and_only_acks_exact_prior_success() 
         super::CommandOutcomeV0::Event(event)
             if matches!(
                 event.as_ref(),
-                oxideloop_controller_core::EventV0::MutationAcknowledged {
+                oxideloop_controller_core::EventV0::MutationNotIssued {
                     transaction_id,
                     attempt_token,
+                    command_id,
                     ..
-                } if transaction_id == "tx" && attempt_token == &"a".repeat(64)
+                } if transaction_id == "tx" && attempt_token == &"a".repeat(64) && *command_id == "c".repeat(64)
             )
     ));
     api.assert_drained();
@@ -2504,7 +2498,6 @@ async fn conditional_apply_409_rereads_once_and_only_acks_exact_prior_success() 
         content_type:Some("application/apply-patch+yaml"), body:Some(patch_body),
         response:status(StatusCode::CONFLICT, json!({"kind":"Status","apiVersion":"v1","code":409})),
     });
-    mismatch.push(Expected { method:Method::GET, path_and_query:"/api/v1/namespaces/tenant-a/configmaps/cm-a", content_type:None, body:None, response:response(json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm-a","namespace":"tenant-a","uid":"child-uid","resourceVersion":"8"},"data":{"other":"value"}})) });
     let (transport, api) = ScriptedApi::transport(mismatch);
     let outcome = transport
         .dispatch(&address, &command)
@@ -2515,7 +2508,7 @@ async fn conditional_apply_409_rereads_once_and_only_acks_exact_prior_success() 
         super::CommandOutcomeV0::Event(event)
             if matches!(
                 event.as_ref(),
-                oxideloop_controller_core::EventV0::MutationFailed {
+                oxideloop_controller_core::EventV0::MutationNotIssued {
                     transaction_id,
                     attempt_token,
                     ..

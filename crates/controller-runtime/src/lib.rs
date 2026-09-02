@@ -5730,6 +5730,7 @@ mod tests {
                 kubernetes_minor: "1.36".into(),
                 gvr: "configmaps".into(),
             },
+            ordinary_proof: None,
             recovery_proof: None,
             deletion_recovery_proof: None,
         }];
@@ -6861,6 +6862,7 @@ mod tests {
                     kubernetes_minor: "1.36".into(),
                     gvr: "configmaps".into(),
                 },
+                ordinary_proof: None,
                 recovery_proof: None,
                 deletion_recovery_proof: None,
             }],
@@ -6977,6 +6979,7 @@ mod tests {
                 kubernetes_minor: "1.36".into(),
                 gvr: "configmaps".into(),
             },
+            ordinary_proof: None,
             recovery_proof: None,
             deletion_recovery_proof: None,
         }];
@@ -7131,6 +7134,7 @@ mod tests {
                         kubernetes_minor: "1.36".into(),
                         gvr: "configmaps".into(),
                     },
+                    ordinary_proof: None,
                     recovery_proof: None,
                     deletion_recovery_proof: None,
                 }],
@@ -8228,6 +8232,12 @@ mod tests {
                     gvr: "configmaps".into(),
                     compatibility_manifest: "validated-native-structural-manifest".into(),
                 },
+                ordinary_proof: Some(oxideloop_controller_core::OrdinaryProofV0 {
+                    root_uid: actor.state().root().uid.clone(),
+                    uid: entry.uid.clone(),
+                    resource_version: entry.resource_version.clone(),
+                    desired_projection: oxideloop_controller_core::DesiredProjectionV0::Untrusted,
+                }),
                 recovery_proof: Some(RecoveryProofV0 {
                     root_uid: actor.state().root().uid.clone(),
                     transaction_id: transaction.id.clone(),
@@ -8240,7 +8250,6 @@ mod tests {
                         .clone(),
                     uid: entry.uid.clone(),
                     resource_version: entry.resource_version.clone(),
-                    desired_projection: oxideloop_controller_core::DesiredProjectionV0::Untrusted,
                 }),
                 deletion_recovery_proof: None,
             })
@@ -8359,6 +8368,7 @@ mod tests {
                     kubernetes_minor: "1.36".into(),
                     gvr: "configmaps".into(),
                 },
+                ordinary_proof: None,
                 recovery_proof: None,
                 deletion_recovery_proof: None,
             })
@@ -8377,6 +8387,7 @@ mod tests {
                     kubernetes_minor: "1.36".into(),
                     gvr: "configmaps".into(),
                 },
+                ordinary_proof: None,
                 recovery_proof: None,
                 deletion_recovery_proof: None,
             })
@@ -8736,6 +8747,7 @@ mod tests {
                 kubernetes_minor: "1.36".into(),
                 gvr: "configmaps".into(),
             },
+            ordinary_proof: None,
             recovery_proof: None,
             deletion_recovery_proof: None,
         }];
@@ -8939,6 +8951,7 @@ mod tests {
                 kubernetes_minor: "1.36".into(),
                 gvr: "configmaps".into(),
             },
+            ordinary_proof: None,
             recovery_proof: None,
             deletion_recovery_proof: None,
         }];

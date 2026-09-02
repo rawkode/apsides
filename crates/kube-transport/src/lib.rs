@@ -5439,6 +5439,18 @@ impl KubeTransportV0 {
                         .await
                     {
                         Ok(object) => result(command, ApplyOutcome::Applied, Some(object)),
+                        Err(TransportErrorV0::Stale("child apply HTTP 409")) => {
+                            // A single child PATCH returned a definitive
+                            // rejection. It cannot have changed the target,
+                            // so invalidate this authorized dispatch rather
+                            // than treating it as response-loss recovery.
+                            return Ok(mutation_not_issued_outcome(
+                                transaction_id,
+                                attempt_token,
+                                &command.command_id,
+                                "child apply HTTP 409",
+                            ));
+                        }
                         Err(TransportErrorV0::ManualRecoveryHold) => {
                             return Ok(mutation_failed_outcome(
                                 transaction_id,
@@ -5458,6 +5470,7 @@ impl KubeTransportV0 {
                     &reference,
                     preconditions,
                     &fence.target.expect("fenced"),
+                    &fence.root,
                     session,
                 )
                 .await
@@ -5913,20 +5926,7 @@ impl KubeTransportV0 {
         match applied {
             Ok(o) => Ok(o),
             Err(error) if is_child_apply_write_conflict(&error, reference.resource) => {
-                let recovered = recover_dropped_write_exact(
-                    self.recovery_reread(reference, session)
-                        .await
-                        .map_err(|_| TransportErrorV0::ManualRecoveryHold)?
-                        .as_ref(),
-                    &desired,
-                    root,
-                    Some(&target.metadata.uid),
-                    tx,
-                    &command.command_id,
-                )
-                .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
-                session.prove_exact_response_loss_recovery()?;
-                Ok(recovered)
+                Err(TransportErrorV0::Stale("child apply HTTP 409"))
             }
             Err(error)
                 if may_recover_response_loss(&error)
@@ -5958,10 +5958,13 @@ impl KubeTransportV0 {
         reference: &ObjectRefV0,
         expected: &oxideloop_mutation_model::ObjectIdentity,
         target: &ObjectV0,
+        root: &ObjectV0,
         session: &OperationSessionV0,
     ) -> Result<oxideloop_mutation_model::ObjectIdentity, TransportErrorV0> {
         if target.metadata.uid != expected.uid
             || target.metadata.resource_version != expected.resource_version
+            || !has_exact_canonical_owner(target, &root.reference, &root.metadata.uid)
+            || target.metadata.annotations.get(ROOT_UID_ANNOTATION) != Some(&root.metadata.uid)
         {
             return Err(TransportErrorV0::Stale("mutation delete pins"));
         }
@@ -10515,26 +10518,239 @@ fn has_exact_canonical_owner(object: &ObjectV0, root: &ObjectRefV0, root_uid: &s
 /// Compares only controller-owned desired fields after callers have separately
 /// authenticated the exact controller owner and root-UID annotation. Runtime
 /// annotations are write/recovery plumbing, not renderer semantics.
+#[must_use]
 pub fn same_desired_semantics(observed: &Value, desired: &Value) -> bool {
-    let kind = observed.get("kind").and_then(Value::as_str);
-    let metadata_matches = if kind == Some("Deployment") {
-        exact_deployment_metadata(observed, desired)
-    } else {
-        exact_metadata(observed, desired)
+    let Some(fields) = controller_apply_fields(observed) else {
+        // An object without a valid controller SSA fieldset is not a safe
+        // baseline: force the first SSA after POST or a watch/status echo.
+        return false;
     };
-    metadata_matches
-        && ["data", "binaryData", "immutable"]
-            .iter()
-            .all(|field| observed.get(*field) == desired.get(*field))
-        && if kind == Some("Service") {
-            same_service_semantics(observed, desired)
-        } else if kind == Some("Deployment") {
-            same_deployment_semantics(observed, desired)
-        } else {
-            observed.get("spec") == desired.get("spec")
-        }
+    let (observed, desired) = canonical_semantic_pair(observed, desired);
+    desired_is_subset(&observed, &desired) && !owned_field_omitted(fields, &observed, &desired)
 }
 
+fn controller_apply_fields(observed: &Value) -> Option<&serde_json::Map<String, Value>> {
+    let api_version = observed.get("apiVersion")?.as_str()?;
+    observed
+        .pointer("/metadata/managedFields")?
+        .as_array()?
+        .iter()
+        .find_map(|entry| {
+            let entry = entry.as_object()?;
+            (entry.get("manager")?.as_str() == Some("oxideloop-controller")
+                && entry.get("operation")?.as_str() == Some("Apply")
+                && entry.get("fieldsType")?.as_str() == Some("FieldsV1")
+                && entry.get("apiVersion")?.as_str() == Some(api_version)
+                && entry
+                    .get("subresource")
+                    .is_none_or(|v| v.is_null() || v.as_str() == Some("")))
+            .then(|| entry.get("fieldsV1")?.as_object())
+            .flatten()
+            .filter(|fields| {
+                valid_fields_v1(fields)
+                    && fields
+                        .keys()
+                        .any(|key| key.starts_with("f:") && key != "f:status")
+            })
+        })
+}
+
+fn valid_fields_v1(fields: &serde_json::Map<String, Value>) -> bool {
+    fields.iter().all(|(key, value)| {
+        (key == "."
+            || key.strip_prefix("f:").is_some()
+            || key.strip_prefix("k:").is_some_and(|selector| {
+                serde_json::from_str::<Value>(selector)
+                    .ok()
+                    .and_then(|value| value.as_object().map(|_| ()))
+                    .is_some()
+            }))
+            && value.as_object().is_some_and(valid_fields_v1)
+    })
+}
+
+fn canonical_semantic_pair(observed: &Value, desired: &Value) -> (Value, Value) {
+    let mut observed = observed.clone();
+    let mut desired = desired.clone();
+    for value in [&mut observed, &mut desired] {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("status");
+        }
+        if let Some(metadata) = value
+            .pointer_mut("/metadata")
+            .and_then(Value::as_object_mut)
+        {
+            for field in [
+                "uid",
+                "resourceVersion",
+                "generation",
+                "creationTimestamp",
+                "deletionTimestamp",
+                "managedFields",
+                "ownerReferences",
+                "selfLink",
+                "finalizers",
+            ] {
+                metadata.remove(field);
+            }
+            if let Some(annotations) = metadata
+                .get_mut("annotations")
+                .and_then(Value::as_object_mut)
+            {
+                annotations.remove(ROOT_UID_ANNOTATION);
+                annotations.remove(TRANSACTION_ID_ANNOTATION);
+                annotations.remove(COMMAND_ID_ANNOTATION);
+                annotations.remove("deployment.kubernetes.io/revision");
+            }
+        }
+    }
+    let kind = observed.get("kind").and_then(Value::as_str);
+    if kind == Some("Deployment") {
+        if let Some(spec) = canonical_deployment_spec(&observed, desired.get("spec")) {
+            observed["spec"] = spec;
+        }
+        if let Some(spec) = canonical_deployment_spec(&desired, None) {
+            desired["spec"] = spec;
+        }
+        normalize_deployment_lists(&mut observed);
+        normalize_deployment_lists(&mut desired);
+    } else if kind == Some("Service") {
+        if let Some(spec) = canonical_service_spec(&observed, desired.get("spec")) {
+            observed["spec"] = spec;
+        }
+        if let Some(spec) = canonical_service_spec(&desired, None) {
+            desired["spec"] = spec;
+        }
+        normalize_service_ports(&mut observed);
+        normalize_service_ports(&mut desired);
+    }
+    (observed, desired)
+}
+
+fn desired_is_subset(observed: &Value, desired: &Value) -> bool {
+    match (observed, desired) {
+        (_, Value::Null) => observed.is_null(),
+        (Value::Object(observed), Value::Object(desired)) => {
+            desired.iter().all(|(key, desired)| {
+                observed
+                    .get(key)
+                    .is_some_and(|actual| desired_is_subset(actual, desired))
+            })
+        }
+        (Value::Array(observed), Value::Array(desired)) => observed == desired,
+        _ => observed == desired,
+    }
+}
+
+fn owned_field_omitted(
+    fields: &serde_json::Map<String, Value>,
+    observed: &Value,
+    desired: &Value,
+) -> bool {
+    fields.iter().any(|(key, child)| {
+        if key == "." {
+            return false;
+        }
+        if let Some(field) = key.strip_prefix("f:") {
+            // Metadata identity and the transport's runtime annotations are
+            // not renderer semantics, even if older SSA entries claim them.
+            if field == "status" {
+                return false;
+            }
+            let actual = observed.get(field);
+            let wanted = desired.get(field);
+            match (actual, wanted) {
+                (Some(actual), None) => !actual.is_null(),
+                (Some(actual), Some(wanted)) => child
+                    .as_object()
+                    .is_none_or(|child| owned_field_omitted(child, actual, wanted)),
+                _ => false,
+            }
+        } else if let Some(selector) = key.strip_prefix("k:") {
+            let Ok(selector) = serde_json::from_str::<Value>(selector) else {
+                return true;
+            };
+            let Some(selector) = selector.as_object() else {
+                return true;
+            };
+            let Some(actual) = observed.as_array().and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| selector.iter().all(|(k, v)| item.get(k) == Some(v)))
+            }) else {
+                return false;
+            };
+            let wanted = desired.as_array().and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| selector.iter().all(|(k, v)| item.get(k) == Some(v)))
+            });
+            wanted.is_none()
+                || child
+                    .as_object()
+                    .is_none_or(|child| owned_field_omitted(child, actual, wanted.unwrap()))
+        } else {
+            true
+        }
+    })
+}
+
+fn normalize_deployment_lists(value: &mut Value) {
+    let Some(containers) = value
+        .pointer_mut("/spec/template/spec/containers")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for container in containers.iter_mut() {
+        if let Some(ports) = container.get_mut("ports").and_then(Value::as_array_mut) {
+            ports.sort_by_key(|port| {
+                (
+                    port.get("containerPort").and_then(Value::as_i64),
+                    port.get("protocol")
+                        .and_then(Value::as_str)
+                        .unwrap_or("TCP")
+                        .to_owned(),
+                )
+            });
+        }
+        if let Some(env) = container.get_mut("env").and_then(Value::as_array_mut) {
+            env.sort_by_key(|entry| {
+                entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            });
+        }
+    }
+    containers.sort_by_key(|container| {
+        container
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    });
+}
+
+fn normalize_service_ports(value: &mut Value) {
+    if let Some(ports) = value
+        .pointer_mut("/spec/ports")
+        .and_then(Value::as_array_mut)
+    {
+        ports.sort_by_key(|port| {
+            (
+                port.get("port").and_then(Value::as_i64),
+                port.get("protocol")
+                    .and_then(Value::as_str)
+                    .unwrap_or("TCP")
+                    .to_owned(),
+            )
+        });
+    }
+}
+
+#[allow(dead_code)]
 fn exact_deployment_metadata(observed: &Value, desired: &Value) -> bool {
     let mut observed_annotations = observed
         .pointer("/metadata/annotations")
@@ -10567,6 +10783,7 @@ fn exact_deployment_metadata(observed: &Value, desired: &Value) -> bool {
 
 // Kubernetes allocates only these Service fields. Every other field remains
 // exact so response-loss recovery cannot silently adopt a caller mismatch.
+#[allow(dead_code)]
 fn same_service_semantics(observed: &Value, desired: &Value) -> bool {
     if observed.get("kind").and_then(Value::as_str) != Some("Service") {
         return true;
@@ -10577,6 +10794,7 @@ fn same_service_semantics(observed: &Value, desired: &Value) -> bool {
     canonical_service_spec(observed, Some(&desired)) == Some(desired)
 }
 
+#[allow(dead_code)]
 fn same_deployment_semantics(observed: &Value, desired: &Value) -> bool {
     let Some(desired) = canonical_deployment_spec(desired, None) else {
         return observed.get("spec").is_none();
@@ -10716,6 +10934,7 @@ fn canonical_service_spec(value: &Value, desired: Option<&Value>) -> Option<Valu
     Some(spec)
 }
 
+#[allow(dead_code)]
 fn exact_metadata(observed: &Value, desired: &Value) -> bool {
     let map = |value: &Value, field: &str| {
         value
@@ -14785,6 +15004,10 @@ mod tests {
             json!("File");
         observed["spec"]["template"]["spec"]["containers"][0]["ports"][0]["protocol"] =
             json!("TCP");
+        observed["metadata"]["managedFields"] = json!([{
+            "manager":"oxideloop-controller", "operation":"Apply", "fieldsType":"FieldsV1",
+            "apiVersion":"apps/v1", "fieldsV1":{"f:metadata":{},"f:spec":{}}
+        }]);
         assert!(same_desired_semantics(&observed, &desired));
         observed["spec"]["template"]["spec"]["containers"][0]["image"] = json!("other");
         assert!(!same_desired_semantics(&observed, &desired));
@@ -14868,6 +15091,10 @@ mod tests {
         observed.value["metadata"]["annotations"]["deployment.kubernetes.io/revision"] = json!("1");
         observed.value["status"] = json!({"readyReplicas":1});
         observed.value["spec"]["replicas"] = json!(1);
+        observed.value["metadata"]["managedFields"] = json!([{
+            "manager":"oxideloop-controller", "operation":"Apply", "fieldsType":"FieldsV1",
+            "apiVersion":"apps/v1", "fieldsV1":{"f:metadata":{},"f:spec":{}}
+        }]);
         assert!(
             recover_dropped_write_exact(
                 Some(&observed),
