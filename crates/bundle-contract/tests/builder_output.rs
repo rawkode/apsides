@@ -47,13 +47,10 @@ fn builder_output_installs_and_opens_by_its_raw_manifest_digest() {
     assert_eq!(installed.digest(), validated.bundle_digest());
 
     let render = installed
-        .open_phase_module(ExecutionPhaseV0::Render, "demo.web-application.render")
+        .open_phase_module(ExecutionPhaseV0::Render, "controller.render")
         .expect("open builder render callable");
     let action = installed
-        .open_phase_module(
-            ExecutionPhaseV0::Action,
-            "demo.web-application.input-changed",
-        )
+        .open_phase_module(ExecutionPhaseV0::Action, "configuration-changed")
         .expect("open builder action callable");
     assert_eq!(
         sha256_hex(render.bytes()),
@@ -104,8 +101,8 @@ fn builder_output_installs_and_opens_by_its_raw_manifest_digest() {
     );
     let action_input = serde_json::json!({
         "abiVersion":"renderer.oxideloop.dev/v0", "bundleDigest": bundle_digest,
-        "automationIdentity":"demo.web-application.input-changed", "automationVersion":"1",
-        "actionModuleIdentity":"demo.web-application.input-changed", "actionModuleDigest": automation.action_module_digest,
+        "automationIdentity":"configuration-changed", "automationVersion":"v1",
+        "actionModuleIdentity":"configuration-changed", "actionModuleDigest": automation.action_module_digest,
         "occurrenceId":"occ-1", "sourceTransitionId":"transition-1", "sourceUid":"input-1", "sourceResourceVersion":"2",
         "eventMetadata":{"source":{"namespace":"demo","name":"demo-input"},"note":"changed"}
     });

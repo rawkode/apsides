@@ -263,17 +263,19 @@ fn validate_metadata(
 fn has_exact_v0_roles(manifest: &oxideloop_bundle_contract::BundleIntegrityManifestV0) -> bool {
     manifest.descriptor.path == "descriptor.json"
         && matches!(manifest.render_modules.as_slice(), [module]
-            if module.identity == "demo.web-application.render" && module.file.path == "render.callable.js")
+            if module.file.path == "render.callable.js")
         && matches!(manifest.action_modules.as_slice(), [module]
-            if module.identity == "demo.web-application.input-changed" && module.file.path == "action.callable.js")
+            if module.file.path == "action.callable.js")
         && manifest.source_maps.is_empty()
         && matches!(manifest.phase_modules.as_slice(), [
             render,
             action,
-        ] if render.phase == oxideloop_bundle_contract::ExecutionPhaseV0::Render
-            && render.module_identity == "demo.web-application.render"
-            && action.phase == oxideloop_bundle_contract::ExecutionPhaseV0::Action
-            && action.module_identity == "demo.web-application.input-changed")
+        ] if matches!(manifest.render_modules.as_slice(), [render_module]
+                if render.phase == oxideloop_bundle_contract::ExecutionPhaseV0::Render
+                    && render.module_identity == render_module.identity)
+            && matches!(manifest.action_modules.as_slice(), [action_module]
+                if action.phase == oxideloop_bundle_contract::ExecutionPhaseV0::Action
+                    && action.module_identity == action_module.identity))
 }
 
 /// Validate and install an archive directly into the store capability.

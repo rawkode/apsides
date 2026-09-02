@@ -48,22 +48,22 @@ fn archive_with_action(action: Vec<u8>) -> (Vec<u8>, String) {
         renderer_abi_version: "renderer.oxideloop.dev/v0".into(),
         descriptor: file("descriptor.json", &descriptor),
         render_modules: vec![ModuleIntegrityV0 {
-            identity: "demo.web-application.render".into(),
+            identity: "controller.render".into(),
             file: file("render.callable.js", &render),
         }],
         action_modules: vec![ModuleIntegrityV0 {
-            identity: "demo.web-application.input-changed".into(),
+            identity: "configuration-changed".into(),
             file: file("action.callable.js", &action),
         }],
         source_maps: vec![],
         phase_modules: vec![
             PhaseModuleV0 {
                 phase: ExecutionPhaseV0::Render,
-                module_identity: "demo.web-application.render".into(),
+                module_identity: "controller.render".into(),
             },
             PhaseModuleV0 {
                 phase: ExecutionPhaseV0::Action,
-                module_identity: "demo.web-application.input-changed".into(),
+                module_identity: "configuration-changed".into(),
             },
         ],
     };
@@ -260,8 +260,8 @@ fn rejects_wrong_expected_digest_and_noncanonical_metadata() {
     );
     let mut noncanonical = bytes.clone();
     let manifest_payload = payload_offset(&bytes, 3);
-    let replacement = b"input-changer";
-    let original = b"input-changed";
+    let replacement = b"configuration-changer";
+    let original = b"configuration-changed";
     let position = noncanonical[manifest_payload..]
         .windows(original.len())
         .position(|window| window == original)
@@ -298,6 +298,25 @@ fn rejects_self_consistent_phase_role_swaps() {
     let mut entries = decode_entries(&bytes);
     let mut manifest: BundleIntegrityManifestV0 = serde_json::from_slice(&entries[3].1).unwrap();
     manifest.phase_modules.swap(0, 1);
+    let manifest_bytes = canonical(&manifest);
+    let digest = sha256_hex(&manifest_bytes);
+    entries[1].1 = canonical(&BundleInstallRecordV0 {
+        bundle_digest: digest.clone(),
+        manifest,
+    });
+    entries[3].1 = manifest_bytes;
+    assert_eq!(
+        parse_validate_archive(&encode_entries(&entries), &digest),
+        Err(ArchiveError::InvalidMetadata)
+    );
+}
+
+#[test]
+fn rejects_phase_module_identity_that_does_not_match_its_fixed_payload_role() {
+    let (bytes, _) = archive();
+    let mut entries = decode_entries(&bytes);
+    let mut manifest: BundleIntegrityManifestV0 = serde_json::from_slice(&entries[3].1).unwrap();
+    manifest.phase_modules[1].module_identity = "controller.render".into();
     let manifest_bytes = canonical(&manifest);
     let digest = sha256_hex(&manifest_bytes);
     entries[1].1 = canonical(&BundleInstallRecordV0 {

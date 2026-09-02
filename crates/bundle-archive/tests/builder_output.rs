@@ -21,7 +21,7 @@ fn typescript_archive_installs_and_opens_by_its_raw_manifest_digest() {
         install_archive(&store, &archive, &expected).expect("install TypeScript archive");
     assert_eq!(installed.digest(), expected);
     let render = installed
-        .open_phase_module(ExecutionPhaseV0::Render, "demo.web-application.render")
+        .open_phase_module(ExecutionPhaseV0::Render, "controller.render")
         .expect("open render callable");
     assert_eq!(
         sha256_hex(render.bytes()),
