@@ -1,0 +1,128 @@
+:root {
+  --sl-color-accent-low: #d7f1e8;
+  --sl-color-accent: #067a62;
+  --sl-color-accent-high: #063e35;
+  --sl-color-white: #13221e;
+  --sl-color-gray-1: #263c35;
+  --sl-color-gray-2: #455b54;
+  --sl-color-gray-3: #6b7e77;
+  --sl-color-gray-4: #aebdb7;
+  --sl-color-gray-5: #dce6e2;
+  --sl-color-gray-6: #edf4f0;
+  --sl-color-black: #f7faf8;
+  --sl-font: "Avenir Next", Avenir, "Segoe UI", sans-serif;
+  --sl-font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+:root[data-theme="dark"] {
+  --sl-color-accent-low: #12382f;
+  --sl-color-accent: #56d9b5;
+  --sl-color-accent-high: #d9fff4;
+  --sl-color-white: #edf8f4;
+  --sl-color-gray-1: #d1e3dc;
+  --sl-color-gray-2: #aac0b8;
+  --sl-color-gray-3: #718b82;
+  --sl-color-gray-4: #435c54;
+  --sl-color-gray-5: #22372f;
+  --sl-color-gray-6: #12231e;
+  --sl-color-black: #08110f;
+}
+
+html {
+  font-size: 100%;
+}
+
+.hero h1 {
+  max-width: 15ch;
+  letter-spacing: -0.035em;
+}
+
+.hero .tagline {
+  max-width: 64ch;
+  line-height: 1.65;
+}
+
+.status-strip {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.75rem 1rem;
+  align-items: start;
+  margin: 2rem 0 2.5rem;
+  padding: 1rem 1.15rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-inline-start: 4px solid #d69513;
+  border-radius: 0.6rem;
+  background: var(--sl-color-gray-6);
+}
+
+.status-strip strong {
+  color: var(--sl-color-white);
+}
+
+.status-strip p {
+  margin: 0;
+  color: var(--sl-color-gray-2);
+}
+
+.architecture-flow {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin: 1.5rem 0 2rem;
+}
+
+.architecture-flow > div {
+  min-height: 9rem;
+  padding: 1rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.6rem;
+  background: var(--sl-color-gray-6);
+}
+
+.architecture-flow strong,
+.architecture-flow span {
+  display: block;
+}
+
+.architecture-flow span {
+  margin-top: 0.45rem;
+  color: var(--sl-color-gray-2);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.contract-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.8rem;
+  margin: 1.5rem 0;
+}
+
+.contract-grid > a {
+  padding: 1rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.6rem;
+  background: var(--sl-color-gray-6);
+  color: var(--sl-color-white);
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.contract-grid > a:hover {
+  border-color: var(--sl-color-accent);
+  color: var(--sl-color-accent-high);
+}
+
+@media (max-width: 52rem) {
+  .architecture-flow {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (max-width: 32rem) {
+  .architecture-flow,
+  .contract-grid,
+  .status-strip {
+    grid-template-columns: 1fr;
+  }
+}
