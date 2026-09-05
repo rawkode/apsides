@@ -555,6 +555,7 @@ fn staged_initial_fixture() -> (
         request_drain_qualification: Some(RequestDrainQualification::UnqualifiedDirectApi),
         proxy_identity: None,
         upgrade_drain: None,
+        previous_writer_checkpoint: None,
     };
     let mut claim = activation.approved_claims[0].claim.clone();
     claim.state = ClaimState::Reserved;
@@ -842,7 +843,7 @@ async fn predecessor_metadata_requires_exact_protected_retirement_authority_befo
         "record-transition",
         "uncommitted",
     ] {
-        let mut registry = staged_upgrade_fixture()?;
+        let mut registry = qualified_upgrade_fixture()?;
         let mut request = registry
             .transitions
             .remove("transition-b")
@@ -908,7 +909,7 @@ async fn predecessor_metadata_requires_exact_protected_retirement_authority_befo
 #[tokio::test]
 async fn authenticated_metadata_predecessor_reserves_without_embedding_old_plan()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let mut registry = staged_upgrade_fixture()?;
+    let mut registry = qualified_upgrade_fixture()?;
     let request = registry
         .transitions
         .remove("transition-b")
@@ -924,6 +925,13 @@ async fn authenticated_metadata_predecessor_reserves_without_embedding_old_plan(
     ]);
     let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
     let reserved = platform.reserve_transition(&request, "executor-b").await?;
+    assert!(
+        reserved
+            .value
+            .transition("transition-b")?
+            .previous_writer_checkpoint
+            .is_some()
+    );
     let previous = serde_json::to_value(
         &reserved
             .value
@@ -1877,5 +1885,289 @@ async fn inventory_checkpoint_rejects_tampered_policy_and_legacy_authority_befor
     );
     assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 1);
     assert_eq!(store.load(&scope).await?, Some(head));
+    Ok(())
+}
+
+#[cfg(feature = "deployer")]
+fn qualified_upgrade_fixture() -> std::result::Result<NamespaceRegistry, Box<dyn std::error::Error>>
+{
+    let mut registry = staged_upgrade_fixture()?;
+    let previous = registry
+        .transitions
+        .get_mut("transition-a")
+        .ok_or("predecessor missing")?;
+    let binding = previous.runtime_binding.as_ref().ok_or("binding missing")?;
+    let proxy_name = format!("reakt-proxy-{}", binding.generation_id);
+    let configuration_name = format!("{proxy_name}-config");
+    let qualification = digest(&"qualified-platform-environment")?;
+    previous.request_drain_qualification = Some(RequestDrainQualification::IsolatedEnvoy {
+        qualification_digest: qualification.clone(),
+        node_image_digest: digest(&"qualified-node-image")?,
+    });
+    previous.proxy_identity = Some(ProxyIdentity {
+        policy_digest: digest(&"proxy-policy")?,
+        deployment_name: proxy_name.clone(),
+        deployment_uid: "proxy-deployment-uid".into(),
+        node_name: "worker".into(),
+        node_uid: "worker-uid".into(),
+        pod_name: "proxy-pod".into(),
+        pod_uid: "proxy-pod-uid".into(),
+        pod_spec_digest: digest(&"isolated-pod-spec")?,
+        envoy_container_id: "containerd://envoy".into(),
+        admin_container_id: "containerd://admin".into(),
+        config_map_name: configuration_name.clone(),
+        config_map_uid: "proxy-config-uid".into(),
+        config_digest: digest(&"public-proxy-configuration")?,
+        qualification_digest: qualification,
+    });
+    for (key, uid) in [
+        (
+            format!("v1/ServiceAccount/control/{}", binding.service_account_name),
+            "credential-uid",
+        ),
+        (
+            "v1/ConfigMap/control/reakt-inventory-example".into(),
+            "inventory-uid",
+        ),
+        (
+            format!("apps/v1/Deployment/control/{proxy_name}"),
+            "proxy-deployment-uid",
+        ),
+        (
+            format!("v1/ConfigMap/control/{configuration_name}"),
+            "proxy-config-uid",
+        ),
+    ] {
+        previous.staged_identity_uids.insert(key, uid.into());
+    }
+    for capability in &previous.plan.request.next.compiled.capabilities {
+        previous.staged_identity_uids.insert(
+            format!(
+                "rbac.authorization.k8s.io/v1/RoleBinding/{}/{}",
+                capability.namespace, binding.service_account_name
+            ),
+            format!("{}-binding-uid", capability.namespace),
+        );
+    }
+    Ok(registry)
+}
+
+#[cfg(feature = "deployer")]
+#[tokio::test]
+async fn writer_checkpoint_backfill_is_atomic_private_and_independent_of_old_history()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut registry = qualified_upgrade_fixture()?;
+    let previous = registry
+        .transitions
+        .get_mut("transition-a")
+        .ok_or("predecessor missing")?;
+    let tls_key = format!(
+        "v1/Secret/control/{}-tls",
+        previous.plan.generation_reservation.service_account_name
+    );
+    previous
+        .staged_identity_uids
+        .insert(tls_key.clone(), "tls-uid".into());
+    previous
+        .staged_content_digests
+        .insert(tls_key.clone(), "private-hash-canary".into());
+    let unrelated = "v1/ConfigMap/control/public-config";
+    previous
+        .staged_content_digests
+        .insert(unrelated.into(), "public-digest-canary".into());
+    let (client, calls) = stateful_wire(vec![object(
+        "reakt-registry-workload",
+        &registry,
+        "registry-uid",
+        "42",
+    )]);
+    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let captured = platform
+        .ensure_previous_writer_checkpoint("transition-b", "executor-b")
+        .await?;
+    let checkpoint = captured
+        .value
+        .transition("transition-b")?
+        .previous_writer_checkpoint
+        .as_ref()
+        .ok_or("checkpoint absent")?;
+    let encoded = serde_json::to_string(checkpoint)?;
+    for forbidden in [
+        "stagedContentDigests",
+        "compiled",
+        "desired",
+        "private-hash-canary",
+        "tls-uid",
+    ] {
+        assert!(!encoded.contains(forbidden));
+    }
+    let prior = captured.value.transition("transition-a")?;
+    assert!(!prior.staged_content_digests.contains_key(&tls_key));
+    assert_eq!(
+        prior.staged_identity_uids.get(&tls_key).map(String::as_str),
+        Some("tls-uid")
+    );
+    assert_eq!(
+        prior
+            .staged_content_digests
+            .get(unrelated)
+            .map(String::as_str),
+        Some("public-digest-canary")
+    );
+    let again = platform
+        .ensure_previous_writer_checkpoint("transition-b", "executor-b")
+        .await?;
+    assert_eq!(captured.value, again.value);
+    {
+        let calls = calls.lock().map_err(|_| "request lock poisoned")?;
+        let writes: Vec<_> = calls
+            .iter()
+            .filter(|(method, _, _)| method == "PUT")
+            .collect();
+        assert_eq!(writes.len(), 1);
+        assert!(
+            !serde_json::to_string(&writes.first().ok_or("write absent")?.2)?
+                .contains("private-hash-canary")
+        );
+    }
+
+    let mut compacted = captured.value;
+    compacted.transitions.remove("transition-a");
+    let (client, calls) = wire(vec![object(
+        "reakt-registry-workload",
+        &compacted,
+        "registry-uid",
+        "43",
+    )]);
+    let restored = PlatformClient::new(client, "control", "workload", "cluster-a")?
+        .ensure_previous_writer_checkpoint("transition-b", "executor-b")
+        .await?;
+    assert_eq!(restored.value, compacted);
+    assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 1);
+    Ok(())
+}
+
+#[cfg(feature = "deployer")]
+#[tokio::test]
+async fn writer_checkpoint_backfill_rejects_registry_races_without_writes()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let registry = qualified_upgrade_fixture()?;
+    let (client, calls) = wire(vec![
+        object("reakt-registry-workload", &registry, "registry-uid", "42"),
+        object("reakt-registry-workload", &registry, "registry-uid", "43"),
+    ]);
+    assert!(
+        PlatformClient::new(client, "control", "workload", "cluster-a")?
+            .ensure_previous_writer_checkpoint("transition-b", "executor-b")
+            .await
+            .is_err()
+    );
+    assert!(
+        calls
+            .lock()
+            .map_err(|_| "request lock poisoned")?
+            .iter()
+            .all(|(method, _, _)| method == "GET")
+    );
+    assert!(
+        registry
+            .transition("transition-b")?
+            .previous_writer_checkpoint
+            .is_none()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "deployer")]
+#[tokio::test]
+async fn writer_checkpoint_substitution_never_overwrites_recorded_authority()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let registry = qualified_upgrade_fixture()?;
+    let (client, _) = stateful_wire(vec![object(
+        "reakt-registry-workload",
+        &registry,
+        "registry-uid",
+        "42",
+    )]);
+    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let captured = platform
+        .ensure_previous_writer_checkpoint("transition-b", "executor-b")
+        .await?;
+    for alteration in [
+        "oversized",
+        "scope",
+        "generation",
+        "proxy-name",
+        "qualification",
+        "extra-identity",
+        "missing-identity",
+    ] {
+        let mut changed = captured.value.clone();
+        let checkpoint = changed
+            .transitions
+            .get_mut("transition-b")
+            .and_then(|stored| stored.previous_writer_checkpoint.as_mut())
+            .ok_or("checkpoint absent")?;
+        match alteration {
+            "oversized" => checkpoint.runtime_binding.controller_image = "x".repeat(128 * 1024),
+            "scope" => checkpoint.control_namespace = "other-control".into(),
+            "generation" => checkpoint.runtime_binding.generation_id = "other-generation".into(),
+            "proxy-name" => checkpoint.proxy_identity.deployment_name = "unrelated-proxy".into(),
+            "qualification" => {
+                checkpoint.proxy_identity.qualification_digest = digest(&"other-qualification")?;
+            }
+            "extra-identity" => {
+                checkpoint.retirement_identity_uids.insert(
+                    "v1/ServiceAccount/control/unrelated".into(),
+                    "unrelated-uid".into(),
+                );
+            }
+            "missing-identity" => {
+                checkpoint.retirement_identity_uids.clear();
+            }
+            _ => return Err("unknown fixture alteration".into()),
+        }
+        let (client, calls) = wire(vec![object(
+            "reakt-registry-workload",
+            &changed,
+            "registry-uid",
+            "43",
+        )]);
+        assert!(
+            PlatformClient::new(client, "control", "workload", "cluster-a")?
+                .ensure_previous_writer_checkpoint("transition-b", "executor-b")
+                .await
+                .is_err(),
+            "{alteration}"
+        );
+        assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 1);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "deployer")]
+#[tokio::test]
+async fn writer_checkpoint_backfill_rejects_unapproved_capability_commitment()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut registry = qualified_upgrade_fixture()?;
+    registry
+        .transitions
+        .get_mut("transition-a")
+        .and_then(|stored| stored.runtime_binding.as_mut())
+        .ok_or("binding missing")?
+        .capability_digest = digest(&"unapproved-capabilities")?;
+    let (client, calls) = wire(vec![object(
+        "reakt-registry-workload",
+        &registry,
+        "registry-uid",
+        "42",
+    )]);
+    assert!(
+        PlatformClient::new(client, "control", "workload", "cluster-a")?
+            .ensure_previous_writer_checkpoint("transition-b", "executor-b")
+            .await
+            .is_err()
+    );
+    assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 1);
     Ok(())
 }

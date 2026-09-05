@@ -1,6 +1,6 @@
 use crate::{
     NamespaceRegistry, PlatformClient, ProxyIdentity, Result, RuntimeBinding, StoredTransition,
-    Versioned, invalid,
+    Versioned, WriterCheckpoint, invalid,
 };
 use compiler_core::digest;
 use k8s_openapi::{
@@ -13,6 +13,36 @@ use k8s_openapi::{
 use kube::{Api, api::DynamicObject};
 
 impl PlatformClient {
+    /// Shutdown checks bind the live proxy to its protected epoch and current
+    /// qualification; the old desired program and credential bodies are unnecessary.
+    pub(crate) async fn verify_previous_writer_proxy(
+        &self,
+        checkpoint: &WriterCheckpoint,
+    ) -> Result<()> {
+        let crate::RequestDrainQualification::IsolatedEnvoy {
+            qualification_digest,
+            node_image_digest,
+        } = &checkpoint.request_drain_qualification
+        else {
+            return Err(invalid(
+                "previous writer lacks isolated proxy qualification",
+            ));
+        };
+        let identity = &checkpoint.proxy_identity;
+        let policy = self
+            .load_proxy_policy(&checkpoint.runtime_binding.domain_id)
+            .await?;
+        if digest(&policy.value)? != identity.policy_digest
+            || &policy.value.environment_qualification_digest != qualification_digest
+            || &policy.value.node_image_digest != node_image_digest
+        {
+            return Err(invalid(
+                "previous proxy qualification changed after staging",
+            ));
+        }
+        self.inspect_proxy(identity).await?;
+        Ok(())
+    }
     pub(crate) async fn verify_proxy_stop_epoch(
         &self,
         identity: &ProxyIdentity,

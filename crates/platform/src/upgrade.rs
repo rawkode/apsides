@@ -4,7 +4,6 @@ use crate::{
 };
 use crate::{
     controller::approved_claims,
-    quiescence::previous_transition,
     store::{read_state, replace_state},
 };
 use compiler_core::digest;
@@ -25,7 +24,9 @@ impl PlatformClient {
         transition: &str,
         executor: &str,
     ) -> Result<Versioned<NamespaceRegistry>> {
-        let mut registry = self.load_registry().await?;
+        let mut registry = self
+            .ensure_previous_writer_checkpoint(transition, executor)
+            .await?;
         let stored = self
             .owning_upgrade(
                 &registry,
@@ -42,7 +43,7 @@ impl PlatformClient {
         if matches!(stored.record.phase, Phase::Cleaning | Phase::Committed) {
             return Ok(registry);
         }
-        self.verify_upgrade_authority(&registry, &stored).await?;
+        self.verify_upgrade_authority(&stored).await?;
         self.verify_staged_controller(&registry, transition).await?;
         if stored.record.phase == Phase::Quiesced {
             registry = self.transfer_upgrade_claims(&registry, transition).await?;
@@ -71,7 +72,9 @@ impl PlatformClient {
         transition: &str,
         executor: &str,
     ) -> Result<Versioned<NamespaceRegistry>> {
-        let registry = self.load_registry().await?;
+        let registry = self
+            .ensure_previous_writer_checkpoint(transition, executor)
+            .await?;
         let stored = self.owning_upgrade(
             &registry,
             transition,
@@ -81,7 +84,7 @@ impl PlatformClient {
         if stored.record.phase == Phase::Committed {
             return Ok(registry);
         }
-        self.verify_upgrade_authority(&registry, stored).await?;
+        self.verify_upgrade_authority(stored).await?;
         let progress = self.execute_cleanup(transition, executor).await?;
         if !progress.pending.is_empty() {
             return Err(Error::Pending(
@@ -133,11 +136,7 @@ impl PlatformClient {
         self.persist_registry(&registry, &next).await
     }
 
-    async fn verify_upgrade_authority(
-        &self,
-        registry: &Versioned<NamespaceRegistry>,
-        stored: &StoredTransition,
-    ) -> Result<()> {
+    async fn verify_upgrade_authority(&self, stored: &StoredTransition) -> Result<()> {
         let binding = stored
             .runtime_binding
             .as_ref()
@@ -150,27 +149,21 @@ impl PlatformClient {
             return Err(invalid("approved trust or ceiling changed"));
         }
         self.verify_staged_proxy(stored).await?;
-        let previous = previous_transition(registry, stored)?;
+        let previous = self.previous_writer(stored)?;
         let drain = stored
             .upgrade_drain
             .as_ref()
             .ok_or_else(|| invalid("upgrade lacks live drain checkpoint"))?;
-        if drain.previous_transition_id != previous.plan.request.transition_id
+        if drain.previous_transition_id != previous.allocation.transition_id
             || drain.runtime_termination.is_none()
             || drain.final_proxy_ledger.is_none()
             || drain.proxy_termination.is_none()
-            || drain.retired_identity_uids != crate::retirement::identities(previous)?
+            || &drain.retired_identity_uids != crate::retirement::identities(previous)
         {
             return Err(invalid("upgrade lacks complete source evidence"));
         }
-        self.verify_proxy_stop_epoch(
-            previous
-                .proxy_identity
-                .as_ref()
-                .ok_or_else(|| invalid("previous frozen proxy missing"))?,
-            true,
-        )
-        .await?;
+        self.verify_proxy_stop_epoch(&previous.proxy_identity, true)
+            .await?;
         self.observe_writer_termination(&drain.runtime_writers)
             .await?;
         self.observe_writer_termination(&drain.proxy_writers)
@@ -247,20 +240,17 @@ impl PlatformClient {
         executor: &str,
     ) -> Result<Versioned<NamespaceRegistry>> {
         let stored = registry.value.transition(transition)?;
-        let previous = previous_transition(registry, stored)?;
+        let previous = self.previous_writer(stored)?;
         let binding = stored
             .runtime_binding
             .as_ref()
             .ok_or_else(|| invalid("new binding missing"))?;
-        let old_binding = previous
-            .runtime_binding
-            .as_ref()
-            .ok_or_else(|| invalid("old binding missing"))?;
+        let old_binding = &previous.runtime_binding;
         let activation_name = format!("reakt-activation-{}", binding.domain_id);
         let current: Versioned<ActivationState> =
             read_state(&self.client, &self.control_namespace, &activation_name).await?;
         let key = format!("v1/ConfigMap/{}/{activation_name}", self.control_namespace);
-        if previous.staged_identity_uids.get(&key) != Some(&current.uid)
+        if previous.activation_uid != current.uid
             || !((current.value.binding == *old_binding
                 && current.value.status == ActivationStatus::Draining)
                 || (current.value.binding == *binding
@@ -291,7 +281,7 @@ impl PlatformClient {
         let inventory: Versioned<RuntimeInventory> =
             read_state(&self.client, &self.control_namespace, &inventory_name).await?;
         let inventory_key = format!("v1/ConfigMap/{}/{inventory_name}", self.control_namespace);
-        if previous.staged_identity_uids.get(&inventory_key) != Some(&inventory.uid)
+        if previous.inventory_uid != inventory.uid
             || (inventory.value.binding != *old_binding && inventory.value.binding != *binding)
         {
             return Err(invalid("inventory identity changed across quiescence"));

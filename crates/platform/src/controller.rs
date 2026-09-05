@@ -1,4 +1,5 @@
 use crate::store::{decode_state, replace_state};
+use crate::tls_integrity::{TlsSecretExpectation, validate_tls_secret};
 use crate::{
     ActivationState, ActivationStatus, ApprovedClaim, NamespaceRegistry, PlatformClient, Result,
     RuntimeBinding, RuntimeInventory, SCHEMA_VERSION, StoredTransition, Versioned, invalid,
@@ -66,15 +67,16 @@ impl PlatformClient {
                 .await
                 .map_err(|_| invalid("generation TLS integrity lookup failed"))?;
             let key = format!("v1/Secret/{}/{name}", self.control_namespace);
-            if secret.metadata.uid.is_none()
-                || stored.staged_identity_uids.get(&key) != secret.metadata.uid.as_ref()
-                || secret.metadata.deletion_timestamp.is_some()
-                || secret.immutable != Some(true)
-                || secret.type_.as_deref() != Some("Opaque")
-                || stored.staged_content_digests.get(&key) != Some(&digest(&secret.data)?)
-            {
-                return Err(invalid("generation TLS UID or immutable content changed"));
-            }
+            let uid = stored
+                .staged_identity_uids
+                .get(&key)
+                .ok_or_else(|| invalid("generation TLS identity missing"))?;
+            validate_tls_secret(
+                &secret,
+                &name,
+                &self.control_namespace,
+                TlsSecretExpectation::RecordedUid(uid),
+            )?;
         }
         Ok(())
     }
@@ -348,6 +350,9 @@ impl PlatformClient {
         name: &str,
         desired: Value,
     ) -> Result<DynamicObject> {
+        if kind == "Secret" {
+            return Err(invalid("Secrets require identity-only staging"));
+        }
         let (group, version) = api_version.split_once('/').unwrap_or(("", api_version));
         let ar = ApiResource::from_gvk(&GroupVersionKind::gvk(group, version, kind));
         let api: Api<DynamicObject> =

@@ -115,6 +115,9 @@ pub struct StoredTransition {
     pub request_drain_qualification: Option<RequestDrainQualification>,
     pub proxy_identity: Option<ProxyIdentity>,
     pub upgrade_drain: Option<UpgradeDrainState>,
+    /// Immutable predecessor authority captured with the upgrade reservation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_writer_checkpoint: Option<crate::WriterCheckpoint>,
 }
 
 impl StoredTransition {
@@ -130,6 +133,7 @@ impl StoredTransition {
             request_drain_qualification: None,
             proxy_identity: None,
             upgrade_drain: None,
+            previous_writer_checkpoint: None,
         }
     }
 }

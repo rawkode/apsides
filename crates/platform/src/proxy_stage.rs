@@ -1,4 +1,5 @@
 use crate::store::read_state;
+use crate::tls_integrity::{TlsSecretExpectation, validate_tls_secret};
 use crate::{
     ADMIN_IMAGE, ENVOY_IMAGE, MAX_PROXY_LEDGER_BYTES, NamespaceRegistry, PlatformClient,
     ProxyIdentity, Result, RuntimeBinding, SCHEMA_VERSION, Versioned, envoy_configuration,
@@ -170,53 +171,53 @@ impl PlatformClient {
         let key = format!("v1/Secret/{}/{name}", self.control_namespace);
         let entry = registry.value.transition(transition)?;
         let known = entry.staged_identity_uids.get(&key);
-        let actual = match (
+        let uid = match (
             api.get_opt(name)
                 .await
                 .map_err(|_| invalid("generation TLS lookup failed"))?,
             known,
         ) {
-            (Some(secret), Some(uid))
-                if secret.metadata.uid.as_ref() == Some(uid)
-                    && secret.metadata.deletion_timestamp.is_none()
-                    && secret.immutable == Some(true)
-                    && entry.staged_content_digests.get(&key) == Some(&digest(&secret.data)?) =>
-            {
+            (Some(secret), Some(uid)) => {
+                validate_tls_secret(
+                    &secret,
+                    name,
+                    &self.control_namespace,
+                    TlsSecretExpectation::RecordedUid(uid),
+                )?;
                 return Ok(());
             }
             (None, None) => {
-                let secret = crate::tls::generation_tls_secret(
+                let expected = crate::tls::generation_tls_secret(
                     name,
                     &self.control_namespace,
                     &binding.generation_id,
                     lifetime,
                 )?;
-                api.create(&PostParams::default(), &secret)
+                let actual = api
+                    .create(&PostParams::default(), &expected)
                     .await
                     .map_err(|_| {
                         invalid("generation TLS creation failed; outcome requires inspection")
-                    })?
+                    })?;
+                validate_tls_secret(
+                    &actual,
+                    name,
+                    &self.control_namespace,
+                    TlsSecretExpectation::Created(&expected),
+                )?
             }
             _ => {
                 return Err(invalid(
-                    "generation TLS object has unrecorded or changed UID/content",
+                    "generation TLS object lacks matching recorded identity",
                 ));
             }
         };
-        let uid = actual
-            .metadata
-            .uid
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| invalid("TLS Secret omitted UID"))?;
         let mut next = registry.value.clone();
         let entry = next
             .transitions
             .get_mut(transition)
             .ok_or_else(|| invalid("missing transition"))?;
-        entry.staged_identity_uids.insert(key.clone(), uid);
-        entry
-            .staged_content_digests
-            .insert(key, digest(&actual.data)?);
+        entry.staged_identity_uids.insert(key, uid);
         *registry = self.persist_registry(registry, &next).await?;
         Ok(())
     }

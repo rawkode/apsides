@@ -1,6 +1,7 @@
 use crate::{
     ActivationState, ActivationStatus, ExpectedPod, ExpectedWriters, NamespaceRegistry,
-    PlatformClient, Result, StoredTransition, UpgradeDrainState, Versioned, invalid,
+    PlatformClient, Result, StoredTransition, UpgradeDrainState, Versioned, WriterCheckpoint,
+    invalid,
 };
 use compiler_core::digest;
 use deploy::{Event, Phase, Quiescence, TerminationEvidence};
@@ -55,15 +56,13 @@ impl PlatformClient {
         transition: &str,
         executor: &str,
     ) -> Result<Versioned<NamespaceRegistry>> {
-        let mut registry = self.load_registry().await?;
+        let mut registry = self
+            .ensure_previous_writer_checkpoint(transition, executor)
+            .await?;
         let current = self
             .owning_upgrade(&registry, transition, executor, &[Phase::Staged])?
             .clone();
-        let previous = previous_transition(&registry, &current)?.clone();
-        crate::retirement::identities(&previous)?;
-        if previous.proxy_identity.is_none() {
-            return Err(invalid("previous generation lacks qualified proxy epoch"));
-        }
+        let previous = self.previous_writer(&current)?.clone();
         self.verify_staged_proxy(&current).await?;
         if current.upgrade_drain.is_none() {
             registry = self
@@ -76,10 +75,7 @@ impl PlatformClient {
             .upgrade_drain
             .clone()
             .ok_or_else(|| invalid("drain checkpoint missing"))?;
-        let proxy = previous
-            .proxy_identity
-            .as_ref()
-            .ok_or_else(|| invalid("old proxy missing"))?;
+        let proxy = &previous.proxy_identity;
         if drain.final_proxy_ledger.is_none() {
             self.freeze_proxy_admission(proxy).await?;
             self.mark_previous_draining(&previous).await?;
@@ -123,7 +119,7 @@ impl PlatformClient {
             .as_ref()
             .ok_or_else(|| invalid("drain state missing"))?;
         let evidence = TerminationEvidence {
-            generation_id: previous.plan.request.next.generation_id.clone(),
+            generation_id: previous.allocation.generation_id.clone(),
             executor_id: executor.into(),
             verification_epoch: current.record.verification_epoch,
             environment_qualification_digest: proxy.qualification_digest.clone(),
@@ -154,20 +150,14 @@ impl PlatformClient {
         &self,
         registry: &Versioned<NamespaceRegistry>,
         transition: &str,
-        previous: &StoredTransition,
+        previous: &WriterCheckpoint,
     ) -> Result<Versioned<NamespaceRegistry>> {
-        self.verify_staged_proxy(previous).await?;
-        let proxy = previous
-            .proxy_identity
-            .as_ref()
-            .ok_or_else(|| invalid("previous generation lacks qualified proxy epoch"))?;
-        let binding = previous
-            .runtime_binding
-            .as_ref()
-            .ok_or_else(|| invalid("previous binding missing"))?;
+        self.verify_previous_writer_proxy(previous).await?;
+        let proxy = &previous.proxy_identity;
+        let binding = &previous.runtime_binding;
         let runtime = self.capture_runtime_writers(previous).await?;
         let drain = UpgradeDrainState {
-            previous_transition_id: previous.plan.request.transition_id.clone(),
+            previous_transition_id: previous.allocation.transition_id.clone(),
             runtime_writers: runtime,
             proxy_writers: ExpectedWriters {
                 deployment_name: proxy.deployment_name.clone(),
@@ -235,16 +225,12 @@ impl PlatformClient {
         self.persist_registry(registry, &next).await
     }
 
-    async fn mark_previous_draining(&self, previous: &StoredTransition) -> Result<()> {
-        let binding = previous
-            .runtime_binding
-            .as_ref()
-            .ok_or_else(|| invalid("old binding missing"))?;
+    async fn mark_previous_draining(&self, previous: &WriterCheckpoint) -> Result<()> {
+        let binding = &previous.runtime_binding;
         let name = format!("reakt-activation-{}", binding.domain_id);
         let state: Versioned<ActivationState> =
             crate::store::read_state(&self.client, &self.control_namespace, &name).await?;
-        let key = format!("v1/ConfigMap/{}/{name}", self.control_namespace);
-        if previous.staged_identity_uids.get(&key) != Some(&state.uid)
+        if previous.activation_uid != state.uid
             || state.value.binding != *binding
             || !matches!(
                 state.value.status,
@@ -297,21 +283,10 @@ impl PlatformClient {
 
     async fn capture_runtime_writers(
         &self,
-        previous: &StoredTransition,
+        previous: &WriterCheckpoint,
     ) -> Result<ExpectedWriters> {
-        let binding = previous
-            .runtime_binding
-            .as_ref()
-            .ok_or_else(|| invalid("old binding missing"))?;
-        let deployment_key = format!(
-            "apps/v1/Deployment/{}/{}",
-            self.control_namespace, binding.service_account_name
-        );
-        let deployment_uid = previous
-            .staged_identity_uids
-            .get(&deployment_key)
-            .cloned()
-            .ok_or_else(|| invalid("old controller UID missing"))?;
+        let binding = &previous.runtime_binding;
+        let deployment_uid = previous.controller_deployment_uid.clone();
         let service_account = format!("{}-process", binding.service_account_name);
         let api: Api<Pod> = Api::namespaced(self.client.clone(), &self.control_namespace);
         let listed = api
@@ -371,10 +346,10 @@ impl PlatformClient {
         &self,
         registry: &Versioned<NamespaceRegistry>,
         transition: &str,
-        previous: &StoredTransition,
+        previous: &WriterCheckpoint,
     ) -> Result<Versioned<NamespaceRegistry>> {
         let mut registry = registry.clone();
-        let approved = crate::retirement::identities(previous)?;
+        let approved = crate::retirement::identities(previous);
         let mut identities: Vec<_> = approved.iter().collect();
         identities.sort_by_key(|(key, _)| key.starts_with("v1/ServiceAccount/"));
         for (key, uid) in identities {
@@ -418,16 +393,27 @@ impl PlatformClient {
     }
 }
 
-pub(crate) fn previous_transition<'a>(
-    registry: &'a Versioned<NamespaceRegistry>,
-    current: &StoredTransition,
-) -> Result<&'a StoredTransition> {
-    let previous = current
-        .plan
-        .request
-        .predecessor()?
-        .ok_or_else(|| invalid("initial generation has no previous writer"))?;
-    crate::predecessor::authenticate(&registry.value, previous)
+impl PlatformClient {
+    pub(crate) fn previous_writer<'a>(
+        &self,
+        current: &'a StoredTransition,
+    ) -> Result<&'a WriterCheckpoint> {
+        let metadata = current
+            .plan
+            .request
+            .predecessor()?
+            .ok_or_else(|| invalid("initial generation has no previous writer"))?;
+        let checkpoint = current.previous_writer_checkpoint.as_ref().ok_or_else(|| {
+            invalid("previous writer checkpoint requires explicit protected backfill")
+        })?;
+        checkpoint.validate(
+            metadata,
+            &self.control_namespace,
+            &self.workload_namespace,
+            &self.cluster_binding,
+        )?;
+        Ok(checkpoint)
+    }
 }
 
 fn verify_record(stored: &StoredTransition) -> Result<()> {

@@ -76,6 +76,7 @@ fn registry() -> NamespaceRegistry {
         request_drain_qualification: None,
         proxy_identity: None,
         upgrade_drain: None,
+        previous_writer_checkpoint: None,
     };
     NamespaceRegistry {
         schema_version: platform::SCHEMA_VERSION.into(),

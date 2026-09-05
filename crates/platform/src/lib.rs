@@ -14,9 +14,11 @@
 //! Kubernetes transport and platform-owned RBAC establish the writer boundary.
 mod permissions;
 mod predecessor;
+mod writer_checkpoint;
 pub use permissions::{
     CreationTarget, DeploymentPermissions, ResourceAccess, RoleDelegation, deployment_permissions,
 };
+pub use writer_checkpoint::WriterCheckpoint;
 
 #[cfg(feature = "test-support")]
 mod test_support;
@@ -121,6 +123,9 @@ pub use proxy_config::{envoy_configuration, envoy_token_sds};
 
 #[cfg(feature = "deployer")]
 mod tls;
+
+#[cfg(feature = "deployer")]
+mod tls_integrity;
 
 #[cfg(feature = "deployer")]
 mod proxy_stage;

@@ -139,7 +139,7 @@ impl PlatformClient {
     /// # Errors
     /// Rejects unavailable, corrupt, oversized or differently scoped registry.
     pub async fn load_registry(&self) -> Result<Versioned<NamespaceRegistry>> {
-        let registry: Versioned<NamespaceRegistry> = read_state(
+        let mut registry: Versioned<NamespaceRegistry> = read_state(
             &self.client,
             &self.control_namespace,
             &format!("reakt-registry-{}", self.workload_namespace),
@@ -151,7 +151,85 @@ impl PlatformClient {
         {
             return Err(invalid("protected registry scope mismatch"));
         }
+        // Older stage records kept a digest of generated private TLS material.
+        // UID-bound immutable Secrets no longer need that value. Do not carry it
+        // into any subsequent registry write; leave unrelated commitments intact.
+        for stored in registry.value.transitions.values_mut() {
+            let key = format!(
+                "v1/Secret/{}/{}-tls",
+                stored
+                    .plan
+                    .request
+                    .next
+                    .compiled
+                    .ir
+                    .domain
+                    .control_namespace,
+                stored.plan.generation_reservation.service_account_name,
+            );
+            stored.staged_content_digests.remove(&key);
+        }
         Ok(registry)
+    }
+
+    /// Capture missing writer authority for an already-reserved v3 upgrade.
+    /// Existing checkpoints are validated and never replaced. This operation
+    /// requires the same executor and authenticated historical state; it grants
+    /// no writer-termination evidence.
+    /// # Errors
+    /// Rejects forged records, unavailable history, changed authority or CAS races.
+    pub async fn ensure_previous_writer_checkpoint(
+        &self,
+        transition: &str,
+        executor: &str,
+    ) -> Result<Versioned<NamespaceRegistry>> {
+        let current = self.load_registry().await?;
+        let stored = current.value.transition(transition)?;
+        deploy::verify_record(&stored.plan, &stored.record)?;
+        if stored.record.executor_id != executor {
+            return Err(invalid("writer checkpoint requires the owning executor"));
+        }
+        let metadata = stored
+            .plan
+            .request
+            .predecessor()?
+            .ok_or_else(|| invalid("initial installation has no previous writer"))?;
+        if let Some(checkpoint) = &stored.previous_writer_checkpoint {
+            checkpoint.validate(
+                metadata,
+                &self.control_namespace,
+                &self.workload_namespace,
+                &self.cluster_binding,
+            )?;
+            return Ok(current);
+        }
+        let checkpoint = crate::writer_checkpoint::project(&current.value, metadata)?;
+        checkpoint.validate(
+            metadata,
+            &self.control_namespace,
+            &self.workload_namespace,
+            &self.cluster_binding,
+        )?;
+        let mut next = current.value.clone();
+        next.transitions
+            .get_mut(transition)
+            .ok_or_else(|| invalid("transition disappeared"))?
+            .previous_writer_checkpoint = Some(checkpoint);
+        let written = replace_state(
+            &self.client,
+            &self.control_namespace,
+            &format!("reakt-registry-{}", self.workload_namespace),
+            &current,
+            &next,
+        )
+        .await?;
+        let reloaded = self.load_registry().await?;
+        if reloaded.uid != written.uid || reloaded.resource_version != written.resource_version {
+            return Err(invalid(
+                "registry changed after writer checkpoint capture; retry",
+            ));
+        }
+        Ok(reloaded)
     }
 
     /// # Errors
@@ -231,9 +309,10 @@ impl PlatformClient {
                 "request was not planned against this protected registry snapshot",
             ));
         }
-        if let Some(previous) = request.predecessor()? {
-            crate::predecessor::authenticate(&current.value, previous)?;
-        }
+        let previous_writer_checkpoint = request
+            .predecessor()?
+            .map(|previous| crate::writer_checkpoint::project(&current.value, previous))
+            .transpose()?;
         let policy = self.load_policy(&domain.id).await?;
         if policy.value.runtime_ceiling != request.runtime_ceiling
             || policy.value.cleanup_ceiling != request.cleanup_ceiling
@@ -284,10 +363,10 @@ impl PlatformClient {
             .ok_or_else(|| invalid("missing domain history"))?
             .allocations
             .push(plan.generation_reservation.clone());
-        next.transitions.insert(
-            request.transition_id.clone(),
-            StoredTransition::reserved(plan, record),
-        );
+        let mut stored = StoredTransition::reserved(plan, record);
+        stored.previous_writer_checkpoint = previous_writer_checkpoint;
+        next.transitions
+            .insert(request.transition_id.clone(), stored);
         replace_state(
             &self.client,
             &self.control_namespace,
