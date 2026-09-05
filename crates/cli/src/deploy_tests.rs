@@ -4,6 +4,12 @@ use platform::{NamespaceRegistry, RuntimeBinding, StoredTransition};
 
 const BUILD: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OTHER: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const REGISTRY_UID: &str = "11111111-1111-4111-8111-111111111111";
+const GENERATION_1: &str = "gceirceircfardairceirceirce-1";
+const GENERATION_2: &str = "gceirceircfardairceirceirce-2";
+const TRANSITION_1: &str = "tceirceircfardairceirceirce-1";
+const TRANSITION_2: &str = "tceirceircfardairceirceirce-2";
+const SERVICE_ACCOUNT_1: &str = "rceirceircfardairceirceirce-1";
 
 fn registry() -> NamespaceRegistry {
     let compiled = compiler_core::parse_and_validate(&json!({
@@ -26,20 +32,21 @@ fn registry() -> NamespaceRegistry {
         domain_id: "example".into(),
         cluster_binding: "cluster-a".into(),
         revision: "1".into(),
-        active_generation_id: None,
-        allocations: vec![],
+        active_allocation: None,
     };
     let request = DeploymentRequest {
-        transition_id: "install".into(),
+        transition_id: TRANSITION_1.into(),
         previous: None,
         next: GenerationPlan {
-            generation_id: "g1".into(),
+            generation_id: GENERATION_1.into(),
             artifact_digest: BUILD.into(),
             compiled: compiled.clone(),
         },
         runtime_ceiling: ceiling.clone(),
         cleanup_ceiling: ceiling,
         registry: RegistrySnapshot {
+            registry_uid: REGISTRY_UID.into(),
+            next_sequence: 1,
             revision: "1".into(),
             claims: vec![],
             generation_history: history.clone(),
@@ -51,10 +58,7 @@ fn registry() -> NamespaceRegistry {
     let mut record = begin(&plan, "job-1").unwrap();
     // Routing fixtures do not purport to be authenticated/replayable cluster records.
     record.phase = Phase::Committed;
-    history.active_generation_id = Some("g1".into());
-    history
-        .allocations
-        .push(plan.generation_reservation.clone());
+    history.active_allocation = Some(plan.generation_reservation.clone());
     let stored = StoredTransition {
         plan,
         record,
@@ -63,12 +67,12 @@ fn registry() -> NamespaceRegistry {
         runtime_binding: Some(RuntimeBinding {
             domain_id: "example".into(),
             cluster_binding: "cluster-a".into(),
-            generation_id: "g1".into(),
+            generation_id: GENERATION_1.into(),
             build_digest: BUILD.into(),
             ir_digest: compiled.ir_digest,
             policy_digest: "policy-1".into(),
             capability_digest: BUILD.into(),
-            service_account_name: "sa".into(),
+            service_account_name: SERVICE_ACCOUNT_1.into(),
             controller_image: "image".into(),
         }),
         staged_trust_policy_digest: None,
@@ -80,66 +84,83 @@ fn registry() -> NamespaceRegistry {
     };
     NamespaceRegistry {
         schema_version: platform::SCHEMA_VERSION.into(),
+        registry_uid: REGISTRY_UID.into(),
+        next_sequence: 2,
         cluster_binding: "cluster-a".into(),
         workload_namespace: "workload".into(),
         claims: vec![],
         histories: BTreeMap::from([("example".into(), history)]),
-        transitions: BTreeMap::from([("install".into(), stored)]),
+        transitions: BTreeMap::from([(TRANSITION_1.into(), stored)]),
     }
 }
 
 #[test]
-fn active_release_is_idempotent_but_changed_policy_allocates_a_generation() {
+fn active_release_is_idempotent_but_changed_policy_allocates_a_generation() -> Result<()> {
     let registry = registry();
     assert_eq!(
-        default_transition(&registry, "example", BUILD, "policy-1"),
-        "install"
+        default_transition(&registry, "example", BUILD, "policy-1")?,
+        TRANSITION_1
     );
-    assert!(default_transition(&registry, "example", BUILD, "policy-2").starts_with("deploy-g2-"));
+    assert_eq!(
+        default_transition(&registry, "example", BUILD, "policy-2")?,
+        TRANSITION_2
+    );
+    Ok(())
 }
 
 #[test]
-fn pending_same_build_precedes_old_active_transition_and_rollback_is_fresh() {
+fn pending_same_build_precedes_old_active_transition_and_rollback_is_fresh() -> Result<()> {
     let mut registry = registry();
-    let mut next = registry.transitions["install"].clone();
-    next.plan.request.transition_id = "pending".into();
-    next.plan.request.next.generation_id = "g2".into();
+    let mut next = registry.transitions[TRANSITION_1].clone();
+    next.plan.request.transition_id = TRANSITION_2.into();
+    next.plan.request.next.generation_id = GENERATION_2.into();
     next.record.phase = Phase::Staged;
-    registry.transitions.insert("pending".into(), next);
+    registry.transitions.insert(TRANSITION_2.into(), next);
     assert_eq!(
-        default_transition(&registry, "example", BUILD, "policy-1"),
-        "pending"
+        default_transition(&registry, "example", BUILD, "policy-1")?,
+        TRANSITION_2
     );
-    let next = registry.transitions.get_mut("pending").unwrap();
+    let next = registry
+        .transitions
+        .get_mut(TRANSITION_2)
+        .ok_or("pending transition missing")?;
     next.record.phase = Phase::Committed;
     next.plan.request.next.artifact_digest = OTHER.into();
-    next.runtime_binding.as_mut().unwrap().generation_id = "g2".into();
+    next.runtime_binding
+        .as_mut()
+        .ok_or("pending runtime binding missing")?
+        .generation_id = GENERATION_2.into();
+    let mut allocation = next.plan.generation_reservation.clone();
+    allocation.sequence = 2;
+    allocation.generation_id = GENERATION_2.into();
+    allocation.transition_id = TRANSITION_2.into();
+    allocation.service_account_name = "rceirceircfardairceirceirce-2".into();
     registry
         .histories
         .get_mut("example")
         .unwrap()
-        .active_generation_id = Some("g2".into());
-    let mut allocation = registry.histories["example"].allocations[0].clone();
-    allocation.generation_id = "g2".into();
-    registry
-        .histories
-        .get_mut("example")
-        .unwrap()
-        .allocations
-        .push(allocation);
-    assert!(default_transition(&registry, "example", BUILD, "policy-1").starts_with("deploy-g3-"));
+        .active_allocation = Some(allocation);
+    registry.next_sequence = 3;
+    assert_eq!(
+        default_transition(&registry, "example", BUILD, "policy-1")?,
+        "tceirceircfardairceirceirce-3"
+    );
+    Ok(())
 }
 
 #[test]
 fn review_uses_metadata_predecessor_but_rejects_unverified_historical_details() -> Result<()> {
     let mut registry = registry();
-    let original = registry.transition("install")?.clone();
-    let initial = crate::review::transition_review(&registry, "install")?;
+    let original = registry.transition(TRANSITION_1)?.clone();
+    let initial = crate::review::transition_review(&registry, TRANSITION_1)?;
     assert!(initial["reactions"]["before"].is_null());
 
     let mut request = original.plan.request.clone();
-    request.transition_id = "upgrade".into();
-    request.next.generation_id = "g2".into();
+    request.transition_id = TRANSITION_2.into();
+    request.next.generation_id = GENERATION_2.into();
+    request.registry.registry_uid = registry.registry_uid.clone();
+    request.registry.next_sequence = registry.next_sequence;
+    request.registry.revision = "1".into();
     request.registry.generation_history = registry
         .histories
         .get("example")
@@ -156,11 +177,11 @@ fn review_uses_metadata_predecessor_but_rejects_unverified_historical_details() 
     let mut upgrade = original;
     upgrade.record = begin(&plan, "job-2")?;
     upgrade.plan = plan;
-    registry.transitions.insert("upgrade".into(), upgrade);
+    registry.transitions.insert(TRANSITION_2.into(), upgrade);
     // The routing fixture marks its historical phase committed without receipts.
     // Review must verify that history before using its old desired fields.
-    assert!(crate::review::transition_review(&registry, "upgrade").is_err());
-    registry.transitions.remove("install");
-    assert!(crate::review::transition_review(&registry, "upgrade").is_err());
+    assert!(crate::review::transition_review(&registry, TRANSITION_2).is_err());
+    registry.transitions.remove(TRANSITION_1);
+    assert!(crate::review::transition_review(&registry, TRANSITION_2).is_err());
     Ok(())
 }

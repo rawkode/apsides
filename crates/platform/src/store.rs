@@ -118,9 +118,11 @@ impl PlatformClient {
         workload_namespace: &str,
         cluster_binding: &str,
     ) -> Result<Self> {
-        if !valid_name(control_namespace)
-            || !valid_name(workload_namespace)
+        if !crate::valid_namespace(control_namespace)
+            || !crate::valid_namespace(workload_namespace)
             || control_namespace == workload_namespace
+            || control_namespace == crate::REGISTRY_AUTHORITY_NAMESPACE
+            || workload_namespace == crate::REGISTRY_AUTHORITY_NAMESPACE
             || cluster_binding.is_empty()
             || cluster_binding.len() > 256
         {
@@ -145,11 +147,65 @@ impl PlatformClient {
             &format!("reakt-registry-{}", self.workload_namespace),
         )
         .await?;
-        if registry.value.schema_version != SCHEMA_VERSION
+        if registry.value.schema_version != crate::REGISTRY_SCHEMA_VERSION
+            || registry.value.registry_uid != registry.uid
+            || registry.value.next_sequence == 0
             || registry.value.cluster_binding != self.cluster_binding
             || registry.value.workload_namespace != self.workload_namespace
         {
             return Err(invalid("protected registry scope mismatch"));
+        }
+        // This anchor is independently provisioned and is never writable by the deployer.
+        let authority: Versioned<crate::RegistryAuthority> = read_state(
+            &self.client,
+            crate::REGISTRY_AUTHORITY_NAMESPACE,
+            &crate::registry_authority_name(&self.control_namespace, &self.workload_namespace)?,
+        )
+        .await?;
+        if authority.value.schema_version != crate::REGISTRY_AUTHORITY_SCHEMA_VERSION
+            || authority.value.registry_uid != registry.uid
+            || authority.value.control_namespace != self.control_namespace
+            || authority.value.cluster_binding != self.cluster_binding
+            || authority.value.workload_namespace != self.workload_namespace
+        {
+            return Err(invalid(
+                "registry incarnation authority mismatch; explicit platform recovery required",
+            ));
+        }
+        // UUID validation is independent of the exhausted-counter sentinel.
+        deploy::allocation_names(&registry.uid, 1)?;
+        for (domain_id, history) in &registry.value.histories {
+            if &history.domain_id != domain_id
+                || history.cluster_binding != registry.value.cluster_binding
+            {
+                return Err(invalid("active allocation history scope mismatch"));
+            }
+            if let Some(allocation) = &history.active_allocation {
+                deploy::validate_allocation(allocation)?;
+                if allocation.registry_uid != registry.uid
+                    || allocation.sequence >= registry.value.next_sequence
+                {
+                    return Err(invalid(
+                        "active allocation is outside protected registry sequence",
+                    ));
+                }
+            }
+        }
+        let mut sequences = std::collections::BTreeSet::new();
+        for (transition_id, stored) in &registry.value.transitions {
+            let allocation = &stored.plan.generation_reservation;
+            deploy::validate_allocation(allocation)?;
+            if allocation.registry_uid != registry.uid
+                || allocation.sequence >= registry.value.next_sequence
+                || !sequences.insert(allocation.sequence)
+                || transition_id != &allocation.transition_id
+                || stored.plan.request.registry.registry_uid != registry.uid
+                || stored.plan.request.registry.next_sequence != allocation.sequence
+            {
+                return Err(invalid(
+                    "stored reservation is outside protected registry allocation authority",
+                ));
+            }
         }
         // Older stage records kept a digest of generated private TLS material.
         // UID-bound immutable Secrets no longer need that value. Do not carry it
@@ -172,7 +228,7 @@ impl PlatformClient {
         Ok(registry)
     }
 
-    /// Capture missing writer authority for an already-reserved v3 upgrade.
+    /// Capture missing writer authority for an already-reserved upgrade.
     /// Existing checkpoints are validated and never replaced. This operation
     /// requires the same executor and authenticated historical state; it grants
     /// no writer-termination evidence.
@@ -275,7 +331,7 @@ impl PlatformClient {
         .await
     }
 
-    /// Atomically reserve claims, permanent generation history and transition
+    /// Atomically consume one registry sequence and reserve claims and transition
     /// ownership in one platform-provisioned namespace registry `ConfigMap`.
     /// # Errors
     /// Rejects stale plans, concurrent deployers, claim overlap and identity reuse.
@@ -285,6 +341,11 @@ impl PlatformClient {
         executor_id: &str,
     ) -> Result<Versioned<NamespaceRegistry>> {
         let current = self.load_registry().await?;
+        let next_sequence = current
+            .value
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| invalid("registry allocation counter exhausted"))?;
         let domain = &request.next.compiled.ir.domain;
         let mut history = current
             .value
@@ -296,6 +357,8 @@ impl PlatformClient {
             })?;
         history.revision.clone_from(&current.resource_version);
         let expected = RegistrySnapshot {
+            registry_uid: current.uid.clone(),
+            next_sequence: current.value.next_sequence,
             revision: current.resource_version.clone(),
             claims: current.value.claims.clone(),
             generation_history: history,
@@ -358,11 +421,7 @@ impl PlatformClient {
             });
         }
         next.claims.sort_by(|a, b| a.identity.cmp(&b.identity));
-        next.histories
-            .get_mut(&domain.id)
-            .ok_or_else(|| invalid("missing domain history"))?
-            .allocations
-            .push(plan.generation_reservation.clone());
+        next.next_sequence = next_sequence;
         let mut stored = StoredTransition::reserved(plan, record);
         stored.previous_writer_checkpoint = previous_writer_checkpoint;
         next.transitions

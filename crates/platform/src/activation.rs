@@ -199,9 +199,9 @@ impl PlatformClient {
             .get(domain)
             .ok_or_else(|| invalid("domain history missing"))?;
         if history
-            .active_generation_id
+            .active_allocation
             .as_ref()
-            .is_some_and(|active| active != generation)
+            .is_some_and(|active| &active.generation_id != generation)
         {
             return Err(invalid(
                 "an old generation is active; initial activation forbidden",
@@ -216,10 +216,6 @@ impl PlatformClient {
                 .ok_or_else(|| invalid("claim vanished"))?;
             claim.state = ClaimState::Active;
         }
-        next.histories
-            .get_mut(domain)
-            .ok_or_else(|| invalid("history vanished"))?
-            .active_generation_id = Some(generation.clone());
         self.persist_registry(registry, &next).await
     }
 
@@ -242,6 +238,18 @@ impl PlatformClient {
             executor_id,
             event,
         )?;
+        if entry.record.phase == Phase::Committed {
+            let history = next
+                .histories
+                .get_mut(&entry.plan.request.next.compiled.ir.domain.id)
+                .ok_or_else(|| invalid("domain history missing at commit"))?;
+            if history.active_allocation.as_ref()
+                != entry.plan.request.predecessor()?.map(|p| &p.allocation)
+            {
+                return Err(invalid("active allocation changed before commit"));
+            }
+            history.active_allocation = Some(entry.plan.generation_reservation.clone());
+        }
         self.persist_registry(registry, &next).await
     }
 

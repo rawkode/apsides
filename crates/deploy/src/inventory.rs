@@ -204,6 +204,7 @@ pub fn validate_inventory_checkpoint(
     snapshot: &InventorySnapshot,
     allocation: &crate::GenerationAllocation,
 ) -> Result<()> {
+    crate::validate_allocation(allocation)?;
     let expected = allocation
         .inventory_metadata_digest
         .as_ref()

@@ -119,12 +119,16 @@ fn valid_request(request: &DeploymentRequest) -> Result<()> {
     Ok(())
 }
 
-fn allocation(generation: &GenerationPlan, transition_id: &str) -> Result<GenerationAllocation> {
+fn allocation(request: &DeploymentRequest) -> Result<GenerationAllocation> {
+    let generation = &request.next;
+    let transition_id = &request.transition_id;
     let (scope, snapshot) = crate::generation_inventory(generation, &[])?;
     Ok(GenerationAllocation {
+        registry_uid: request.registry.registry_uid.clone(),
+        sequence: request.registry.next_sequence,
         generation_id: generation.generation_id.clone(),
         service_account_name: service_account_name(generation)?,
-        transition_id: transition_id.into(),
+        transition_id: transition_id.clone(),
         artifact_digest: generation.artifact_digest.clone(),
         ir_digest: generation.compiled.ir_digest.clone(),
         inventory_metadata_digest: Some(crate::inventory_metadata_digest(&scope, &snapshot)?),
@@ -135,67 +139,46 @@ fn validate_generation_history(request: &DeploymentRequest) -> Result<()> {
     let history = &request.registry.generation_history;
     let domain = &request.next.compiled.ir.domain;
     let previous = request.predecessor()?;
-    if history.active_generation_id.as_ref()
-        != previous.map(|previous| &previous.allocation.generation_id)
+    request
+        .registry
+        .next_sequence
+        .checked_add(1)
+        .ok_or_else(|| Error::Plan("registry allocation counter exhausted".into()))?;
+    let names = crate::allocation_names(
+        &request.registry.registry_uid,
+        request.registry.next_sequence,
+    )?;
+    if request.next.generation_id != names.generation_id
+        || request.transition_id != names.transition_id
     {
         return Err(Error::Plan(
-            "previous generation does not match protected active-generation authority".into(),
+            "generation and transition must use the protected registry allocation sequence".into(),
+        ));
+    }
+    if history.active_allocation.as_ref() != previous.map(|p| &p.allocation) {
+        return Err(Error::Plan(
+            "previous generation does not match protected active allocation".into(),
         ));
     }
     if history.domain_id != domain.id
         || history.cluster_binding != domain.cluster_binding
-        || history.revision.is_empty()
-        || history.revision.len() > 256
-        || history.allocations.len() > 4096
+        || history.revision != request.registry.revision
     {
         return Err(Error::Plan(
-            "generation history must be complete, bounded, and bound to this domain and cluster"
-                .into(),
+            "active allocation scope or revision mismatch".into(),
         ));
     }
-    let mut ids = BTreeSet::new();
-    let mut accounts = BTreeSet::new();
-    let mut transitions = BTreeSet::new();
-    let next_account = service_account_name(&request.next)?;
-    for entry in &history.allocations {
-        if !valid_id(&entry.generation_id)
-            || !valid_id(&entry.transition_id)
-            || !valid_id(&entry.service_account_name)
-            || !valid_digest(&entry.artifact_digest)
-            || !valid_digest(&entry.ir_digest)
-            || entry
-                .inventory_metadata_digest
-                .as_ref()
-                .is_some_and(|value| !valid_digest(value))
-            || !ids.insert(&entry.generation_id)
-            || !accounts.insert(&entry.service_account_name)
-            || !transitions.insert(&entry.transition_id)
-        {
-            return Err(Error::Plan(
-                "generation history contains invalid or repeated allocations".into(),
-            ));
-        }
-        if entry.generation_id == request.next.generation_id
-            || entry.service_account_name == next_account
-            || entry.transition_id == request.transition_id
-        {
-            return Err(Error::Plan("generation, runtime identity, or transition ID was allocated previously; rollback requires fresh activation identities".into()));
-        }
-    }
     if let Some(previous) = previous {
-        let entry = history
-            .allocations
-            .iter()
-            .find(|entry| entry.generation_id == previous.allocation.generation_id)
-            .ok_or_else(|| {
-                Error::Plan("prior generation is absent from protected generation history".into())
-            })?;
-        crate::validate_inventory_checkpoint(&previous.scope, &previous.inventory, entry)?;
-        if entry != &previous.allocation {
+        let entry = &previous.allocation;
+        crate::validate_allocation(entry)?;
+        if entry.registry_uid != request.registry.registry_uid
+            || entry.sequence >= request.registry.next_sequence
+        {
             return Err(Error::Plan(
-                "prior generation differs from its protected allocation history".into(),
+                "predecessor allocation is outside the registry incarnation or sequence".into(),
             ));
         }
+        crate::validate_inventory_checkpoint(&previous.scope, &previous.inventory, entry)?;
         previous
             .inventory
             .encode(&previous.scope)
@@ -398,9 +381,9 @@ pub fn plan_transition(request: &DeploymentRequest) -> Result<TransitionPlan> {
         None => (Vec::new(), Vec::new()),
     };
     cleanup_allowed(&capabilities, &request.cleanup_ceiling)?;
-    let generation_reservation = allocation(&request.next, &request.transition_id)?;
+    let generation_reservation = allocation(request)?;
     let mut plan = TransitionPlan {
-        schema_version: "reakt.dev/transition-plan/v3".into(),
+        schema_version: "reakt.dev/transition-plan/v4".into(),
         plan_digest: String::new(), request: request.clone(), reservations,
         generation_reservation, cleanup, cleanup_capabilities: capabilities,
         warnings: vec!["uncertain old-writer termination blocks activation; short-lived credentials do not undo durable changes".into()],

@@ -34,6 +34,7 @@ class LifecycleRunner:
         self.admin = self.output / "admin.kubeconfig"
         self.issuer = self.output / "issuer.kubeconfig"
         self.results = []
+        self.allocations = {}
         self.created = False
         self.adopted_uid = None
         self.candidates = [args.first.resolve(), args.second.resolve()]
@@ -155,16 +156,36 @@ class LifecycleRunner:
                     **self.profile, "environmentQualificationDigest": digest(qualification), "nodeImageDigest": NODE.split("@")[1], "certificateLifetimeSeconds": 86400})
         registry_name = "reakt-registry-" + self.workload
         registry = self.get("configmap", registry_name, self.control)
-        state = json.loads(registry["data"]["state.json"]) if registry else {"schemaVersion": "reakt.dev/platform/v1", "clusterBinding": self.binding,
-                 "workloadNamespace": self.workload, "claims": [], "transitions": {}, "histories": {}}
+        state = json.loads(registry["data"]["state.json"]) if registry else {"schemaVersion": "reakt.dev/namespace-registry/v2", "clusterBinding": self.binding,
+                 "workloadNamespace": self.workload, "nextSequence": "1", "claims": [], "transitions": {}, "histories": {}}
         if state["clusterBinding"] != self.binding or state["workloadNamespace"] != self.workload or self.domain in state["histories"]:
             raise RuntimeError("test bootstrap refuses to replace existing domain history or scope")
-        state["histories"][self.domain] = {"domainId": self.domain, "clusterBinding": self.binding, "revision": "bootstrap", "activeGenerationId": None, "allocations": []}
+        state["histories"][self.domain] = {"domainId": self.domain, "clusterBinding": self.binding, "revision": "bootstrap", "activeAllocation": None}
+        if registry and state.get("registryUid") != registry["metadata"]["uid"]:
+            raise RuntimeError("test bootstrap refuses a registry with an unbound incarnation")
+        if not registry:
+            registry = json.loads(self.k("create", "-f", "-", "-o", "json", data=json.dumps({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": {"name": registry_name, "namespace": self.control},
+            })).stdout)
+            state["registryUid"] = registry["metadata"]["uid"]
         if registry:
+            registry["data"] = registry.get("data", {})
             registry["data"]["state.json"] = json.dumps(state, sort_keys=True, separators=(",", ":"))
             self.k("replace", "-f", "-", data=json.dumps(registry))
-        else:
-            self.state(registry_name, state)
+        self.apply({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "reakt-platform"}})
+        authority_name = "reakt-registry-authority." + self.control + "." + self.workload
+        if self.get("configmap", authority_name, "reakt-platform"):
+            raise RuntimeError("test bootstrap refuses to replace registry authority")
+        self.k("create", "-f", "-", data=json.dumps({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": authority_name, "namespace": "reakt-platform"},
+            "data": {"state.json": json.dumps({
+                "schemaVersion": "reakt.dev/registry-authority/v1", "registryUid": state["registryUid"],
+                "clusterBinding": self.binding, "controlNamespace": self.control,
+                "workloadNamespace": self.workload,
+            }, sort_keys=True, separators=(",", ":"))},
+        }))
         for account in ["test-deployer", "test-issuer"]:
             self.apply({"apiVersion": "v1", "kind": "ServiceAccount", "metadata": {"name": account, "namespace": self.control}, "automountServiceAccountToken": False})
         secret = self.apply({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "deployment-binding", "namespace": self.control}, "immutable": True, "type": "Opaque"})
@@ -192,6 +213,8 @@ class LifecycleRunner:
                  rule("", ["pods"], ["get", "list"]), rule("", ["pods/exec"], ["get"]), rule("", ["services"], ["get", "create"]),
                  rule("apps", ["deployments"], ["get", "create", "update"]), rule("apps", ["replicasets"], ["get"]),
                  rule("rbac.authorization.k8s.io", ["roles", "rolebindings"], ["get", "create"]), rule("rbac.authorization.k8s.io", ["rolebindings"], ["delete"])]
+        self.role("reakt-platform", "read-registry-authority-" + self.workload,
+                  [rule("", ["configmaps"], ["get"], ["reakt-registry-authority." + self.control + "." + self.workload])], "test-deployer")
         self.role(self.control, "test-deployer", rules, "test-deployer")
         self.role(self.workload, "test-deployer", [rule("", ["configmaps", "services"], ["get", "list", "watch", "create", "patch", "delete"]),
                   rule("rbac.authorization.k8s.io", ["roles", "rolebindings"], ["get", "create"]), rule("rbac.authorization.k8s.io", ["rolebindings"], ["delete"])], "test-deployer")
@@ -205,9 +228,23 @@ class LifecycleRunner:
                     "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": name},
                     "subjects": [{"kind": "ServiceAccount", "name": "test-deployer", "namespace": self.control}]})
 
+    def allocation(self, candidate, alias):
+        if alias not in self.allocations:
+            path = self.output / "allocation.json"
+            path.write_text(json.dumps({"artifact": str(candidate), "transition": "allocation-query",
+                                        "action": "allocation", "target": self.target}))
+            environment = dict(os.environ, KUBECONFIG=str(self.issuer), REAKT_TEST_STEP=str(path))
+            result = self.cargo("candidate_transition_step", env=environment)
+            records = [json.loads(line.split("=", 1)[1]) for line in result.stdout.splitlines()
+                       if line.startswith("REAKT_TEST_ALLOCATION=")]
+            if result.returncode or len(records) != 1:
+                raise RuntimeError("failed to read canonical test allocation")
+            self.allocations[alias] = records[0]
+        return self.allocations[alias]
+
     def step(self, candidate, transition, action, timeout=120, expected_pending=False, expected_error=None):
         path = self.output / "step.json"
-        path.write_text(json.dumps({"artifact": str(candidate), "transition": transition, "action": action, "target": self.target,
+        path.write_text(json.dumps({"artifact": str(candidate), "transition": self.allocation(candidate, transition)["transition"], "action": action, "target": self.target,
                                    "ownershipIntents": ["adopt-retained"] if self.adopted_uid and transition == "install" else []}))
         environment = dict(os.environ, KUBECONFIG=str(self.issuer), REAKT_TEST_STEP=str(path))
         deadline = time.monotonic() + timeout
@@ -247,8 +284,8 @@ class LifecycleRunner:
         self.apply({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "reakt-platform-intents"}})
         release_digest = "sha256:" + hashlib.sha256((self.candidates[0] / "release.json").read_bytes()).hexdigest()
         approval = {
-            "schemaVersion": "reakt.dev/ownership-intent/v1", "transitionId": "install",
-            "domainId": self.domain, "generationId": "g1-" + release_digest[7:19], "releaseDigest": release_digest,
+            "schemaVersion": "reakt.dev/ownership-intent/v1", "transitionId": self.allocation(self.candidates[0], "install")["transition"],
+            "domainId": self.domain, "generationId": self.allocation(self.candidates[0], "install")["generation"], "releaseDigest": release_digest,
             "clusterBinding": self.binding, "controlNamespace": self.control,
             "identity": {"apiGroup": "", "resource": "configmaps", "namespace": self.workload, "name": "retained"},
             "observedUid": self.adopted_uid, "observedResourceVersion": existing["metadata"]["resourceVersion"],
@@ -263,7 +300,7 @@ class LifecycleRunner:
 
     def old_credential(self):
         registry = json.loads(self.get("configmap", "reakt-registry-" + self.workload, self.control)["data"]["state.json"])
-        account = registry["transitions"]["install"]["runtimeBinding"]["serviceAccountName"]
+        account = registry["transitions"][self.allocations["install"]["transition"]]["runtimeBinding"]["serviceAccountName"]
         config = json.loads(self.k("config", "view", "--raw", "--minify", "-o", "json").stdout)
         token = self.k("create", "token", account, "-n", self.control, "--duration=10m").stdout.strip()
         config["users"] = [{"name": "old-generation", "user": {"token": token}}]

@@ -133,6 +133,16 @@ impl PlatformClient {
             .get_mut(transition)
             .ok_or_else(|| invalid("transition missing"))?
             .record = updated;
+        let history = next
+            .histories
+            .get_mut(&stored.plan.request.next.compiled.ir.domain.id)
+            .ok_or_else(|| invalid("domain history missing at commit"))?;
+        if history.active_allocation.as_ref()
+            != stored.plan.request.predecessor()?.map(|p| &p.allocation)
+        {
+            return Err(invalid("active allocation changed before commit"));
+        }
+        history.active_allocation = Some(stored.plan.generation_reservation.clone());
         self.persist_registry(&registry, &next).await
     }
 
@@ -196,15 +206,12 @@ impl PlatformClient {
             .predecessor()?
             .ok_or_else(|| invalid("previous generation missing"))?;
         let domain = &stored.plan.request.next.compiled.ir.domain.id;
-        let generation = &stored.plan.request.next.generation_id;
         let mut next = registry.value.clone();
         let history = next
             .histories
             .get_mut(domain)
             .ok_or_else(|| invalid("domain history missing"))?;
-        if !history.active_generation_id.as_ref().is_some_and(|active| {
-            active == &previous.allocation.generation_id || active == generation
-        }) {
+        if history.active_allocation.as_ref() != Some(&previous.allocation) {
             return Err(invalid("active generation differs from transition"));
         }
         for approved in approved_claims(&registry.value, stored)? {
@@ -229,7 +236,6 @@ impl PlatformClient {
             claim.state = ClaimState::Releasing;
             claim.transition_id = transition.into();
         }
-        history.active_generation_id = Some(generation.clone());
         self.persist_registry(registry, &next).await
     }
 

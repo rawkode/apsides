@@ -47,14 +47,15 @@ async fn deploy(options: &BTreeMap<String, String>) -> Result<Value> {
     let executor = executor_id(options)?;
     let registry = platform.load_registry().await?;
     let policy_digest = compiler_core::digest(&platform.load_policy(&domain.id).await?.value)?;
-    let transition_id = options.get("--transition").cloned().unwrap_or_else(|| {
-        default_transition(
+    let transition_id = match options.get("--transition") {
+        Some(transition) => transition.clone(),
+        None => default_transition(
             &registry.value,
             &domain.id,
             verified.release_digest(),
             &policy_digest,
-        )
-    });
+        )?,
+    };
     verify_resumed_intents(
         options.get("--ownership-intents"),
         registry.value.transitions.get(&transition_id),
@@ -151,19 +152,33 @@ async fn reserve_new_transition(
     executor: &str,
     options: &BTreeMap<String, String>,
 ) -> Result<()> {
+    registry
+        .value
+        .next_sequence
+        .checked_add(1)
+        .ok_or("registry allocation counter exhausted")?;
+    let names = deploy::allocation_names(&registry.uid, registry.value.next_sequence)?;
+    if transition_id != names.transition_id {
+        return Err("fresh transition must use the canonical registry allocation identity".into());
+    }
     let domain = &verified.compiled().ir.domain;
 
     let active = registry
         .value
         .histories
         .get(&domain.id)
-        .and_then(|history| history.active_generation_id.as_deref());
+        .and_then(|history| {
+            history
+                .active_allocation
+                .as_ref()
+                .map(|a| a.generation_id.as_str())
+        });
     crate::inventory_connection::require_head(inventory, domain, active).await?;
     if registry
         .value
         .histories
         .get(&domain.id)
-        .is_some_and(|h| h.active_generation_id.is_some())
+        .is_some_and(|h| h.active_allocation.is_some())
     {
         registry = crate::inventory_connection::capture_active(platform, inventory, domain).await?;
     }
@@ -352,11 +367,11 @@ async fn prepare_request(
         .ok_or("platform has not provisioned this domain history")?;
     history.revision.clone_from(&registry.resource_version);
     let previous = prepare_predecessor(inventory, &registry.value, domain, &history).await?;
-    let generation_id = format!(
-        "g{}-{}",
-        history.allocations.len() + 1,
-        &verified.release_digest()[7..19]
-    );
+    let names = deploy::allocation_names(&registry.uid, registry.value.next_sequence)?;
+    if transition_id != names.transition_id {
+        return Err("fresh transition must use the canonical registry allocation identity".into());
+    }
+    let generation_id = names.generation_id;
     let next = GenerationPlan {
         generation_id,
         artifact_digest: verified.release_digest().into(),
@@ -384,6 +399,8 @@ async fn prepare_request(
         runtime_ceiling: policy.value.runtime_ceiling,
         cleanup_ceiling: policy.value.cleanup_ceiling,
         registry: RegistrySnapshot {
+            registry_uid: registry.uid.clone(),
+            next_sequence: registry.value.next_sequence,
             revision: registry.resource_version.clone(),
             claims: registry.value.claims.clone(),
             generation_history: history,
@@ -400,17 +417,9 @@ async fn prepare_predecessor(
     domain: &compiler_core::Domain,
     history: &deploy::GenerationHistory,
 ) -> Result<Option<deploy::PreviousGeneration>> {
-    let Some(active) = &history.active_generation_id else {
+    let Some(allocation) = &history.active_allocation else {
         return Ok(None);
     };
-    let mut allocations = history
-        .allocations
-        .iter()
-        .filter(|a| &a.generation_id == active);
-    let allocation = allocations.next().ok_or("active allocation missing")?;
-    if allocations.next().is_some() {
-        return Err("active allocation is ambiguous".into());
-    }
     let prior = registry
         .transitions
         .get(&allocation.transition_id)
@@ -462,7 +471,7 @@ fn default_transition(
     domain: &str,
     release: &str,
     policy: &str,
-) -> String {
+) -> Result<String> {
     let matching = |s: &&platform::StoredTransition| {
         s.plan.request.next.compiled.ir.domain.id == domain
             && s.plan.request.next.artifact_digest == release
@@ -473,28 +482,21 @@ fn default_transition(
         .filter(matching)
         .find(|s| s.record.phase != Phase::Committed)
     {
-        return pending.plan.request.transition_id.clone();
+        return Ok(pending.plan.request.transition_id.clone());
     }
     if let Some(active) = registry.transitions.values().filter(matching).find(|s| {
         registry
             .histories
             .get(domain)
-            .and_then(|h| h.active_generation_id.as_ref())
+            .and_then(|h| h.active_allocation.as_ref().map(|a| &a.generation_id))
             == Some(&s.plan.request.next.generation_id)
             && s.runtime_binding
                 .as_ref()
                 .is_some_and(|b| b.policy_digest == policy)
     }) {
-        return active.plan.request.transition_id.clone();
+        return Ok(active.plan.request.transition_id.clone());
     }
-    format!(
-        "deploy-g{}-{}",
-        registry
-            .histories
-            .get(domain)
-            .map_or(1, |h| h.allocations.len() + 1),
-        &release[7..31]
-    )
+    Ok(deploy::allocation_names(&registry.registry_uid, registry.next_sequence)?.transition_id)
 }
 
 async fn drive_transition(
@@ -588,7 +590,7 @@ fn check_existing(
         if registry
             .histories
             .get(domain)
-            .and_then(|h| h.active_generation_id.as_ref())
+            .and_then(|h| h.active_allocation.as_ref().map(|a| &a.generation_id))
             != Some(&stored.plan.request.next.generation_id)
             || stored
                 .runtime_binding

@@ -33,7 +33,7 @@ impl PlatformClient {
             .value
             .histories
             .get(domain_id)
-            .and_then(|h| h.active_generation_id.as_ref())
+            .and_then(|h| h.active_allocation.as_ref().map(|a| &a.generation_id))
             .ok_or_else(|| invalid("domain has no active generation"))?;
         let stored = current
             .value
@@ -409,8 +409,26 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn cleanup_registry_fixture() -> crate::Versioned<NamespaceRegistry> {
+        crate::Versioned {
+            value: NamespaceRegistry {
+                registry_uid: "11111111-1111-4111-8111-111111111111".into(),
+                next_sequence: 1,
+                schema_version: crate::REGISTRY_SCHEMA_VERSION.into(),
+                cluster_binding: "cluster-a".into(),
+                workload_namespace: "workload".into(),
+                claims: vec![],
+                histories: std::collections::BTreeMap::default(),
+                transitions: std::collections::BTreeMap::default(),
+            },
+            uid: "11111111-1111-4111-8111-111111111111".into(),
+            resource_version: "7".into(),
+        }
+    }
+
     #[tokio::test]
-    async fn delete_preserves_finalizers_and_sends_both_preconditions() {
+    async fn delete_preserves_finalizers_and_sends_both_preconditions()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         use http::{Request, Response};
         use http_body_util::BodyExt;
         use kube::client::Body;
@@ -419,18 +437,7 @@ mod tests {
             convert::Infallible,
             sync::{Arc, Mutex},
         };
-        let registry = crate::Versioned {
-            value: NamespaceRegistry {
-                schema_version: crate::SCHEMA_VERSION.into(),
-                cluster_binding: "cluster-a".into(),
-                workload_namespace: "workload".into(),
-                claims: vec![],
-                histories: std::collections::BTreeMap::default(),
-                transitions: std::collections::BTreeMap::default(),
-            },
-            uid: "registry-uid".into(),
-            resource_version: "7".into(),
-        };
+        let registry = cleanup_registry_fixture();
         let ceiling: compiler_core::PermissionCeiling = serde_json::from_value(json!({"policyRef":"platform","domainId":"example","clusterBinding":"cluster-a","workloadNamespace":"workload","controlNamespace":"control","capabilities":[],"acceptedEnforcementGaps":[],"acceptedIndirectRisks":[]})).unwrap();
         let policy = crate::Versioned {
             value: crate::PolicyState {
@@ -444,6 +451,11 @@ mod tests {
         let live: DynamicObject = serde_json::from_value(json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"settings","namespace":"workload","uid":"target-uid","resourceVersion":"42","finalizers":["example.test/hold"]}})).unwrap();
         let replies = Arc::new(Mutex::new(VecDeque::from([
             json!({"metadata":{"uid":registry.uid,"resourceVersion":registry.resource_version},"data":{"state.json":serde_json::to_string(&registry.value).unwrap()}}),
+            json!({"metadata":{"uid":"authority-uid","resourceVersion":"1"},"data":{"state.json":json!({
+                "schemaVersion":crate::REGISTRY_AUTHORITY_SCHEMA_VERSION,
+                "registryUid":registry.uid,"clusterBinding":"cluster-a",
+                "controlNamespace":"control","workloadNamespace":"workload"
+            }).to_string()}}),
             json!({"metadata":{"uid":policy.uid,"resourceVersion":policy.resource_version},"data":{"state.json":serde_json::to_string(&policy.value).unwrap()}}),
             serde_json::to_value(&live).unwrap(),
             serde_json::to_value(&live).unwrap(),
@@ -499,13 +511,18 @@ mod tests {
         let requests = requests.lock().unwrap();
         assert_eq!(
             requests.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
-            ["GET", "GET", "DELETE", "GET"]
+            ["GET", "GET", "GET", "DELETE", "GET"]
         );
+        let deletion = requests
+            .iter()
+            .find(|request| request.0 == "DELETE")
+            .ok_or("cleanup did not issue DELETE")?;
         assert_eq!(
-            requests[2].1["preconditions"],
-            json!({"uid":"target-uid","resourceVersion":"42"})
+            deletion.1.get("preconditions"),
+            Some(&json!({"uid":"target-uid","resourceVersion":"42"}))
         );
-        assert!(requests[2].1.get("finalizers").is_none());
+        assert!(deletion.1.get("finalizers").is_none());
+        Ok(())
     }
 
     #[test]

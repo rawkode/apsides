@@ -8,12 +8,13 @@ All JSON uses `schemaVersion: "reakt.dev/platform/v1"`, camelCase fields, strict
 | --- | --- | --- |
 | `reakt-policy-{domain}` | platform administration | runtime and deployer; `PolicyState { runtimeCeiling, cleanupCeiling }` |
 | `reakt-trust-{domain}` | platform administration | deployer only; release verifier's policy JSON |
+| `reakt-registry-authority.{controlNamespace}.{workloadNamespace}` in `reakt-platform` | platform administration and explicit recovery only | deployer exact GET only; scope and admitted registry UID |
 | `reakt-registry-{workloadNamespace}` | authorized deployment jobs | deployer only; `NamespaceRegistry` |
 | `reakt-activation-{domain}` | authorized deployment job | runtime; `ActivationState` |
 | `reakt-inventory-{domain}` | runtime updates a preprovisioned object | runtime and deployer; `RuntimeInventory` |
 | Secret `reakt-rollout-key-{domain}` | authorized deployment job | runtime only when sensitive inputs require it; exactly `key` (32 bytes) and `keyId` (UTF-8) |
 
-The namespace registry contains claims, complete per-domain permanent generation histories, and deployment plans/transition records. `reserve_transition` reads it, compares the exact supplied snapshot and independently loaded ceilings, invokes `deploy`, then atomically reserves resource identities, generation identity and transition ownership in one ConfigMap replacement. Kubernetes UID/resourceVersion predicates reject concurrent deployers. Histories are never inferred from currently active claims.
+The namespace registry contains claims, one registry-wide monotonic allocation counter, a committed active allocation per domain, and retained deployment plans/transition records. `reserve_transition` reads it, compares the exact supplied snapshot and independently loaded ceilings, invokes `deploy`, then atomically reserves resource identities, generation identity and transition ownership in one ConfigMap replacement. Kubernetes UID/resourceVersion predicates reject concurrent deployers. Allocation authority is never inferred from currently active claims. Counters are canonical decimal strings; snapshots and allocations bind the actual registry UID. Full transition plans remain retained pending the separate compaction migration.
 
 `load_trust_policy` returns the protected policy JSON plus Kubernetes UID/resourceVersion for the separate established signature verifier. `load_policy` similarly returns the typed ceilings. Hashes identify these records; their writers' platform-controlled RBAC establishes trust. The release verifier must reject fixture artifacts and bind approved provenance, compiled plan, controller image and build manifest before deployment proceeds.
 

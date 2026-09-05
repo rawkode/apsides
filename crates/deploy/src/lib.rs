@@ -12,6 +12,9 @@
 #![forbid(unsafe_code)]
 //! Pure provider-neutral deployment planning. Kubernetes execution and evidence
 //! verification are deliberately outside this model's authority.
+mod allocation;
+pub mod allocation_counter;
+pub use allocation::{AllocationNames, allocation_names, validate_allocation};
 mod inventory;
 pub use inventory::{
     generation_inventory, inventory_metadata_digest, predecessor_metadata,

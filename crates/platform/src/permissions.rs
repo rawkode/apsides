@@ -126,7 +126,7 @@ pub fn deployment_permissions(plan: &TransitionPlan) -> Result<DeploymentPermiss
         ));
     }
     let mut requests = Requests::default();
-    control_state(plan, &mut requests);
+    control_state(plan, &mut requests)?;
     let roles = stage_generation(plan, &mut requests);
     previous_generation(plan, &mut requests)?;
     for capability in &plan.cleanup_capabilities {
@@ -166,8 +166,18 @@ pub fn deployment_permissions(plan: &TransitionPlan) -> Result<DeploymentPermiss
     })
 }
 
-fn control_state(plan: &TransitionPlan, requests: &mut Requests) {
+fn control_state(plan: &TransitionPlan, requests: &mut Requests) -> Result<()> {
     let domain = &plan.request.next.compiled.ir.domain;
+    requests.add(
+        Some(crate::REGISTRY_AUTHORITY_NAMESPACE),
+        "",
+        "configmaps",
+        "get",
+        Some(&crate::registry_authority_name(
+            &domain.control_namespace,
+            &domain.namespace,
+        )?),
+    );
     let namespace = &domain.control_namespace;
     for name in [
         format!("reakt-policy-{}", domain.id),
@@ -213,6 +223,7 @@ fn control_state(plan: &TransitionPlan, requests: &mut Requests) {
     requests.add(Some(namespace), "", "pods", "list", None);
     requests.add(Some(namespace), "apps", "replicasets", "get", None);
     requests.add(None, "", "nodes", "get", None);
+    Ok(())
 }
 
 fn stage_generation(plan: &TransitionPlan, requests: &mut Requests) -> Vec<RoleDelegation> {

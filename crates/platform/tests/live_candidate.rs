@@ -72,6 +72,15 @@ async fn transition_step() -> Result<()> {
     platform
         .verify_test_cluster_target(&authorization, &target)
         .await?;
+    if action == "allocation" {
+        let registry = platform.load_registry().await?;
+        let names = deploy::allocation_names(&registry.uid, registry.value.next_sequence)?;
+        println!(
+            "REAKT_TEST_ALLOCATION={}",
+            json!({"generation":names.generation_id,"transition":names.transition_id})
+        );
+        return Ok(());
+    }
     match action {
         "reserve" => {
             let names: Vec<String> = serde_json::from_value(
@@ -131,21 +140,21 @@ async fn reserve(
         return Err("test transition already exists".into());
     }
     if registry.value.histories[&domain.id]
-        .active_generation_id
+        .active_allocation
         .is_some()
     {
         let active = registry
             .value
             .histories
             .get(&domain.id)
-            .and_then(|history| history.active_generation_id.as_ref())
+            .and_then(|history| history.active_allocation.as_ref())
             .ok_or("active generation missing")?;
         let prior = registry
             .value
             .transitions
             .values()
             .find(|stored| {
-                stored.plan.request.next.generation_id == *active
+                stored.plan.generation_reservation == *active
                     && stored.plan.request.next.compiled.ir.domain.id == domain.id
             })
             .ok_or("active test generation missing")?;
@@ -158,7 +167,7 @@ async fn reserve(
     let mut history = registry.value.histories[&domain.id].clone();
     history.revision.clone_from(&registry.resource_version);
     let previous = history
-        .active_generation_id
+        .active_allocation
         .as_ref()
         .map(|generation| -> Result<deploy::PreviousGeneration> {
             let stored = registry
@@ -167,7 +176,7 @@ async fn reserve(
                 .values()
                 .find(|s| {
                     s.record.phase == Phase::Committed
-                        && s.plan.request.next.generation_id == *generation
+                        && s.plan.generation_reservation == *generation
                 })
                 .ok_or("active plan absent")?;
             Ok(deploy::PreviousGeneration::Metadata(Box::new(
@@ -180,12 +189,12 @@ async fn reserve(
         })
         .transpose()?;
     let policy = platform.load_policy(&domain.id).await?.value;
+    let names = deploy::allocation_names(&registry.uid, registry.value.next_sequence)?;
+    if transition != names.transition_id {
+        return Err("test transition must match the protected allocation identity".into());
+    }
     let next = GenerationPlan {
-        generation_id: format!(
-            "g{}-{}",
-            history.allocations.len() + 1,
-            &candidate.release_digest()[7..19]
-        ),
+        generation_id: names.generation_id,
         artifact_digest: candidate.release_digest().into(),
         compiled: candidate.compiled().clone(),
     };
@@ -199,6 +208,8 @@ async fn reserve(
         runtime_ceiling: policy.runtime_ceiling,
         cleanup_ceiling: policy.cleanup_ceiling,
         registry: RegistrySnapshot {
+            registry_uid: registry.uid,
+            next_sequence: registry.value.next_sequence,
             revision: registry.resource_version,
             claims: registry.value.claims,
             generation_history: history,

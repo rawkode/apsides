@@ -34,7 +34,7 @@ impl PlatformClient {
                 .value
                 .histories
                 .get(&domain.id)
-                .and_then(|h| h.active_generation_id.as_ref())
+                .and_then(|h| h.active_allocation.as_ref().map(|a| &a.generation_id))
                 != Some(&generation.generation_id)
             || registry.value.transitions.values().any(|entry| {
                 entry.plan.request.next.compiled.ir.domain.id == domain.id

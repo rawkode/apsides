@@ -4,6 +4,8 @@ use serde_json::json;
 use std::collections::BTreeSet;
 
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const REGISTRY_UID: &str = "11111111-1111-4111-8111-111111111111";
+const REGISTRY_TOKEN: &str = "ceirceircfardairceirceirce";
 
 fn adoption_intent(request: &DeploymentRequest) -> OwnershipIntent {
     let target = &request.next;
@@ -113,11 +115,23 @@ fn identity(name: &str) -> ResourceIdentity {
     }
 }
 
-fn allocation(generation: &GenerationPlan, transition_id: &str) -> GenerationAllocation {
+fn fixture_names(sequence: u64) -> (String, String, String) {
+    let suffix = format!("{REGISTRY_TOKEN}-{sequence}");
+    (
+        format!("g{suffix}"),
+        format!("t{suffix}"),
+        format!("r{suffix}"),
+    )
+}
+
+fn allocation(generation: &GenerationPlan, sequence: u64) -> GenerationAllocation {
+    let (_, transition_id, service_account_name) = fixture_names(sequence);
     GenerationAllocation {
+        registry_uid: REGISTRY_UID.into(),
+        sequence,
         generation_id: generation.generation_id.clone(),
-        service_account_name: service_account_name(generation).unwrap(),
-        transition_id: transition_id.into(),
+        service_account_name,
+        transition_id,
         artifact_digest: generation.artifact_digest.clone(),
         ir_digest: generation.compiled.ir_digest.clone(),
         inventory_metadata_digest: generation_inventory(generation, &[])
@@ -127,6 +141,22 @@ fn allocation(generation: &GenerationPlan, transition_id: &str) -> GenerationAll
 }
 
 fn request(previous: Option<GenerationPlan>, next: GenerationPlan) -> DeploymentRequest {
+    let next_sequence = if previous.is_some() { 2 } else { 1 };
+    request_at_sequence(previous, next, next_sequence)
+}
+
+fn request_at_sequence(
+    mut previous: Option<GenerationPlan>,
+    mut next: GenerationPlan,
+    next_sequence: u64,
+) -> DeploymentRequest {
+    let (generation_id, transition_id, _) = fixture_names(next_sequence);
+    next.generation_id = generation_id;
+    let previous_sequence = next_sequence.saturating_sub(1);
+    let (_, previous_transition_id, _) = fixture_names(previous_sequence);
+    if let Some(previous) = &mut previous {
+        previous.generation_id = fixture_names(previous_sequence).0;
+    }
     let runtime_ceiling = ceiling(&next);
     let mut cleanup_ceiling = ceiling(&next);
     let claims = previous.as_ref().map_or_else(Vec::new, |previous| {
@@ -139,7 +169,7 @@ fn request(previous: Option<GenerationPlan>, next: GenerationPlan) -> Deployment
                 identity: identity(&resource.name),
                 domain_id: "example".into(),
                 generation_id: previous.generation_id.clone(),
-                transition_id: "old-transition".into(),
+                transition_id: previous_transition_id.clone(),
                 state: ClaimState::Active,
                 uid: Some(format!("uid-{}", resource.name)),
             })
@@ -159,18 +189,12 @@ fn request(previous: Option<GenerationPlan>, next: GenerationPlan) -> Deployment
     }
     let previous_allocation = previous
         .as_ref()
-        .map(|previous| allocation(previous, "old-transition"));
+        .map(|previous| allocation(previous, previous_sequence));
     let generation_history = GenerationHistory {
         domain_id: next.compiled.ir.domain.id.clone(),
         cluster_binding: next.compiled.ir.domain.cluster_binding.clone(),
-        revision: "history-7".into(),
-        active_generation_id: previous
-            .as_ref()
-            .map(|previous| previous.generation_id.clone()),
-        allocations: previous_allocation
-            .as_ref()
-            .map(|allocation| vec![allocation.clone()])
-            .unwrap_or_default(),
+        revision: "rv-7".into(),
+        active_allocation: previous_allocation.clone(),
     };
     let previous = previous
         .zip(previous_allocation)
@@ -182,12 +206,14 @@ fn request(previous: Option<GenerationPlan>, next: GenerationPlan) -> Deployment
             )))
         });
     DeploymentRequest {
-        transition_id: "transition-2".into(),
+        transition_id,
         previous,
         next,
         runtime_ceiling,
         cleanup_ceiling,
         registry: RegistrySnapshot {
+            registry_uid: REGISTRY_UID.into(),
+            next_sequence,
             revision: "rv-7".into(),
             claims,
             generation_history,
@@ -277,7 +303,7 @@ fn events(plan: &TransitionPlan) -> Vec<Event> {
         Event::Staged {
             event_id: "staged".into(),
             generation_id: plan.request.next.generation_id.clone(),
-            service_account_name: service_account_name(&plan.request.next).unwrap(),
+            service_account_name: plan.generation_reservation.service_account_name.clone(),
             registry_cas_receipt_digest: DIGEST.into(),
             verification_epoch: 0,
         },
@@ -348,16 +374,26 @@ fn interruption_after_every_phase_resumes_from_serialized_durable_state() {
 }
 
 #[test]
-fn rollback_reuses_build_only_with_new_generation_and_distinct_runtime_identity() {
+fn rollback_reuses_build_only_with_new_allocation_identity()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     let previous = generation("generation-1", &[("config", "orphan")]);
     let next = generation("generation-2", &[("config", "orphan")]);
     assert_eq!(previous.artifact_digest, next.artifact_digest);
+    let plan = plan_transition(&request(Some(previous), next))?;
+    let predecessor = plan.request.predecessor()?.ok_or("predecessor missing")?;
     assert_ne!(
-        service_account_name(&previous).unwrap(),
-        service_account_name(&next).unwrap()
+        predecessor.allocation.generation_id,
+        plan.generation_reservation.generation_id
     );
-    assert!(plan_transition(&request(Some(previous.clone()), next)).is_ok());
-    assert!(plan_transition(&request(Some(previous.clone()), previous)).is_err());
+    assert_ne!(
+        predecessor.allocation.service_account_name,
+        plan.generation_reservation.service_account_name
+    );
+    assert_eq!(
+        predecessor.allocation.artifact_digest,
+        plan.generation_reservation.artifact_digest
+    );
+    Ok(())
 }
 
 #[test]
@@ -718,76 +754,107 @@ fn cleaning_record(plan: &TransitionPlan) -> TransitionRecord {
 }
 
 #[test]
-fn historical_generation_and_runtime_identity_cannot_be_reallocated() {
-    let first = generation("generation-a", &[("config", "orphan")]);
-    let second = generation("generation-b", &[("config", "orphan")]);
-    let mut replay = request(Some(second.clone()), first.clone());
-    replay
-        .registry
-        .generation_history
-        .allocations
-        .insert(0, allocation(&first, "transition-a"));
+fn canonical_plan_replays_after_counter_advances_and_failed_identity_is_not_reused()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let first_request =
+        request_at_sequence(None, generation("ignored", &[("config", "orphan")]), 1);
+    let first = plan_transition(&first_request)?;
+    let first_names = allocation_names(REGISTRY_UID, 1)?;
     assert!(
-        plan_transition(&replay).is_err(),
-        "A -> B -> A must not reactivate A or its ServiceAccount"
+        allocation_names(REGISTRY_UID, 36)?
+            .generation_id
+            .ends_with("-10")
     );
-
-    let fresh = generation("generation-c", &[("config", "orphan")]);
-    let mut allowed = request(Some(second), fresh.clone());
-    allowed
-        .registry
-        .generation_history
-        .allocations
-        .insert(0, allocation(&first, "transition-a"));
-    let plan = plan_transition(&allowed).unwrap();
-    assert_eq!(plan.generation_reservation.generation_id, "generation-c");
     assert_eq!(
-        plan.generation_reservation.service_account_name,
-        service_account_name(&fresh).unwrap()
+        first.generation_reservation.generation_id,
+        first_names.generation_id
     );
-    allowed.registry.generation_history.allocations[0].service_account_name =
-        service_account_name(&fresh).unwrap();
-    assert!(
-        plan_transition(&allowed).is_err(),
-        "historical runtime identity collision must also be rejected"
+    assert_eq!(
+        first.generation_reservation.transition_id,
+        first_names.transition_id
     );
+    assert_eq!(
+        first.generation_reservation.service_account_name,
+        first_names.service_account_name
+    );
+
+    // Sequence one may fail before commit, but the protected counter still moves.
+    let retry_request =
+        request_at_sequence(None, generation("ignored", &[("config", "orphan")]), 2);
+    let retry = plan_transition(&retry_request)?;
+    assert_ne!(
+        first.generation_reservation.generation_id,
+        retry.generation_reservation.generation_id
+    );
+    assert_ne!(
+        first.generation_reservation.transition_id,
+        retry.generation_reservation.transition_id
+    );
+    assert_ne!(
+        first.generation_reservation.service_account_name,
+        retry.generation_reservation.service_account_name
+    );
+
+    // Advancing the external registry does not make the immutable first plan noncanonical.
+    begin(&first, "executor")?;
+    let mut reused = retry_request;
+    reused.next.generation_id = first.generation_reservation.generation_id;
+    assert!(plan_transition(&reused).is_err());
+    Ok(())
 }
 
 #[test]
-fn reinstall_after_uninstall_keeps_history_and_allocates_fresh_identities() {
-    let retired = generation("retired-generation", &[("config", "orphan")]);
-    let next = generation("new-installation", &[("config", "orphan")]);
-    let mut reinstall = request(None, next);
-    reinstall
-        .registry
-        .generation_history
-        .allocations
-        .push(allocation(&retired, "retired-transition"));
-    assert!(
-        reinstall
-            .registry
-            .generation_history
-            .active_generation_id
-            .is_none()
-    );
-    assert!(plan_transition(&reinstall).is_ok());
-    reinstall.next = retired;
-    assert!(
-        plan_transition(&reinstall).is_err(),
-        "uninstall must not erase historical allocation authority"
-    );
+fn malformed_registry_and_exhausted_counter_are_rejected()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let baseline = request_at_sequence(None, generation("ignored", &[]), 3);
+    plan_transition(&baseline)?;
+
+    let mut malformed = baseline.clone();
+    malformed.registry.registry_uid = "not-a-registry-uuid".into();
+    assert!(plan_transition(&malformed).is_err());
+    let mut numeric_counter = serde_json::to_value(&baseline)?;
+    numeric_counter
+        .get_mut("registry")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("registry encoding missing")?
+        .insert("nextSequence".into(), json!(3));
+    assert!(serde_json::from_value::<DeploymentRequest>(numeric_counter).is_err());
+    let mut missing_counter = serde_json::to_value(&baseline)?;
+    missing_counter
+        .get_mut("registry")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("registry encoding missing")?
+        .remove("nextSequence");
+    assert!(serde_json::from_value::<DeploymentRequest>(missing_counter).is_err());
+    let mut zero = baseline.clone();
+    zero.registry.next_sequence = 0;
+    assert!(plan_transition(&zero).is_err());
+    let mut exhausted = baseline;
+    exhausted.registry.next_sequence = u64::MAX;
+    let error = plan_transition(&exhausted)
+        .err()
+        .ok_or("exhausted allocation counter was accepted")?;
+    assert!(error.to_string().contains("exhausted"));
+    Ok(())
 }
 
 #[test]
-fn missing_mismatched_or_truncated_generation_history_is_rejected() {
+fn missing_mismatched_or_scoped_active_allocation_is_rejected()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     let previous = generation("generation-a", &[("config", "orphan")]);
     let next = generation("generation-b", &[("config", "orphan")]);
     let base = request(Some(previous), next);
+    plan_transition(&base)?;
     let mut missing = base.clone();
-    missing.registry.generation_history.allocations.clear();
+    missing.registry.generation_history.active_allocation = None;
     assert!(plan_transition(&missing).is_err());
     let mut reused_transition = base.clone();
-    reused_transition.transition_id = reused_transition.registry.generation_history.allocations[0]
+    reused_transition.transition_id = reused_transition
+        .registry
+        .generation_history
+        .active_allocation
+        .as_ref()
+        .ok_or("active allocation missing")?
         .transition_id
         .clone();
     assert!(
@@ -804,33 +871,40 @@ fn missing_mismatched_or_truncated_generation_history_is_rejected() {
     stale_previous
         .registry
         .generation_history
-        .active_generation_id = Some("different-active-generation".into());
+        .active_allocation
+        .as_mut()
+        .ok_or("active allocation missing")?
+        .artifact_digest =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
     assert!(
         plan_transition(&stale_previous).is_err(),
         "an approved historical build is not authority to ignore the active writer"
     );
-    let mut omitted = serde_json::to_value(&base).unwrap();
+    let mut wrong_incarnation = base.clone();
+    predecessor_mut(&mut wrong_incarnation)?
+        .allocation
+        .registry_uid = "22222222-2222-4222-8222-222222222222".into();
+    assert!(plan_transition(&wrong_incarnation).is_err());
+    let mut wrong_revision = base.clone();
+    wrong_revision.registry.generation_history.revision = "stale".into();
+    assert!(plan_transition(&wrong_revision).is_err());
+
+    let mut omitted = serde_json::to_value(&base)?;
     omitted["registry"]
         .as_object_mut()
-        .unwrap()
+        .ok_or("registry encoding missing")?
         .remove("generationHistory");
     assert!(serde_json::from_value::<DeploymentRequest>(omitted).is_err());
-    let mut missing_active = serde_json::to_value(&base).unwrap();
+    let mut missing_active = serde_json::to_value(&base)?;
     missing_active["registry"]["generationHistory"]
         .as_object_mut()
-        .unwrap()
-        .remove("activeGenerationId");
+        .ok_or("history encoding missing")?
+        .remove("activeAllocation");
     assert!(
         serde_json::from_value::<DeploymentRequest>(missing_active).is_err(),
         "an absent active pointer must not imply explicit uninstall authority"
     );
-    let mut duplicate = base;
-    duplicate
-        .registry
-        .generation_history
-        .allocations
-        .push(duplicate.registry.generation_history.allocations[0].clone());
-    assert!(plan_transition(&duplicate).is_err());
+    Ok(())
 }
 
 #[test]
@@ -1035,6 +1109,7 @@ fn block_and_resume_from_quiescence(plan: &TransitionPlan) -> TransitionRecord {
 #[test]
 fn cleanup_and_inventory_projection_exclude_resource_payloads() {
     let mut prior = generation("g1", &[("removed", "delete"), ("retained", "orphan")]);
+    prior.generation_id = fixture_names(1).0;
     prior.compiled.ir.resources[0].desired["data"]["value"] = json!("private-value-canary");
     for resource in &mut prior.compiled.ir.resources {
         resource.source.file = "private-path-canary.ts".into();
@@ -1161,9 +1236,12 @@ fn protected_metadata_commitment_excludes_desired_values_and_requires_legacy_rec
     upgrade
         .registry
         .generation_history
-        .allocations
-        .first_mut()
+        .active_allocation
+        .as_mut()
         .ok_or("allocation missing")?
+        .inventory_metadata_digest = None;
+    predecessor_mut(&mut upgrade)?
+        .allocation
         .inventory_metadata_digest = None;
     let error = plan_transition(&upgrade)
         .err()
@@ -1196,14 +1274,15 @@ fn protected_metadata_commitment_excludes_desired_values_and_requires_legacy_rec
 #[test]
 fn predecessor_metadata_rejects_forged_allocation_policy_uid_transition_and_membership()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let prior = generation("g1", &[("old", "orphan")]);
+    let mut prior = generation("g1", &[("old", "orphan")]);
+    prior.generation_id = fixture_names(1).0;
     let baseline = request(Some(prior.clone()), generation("g2", &[]));
     plan_transition(&baseline)?;
     let allocation = baseline
         .registry
         .generation_history
-        .allocations
-        .first()
+        .active_allocation
+        .as_ref()
         .ok_or("missing fixture allocation")?;
     assert_eq!(
         predecessor_metadata(&prior, allocation, &baseline.registry.claims)?,

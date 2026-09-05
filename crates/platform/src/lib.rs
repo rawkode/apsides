@@ -54,6 +54,29 @@ pub use termination::{
     ExpectedPod, ExpectedWriters, ProcessTerminationObservation, TERMINATION_FINALIZER,
 };
 
+/// Return the fixed, bounded name of the separately provisioned incarnation anchor.
+/// # Errors
+/// Rejects invalid or overlapping Kubernetes namespace scopes.
+pub fn registry_authority_name(
+    control_namespace: &str,
+    workload_namespace: &str,
+) -> Result<String> {
+    if !valid_namespace(control_namespace)
+        || !valid_namespace(workload_namespace)
+        || control_namespace == workload_namespace
+        || control_namespace == REGISTRY_AUTHORITY_NAMESPACE
+        || workload_namespace == REGISTRY_AUTHORITY_NAMESPACE
+    {
+        return Err(invalid("invalid registry authority scope"));
+    }
+    Ok(format!(
+        "reakt-registry-authority.{control_namespace}.{workload_namespace}"
+    ))
+}
+
+pub const REGISTRY_AUTHORITY_NAMESPACE: &str = "reakt-platform";
+pub const REGISTRY_SCHEMA_VERSION: &str = "reakt.dev/namespace-registry/v2";
+pub const REGISTRY_AUTHORITY_SCHEMA_VERSION: &str = "reakt.dev/registry-authority/v1";
 pub const SCHEMA_VERSION: &str = "reakt.dev/platform/v1";
 pub const MAX_STATE_BYTES: usize = 512 * 1024;
 
@@ -93,6 +116,10 @@ fn valid_digest(value: &str) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     })
+}
+
+fn valid_namespace(value: &str) -> bool {
+    value.len() <= 63 && !value.contains('.') && valid_name(value)
 }
 
 fn valid_name(value: &str) -> bool {
@@ -141,3 +168,28 @@ mod quiescence;
 mod retirement;
 #[cfg(feature = "deployer")]
 mod upgrade;
+
+#[cfg(test)]
+mod allocation_tests {
+    #[test]
+    fn authority_name_preserves_maximum_namespace_scopes() -> crate::Result<()> {
+        let control = "c".repeat(63);
+        let workload = "w".repeat(63);
+        let name = super::registry_authority_name(&control, &workload)?;
+        assert!(name.len() <= 253);
+        assert!(name.split('.').all(|label| label.len() <= 63));
+        assert_ne!(name, super::registry_authority_name(&workload, &control)?);
+        for invalid in [
+            "a.b",
+            "",
+            "-control",
+            "control-",
+            "Control",
+            &"c".repeat(64),
+        ] {
+            assert!(super::registry_authority_name(invalid, "workload").is_err());
+            assert!(super::registry_authority_name("control", invalid).is_err());
+        }
+        Ok(())
+    }
+}

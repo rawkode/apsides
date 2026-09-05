@@ -9,6 +9,7 @@ use inventory::{
 use serde_json::json;
 
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const REGISTRY_UID: &str = "11111111-1111-4111-8111-111111111111";
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -38,16 +39,18 @@ fn resource(name: &str) -> TrackedResource {
 fn snapshot() -> InventorySnapshot {
     InventorySnapshot {
         schema_version: INVENTORY_SCHEMA.into(),
-        generation: "generation-a".into(),
+        generation: "gceirceircfardairceirceirce-1".into(),
         resources: vec![resource("alpha")],
     }
 }
 
 fn allocation(metadata_digest: Option<String>) -> GenerationAllocation {
     GenerationAllocation {
-        generation_id: "generation-a".into(),
-        service_account_name: "example-generation-a".into(),
-        transition_id: "transition-a".into(),
+        registry_uid: REGISTRY_UID.into(),
+        sequence: 1,
+        generation_id: "gceirceircfardairceirceirce-1".into(),
+        service_account_name: "rceirceircfardairceirceirce-1".into(),
+        transition_id: "tceirceircfardairceirceirce-1".into(),
         artifact_digest: DIGEST.into(),
         ir_digest: DIGEST.into(),
         inventory_metadata_digest: metadata_digest,
@@ -182,9 +185,11 @@ fn invalid_inventory_cannot_be_committed() -> TestResult {
 #[test]
 fn legacy_allocation_decodes_but_requires_explicit_recovery() -> TestResult {
     let value = json!({
-        "generationId": "generation-a",
-        "serviceAccountName": "example-generation-a",
-        "transitionId": "transition-a",
+        "generationId": "gceirceircfardairceirceirce-1",
+        "registryUid": REGISTRY_UID,
+        "sequence": "1",
+        "serviceAccountName": "rceirceircfardairceirceirce-1",
+        "transitionId": "tceirceircfardairceirceirce-1",
         "artifactDigest": DIGEST,
         "irDigest": DIGEST
     });

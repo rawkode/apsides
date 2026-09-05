@@ -26,7 +26,7 @@ impl PlatformClient {
             .value
             .histories
             .get(domain)
-            .and_then(|history| history.active_generation_id.as_ref())
+            .and_then(|history| history.active_allocation.as_ref().map(|a| &a.generation_id))
             != Some(generation)
             || registry.value.transitions.values().any(|entry| {
                 entry.plan.request.next.compiled.ir.domain.id == domain
@@ -132,20 +132,14 @@ pub(crate) fn active_inventory_allocation<'a>(
         .histories
         .get(domain)
         .ok_or_else(|| invalid("active inventory history is missing"))?;
-    if history.domain_id != domain || history.active_generation_id.as_deref() != Some(generation) {
+    let allocation = history
+        .active_allocation
+        .as_ref()
+        .ok_or_else(|| invalid("active inventory allocation is missing"))?;
+    if history.domain_id != domain || allocation.generation_id != generation {
         return Err(invalid(
             "inventory generation differs from protected active history",
         ));
-    }
-    let mut matches = history
-        .allocations
-        .iter()
-        .filter(|entry| entry.generation_id == generation);
-    let allocation = matches
-        .next()
-        .ok_or_else(|| invalid("active inventory allocation is missing"))?;
-    if matches.next().is_some() {
-        return Err(invalid("active inventory allocation is ambiguous"));
     }
     Ok(allocation)
 }

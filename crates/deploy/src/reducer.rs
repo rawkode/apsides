@@ -14,12 +14,7 @@ fn reject(message: &str) -> Error {
 /// # Errors
 /// Fails if canonical generation identity serialization fails.
 pub fn service_account_name(generation: &GenerationPlan) -> Result<String> {
-    let hashed = digest(&generation.generation_id)?;
-    Ok(format!(
-        "reakt-{}-{}",
-        generation.compiled.ir.domain.id,
-        &hashed[7..23]
-    ))
+    crate::allocation::service_account_for_generation(&generation.generation_id)
 }
 
 fn initial(plan: &TransitionPlan, executor_id: &str) -> TransitionRecord {
@@ -83,8 +78,8 @@ pub fn verify_record(plan: &TransitionPlan, record: &TransitionRecord) -> Result
 }
 
 fn require_inventory_checkpoint(plan: &TransitionPlan) -> Result<()> {
-    if plan.schema_version != "reakt.dev/transition-plan/v3" {
-        return Err(reject("pre-v3 transition plan requires explicit recovery"));
+    if plan.schema_version != "reakt.dev/transition-plan/v4" {
+        return Err(reject("pre-v4 transition plan requires explicit recovery"));
     }
     if plan
         .generation_reservation

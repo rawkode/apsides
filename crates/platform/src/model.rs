@@ -141,12 +141,26 @@ impl StoredTransition {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NamespaceRegistry {
+    pub registry_uid: String,
+    #[serde(with = "deploy::allocation_counter")]
+    pub next_sequence: u64,
     pub schema_version: String,
     pub cluster_binding: String,
     pub workload_namespace: String,
     pub claims: Vec<ProtectedClaim>,
     pub histories: BTreeMap<String, GenerationHistory>,
     pub transitions: BTreeMap<String, StoredTransition>,
+}
+
+/// Separately provisioned registry incarnation authority; deployers can only read it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RegistryAuthority {
+    pub control_namespace: String,
+    pub schema_version: String,
+    pub registry_uid: String,
+    pub cluster_binding: String,
+    pub workload_namespace: String,
 }
 
 /// Domain key bytes deliberately have no Debug or Serialize implementation.

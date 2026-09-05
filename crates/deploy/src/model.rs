@@ -40,13 +40,15 @@ pub struct ProtectedClaim {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RegistrySnapshot {
+    pub registry_uid: String,
+    #[serde(with = "crate::allocation_counter")]
+    pub next_sequence: u64,
     pub revision: String,
     pub claims: Vec<ProtectedClaim>,
     pub generation_history: GenerationHistory,
 }
 
-/// Platform-owned, complete allocation history. Failed and retired allocations
-/// remain present permanently; current claims cannot replace this authority.
+/// Bounded platform-owned committed allocation for one domain.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GenerationHistory {
@@ -54,13 +56,15 @@ pub struct GenerationHistory {
     pub cluster_binding: String,
     pub revision: String,
     #[serde(deserialize_with = "Option::deserialize")]
-    pub active_generation_id: Option<String>,
-    pub allocations: Vec<GenerationAllocation>,
+    pub active_allocation: Option<GenerationAllocation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GenerationAllocation {
+    pub registry_uid: String,
+    #[serde(with = "crate::allocation_counter")]
+    pub sequence: u64,
     pub generation_id: String,
     pub service_account_name: String,
     pub transition_id: String,
