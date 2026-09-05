@@ -4,23 +4,19 @@ This directory is a self-contained [Astro Starlight](https://starlight.astro.bui
 existing files under `reakt/` are the detailed implementation and contract
 references; the other pages provide a guided path through them.
 
-Requires Node.js 22.12 or newer.
+Requires cuenv 0.55.0 and Node.js 22.12 or newer. Run these tasks from the repository root.
 
 ```sh
-cd docs
-npm ci
-npm run dev
+cuenv task docsDev
 ```
 
 Build the static site with:
 
 ```sh
-cd docs
-npm ci
-npm run build
+cuenv task docsBuild
 ```
 
-`npm run build` checks content schemas, writes the static site to `docs/dist/`,
+`cuenv task docsBuild` checks content schemas, writes the static site to `docs/dist/`,
 then validates every internal HTML target and fragment. Broken internal links
 fail the build.
 

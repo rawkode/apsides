@@ -8,8 +8,8 @@
   },
   "scripts": {
     "prepare:content": "node scripts/prepare-content.mjs",
-    "dev": "npm run prepare:content && astro dev",
-    "build": "npm run prepare:content && astro check && astro build && node scripts/check-links.mjs",
+    "dev": "astro dev",
+    "build": "astro check && astro build && node scripts/check-links.mjs",
     "preview": "astro preview"
   },
   "devDependencies": {

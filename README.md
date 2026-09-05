@@ -53,3 +53,22 @@ The [toolchain choices](docs/reakt/TOOLCHAIN.md) explain the Oxc/Deno and OSS in
 The [migration status](docs/reakt/STATUS.md) distinguishes implemented behavior, observed verification, and outstanding release gates. Full Kubernetes authorization, workload readiness, deployment recovery, and enforced offline execution require their own evidence.
 
 The previous implementation and its historical commands remain documented in [the legacy POC notes](docs/reakt/LEGACY-POC.md). Existing API group names and persisted formats are not silently rewritten; migration of installed controllers requires the explicit lifecycle protocol.
+
+## Development tasks
+
+Use cuenv 0.55.0 with the pinned schema in `cue.mod/module.cue`:
+
+```sh
+cuenv task generate        # ABI bindings, JSON schemas and CRDs
+cuenv task build           # Generate prerequisites and build the CLI
+cuenv task test-generated  # Regenerate and test the contracts
+cuenv task sdk-check       # Install dependencies, generate and typecheck SDK
+cuenv task legacy-example  # Generate prerequisites and run the legacy example
+cuenv task docsDev         # Prepare and serve Astro documentation
+cuenv task docsBuild       # Prepare, check and build the documentation
+```
+
+Generated code and schemas are ignored and must never be committed. Run
+`cuenv task generate` before invoking lower-level Cargo, SDK or legacy deployment
+commands directly from a fresh checkout. Commit canonical sources, generators
+and dependency lockfiles. The docs content mirror and static output are also ignored.

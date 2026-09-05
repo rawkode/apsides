@@ -8,3 +8,14 @@
 __pycache__/
 *.pyc
 /.pnpm-store/
+
+# Recreated by cuenv task generate; commit sources and generators only.
+/abi/renderer/v0/*.schema.json
+/abi/renderer/v0/*.generated.ts
+/abi/bundle/v0/*.schema.json
+/abi/bundle/v0/*.generated.ts
+/abi/renderer-protocol/v0/*.schema.json
+/abi/renderer-protocol/v0/*.generated.ts
+/packages/sdk/src/generated/
+/probes/conditional-mutation/v0/probe.schema.json
+/deploy/crds/oxideloop-crds.yaml
