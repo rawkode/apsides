@@ -42,6 +42,8 @@ impl PlatformClient {
             namespace: self.workload_namespace.clone(),
             controller: domain.into(),
         };
+        let allocation = active_inventory_allocation(&registry.value, domain, generation)?;
+        deploy::validate_inventory_checkpoint(&scope, &expected_head.snapshot, allocation)?;
         let current_head = store
             .load(&scope)
             .await?
@@ -49,7 +51,12 @@ impl PlatformClient {
         if &current_head != expected_head {
             return Err(invalid("inventory changed after UID capture"));
         }
-        let snapshot = complete_uids(&scope, &current_head.snapshot, &registry.value.claims)?;
+        let snapshot = complete_uids(
+            &scope,
+            &current_head.snapshot,
+            &registry.value.claims,
+            &allocation.transition_id,
+        )?;
         self.recheck_inventory_registry(&registry).await?;
         let published = store
             .publish(&scope, Some(&current_head.revision), &snapshot)
@@ -63,6 +70,7 @@ fn complete_uids(
     scope: &InventoryScope,
     snapshot: &InventorySnapshot,
     claims: &[ProtectedClaim],
+    transition_id: &str,
 ) -> Result<InventorySnapshot> {
     snapshot
         .encode(scope)
@@ -74,6 +82,7 @@ fn complete_uids(
     {
         if claim.state != ClaimState::Active
             || claim.generation_id != snapshot.generation
+            || claim.transition_id != transition_id
             || active
                 .insert(
                     inventory::ResourceKey {
@@ -111,4 +120,32 @@ fn complete_uids(
     next.encode(scope)
         .map_err(|_| invalid("invalid captured UID metadata"))?;
     Ok(next)
+}
+
+/// Resolve one protected active allocation without historical plan lookup.
+pub(crate) fn active_inventory_allocation<'a>(
+    registry: &'a NamespaceRegistry,
+    domain: &str,
+    generation: &str,
+) -> Result<&'a deploy::GenerationAllocation> {
+    let history = registry
+        .histories
+        .get(domain)
+        .ok_or_else(|| invalid("active inventory history is missing"))?;
+    if history.domain_id != domain || history.active_generation_id.as_deref() != Some(generation) {
+        return Err(invalid(
+            "inventory generation differs from protected active history",
+        ));
+    }
+    let mut matches = history
+        .allocations
+        .iter()
+        .filter(|entry| entry.generation_id == generation);
+    let allocation = matches
+        .next()
+        .ok_or_else(|| invalid("active inventory allocation is missing"))?;
+    if matches.next().is_some() {
+        return Err(invalid("active inventory allocation is ambiguous"));
+    }
+    Ok(allocation)
 }

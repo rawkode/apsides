@@ -42,6 +42,7 @@ fn initial(plan: &TransitionPlan, executor_id: &str) -> TransitionRecord {
 /// # Errors
 /// Rejects a forged plan or invalid executor identity.
 pub fn begin(plan: &TransitionPlan, executor_id: &str) -> Result<TransitionRecord> {
+    require_inventory_checkpoint(plan)?;
     if !valid_id(executor_id) || plan_transition(&plan.request)? != *plan {
         return Err(reject("invalid executor or noncanonical transition plan"));
     }
@@ -52,6 +53,7 @@ pub fn begin(plan: &TransitionPlan, executor_id: &str) -> Result<TransitionRecor
 /// # Errors
 /// Rejects altered plans, forged phases, invalid receipts, or oversized records.
 pub fn verify_record(plan: &TransitionPlan, record: &TransitionRecord) -> Result<()> {
+    require_inventory_checkpoint(plan)?;
     if compiler_core::canonical_bytes(record)?.len() > 1024 * 1024 {
         return Err(reject(
             "transition record exceeds the 1 MiB control-state budget",
@@ -75,6 +77,19 @@ pub fn verify_record(plan: &TransitionPlan, record: &TransitionRecord) -> Result
     if reconstructed != *record {
         return Err(reject(
             "record phase/revision does not match its durable event history",
+        ));
+    }
+    Ok(())
+}
+
+fn require_inventory_checkpoint(plan: &TransitionPlan) -> Result<()> {
+    if plan
+        .generation_reservation
+        .inventory_metadata_digest
+        .is_none()
+    {
+        return Err(reject(
+            "legacy transition lacks a protected inventory checkpoint; explicit recovery is required",
         ));
     }
     Ok(())

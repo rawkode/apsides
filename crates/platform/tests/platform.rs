@@ -1643,3 +1643,105 @@ async fn captured_uid_publication_rejects_known_uid_change_without_overwrite()
     assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 1);
     Ok(())
 }
+
+#[cfg(feature = "deployer")]
+#[tokio::test]
+async fn inventory_checkpoint_rejects_tampered_policy_and_legacy_authority_before_capture()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    use inventory::{InventoryStore, LibsqlInventory};
+    for corruption in ["policy", "legacy", "duplicate-allocation"] {
+        let directory = tempfile::tempdir()?;
+        let store = LibsqlInventory::open_local(&directory.path().join("inventory.db")).await?;
+        let mut registry = staged_upgrade_fixture();
+        registry.transitions.remove("transition-b");
+        let (scope, mut snapshot) = deploy::generation_inventory(
+            &registry.transition("transition-a")?.plan.request.next,
+            &registry.claims,
+        )?;
+        if corruption == "policy" {
+            let resource = snapshot.resources.first_mut().ok_or("resource missing")?;
+            resource.deletion_policy = match resource.deletion_policy {
+                compiler_core::DeletionPolicy::Delete => compiler_core::DeletionPolicy::Orphan,
+                compiler_core::DeletionPolicy::Orphan => compiler_core::DeletionPolicy::Delete,
+            };
+        } else {
+            let history = registry
+                .histories
+                .get_mut("example")
+                .ok_or("history missing")?;
+            let allocation = history
+                .allocations
+                .iter_mut()
+                .find(|entry| entry.generation_id == snapshot.generation)
+                .ok_or("allocation missing")?;
+            if corruption == "legacy" {
+                allocation.inventory_metadata_digest = None;
+            } else {
+                let duplicate = allocation.clone();
+                history.allocations.push(duplicate);
+            }
+        }
+        let head = store.publish(&scope, None, &snapshot).await?;
+        let captured = Versioned {
+            value: registry.clone(),
+            uid: "registry-uid".into(),
+            resource_version: "42".into(),
+        };
+        let control = object("reakt-registry-workload", &registry, "registry-uid", "42");
+        let (client, calls) = wire(vec![control.clone()]);
+        assert!(
+            PlatformClient::new(client, "control", "workload", "cluster-a")?
+                .capture_active_claim_uids("example", &snapshot)
+                .await
+                .is_err(),
+            "{corruption}"
+        );
+        assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 1);
+        let (client, calls) = wire(vec![control]);
+        assert!(
+            PlatformClient::new(client, "control", "workload", "cluster-a")?
+                .publish_captured_inventory(&store, "example", &captured, &head)
+                .await
+                .is_err(),
+            "{corruption}"
+        );
+        assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 1);
+        assert_eq!(store.load(&scope).await?, Some(head));
+    }
+
+    let directory = tempfile::tempdir()?;
+    let store = LibsqlInventory::open_local(&directory.path().join("inventory.db")).await?;
+    let mut registry = staged_upgrade_fixture();
+    registry.transitions.remove("transition-b");
+    let (scope, snapshot) = deploy::generation_inventory(
+        &registry.transition("transition-a")?.plan.request.next,
+        &registry.claims,
+    )?;
+    let head = store.publish(&scope, None, &snapshot).await?;
+    registry
+        .claims
+        .first_mut()
+        .ok_or("claim missing")?
+        .transition_id = "wrong-transition".into();
+    let captured = Versioned {
+        value: registry.clone(),
+        uid: "registry-uid".into(),
+        resource_version: "42".into(),
+    };
+    let (client, calls) = wire(vec![object(
+        "reakt-registry-workload",
+        &registry,
+        "registry-uid",
+        "42",
+    )]);
+    assert!(
+        PlatformClient::new(client, "control", "workload", "cluster-a")?
+            .publish_captured_inventory(&store, "example", &captured, &head)
+            .await
+            .is_err(),
+        "claim from another transition must not complete inventory UIDs"
+    );
+    assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 1);
+    assert_eq!(store.load(&scope).await?, Some(head));
+    Ok(())
+}

@@ -102,12 +102,14 @@ fn valid_request(request: &DeploymentRequest) -> Result<()> {
 }
 
 fn allocation(generation: &GenerationPlan, transition_id: &str) -> Result<GenerationAllocation> {
+    let (scope, snapshot) = crate::generation_inventory(generation, &[])?;
     Ok(GenerationAllocation {
         generation_id: generation.generation_id.clone(),
         service_account_name: service_account_name(generation)?,
         transition_id: transition_id.into(),
         artifact_digest: generation.artifact_digest.clone(),
         ir_digest: generation.compiled.ir_digest.clone(),
+        inventory_metadata_digest: Some(crate::inventory_metadata_digest(&scope, &snapshot)?),
     })
 }
 
@@ -145,6 +147,10 @@ fn validate_generation_history(request: &DeploymentRequest) -> Result<()> {
             || !valid_id(&entry.service_account_name)
             || !valid_digest(&entry.artifact_digest)
             || !valid_digest(&entry.ir_digest)
+            || entry
+                .inventory_metadata_digest
+                .as_ref()
+                .is_some_and(|value| !valid_digest(value))
             || !ids.insert(&entry.generation_id)
             || !accounts.insert(&entry.service_account_name)
             || !transitions.insert(&entry.transition_id)
@@ -168,6 +174,8 @@ fn validate_generation_history(request: &DeploymentRequest) -> Result<()> {
             .ok_or_else(|| {
                 Error::Plan("prior generation is absent from protected generation history".into())
             })?;
+        let (scope, snapshot) = crate::generation_inventory(previous, &request.registry.claims)?;
+        crate::validate_inventory_checkpoint(&scope, &snapshot, entry)?;
         if entry.artifact_digest != previous.artifact_digest
             || entry.ir_digest != previous.compiled.ir_digest
             || entry.service_account_name != service_account_name(previous)?

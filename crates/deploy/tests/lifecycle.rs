@@ -119,6 +119,9 @@ fn allocation(generation: &GenerationPlan, transition_id: &str) -> GenerationAll
         transition_id: transition_id.into(),
         artifact_digest: generation.artifact_digest.clone(),
         ir_digest: generation.compiled.ir_digest.clone(),
+        inventory_metadata_digest: generation_inventory(generation, &[])
+            .and_then(|(scope, snapshot)| inventory_metadata_digest(&scope, &snapshot))
+            .ok(),
     }
 }
 
@@ -1038,5 +1041,63 @@ fn persisted_inventory_must_match_approved_resource_metadata()
     resource.identity.name = "extra".into();
     extra.resources.push(resource);
     assert!(validate_transition_inventory(&upgrade, Some(&extra)).is_err());
+    Ok(())
+}
+
+#[test]
+fn protected_metadata_commitment_excludes_desired_values_and_requires_legacy_recovery()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let original = generation("g1", &[("config", "delete")]);
+    let original_plan = plan_transition(&request(None, original.clone()))?;
+    let mut changed_ir = original.compiled.ir.clone();
+    changed_ir
+        .resources
+        .first_mut()
+        .ok_or("resource missing")?
+        .desired["data"] =
+        serde_json::json!({"private-value-canary": "not-part-of-inventory-commitment"});
+    let changed = GenerationPlan {
+        compiled: compiler_core::validate(&changed_ir)?,
+        ..original.clone()
+    };
+    assert_ne!(original.compiled.ir_digest, changed.compiled.ir_digest);
+    let changed_plan = plan_transition(&request(None, changed))?;
+    assert!(
+        original_plan
+            .generation_reservation
+            .inventory_metadata_digest
+            .is_some()
+    );
+    assert_eq!(
+        original_plan
+            .generation_reservation
+            .inventory_metadata_digest,
+        changed_plan
+            .generation_reservation
+            .inventory_metadata_digest
+    );
+    let mut upgrade = request(Some(original), generation("g2", &[]));
+    upgrade
+        .registry
+        .generation_history
+        .allocations
+        .first_mut()
+        .ok_or("allocation missing")?
+        .inventory_metadata_digest = None;
+    let error = plan_transition(&upgrade)
+        .err()
+        .ok_or("legacy upgrade unexpectedly accepted")?;
+    assert!(error.to_string().contains("explicit recovery"));
+
+    let record = begin(&original_plan, "executor")?;
+    let mut legacy_plan = original_plan;
+    legacy_plan.generation_reservation.inventory_metadata_digest = None;
+    for outcome in [
+        begin(&legacy_plan, "executor").map(|_| ()),
+        verify_record(&legacy_plan, &record),
+    ] {
+        let error = outcome.err().ok_or("legacy transition accepted")?;
+        assert!(error.to_string().contains("explicit recovery"));
+    }
     Ok(())
 }

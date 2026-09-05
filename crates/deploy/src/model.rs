@@ -66,6 +66,10 @@ pub struct GenerationAllocation {
     pub transition_id: String,
     pub artifact_digest: String,
     pub ir_digest: String,
+    /// Protected commitment to approved identity/lifecycle metadata, never values.
+    /// Missing on legacy allocations; it cannot be inferred as upgrade authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_metadata_digest: Option<String>,
 }
 
 /// Runtime-written information is diagnostic input only. It does not grant

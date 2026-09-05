@@ -13,7 +13,10 @@
 //! Pure provider-neutral deployment planning. Kubernetes execution and evidence
 //! verification are deliberately outside this model's authority.
 mod inventory;
-pub use inventory::{generation_inventory, validate_transition_inventory};
+pub use inventory::{
+    generation_inventory, inventory_metadata_digest, validate_inventory_checkpoint,
+    validate_transition_inventory,
+};
 mod model;
 mod ownership;
 mod planner;

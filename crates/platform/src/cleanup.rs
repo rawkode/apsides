@@ -50,6 +50,12 @@ impl PlatformClient {
             namespace: self.workload_namespace.clone(),
             controller: domain_id.into(),
         };
+        let allocation = crate::inventory_capture::active_inventory_allocation(
+            &current.value,
+            domain_id,
+            generation,
+        )?;
+        deploy::validate_inventory_checkpoint(&scope, inventory, allocation)?;
         validate_active_inventory(&scope, inventory, generation, &current.value.claims)?;
         let mut next = current.value.clone();
         for resource in &inventory.resources {

@@ -70,6 +70,11 @@ impl PlatformClient {
             ));
         }
         let (scope, snapshot) = generation_inventory(generation, &registry.value.claims)?;
+        deploy::validate_inventory_checkpoint(
+            &scope,
+            &snapshot,
+            &stored.plan.generation_reservation,
+        )?;
         let previous = store.load(&scope).await?;
         if previous
             .as_ref()

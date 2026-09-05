@@ -24,4 +24,14 @@ CI supplies the new compiled controller and updates its Roles, RoleBindings and 
 
 Exercise omitted-resource delete and orphan policy, retained resources, replacement UIDs, finalizer-delayed cleanup, concurrent deployers, interruption across each storage/Kubernetes boundary, idempotent recovery and revoked old writers. Prove that more than one MiB of resource tracking and repeated upgrades do not enlarge a Kubernetes object without bound. Scan persisted inventory for private-value canaries and their hashes. Verify local persistent libSQL and a TLS Turso primary separately.
 
-The current executor still serializes full transition plans in ConfigMaps. This document does not claim that migration is complete. Independent architecture and final adversarial review remain unavailable due to the configured agents' account usage limit.
+The current executor still serializes full transition plans in ConfigMaps. This document does not claim that migration is complete.
+
+## Protected inventory checkpoint
+
+Each new generation allocation commits to a versioned digest of the approved inventory metadata and its cluster, namespace and controller scope. The digest covers resource membership, API identity, kind, generation and deletion policy. It excludes UIDs, which are captured later against protected ownership claims, and never includes desired values or source. Completing UIDs therefore preserves the allocation commitment.
+
+Planning, live UID capture and inventory publication verify this checkpoint. Captured UID publication also binds claims to the allocation's transition. Altering persisted delete/orphan policy cannot authorize cleanup.
+
+This is a compatibility boundary for pre-checkpoint POC state. Legacy allocations and registry JSON still deserialize, but legacy transitions cannot begin, resume, replay or republish committed inventory. A missing checkpoint rejects transition verification or upgrade authority with an explicit recovery error. There is no automatic legacy recovery implemented; do not treat this build as a seamless upgrade for an existing pre-checkpoint deployment. New transitions retain canonical replay and inventory publication coverage.
+
+An independent architecture and implementation review passed for this prerequisite. It does not remove the old compiled-plan dependency: predecessor representation, historical writer retirement, registry compaction and live persistent-backend acceptance remain required.

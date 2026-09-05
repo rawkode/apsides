@@ -85,3 +85,53 @@ pub fn validate_transition_inventory(
         )),
     }
 }
+
+/// Commit only to approved inventory metadata. UIDs are captured later and are
+/// authenticated separately against protected claims; their completion must not
+/// change this immutable allocation commitment.
+/// # Errors
+/// Rejects malformed, unsorted or foreign-scope tracking metadata.
+pub fn inventory_metadata_digest(
+    scope: &InventoryScope,
+    snapshot: &InventorySnapshot,
+) -> Result<String> {
+    snapshot
+        .encode(scope)
+        .map_err(|_| Error::Plan("invalid inventory checkpoint metadata".into()))?;
+    let mut metadata = snapshot.clone();
+    for resource in &mut metadata.resources {
+        resource.uid = None;
+    }
+    Ok(compiler_core::digest(&serde_json::json!({
+        "schemaVersion": "reakt.dev/inventory-metadata-checkpoint/v1",
+        "scope": scope,
+        "snapshot": metadata,
+    }))?)
+}
+
+/// Verify metadata against protected allocation authority without any compiled
+/// predecessor, manifest or source. This does not validate live UID ownership.
+/// # Errors
+/// Rejects missing legacy checkpoints and changed generation or metadata.
+pub fn validate_inventory_checkpoint(
+    scope: &InventoryScope,
+    snapshot: &InventorySnapshot,
+    allocation: &crate::GenerationAllocation,
+) -> Result<()> {
+    let expected = allocation
+        .inventory_metadata_digest
+        .as_ref()
+        .ok_or_else(|| {
+            Error::Plan(
+                "protected inventory checkpoint is missing; explicit recovery is required".into(),
+            )
+        })?;
+    if snapshot.generation != allocation.generation_id
+        || &inventory_metadata_digest(scope, snapshot)? != expected
+    {
+        return Err(Error::Plan(
+            "inventory metadata differs from its protected allocation".into(),
+        ));
+    }
+    Ok(())
+}
