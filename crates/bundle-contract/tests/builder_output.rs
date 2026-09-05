@@ -1,7 +1,7 @@
 use std::{env, fs, path::Path};
 
-use oxideloop_bundle_contract::{BundleStore, ExecutionPhaseV0, parse_validate_manifest};
-use oxideloop_renderer_abi::sha256_hex;
+use bundle_contract::{BundleStore, ExecutionPhaseV0, parse_validate_manifest};
+use renderer_abi::sha256_hex;
 use renderer_host::{Invocation, Limits, RendererHost};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -89,7 +89,7 @@ fn builder_output_installs_and_opens_by_its_raw_manifest_digest() {
     );
     assert_eq!(
         automation.source_dependency,
-        oxideloop_renderer_abi::model::Dependency::Object {
+        renderer_abi::model::Dependency::Object {
             api_version: "v1".into(),
             kind: "ConfigMap".into(),
             namespace: "demo".into(),

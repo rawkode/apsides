@@ -5,11 +5,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use oxideloop_renderer_protocol::{
+use renderer_client::{RendererClient, RendererClientError};
+use renderer_protocol::{
     ErrorCategoryV0, FrameV0, PhaseV0, RequestIdV0, RequestV0, ResponseStatusV0, ResponseV0,
     read_frame, write_frame,
 };
-use renderer_client::{RendererClient, RendererClientError};
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
 

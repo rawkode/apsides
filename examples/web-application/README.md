@@ -1,139 +1,102 @@
 # WebApplication example
 
-This example is a complete TypeScript-authored Kubernetes controller. Its
-single source file is
+The application controller is authored in React-style TypeScript at
 [`packages/example-bundle/src/controller.tsx`](../../packages/example-bundle/src/controller.tsx).
-That exact file is compiled by the bundle builder and exercised by the example
-tests.
+It declares the nginx Deployment and Service, renders a ConfigMap, watches a
+second ConfigMap with `useResource`, enriches every object, and runs an
+event-driven automation when the watched data changes.
 
-The controller declares:
+`oxideloop build` compiles that TSX to OxideLoop's deterministic intermediate
+representation, embeds the IR archive in a Rust controller image, saves that
+image locally, and writes a build receipt. `oxideloop deploy` creates or reuses
+the explicitly named kind cluster, loads the exact saved image, installs the
+CRDs and namespaced controller, creates the root `WebApplication`, and waits
+for the generated workload to be ready. The cluster does not contain a bundle
+ConfigMap; the controller image is the program artifact.
 
-- a ConfigMap, Deployment, and optional Service;
-- enrichment defaults shared by all three resources;
-- a watched `demo-input` ConfigMap through `useResource`;
-- a dependency-driven rerender of `root-config.data.message`; and
-- one `configuration-changed` automation that emits a Kubernetes
-  `ConfigurationChanged` Event for each observed source transition.
+## Run the example
 
-Run the commands below from the repository root.
-
-## Run the short live demo
-
-The presenter-friendly demo creates a fresh kind cluster, compiles this exact
-TSX controller, installs the Rust controller and isolated renderer, and shows
-the three rendered resources. It then creates and changes a watched ConfigMap
-so you can see both the hook-driven rerender and the resulting Kubernetes
-Event automation.
-
-Prerequisites are a running Docker-compatible daemon plus `kind`, `kubectl`,
-`jq`, `pnpm`, `rg`, and `shasum`.
+From the repository root, with Docker running and `kind`, `kubectl`, `pnpm`,
+and the Rust toolchain installed:
 
 ```sh
-examples/web-application/deploy.sh
+cargo build --locked -p legacy-cli
+
+target/debug/oxideloop build \
+  --source packages/example-bundle/src \
+  --image oxideloop-example-controller \
+  --output work/example
+
+target/debug/oxideloop deploy \
+  --build work/example/receipt.json \
+  --kind-cluster oxideloop-example \
+  --namespace oxideloop-example \
+  --root-name root \
+  --workload-image nginxinc/nginx-unprivileged:alpine
 ```
 
-The cluster is deleted when the script finishes. Useful presentation options
-are:
+The short version runs those same commands and prints the resulting resources:
 
 ```sh
-# Pause between each visible step. The authored TSX is printed by default.
-DEMO_PAUSE=1 examples/web-application/deploy.sh
-
-# Skip printing the authored TSX.
-SHOW_SOURCE=0 examples/web-application/deploy.sh
-
-# Leave the cluster running for exploration after the demo.
-KEEP_CLUSTER=1 examples/web-application/deploy.sh
+make example
 ```
 
-This is the happy-path demo, not the exhaustive acceptance suite. It skips
-collision injection, crash recovery, pruning, and artifact-integrity checks;
-those remain in `run-kind-e2e.sh` below.
-
-## Check and compile the controller
-
-Install the pinned workspace dependencies, typecheck the exact source, run its
-local render checks, and build the immutable bundle consumed by the Rust
-controller:
+In another terminal, expose the generated web Service:
 
 ```sh
-pnpm install --frozen-lockfile
-pnpm --filter @oxideloop/example-bundle typecheck
-pnpm --filter @oxideloop/example-bundle test
-mkdir -p work/example
-pnpm bundle:e2e -- \
-  --out work/example/bundle.archive \
-  --metadata work/example/bundle-metadata.json
+make example-forward
 ```
 
-Inspect the bundle identity with:
+Then open <http://localhost:8080>. The page is served by the workload declared
+by `controller.tsx`, not by the OxideLoop controller pod.
+
+## Exercise the hooks
+
+Create the ConfigMap watched by `useResource` and wait for the rendered output
+to change:
 
 ```sh
-jq '{
-  authoredSource: .buildBundle.authoredSource,
-  bundleDigest: .buildBundle.bundleDigest,
-  action: .buildBundle.actionModule,
-  render: .buildBundle.renderModule
-}' work/example/bundle-metadata.json
+kubectl --context kind-oxideloop-example --namespace oxideloop-example \
+  create configmap demo-input --from-literal=message=vanilla
+
+kubectl --context kind-oxideloop-example --namespace oxideloop-example \
+  wait --for='jsonpath={.data.message}=vanilla' configmap/root-config \
+  --timeout=180s
+
+STATE=$(kubectl --context kind-oxideloop-example --namespace oxideloop-example \
+  get webapplication/root -o jsonpath='{.status.state.name}')
+
+kubectl --context kind-oxideloop-example --namespace oxideloop-example \
+  wait --for='jsonpath={.spec.state.automation.baselines[0].automationId}=configuration-changed' \
+  "oxideloopstate/$STATE" --timeout=180s
 ```
 
-## Run the complete example on a fresh kind cluster
-
-Prerequisites are a running Docker-compatible daemon plus `git`, `kind`,
-`kubectl`, `jq`, `pnpm`, Rust, and Cargo. The acceptance runner intentionally
-requires a clean committed checkout so every captured result names the exact
-source revision it exercised.
+Change the watched value:
 
 ```sh
-test -z "$(git status --porcelain --untracked-files=all)"
+kubectl --context kind-oxideloop-example --namespace oxideloop-example \
+  patch configmap/demo-input --type=merge \
+  --patch='{"data":{"message":"chocolate"}}'
 
-RUN_ID="web-example-$(date -u +%Y%m%dt%H%M%Sz)-$$" \
-  examples/web-application/run-kind-e2e.sh
+kubectl --context kind-oxideloop-example --namespace oxideloop-example \
+  wait --for='jsonpath={.data.message}=chocolate' configmap/root-config \
+  --timeout=180s
+
+make example-status
 ```
 
-The wrapper calls the repository's authoritative lifecycle runner. It creates
-a disposable cluster, builds and loads the controller and isolated renderer
-images, compiles and publishes the exact TSX bundle, installs OxideLoop, and
-applies a `WebApplication`. A successful run verifies:
+The status output includes the rendered message, successful `AutomationRun`,
+and `ConfigurationChanged` Kubernetes Event.
 
-1. ConfigMap, Deployment, and Service creation with exact root ownership and
-   durable inventory entries.
-2. Server-side apply ownership and stable child UIDs across reconciliation.
-3. An initial dependency baseline without an Event, followed by exactly one
-   correlated `AutomationRun` and Event for each `demo-input.data.message`
-   transition.
-4. Recovery across controller restarts without recreating managed resources or
-   duplicating completed automations.
-5. Service pruning when `spec.expose` becomes false while the ConfigMap and
-   Deployment remain.
-6. Cleanup of managed resources, automation state, and Events when the root is
-   deleted.
+Re-running `oxideloop deploy` with the same receipt is an exact, write-free
+resume. It refuses fixed-name objects that do not match that receipt instead of
+adopting or overwriting them.
 
-The runner also exercises the repository's guarded foreign-name collision and
-durability boundaries. Those checks are part of the same lifecycle proof; no
-second example implementation is maintained here.
-
-## Inspect evidence
-
-Every run writes an ignored evidence directory at
-`work/kind-e2e/<RUN_ID>/`. After the command finishes, inspect its summary:
+Remove the disposable cluster when finished:
 
 ```sh
-jq '{status,sourceRevision,mode,clusterDisposition,failureReason}' \
-  work/kind-e2e/<RUN_ID>/result.json
+make example-clean
 ```
 
-Success requires `status: "passed"` and `clusterDisposition: "deleted"`.
-`reproducibility.json` records the source revision, bundle digest, kind node
-image, and loaded controller/renderer image identities. The artifact inventory
-contains hashes for the captured Kubernetes objects and logs.
-
-Set `KEEP_CLUSTER=1` only while diagnosing a failure. You are then responsible
-for deleting the exact cluster printed by the runner.
-
-## Compatibility boundary
-
-This repository is still pre-release. The example's `WebApplication` requires
-`spec.image`; legacy `spec.message` is accepted only as an optional compatibility
-field. The generated CRD change is intended for a fresh cluster and is not a
-supported in-place upgrade from an older message-only installation.
+For the exhaustive crash, recovery, pruning, and ownership suite, use
+`scripts/run-kind-e2e.sh`.

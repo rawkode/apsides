@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
-use oxideloop_renderer_abi::{canonical_bytes, parse_strict_value, sha256_hex};
+use renderer_abi::{canonical_bytes, parse_strict_value, sha256_hex};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -147,7 +147,7 @@ pub fn validate_descriptor(
 ) -> Result<(), BundleError> {
     if descriptor.descriptor_version != DESCRIPTOR_VERSION_V0
         || descriptor.renderer_abi_version != manifest.renderer_abi_version
-        || descriptor.renderer_abi_version != oxideloop_renderer_abi::model::ABI_VERSION_V0
+        || descriptor.renderer_abi_version != renderer_abi::model::ABI_VERSION_V0
         || descriptor.action_modules.is_empty()
         || descriptor.action_modules.len() > MAX_DESCRIPTOR_MODULES
     {
@@ -195,7 +195,7 @@ pub fn validate_descriptor(
 /// declarations, digest format failures, or invalid phase mappings.
 pub fn validate_manifest(manifest: &BundleIntegrityManifestV0) -> Result<(), BundleError> {
     if manifest.manifest_version != BUNDLE_MANIFEST_VERSION_V0
-        || manifest.renderer_abi_version != oxideloop_renderer_abi::model::ABI_VERSION_V0
+        || manifest.renderer_abi_version != renderer_abi::model::ABI_VERSION_V0
         || blank(&manifest.compiler.identity)
         || blank(&manifest.compiler.version)
         || blank(&manifest.bundler.identity)
@@ -813,7 +813,7 @@ fn load_record(directory: &Dir) -> Result<BundleInstallRecordV0, BundleError> {
     if bytes.len() > MAX_INSTALL_RECORD_BYTES {
         return Err(BundleError::Limit);
     }
-    let value: Value = oxideloop_renderer_abi::parse_strict_value(
+    let value: Value = renderer_abi::parse_strict_value(
         std::str::from_utf8(&bytes).map_err(|_| BundleError::InvalidManifest)?,
     )
     .map_err(|_| BundleError::InvalidManifest)?;

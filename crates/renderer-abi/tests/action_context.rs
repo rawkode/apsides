@@ -1,4 +1,4 @@
-use oxideloop_renderer_abi::{
+use renderer_abi::{
     ACTION_CONTEXT_KEY_V1, AbiError, action_context_source_matches, action_context_v1,
     canonical_bytes, parse_validate_action_input,
 };

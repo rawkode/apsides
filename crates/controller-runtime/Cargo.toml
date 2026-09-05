@@ -1,5 +1,5 @@
 [package]
-name = "oxideloop-controller-runtime"
+name = "controller-runtime"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ publish = false
 
 [features]
 default = []
-test-failpoints = ["dep:rustix", "oxideloop-kube-transport/bootstrap-diagnostics"]
+test-failpoints = ["dep:rustix", "kube-transport/bootstrap-diagnostics"]
 
 [[bin]]
 name = "oxideloop-e2e-failpoint-control"
@@ -17,16 +17,16 @@ path = "src/bin/oxideloop-e2e-failpoint-control.rs"
 required-features = ["test-failpoints"]
 
 [dependencies]
-oxideloop-bundle-archive = { path = "../bundle-archive" }
-oxideloop-bundle-contract = { path = "../bundle-contract" }
-oxideloop-controller-core = { path = "../controller-core" }
-oxideloop-controller-api = { path = "../controller-api" }
-oxideloop-event-planner = { path = "../event-planner" }
-oxideloop-kube-transport = { path = "../kube-transport" }
-oxideloop-mutation-model = { path = "../mutation-model" }
-oxideloop-renderer-abi = { path = "../renderer-abi" }
-oxideloop-renderer-protocol = { path = "../renderer-protocol" }
-oxideloop-renderer-client = { path = "../renderer-client" }
+bundle-archive = { path = "../bundle-archive" }
+bundle-contract = { path = "../bundle-contract" }
+controller-core = { path = "../controller-core" }
+controller-api = { path = "../controller-api" }
+event-planner = { path = "../event-planner" }
+kube-transport = { path = "../kube-transport" }
+mutation-model = { path = "../mutation-model" }
+renderer-abi = { path = "../renderer-abi" }
+renderer-protocol = { path = "../renderer-protocol" }
+renderer-client = { path = "../renderer-client" }
 serde_json = "1"
 thiserror = "2"
 async-trait = "0.1"
@@ -37,7 +37,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 time = { version = "0.3", features = ["formatting"] }
 
 [dev-dependencies]
-oxideloop-kube-transport = { path = "../kube-transport", features = ["test-support"] }
+kube-transport = { path = "../kube-transport", features = ["test-support"] }
 http = "1"
 http-body-util = "0.1"
 kube = { version = "4.2", default-features = false, features = ["client", "rustls-tls"] }

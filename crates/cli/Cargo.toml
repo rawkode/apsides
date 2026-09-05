@@ -1,0 +1,30 @@
+[package]
+name = "cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "reakt"
+path = "src/main.rs"
+
+[dependencies]
+compiler-core = { path = "../compiler-core" }
+release = { path = "../release" }
+platform = { path = "../platform", features = ["deployer"] }
+deploy = { path = "../deploy" }
+inventory = { path = "../inventory" }
+url = "2"
+kube = { version = "4.2", default-features = false, features = ["client", "rustls-tls", "config"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

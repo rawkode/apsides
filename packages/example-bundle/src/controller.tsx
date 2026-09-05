@@ -48,6 +48,7 @@ export default defineController<WebApplicationSpec>(({ root }) => {
 
   useAutomation({
     when: settings.changed(),
+    // todo: support restarting the pod
     action: configurationChanged,
     metadata: { message },
   });

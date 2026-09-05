@@ -7,11 +7,11 @@ use std::{
     time::Duration,
 };
 
+use controller_runtime::{BarrierV0, RuntimeErrorV0, establish_dependencies_async};
 use http::{Request, Response};
 use kube::{Client, client::Body};
-use oxideloop_controller_runtime::{BarrierV0, RuntimeErrorV0, establish_dependencies_async};
-use oxideloop_kube_transport::{FiniteIoStageV0, KubeTransportV0, TransportErrorV0};
-use oxideloop_renderer_abi::model::Dependency;
+use kube_transport::{FiniteIoStageV0, KubeTransportV0, TransportErrorV0};
+use renderer_abi::model::Dependency;
 use serde_json::json;
 use tower::service_fn;
 

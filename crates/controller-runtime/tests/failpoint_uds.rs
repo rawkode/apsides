@@ -15,7 +15,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use oxideloop_controller_runtime::{
+use controller_runtime::{
     FailpointV0, FailpointsV0,
     failpoint_uds::{
         FailpointControlV0, FailpointUdsError, FailpointUdsListenerV0, MAX_REQUEST_BYTES,

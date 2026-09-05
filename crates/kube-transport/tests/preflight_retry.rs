@@ -5,14 +5,14 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use http::{Method, Request, Response};
-use kube::{Client, client::Body};
-use oxideloop_controller_api::{
+use controller_api::{
     DurablePhase, OxideLoopStateSpec, PersistOperation, PersistPurpose, RootBinding, StateBody,
     bootstrap_id,
 };
-use oxideloop_controller_core::{CommandV0, PreconditionsV0};
-use oxideloop_kube_transport::{KubeTransportV0, RootAddressV0, TransportErrorV0};
+use controller_core::{CommandV0, PreconditionsV0};
+use http::{Method, Request, Response};
+use kube::{Client, client::Body};
+use kube_transport::{KubeTransportV0, RootAddressV0, TransportErrorV0};
 use serde_json::{Value, json};
 use tower::service_fn;
 
@@ -137,7 +137,7 @@ async fn malformed_preflight_retries_frozen_request_before_any_write() {
     let result = transport.dispatch(&address, &command()).await;
     assert!(matches!(
         result,
-        Ok(oxideloop_kube_transport::CommandOutcomeV0::Event(_))
+        Ok(kube_transport::CommandOutcomeV0::Event(_))
     ));
     let calls = calls.lock().expect("calls");
     assert_eq!(

@@ -8,5 +8,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         args.next().map_or(std::env::current_dir()?, PathBuf::from)
     };
-    oxideloop_renderer_protocol::generate::generate(&root, check)
+    renderer_protocol::generate::generate(&root, check)
 }

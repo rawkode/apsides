@@ -14,25 +14,25 @@ use std::{
     time::Duration,
 };
 
-use http::{Method, Request, Response, StatusCode};
-use kube::{Client, client::Body};
-use oxideloop_controller_api::{
+use controller_api::{
     ApplyIntent, ApplyOperation, ApplyRecoveryPolicy, ApplyTransaction, AutomationRunCompletion,
     AutomationRunCompletionState, AutomationRunSpec, AutomationRunStatus, DurablePhase,
     NextCommandLifecycleStateV0, ObjectIdentity, OxideLoopStateSpec, PersistOperation,
     PersistPurpose, PreparedRecoveryClaim, ProgramBundleReference, RootBinding, StateBody,
     StateLink, WebApplicationStatus, automation_run_name, bootstrap_id,
 };
-use oxideloop_controller_core::{
+use controller_core::{
     CommandV0, MutationCommandV0, PreconditionsV0, retired_state_delete_command_token,
     root_only_finalizer_command_token, root_only_owned_children_verify_token,
 };
-use oxideloop_event_planner::{
+use event_planner::{
     ObjectIdentity as PlannerObjectIdentity, ObjectRef as PlannerObjectRef, RunCorrelationV0,
     materialize_event, plan_event,
 };
-use oxideloop_mutation_model::{HttpMethod, MutationDecision};
-use oxideloop_renderer_abi::{
+use http::{Method, Request, Response, StatusCode};
+use kube::{Client, client::Body};
+use mutation_model::{HttpMethod, MutationDecision};
+use renderer_abi::{
     canonical_bytes, parse_validate_action_input, parse_validate_action_output, sha256_hex,
 };
 use serde_json::{Value, json};
@@ -146,7 +146,7 @@ fn lost_response() -> Response<Body> {
         .expect("lost response")
 }
 
-fn generated_event_plan() -> oxideloop_event_planner::PlannedEventV0 {
+fn generated_event_plan() -> event_planner::PlannedEventV0 {
     let input = parse_validate_action_input(
         &json!({
             "abiVersion":"renderer.oxideloop.dev/v0",
@@ -222,7 +222,7 @@ fn generated_event_plan() -> oxideloop_event_planner::PlannedEventV0 {
     plan_event(&input, &output, &root, &source, &run, &correlation).expect("P7 plan")
 }
 
-fn event_response(plan: &oxideloop_event_planner::PlannedEventV0, uid: &str, rv: &str) -> Value {
+fn event_response(plan: &event_planner::PlannedEventV0, uid: &str, rv: &str) -> Value {
     let mut event = materialize_event(plan, "2026-01-01T00:00:00Z").expect("materialized event");
     event["metadata"]["uid"] = json!(uid);
     event["metadata"]["resourceVersion"] = json!(rv);
@@ -266,8 +266,6 @@ fn automation_spec() -> AutomationRunSpec {
         automation_version: input_document.automation_version,
         bundle_digest: input_document.bundle_digest.clone(),
         program: ProgramBundleReference {
-            config_map_name: "bundle".into(),
-            key: "program.mjs".into(),
             digest: input_document.bundle_digest,
         },
         action_module_identity: input_document.action_module_identity,
@@ -433,7 +431,7 @@ fn root_only_json(
 }
 
 fn retired_state_setup() -> (RootAddressV0, CommandV0, Value, Value) {
-    let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
+    let state_name = controller_api::state_name("root-uid").expect("state name");
     let deletion_id = "d".repeat(64);
     let cleanup_token = "e".repeat(64);
     let root = json!({
@@ -592,7 +590,7 @@ fn force_fence_objects() -> (Value, Value, Value) {
 }
 
 fn conditional_apply_command(
-    prepared: Option<oxideloop_mutation_model::ObjectIdentity>,
+    prepared: Option<mutation_model::ObjectIdentity>,
     content_type: &str,
     manager: &str,
     force: bool,
@@ -625,7 +623,7 @@ fn conditional_apply_command(
                 content_type: content_type.into(),
                 field_manager: manager.into(),
                 force,
-                expected: oxideloop_mutation_model::ObjectIdentity {
+                expected: mutation_model::ObjectIdentity {
                     uid: "child-uid".into(),
                     resource_version: "7".into(),
                 },
@@ -698,13 +696,13 @@ fn authorized_dispatch_state(
                 id: transaction_id.into(),
                 generation: 1,
                 graph_identity_algorithm:
-                    oxideloop_controller_api::TransactionGraphIdentityAlgorithm::LegacyV0,
+                    controller_api::TransactionGraphIdentityAlgorithm::LegacyV0,
                 frozen_render_input_hash: "d".repeat(64),
                 desired_graph_hash: "e".repeat(64),
                 recovery_policy: ApplyRecoveryPolicy::ReplanAndRevalidateBeforeEffect,
                 attempt_token,
                 prepared_intents: vec![intent],
-                next_command_lifecycle: oxideloop_controller_api::NextCommandLifecycleV0 {
+                next_command_lifecycle: controller_api::NextCommandLifecycleV0 {
                     state: NextCommandLifecycleStateV0::DispatchAuthorizedMayHaveIssued,
                     command_id: Some(command_id),
                 },
@@ -1090,13 +1088,13 @@ fn delete_command(
                 name: name.into(),
             },
             logical_id: name.into(),
-            prepared_expected_target: Some(oxideloop_mutation_model::ObjectIdentity {
+            prepared_expected_target: Some(mutation_model::ObjectIdentity {
                 uid: uid.into(),
                 resource_version: resource_version.into(),
             }),
             decision: MutationDecision::PreconditionedDelete {
                 method: HttpMethod::Delete,
-                preconditions: oxideloop_mutation_model::ObjectIdentity {
+                preconditions: mutation_model::ObjectIdentity {
                     uid: uid.into(),
                     resource_version: resource_version.into(),
                 },
@@ -2184,7 +2182,7 @@ async fn conditional_apply_authority_mismatches_issue_no_patch() {
             true,
         ),
         (
-            Some(oxideloop_mutation_model::ObjectIdentity {
+            Some(mutation_model::ObjectIdentity {
                 uid: "wrong".into(),
                 resource_version: "7".into(),
             }),
@@ -2193,7 +2191,7 @@ async fn conditional_apply_authority_mismatches_issue_no_patch() {
             true,
         ),
         (
-            Some(oxideloop_mutation_model::ObjectIdentity {
+            Some(mutation_model::ObjectIdentity {
                 uid: "child-uid".into(),
                 resource_version: "7".into(),
             }),
@@ -2202,7 +2200,7 @@ async fn conditional_apply_authority_mismatches_issue_no_patch() {
             true,
         ),
         (
-            Some(oxideloop_mutation_model::ObjectIdentity {
+            Some(mutation_model::ObjectIdentity {
                 uid: "child-uid".into(),
                 resource_version: "7".into(),
             }),
@@ -2211,7 +2209,7 @@ async fn conditional_apply_authority_mismatches_issue_no_patch() {
             true,
         ),
         (
-            Some(oxideloop_mutation_model::ObjectIdentity {
+            Some(mutation_model::ObjectIdentity {
                 uid: "child-uid".into(),
                 resource_version: "7".into(),
             }),
@@ -2241,7 +2239,7 @@ async fn conditional_apply_authority_mismatches_issue_no_patch() {
             .dispatch(
                 &address,
                 &conditional_apply_command(
-                    Some(oxideloop_mutation_model::ObjectIdentity {
+                    Some(mutation_model::ObjectIdentity {
                         uid: "child-uid".into(),
                         resource_version: "7".into(),
                     }),
@@ -2264,7 +2262,7 @@ async fn conditional_apply_authority_mismatches_issue_no_patch() {
             .dispatch(
                 &address,
                 &conditional_apply_command(
-                    Some(oxideloop_mutation_model::ObjectIdentity {
+                    Some(mutation_model::ObjectIdentity {
                         uid: "child-uid".into(),
                         resource_version: "7".into(),
                     }),
@@ -2288,7 +2286,7 @@ async fn dispatch_authorization_mismatches_hold_before_any_child_write() {
         state_name: "state-a".into(),
     };
     let command = conditional_apply_command(
-        Some(oxideloop_mutation_model::ObjectIdentity {
+        Some(mutation_model::ObjectIdentity {
             uid: "child-uid".into(),
             resource_version: "7".into(),
         }),
@@ -2456,7 +2454,7 @@ async fn conditional_apply_409_rereads_once_and_only_acks_exact_prior_success() 
         state_name: "state-a".into(),
     };
     let command = conditional_apply_command(
-        Some(oxideloop_mutation_model::ObjectIdentity {
+        Some(mutation_model::ObjectIdentity {
             uid: "child-uid".into(),
             resource_version: "7".into(),
         }),
@@ -2492,7 +2490,7 @@ async fn conditional_apply_409_rereads_once_and_only_acks_exact_prior_success() 
         super::CommandOutcomeV0::Event(event)
             if matches!(
                 event.as_ref(),
-                oxideloop_controller_core::EventV0::MutationNotIssued {
+                controller_core::EventV0::MutationNotIssued {
                     transaction_id,
                     attempt_token,
                     command_id,
@@ -2519,7 +2517,7 @@ async fn conditional_apply_409_rereads_once_and_only_acks_exact_prior_success() 
         super::CommandOutcomeV0::Event(event)
             if matches!(
                 event.as_ref(),
-                oxideloop_controller_core::EventV0::MutationNotIssued {
+                controller_core::EventV0::MutationNotIssued {
                     transaction_id,
                     attempt_token,
                     ..
@@ -2545,7 +2543,7 @@ async fn persist_state_409_rereads_once_and_requires_an_exact_advanced_proof() {
     assert!(matches!(
         transport.dispatch(&address, &persist_command()).await,
         Ok(super::CommandOutcomeV0::Event(event))
-            if matches!(event.as_ref(), oxideloop_controller_core::EventV0::Persisted { .. })
+            if matches!(event.as_ref(), controller_core::EventV0::Persisted { .. })
     ));
     api.assert_drained();
 
@@ -2593,7 +2591,7 @@ async fn timed_out_state_persist_proves_once_or_fails_closed_without_replay() {
     assert!(matches!(
         outcome,
         super::CommandOutcomeV0::Event(event)
-            if matches!(event.as_ref(), oxideloop_controller_core::EventV0::Persisted { .. })
+            if matches!(event.as_ref(), controller_core::EventV0::Persisted { .. })
     ));
     assert_eq!(
         patches.load(Ordering::SeqCst),
@@ -2684,7 +2682,7 @@ async fn timed_out_mutation_result_persist_recovers_once_without_replaying_patch
     assert!(matches!(
         outcome,
         super::CommandOutcomeV0::Event(event)
-            if matches!(event.as_ref(), oxideloop_controller_core::EventV0::Persisted { .. })
+            if matches!(event.as_ref(), controller_core::EventV0::Persisted { .. })
     ));
     assert_eq!(
         patches.load(Ordering::SeqCst),
@@ -2710,7 +2708,7 @@ async fn persist_root_status_409_rereads_once_and_requires_an_exact_advanced_pro
     assert!(matches!(
         transport.dispatch(&address, &root_status_command()).await,
         Ok(super::CommandOutcomeV0::Event(event))
-            if matches!(event.as_ref(), oxideloop_controller_core::EventV0::RootStatusPersisted { .. })
+            if matches!(event.as_ref(), controller_core::EventV0::RootStatusPersisted { .. })
     ));
     api.assert_drained();
 
@@ -2776,7 +2774,7 @@ async fn managed_delete_ack_echoes_prepared_identity_for_config_map_and_service(
         assert!(matches!(
             outcome,
             super::CommandOutcomeV0::Event(event)
-                if matches!(*event, oxideloop_controller_core::EventV0::MutationAcknowledged { ref results, .. }
+                if matches!(*event, controller_core::EventV0::MutationAcknowledged { ref results, .. }
                     if results.len() == 1
                         && results[0].uid.as_deref() == Some(uid)
                         && results[0].resource_version.as_deref() == Some(resource_version))
@@ -2813,7 +2811,7 @@ async fn stale_delete_target_is_non_mutating_and_not_response_loss_recovery() {
     assert!(matches!(
         outcome,
         super::CommandOutcomeV0::Event(event)
-            if matches!(event.as_ref(), oxideloop_controller_core::EventV0::MutationNotIssued {
+            if matches!(event.as_ref(), controller_core::EventV0::MutationNotIssued {
                 transaction_id, attempt_token, reason, ..
             } if transaction_id == "tx" && attempt_token == &"a".repeat(64)
                 && reason == "mutation delete pins")
@@ -2846,7 +2844,7 @@ async fn managed_owner_and_root_near_misses_are_correlated_no_write_events() {
             .dispatch(
                 &address,
                 &conditional_apply_command(
-                    Some(oxideloop_mutation_model::ObjectIdentity {
+                    Some(mutation_model::ObjectIdentity {
                         uid: "child-uid".into(),
                         resource_version: "7".into(),
                     }),
@@ -2858,7 +2856,7 @@ async fn managed_owner_and_root_near_misses_are_correlated_no_write_events() {
             .await
             .expect("pre-write mismatch is an event");
         assert!(matches!(outcome, super::CommandOutcomeV0::Event(event)
-            if matches!(event.as_ref(), oxideloop_controller_core::EventV0::MutationNotIssued {
+            if matches!(event.as_ref(), controller_core::EventV0::MutationNotIssued {
                 transaction_id, attempt_token, command_id, ..
             } if transaction_id == "tx" && attempt_token == &"a".repeat(64) && *command_id == "c".repeat(64))));
         api.assert_drained();
@@ -2901,7 +2899,7 @@ async fn managed_owner_and_root_near_misses_are_correlated_no_write_events() {
             .await
             .expect("pre-write mismatch event");
         assert!(matches!(outcome, super::CommandOutcomeV0::Event(event)
-            if matches!(event.as_ref(), oxideloop_controller_core::EventV0::MutationNotIssued {
+            if matches!(event.as_ref(), controller_core::EventV0::MutationNotIssued {
                 transaction_id, attempt_token, command_id, ..
             } if transaction_id == "tx" && attempt_token == &"a".repeat(64) && *command_id == "c".repeat(64))));
         api.assert_drained();
@@ -2910,7 +2908,7 @@ async fn managed_owner_and_root_near_misses_are_correlated_no_write_events() {
 
 #[tokio::test]
 async fn root_only_verify_uses_receipt_state_identity_and_empty_state_rv() {
-    let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
+    let state_name = controller_api::state_name("root-uid").expect("state name");
     let token =
         root_only_owned_children_verify_token(&"d".repeat(64), 3, "root-uid", 3, "9", "state-uid");
     let receipt_cleanup_token = "d".repeat(64);
@@ -2987,7 +2985,7 @@ async fn root_only_verify_uses_receipt_state_identity_and_empty_state_rv() {
     assert!(matches!(
         outcome,
         super::CommandOutcomeV0::Event(event)
-            if matches!(*event, oxideloop_controller_core::EventV0::OwnedChildrenVerifiedAbsent {
+            if matches!(*event, controller_core::EventV0::OwnedChildrenVerifiedAbsent {
                 token: ref actual_token,
                 cleanup_token: ref actual_cleanup,
                 root_generation: 3,
@@ -3007,7 +3005,7 @@ async fn root_only_verify_uses_receipt_state_identity_and_empty_state_rv() {
 
 #[tokio::test]
 async fn root_only_remove_rechecks_children_before_exact_finalizer_patch() {
-    let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
+    let state_name = controller_api::state_name("root-uid").expect("state name");
     let receipt_cleanup_token = "d".repeat(64);
     let token = root_only_finalizer_token("9", 3, &state_name, "state-uid", &receipt_cleanup_token);
     let state_path = format!(
@@ -3097,7 +3095,7 @@ async fn root_only_remove_rechecks_children_before_exact_finalizer_patch() {
     assert!(matches!(
         outcome,
         super::CommandOutcomeV0::Event(event)
-            if matches!(&*event, oxideloop_controller_core::EventV0::RootFinalizerRemoved {
+            if matches!(&*event, controller_core::EventV0::RootFinalizerRemoved {
                 token: actual_token,
                 root_uid,
                 old_root_resource_version,
@@ -3112,7 +3110,7 @@ async fn root_only_remove_rechecks_children_before_exact_finalizer_patch() {
 
 #[tokio::test]
 async fn root_only_current_command_tokens_are_checked_independently_of_the_receipt() {
-    let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
+    let state_name = controller_api::state_name("root-uid").expect("state name");
     let receipt_cleanup_token = "e".repeat(64);
     let commands = [
         CommandV0::VerifyOwnedChildrenAbsent {
@@ -3157,7 +3155,7 @@ async fn root_only_current_command_tokens_are_checked_independently_of_the_recei
 
 #[tokio::test]
 async fn root_only_remove_holds_for_state_or_child_reappearance_without_patch() {
-    let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
+    let state_name = controller_api::state_name("root-uid").expect("state name");
     let receipt_cleanup_token = "d".repeat(64);
     let token = root_only_finalizer_token("9", 3, &state_name, "state-uid", &receipt_cleanup_token);
     let state_path = format!(
@@ -3259,7 +3257,7 @@ async fn root_only_remove_holds_for_state_or_child_reappearance_without_patch() 
 
 #[tokio::test]
 async fn root_only_validation_failures_never_issue_state_or_patch_requests() {
-    let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
+    let state_name = controller_api::state_name("root-uid").expect("state name");
     let receipt_cleanup_token = "d".repeat(64);
     let token = root_only_finalizer_token("9", 3, &state_name, "state-uid", &receipt_cleanup_token);
     let stale_rv = root_only_json("10", 3, &state_name, "state-uid", &receipt_cleanup_token);
@@ -3422,7 +3420,7 @@ async fn root_absence_terminal_check_allows_empty_state_rv_sentinel() {
     assert!(matches!(
         outcome,
         super::CommandOutcomeV0::Event(event)
-            if matches!(&*event, oxideloop_controller_core::EventV0::RootUidVerifiedAbsent {
+            if matches!(&*event, controller_core::EventV0::RootUidVerifiedAbsent {
                 token: actual_token,
                 root_uid: actual_uid,
             } if actual_token == &token && actual_uid == "root-uid")
@@ -4291,7 +4289,7 @@ async fn owned_child_verification_blocks_an_automation_run_by_owner_uid_alone() 
         .await
         .expect("verification response");
     assert!(
-        matches!(outcome, super::CommandOutcomeV0::Event(event) if matches!(*event, oxideloop_controller_core::EventV0::OwnedChildrenVerificationFailed { .. }))
+        matches!(outcome, super::CommandOutcomeV0::Event(event) if matches!(*event, controller_core::EventV0::OwnedChildrenVerificationFailed { .. }))
     );
     api.assert_drained();
 }
@@ -4354,7 +4352,7 @@ async fn retired_state_delete_is_uid_rv_fenced_and_2xx_requires_a_404_proof() {
     assert!(matches!(
         outcome,
         super::CommandOutcomeV0::Event(event)
-            if matches!(&*event, oxideloop_controller_core::EventV0::RetiredStateDeleted {
+            if matches!(&*event, controller_core::EventV0::RetiredStateDeleted {
                 state_uid, state_resource_version, ..
             } if state_uid == "state-uid" && state_resource_version == "4")
     ));
@@ -4376,7 +4374,7 @@ async fn retired_state_delete_recovers_an_ambiguous_response_only_with_the_same_
     assert!(matches!(
         transport.dispatch(&address, &command).await,
         Ok(super::CommandOutcomeV0::Event(event))
-            if matches!(&*event, oxideloop_controller_core::EventV0::RetiredStateDeleted { .. })
+            if matches!(&*event, controller_core::EventV0::RetiredStateDeleted { .. })
     ));
     // A second DELETE or any root PATCH would be an unexpected scripted call.
     api.assert_drained();

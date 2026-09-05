@@ -1,4 +1,4 @@
-use oxideloop_renderer_abi::{
+use renderer_abi::{
     AbiError,
     limits::{MAX_EVENT_METADATA_CANONICAL_BYTES, MAX_RESOURCES, validate_json_limits},
     parse_validate_action_input, parse_validate_action_output, parse_validate_render_output,

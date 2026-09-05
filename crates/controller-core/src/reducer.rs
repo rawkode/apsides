@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use oxideloop_controller_api::{
+use controller_api::{
     ApplyIntent, ApplyOperation, ApplyOutcome, ApplyRecoveryPolicy, ApplyResult, ApplyTransaction,
     AutomationBaseline, AutomationCompletion, AutomationCompletionOutcome, AutomationPending,
     AutomationRunCompletionState, AutomationRunSpec, DeletionCleanupReceipt, DeletionTransaction,
@@ -27,13 +27,13 @@ use oxideloop_controller_api::{
     automation_run_name, bootstrap_id, state_name, validate_automation_run_name,
     validate_root_state_link,
 };
-use oxideloop_mutation_model::{
+use mutation_model::{
     APPLY_PATCH_CONTENT_TYPE, BackendQualification, CONTROLLER_FIELD_MANAGER, HttpMethod,
     MutationDecision, MutationIntent, MutationPlanInputV0, ObjectIdentity as MutationIdentity,
     Observation, PROBE_VERSION_V0, plan,
 };
-use oxideloop_renderer_abi::model::{Dependency, RenderDisposition, ResourceDeclaration};
-use oxideloop_renderer_abi::{
+use renderer_abi::model::{Dependency, RenderDisposition, ResourceDeclaration};
+use renderer_abi::{
     ActionInputV0, RenderInputV0, canonical_bytes, parse_validate_render_input,
     parse_validate_render_output, sha256_hex,
 };
@@ -350,8 +350,8 @@ impl MachineStateV0 {
         // condition must not survive until the exact descriptor verification.
         root.status = WebApplicationStatus::default();
         let state = OxideLoopStateSpec {
-            state_version: oxideloop_controller_api::STATE_VERSION_V1,
-            root: oxideloop_controller_api::RootBinding {
+            state_version: controller_api::STATE_VERSION_V1,
+            root: controller_api::RootBinding {
                 uid: root.uid.clone(),
                 bootstrap_id: bootstrap_id(&root.uid)
                     .map_err(|error| ReconcileError::Link(error.to_string()))?,
@@ -408,8 +408,8 @@ impl MachineStateV0 {
         root.state_resource_version.clear();
         root.state_finalizer_present = false;
         let journal = OxideLoopStateSpec {
-            state_version: oxideloop_controller_api::STATE_VERSION_V1,
-            root: oxideloop_controller_api::RootBinding {
+            state_version: controller_api::STATE_VERSION_V1,
+            root: controller_api::RootBinding {
                 uid: root.uid.clone(),
                 bootstrap_id: bootstrap_id(&root.uid)
                     .map_err(|error| ReconcileError::Recovery(error.to_string()))?,
@@ -658,7 +658,7 @@ pub enum EventV0 {
         state_resource_version: String,
         old_root_resource_version: String,
         new_root_resource_version: String,
-        status_state_link: oxideloop_controller_api::StateLink,
+        status_state_link: controller_api::StateLink,
         root_finalizer_present: bool,
         state_finalizer_present: bool,
     },
@@ -2041,7 +2041,7 @@ fn bootstrap_ack(
     state_resource_version: &str,
     old_root_resource_version: &str,
     new_root_resource_version: &str,
-    status_state_link: &oxideloop_controller_api::StateLink,
+    status_state_link: &controller_api::StateLink,
     root_finalizer_present: bool,
     state_finalizer_present: bool,
     commands: &mut Vec<CommandV0>,
@@ -2056,7 +2056,7 @@ fn bootstrap_ack(
     let valid = state.phase == PhaseV0::BootstrapPending
         && pending.token == token
         && pending.state_name == state_name
-        && oxideloop_controller_api::state_name(state.root.uid.as_str())
+        && controller_api::state_name(state.root.uid.as_str())
             .is_ok_and(|expected| expected == state_name)
         && !state_uid.is_empty()
         && !state_resource_version.is_empty()
@@ -4683,7 +4683,7 @@ fn trigger_automation(
         return Ok(());
     }
     let action = ActionInputV0 {
-        abi_version: oxideloop_renderer_abi::model::ABI_VERSION_V0.into(),
+        abi_version: renderer_abi::model::ABI_VERSION_V0.into(),
         bundle_digest: state.root.bundle_digest.clone(),
         automation_identity: trigger.automation_identity.clone(),
         automation_version: trigger.automation_version.clone(),
@@ -4716,7 +4716,7 @@ fn trigger_automation(
         program: state.root.spec.program.clone(),
         action_module_identity: trigger.action_module_identity,
         action_module_digest: trigger.action_module_digest,
-        renderer_abi_version: oxideloop_renderer_abi::model::ABI_VERSION_V0.into(),
+        renderer_abi_version: renderer_abi::model::ABI_VERSION_V0.into(),
         action_input_hash: sha256_hex(action_input_v0.as_bytes()),
         event_metadata_hash: sha256_hex(
             &canonical_bytes(&action.event_metadata)
@@ -5813,8 +5813,8 @@ fn receipt_only_deletion_journal(
     receipt: &DeletionCleanupReceipt,
 ) -> Result<OxideLoopStateSpec, ReconcileError> {
     let journal = OxideLoopStateSpec {
-        state_version: oxideloop_controller_api::STATE_VERSION_V1,
-        root: oxideloop_controller_api::RootBinding {
+        state_version: controller_api::STATE_VERSION_V1,
+        root: controller_api::RootBinding {
             uid: root.uid.clone(),
             bootstrap_id: bootstrap_id(&root.uid)
                 .map_err(|error| ReconcileError::Recovery(error.to_string()))?,
@@ -6139,12 +6139,12 @@ fn sort_automation(state: &mut MachineStateV0) {
 #[allow(clippy::too_many_lines)]
 mod tests {
     use super::*;
-    use oxideloop_controller_api::{
+    use controller_api::{
         ConditionStatus, ProgramBundleReference, RootBinding, RootCondition, RootConditionType,
         STATE_VERSION_V1, StateBody, StateLink, WebApplicationSpec, bootstrap_id, state_name,
     };
-    use oxideloop_renderer_abi::RenderOutputV0;
-    use oxideloop_renderer_abi::model::{ABI_VERSION_V0, ResourceDeclaration, RootProjection};
+    use renderer_abi::RenderOutputV0;
+    use renderer_abi::model::{ABI_VERSION_V0, ResourceDeclaration, RootProjection};
 
     fn web_application_spec(digest: impl Into<String>) -> WebApplicationSpec {
         WebApplicationSpec {
@@ -6153,8 +6153,6 @@ mod tests {
             message: None,
             expose: false,
             program: ProgramBundleReference {
-                config_map_name: "bundle".into(),
-                key: "program.mjs".into(),
                 digest: digest.into(),
             },
         }
@@ -7216,7 +7214,7 @@ mod tests {
         let mut changed_input: RenderInputV0 = serde_json::from_str(&input).unwrap();
         changed_input
             .observations
-            .push(oxideloop_renderer_abi::model::Observation {
+            .push(renderer_abi::model::Observation {
                 api_version: "v1".into(),
                 kind: "ConfigMap".into(),
                 namespace: "demo".into(),
@@ -8581,9 +8579,9 @@ mod tests {
 
         let mut historic_hash_mismatch = spec.clone();
         // This is a valid exact run identity with every field duplicated in
-        // AutomationPending intact. Only the program source authority changes,
-        // so the canonical full-spec hash must be what rejects it.
-        historic_hash_mismatch.program.config_map_name = "replacement-bundle".into();
+        // AutomationPending intact. Only the embedded program authority
+        // changes, so the canonical full-spec hash must reject it.
+        historic_hash_mismatch.program.digest = "b".repeat(64);
         let held = reduce(
             completion_state.clone(),
             EventV0::AutomationCompleted {
@@ -11516,34 +11514,6 @@ mod tests {
                 .unwrap()
                 .commands
                 .as_slice(),
-            [CommandV0::Hold { .. }]
-        ));
-        let mut changed_program_config_map = ready.root.clone();
-        changed_program_config_map.spec.program.config_map_name = "replacement-bundle".into();
-        assert!(matches!(
-            reduce(
-                ready.clone(),
-                EventV0::RootRefreshed {
-                    root: changed_program_config_map
-                }
-            )
-            .unwrap()
-            .commands
-            .as_slice(),
-            [CommandV0::Hold { .. }]
-        ));
-        let mut changed_program_key = ready.root.clone();
-        changed_program_key.spec.program.key = "replacement-program.mjs".into();
-        assert!(matches!(
-            reduce(
-                ready.clone(),
-                EventV0::RootRefreshed {
-                    root: changed_program_key
-                }
-            )
-            .unwrap()
-            .commands
-            .as_slice(),
             [CommandV0::Hold { .. }]
         ));
         let mut changed_digest = ready.root.clone();

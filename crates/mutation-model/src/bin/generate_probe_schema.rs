@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use oxideloop_mutation_model::generated_probe_schema;
+use mutation_model::generated_probe_schema;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = std::env::args_os()

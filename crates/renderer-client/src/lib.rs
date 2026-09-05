@@ -21,7 +21,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use oxideloop_renderer_protocol::{
+use renderer_protocol::{
     FrameV0, ProtocolError, RequestV0, ResponseStatusV0, ResponseV0, read_frame, write_frame,
 };
 #[cfg(unix)]
@@ -405,8 +405,8 @@ mod unix_tests {
 
     fn request() -> RequestV0 {
         RequestV0 {
-            request_id: oxideloop_renderer_protocol::RequestIdV0 { bytes: [7; 16] },
-            phase: oxideloop_renderer_protocol::PhaseV0::Render,
+            request_id: renderer_protocol::RequestIdV0 { bytes: [7; 16] },
+            phase: renderer_protocol::PhaseV0::Render,
             bundle_digest: DIGEST.into(),
             module_digest: Some(DIGEST.into()),
             duration_millis: 250,

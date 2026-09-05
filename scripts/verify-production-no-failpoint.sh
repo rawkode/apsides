@@ -112,9 +112,9 @@ RUBY
 dockerfile=$ROOT_DIR/Dockerfile
 grep -F 'FROM gcr.io/distroless/cc-debian12:nonroot AS production' "$dockerfile" >/dev/null || fail "production runtime target missing"
 grep -F 'FROM gcr.io/distroless/cc-debian12:nonroot AS e2e-failpoints' "$dockerfile" >/dev/null || fail "e2e runtime target missing"
-grep -F 'cargo build --locked --release -p oxideloop-controller-runtime --bin oxideloop-controller' "$dockerfile" >/dev/null || fail "production controller release build missing"
-grep -F 'cargo build --locked -p oxideloop-controller-runtime --features test-failpoints --bin oxideloop-controller' "$dockerfile" >/dev/null || fail "debug failpoint build missing"
-grep -F 'cargo build --locked -p oxideloop-controller-runtime --features test-failpoints --bin oxideloop-e2e-failpoint-control' "$dockerfile" >/dev/null || fail "e2e control client build missing"
+grep -F 'cargo build --locked --release -p controller-runtime --bin oxideloop-controller' "$dockerfile" >/dev/null || fail "production controller release build missing"
+grep -F 'cargo build --locked -p controller-runtime --features test-failpoints --bin oxideloop-controller' "$dockerfile" >/dev/null || fail "debug failpoint build missing"
+grep -F 'cargo build --locked -p controller-runtime --features test-failpoints --bin oxideloop-e2e-failpoint-control' "$dockerfile" >/dev/null || fail "e2e control client build missing"
 grep -F 'target/release/oxideloop-controller' "$dockerfile" >/dev/null || fail "production controller artifact path missing"
 grep -F 'target/debug/oxideloop-controller' "$dockerfile" >/dev/null || fail "e2e controller artifact path missing"
 grep -F 'target/debug/oxideloop-e2e-failpoint-control' "$dockerfile" >/dev/null || fail "e2e control client artifact path missing"

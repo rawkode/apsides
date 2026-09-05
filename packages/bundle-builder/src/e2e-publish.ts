@@ -7,6 +7,8 @@ import { buildBundle, type BuiltBundle, type BundleIntegrityManifestV0 } from ".
 export interface E2EBundleMetadata {
   readonly metadataVersion: "oxideloop.dev/e2e-bundle-metadata/v0";
   readonly buildBundle: {
+    /** SHA-256 of the exact controller.tsx bytes compiled into this bundle. */
+    readonly sourceSha256: string;
     /** SHA-256 of the canonical integrity-manifest.json bytes. */
     readonly bundleDigest: string;
     readonly bundleDigestScope: "canonical integrity-manifest.json sha256";
@@ -79,6 +81,7 @@ function createMetadata(result: BuiltBundle, repositoryRoot: string, sourceRoot:
   return {
     metadataVersion: "oxideloop.dev/e2e-bundle-metadata/v0",
     buildBundle: {
+      sourceSha256: result.sourceSha256,
       bundleDigest: result.bundleDigest,
       bundleDigestScope: "canonical integrity-manifest.json sha256",
       archive: {

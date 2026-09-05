@@ -18,7 +18,12 @@ export interface BundleOptions {
 }
 export interface FileIntegrity { readonly path: string; readonly length: number; readonly sha256: string; }
 export interface BundleIntegrityManifestV0 { readonly manifestVersion: string; readonly compiler: { identity: string; version: string }; readonly bundler: { identity: string; version: string }; readonly rendererAbiVersion: string; readonly descriptor: FileIntegrity; readonly renderModules: Array<FileIntegrity & { identity: string }>; readonly actionModules: Array<FileIntegrity & { identity: string }>; readonly sourceMaps: FileIntegrity[]; readonly phaseModules: Array<{ phase: string; moduleIdentity: string }>; }
-export interface BuiltBundle { readonly bundleDigest: string; readonly manifest: BundleIntegrityManifestV0; readonly archiveBytes: Buffer; }
+export interface BuiltBundle {
+  readonly bundleDigest: string;
+  readonly manifest: BundleIntegrityManifestV0;
+  readonly archiveBytes: Buffer;
+  readonly sourceSha256: string;
+}
 
 const ABI = "renderer.oxideloop.dev/v0";
 const RENDER_IDENTITY = "controller.render";
@@ -118,7 +123,12 @@ export async function buildBundle(options: BundleOptions): Promise<BuiltBundle> 
       "integrity-manifest.json": Buffer.from(manifestBytes, "utf8"),
       "render.callable.js": await readOwnedStagingFile(renderPath),
     });
-    return { bundleDigest, manifest, archiveBytes: Buffer.from(archiveBytes) };
+    return {
+      bundleDigest,
+      manifest,
+      archiveBytes: Buffer.from(archiveBytes),
+      sourceSha256: createHash("sha256").update(controller.source, "utf8").digest("hex"),
+    };
   } finally {
     if (staging) await rm(staging, { recursive: true, force: true });
   }

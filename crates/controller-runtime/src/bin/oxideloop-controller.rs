@@ -1,17 +1,19 @@
 //! v0 production single-root controller entrypoint.
 //!
 //! The process has one explicit root authority boundary. Bundle bytes come
-//! only from the root's same-namespace `spec.program` `ConfigMap` reference.
+//! only from the image-owned, digest-addressed embedded archive.
 
 use std::{path::PathBuf, process::ExitCode};
 
-use oxideloop_controller_runtime::{ControllerDriverV0, DriverConfigV0, RuntimeErrorV0};
+use controller_runtime::{ControllerDriverV0, DriverConfigV0, RuntimeErrorV0};
 
 #[derive(Debug)]
 struct Args {
     namespace: String,
     root_name: String,
     bundle_store: PathBuf,
+    embedded_bundle_archive: PathBuf,
+    embedded_bundle_digest: PathBuf,
     renderer_socket: PathBuf,
     #[cfg(feature = "test-failpoints")]
     failpoint_socket: Option<PathBuf>,
@@ -20,11 +22,11 @@ struct Args {
 fn usage() -> &'static str {
     #[cfg(feature = "test-failpoints")]
     {
-        "usage: oxideloop-controller --namespace NS --root-name NAME --bundle-store DIR --renderer-unix-socket SOCKET [--failpoint-unix-socket SOCKET]"
+        "usage: oxideloop-controller --namespace NS --root-name NAME --bundle-store DIR --embedded-bundle-archive ARCHIVE --embedded-bundle-digest DIGEST --renderer-unix-socket SOCKET [--failpoint-unix-socket SOCKET]"
     }
     #[cfg(not(feature = "test-failpoints"))]
     {
-        "usage: oxideloop-controller --namespace NS --root-name NAME --bundle-store DIR --renderer-unix-socket SOCKET"
+        "usage: oxideloop-controller --namespace NS --root-name NAME --bundle-store DIR --embedded-bundle-archive ARCHIVE --embedded-bundle-digest DIGEST --renderer-unix-socket SOCKET"
     }
 }
 
@@ -37,6 +39,8 @@ fn parse_args_from(values: impl IntoIterator<Item = String>) -> Result<Args, Str
     let mut namespace = None;
     let mut root_name = None;
     let mut bundle_store = None;
+    let mut embedded_bundle_archive = None;
+    let mut embedded_bundle_digest = None;
     let mut renderer_socket = None;
     #[cfg(feature = "test-failpoints")]
     let mut failpoint_socket = None;
@@ -48,6 +52,8 @@ fn parse_args_from(values: impl IntoIterator<Item = String>) -> Result<Args, Str
             "--namespace" => namespace = Some(value),
             "--root-name" => root_name = Some(value),
             "--bundle-store" => bundle_store = Some(PathBuf::from(value)),
+            "--embedded-bundle-archive" => embedded_bundle_archive = Some(PathBuf::from(value)),
+            "--embedded-bundle-digest" => embedded_bundle_digest = Some(PathBuf::from(value)),
             "--renderer-unix-socket" => renderer_socket = Some(PathBuf::from(value)),
             #[cfg(feature = "test-failpoints")]
             "--failpoint-unix-socket" => failpoint_socket = Some(PathBuf::from(value)),
@@ -58,15 +64,22 @@ fn parse_args_from(values: impl IntoIterator<Item = String>) -> Result<Args, Str
         namespace: namespace.ok_or("--namespace is required")?,
         root_name: root_name.ok_or("--root-name is required")?,
         bundle_store: bundle_store.ok_or("--bundle-store is required")?,
+        embedded_bundle_archive: embedded_bundle_archive
+            .ok_or("--embedded-bundle-archive is required")?,
+        embedded_bundle_digest: embedded_bundle_digest
+            .ok_or("--embedded-bundle-digest is required")?,
         renderer_socket: renderer_socket.ok_or("--renderer-unix-socket is required")?,
         #[cfg(feature = "test-failpoints")]
         failpoint_socket,
     };
-    if args.namespace.is_empty() || args.root_name.is_empty() || !args.renderer_socket.is_absolute()
+    if args.namespace.is_empty()
+        || args.root_name.is_empty()
+        || !args.bundle_store.is_absolute()
+        || !args.embedded_bundle_archive.is_absolute()
+        || !args.embedded_bundle_digest.is_absolute()
+        || !args.renderer_socket.is_absolute()
     {
-        return Err(
-            "namespace/root name must be nonempty and renderer socket must be absolute".into(),
-        );
+        return Err("namespace/root name and all controller paths must be absolute".into());
     }
     #[cfg(feature = "test-failpoints")]
     if args
@@ -106,6 +119,8 @@ async fn main() -> ExitCode {
         namespace: args.namespace,
         root_name: args.root_name,
         bundle_store: args.bundle_store,
+        embedded_bundle_archive: args.embedded_bundle_archive,
+        embedded_bundle_digest: args.embedded_bundle_digest,
         renderer_unix_socket: args.renderer_socket,
         #[cfg(feature = "test-failpoints")]
         failpoint_unix_socket: args.failpoint_socket,
@@ -136,7 +151,9 @@ mod tests {
 
     #[test]
     fn default_parser_accepts_only_the_production_surface() {
-        assert!(!usage().contains("bundle-archive"));
+        assert!(usage().contains("--embedded-bundle-archive"));
+        assert!(usage().contains("--embedded-bundle-digest"));
+        assert!(!usage().contains("--failpoint-unix-socket"));
         let args = parse_args_from([
             "--namespace".into(),
             "ns".into(),
@@ -144,6 +161,10 @@ mod tests {
             "root".into(),
             "--bundle-store".into(),
             "/tmp/store".into(),
+            "--embedded-bundle-archive".into(),
+            "/tmp/bundle.archive".into(),
+            "--embedded-bundle-digest".into(),
+            "/tmp/bundle.digest".into(),
             "--renderer-unix-socket".into(),
             "/tmp/renderer.sock".into(),
         ])

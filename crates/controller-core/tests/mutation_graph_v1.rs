@@ -4,22 +4,20 @@
 //! `reduce`; they are a compatibility tripwire for the renderer/controller
 //! boundary rather than white-box tests of private planner helpers.
 
-use oxideloop_controller_api::{
+use controller_api::{
     ObjectIdentity, OxideLoopStateSpec, PersistPurpose, ProgramBundleReference, RootBinding,
     STATE_VERSION_V1, StateBody, StateLink, WebApplicationSpec, WebApplicationStatus, bootstrap_id,
     state_name,
 };
-use oxideloop_controller_core::{
+use controller_core::{
     CommandV0, DesiredObservationV0, EventV0, FrozenInputV0, MachineStateV0, PhaseV0,
     PreconditionsV0, RecoveryProofV0, RootSnapshotV0, reduce,
 };
-use oxideloop_mutation_model::{
-    BackendQualification, ObjectIdentity as MutationIdentity, Observation,
-};
-use oxideloop_renderer_abi::model::{
+use mutation_model::{BackendQualification, ObjectIdentity as MutationIdentity, Observation};
+use renderer_abi::model::{
     ABI_VERSION_V0, Dependency, RenderDisposition, ResourceDeclaration, RootProjection,
 };
-use oxideloop_renderer_abi::{RenderInputV0, RenderOutputV0, parse_validate_render_input};
+use renderer_abi::{RenderInputV0, RenderOutputV0, parse_validate_render_input};
 
 const ROOT_UID: &str = "root-uid";
 const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -47,8 +45,6 @@ fn linked() -> MachineStateV0 {
                 message: None,
                 expose: false,
                 program: ProgramBundleReference {
-                    config_map_name: "bundle".into(),
-                    key: "program.mjs".into(),
                     digest: DIGEST.into(),
                 },
             },

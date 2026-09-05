@@ -1,4 +1,4 @@
-use oxideloop_renderer_protocol::{
+use renderer_protocol::{
     ErrorCategoryV0, FrameV0, MAX_DURATION_MILLIS, PhaseV0, ProtocolError, RequestIdV0, RequestV0,
     ResponseStatusV0, ResponseV0, read_frame, write_frame,
 };

@@ -7,15 +7,15 @@
 //! runtime error to the caller.
 
 use async_trait::async_trait;
-use oxideloop_controller_api::{ProgramBundleReference, WebApplicationSpec, WebApplicationStatus};
-use oxideloop_controller_core::{MachineStateV0, RootSnapshotV0};
-use oxideloop_controller_runtime::{
+use controller_api::{ProgramBundleReference, WebApplicationSpec, WebApplicationStatus};
+use controller_core::{MachineStateV0, RootSnapshotV0};
+use controller_runtime::{
     BarrierV0, FixedPointPortV0, ModeV0, RootActorV0, RuntimeErrorV0,
     observation_token_for_barrier, reconcile_with_watch_restarts,
 };
-use oxideloop_kube_transport::TransportErrorV0;
-use oxideloop_renderer_abi::RenderInputV0;
-use oxideloop_renderer_abi::model::{
+use kube_transport::TransportErrorV0;
+use renderer_abi::RenderInputV0;
+use renderer_abi::model::{
     ABI_VERSION_V0, Dependency, RenderDisposition, RenderOutputV0, RootProjection,
 };
 
@@ -47,7 +47,7 @@ impl FixedPointPortV0 for TracePort {
     async fn observe_after_barrier(
         &mut self,
         _dependencies: &[Dependency],
-    ) -> Result<Vec<oxideloop_renderer_abi::model::Observation>, RuntimeErrorV0> {
+    ) -> Result<Vec<renderer_abi::model::Observation>, RuntimeErrorV0> {
         self.observed_calls += 1;
         Ok(vec![])
     }
@@ -74,8 +74,6 @@ fn actor() -> RootActorV0 {
                 message: None,
                 expose: false,
                 program: ProgramBundleReference {
-                    config_map_name: "bundle".into(),
-                    key: "program.mjs".into(),
                     digest: "a".repeat(64),
                 },
             },
@@ -109,8 +107,6 @@ fn input() -> RenderInputV0 {
                 message: None,
                 expose: false,
                 program: ProgramBundleReference {
-                    config_map_name: "bundle".into(),
-                    key: "program.mjs".into(),
                     digest: "a".repeat(64),
                 },
             })

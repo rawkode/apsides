@@ -120,13 +120,13 @@ capture_collision_regression_boundary() {
         return 1
       }
     }
-    run_one oxideloop-controller-core reducer::tests::blocked_foreign_collision_root_deletion_preempts_through_normal_deletion_boundary
-    run_one oxideloop-controller-runtime driver::tests::driver_root_deletion_preempts_blocked_collision_and_jsonl_is_correlated_and_deduped
-    run_one oxideloop-controller-runtime driver::tests::driver_stale_blocked_collision_witness_is_illegal_quiescence
-    run_one oxideloop-controller-runtime driver::tests::driver_ready_policy_dedupes_stable_jsonl_observation
-    run_one oxideloop-controller-runtime driver::tests::raw_root_self_echo_does_not_invalidate_a_prewrite_session
-    run_one oxideloop-controller-runtime driver::tests::real_transport_root_status_echo_restarts_the_full_prewrite_before_one_write
-    run_one oxideloop-controller-runtime adapters::tests::stale_or_unpinned_delete_never_erases_a_replacement
+    run_one controller-core reducer::tests::blocked_foreign_collision_root_deletion_preempts_through_normal_deletion_boundary
+    run_one controller-runtime driver::tests::driver_root_deletion_preempts_blocked_collision_and_jsonl_is_correlated_and_deduped
+    run_one controller-runtime driver::tests::driver_stale_blocked_collision_witness_is_illegal_quiescence
+    run_one controller-runtime driver::tests::driver_ready_policy_dedupes_stable_jsonl_observation
+    run_one controller-runtime driver::tests::raw_root_self_echo_does_not_invalidate_a_prewrite_session
+    run_one controller-runtime driver::tests::real_transport_root_status_echo_restarts_the_full_prewrite_before_one_write
+    run_one controller-runtime adapters::tests::stale_or_unpinned_delete_never_erases_a_replacement
   ' || die 'targeted collision regression tests failed'
 }
 ownership_reproducibility() {
@@ -371,8 +371,6 @@ spec:
   replicas: 0
   expose: true
   program:
-    configMapName: oxideloop-e2e-bundle
-    key: bundle.archive
     digest: $BUNDLE_DIGEST
 EOF
 }
@@ -468,7 +466,7 @@ collision_event_stream() {
     # Controller logs can contain unrelated structured diagnostics. Preserve
     # them separately, but keep rejecting malformed records that identify as
     # this runtime's collision-observability stream.
-    if printf '%s\n' "$line" | jq -e '(type == "object" and ((has("component") | not) or .component != "oxideloop-controller-runtime"))' >/dev/null 2>&1; then
+    if printf '%s\n' "$line" | jq -e '(type == "object" and ((has("component") | not) or .component != "controller-runtime"))' >/dev/null 2>&1; then
       printf '%s\n' "$line" >>"$unrelated_log"
       continue
     fi
@@ -478,7 +476,7 @@ collision_event_stream() {
       fromjson as $record |
       if ($record | type) != "object" then error("record is not an object") else $record end |
       if ((keys | sort) != ["acknowledgement_class","barrier_generation","cache_epoch","collision","command_class","command_detail","component","event","fence_token_sha256","phase","root_resource_version","root_uid","state_resource_version"]) then error("record field set is not exact") else . end |
-      if .component != "oxideloop-controller-runtime" then error("record component is not the runtime") else . end |
+      if .component != "controller-runtime" then error("record component is not the runtime") else . end |
       if (.event | nonempty) then . else error("record event is invalid") end |
       if (.root_uid | nonempty) and .root_uid == $rootUid then . else error("record root UID is not the expected root") end |
       if (.root_resource_version | type) != "string" or (.state_resource_version | type) != "string" then error("root/state resource versions are not strings") else . end |
@@ -698,25 +696,23 @@ pnpm bundle:e2e -- --out "$WORK/bundle.archive" --metadata "$WORK/bundle-metadat
 BUNDLE_DIGEST=$(jq -er '.buildBundle.bundleDigest' "$WORK/bundle-metadata.json")
 BUNDLE_SHA=$(jq -er '.buildBundle.archive.sha256' "$WORK/bundle-metadata.json")
 test "$(hash_file "$WORK/bundle.archive")" = "$BUNDLE_SHA" || die "bundle archive digest differs from metadata"
-base64 <"$WORK/bundle.archive" | tr -d '\n' >"$WORK/bundle.base64"
-cat >"$WORK/bundle-configmap.yaml" <<EOF
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: oxideloop-e2e-bundle
-  namespace: $NAMESPACE
-binaryData:
-  bundle.archive: $(cat "$WORK/bundle.base64")
-EOF
-ctx apply -f "$WORK/bundle-configmap.yaml"
+printf '%s\n' "$BUNDLE_DIGEST" >"$WORK/bundle.digest"
+BUNDLE_ARCHIVE_CONTEXT=${WORK#"$ROOT"/}/bundle.archive
+BUNDLE_DIGEST_CONTEXT=${WORK#"$ROOT"/}/bundle.digest
 
 PRODUCTION_IMAGE="oxideloop-e2e:production-$RUN_ID"
 FAILPOINT_IMAGE="oxideloop-e2e:failpoints-$RUN_ID"
 # Disable provenance attestations so each local tag resolves to one platform
 # manifest. Docker inspect then exposes both that manifest digest and its
 # config digest; Kubernetes reports the latter in container status.
-docker build --provenance=false --target production -t "$PRODUCTION_IMAGE" .
-docker build --provenance=false --target e2e-failpoints -t "$FAILPOINT_IMAGE" .
+docker build --provenance=false --target production \
+  --build-arg "OXIDELOOP_BUNDLE_ARCHIVE=$BUNDLE_ARCHIVE_CONTEXT" \
+  --build-arg "OXIDELOOP_BUNDLE_DIGEST_FILE=$BUNDLE_DIGEST_CONTEXT" \
+  -t "$PRODUCTION_IMAGE" .
+docker build --provenance=false --target e2e-failpoints \
+  --build-arg "OXIDELOOP_BUNDLE_ARCHIVE=$BUNDLE_ARCHIVE_CONTEXT" \
+  --build-arg "OXIDELOOP_BUNDLE_DIGEST_FILE=$BUNDLE_DIGEST_CONTEXT" \
+  -t "$FAILPOINT_IMAGE" .
 atomic_capture docker-image-production.inspect.json docker image inspect "$PRODUCTION_IMAGE" || die 'failed to capture production Docker inspect JSON'
 atomic_capture docker-image-failpoints.inspect.json docker image inspect "$FAILPOINT_IMAGE" || die 'failed to capture failpoint Docker inspect JSON'
 image_identity_from_inspect() {

@@ -70,7 +70,7 @@ fn sort_json(value: Value) -> Value {
 
 fn typescript_declarations() -> String {
     let mut output = String::from(
-        "// Generated from oxideloop-renderer-abi Rust types. Do not edit.\n\
+        "// Generated from renderer-abi Rust types. Do not edit.\n\
          export type JsonPrimitive = null | boolean | number | string;\n\
          export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };\n\n",
     );

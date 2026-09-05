@@ -27,39 +27,39 @@ use std::{
     path::PathBuf,
 };
 
-use oxideloop_bundle_archive::{ArchiveError, install_archive};
-use oxideloop_bundle_contract::{
+use bundle_archive::{ArchiveError, install_archive};
+use bundle_contract::{
     BundleDescriptorV0, BundleError, BundleStore, ExecutionPhaseV0, InstalledBundle,
 };
-use oxideloop_controller_api::{
+use controller_api::{
     AutomationRunCompletion, AutomationRunCompletionState, AutomationRunSpec, AutomationRunStatus,
     InventoryEntry, ObjectIdentity, WebApplicationSpec, WebApplicationStatus,
 };
-use oxideloop_controller_core::{
+use controller_core::{
     AutomationRunCleanupV0, CommandV0, DesiredObservationV0, EventV0, InternalReconcileCauseV0,
     MachineStateV0, PhaseV0, PreconditionsV0, RootSnapshotV0, reduce,
 };
-use oxideloop_event_planner::{
+use event_planner::{
     ObjectRef as PlannerObjectRefV0, PlannedEventV0, PlannerError, RunCorrelationV0, plan_event,
     semantically_equal,
 };
-use oxideloop_kube_transport::{
+use kube_transport::{
     DiscoveryPortV0, KubeTransportV0, ListV0, ObjectRefV0, OperationSessionV0, ResourceKindV0,
     TransportErrorV0, UnlinkedBootstrapDeletionCleanupV0, WatchEventV0, WatchHandleV0,
     bootstrap_authority_bundle_v1, bootstrap_authority_bundle_v1_matches_state,
     completed_unlinked_bootstrap_cleanup_bundle_v1,
 };
-use oxideloop_renderer_abi::{
+use renderer_abi::{
     model::{
         ActionInputV0, ActionOutputV0, Dependency, RenderInputV0, RenderOutputV0,
         ResourceDeclaration,
     },
     parse_validate_action_output, parse_validate_render_output,
 };
-use oxideloop_renderer_protocol::{
+use renderer_client::RendererClient;
+use renderer_protocol::{
     PhaseV0 as RendererPhaseV0, RequestIdV0, RequestV0, ResponseStatusV0, ResponseV0,
 };
-use renderer_client::RendererClient;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -283,7 +283,7 @@ pub struct ValidatedDeletionObservationV0 {
 pub(crate) struct DescriptorCommandCapabilityV0 {
     token: String,
     preconditions: PreconditionsV0,
-    program: oxideloop_controller_api::ProgramBundleReference,
+    program: controller_api::ProgramBundleReference,
     bundle_digest: String,
 }
 
@@ -294,7 +294,7 @@ impl DescriptorCommandCapabilityV0 {
     pub(crate) fn preconditions(&self) -> &PreconditionsV0 {
         &self.preconditions
     }
-    pub(crate) fn program(&self) -> &oxideloop_controller_api::ProgramBundleReference {
+    pub(crate) fn program(&self) -> &controller_api::ProgramBundleReference {
         &self.program
     }
     pub(crate) fn bundle_digest(&self) -> &str {
@@ -309,7 +309,7 @@ pub(crate) struct DeletionCommandCapabilityV0 {
     preconditions: PreconditionsV0,
     request_token: String,
     root: RootSnapshotV0,
-    durable: oxideloop_controller_api::StateBody,
+    durable: controller_api::StateBody,
 }
 
 impl DeletionCommandCapabilityV0 {
@@ -322,7 +322,7 @@ impl DeletionCommandCapabilityV0 {
     pub(crate) fn root(&self) -> &RootSnapshotV0 {
         &self.root
     }
-    pub(crate) fn durable(&self) -> &oxideloop_controller_api::StateBody {
+    pub(crate) fn durable(&self) -> &controller_api::StateBody {
         &self.durable
     }
 }
@@ -461,20 +461,20 @@ impl FixedPointProvenanceV0 {
 
 impl GenuineChangeV0 {
     fn from_observations(
-        observations: &[oxideloop_renderer_abi::model::Observation],
+        observations: &[renderer_abi::model::Observation],
         barrier: BarrierV0,
         retained_incarnation: u64,
     ) -> Result<Self, RuntimeErrorV0> {
         let snapshot = serde_json::to_value(observations).map_err(|_| {
             RuntimeErrorV0::Hold("retained dependency observations cannot be canonicalized".into())
         })?;
-        let canonical = oxideloop_renderer_abi::canonical_bytes(&snapshot).map_err(|_| {
+        let canonical = renderer_abi::canonical_bytes(&snapshot).map_err(|_| {
             RuntimeErrorV0::Hold("retained dependency observations cannot be canonicalized".into())
         })?;
         Ok(Self {
             barrier,
             retained_incarnation,
-            fingerprint: oxideloop_renderer_abi::sha256_hex(&canonical),
+            fingerprint: renderer_abi::sha256_hex(&canonical),
         })
     }
 }
@@ -588,7 +588,7 @@ pub trait AutomationPortV0: Send {
         &mut self,
         plan: &PlannedEventV0,
         event_time: &str,
-    ) -> Result<oxideloop_kube_transport::EventMaterializationRefV0, RuntimeErrorV0>;
+    ) -> Result<kube_transport::EventMaterializationRefV0, RuntimeErrorV0>;
     async fn persist_completion(
         &mut self,
         namespace: &str,
@@ -597,7 +597,7 @@ pub trait AutomationPortV0: Send {
         expected_resource_version: &str,
         expected_spec: &AutomationRunSpec,
         status: &AutomationRunStatus,
-    ) -> Result<oxideloop_kube_transport::AutomationCompletionAckV0, RuntimeErrorV0>;
+    ) -> Result<kube_transport::AutomationCompletionAckV0, RuntimeErrorV0>;
 }
 
 /// Immutable live references supplied by the exact rereads that ensured the
@@ -885,7 +885,7 @@ impl RootActorV0 {
                 .collect::<Vec<_>>()
         });
         serde_json::json!({
-            "component": "oxideloop-controller-runtime",
+            "component": "controller-runtime",
             "event": event,
             "root_uid": root.uid,
             "root_resource_version": root.root_resource_version,
@@ -1167,7 +1167,7 @@ impl RootActorV0 {
         let seed = FixedPointProvenanceSeedV0 {
             request_id: request_id.clone(),
             preconditions: preconditions.clone(),
-            initial_input_hash: oxideloop_renderer_abi::sha256_hex(&canonical_render_input(input)?),
+            initial_input_hash: renderer_abi::sha256_hex(&canonical_render_input(input)?),
             root_name: root.name.clone(),
             root_namespace: root.namespace.clone(),
             root_uid: root.uid.clone(),
@@ -1259,13 +1259,13 @@ impl RootActorV0 {
             String::from_utf8(render_input.clone()).map_err(|_| RuntimeErrorV0::RendererAbi)?;
         let render_output_json =
             String::from_utf8(render_output).map_err(|_| RuntimeErrorV0::RendererAbi)?;
-        let frozen = oxideloop_controller_core::FrozenInputV0 {
+        let frozen = controller_core::FrozenInputV0 {
             root_generation: preconditions.root_generation,
             state_resource_version: preconditions.state_resource_version.clone(),
             observation_token: preconditions.observation_token.clone(),
             cache_epoch: preconditions.cache_epoch.clone(),
             final_observation_fence_token: fence.token.clone(),
-            render_input_hash: oxideloop_renderer_abi::sha256_hex(&render_input),
+            render_input_hash: renderer_abi::sha256_hex(&render_input),
         };
         let observed = fence.desired_observations.clone();
         let event = match self.state.phase() {
@@ -1397,7 +1397,7 @@ impl RootActorV0 {
         })?;
         let input_hash = |input: &RenderInputV0| {
             canonical_render_input(input)
-                .map(|canonical| oxideloop_renderer_abi::sha256_hex(&canonical))
+                .map(|canonical| renderer_abi::sha256_hex(&canonical))
                 .map_err(|_| {
                     RuntimeErrorV0::Hold(
                         "completed fixed-point input cannot be canonicalized".into(),
@@ -1441,7 +1441,7 @@ impl RootActorV0 {
             || root.generation != provenance.seed.root_generation
             || root_spec != provenance.seed.root_spec
             || root.bundle_digest != provenance.seed.bundle_digest
-            || final_result.input.abi_version != oxideloop_renderer_abi::model::ABI_VERSION_V0
+            || final_result.input.abi_version != renderer_abi::model::ABI_VERSION_V0
             || !render_input_matches_root_and_barrier(&final_result.input, root, self.barrier)
             || final_result.input.root.spec != root_spec
             || final_result.input.bundle_digest != root.bundle_digest
@@ -1565,7 +1565,7 @@ impl RootActorV0 {
         self.pending_informer_readiness = None;
         self.observation_events.clear();
         self.barrier.generation = self.barrier.generation.saturating_add(1);
-        let observation_token = oxideloop_renderer_abi::sha256_hex(
+        let observation_token = renderer_abi::sha256_hex(
             format!(
                 "oxideloop-genuine-dependency-change/v0\0{}\0{}\0{}\0{}",
                 self.state.root().uid,
@@ -2143,7 +2143,7 @@ impl RootActorV0 {
                 "render observation does not match the owned request pins".into(),
             ));
         }
-        let fence_token_hash = oxideloop_renderer_abi::sha256_hex(observation.token().as_bytes());
+        let fence_token_hash = renderer_abi::sha256_hex(observation.token().as_bytes());
         self.accept_acknowledgement_with_fence(observation.event, Some(fence_token_hash))
     }
 
@@ -2180,7 +2180,7 @@ impl RootActorV0 {
             .find(|pending| pending.occurrence_id == *occurrence_id)
             .ok_or_else(|| RuntimeErrorV0::Hold("completion has no durable pending run".into()))?;
         let canonical =
-            oxideloop_renderer_abi::canonical_bytes(&serde_json::to_value(spec).map_err(|_| {
+            renderer_abi::canonical_bytes(&serde_json::to_value(spec).map_err(|_| {
                 RuntimeErrorV0::Hold("automation completion spec cannot be canonicalized".into())
             })?)
             .map_err(|_| {
@@ -2190,7 +2190,7 @@ impl RootActorV0 {
             || pending.run_name != *name
             || pending.run_uid != *uid
             || pending.run_resource_version != *old_resource_version
-            || pending.spec_hash != oxideloop_renderer_abi::sha256_hex(&canonical)
+            || pending.spec_hash != renderer_abi::sha256_hex(&canonical)
         {
             return Err(RuntimeErrorV0::Hold(
                 "automation completion does not match durable pending pins".into(),
@@ -2650,8 +2650,8 @@ impl RootActorV0 {
 }
 
 fn frozen_matches_preconditions(
-    frozen: &oxideloop_controller_core::FrozenInputV0,
-    preconditions: &oxideloop_controller_core::PreconditionsV0,
+    frozen: &controller_core::FrozenInputV0,
+    preconditions: &controller_core::PreconditionsV0,
 ) -> bool {
     frozen.root_generation == preconditions.root_generation
         && frozen.state_resource_version == preconditions.state_resource_version
@@ -2751,8 +2751,7 @@ fn specialized_effect_acknowledgement_event(
             Some("revalidation_completed")
         }
         (CommandV0::Persist { operation, .. }, EffectAcknowledgementClassV0::Other)
-            if operation.purpose
-                == oxideloop_controller_api::PersistPurpose::DispatchAuthorization =>
+            if operation.purpose == controller_api::PersistPurpose::DispatchAuthorization =>
         {
             Some("dispatch_authorization_acknowledged")
         }
@@ -2760,7 +2759,7 @@ fn specialized_effect_acknowledgement_event(
             Some("mutation_post_acknowledged")
         }
         (CommandV0::Persist { operation, .. }, EffectAcknowledgementClassV0::Other)
-            if operation.purpose == oxideloop_controller_api::PersistPurpose::MutationResult =>
+            if operation.purpose == controller_api::PersistPurpose::MutationResult =>
         {
             Some("mutation_result_persist_acknowledged")
         }
@@ -2800,12 +2799,10 @@ fn command_detail(command: &CommandV0) -> serde_json::Value {
             ..
         } => (
             Some(persist_purpose_name(operation.purpose)),
-            Some(oxideloop_renderer_abi::sha256_hex(
+            Some(renderer_abi::sha256_hex(
                 preconditions.observation_token.as_bytes(),
             )),
-            Some(oxideloop_renderer_abi::sha256_hex(
-                operation.token.as_bytes(),
-            )),
+            Some(renderer_abi::sha256_hex(operation.token.as_bytes())),
             None,
             None,
         ),
@@ -2817,10 +2814,8 @@ fn command_detail(command: &CommandV0) -> serde_json::Value {
             None,
             None,
             None,
-            Some(oxideloop_renderer_abi::sha256_hex(
-                transaction_id.as_bytes(),
-            )),
-            Some(oxideloop_renderer_abi::sha256_hex(attempt_token.as_bytes())),
+            Some(renderer_abi::sha256_hex(transaction_id.as_bytes())),
+            Some(renderer_abi::sha256_hex(attempt_token.as_bytes())),
         ),
         CommandV0::EnsureBootstrap { .. }
         | CommandV0::PersistRootStatus { .. }
@@ -2837,9 +2832,8 @@ fn command_detail(command: &CommandV0) -> serde_json::Value {
         | CommandV0::Hold { .. }
         | CommandV0::IgnoredStale { .. } => (None, None, None, None, None),
     };
-    let observation_token_hash = command_preconditions(command).map(|preconditions| {
-        oxideloop_renderer_abi::sha256_hex(preconditions.observation_token.as_bytes())
-    });
+    let observation_token_hash = command_preconditions(command)
+        .map(|preconditions| renderer_abi::sha256_hex(preconditions.observation_token.as_bytes()));
     serde_json::json!({
         "class": command_class(command),
         "persist_purpose": persist_purpose,
@@ -2871,32 +2865,26 @@ fn command_preconditions(command: &CommandV0) -> Option<&PreconditionsV0> {
     }
 }
 
-const fn persist_purpose_name(purpose: oxideloop_controller_api::PersistPurpose) -> &'static str {
+const fn persist_purpose_name(purpose: controller_api::PersistPurpose) -> &'static str {
     match purpose {
-        oxideloop_controller_api::PersistPurpose::Prepare => "prepare",
-        oxideloop_controller_api::PersistPurpose::DispatchAuthorization => "dispatch_authorization",
-        oxideloop_controller_api::PersistPurpose::Invalidate => "invalidate",
-        oxideloop_controller_api::PersistPurpose::MutationResult => "mutation_result",
-        oxideloop_controller_api::PersistPurpose::Completion => "completion",
-        oxideloop_controller_api::PersistPurpose::AutomationBaseline => "automation_baseline",
-        oxideloop_controller_api::PersistPurpose::AutomationPending => "automation_pending",
-        oxideloop_controller_api::PersistPurpose::AutomationCompletion => "automation_completion",
-        oxideloop_controller_api::PersistPurpose::DeletionStart => "deletion_start",
-        oxideloop_controller_api::PersistPurpose::DeletionPrepare => "deletion_prepare",
-        oxideloop_controller_api::PersistPurpose::DeletionMutationResult => {
-            "deletion_mutation_result"
-        }
-        oxideloop_controller_api::PersistPurpose::DeletionAutomationCleanup => {
-            "deletion_automation_cleanup"
-        }
-        oxideloop_controller_api::PersistPurpose::GenerationAdvanceClosure => {
-            "generation_advance_closure"
-        }
+        controller_api::PersistPurpose::Prepare => "prepare",
+        controller_api::PersistPurpose::DispatchAuthorization => "dispatch_authorization",
+        controller_api::PersistPurpose::Invalidate => "invalidate",
+        controller_api::PersistPurpose::MutationResult => "mutation_result",
+        controller_api::PersistPurpose::Completion => "completion",
+        controller_api::PersistPurpose::AutomationBaseline => "automation_baseline",
+        controller_api::PersistPurpose::AutomationPending => "automation_pending",
+        controller_api::PersistPurpose::AutomationCompletion => "automation_completion",
+        controller_api::PersistPurpose::DeletionStart => "deletion_start",
+        controller_api::PersistPurpose::DeletionPrepare => "deletion_prepare",
+        controller_api::PersistPurpose::DeletionMutationResult => "deletion_mutation_result",
+        controller_api::PersistPurpose::DeletionAutomationCleanup => "deletion_automation_cleanup",
+        controller_api::PersistPurpose::GenerationAdvanceClosure => "generation_advance_closure",
     }
 }
 
 fn fixed_point_request_id(preconditions: &PreconditionsV0) -> String {
-    oxideloop_renderer_abi::sha256_hex(
+    renderer_abi::sha256_hex(
         format!(
             "oxideloop-fixed-point-request/v0\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             preconditions.root_uid,
@@ -2912,7 +2900,7 @@ fn fixed_point_request_id(preconditions: &PreconditionsV0) -> String {
 }
 
 fn deletion_observation_request_token(preconditions: &PreconditionsV0) -> String {
-    oxideloop_renderer_abi::sha256_hex(
+    renderer_abi::sha256_hex(
         format!(
             "oxideloop-deletion-observation-request/v0\0{}\0{}\0{}\0{}\0{}",
             preconditions.root_uid,
@@ -3057,11 +3045,11 @@ pub(crate) fn coverage_dependencies(
         })
         .collect::<Vec<_>>();
     let normalized = normalize_dependencies(&dependencies)?;
-    let canonical = oxideloop_renderer_abi::canonical_bytes(
+    let canonical = renderer_abi::canonical_bytes(
         &serde_json::to_value(&normalized).map_err(|_| RuntimeErrorV0::RendererAbi)?,
     )
     .map_err(|_| RuntimeErrorV0::RendererAbi)?;
-    Ok((normalized, oxideloop_renderer_abi::sha256_hex(&canonical)))
+    Ok((normalized, renderer_abi::sha256_hex(&canonical)))
 }
 
 pub(crate) fn renderer_dependency_plan(
@@ -3120,13 +3108,12 @@ fn inventory_hash(inventory: &[InventoryEntry]) -> Result<String, RuntimeErrorV0
                 &right.bundle_digest,
             ))
     });
-    let canonical = oxideloop_renderer_abi::canonical_bytes(
-        &serde_json::to_value(canonical_inventory).map_err(|_| {
-            RuntimeErrorV0::Hold("durable inventory cannot be canonicalized".into())
-        })?,
-    )
-    .map_err(|_| RuntimeErrorV0::Hold("durable inventory cannot be canonicalized".into()))?;
-    Ok(oxideloop_renderer_abi::sha256_hex(&canonical))
+    let canonical =
+        renderer_abi::canonical_bytes(&serde_json::to_value(canonical_inventory).map_err(
+            |_| RuntimeErrorV0::Hold("durable inventory cannot be canonicalized".into()),
+        )?)
+        .map_err(|_| RuntimeErrorV0::Hold("durable inventory cannot be canonicalized".into()))?;
+    Ok(renderer_abi::sha256_hex(&canonical))
 }
 
 #[derive(Default)]
@@ -3157,7 +3144,7 @@ fn metadata_finalizers<'a>(
 /// deliberately local and narrow: callers must nominate the exact root key,
 /// while the typed spec/status parsers reject unknown authored/status fields.
 pub fn root_snapshot_from_object(
-    object: &oxideloop_kube_transport::ObjectV0,
+    object: &kube_transport::ObjectV0,
     namespace: &str,
     name: &str,
 ) -> Result<RootSnapshotV0, RuntimeErrorV0> {
@@ -3231,7 +3218,7 @@ pub fn root_snapshot_from_object(
         root_resource_version: object.metadata.resource_version.clone(),
         root_finalizer_present: finalizers
             .iter()
-            .any(|value| value.as_str() == Some(oxideloop_controller_api::ROOT_FINALIZER)),
+            .any(|value| value.as_str() == Some(controller_api::ROOT_FINALIZER)),
         state_finalizer_present: false,
         deleting: metadata
             .get("deletionTimestamp")
@@ -3251,7 +3238,7 @@ trait LoaderRereadPortV0: Sync {
     async fn reread_object(
         &self,
         reference: &ObjectRefV0,
-    ) -> Result<Option<oxideloop_kube_transport::ObjectV0>, TransportErrorV0>;
+    ) -> Result<Option<kube_transport::ObjectV0>, TransportErrorV0>;
 }
 
 #[async_trait]
@@ -3259,7 +3246,7 @@ impl LoaderRereadPortV0 for KubeTransportV0 {
     async fn reread_object(
         &self,
         reference: &ObjectRefV0,
-    ) -> Result<Option<oxideloop_kube_transport::ObjectV0>, TransportErrorV0> {
+    ) -> Result<Option<kube_transport::ObjectV0>, TransportErrorV0> {
         self.reread(reference).await
     }
 }
@@ -3285,7 +3272,7 @@ impl LoaderRereadPortV0 for PrewriteOperationLoaderRereadPortV0<'_> {
     async fn reread_object(
         &self,
         reference: &ObjectRefV0,
-    ) -> Result<Option<oxideloop_kube_transport::ObjectV0>, TransportErrorV0> {
+    ) -> Result<Option<kube_transport::ObjectV0>, TransportErrorV0> {
         self.transport
             .reread_prewrite_in_operation(reference, self.operation)
             .await
@@ -3297,7 +3284,7 @@ impl LoaderRereadPortV0 for OperationLoaderRereadPortV0<'_> {
     async fn reread_object(
         &self,
         reference: &ObjectRefV0,
-    ) -> Result<Option<oxideloop_kube_transport::ObjectV0>, TransportErrorV0> {
+    ) -> Result<Option<kube_transport::ObjectV0>, TransportErrorV0> {
         self.transport
             .reread_in_operation(reference, self.operation)
             .await
@@ -3309,7 +3296,7 @@ async fn recover_unlinked_deleting_root<P: LoaderRereadPortV0>(
     namespace: &str,
     snapshot: RootSnapshotV0,
 ) -> Result<Option<MachineStateV0>, RuntimeErrorV0> {
-    let receipt = oxideloop_controller_core::validate_deleting_root_receipt(&snapshot)
+    let receipt = controller_core::validate_deleting_root_receipt(&snapshot)
         .map_err(|error| RuntimeErrorV0::Hold(error.to_string()))?;
     let state_ref = ObjectRefV0 {
         resource: ResourceKindV0::OxideLoopState,
@@ -3330,7 +3317,7 @@ async fn recover_unlinked_deleting_root<P: LoaderRereadPortV0>(
 /// State name must be absent before a restart may treat the cleanup as done.
 async fn completed_unlinked_bootstrap_cleanup_v1<P: LoaderRereadPortV0>(
     transport: &P,
-    root: &oxideloop_kube_transport::ObjectV0,
+    root: &kube_transport::ObjectV0,
 ) -> Result<bool, RuntimeErrorV0> {
     let bundle = completed_unlinked_bootstrap_cleanup_bundle_v1(root).map_err(|_| {
         RuntimeErrorV0::Hold("completed unlinked bootstrap cleanup bundle is malformed".into())
@@ -3357,8 +3344,8 @@ async fn completed_unlinked_bootstrap_cleanup_v1<P: LoaderRereadPortV0>(
     }
 }
 
-fn validate_state_status(state: &oxideloop_kube_transport::ObjectV0) -> Result<(), RuntimeErrorV0> {
-    serde_json::from_value::<oxideloop_controller_api::OxideLoopStateStatus>(
+fn validate_state_status(state: &kube_transport::ObjectV0) -> Result<(), RuntimeErrorV0> {
+    serde_json::from_value::<controller_api::OxideLoopStateStatus>(
         state
             .value
             .get("status")
@@ -3372,9 +3359,9 @@ fn validate_state_status(state: &oxideloop_kube_transport::ObjectV0) -> Result<(
 fn install_linked_state_pins(
     snapshot: &mut RootSnapshotV0,
     namespace: &str,
-    link: &oxideloop_controller_api::StateLink,
+    link: &controller_api::StateLink,
     state_ref: &ObjectRefV0,
-    state: &oxideloop_kube_transport::ObjectV0,
+    state: &kube_transport::ObjectV0,
 ) -> Result<(), RuntimeErrorV0> {
     if state.reference != *state_ref
         || state.metadata.uid != link.uid
@@ -3406,7 +3393,7 @@ fn install_linked_state_pins(
     let finalizers = metadata_finalizers(metadata, "linked state finalizers are invalid")?;
     if !finalizers
         .iter()
-        .any(|value| value.as_str() == Some(oxideloop_controller_api::STATE_FINALIZER))
+        .any(|value| value.as_str() == Some(controller_api::STATE_FINALIZER))
     {
         return Err(RuntimeErrorV0::Hold(
             "linked state finalizer is absent".into(),
@@ -3417,7 +3404,7 @@ fn install_linked_state_pins(
         .and_then(Value::as_object)
         .ok_or_else(|| RuntimeErrorV0::Hold("linked state annotations are invalid".into()))?;
     let annotated_root_uid = annotations
-        .get(oxideloop_kube_transport::ROOT_UID_ANNOTATION)
+        .get(kube_transport::ROOT_UID_ANNOTATION)
         .and_then(Value::as_str)
         .filter(|value| *value == snapshot.uid)
         .ok_or_else(|| {
@@ -3426,7 +3413,7 @@ fn install_linked_state_pins(
     if state
         .metadata
         .annotations
-        .get(oxideloop_kube_transport::ROOT_UID_ANNOTATION)
+        .get(kube_transport::ROOT_UID_ANNOTATION)
         .is_none_or(|value| value != annotated_root_uid)
     {
         return Err(RuntimeErrorV0::Hold(
@@ -3467,9 +3454,9 @@ fn install_linked_state_pins(
 fn classify_retired_state_tombstone(
     snapshot: &mut RootSnapshotV0,
     namespace: &str,
-    link: &oxideloop_controller_api::StateLink,
+    link: &controller_api::StateLink,
     state_ref: &ObjectRefV0,
-    state: &oxideloop_kube_transport::ObjectV0,
+    state: &kube_transport::ObjectV0,
 ) -> Result<bool, RuntimeErrorV0> {
     let metadata = state
         .value
@@ -3485,9 +3472,9 @@ fn classify_retired_state_tombstone(
     if !snapshot.deleting {
         return Ok(false);
     }
-    let deterministic_name = oxideloop_controller_api::state_name(&snapshot.uid)
+    let deterministic_name = controller_api::state_name(&snapshot.uid)
         .map_err(|error| RuntimeErrorV0::Hold(error.to_string()))?;
-    let receipt = oxideloop_controller_core::validate_deleting_root_receipt(snapshot)
+    let receipt = controller_core::validate_deleting_root_receipt(snapshot)
         .map_err(|error| RuntimeErrorV0::Hold(error.to_string()))?
         .clone();
     if !snapshot.root_finalizer_present
@@ -3519,7 +3506,7 @@ fn classify_retired_state_tombstone(
         .and_then(Value::as_object)
         .ok_or_else(|| RuntimeErrorV0::Hold("retired State annotations are invalid".into()))?;
     let raw_root_uid = annotations
-        .get(oxideloop_kube_transport::ROOT_UID_ANNOTATION)
+        .get(kube_transport::ROOT_UID_ANNOTATION)
         .and_then(Value::as_str)
         .filter(|value| *value == snapshot.uid)
         .ok_or_else(|| {
@@ -3528,7 +3515,7 @@ fn classify_retired_state_tombstone(
     if state
         .metadata
         .annotations
-        .get(oxideloop_kube_transport::ROOT_UID_ANNOTATION)
+        .get(kube_transport::ROOT_UID_ANNOTATION)
         .is_none_or(|value| value != raw_root_uid)
     {
         return Err(RuntimeErrorV0::Hold(
@@ -3609,7 +3596,7 @@ async fn fresh_root_snapshot_from_reader<P: LoaderRereadPortV0>(
         if !snapshot.deleting {
             return Ok(snapshot);
         }
-        let receipt = oxideloop_controller_core::validate_deleting_root_receipt(&snapshot)
+        let receipt = controller_core::validate_deleting_root_receipt(&snapshot)
             .map_err(|error| RuntimeErrorV0::Hold(error.to_string()))?;
         let state_ref = ObjectRefV0 {
             resource: ResourceKindV0::OxideLoopState,
@@ -3624,7 +3611,7 @@ async fn fresh_root_snapshot_from_reader<P: LoaderRereadPortV0>(
         }
         return recover_deleting_root_without_state(snapshot).map(|machine| machine.root().clone());
     };
-    let deterministic_state_name = oxideloop_controller_api::state_name(&snapshot.uid)
+    let deterministic_state_name = controller_api::state_name(&snapshot.uid)
         .map_err(|error| RuntimeErrorV0::Hold(error.to_string()))?;
     if link.root_uid != snapshot.uid || link.name != deterministic_state_name || link.uid.is_empty()
     {
@@ -3789,7 +3776,7 @@ async fn load_machine_from_root_reader<P: LoaderRereadPortV0>(
     transport: &P,
     namespace: &str,
     name: &str,
-    root: oxideloop_kube_transport::ObjectV0,
+    root: kube_transport::ObjectV0,
 ) -> Result<Option<MachineStateV0>, RuntimeErrorV0> {
     let mut snapshot = root_snapshot_from_object(&root, namespace, name)?;
     let Some(link) = snapshot.status.state.clone() else {
@@ -3817,7 +3804,7 @@ async fn load_machine_from_root_reader<P: LoaderRereadPortV0>(
             .map(Some)
             .map_err(|error| RuntimeErrorV0::Hold(error.to_string()));
     };
-    let deterministic_state_name = oxideloop_controller_api::state_name(&snapshot.uid)
+    let deterministic_state_name = controller_api::state_name(&snapshot.uid)
         .map_err(|error| RuntimeErrorV0::Hold(error.to_string()))?;
     if link.root_uid != snapshot.uid || link.name != deterministic_state_name || link.uid.is_empty()
     {
@@ -3840,7 +3827,7 @@ async fn load_machine_from_root_reader<P: LoaderRereadPortV0>(
             .map_err(|error| RuntimeErrorV0::Hold(error.to_string()));
     }
     install_linked_state_pins(&mut snapshot, namespace, &link, &state_ref, &state)?;
-    let journal: oxideloop_controller_api::OxideLoopStateSpec = serde_json::from_value(
+    let journal: controller_api::OxideLoopStateSpec = serde_json::from_value(
         state
             .value
             .get("spec")
@@ -3870,7 +3857,7 @@ impl ControllerRuntimeV0 {
 /// this boundary because Kubernetes cannot make a multi-object batch atomic.
 pub async fn dispatch_transport_command(
     transport: &KubeTransportV0,
-    address: &oxideloop_kube_transport::RootAddressV0,
+    address: &kube_transport::RootAddressV0,
     command: &CommandV0,
 ) -> Result<Option<EventV0>, RuntimeErrorV0> {
     dispatch_transport_command_in_operation(
@@ -3888,7 +3875,7 @@ pub async fn dispatch_transport_command(
 /// a command or its budget.
 pub async fn dispatch_transport_command_in_operation(
     transport: &KubeTransportV0,
-    address: &oxideloop_kube_transport::RootAddressV0,
+    address: &kube_transport::RootAddressV0,
     command: &CommandV0,
     operation: &OperationSessionV0,
 ) -> Result<Option<EventV0>, RuntimeErrorV0> {
@@ -3897,14 +3884,12 @@ pub async fn dispatch_transport_command_in_operation(
         .dispatch_in_operation(address, command, operation)
         .await?
     {
-        oxideloop_kube_transport::CommandOutcomeV0::Event(event) => Ok(Some(*event)),
+        kube_transport::CommandOutcomeV0::Event(event) => Ok(Some(*event)),
         // Bootstrap is a deliberately resumable multi-write effect.  Retain
         // command ownership and retry it rather than acknowledging early.
-        oxideloop_kube_transport::CommandOutcomeV0::NeedsSequencing { .. }
-        | oxideloop_kube_transport::CommandOutcomeV0::NotKubernetesEffect => Ok(None),
-        oxideloop_kube_transport::CommandOutcomeV0::Hold { reason } => {
-            Err(RuntimeErrorV0::Hold(reason))
-        }
+        kube_transport::CommandOutcomeV0::NeedsSequencing { .. }
+        | kube_transport::CommandOutcomeV0::NotKubernetesEffect => Ok(None),
+        kube_transport::CommandOutcomeV0::Hold { reason } => Err(RuntimeErrorV0::Hold(reason)),
     }
 }
 
@@ -3925,7 +3910,7 @@ fn validate_transport_command_shape(command: &CommandV0) -> Result<(), RuntimeEr
 pub async fn drive_kubernetes_until_external(
     actor: &mut RootActorV0,
     transport: &KubeTransportV0,
-    address: &oxideloop_kube_transport::RootAddressV0,
+    address: &kube_transport::RootAddressV0,
 ) -> Result<Option<CommandV0>, RuntimeErrorV0> {
     let mut dispatcher = SealedKubernetesDispatcherV0 { transport, address };
     drive_kubernetes_with_dispatcher(actor, &mut dispatcher).await
@@ -3939,7 +3924,7 @@ trait KubernetesDispatcherV0 {
 
 struct SealedKubernetesDispatcherV0<'a> {
     transport: &'a KubeTransportV0,
-    address: &'a oxideloop_kube_transport::RootAddressV0,
+    address: &'a kube_transport::RootAddressV0,
 }
 
 #[async_trait]
@@ -4139,7 +4124,7 @@ pub trait FixedPointPortV0: Send {
     async fn observe_after_barrier(
         &mut self,
         dependencies: &[Dependency],
-    ) -> Result<Vec<oxideloop_renderer_abi::model::Observation>, RuntimeErrorV0>;
+    ) -> Result<Vec<renderer_abi::model::Observation>, RuntimeErrorV0>;
 
     /// Installs the current global barrier without manufacturing a renderer
     /// observation transition.  Concrete ports use it to bind a fresh
@@ -4156,7 +4141,7 @@ pub trait FixedPointPortV0: Send {
 /// stale observation cannot be mistaken for one from the restarted epoch.
 #[must_use]
 pub fn observation_token_for_barrier(token: &str, barrier: BarrierV0) -> String {
-    oxideloop_renderer_abi::sha256_hex(
+    renderer_abi::sha256_hex(
         format!(
             "oxideloop-observation-v0\\0{token}\\0{}\\0{}",
             barrier.generation, barrier.cache_epoch
@@ -4232,7 +4217,7 @@ pub struct CompletedObservationFenceV0 {
     barrier: BarrierV0,
     sequence: u64,
     dependencies: Vec<Dependency>,
-    renderer_observations: Vec<oxideloop_renderer_abi::model::Observation>,
+    renderer_observations: Vec<renderer_abi::model::Observation>,
     desired_observations: Vec<DesiredObservationV0>,
 }
 
@@ -4258,7 +4243,7 @@ impl CompletedObservationFenceV0 {
     }
 
     #[must_use]
-    pub fn renderer_observations(&self) -> &[oxideloop_renderer_abi::model::Observation] {
+    pub fn renderer_observations(&self) -> &[renderer_abi::model::Observation] {
         &self.renderer_observations
     }
 
@@ -4283,10 +4268,10 @@ fn completed_observation_fence_token(
     sequence: u64,
     final_snapshot: &serde_json::Value,
 ) -> String {
-    let canonical = oxideloop_renderer_abi::canonical_bytes(final_snapshot)
+    let canonical = renderer_abi::canonical_bytes(final_snapshot)
         .expect("completed observation fence snapshot is serializable JSON");
-    let snapshot_hash = oxideloop_renderer_abi::sha256_hex(&canonical);
-    oxideloop_renderer_abi::sha256_hex(
+    let snapshot_hash = renderer_abi::sha256_hex(&canonical);
+    renderer_abi::sha256_hex(
         format!(
             "oxideloop-completed-observation-fence/v0\0{root_uid}\0{}\0{sequence}\0{snapshot_hash}",
             barrier.cache_epoch
@@ -4351,7 +4336,7 @@ pub struct ObservationBarrierV0 {
     /// list/watch/reread snapshot covers.
     pub dependencies: Vec<Dependency>,
     pub collections: BTreeMap<(ResourceKindV0, String), ListV0>,
-    pub objects: Vec<(ObjectRefV0, Option<oxideloop_kube_transport::ObjectV0>)>,
+    pub objects: Vec<(ObjectRefV0, Option<kube_transport::ObjectV0>)>,
     pub(crate) watches: Vec<WatchHandleV0>,
 }
 
@@ -4504,7 +4489,7 @@ pub fn canonical_render_input(input: &RenderInputV0) -> Result<Vec<u8>, RuntimeE
     serde_json::to_string(input)
         .map_err(|_| RuntimeErrorV0::RendererAbi)
         .and_then(|json| {
-            oxideloop_renderer_abi::parse_validate_render_input(&json)
+            renderer_abi::parse_validate_render_input(&json)
                 .map(|validated| validated.canonical_bytes)
                 .map_err(|_| RuntimeErrorV0::RendererAbi)
         })
@@ -4514,7 +4499,7 @@ pub fn canonical_action_input(input: &ActionInputV0) -> Result<Vec<u8>, RuntimeE
     serde_json::to_string(input)
         .map_err(|_| RuntimeErrorV0::RendererAbi)
         .and_then(|json| {
-            oxideloop_renderer_abi::parse_validate_action_input(&json)
+            renderer_abi::parse_validate_action_input(&json)
                 .map(|validated| validated.canonical_bytes)
                 .map_err(|_| RuntimeErrorV0::RendererAbi)
         })
@@ -4580,7 +4565,7 @@ pub async fn drive_automation<P: AutomationPortV0, R: RendererPortV0>(
         &spec.action_module_identity,
         &spec.action_module_digest,
     )?;
-    let input = oxideloop_renderer_abi::parse_validate_action_input(&spec.action_input_v0)
+    let input = renderer_abi::parse_validate_action_input(&spec.action_input_v0)
         .map_err(|_| RuntimeErrorV0::RendererAbi)?;
     if input.canonical_bytes != spec.action_input_v0.as_bytes() {
         return Err(RuntimeErrorV0::RendererAbi);
@@ -4703,24 +4688,24 @@ mod tests {
     };
 
     use super::*;
-    use http::{Method, Request, Response};
-    use http_body_util::BodyExt;
-    use kube::{Client, client::Body};
-    use oxideloop_controller_api::{
+    use controller_api::{
         ApplyOutcome, ApplyResult, AutomationPending, DeletionTransaction,
         GenerationAdvanceClosurePurpose, InventoryEntry, ObjectIdentity, OxideLoopStateSpec,
         PersistPurpose, ProgramBundleReference, RootBinding, StateBody, StateLink,
         WebApplicationSpec, WebApplicationStatus, bootstrap_id,
     };
-    use oxideloop_controller_core::{
+    use controller_core::{
         ActionTriggerV0, AutomationRunCleanupV0, DesiredObservationV0, FrozenInputV0,
         RecoveryProofV0, RootSnapshotV0, TransitionV0, automation_source_transition_token,
     };
-    use oxideloop_kube_transport::{
+    use http::{Method, Request, Response};
+    use http_body_util::BodyExt;
+    use kube::{Client, client::Body};
+    use kube_transport::{
         ConflictProvenanceV0, ObjectMetaV0, ObjectV0, WatchEventV0, WatchStageV0,
     };
-    use oxideloop_mutation_model::{BackendQualification, Observation};
-    use oxideloop_renderer_abi::model::{
+    use mutation_model::{BackendQualification, Observation};
+    use renderer_abi::model::{
         ABI_VERSION_V0, RenderDisposition, ResourceDeclaration, RootProjection,
     };
 
@@ -4731,13 +4716,11 @@ mod tests {
             message: None,
             expose: false,
             program: ProgramBundleReference {
-                config_map_name: "bundle".into(),
-                key: "program.mjs".into(),
                 digest: digest.into(),
             },
         }
     }
-    use oxideloop_renderer_abi::parse_validate_render_input;
+    use renderer_abi::parse_validate_render_input;
     use tower::service_fn;
 
     #[allow(clippy::needless_pass_by_value)]
@@ -4789,7 +4772,7 @@ mod tests {
             "resourceVersion": root.root_resource_version,
             "generation": root.generation,
             "finalizers": if root.root_finalizer_present {
-                vec![oxideloop_controller_api::ROOT_FINALIZER]
+                vec![controller_api::ROOT_FINALIZER]
             } else {
                 vec![]
             },
@@ -4829,7 +4812,7 @@ mod tests {
                 uid: root.state_uid.clone(),
                 resource_version: state_rv.into(),
                 annotations: BTreeMap::from([(
-                    oxideloop_kube_transport::ROOT_UID_ANNOTATION.into(),
+                    kube_transport::ROOT_UID_ANNOTATION.into(),
                     root.uid.clone(),
                 )]),
                 owner_uids: vec![root.uid.clone()],
@@ -4843,12 +4826,12 @@ mod tests {
                     "uid": root.state_uid,
                     "resourceVersion": state_rv,
                     "finalizers": if root.state_finalizer_present {
-                        vec![oxideloop_controller_api::STATE_FINALIZER]
+                        vec![controller_api::STATE_FINALIZER]
                     } else {
                         vec![]
                     },
                     "annotations": {
-                        oxideloop_kube_transport::ROOT_UID_ANNOTATION: root.uid,
+                        kube_transport::ROOT_UID_ANNOTATION: root.uid,
                     },
                     "ownerReferences": [{
                         "apiVersion": "demo.oxideloop.dev/v1alpha1",
@@ -4893,39 +4876,36 @@ mod tests {
     async fn loader_recognizes_completed_unlinked_v1_cleanup_and_rejects_nondeterministic_tail_state_name()
      {
         let root_uid = "root-uid";
-        let state_name = oxideloop_controller_api::state_name(root_uid)
+        let state_name = controller_api::state_name(root_uid)
             .expect("fixture UID has a deterministic State name");
         let annotations = BTreeMap::from([
+            (kube_transport::ROOT_UID_ANNOTATION.into(), root_uid.into()),
             (
-                oxideloop_kube_transport::ROOT_UID_ANNOTATION.into(),
-                root_uid.into(),
-            ),
-            (
-                oxideloop_kube_transport::TRANSACTION_ID_ANNOTATION.into(),
+                kube_transport::TRANSACTION_ID_ANNOTATION.into(),
                 "bootstrap-token".into(),
             ),
             (
-                oxideloop_kube_transport::COMMAND_ID_ANNOTATION.into(),
+                kube_transport::COMMAND_ID_ANNOTATION.into(),
                 "bootstrap-token".into(),
             ),
             (
-                oxideloop_kube_transport::BOOTSTRAP_AUTHORITY_VERSION_ANNOTATION.into(),
-                oxideloop_kube_transport::BOOTSTRAP_AUTHORITY_VERSION_V1.into(),
+                kube_transport::BOOTSTRAP_AUTHORITY_VERSION_ANNOTATION.into(),
+                kube_transport::BOOTSTRAP_AUTHORITY_VERSION_V1.into(),
             ),
             (
-                oxideloop_kube_transport::BOOTSTRAP_STATE_NAME_ANNOTATION.into(),
+                kube_transport::BOOTSTRAP_STATE_NAME_ANNOTATION.into(),
                 state_name,
             ),
             (
-                oxideloop_kube_transport::BOOTSTRAP_STATE_UID_ANNOTATION.into(),
+                kube_transport::BOOTSTRAP_STATE_UID_ANNOTATION.into(),
                 "old-state-uid".into(),
             ),
             (
-                oxideloop_kube_transport::BOOTSTRAP_STATE_SPEC_DIGEST_ANNOTATION.into(),
+                kube_transport::BOOTSTRAP_STATE_SPEC_DIGEST_ANNOTATION.into(),
                 "a".repeat(64),
             ),
             (
-                oxideloop_kube_transport::BOOTSTRAP_PROOF_TOKEN_ANNOTATION.into(),
+                kube_transport::BOOTSTRAP_PROOF_TOKEN_ANNOTATION.into(),
                 "bootstrap-token".into(),
             ),
         ]);
@@ -4949,7 +4929,7 @@ mod tests {
                     "resourceVersion": "root-rv", "generation": 1,
                     "deletionTimestamp": "2026-08-31T00:00:00Z",
                     "finalizers": [
-                        oxideloop_controller_api::ROOT_FINALIZER,
+                        controller_api::ROOT_FINALIZER,
                         "example.test/other-finalizer"
                     ],
                     "annotations": annotations,
@@ -4965,7 +4945,7 @@ mod tests {
             "apiVersion": "runtime.oxideloop.dev/v1alpha1",
             "kind": "OxideLoopState",
             "metadata": {
-                "name": oxideloop_controller_api::state_name(root_uid)
+                "name": controller_api::state_name(root_uid)
                     .expect("fixture root UID has a deterministic State name"),
                 "namespace": "ns",
                 "uid": "replacement-state-uid",
@@ -5047,11 +5027,11 @@ mod tests {
             let mut wire = wire.lock().expect("wire is writable");
             let alternate_state_name = "another-valid-state";
             wire.0.metadata.annotations.insert(
-                oxideloop_kube_transport::BOOTSTRAP_STATE_NAME_ANNOTATION.into(),
+                kube_transport::BOOTSTRAP_STATE_NAME_ANNOTATION.into(),
                 alternate_state_name.into(),
             );
             wire.0.value["metadata"]["annotations"]
-                [oxideloop_kube_transport::BOOTSTRAP_STATE_NAME_ANNOTATION] =
+                [kube_transport::BOOTSTRAP_STATE_NAME_ANNOTATION] =
                 serde_json::json!(alternate_state_name);
         }
         assert!(matches!(
@@ -5116,7 +5096,7 @@ mod tests {
             .as_ref()
             .expect("receipt")
             .clone();
-        root.status.state = Some(oxideloop_controller_api::StateLink {
+        root.status.state = Some(controller_api::StateLink {
             root_uid: root.uid.clone(),
             name: receipt.state_name.clone(),
             uid: receipt.state_uid.clone(),
@@ -5174,7 +5154,7 @@ mod tests {
 
         let mut wrong_annotation = accepted.clone();
         wrong_annotation.objects[1].value["metadata"]["annotations"]
-            [oxideloop_kube_transport::ROOT_UID_ANNOTATION] = serde_json::json!("other-root");
+            [kube_transport::ROOT_UID_ANNOTATION] = serde_json::json!("other-root");
         assert!(matches!(
             load_machine_from_reader(&wrong_annotation, "ns", "demo").await,
             Err(RuntimeErrorV0::Hold(error)) if error.contains("retired State root UID annotation")
@@ -5224,7 +5204,7 @@ mod tests {
             domain_annotation_disagrees_with_raw_pin,
             |loader: &mut LoaderPort| {
                 loader.objects[1].metadata.annotations.insert(
-                    oxideloop_kube_transport::ROOT_UID_ANNOTATION.into(),
+                    kube_transport::ROOT_UID_ANNOTATION.into(),
                     "other-root".into(),
                 );
             }
@@ -5277,7 +5257,7 @@ mod tests {
 
         let mut mismatched_annotation = loader_port_for_machine(&machine, "state-rv-2");
         mismatched_annotation.objects[1].value["metadata"]["annotations"]
-            [oxideloop_kube_transport::ROOT_UID_ANNOTATION] = Value::String("foreign-root".into());
+            [kube_transport::ROOT_UID_ANNOTATION] = Value::String("foreign-root".into());
         assert!(matches!(
             load_machine_from_reader(&mismatched_annotation, "ns", "demo").await,
             Err(RuntimeErrorV0::Hold(error)) if error == "linked state root UID annotation is invalid"
@@ -5288,7 +5268,7 @@ mod tests {
             .metadata
             .annotations
             .insert(
-                oxideloop_kube_transport::ROOT_UID_ANNOTATION.into(),
+                kube_transport::ROOT_UID_ANNOTATION.into(),
                 "foreign-root".into(),
             );
         assert!(matches!(
@@ -5376,7 +5356,7 @@ mod tests {
         BundleDescriptorV0 {
             descriptor_version: "oxideloop.dev/descriptor/v0".into(),
             renderer_abi_version: ABI_VERSION_V0.into(),
-            render_module: oxideloop_bundle_contract::DescriptorModuleV0 {
+            render_module: bundle_contract::DescriptorModuleV0 {
                 identity: "render/main.mjs".into(),
                 digest: "a".repeat(64),
             },
@@ -5525,7 +5505,7 @@ mod tests {
     }
 
     fn linked_machine() -> MachineStateV0 {
-        let linked_state_name = oxideloop_controller_api::state_name("root-uid").unwrap();
+        let linked_state_name = controller_api::state_name("root-uid").unwrap();
         MachineStateV0::new(
             RootSnapshotV0 {
                 uid: "root-uid".into(),
@@ -5555,7 +5535,7 @@ mod tests {
                 deleting: false,
             },
             OxideLoopStateSpec {
-                state_version: oxideloop_controller_api::STATE_VERSION_V1,
+                state_version: controller_api::STATE_VERSION_V1,
                 root: RootBinding {
                     uid: "root-uid".into(),
                     bootstrap_id: bootstrap_id("root-uid").unwrap(),
@@ -5699,7 +5679,7 @@ mod tests {
             final_observation_fence_token: "f".repeat(64),
             render_input_hash: parse_validate_render_input(&input).unwrap().sha256,
         };
-        let identity = oxideloop_controller_api::ObjectIdentity {
+        let identity = controller_api::ObjectIdentity {
             api_version: "v1".into(),
             kind: "ConfigMap".into(),
             namespace: "ns".into(),
@@ -5911,7 +5891,7 @@ mod tests {
             automation_version: "v1".into(),
             action_module_identity: "actions/smoke.mjs".into(),
             action_module_digest: "b".repeat(64),
-            source: oxideloop_controller_api::ObjectIdentity {
+            source: controller_api::ObjectIdentity {
                 api_version: "v1".into(),
                 kind: "ConfigMap".into(),
                 namespace: "ns".into(),
@@ -6242,7 +6222,7 @@ mod tests {
             "automationId": "smoke",
             "automationVersion": "v1",
             "bundleDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "program": {"configMapName":"bundle","key":"program.mjs","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+            "program": {"digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
             "actionModuleIdentity": "action.mjs",
             "actionModuleDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "rendererAbiVersion": "renderer.oxideloop.dev/v0",
@@ -6273,9 +6253,9 @@ mod tests {
         actor
     }
 
-    fn deletion_address(actor: &RootActorV0) -> oxideloop_kube_transport::RootAddressV0 {
+    fn deletion_address(actor: &RootActorV0) -> kube_transport::RootAddressV0 {
         let root = actor.state().root();
-        oxideloop_kube_transport::RootAddressV0 {
+        kube_transport::RootAddressV0 {
             namespace: root.namespace.clone(),
             name: root.name.clone(),
             state_name: root.state_name.clone(),
@@ -6549,7 +6529,7 @@ mod tests {
     }
 
     fn deletion_mutation_pending() -> (MachineStateV0, EventV0) {
-        let identity = oxideloop_controller_api::ObjectIdentity {
+        let identity = controller_api::ObjectIdentity {
             api_version: "v1".into(),
             kind: "ConfigMap".into(),
             namespace: "ns".into(),
@@ -6607,7 +6587,7 @@ mod tests {
     }
 
     fn deletion_automation_cleanup_pending() -> (MachineStateV0, EventV0) {
-        let source = oxideloop_controller_api::ObjectIdentity {
+        let source = controller_api::ObjectIdentity {
             api_version: "v1".into(),
             kind: "ConfigMap".into(),
             namespace: "ns".into(),
@@ -6831,7 +6811,7 @@ mod tests {
             diagnostics: vec![],
         })
         .unwrap();
-        let identity = oxideloop_controller_api::ObjectIdentity {
+        let identity = controller_api::ObjectIdentity {
             api_version: "v1".into(),
             kind: "ConfigMap".into(),
             namespace: "ns".into(),
@@ -6843,7 +6823,7 @@ mod tests {
                 state_resource_version: state_resource_version.into(),
                 observation_token: observation_token.into(),
                 cache_epoch: cache_epoch.into(),
-                final_observation_fence_token: oxideloop_renderer_abi::sha256_hex(
+                final_observation_fence_token: renderer_abi::sha256_hex(
                     format!("prune-final-fence/v0/{observation_token}").as_bytes(),
                 ),
                 render_input_hash: parse_validate_render_input(&input).unwrap().sha256,
@@ -6853,7 +6833,7 @@ mod tests {
             vec![DesiredObservationV0 {
                 identity,
                 observation: Observation::Existing {
-                    identity: oxideloop_mutation_model::ObjectIdentity {
+                    identity: mutation_model::ObjectIdentity {
                         uid: "managed-uid".into(),
                         resource_version: "managed-rv-1".into(),
                     },
@@ -6862,11 +6842,11 @@ mod tests {
                     kubernetes_minor: "1.36".into(),
                     gvr: "configmaps".into(),
                 },
-                ordinary_proof: Some(oxideloop_controller_core::OrdinaryProofV0 {
+                ordinary_proof: Some(controller_core::OrdinaryProofV0 {
                     root_uid: root.uid.clone(),
                     uid: "managed-uid".into(),
                     resource_version: "managed-rv-1".into(),
-                    desired_projection: oxideloop_controller_core::DesiredProjectionV0::Untrusted,
+                    desired_projection: controller_core::DesiredProjectionV0::Untrusted,
                 }),
                 recovery_proof: None,
                 deletion_recovery_proof: None,
@@ -6888,7 +6868,7 @@ mod tests {
 
     fn genuine_change(actor: &RootActorV0) -> GenuineChangeV0 {
         GenuineChangeV0::from_observations(
-            &[oxideloop_renderer_abi::model::Observation {
+            &[renderer_abi::model::Observation {
                 api_version: "v1".into(),
                 kind: "ConfigMap".into(),
                 namespace: "ns".into(),
@@ -6953,7 +6933,7 @@ mod tests {
             &preconditions.observation_token,
             &preconditions.cache_epoch,
         );
-        let identity = oxideloop_controller_api::ObjectIdentity {
+        let identity = controller_api::ObjectIdentity {
             api_version: "v1".into(),
             kind: "ConfigMap".into(),
             namespace: "ns".into(),
@@ -7103,7 +7083,7 @@ mod tests {
             &preconditions.observation_token,
             &preconditions.cache_epoch,
         );
-        let identity = oxideloop_controller_api::ObjectIdentity {
+        let identity = controller_api::ObjectIdentity {
             api_version: "v1".into(),
             kind: "ConfigMap".into(),
             namespace: "ns".into(),
@@ -7251,7 +7231,7 @@ mod tests {
         let mut changed_input = trusted_render_input(&actor, &preconditions.observation_token);
         changed_input
             .observations
-            .push(oxideloop_renderer_abi::model::Observation {
+            .push(renderer_abi::model::Observation {
                 api_version: "v1".into(),
                 kind: "ConfigMap".into(),
                 namespace: "ns".into(),
@@ -7357,8 +7337,8 @@ mod tests {
             assert!(matches!(
                 actor.next_command(),
                 Ok(Some(CommandV0::Persist {
-                    operation: oxideloop_controller_api::PersistOperation {
-                        purpose: oxideloop_controller_api::PersistPurpose::GenerationAdvanceClosure,
+                    operation: controller_api::PersistOperation {
+                        purpose: controller_api::PersistPurpose::GenerationAdvanceClosure,
                         ..
                     },
                     ..
@@ -7566,7 +7546,7 @@ mod tests {
         let root = base.root().clone();
         let mut journal = base.journal().clone();
         journal.state.inventory.push(InventoryEntry {
-            identity: oxideloop_controller_api::ObjectIdentity {
+            identity: controller_api::ObjectIdentity {
                 api_version: "v1".into(),
                 kind: "ConfigMap".into(),
                 namespace: "ns".into(),
@@ -7800,7 +7780,7 @@ mod tests {
             .expect("supersession preserves the durable prepared transaction");
         assert_eq!(
             transaction.next_command_lifecycle.state,
-            oxideloop_controller_api::NextCommandLifecycleStateV0::PreparedNotIssued
+            controller_api::NextCommandLifecycleStateV0::PreparedNotIssued
         );
 
         actor.informers_ready(fresh_barrier);
@@ -8227,7 +8207,7 @@ mod tests {
             .map(|entry| DesiredObservationV0 {
                 identity: entry.identity.clone(),
                 observation: Observation::Existing {
-                    identity: oxideloop_mutation_model::ObjectIdentity {
+                    identity: mutation_model::ObjectIdentity {
                         uid: entry.uid.clone(),
                         resource_version: entry.resource_version.clone(),
                     },
@@ -8237,11 +8217,11 @@ mod tests {
                     gvr: "configmaps".into(),
                     compatibility_manifest: "validated-native-structural-manifest".into(),
                 },
-                ordinary_proof: Some(oxideloop_controller_core::OrdinaryProofV0 {
+                ordinary_proof: Some(controller_core::OrdinaryProofV0 {
                     root_uid: actor.state().root().uid.clone(),
                     uid: entry.uid.clone(),
                     resource_version: entry.resource_version.clone(),
-                    desired_projection: oxideloop_controller_core::DesiredProjectionV0::Untrusted,
+                    desired_projection: controller_core::DesiredProjectionV0::Untrusted,
                 }),
                 recovery_proof: Some(RecoveryProofV0 {
                     root_uid: actor.state().root().uid.clone(),
@@ -8383,7 +8363,7 @@ mod tests {
             .map(|entry| DesiredObservationV0 {
                 identity: entry.identity.clone(),
                 observation: Observation::Existing {
-                    identity: oxideloop_mutation_model::ObjectIdentity {
+                    identity: mutation_model::ObjectIdentity {
                         uid: "foreign-uid".into(),
                         resource_version: "foreign-rv".into(),
                     },
@@ -8741,7 +8721,7 @@ mod tests {
         })
         .expect("same desired output serializes");
         let observed = vec![DesiredObservationV0 {
-            identity: oxideloop_controller_api::ObjectIdentity {
+            identity: controller_api::ObjectIdentity {
                 api_version: "v1".into(),
                 kind: "ConfigMap".into(),
                 namespace: "ns".into(),
@@ -8804,7 +8784,7 @@ mod tests {
         let loader = loader_port_for_machine(&recovered, &recovered.root().state_resource_version);
         let mut root_wire = loader.objects[0].value.clone();
         root_wire["metadata"]["annotations"] = serde_json::json!({
-            oxideloop_kube_transport::ROOT_UID_ANNOTATION: recovered.root().uid,
+            kube_transport::ROOT_UID_ANNOTATION: recovered.root().uid,
         });
         let root_wire = Arc::new(Mutex::new(root_wire));
         let state_wire = loader.objects[1].value.clone();
@@ -8882,7 +8862,7 @@ mod tests {
             }
         });
         let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
-        let address = oxideloop_kube_transport::RootAddressV0 {
+        let address = kube_transport::RootAddressV0 {
             namespace: recovered.root().namespace.clone(),
             name: recovered.root().name.clone(),
             state_name: recovered.root().state_name.clone(),
@@ -9254,13 +9234,13 @@ mod tests {
             &dispatcher.calls[0],
             CommandV0::Persist { operation, .. }
                 if operation.purpose
-                    == oxideloop_controller_api::PersistPurpose::GenerationAdvanceClosure
+                    == controller_api::PersistPurpose::GenerationAdvanceClosure
         ));
         assert!(matches!(
             &dispatcher.calls[1],
             CommandV0::Persist { operation, .. }
                 if operation.purpose
-                    == oxideloop_controller_api::PersistPurpose::GenerationAdvanceClosure
+                    == controller_api::PersistPurpose::GenerationAdvanceClosure
         ));
         assert_eq!(actor.state().root().generation, 9);
         assert_eq!(
@@ -9270,7 +9250,7 @@ mod tests {
     }
 
     fn root_only_deletion_snapshot(root_finalizer_present: bool) -> RootSnapshotV0 {
-        let linked_state_name = oxideloop_controller_api::state_name("root-uid").unwrap();
+        let linked_state_name = controller_api::state_name("root-uid").unwrap();
         RootSnapshotV0 {
             uid: "root-uid".into(),
             namespace: "ns".into(),
@@ -9279,7 +9259,7 @@ mod tests {
             spec: root_spec("0".repeat(64)),
             bundle_digest: "0".repeat(64),
             status: WebApplicationStatus {
-                deletion_cleanup_receipt: Some(oxideloop_controller_api::DeletionCleanupReceipt {
+                deletion_cleanup_receipt: Some(controller_api::DeletionCleanupReceipt {
                     root_uid: "root-uid".into(),
                     deletion_id: "d".repeat(64),
                     deletion_start_generation: 2,
@@ -9435,7 +9415,7 @@ mod tests {
                 state_resource_version: "state-rv-1".into(),
                 old_root_resource_version: root_resource_version.clone(),
                 new_root_resource_version: "root-rv-2".into(),
-                status_state_link: oxideloop_controller_api::StateLink {
+                status_state_link: controller_api::StateLink {
                     root_uid: "root-uid".into(),
                     name: state_name.clone(),
                     uid: "state-uid".into(),
@@ -9503,10 +9483,10 @@ mod tests {
 
     #[test]
     fn public_mutation_dispatch_rejects_batches() {
-        let mutation = oxideloop_controller_core::MutationCommandV0 {
+        let mutation = controller_core::MutationCommandV0 {
             command_id: "c".repeat(64),
             attempt_token: "a".repeat(64),
-            preconditions: oxideloop_controller_core::PreconditionsV0 {
+            preconditions: controller_core::PreconditionsV0 {
                 root_uid: "root-uid".into(),
                 root_generation: 1,
                 root_resource_version: "root-rv".into(),
@@ -9515,7 +9495,7 @@ mod tests {
                 observation_token: String::new(),
                 cache_epoch: String::new(),
             },
-            identity: oxideloop_controller_api::ObjectIdentity {
+            identity: controller_api::ObjectIdentity {
                 api_version: "v1".into(),
                 kind: "ConfigMap".into(),
                 namespace: "ns".into(),
@@ -9523,8 +9503,8 @@ mod tests {
             },
             logical_id: "managed".into(),
             prepared_expected_target: None,
-            decision: oxideloop_mutation_model::MutationDecision::Post {
-                method: oxideloop_mutation_model::HttpMethod::Post,
+            decision: mutation_model::MutationDecision::Post {
+                method: mutation_model::HttpMethod::Post,
                 body: serde_json::json!({}),
             },
         };
@@ -9571,10 +9551,10 @@ mod tests {
         actor.commands.push_back(CommandV0::Mutate {
             transaction_id: "t".repeat(64),
             attempt_token: "a".repeat(64),
-            commands: vec![oxideloop_controller_core::MutationCommandV0 {
+            commands: vec![controller_core::MutationCommandV0 {
                 command_id: "c".repeat(64),
                 attempt_token: "a".repeat(64),
-                preconditions: oxideloop_controller_core::PreconditionsV0 {
+                preconditions: controller_core::PreconditionsV0 {
                     root_uid: "root-uid".into(),
                     root_generation: 1,
                     root_resource_version: "root-rv".into(),
@@ -9583,7 +9563,7 @@ mod tests {
                     observation_token: String::new(),
                     cache_epoch: String::new(),
                 },
-                identity: oxideloop_controller_api::ObjectIdentity {
+                identity: controller_api::ObjectIdentity {
                     api_version: "v1".into(),
                     kind: "ConfigMap".into(),
                     namespace: "ns".into(),
@@ -9591,8 +9571,8 @@ mod tests {
                 },
                 logical_id: "managed".into(),
                 prepared_expected_target: None,
-                decision: oxideloop_mutation_model::MutationDecision::Post {
-                    method: oxideloop_mutation_model::HttpMethod::Post,
+                decision: mutation_model::MutationDecision::Post {
+                    method: mutation_model::HttpMethod::Post,
                     body: serde_json::json!({}),
                 },
             }],
@@ -9834,7 +9814,7 @@ mod tests {
         acknowledged_root.root_resource_version = "root-rv-2".into();
         acknowledged_root.root_finalizer_present = true;
         acknowledged_root.state_finalizer_present = true;
-        acknowledged_root.status.state = Some(oxideloop_controller_api::StateLink {
+        acknowledged_root.status.state = Some(controller_api::StateLink {
             root_uid: acknowledged_root.uid.clone(),
             name: state_name.clone(),
             uid: "state-uid".into(),
@@ -9852,7 +9832,7 @@ mod tests {
                 state_resource_version: "state-rv-1".into(),
                 old_root_resource_version: root_resource_version,
                 new_root_resource_version: "root-rv-2".into(),
-                status_state_link: oxideloop_controller_api::StateLink {
+                status_state_link: controller_api::StateLink {
                     root_uid: "root-uid".into(),
                     name: state_name,
                     uid: "state-uid".into(),
@@ -10025,7 +10005,7 @@ mod tests {
         let mut actor = actor();
         let initial = actor.barrier();
         let genuine = GenuineChangeV0::from_observations(
-            &[oxideloop_renderer_abi::model::Observation {
+            &[renderer_abi::model::Observation {
                 api_version: "v1".into(),
                 kind: "ConfigMap".into(),
                 namespace: "ns".into(),
@@ -10892,7 +10872,7 @@ mod tests {
         async fn observe_after_barrier(
             &mut self,
             dependencies: &[Dependency],
-        ) -> Result<Vec<oxideloop_renderer_abi::model::Observation>, RuntimeErrorV0> {
+        ) -> Result<Vec<renderer_abi::model::Observation>, RuntimeErrorV0> {
             assert_eq!(dependencies, [dep()]);
             self.barriers += 1;
             Ok(vec![])
@@ -10970,7 +10950,7 @@ mod tests {
         async fn observe_after_barrier(
             &mut self,
             _: &[Dependency],
-        ) -> Result<Vec<oxideloop_renderer_abi::model::Observation>, RuntimeErrorV0> {
+        ) -> Result<Vec<renderer_abi::model::Observation>, RuntimeErrorV0> {
             Ok(vec![])
         }
 
@@ -11124,7 +11104,7 @@ mod tests {
         };
         for error in [
             TransportErrorV0::Conflict(ConflictProvenanceV0::Read {
-                operation: oxideloop_kube_transport::ReadOperationV0::Get,
+                operation: kube_transport::ReadOperationV0::Get,
                 resource: ResourceKindV0::ConfigMap,
             }),
             TransportErrorV0::Conflict(ConflictProvenanceV0::WatchTerminal {

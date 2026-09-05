@@ -1,5 +1,5 @@
 [package]
-name = "oxideloop-renderer-client"
+name = "renderer-client"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,7 @@ publish = false
 name = "renderer_client"
 
 [dependencies]
-oxideloop-renderer-protocol = { path = "../renderer-protocol" }
+renderer-protocol = { path = "../renderer-protocol" }
 thiserror = "2"
 socket2 = "0.6"
 

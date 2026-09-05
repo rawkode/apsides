@@ -61,6 +61,10 @@ spec:
             - $(ROOT_NAME)
             - --bundle-store
             - /var/lib/oxideloop/bundles
+            - --embedded-bundle-archive
+            - /usr/share/oxideloop/bundle.archive
+            - --embedded-bundle-digest
+            - /usr/share/oxideloop/bundle.digest
             - --renderer-unix-socket
             - /run/oxideloop/renderer/renderer.sock
             - --failpoint-unix-socket

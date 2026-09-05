@@ -1,4 +1,4 @@
-use oxideloop_controller_core::{AutomationRunCleanupV0, RecoveryProofV0};
+use controller_core::{AutomationRunCleanupV0, RecoveryProofV0};
 
 #[test]
 fn downstream_can_construct_recovery_and_cleanup_protocol_types() {

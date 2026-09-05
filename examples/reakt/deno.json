@@ -1,0 +1,5 @@
+{
+  "imports": {
+    "@reakt/kubernetes": "../../packages/reakt/src/index.ts"
+  }
+}

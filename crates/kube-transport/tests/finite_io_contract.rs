@@ -9,17 +9,17 @@ use std::{
     time::Duration,
 };
 
-use http::{Request, Response, StatusCode};
-use kube::{Client, client::Body};
-use oxideloop_controller_api::{
+use controller_api::{
     AutomationPending, AutomationRunCompletion, AutomationRunCompletionState, AutomationRunSpec,
     AutomationRunStatus, ObjectIdentity, ProgramBundleReference, automation_run_name,
 };
-use oxideloop_kube_transport::{
+use http::{Request, Response, StatusCode};
+use kube::{Client, client::Body};
+use kube_transport::{
     AutomationRunObservationBarrierV0, KubeTransportV0, ObjectMetaV0, ObjectRefV0, ObjectV0,
     PrewriteGateStateV0, ResourceKindV0, TransportErrorV0, WatchEventV0, WatchHandleV0,
 };
-use oxideloop_renderer_abi::{canonical_bytes, parse_validate_action_input, sha256_hex};
+use renderer_abi::{canonical_bytes, parse_validate_action_input, sha256_hex};
 use serde_json::json;
 use tower::service_fn;
 
@@ -156,7 +156,7 @@ async fn initial_list_deadline_is_typed_and_does_not_write() {
     assert_eq!(
         result,
         Err(TransportErrorV0::FiniteIoDeadline(
-            oxideloop_kube_transport::FiniteIoStageV0::ReadOnly
+            kube_transport::FiniteIoStageV0::ReadOnly
         ))
     );
     assert_eq!(requests.load(Ordering::SeqCst), 1);
@@ -174,7 +174,7 @@ async fn watch_open_deadline_is_typed_and_does_not_start_a_stream() {
     assert!(matches!(
         result,
         Err(TransportErrorV0::FiniteIoDeadline(
-            oxideloop_kube_transport::FiniteIoStageV0::WatchOpen
+            kube_transport::FiniteIoStageV0::WatchOpen
         ))
     ));
     assert_eq!(requests.load(Ordering::SeqCst), 1);
@@ -183,7 +183,7 @@ async fn watch_open_deadline_is_typed_and_does_not_start_a_stream() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exact_get_deadline_is_typed_and_does_not_write() {
     let (transport, requests) = transport(HangAt::DirectGet);
-    let reference = oxideloop_kube_transport::ObjectRefV0 {
+    let reference = kube_transport::ObjectRefV0 {
         resource: ResourceKindV0::ConfigMap,
         namespace: "ns".into(),
         name: "object".into(),
@@ -194,7 +194,7 @@ async fn exact_get_deadline_is_typed_and_does_not_write() {
     assert_eq!(
         result,
         Err(TransportErrorV0::FiniteIoDeadline(
-            oxideloop_kube_transport::FiniteIoStageV0::ReadOnly
+            kube_transport::FiniteIoStageV0::ReadOnly
         ))
     );
     assert_eq!(requests.load(Ordering::SeqCst), 1);
@@ -212,7 +212,7 @@ async fn bundle_get_deadline_is_a_typed_finite_read_failure() {
     assert_eq!(
         result,
         Err(TransportErrorV0::FiniteIoDeadline(
-            oxideloop_kube_transport::FiniteIoStageV0::ReadOnly
+            kube_transport::FiniteIoStageV0::ReadOnly
         ))
     );
     assert_eq!(requests.load(Ordering::SeqCst), 1);
@@ -258,8 +258,6 @@ async fn retained_watch_silence_survives_the_finite_read_budget_and_then_deliver
         automation_version: input.automation_version.clone(),
         bundle_digest: input.bundle_digest.clone(),
         program: ProgramBundleReference {
-            config_map_name: "bundle".into(),
-            key: "program.mjs".into(),
             digest: input.bundle_digest.clone(),
         },
         action_module_identity: input.action_module_identity.clone(),
@@ -285,7 +283,7 @@ async fn retained_watch_silence_survives_the_finite_read_budget_and_then_deliver
         run_resource_version: "1".into(),
         spec_hash,
     };
-    let expectation = oxideloop_kube_transport::AutomationRunExpectationV0::from_pending(
+    let expectation = kube_transport::AutomationRunExpectationV0::from_pending(
         ObjectRefV0 {
             resource: ResourceKindV0::WebApplication,
             namespace: "ns".into(),

@@ -29,26 +29,26 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures_util::StreamExt;
-use oxideloop_controller_api::{
+use controller_api::{
     ApplyOperation, ApplyOutcome, ApplyResult, AutomationPending, AutomationRunCompletionState,
     AutomationRunSpec, AutomationRunStatus, DeletionCleanupReceipt, DurablePhase,
     GenerationAdvanceClosurePurpose, MAX_MESSAGE_BYTES, NextCommandLifecycleStateV0,
     ObjectIdentity, OxideLoopStateSpec, PersistPurpose, ROOT_FINALIZER, STATE_FINALIZER, StateLink,
     WebApplicationStatus, validate_automation_run_name,
 };
-use oxideloop_controller_core::{
+use controller_core::{
     CommandV0, MutationCommandV0, PreconditionsV0, linked_root_finalizer_command_token,
     linked_state_finalizer_command_token, retired_state_delete_command_token,
     root_only_finalizer_command_token, root_only_owned_children_verify_token,
 };
 #[cfg(test)]
-use oxideloop_event_planner::semantically_equal;
-use oxideloop_event_planner::{PlannedEventV0, materialize_event};
-use oxideloop_mutation_model::{
+use event_planner::semantically_equal;
+use event_planner::{PlannedEventV0, materialize_event};
+use futures_util::StreamExt;
+use mutation_model::{
     APPLY_PATCH_CONTENT_TYPE, CONTROLLER_FIELD_MANAGER, HttpMethod, MutationDecision,
 };
-use oxideloop_renderer_abi::{canonical_bytes, sha256_hex};
+use renderer_abi::{canonical_bytes, sha256_hex};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -1041,7 +1041,7 @@ struct BootstrapFrozenRootV0 {
     namespace: String,
     name: String,
     generation: i64,
-    spec: oxideloop_controller_api::WebApplicationSpec,
+    spec: controller_api::WebApplicationSpec,
     deleting: bool,
 }
 
@@ -3177,7 +3177,7 @@ impl ValidatedAutomationRunV0 {
     /// Returns the immutable historical program authority.  Incomplete replay
     /// must use this value, not a newer root program reference.
     #[must_use]
-    pub fn program(&self) -> &oxideloop_controller_api::ProgramBundleReference {
+    pub fn program(&self) -> &controller_api::ProgramBundleReference {
         &self.spec.program
     }
 
@@ -3436,7 +3436,7 @@ pub enum TransportErrorV0 {
 /// this boundary as an escape hatch for arbitrary API operations.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommandOutcomeV0 {
-    Event(Box<oxideloop_controller_core::EventV0>),
+    Event(Box<controller_core::EventV0>),
     NotKubernetesEffect,
     /// `Mutate` is an ordered transaction.  The driver must submit exactly one
     /// mutation command per call and persist the acknowledgement before asking
@@ -4571,7 +4571,7 @@ impl KubeTransportV0 {
                     Err(error) => return Err(error),
                 };
                 Ok(CommandOutcomeV0::Event(Box::new(
-                    oxideloop_controller_core::EventV0::Persisted {
+                    controller_core::EventV0::Persisted {
                         token: operation.token.clone(),
                         old_state_resource_version: preconditions.state_resource_version.clone(),
                         new_state_resource_version: written.metadata.resource_version,
@@ -4639,7 +4639,7 @@ impl KubeTransportV0 {
                     Err(error) => return Err(error),
                 };
                 Ok(CommandOutcomeV0::Event(Box::new(
-                    oxideloop_controller_core::EventV0::RootStatusPersisted {
+                    controller_core::EventV0::RootStatusPersisted {
                         token: token.clone(),
                         old_root_resource_version: old_root_resource_version.clone(),
                         new_root_resource_version: written.metadata.resource_version,
@@ -4704,7 +4704,7 @@ impl KubeTransportV0 {
                 .await
                 .map_err(|_| ambiguous_delete_or_finalizer())?;
                 Ok(CommandOutcomeV0::Event(Box::new(
-                    oxideloop_controller_core::EventV0::AutomationRunDeleted {
+                    controller_core::EventV0::AutomationRunDeleted {
                         token: token.clone(),
                         occurrence_id: occurrence_id.clone(),
                         name: name.clone(),
@@ -4734,7 +4734,7 @@ impl KubeTransportV0 {
                         .any(|item| owned_by(&item, &fence.root.metadata.uid))
                     {
                         return Ok(CommandOutcomeV0::Event(Box::new(
-                            oxideloop_controller_core::EventV0::OwnedChildrenVerificationFailed {
+                            controller_core::EventV0::OwnedChildrenVerificationFailed {
                                 token: token.clone(),
                                 reason: "owned child remains present".into(),
                             },
@@ -4742,7 +4742,7 @@ impl KubeTransportV0 {
                     }
                 }
                 Ok(CommandOutcomeV0::Event(Box::new(
-                    oxideloop_controller_core::EventV0::OwnedChildrenVerifiedAbsent {
+                    controller_core::EventV0::OwnedChildrenVerifiedAbsent {
                         token: token.clone(),
                         cleanup_token: token.clone(),
                         root_generation: generation(&fence.root)?,
@@ -4774,7 +4774,7 @@ impl KubeTransportV0 {
                     return Err(TransportErrorV0::ManualRecoveryHold);
                 }
                 Ok(CommandOutcomeV0::Event(Box::new(
-                    oxideloop_controller_core::EventV0::StateFinalizerRemoved {
+                    controller_core::EventV0::StateFinalizerRemoved {
                         token: token.clone(),
                         state_uid: fence.state.metadata.uid,
                         old_state_resource_version: fence.state.metadata.resource_version,
@@ -4822,7 +4822,7 @@ impl KubeTransportV0 {
                     return Err(TransportErrorV0::ManualRecoveryHold);
                 }
                 Ok(CommandOutcomeV0::Event(Box::new(
-                    oxideloop_controller_core::EventV0::RootFinalizerRemoved {
+                    controller_core::EventV0::RootFinalizerRemoved {
                         token: token.clone(),
                         root_uid: root.metadata.uid,
                         old_root_resource_version: root.metadata.resource_version,
@@ -4841,21 +4841,21 @@ impl KubeTransportV0 {
                 let (root_ref, _) = address.references();
                 match self.reread_in_operation(&root_ref, session).await? {
                     None => Ok(CommandOutcomeV0::Event(Box::new(
-                        oxideloop_controller_core::EventV0::RootUidVerifiedAbsent {
+                        controller_core::EventV0::RootUidVerifiedAbsent {
                             token: token.clone(),
                             root_uid: root_uid.clone(),
                         },
                     ))),
                     Some(observed) if observed.metadata.uid != *root_uid => {
                         Ok(CommandOutcomeV0::Event(Box::new(
-                            oxideloop_controller_core::EventV0::RootUidVerifiedAbsent {
+                            controller_core::EventV0::RootUidVerifiedAbsent {
                                 token: token.clone(),
                                 root_uid: root_uid.clone(),
                             },
                         )))
                     }
                     Some(observed) => Ok(CommandOutcomeV0::Event(Box::new(
-                        oxideloop_controller_core::EventV0::RootUidAbsenceFailed {
+                        controller_core::EventV0::RootUidAbsenceFailed {
                             token: token.clone(),
                             observed_uid: observed.metadata.uid,
                         },
@@ -4875,7 +4875,7 @@ impl KubeTransportV0 {
         address: &RootAddressV0,
         state: &OxideLoopStateSpec,
         preconditions: &PreconditionsV0,
-        operation: &oxideloop_controller_api::PersistOperation,
+        operation: &controller_api::PersistOperation,
         session: &OperationSessionV0,
     ) -> Result<CommandOutcomeV0, TransportErrorV0> {
         let (root_ref, state_ref) = address.references();
@@ -4904,7 +4904,7 @@ impl KubeTransportV0 {
         }
         session.prove_exact_response_loss_recovery()?;
         Ok(CommandOutcomeV0::Event(Box::new(
-            oxideloop_controller_core::EventV0::Persisted {
+            controller_core::EventV0::Persisted {
                 token: operation.token.clone(),
                 old_state_resource_version: preconditions.state_resource_version.clone(),
                 new_state_resource_version: observed.metadata.resource_version,
@@ -4969,7 +4969,7 @@ impl KubeTransportV0 {
             session.prove_exact_response_loss_recovery()?;
         }
         Ok(CommandOutcomeV0::Event(Box::new(
-            oxideloop_controller_core::EventV0::RootStatusPersisted {
+            controller_core::EventV0::RootStatusPersisted {
                 token: token.into(),
                 old_root_resource_version: old_rv.into(),
                 new_root_resource_version: observed.metadata.resource_version,
@@ -5301,7 +5301,7 @@ impl KubeTransportV0 {
             return Err(TransportErrorV0::ManualRecoveryHold);
         }
         Ok(CommandOutcomeV0::Event(Box::new(
-            oxideloop_controller_core::EventV0::BootstrapAcknowledged {
+            controller_core::EventV0::BootstrapAcknowledged {
                 token: token.clone(),
                 state_name: state_name.clone(),
                 state_uid: final_state.metadata.uid,
@@ -5557,7 +5557,7 @@ impl KubeTransportV0 {
             }
             _ => {
                 return Ok(CommandOutcomeV0::Event(Box::new(
-                    oxideloop_controller_core::EventV0::MutationFailed {
+                    controller_core::EventV0::MutationFailed {
                         attempt_token: attempt_token.into(),
                         transaction_id: transaction_id.into(),
                         reason: "unsupported mutation decision or target".into(),
@@ -5566,7 +5566,7 @@ impl KubeTransportV0 {
             }
         }?;
         Ok(CommandOutcomeV0::Event(Box::new(
-            oxideloop_controller_core::EventV0::MutationAcknowledged {
+            controller_core::EventV0::MutationAcknowledged {
                 attempt_token: attempt_token.into(),
                 transaction_id: transaction_id.into(),
                 results: vec![outcome],
@@ -6022,11 +6022,11 @@ impl KubeTransportV0 {
     async fn mutation_delete(
         &self,
         reference: &ObjectRefV0,
-        expected: &oxideloop_mutation_model::ObjectIdentity,
+        expected: &mutation_model::ObjectIdentity,
         target: &ObjectV0,
         root: &ObjectV0,
         session: &OperationSessionV0,
-    ) -> Result<oxideloop_mutation_model::ObjectIdentity, TransportErrorV0> {
+    ) -> Result<mutation_model::ObjectIdentity, TransportErrorV0> {
         if target.metadata.uid != expected.uid
             || target.metadata.resource_version != expected.resource_version
             || !has_exact_canonical_owner(target, &root.reference, &root.metadata.uid)
@@ -6127,7 +6127,7 @@ impl KubeTransportV0 {
             },
         };
         Ok(CommandOutcomeV0::Event(Box::new(
-            oxideloop_controller_core::EventV0::AutomationRunEnsured {
+            controller_core::EventV0::AutomationRunEnsured {
                 token: token.into(),
                 name: name.into(),
                 spec: spec.clone(),
@@ -6857,7 +6857,7 @@ impl KubeTransportV0 {
         receipt
             .validate()
             .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
-        let expected_state_name = oxideloop_controller_api::state_name(&root.metadata.uid)
+        let expected_state_name = controller_api::state_name(&root.metadata.uid)
             .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
         let state_link_matches = status.state.as_ref().is_none_or(|link| {
             link.root_uid == root.metadata.uid
@@ -6974,7 +6974,7 @@ impl KubeTransportV0 {
         receipt
             .validate()
             .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
-        let expected_state_name = oxideloop_controller_api::state_name(&root.metadata.uid)
+        let expected_state_name = controller_api::state_name(&root.metadata.uid)
             .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
         let Some(link) = status.state.as_ref() else {
             return Err(TransportErrorV0::ManualRecoveryHold);
@@ -7097,7 +7097,7 @@ impl KubeTransportV0 {
             session.prove_exact_response_loss_recovery()?;
         }
         Ok(CommandOutcomeV0::Event(Box::new(
-            oxideloop_controller_core::EventV0::RetiredStateDeleted {
+            controller_core::EventV0::RetiredStateDeleted {
                 token: token.into(),
                 state_uid: preconditions.state_uid.clone(),
                 state_resource_version: preconditions.state_resource_version.clone(),
@@ -7135,7 +7135,7 @@ impl KubeTransportV0 {
                 .any(|item| owned_by(&item, &root.metadata.uid))
             {
                 return Ok(CommandOutcomeV0::Event(Box::new(
-                    oxideloop_controller_core::EventV0::OwnedChildrenVerificationFailed {
+                    controller_core::EventV0::OwnedChildrenVerificationFailed {
                         token: token.into(),
                         reason: "owned child remains present".into(),
                     },
@@ -7143,7 +7143,7 @@ impl KubeTransportV0 {
             }
         }
         Ok(CommandOutcomeV0::Event(Box::new(
-            oxideloop_controller_core::EventV0::OwnedChildrenVerifiedAbsent {
+            controller_core::EventV0::OwnedChildrenVerifiedAbsent {
                 token: token.into(),
                 // The receipt proves cleanup that completed before the
                 // linked state disappeared. It is distinct from this fresh,
@@ -7198,7 +7198,7 @@ impl KubeTransportV0 {
             return Err(TransportErrorV0::ManualRecoveryHold);
         }
         Ok(CommandOutcomeV0::Event(Box::new(
-            oxideloop_controller_core::EventV0::RootFinalizerRemoved {
+            controller_core::EventV0::RootFinalizerRemoved {
                 token: token.into(),
                 root_uid: receipt.root_uid,
                 old_root_resource_version: root.metadata.resource_version,
@@ -8642,9 +8642,9 @@ pub fn validate_automation_run_observation(
         .map_err(|_| automation_observation_hold("AutomationRun name is not deterministic"))?;
     let spec_value = serde_json::to_value(&spec)
         .map_err(|_| automation_observation_hold("AutomationRun spec cannot be canonicalized"))?;
-    let canonical = oxideloop_renderer_abi::canonical_bytes(&spec_value)
+    let canonical = renderer_abi::canonical_bytes(&spec_value)
         .map_err(|_| automation_observation_hold("AutomationRun spec cannot be canonicalized"))?;
-    if oxideloop_renderer_abi::sha256_hex(&canonical) != expectation.spec_hash
+    if renderer_abi::sha256_hex(&canonical) != expectation.spec_hash
         || spec.root_uid != expectation.root_uid
         || spec.occurrence_id != expectation.occurrence_id
     {
@@ -9082,7 +9082,7 @@ fn conditional_apply_force_authorized(
     command: &MutationCommandV0,
     content_type: &str,
     field_manager: &str,
-    expected: &oxideloop_mutation_model::ObjectIdentity,
+    expected: &mutation_model::ObjectIdentity,
     root: &ObjectV0,
     target: &ObjectV0,
 ) -> bool {
@@ -9116,13 +9116,11 @@ fn mutation_failed_outcome(
     attempt_token: &str,
     reason: &str,
 ) -> CommandOutcomeV0 {
-    CommandOutcomeV0::Event(Box::new(
-        oxideloop_controller_core::EventV0::MutationFailed {
-            attempt_token: attempt_token.into(),
-            transaction_id: transaction_id.into(),
-            reason: reason.into(),
-        },
-    ))
+    CommandOutcomeV0::Event(Box::new(controller_core::EventV0::MutationFailed {
+        attempt_token: attempt_token.into(),
+        transaction_id: transaction_id.into(),
+        reason: reason.into(),
+    }))
 }
 
 fn mutation_not_issued_outcome(
@@ -9131,14 +9129,12 @@ fn mutation_not_issued_outcome(
     command_id: &str,
     reason: &str,
 ) -> CommandOutcomeV0 {
-    CommandOutcomeV0::Event(Box::new(
-        oxideloop_controller_core::EventV0::MutationNotIssued {
-            transaction_id: transaction_id.into(),
-            attempt_token: attempt_token.into(),
-            command_id: command_id.into(),
-            reason: reason.into(),
-        },
-    ))
+    CommandOutcomeV0::Event(Box::new(controller_core::EventV0::MutationNotIssued {
+        transaction_id: transaction_id.into(),
+        attempt_token: attempt_token.into(),
+        command_id: command_id.into(),
+        reason: reason.into(),
+    }))
 }
 
 fn owned_by(object: &ObjectV0, root_uid: &str) -> bool {
@@ -9237,7 +9233,7 @@ fn has_linked_deleting_root_authority(
     root: &ObjectV0,
     preconditions: &PreconditionsV0,
 ) -> bool {
-    let expected_state_name = oxideloop_controller_api::state_name(&root.metadata.uid).ok();
+    let expected_state_name = controller_api::state_name(&root.metadata.uid).ok();
     has_exact_object_identity(
         root,
         ResourceKindV0::WebApplication,
@@ -9376,7 +9372,7 @@ pub fn completed_unlinked_bootstrap_cleanup_bundle_v1(
         return Ok(None);
     };
     let finalizers = strict_finalizers(root)?;
-    let expected_state_name = oxideloop_controller_api::state_name(&root.metadata.uid)
+    let expected_state_name = controller_api::state_name(&root.metadata.uid)
         .map_err(|_| TransportErrorV0::ManualRecoveryHold)?;
     // The normal unlinked-v1 cleanup authority still owns roots carrying our
     // finalizer. This relaxed parser is only for its already-completed tail.
@@ -9654,7 +9650,7 @@ fn validate_unlinked_deleting_bootstrap_root_with_bundle(
             .pointer("/status/deletionCleanupReceipt")
             .is_some()
         || bundle.state_name
-            != oxideloop_controller_api::state_name(&root.metadata.uid)
+            != controller_api::state_name(&root.metadata.uid)
                 .map_err(|_| TransportErrorV0::ManualRecoveryHold)?
         || generation(root).is_err()
     {
@@ -10434,7 +10430,7 @@ fn is_supported_deployment_v1(object: &Value) -> bool {
 fn validate_conditional_apply_body(
     object: &Value,
     expected: &ObjectRefV0,
-    target: &oxideloop_mutation_model::ObjectIdentity,
+    target: &mutation_model::ObjectIdentity,
 ) -> Result<(), TransportErrorV0> {
     let metadata = object
         .pointer("/metadata")
@@ -11467,7 +11463,7 @@ mod tests {
                 "spec":{
                     "image":"example.invalid/web:latest", "replicas":1,
                     "message":"bootstrap authority", "expose":false,
-                    "program":{"configMapName":"bundle", "key":"program.mjs", "digest":"0000000000000000000000000000000000000000000000000000000000000000"}
+                    "program":{"digest":"0000000000000000000000000000000000000000000000000000000000000000"}
                 },
                 "status":{},
             }),
@@ -11616,8 +11612,8 @@ mod tests {
     }
 
     fn linked_deletion_fixture() -> (RootAddressV0, ObjectV0, ObjectV0, PreconditionsV0, String) {
-        let state_name = oxideloop_controller_api::state_name("root-uid")
-            .expect("fixture State name is deterministic");
+        let state_name =
+            controller_api::state_name("root-uid").expect("fixture State name is deterministic");
         let cleanup_token = "c".repeat(64);
         let persist_token = "a".repeat(64);
         let deletion_id = "d".repeat(64);
@@ -11644,7 +11640,7 @@ mod tests {
                     "finalizers":[ROOT_FINALIZER],
                 },
                 "spec":{"image":"example.invalid/web:latest", "replicas":1, "message":"linked deletion", "expose":false,
-                    "program":{"configMapName":"bundle", "key":"program.mjs", "digest":"0".repeat(64)}},
+                    "program":{"digest":"0".repeat(64)}},
                 "status":{
                     "state":{"rootUid":"root-uid", "name":state_name, "uid":"state-uid"},
                     "deletionCleanupReceipt":{
@@ -11683,7 +11679,7 @@ mod tests {
                     "finalizers":[STATE_FINALIZER],
                 },
                 "spec":{"stateVersion":1,
-                    "root":{"uid":"root-uid", "bootstrapId":oxideloop_controller_api::bootstrap_id("root-uid").expect("bootstrap id"), "bundleDigest":"0".repeat(64)},
+                    "root":{"uid":"root-uid", "bootstrapId":controller_api::bootstrap_id("root-uid").expect("bootstrap id"), "bundleDigest":"0".repeat(64)},
                     "state":{"pendingPersist":{"token":persist_token, "purpose":"DeletionStart", "phase":"DeletionStart", "oldStateResourceVersion":"state-rv-0", "rootGeneration":3},
                         "deletion":{"id":deletion_id, "deletionStartGeneration":3}, "automation":{}}},
                 "status":{},
@@ -11774,7 +11770,7 @@ mod tests {
     fn unlinked_deleting_bootstrap_fixture() -> (ObjectV0, ObjectV0) {
         let initial_root = bootstrap_authority_root("1");
         let (mut root, mut state) = final_proof_fixture(&initial_root);
-        let state_name = oxideloop_controller_api::state_name(&root.metadata.uid)
+        let state_name = controller_api::state_name(&root.metadata.uid)
             .expect("fixture root UID has a deterministic State name");
         state.reference.name.clone_from(&state_name);
         state.value["metadata"]["name"] = json!(state_name);
@@ -16319,10 +16315,10 @@ mod tests {
     fn event_target_is_exact_and_recovery_never_adopts_a_foreign_body() {
         assert_eq!(ResourceKindV0::Event.api_version(), "events.k8s.io/v1");
         assert_eq!(ResourceKindV0::Event.kind(), "Event");
-        let plan = oxideloop_event_planner::PlannedEventV0 {
+        let plan = event_planner::PlannedEventV0 {
             api_version: "events.k8s.io/v1".into(),
             kind: "Event".into(),
-            metadata: oxideloop_event_planner::EventMetadata {
+            metadata: event_planner::EventMetadata {
                 name: "event".into(),
                 namespace: "ns".into(),
                 labels: BTreeMap::new(),
@@ -16335,7 +16331,7 @@ mod tests {
             event_type: "Normal".into(),
             reporting_controller: "controller".into(),
             reporting_instance: "instance".into(),
-            regarding: oxideloop_event_planner::EventRegarding {
+            regarding: event_planner::EventRegarding {
                 api_version: "v1".into(),
                 kind: "ConfigMap".into(),
                 namespace: "ns".into(),

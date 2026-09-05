@@ -1,0 +1,39 @@
+[package]
+name = "platform"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+deployer = ["dep:release", "dep:tokio", "kube/ws", "dep:rcgen", "dep:time"]
+test-support = ["deployer", "release/test-support", "kube/config"]
+
+[dependencies]
+rcgen = { version = "=0.14.8", default-features = false, features = ["crypto", "pem", "ring"], optional = true }
+time = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["io-util", "time"], optional = true }
+release = { path = "../release", optional = true }
+k8s-openapi = { version = "0.28", default-features = false, features = ["v1_36"] }
+kube = { version = "4.2", default-features = false, features = ["client", "rustls-tls"] }
+compiler-core = { path = "../compiler-core" }
+deploy = { path = "../deploy" }
+inventory = { path = "../inventory", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+secrecy = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+inventory = { path = "../inventory" }
+tempfile = "3"
+http = "1"
+http-body-util = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

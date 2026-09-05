@@ -1,4 +1,4 @@
-// Generated from oxideloop-bundle-contract Rust types. Do not edit.
+// Generated from bundle-contract Rust types. Do not edit.
 
 export type ToolIdentityV0 = { identity: string, version: string, };
 

@@ -8,27 +8,27 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures_util::future::select_all;
-use oxideloop_bundle_contract::BundleDescriptorV0;
-use oxideloop_controller_api::{AutomationRunSpec, InventoryEntry, ObjectIdentity, StateBody};
-use oxideloop_controller_core::{
+use bundle_contract::BundleDescriptorV0;
+use controller_api::{AutomationRunSpec, InventoryEntry, ObjectIdentity, StateBody};
+use controller_core::{
     AutomationRunCleanupV0, DesiredObservationV0, DesiredProjectionV0, OrdinaryProofV0,
     PhaseV0 as CorePhaseV0, RecoveryProofV0,
 };
-use oxideloop_kube_transport::{
+use futures_util::future::select_all;
+use kube_transport::{
     AutomationCompletionAckV0, AutomationRunExpectationV0, AutomationRunObservationBarrierV0,
     ConflictProvenanceV0, EventMaterializationRefV0, KubeTransportV0, ObjectRefV0, ObjectV0,
     ResourceKindV0, RootAddressV0, TransportErrorV0, WatchEventV0,
 };
-use oxideloop_mutation_model::{
+use mutation_model::{
     BackendQualification, ObjectIdentity as MutationIdentity, Observation as CoreObservation,
 };
-use oxideloop_renderer_abi::{
+use renderer_abi::{
     RenderInputV0,
     model::{Dependency, Observation, RenderOutputV0},
 };
-use oxideloop_renderer_protocol::{PhaseV0, RequestV0, ResponseV0};
 use renderer_client::RendererClient;
+use renderer_protocol::{PhaseV0, RequestV0, ResponseV0};
 
 use crate::{
     AutomationPortV0, BarrierV0, CompletedObservationFenceV0, CompletedObservationSessionV0,
@@ -90,7 +90,7 @@ pub struct KubeAutomationPortV0<'a> {
 impl AutomationPortV0 for KubeAutomationPortV0<'_> {
     async fn create_or_exact_recover_event(
         &mut self,
-        plan: &oxideloop_event_planner::PlannedEventV0,
+        plan: &event_planner::PlannedEventV0,
         event_time: &str,
     ) -> Result<EventMaterializationRefV0, RuntimeErrorV0> {
         self.transport
@@ -104,8 +104,8 @@ impl AutomationPortV0 for KubeAutomationPortV0<'_> {
         name: &str,
         expected_uid: &str,
         expected_resource_version: &str,
-        expected_spec: &oxideloop_controller_api::AutomationRunSpec,
-        status: &oxideloop_controller_api::AutomationRunStatus,
+        expected_spec: &controller_api::AutomationRunSpec,
+        status: &controller_api::AutomationRunStatus,
     ) -> Result<AutomationCompletionAckV0, RuntimeErrorV0> {
         self.transport
             .persist_automation_run_completion(
@@ -608,7 +608,7 @@ impl<'a, R> KubeFixedPointPortV0<'a, R> {
             descriptor: BundleDescriptorV0 {
                 descriptor_version: "oxideloop.dev/descriptor/v0".into(),
                 renderer_abi_version: "renderer.oxideloop.dev/v0".into(),
-                render_module: oxideloop_bundle_contract::DescriptorModuleV0 {
+                render_module: bundle_contract::DescriptorModuleV0 {
                     identity: "render/main.mjs".into(),
                     digest: "a".repeat(64),
                 },
@@ -944,8 +944,8 @@ pub(crate) async fn reconcile_split_for_test<'a, R: RendererPortV0>(
             ))
         }
         Err(RuntimeErrorV0::Discovery(
-            error @ (oxideloop_kube_transport::TransportErrorV0::WatchGone
-            | oxideloop_kube_transport::TransportErrorV0::WatchOverflow),
+            error @ (kube_transport::TransportErrorV0::WatchGone
+            | kube_transport::TransportErrorV0::WatchOverflow),
         )) => {
             actor.watch_invalidated();
             // The reunited port owns no current fixed-point result after a
@@ -973,8 +973,8 @@ fn coordinate_retained_watch_result(
             RetainedWatchCoordinationV0::DuplicateIgnored
         }),
         Err(RuntimeErrorV0::Discovery(
-            oxideloop_kube_transport::TransportErrorV0::WatchGone
-            | oxideloop_kube_transport::TransportErrorV0::WatchOverflow,
+            kube_transport::TransportErrorV0::WatchGone
+            | kube_transport::TransportErrorV0::WatchOverflow,
         )) => {
             actor.watch_invalidated();
             Ok(RetainedWatchCoordinationV0::RestartRequired)
@@ -987,7 +987,7 @@ fn coordinate_retained_watch_result(
 impl<R: RendererPortV0> FixedPointPortV0 for KubeFixedPointPortV0<'_, R> {
     async fn render(&mut self, input: &RenderInputV0) -> Result<RenderOutputV0, RuntimeErrorV0> {
         let payload = canonical_render_input(input)?;
-        let hash = oxideloop_renderer_abi::sha256_hex(&payload);
+        let hash = renderer_abi::sha256_hex(&payload);
         let request = renderer_request(
             PhaseV0::Render,
             deterministic_request_id(&hash)?,
@@ -999,14 +999,14 @@ impl<R: RendererPortV0> FixedPointPortV0 for KubeFixedPointPortV0<'_, R> {
         // Keep the parser/correlation rule identical to the direct client path.
         let payload = crate::renderer_payload(&response, &request)?;
         let text = std::str::from_utf8(&payload).map_err(|_| RuntimeErrorV0::RendererAbi)?;
-        Ok(oxideloop_renderer_abi::parse_validate_render_output(text)
+        Ok(renderer_abi::parse_validate_render_output(text)
             .map_err(|_| RuntimeErrorV0::RendererAbi)?
             .document)
     }
 
     async fn observe_after_barrier(
         &mut self,
-        dependencies: &[oxideloop_renderer_abi::model::Dependency],
+        dependencies: &[renderer_abi::model::Dependency],
     ) -> Result<Vec<Observation>, RuntimeErrorV0> {
         let namespace = self.root_namespace.as_deref().ok_or_else(|| {
             RuntimeErrorV0::Hold(
@@ -1260,7 +1260,7 @@ async fn establish_union_retained(
 impl<R: RendererPortV0> FixedPointPortV0 for RenderExecutionPortV0<'_, R> {
     async fn render(&mut self, input: &RenderInputV0) -> Result<RenderOutputV0, RuntimeErrorV0> {
         let payload = canonical_render_input(input)?;
-        let hash = oxideloop_renderer_abi::sha256_hex(&payload);
+        let hash = renderer_abi::sha256_hex(&payload);
         let request = renderer_request(
             PhaseV0::Render,
             deterministic_request_id(&hash)?,
@@ -1271,14 +1271,14 @@ impl<R: RendererPortV0> FixedPointPortV0 for RenderExecutionPortV0<'_, R> {
         let response = self.renderer.call(&request).await?;
         let payload = crate::renderer_payload(&response, &request)?;
         let text = std::str::from_utf8(&payload).map_err(|_| RuntimeErrorV0::RendererAbi)?;
-        Ok(oxideloop_renderer_abi::parse_validate_render_output(text)
+        Ok(renderer_abi::parse_validate_render_output(text)
             .map_err(|_| RuntimeErrorV0::RendererAbi)?
             .document)
     }
 
     async fn observe_after_barrier(
         &mut self,
-        dependencies: &[oxideloop_renderer_abi::model::Dependency],
+        dependencies: &[renderer_abi::model::Dependency],
     ) -> Result<Vec<Observation>, RuntimeErrorV0> {
         let namespace = self.root_namespace.as_deref().ok_or_else(|| {
             RuntimeErrorV0::Hold(
@@ -1759,7 +1759,7 @@ impl RetainedObservationBarrierV0 {
         root: &ObjectRefV0,
         root_uid: &str,
         desired_identities: &[ObjectIdentity],
-        desired_resources: &[oxideloop_renderer_abi::model::ResourceDeclaration],
+        desired_resources: &[renderer_abi::model::ResourceDeclaration],
         durable_inventory: &[InventoryEntry],
     ) -> Result<Vec<DesiredObservationV0>, RuntimeErrorV0> {
         let mut requested = BTreeMap::new();
@@ -2063,13 +2063,11 @@ fn desired_observation_with_desired(
         && object
             .metadata
             .annotations
-            .get(oxideloop_kube_transport::ROOT_UID_ANNOTATION)
+            .get(kube_transport::ROOT_UID_ANNOTATION)
             == Some(&root_uid.to_string());
     let ordinary_proof = if ordinary_owner {
         let desired_projection = match desired {
-            Some(desired)
-                if oxideloop_kube_transport::same_desired_semantics(&object.value, desired) =>
-            {
+            Some(desired) if kube_transport::same_desired_semantics(&object.value, desired) => {
                 DesiredProjectionV0::Matches
             }
             Some(_) => DesiredProjectionV0::Differs,
@@ -2121,29 +2119,29 @@ fn desired_observation_with_desired(
 fn exact_recovery_annotations(object: &ObjectV0, root_uid: &str) -> Option<(String, String)> {
     let annotations = object.value.pointer("/metadata/annotations")?.as_object()?;
     let root = annotations
-        .get(oxideloop_kube_transport::ROOT_UID_ANNOTATION)?
+        .get(kube_transport::ROOT_UID_ANNOTATION)?
         .as_str()?;
     let transaction_id = annotations
-        .get(oxideloop_kube_transport::TRANSACTION_ID_ANNOTATION)?
+        .get(kube_transport::TRANSACTION_ID_ANNOTATION)?
         .as_str()?;
     let command_id = annotations
-        .get(oxideloop_kube_transport::COMMAND_ID_ANNOTATION)?
+        .get(kube_transport::COMMAND_ID_ANNOTATION)?
         .as_str()?;
     if root != root_uid
         || object
             .metadata
             .annotations
-            .get(oxideloop_kube_transport::ROOT_UID_ANNOTATION)
+            .get(kube_transport::ROOT_UID_ANNOTATION)
             .is_none_or(|value| value != root)
         || object
             .metadata
             .annotations
-            .get(oxideloop_kube_transport::TRANSACTION_ID_ANNOTATION)
+            .get(kube_transport::TRANSACTION_ID_ANNOTATION)
             .is_none_or(|value| value != transaction_id)
         || object
             .metadata
             .annotations
-            .get(oxideloop_kube_transport::COMMAND_ID_ANNOTATION)
+            .get(kube_transport::COMMAND_ID_ANNOTATION)
             .is_none_or(|value| value != command_id)
     {
         return None;
@@ -2227,20 +2225,16 @@ mod tests {
         },
     };
 
-    use http::{Request, Response};
-    use kube::{Client, client::Body};
-    use oxideloop_controller_api::{
+    use controller_api::{
         InventoryEntry, OxideLoopStateSpec, ProgramBundleReference, PruneCandidate,
         PruneObservation, RootBinding, STATE_VERSION_V1, StateBody, StateLink, WebApplicationSpec,
         WebApplicationStatus, bootstrap_id, state_name,
     };
-    use oxideloop_controller_core::{
-        CommandV0, EventV0, MachineStateV0, PreconditionsV0, RootSnapshotV0,
-    };
-    use oxideloop_kube_transport::{ListV0, ObjectMetaV0, TransportErrorV0};
-    use oxideloop_renderer_abi::model::{
-        Dependency, RenderDisposition, ResourceDeclaration, RootProjection,
-    };
+    use controller_core::{CommandV0, EventV0, MachineStateV0, PreconditionsV0, RootSnapshotV0};
+    use http::{Request, Response};
+    use kube::{Client, client::Body};
+    use kube_transport::{ListV0, ObjectMetaV0, TransportErrorV0};
+    use renderer_abi::model::{Dependency, RenderDisposition, ResourceDeclaration, RootProjection};
     use serde_json::json;
     use tower::service_fn;
 
@@ -2267,7 +2261,7 @@ mod tests {
                 phase: request.phase,
                 bundle_digest: request.bundle_digest.clone(),
                 module_digest: request.module_digest.clone(),
-                status: oxideloop_renderer_protocol::ResponseStatusV0::Ok,
+                status: renderer_protocol::ResponseStatusV0::Ok,
                 error_category: None,
                 payload: serde_json::to_vec(&self.output).expect("test output serializes"),
             })
@@ -2294,7 +2288,7 @@ mod tests {
                 phase: request.phase,
                 bundle_digest: request.bundle_digest.clone(),
                 module_digest: request.module_digest.clone(),
-                status: oxideloop_renderer_protocol::ResponseStatusV0::Ok,
+                status: renderer_protocol::ResponseStatusV0::Ok,
                 error_category: None,
                 payload: serde_json::to_vec(&self.output).expect("test output serializes"),
             })
@@ -2394,8 +2388,6 @@ mod tests {
                     message: None,
                     expose: false,
                     program: ProgramBundleReference {
-                        config_map_name: "bundle".into(),
-                        key: "program.mjs".into(),
                         digest: "a".repeat(64),
                     },
                 },
@@ -2490,8 +2482,6 @@ mod tests {
                         "replicas": 1,
                         "expose": false,
                         "program": {
-                            "configMapName": "bundle",
-                            "key": "program.mjs",
                             "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                         }
                     }),
@@ -2526,7 +2516,7 @@ mod tests {
         BundleDescriptorV0 {
             descriptor_version: "oxideloop.dev/descriptor/v0".into(),
             renderer_abi_version: "renderer.oxideloop.dev/v0".into(),
-            render_module: oxideloop_bundle_contract::DescriptorModuleV0 {
+            render_module: bundle_contract::DescriptorModuleV0 {
                 identity: "render/main.mjs".into(),
                 digest: "a".repeat(64),
             },
@@ -2881,8 +2871,8 @@ mod tests {
         retained.record(WatchEventV0::Deleted(object("config", "uid-1", "4")));
         let observations = retained.observations();
         let input = RenderInputV0 {
-            abi_version: oxideloop_renderer_abi::model::ABI_VERSION_V0.into(),
-            root: oxideloop_renderer_abi::model::RootProjection {
+            abi_version: renderer_abi::model::ABI_VERSION_V0.into(),
+            root: renderer_abi::model::RootProjection {
                 api_version: "demo.oxideloop.dev/v1alpha1".into(),
                 kind: "WebApplication".into(),
                 namespace: "ns".into(),
@@ -3247,12 +3237,11 @@ mod tests {
                 )
             }
         });
-        let transport = oxideloop_kube_transport::KubeTransportV0::test_from_client(Client::new(
-            service, "default",
-        ));
+        let transport =
+            kube_transport::KubeTransportV0::test_from_client(Client::new(service, "default"));
         let mut watch_senders = Vec::new();
         for _ in 0..2 {
-            let (sender, watch) = oxideloop_kube_transport::WatchHandleV0::test_channel(1);
+            let (sender, watch) = kube_transport::WatchHandleV0::test_channel(1);
             watch_senders.push(sender);
             transport.test_push_watch(watch);
         }
@@ -3431,7 +3420,7 @@ mod tests {
         let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
         let mut watch_senders = Vec::new();
         for _ in 0..3 {
-            let (sender, watch) = oxideloop_kube_transport::WatchHandleV0::test_channel(1);
+            let (sender, watch) = kube_transport::WatchHandleV0::test_channel(1);
             watch_senders.push(sender);
             transport.test_push_watch(watch);
         }
@@ -3713,7 +3702,7 @@ mod tests {
                 }
             });
             let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
-            let (watch_sender, watch) = oxideloop_kube_transport::WatchHandleV0::test_channel(1);
+            let (watch_sender, watch) = kube_transport::WatchHandleV0::test_channel(1);
             transport.test_push_watch(watch);
             let d = vec![Dependency::Collection {
                 api_version: "v1".into(),
@@ -4117,8 +4106,7 @@ mod tests {
             Err(TransportErrorV0::WatchOverflow),
         ] {
             let template = fixed_final_result(dependencies.clone());
-            let (watch_sender, old_watch) =
-                oxideloop_kube_transport::WatchHandleV0::test_channel(1);
+            let (watch_sender, old_watch) = kube_transport::WatchHandleV0::test_channel(1);
             let old_observation = ObservationBarrierV0 {
                 generation: barrier,
                 dependencies: normalize_dependencies(&dependencies).expect("test dependencies"),
@@ -4342,7 +4330,7 @@ mod tests {
                 }),
                 readiness: None,
             };
-            let (sender, watch) = oxideloop_kube_transport::WatchHandleV0::test_channel(1);
+            let (sender, watch) = kube_transport::WatchHandleV0::test_channel(1);
             let observation = ObservationBarrierV0 {
                 generation: barrier,
                 dependencies: normalize_dependencies(&dependencies).expect("test dependencies"),
@@ -4489,7 +4477,7 @@ mod tests {
                 observation_token: "global-token".into(),
             }];
             let template = fixed_final_result(dependencies.clone());
-            let (sender, watch) = oxideloop_kube_transport::WatchHandleV0::test_channel(1);
+            let (sender, watch) = kube_transport::WatchHandleV0::test_channel(1);
             sender
                 .try_send(Err(error))
                 .expect("buffer initial terminal watch error");
@@ -4533,7 +4521,7 @@ mod tests {
             retry_input.observation_token = preconditions.observation_token;
             retry_input.cache_epoch = preconditions.cache_epoch;
             let (collision_sender, collision_watch) =
-                oxideloop_kube_transport::WatchHandleV0::test_channel(1);
+                kube_transport::WatchHandleV0::test_channel(1);
             let retry_port = KubeFixedPointPortV0::fixed_point_for_test(
                 StableRendererV0 {
                     output: template.output.clone(),
@@ -5028,15 +5016,15 @@ mod tests {
         let mut object = object("owned", "child-uid", "7");
         let annotations = BTreeMap::from([
             (
-                oxideloop_kube_transport::ROOT_UID_ANNOTATION.into(),
+                kube_transport::ROOT_UID_ANNOTATION.into(),
                 "root-uid".into(),
             ),
             (
-                oxideloop_kube_transport::TRANSACTION_ID_ANNOTATION.into(),
+                kube_transport::TRANSACTION_ID_ANNOTATION.into(),
                 "tx-1".into(),
             ),
             (
-                oxideloop_kube_transport::COMMAND_ID_ANNOTATION.into(),
+                kube_transport::COMMAND_ID_ANNOTATION.into(),
                 "command-1".into(),
             ),
         ]);
@@ -5109,7 +5097,7 @@ mod tests {
 
         let mut mismatched_proof = owned_proven_object();
         mismatched_proof.metadata.annotations.insert(
-            oxideloop_kube_transport::COMMAND_ID_ANNOTATION.into(),
+            kube_transport::COMMAND_ID_ANNOTATION.into(),
             "different".into(),
         );
         assert!(

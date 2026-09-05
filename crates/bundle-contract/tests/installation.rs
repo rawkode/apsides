@@ -1,11 +1,11 @@
 use std::fs;
 
-use oxideloop_bundle_contract::{
+use bundle_contract::{
     BUNDLE_MANIFEST_VERSION_V0, BundleError, BundleInstallRecordV0, BundleIntegrityManifestV0,
     BundleStore, ExecutionPhaseV0, FileIntegrityV0, MAX_FILE_BYTES, MAX_MANIFEST_BYTES,
     ModuleIntegrityV0, PhaseModuleV0, ToolIdentityV0, parse_validate_manifest,
 };
-use oxideloop_renderer_abi::{canonical_bytes, sha256_hex};
+use renderer_abi::{canonical_bytes, sha256_hex};
 use tempfile::TempDir;
 
 fn digest(bytes: &[u8]) -> String {
@@ -84,9 +84,7 @@ fn store_entries(path: &std::path::Path) -> Vec<String> {
     entries.sort();
     entries
 }
-fn validated(
-    manifest: &BundleIntegrityManifestV0,
-) -> oxideloop_bundle_contract::ValidatedManifestV0 {
+fn validated(manifest: &BundleIntegrityManifestV0) -> bundle_contract::ValidatedManifestV0 {
     parse_validate_manifest(&serde_json::to_string(manifest).unwrap()).unwrap()
 }
 
@@ -123,7 +121,7 @@ fn descriptor_is_strict_and_cross_validated() {
     let installed = store.install_directory(source.path(), &validated).unwrap();
     assert_eq!(installed.descriptor().unwrap().action_modules.len(), 1);
     let unknown = r#"{"descriptorVersion":"oxideloop.dev/descriptor/v0","rendererAbiVersion":"renderer.oxideloop.dev/v0","renderModule":{"identity":"render.main","digest":"0000000000000000000000000000000000000000000000000000000000000000"},"actionModules":[],"extra":1}"#;
-    assert!(oxideloop_bundle_contract::parse_validate_descriptor(unknown, &manifest).is_err());
+    assert!(bundle_contract::parse_validate_descriptor(unknown, &manifest).is_err());
 }
 
 #[test]
@@ -507,49 +505,49 @@ fn manifest_rejects_paths_duplicates_digests_and_missing_modules() {
     let mut input = manifest();
     input.descriptor.path = "../escape".into();
     assert_eq!(
-        oxideloop_bundle_contract::validate_manifest(&input),
+        bundle_contract::validate_manifest(&input),
         Err(BundleError::InvalidPath)
     );
     let mut input = manifest();
     input.source_maps.push(input.descriptor.clone());
     assert_eq!(
-        oxideloop_bundle_contract::validate_manifest(&input),
+        bundle_contract::validate_manifest(&input),
         Err(BundleError::DuplicateDeclaration)
     );
     let mut input = manifest();
     input.action_modules[0].file.sha256 = "0".repeat(63);
     assert_eq!(
-        oxideloop_bundle_contract::validate_manifest(&input),
+        bundle_contract::validate_manifest(&input),
         Err(BundleError::InvalidContract)
     );
     let mut input = manifest();
     input.render_modules.clear();
     assert_eq!(
-        oxideloop_bundle_contract::validate_manifest(&input),
+        bundle_contract::validate_manifest(&input),
         Err(BundleError::MissingModule)
     );
     let mut input = manifest();
     input.phase_modules[1].phase = ExecutionPhaseV0::Render;
     assert_eq!(
-        oxideloop_bundle_contract::validate_manifest(&input),
+        bundle_contract::validate_manifest(&input),
         Err(BundleError::InvalidContract)
     );
     let mut input = manifest();
     input.phase_modules.push(input.phase_modules[0].clone());
     assert_eq!(
-        oxideloop_bundle_contract::validate_manifest(&input),
+        bundle_contract::validate_manifest(&input),
         Err(BundleError::InvalidContract)
     );
     let mut input = manifest();
     input.action_modules[0].file.length = MAX_FILE_BYTES + 1;
     assert_eq!(
-        oxideloop_bundle_contract::validate_manifest(&input),
+        bundle_contract::validate_manifest(&input),
         Err(BundleError::Limit)
     );
     let mut input = manifest();
     input.compiler.identity = "x".repeat(257);
     assert_eq!(
-        oxideloop_bundle_contract::validate_manifest(&input),
+        bundle_contract::validate_manifest(&input),
         Err(BundleError::Limit)
     );
     let mut raw = serde_json::to_string(&manifest()).unwrap();
@@ -558,26 +556,26 @@ fn manifest_rejects_paths_duplicates_digests_and_missing_modules() {
     let mut input = manifest();
     input.descriptor.path = "foo/./descriptor.json".into();
     assert_eq!(
-        oxideloop_bundle_contract::validate_manifest(&input),
+        bundle_contract::validate_manifest(&input),
         Err(BundleError::InvalidPath)
     );
     let mut input = manifest();
     input.descriptor.path = format!("{}descriptor.json", "a/".repeat(32));
     assert_eq!(
-        oxideloop_bundle_contract::validate_manifest(&input),
+        bundle_contract::validate_manifest(&input),
         Err(BundleError::Limit)
     );
     let mut input = manifest();
     input.descriptor.path = "install-record.json".into();
     assert_eq!(
-        oxideloop_bundle_contract::validate_manifest(&input),
+        bundle_contract::validate_manifest(&input),
         Err(BundleError::InvalidPath)
     );
     let mut input = manifest();
     input.descriptor.path = "foo".into();
     input.render_modules[0].file.path = "foo/render.js".into();
     assert_eq!(
-        oxideloop_bundle_contract::validate_manifest(&input),
+        bundle_contract::validate_manifest(&input),
         Err(BundleError::InvalidPath)
     );
 }

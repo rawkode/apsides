@@ -1,11 +1,11 @@
 use std::{env, fs, path::Path, process::Command, sync::Arc, thread};
 
-use oxideloop_bundle_archive::{ArchiveError, install_archive, parse_validate_archive};
-use oxideloop_bundle_contract::{
+use bundle_archive::{ArchiveError, install_archive, parse_validate_archive};
+use bundle_contract::{
     BUNDLE_MANIFEST_VERSION_V0, BundleInstallRecordV0, BundleIntegrityManifestV0, BundleStore,
     ExecutionPhaseV0, FileIntegrityV0, ModuleIntegrityV0, PhaseModuleV0, ToolIdentityV0,
 };
-use oxideloop_renderer_abi::{canonical_bytes, sha256_hex};
+use renderer_abi::{canonical_bytes, sha256_hex};
 use tempfile::TempDir;
 
 const PATHS: [&str; 5] = [

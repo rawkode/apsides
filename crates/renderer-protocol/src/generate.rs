@@ -21,7 +21,7 @@ pub fn generate(root: &Path, check: bool) -> Result<(), Box<dyn std::error::Erro
         serde_json::to_string_pretty(&sort_json(serde_json::to_value(schema_for!(ResponseV0))?))?
             + "\n";
     let mut typescript =
-        String::from("// Generated from oxideloop-renderer-protocol Rust types. Do not edit.\n\n");
+        String::from("// Generated from renderer-protocol Rust types. Do not edit.\n\n");
     macro_rules! emit {
         ($type:ty) => {{
             let item = <$type>::decl();

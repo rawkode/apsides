@@ -4,7 +4,7 @@ use std::path::Path;
 #[test]
 fn checked_in_renderer_protocol_artifacts_are_current() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    oxideloop_renderer_protocol::generate::generate(&root, true).unwrap();
+    renderer_protocol::generate::generate(&root, true).unwrap();
     let typescript =
         fs::read_to_string(root.join("abi/renderer-protocol/v0/renderer-protocol-v0.generated.ts"))
             .unwrap();
@@ -30,5 +30,5 @@ fn stale_short_artifacts_return_an_error_instead_of_panicking() {
     ] {
         fs::write(directory.join(name), "x").unwrap();
     }
-    assert!(oxideloop_renderer_protocol::generate::generate(root.path(), true).is_err());
+    assert!(renderer_protocol::generate::generate(root.path(), true).is_err());
 }

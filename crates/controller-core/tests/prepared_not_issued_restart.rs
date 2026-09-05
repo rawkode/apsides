@@ -1,14 +1,14 @@
-use oxideloop_controller_api::{
+use controller_api::{
     ObjectIdentity, OxideLoopStateSpec, PersistPurpose, ProgramBundleReference, RootBinding,
     STATE_VERSION_V1, StateBody, StateLink, WebApplicationSpec, WebApplicationStatus, bootstrap_id,
     state_name,
 };
-use oxideloop_controller_core::{
+use controller_core::{
     CommandV0, DesiredObservationV0, EventV0, FrozenInputV0, MachineStateV0, PhaseV0,
     RootSnapshotV0, reduce,
 };
-use oxideloop_mutation_model::{BackendQualification, Observation};
-use oxideloop_renderer_abi::{
+use mutation_model::{BackendQualification, Observation};
+use renderer_abi::{
     RenderOutputV0,
     model::{ABI_VERSION_V0, RenderDisposition, ResourceDeclaration, RootProjection},
     parse_validate_render_input,
@@ -31,8 +31,6 @@ fn linked_machine() -> MachineStateV0 {
                 message: None,
                 expose: false,
                 program: ProgramBundleReference {
-                    config_map_name: "bundle".into(),
-                    key: "program.mjs".into(),
                     digest: BUNDLE_DIGEST.into(),
                 },
             },
@@ -68,7 +66,7 @@ fn linked_machine() -> MachineStateV0 {
 }
 
 fn render_input(machine: &MachineStateV0, token: &str, cache_epoch: &str) -> String {
-    serde_json::to_string(&oxideloop_renderer_abi::RenderInputV0 {
+    serde_json::to_string(&renderer_abi::RenderInputV0 {
         abi_version: ABI_VERSION_V0.into(),
         root: RootProjection {
             api_version: "demo.oxideloop.dev/v1alpha1".into(),

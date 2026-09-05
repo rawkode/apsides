@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use oxideloop_mutation_model::generated_probe_schema;
+use mutation_model::generated_probe_schema;
 
 #[test]
 fn checked_probe_schema_is_current() {

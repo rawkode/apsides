@@ -1,27 +1,27 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use oxideloop_bundle_contract::{BundleDescriptorV0, DescriptorModuleV0};
-use oxideloop_controller_api::{
+use bundle_contract::{BundleDescriptorV0, DescriptorModuleV0};
+use controller_api::{
     AutomationRunCompletion, AutomationRunCompletionState, AutomationRunSpec, AutomationRunStatus,
     ObjectIdentity as ApiObjectIdentity, ProgramBundleReference, automation_run_name,
 };
-use oxideloop_controller_core::EventV0;
-use oxideloop_controller_runtime::{
+use controller_core::EventV0;
+use controller_runtime::{
     AutomationExecutionV0, AutomationPortV0, FailpointV0, FailpointsV0, RendererPortV0,
     RuntimeErrorV0, drive_automation,
 };
-use oxideloop_event_planner::{
+use event_planner::{
     ObjectIdentity as PlannerObjectIdentity, ObjectRef as PlannerObjectRefV0, PlannedEventV0,
     RunCorrelationV0,
 };
-use oxideloop_kube_transport::{AutomationCompletionAckV0, EventMaterializationRefV0};
-use oxideloop_renderer_abi::{
+use kube_transport::{AutomationCompletionAckV0, EventMaterializationRefV0};
+use renderer_abi::{
     ActionInputV0, ActionOutputV0, canonical_bytes,
     model::{ABI_VERSION_V0, ActionDeclaration},
     sha256_hex,
 };
-use oxideloop_renderer_protocol::{PhaseV0, RequestV0, ResponseStatusV0, ResponseV0};
+use renderer_protocol::{PhaseV0, RequestV0, ResponseStatusV0, ResponseV0};
 use serde_json::json;
 
 const BUNDLE_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -216,8 +216,6 @@ fn spec(occurrence_id: &str) -> AutomationRunSpec {
         automation_version: "v1".into(),
         bundle_digest: BUNDLE_DIGEST.into(),
         program: ProgramBundleReference {
-            config_map_name: "bundle".into(),
-            key: "program.mjs".into(),
             digest: BUNDLE_DIGEST.into(),
         },
         action_module_identity: "actions/input-changed.mjs".into(),
@@ -362,10 +360,10 @@ fn completion_ack(
 
 fn planned_event(spec: &AutomationRunSpec) -> PlannedEventV0 {
     let execution = execution(spec);
-    oxideloop_event_planner::plan_event(
-        &oxideloop_renderer_abi::parse_validate_action_input(&spec.action_input_v0)
+    event_planner::plan_event(
+        &renderer_abi::parse_validate_action_input(&spec.action_input_v0)
             .expect("valid action input"),
-        &oxideloop_renderer_abi::parse_validate_action_output(
+        &renderer_abi::parse_validate_action_output(
             std::str::from_utf8(&action_output_payload()).expect("UTF-8 action output"),
         )
         .expect("valid action output"),
@@ -610,5 +608,5 @@ async fn preexisting_mismatches_are_held_and_never_adopted() {
 }
 
 fn super_request_id(hash: &str) -> [u8; 16] {
-    oxideloop_controller_runtime::deterministic_request_id(hash).expect("valid hash")
+    controller_runtime::deterministic_request_id(hash).expect("valid hash")
 }

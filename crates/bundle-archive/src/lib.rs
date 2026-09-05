@@ -19,11 +19,11 @@
 //! entries. This makes links, devices, FIFOs, and tar-like format confusion
 //! unrepresentable at the wire boundary.
 
-use oxideloop_bundle_contract::{
+use bundle_contract::{
     BundleError, BundleInstallRecordV0, BundleStore, InstalledBundle, ValidatedManifestV0,
     parse_validate_manifest,
 };
-use oxideloop_renderer_abi::{canonical_bytes, parse_strict_value, sha256_hex};
+use renderer_abi::{canonical_bytes, parse_strict_value, sha256_hex};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use thiserror::Error;
@@ -260,7 +260,7 @@ fn validate_metadata(
     Ok(manifest)
 }
 
-fn has_exact_v0_roles(manifest: &oxideloop_bundle_contract::BundleIntegrityManifestV0) -> bool {
+fn has_exact_v0_roles(manifest: &bundle_contract::BundleIntegrityManifestV0) -> bool {
     manifest.descriptor.path == "descriptor.json"
         && matches!(manifest.render_modules.as_slice(), [module]
             if module.file.path == "render.callable.js")
@@ -271,10 +271,10 @@ fn has_exact_v0_roles(manifest: &oxideloop_bundle_contract::BundleIntegrityManif
             render,
             action,
         ] if matches!(manifest.render_modules.as_slice(), [render_module]
-                if render.phase == oxideloop_bundle_contract::ExecutionPhaseV0::Render
+                if render.phase == bundle_contract::ExecutionPhaseV0::Render
                     && render.module_identity == render_module.identity)
             && matches!(manifest.action_modules.as_slice(), [action_module]
-                if action.phase == oxideloop_bundle_contract::ExecutionPhaseV0::Action
+                if action.phase == bundle_contract::ExecutionPhaseV0::Action
                     && action.module_identity == action_module.identity))
 }
 

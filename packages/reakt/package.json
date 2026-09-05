@@ -1,0 +1,11 @@
+{
+  "name": "@reakt/kubernetes",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "typecheck": "deno check src/index.ts src/index.test.ts",
+    "test": "deno run src/index.test.ts"
+  }
+}

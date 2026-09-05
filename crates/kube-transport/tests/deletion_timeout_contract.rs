@@ -6,11 +6,11 @@ use std::{
     time::Duration,
 };
 
+use controller_api::state_name as deterministic_state_name;
+use controller_core::{CommandV0, PreconditionsV0, linked_state_finalizer_command_token};
 use http::{Method, Request, Response};
 use kube::{Client, client::Body};
-use oxideloop_controller_api::state_name as deterministic_state_name;
-use oxideloop_controller_core::{CommandV0, PreconditionsV0, linked_state_finalizer_command_token};
-use oxideloop_kube_transport::{
+use kube_transport::{
     COMMAND_ID_ANNOTATION, KubeTransportV0, ROOT_UID_ANNOTATION, RootAddressV0,
     TRANSACTION_ID_ANNOTATION, TransportErrorV0,
 };
@@ -34,7 +34,7 @@ fn response(value: impl serde::Serialize) -> Response<Body> {
 fn state_spec() -> Value {
     json!({
         "stateVersion":1,
-        "root":{"uid":ROOT_UID,"bootstrapId":oxideloop_controller_api::bootstrap_id(ROOT_UID).expect("fixture bootstrap ID"),"bundleDigest":"0".repeat(64)},
+        "root":{"uid":ROOT_UID,"bootstrapId":controller_api::bootstrap_id(ROOT_UID).expect("fixture bootstrap ID"),"bundleDigest":"0".repeat(64)},
         "state":{
             "pendingPersist":{"token":PERSIST_TOKEN,"purpose":"DeletionStart","phase":"DeletionStart","oldStateResourceVersion":"3","rootGeneration":1},
             "deletion":{"id":DELETION_ID,"deletionStartGeneration":1},

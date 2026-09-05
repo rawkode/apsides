@@ -10,29 +10,30 @@
 use std::future::Future;
 use std::{
     collections::{BTreeMap, VecDeque},
-    path::PathBuf,
+    fs,
+    path::{Path, PathBuf},
     pin::Pin,
 };
 
-use oxideloop_bundle_archive::install_archive;
-use oxideloop_bundle_contract::{BundleDescriptorV0, BundleStore, MAX_BUNDLE_BYTES};
+use bundle_archive::install_archive;
+use bundle_contract::{BundleDescriptorV0, BundleStore, MAX_BUNDLE_BYTES};
 #[cfg(feature = "test-failpoints")]
-use oxideloop_controller_api::PersistPurpose;
-use oxideloop_controller_api::{ObjectIdentity, PersistPurpose, ProgramBundleReference};
-use oxideloop_controller_core::{
+use controller_api::PersistPurpose;
+use controller_api::{ObjectIdentity, PersistPurpose, ProgramBundleReference};
+use controller_core::{
     ActionTriggerV0, CommandV0, EventV0, MachineStateV0, PhaseV0, PreconditionsV0,
     automation_source_transition_token, retired_state_delete_command_token,
     root_only_owned_children_verify_token,
 };
-use oxideloop_event_planner::{
+use event_planner::{
     ObjectIdentity as PlannerIdentityV0, ObjectRef as PlannerObjectRefV0, RunCorrelationV0,
 };
-use oxideloop_kube_transport::{
+use kube_transport::{
     AutomationRunExpectationV0, AutomationRunObservationBarrierV0, ConflictProvenanceV0,
     KubeTransportV0, ObjectRefV0, OperationSessionV0, PrewriteGateStateV0, ResourceKindV0,
     TransportErrorV0, WatchEventV0, WatchHandleV0,
 };
-use oxideloop_renderer_abi::{
+use renderer_abi::{
     action_context_source_matches, action_context_v1,
     limits::validate_event_metadata,
     model::{ABI_VERSION_V0, Dependency, RenderInputV0, RootProjection},
@@ -54,15 +55,17 @@ use crate::{
     load_machine_from_transport_in_operation,
 };
 #[cfg(all(feature = "test-failpoints", test))]
-use oxideloop_kube_transport::ObjectV0;
+use kube_transport::ObjectV0;
 
-/// Explicit production inputs.  There is no archive-file, TCP renderer, or
-/// ambient environment configuration path.
+/// Explicit production inputs. The program archive and its digest are fixed
+/// image files, not Kubernetes objects or ambient environment configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DriverConfigV0 {
     pub namespace: String,
     pub root_name: String,
     pub bundle_store: PathBuf,
+    pub embedded_bundle_archive: PathBuf,
+    pub embedded_bundle_digest: PathBuf,
     pub renderer_unix_socket: PathBuf,
     #[cfg(feature = "test-failpoints")]
     pub failpoint_unix_socket: Option<PathBuf>,
@@ -74,10 +77,13 @@ impl DriverConfigV0 {
     pub fn validate(&self) -> Result<(), RuntimeErrorV0> {
         if self.namespace.is_empty()
             || self.root_name.is_empty()
+            || !self.bundle_store.is_absolute()
+            || !self.embedded_bundle_archive.is_absolute()
+            || !self.embedded_bundle_digest.is_absolute()
             || !self.renderer_unix_socket.is_absolute()
         {
             return Err(RuntimeErrorV0::Hold(
-                "namespace/root name must be nonempty and renderer socket must be absolute".into(),
+                "namespace/root name and all controller paths must be absolute".into(),
             ));
         }
         #[cfg(feature = "test-failpoints")]
@@ -111,7 +117,7 @@ enum QuiescentWakeV0 {
     FailpointPoll,
     Root(Result<WatchEventV0, TransportErrorV0>),
     Dependency(Result<BufferedRetainedWatchV0, RuntimeErrorV0>),
-    Automation(Box<Result<oxideloop_kube_transport::ValidatedAutomationRunV0, TransportErrorV0>>),
+    Automation(Box<Result<kube_transport::ValidatedAutomationRunV0, TransportErrorV0>>),
 }
 
 /// The only no-command driver boundary. Keeping this policy separate from the
@@ -196,8 +202,15 @@ impl ControllerDriverV0 {
 
     /// Creates the only supported production Kubernetes transport.
     pub async fn in_cluster(config: DriverConfigV0) -> Result<Self, RuntimeErrorV0> {
+        // Validate and install the image-owned program before constructing a
+        // Kubernetes transport. A malformed image must not gain API access.
+        let store = prepare_embedded_store(&config)?;
         let transport = KubeTransportV0::in_cluster().await?;
-        Self::new(config, transport)
+        Ok(Self {
+            config,
+            transport,
+            store,
+        })
     }
 
     /// Runs until the exact original root has completed deletion.  An absent
@@ -415,12 +428,7 @@ impl ControllerDriverV0 {
                     }
                     let program = capability.program().clone();
                     let (descriptor, buffered) = match collect_while_observing(
-                        descriptor_for_program(
-                            &self.transport,
-                            &self.store,
-                            &self.config.namespace,
-                            &program,
-                        ),
+                        async { descriptor_for_program(&self.store, &program) },
                         &mut root_watch,
                         &mut fixed_point,
                         &mut automation_watch,
@@ -1031,13 +1039,8 @@ impl ControllerDriverV0 {
                             ));
                         }
                         if !active.state().root().deleting {
-                            let descriptor = descriptor_for_program(
-                                &self.transport,
-                                &self.store,
-                                &self.config.namespace,
-                                watch.current().program(),
-                            )
-                            .await?;
+                            let descriptor =
+                                descriptor_for_program(&self.store, watch.current().program())?;
                             descriptors
                                 .entry(watch.current().spec().bundle_digest.clone())
                                 .or_insert_with(|| descriptor.clone());
@@ -1112,14 +1115,14 @@ impl ControllerDriverV0 {
                             run = async {
                                 if blocked_foreign_collision {
                                     std::future::pending::<Result<
-                                        oxideloop_kube_transport::ValidatedAutomationRunV0,
+                                        kube_transport::ValidatedAutomationRunV0,
                                         TransportErrorV0,
                                     >>().await
                                 } else {
                                     match automation_watch.as_mut() {
                                         Some(watch) => watch.next_change().await,
                                         None => std::future::pending::<Result<
-                                            oxideloop_kube_transport::ValidatedAutomationRunV0,
+                                            kube_transport::ValidatedAutomationRunV0,
                                             TransportErrorV0,
                                         >>().await,
                                     }
@@ -1141,14 +1144,14 @@ impl ControllerDriverV0 {
                             run = async {
                                 if blocked_foreign_collision {
                                     std::future::pending::<Result<
-                                        oxideloop_kube_transport::ValidatedAutomationRunV0,
+                                        kube_transport::ValidatedAutomationRunV0,
                                         TransportErrorV0,
                                     >>().await
                                 } else {
                                     match automation_watch.as_mut() {
                                         Some(watch) => watch.next_change().await,
                                         None => std::future::pending::<Result<
-                                            oxideloop_kube_transport::ValidatedAutomationRunV0,
+                                            kube_transport::ValidatedAutomationRunV0,
                                             TransportErrorV0,
                                         >>().await,
                                     }
@@ -1505,7 +1508,7 @@ fn enqueue_next_automation_candidate(
 fn automation_candidates_from_final_render(
     actor: &RootActorV0,
     input: &RenderInputV0,
-    output: &oxideloop_renderer_abi::RenderOutputV0,
+    output: &renderer_abi::RenderOutputV0,
     final_dependencies: &[Dependency],
     descriptor: &BundleDescriptorV0,
 ) -> Result<VecDeque<QueuedAutomationV0>, RuntimeErrorV0> {
@@ -1680,7 +1683,7 @@ enum BufferedRootWatchV0 {
 /// retained barrier must be re-established from durable pending state after
 /// the command acknowledgement; it never turns it into a reducer event.
 enum BufferedAutomationWatchV0 {
-    Changed(Box<oxideloop_kube_transport::ValidatedAutomationRunV0>),
+    Changed(Box<kube_transport::ValidatedAutomationRunV0>),
     RestartRequired,
 }
 
@@ -1845,7 +1848,7 @@ async fn drain_collected_bootstrap_fence_to_watermark(
 #[allow(clippy::too_many_arguments)]
 async fn execute_kubernetes_command_while_observing(
     transport: &KubeTransportV0,
-    address: &oxideloop_kube_transport::RootAddressV0,
+    address: &kube_transport::RootAddressV0,
     command: &CommandV0,
     root_watch: &mut WatchHandleV0,
     fixed_point: &mut Option<KubeFixedPointPortV0<'_, UnixRendererPortV0>>,
@@ -1978,7 +1981,7 @@ async fn rebarrier_after_fresh_bootstrap_cut<R>(
 #[cfg(test)]
 async fn dispatch_owned_command_until_event(
     transport: &KubeTransportV0,
-    address: &oxideloop_kube_transport::RootAddressV0,
+    address: &kube_transport::RootAddressV0,
     command: &CommandV0,
 ) -> Result<Option<EventV0>, RuntimeErrorV0> {
     dispatch_owned_command_until_event_with_operation(
@@ -1992,7 +1995,7 @@ async fn dispatch_owned_command_until_event(
 
 async fn dispatch_owned_command_until_event_with_operation(
     transport: &KubeTransportV0,
-    address: &oxideloop_kube_transport::RootAddressV0,
+    address: &kube_transport::RootAddressV0,
     command: &CommandV0,
     operation: OperationSessionV0,
 ) -> Result<Option<EventV0>, RuntimeErrorV0> {
@@ -2016,17 +2019,13 @@ async fn dispatch_owned_command_until_event_with_operation(
 type OwnedCommandFutureV0<'a> =
     Pin<Box<dyn Future<Output = Result<Option<EventV0>, RuntimeErrorV0>> + Send + 'a>>;
 type RootAuthenticationFutureV0<'a> = Pin<
-    Box<
-        dyn Future<Output = Result<oxideloop_controller_core::RootSnapshotV0, RuntimeErrorV0>>
-            + Send
-            + 'a,
-    >,
+    Box<dyn Future<Output = Result<controller_core::RootSnapshotV0, RuntimeErrorV0>> + Send + 'a>,
 >;
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn collect_kubernetes_command_while_observing<R>(
     transport: &KubeTransportV0,
-    address: &oxideloop_kube_transport::RootAddressV0,
+    address: &kube_transport::RootAddressV0,
     command: &CommandV0,
     root_watch: &mut WatchHandleV0,
     fixed_point: &mut Option<KubeFixedPointPortV0<'_, R>>,
@@ -2074,7 +2073,7 @@ async fn collect_kubernetes_command_while_observing<R>(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn collect_kubernetes_command_while_observing_inner<R>(
     transport: &KubeTransportV0,
-    address: &oxideloop_kube_transport::RootAddressV0,
+    address: &kube_transport::RootAddressV0,
     command: &CommandV0,
     root_watch: &mut WatchHandleV0,
     fixed_point: &mut Option<KubeFixedPointPortV0<'_, R>>,
@@ -2302,7 +2301,7 @@ async fn collect_kubernetes_command_while_observing_inner<R>(
                 if let Some(authentication) = root_authentication.as_mut() {
                     Some(authentication.await)
                 } else {
-                    std::future::pending::<Option<Result<oxideloop_controller_core::RootSnapshotV0, RuntimeErrorV0>>>().await
+                    std::future::pending::<Option<Result<controller_core::RootSnapshotV0, RuntimeErrorV0>>>().await
                 }
             }, if root_authentication.is_some() => {
                 let epoch = root_auth_epoch.expect("root authentication owns an epoch");
@@ -2376,11 +2375,11 @@ async fn collect_kubernetes_command_while_observing_inner<R>(
             }
             run = async {
                 if buffered.automation_faulted || buffered.automation.is_some() {
-                    std::future::pending::<Result<oxideloop_kube_transport::ValidatedAutomationRunV0, TransportErrorV0>>().await
+                    std::future::pending::<Result<kube_transport::ValidatedAutomationRunV0, TransportErrorV0>>().await
                 } else if let Some(watch) = automation_watch.as_mut() {
                     watch.next_change().await
                 } else {
-                    std::future::pending::<Result<oxideloop_kube_transport::ValidatedAutomationRunV0, TransportErrorV0>>().await
+                    std::future::pending::<Result<kube_transport::ValidatedAutomationRunV0, TransportErrorV0>>().await
                 }
             } => {
                 match run {
@@ -2548,11 +2547,11 @@ where
             }
             run = async {
                 if buffered.automation_faulted || buffered.automation.is_some() {
-                    std::future::pending::<Result<oxideloop_kube_transport::ValidatedAutomationRunV0, TransportErrorV0>>().await
+                    std::future::pending::<Result<kube_transport::ValidatedAutomationRunV0, TransportErrorV0>>().await
                 } else if let Some(watch) = automation_watch.as_mut() {
                     watch.next_change().await
                 } else {
-                    std::future::pending::<Result<oxideloop_kube_transport::ValidatedAutomationRunV0, TransportErrorV0>>().await
+                    std::future::pending::<Result<kube_transport::ValidatedAutomationRunV0, TransportErrorV0>>().await
                 }
             } => {
                 match run {
@@ -2664,11 +2663,11 @@ where
             },
             run = async {
                 if buffered.automation_faulted || buffered.automation.is_some() {
-                    std::future::pending::<Result<oxideloop_kube_transport::ValidatedAutomationRunV0, TransportErrorV0>>().await
+                    std::future::pending::<Result<kube_transport::ValidatedAutomationRunV0, TransportErrorV0>>().await
                 } else if let Some(watch) = automation_watch.as_mut() {
                     watch.next_change().await
                 } else {
-                    std::future::pending::<Result<oxideloop_kube_transport::ValidatedAutomationRunV0, TransportErrorV0>>().await
+                    std::future::pending::<Result<kube_transport::ValidatedAutomationRunV0, TransportErrorV0>>().await
                 }
             } => match run {
                 Ok(run) => {
@@ -3125,20 +3124,18 @@ fn is_dependency_watch_terminal(error: &TransportErrorV0) -> bool {
         || is_watch_terminal_for(error, ResourceKindV0::AutomationRun)
 }
 
-fn root_address(
-    actor: &RootActorV0,
-) -> Result<oxideloop_kube_transport::RootAddressV0, RuntimeErrorV0> {
+fn root_address(actor: &RootActorV0) -> Result<kube_transport::RootAddressV0, RuntimeErrorV0> {
     let root = actor.state().root();
     // A bootstrap root intentionally has no trusted state link yet, but the
     // first owned command still addresses the deterministic state name. Once
     // bootstrap is acknowledged, the linked-state pin remains authoritative.
     let state_name = if root.state_name.is_empty() {
-        oxideloop_controller_api::state_name(&root.uid)
+        controller_api::state_name(&root.uid)
             .map_err(|error| RuntimeErrorV0::Hold(error.to_string()))?
     } else {
         root.state_name.clone()
     };
-    Ok(oxideloop_kube_transport::RootAddressV0 {
+    Ok(kube_transport::RootAddressV0 {
         namespace: root.namespace.clone(),
         name: root.name.clone(),
         state_name,
@@ -3157,7 +3154,7 @@ enum DeletionAuthorityCutV0 {
 
 fn recovery_preconditions_match(
     preconditions: &PreconditionsV0,
-    root: &oxideloop_controller_core::RootSnapshotV0,
+    root: &controller_core::RootSnapshotV0,
 ) -> bool {
     preconditions.root_uid == root.uid
         && preconditions.root_generation == root.generation
@@ -3169,23 +3166,22 @@ fn recovery_preconditions_match(
 }
 
 fn exact_deletion_link(
-    root: &oxideloop_controller_core::RootSnapshotV0,
+    root: &controller_core::RootSnapshotV0,
 ) -> Result<
     (
-        &oxideloop_controller_api::DeletionCleanupReceipt,
-        &oxideloop_controller_api::StateLink,
+        &controller_api::DeletionCleanupReceipt,
+        &controller_api::StateLink,
     ),
     RuntimeErrorV0,
 > {
-    let receipt =
-        oxideloop_controller_core::validate_deleting_root_receipt(root).map_err(|error| {
-            RuntimeErrorV0::Hold(format!("deletion cut receipt is invalid: {error}"))
-        })?;
+    let receipt = controller_core::validate_deleting_root_receipt(root).map_err(|error| {
+        RuntimeErrorV0::Hold(format!("deletion cut receipt is invalid: {error}"))
+    })?;
     let link =
         root.status.state.as_ref().ok_or_else(|| {
             RuntimeErrorV0::Hold("deletion cut root has no exact State link".into())
         })?;
-    let deterministic_name = oxideloop_controller_api::state_name(&root.uid)
+    let deterministic_name = controller_api::state_name(&root.uid)
         .map_err(|error| RuntimeErrorV0::Hold(error.to_string()))?;
     if !root.deleting
         || !root.root_finalizer_present
@@ -3404,8 +3400,8 @@ fn is_exact_retired_state_delete(command: &CommandV0, state: &MachineStateV0) ->
 
 #[cfg(feature = "test-failpoints")]
 fn validate_deletion_barrier_root(
-    original: &oxideloop_controller_core::RootSnapshotV0,
-    current: &oxideloop_controller_core::RootSnapshotV0,
+    original: &controller_core::RootSnapshotV0,
+    current: &controller_core::RootSnapshotV0,
 ) -> Result<(), RuntimeErrorV0> {
     if current.uid != original.uid
         || current.namespace != original.namespace
@@ -3418,7 +3414,7 @@ fn validate_deletion_barrier_root(
             "deletion barrier root/receipt proof changed or is incomplete".into(),
         ));
     }
-    oxideloop_controller_core::validate_deleting_root_receipt(current).map_err(|error| {
+    controller_core::validate_deleting_root_receipt(current).map_err(|error| {
         RuntimeErrorV0::Hold(format!("deletion barrier receipt is invalid: {error}"))
     })?;
     Ok(())
@@ -3498,32 +3494,74 @@ fn render_input(
     })
 }
 
-async fn descriptor_for_program(
-    transport: &KubeTransportV0,
+fn descriptor_for_program(
     store: &BundleStore,
-    namespace: &str,
     program: &ProgramBundleReference,
 ) -> Result<BundleDescriptorV0, RuntimeErrorV0> {
     program
         .validate()
         .map_err(|_| RuntimeErrorV0::Hold("program bundle reference is invalid".into()))?;
-    let installed = if let Ok(installed) = store.open_installed(&program.digest) {
-        installed
-    } else {
-        let source = transport
-            .read_bundle_binary_data(
-                namespace,
-                namespace,
-                &program.config_map_name,
-                &program.key,
-                usize::try_from(MAX_BUNDLE_BYTES).map_err(|_| {
-                    RuntimeErrorV0::Hold("bundle byte limit cannot fit this platform".into())
-                })?,
-            )
-            .await?;
-        install_archive(store, &source.bytes, &program.digest)?
-    };
+    let installed = store.open_installed(&program.digest).map_err(|_| {
+        RuntimeErrorV0::Hold("image does not contain the root's verified program digest".into())
+    })?;
     installed.descriptor().map_err(Into::into)
+}
+
+fn install_embedded_program(
+    store: &BundleStore,
+    archive_path: &Path,
+    digest_path: &Path,
+) -> Result<(), RuntimeErrorV0> {
+    let digest_bytes = read_image_file(digest_path, 65)?;
+    let digest = std::str::from_utf8(&digest_bytes)
+        .ok()
+        .and_then(|value| value.strip_suffix('\n').or(Some(value)))
+        .filter(|value| !value.contains('\n') && !value.contains('\r'))
+        .ok_or_else(|| RuntimeErrorV0::Hold("embedded bundle digest is invalid".into()))?;
+    let program = ProgramBundleReference {
+        digest: digest.to_owned(),
+    };
+    program
+        .validate()
+        .map_err(|_| RuntimeErrorV0::Hold("embedded bundle digest is invalid".into()))?;
+    let archive = read_image_file(
+        archive_path,
+        usize::try_from(MAX_BUNDLE_BYTES).map_err(|_| {
+            RuntimeErrorV0::Hold("bundle byte limit cannot fit this platform".into())
+        })?,
+    )?;
+    let installed = install_archive(store, &archive, &program.digest)
+        .map_err(|_| RuntimeErrorV0::Hold("embedded bundle archive is invalid".into()))?;
+    installed
+        .descriptor()
+        .map_err(|_| RuntimeErrorV0::Hold("embedded bundle descriptor is invalid".into()))?;
+    Ok(())
+}
+
+/// Prepare the image-owned descriptor store before the production client is
+/// constructed. Keeping this boundary synchronous makes it mechanically
+/// impossible for malformed image inputs to cause Kubernetes I/O.
+fn prepare_embedded_store(config: &DriverConfigV0) -> Result<BundleStore, RuntimeErrorV0> {
+    config.validate()?;
+    let store = BundleStore::new(&config.bundle_store)?;
+    install_embedded_program(
+        &store,
+        &config.embedded_bundle_archive,
+        &config.embedded_bundle_digest,
+    )?;
+    Ok(store)
+}
+
+fn read_image_file(path: &Path, maximum: usize) -> Result<Vec<u8>, RuntimeErrorV0> {
+    let metadata = fs::metadata(path)
+        .map_err(|_| RuntimeErrorV0::Hold("embedded program image file is unavailable".into()))?;
+    if !metadata.is_file() || metadata.len() > u64::try_from(maximum).unwrap_or(u64::MAX) {
+        return Err(RuntimeErrorV0::Hold(
+            "embedded program image file exceeds its fixed bound".into(),
+        ));
+    }
+    fs::read(path)
+        .map_err(|_| RuntimeErrorV0::Hold("embedded program image file is unreadable".into()))
 }
 
 fn descriptor_for_digest<'a>(
@@ -3574,7 +3612,7 @@ async fn wait_before_barrier_restart(restart: usize) {
 
 fn automation_execution(
     actor: &RootActorV0,
-    run: &oxideloop_kube_transport::ValidatedAutomationRunV0,
+    run: &kube_transport::ValidatedAutomationRunV0,
 ) -> Result<crate::AutomationExecutionV0, RuntimeErrorV0> {
     let spec = run.spec();
     if spec.root_uid != actor.state().root().uid || actor.state().root().deleting {
@@ -3677,24 +3715,24 @@ mod tests {
         },
     };
 
-    use http::{Request, Response};
-    use http_body_util::BodyExt;
-    use kube::{Client, client::Body};
-    use oxideloop_bundle_contract::{
+    use bundle_contract::{
         BUNDLE_MANIFEST_VERSION_V0, BundleInstallRecordV0, BundleIntegrityManifestV0,
         DescriptorModuleV0, ExecutionPhaseV0, FileIntegrityV0, ModuleIntegrityV0, PhaseModuleV0,
         ToolIdentityV0,
     };
-    use oxideloop_controller_api::{
+    use controller_api::{
         AutomationPending, AutomationRunCompletion, AutomationRunCompletionState,
         AutomationRunSpec, AutomationRunStatus, AutomationState, ObjectIdentity,
         OxideLoopStateSpec, RootBinding, STATE_VERSION_V1, StateBody, StateLink,
         WebApplicationSpec, WebApplicationStatus, automation_run_name, bootstrap_id, state_name,
     };
-    use oxideloop_controller_core::{DesiredObservationV0, FrozenInputV0, RootSnapshotV0};
-    use oxideloop_kube_transport::{ObjectMetaV0, ObjectV0};
-    use oxideloop_mutation_model::{BackendQualification, Observation as MutationObservation};
-    use oxideloop_renderer_abi::{
+    use controller_core::{DesiredObservationV0, FrozenInputV0, RootSnapshotV0};
+    use http::{Request, Response};
+    use http_body_util::BodyExt;
+    use kube::{Client, client::Body};
+    use kube_transport::{ObjectMetaV0, ObjectV0};
+    use mutation_model::{BackendQualification, Observation as MutationObservation};
+    use renderer_abi::{
         ActionInputV0, canonical_bytes,
         model::{
             ABI_VERSION_V0, AutomationDeclaration, Dependency, Observation, RenderDisposition,
@@ -3761,23 +3799,23 @@ mod tests {
         missing_receipt.status.deletion_cleanup_receipt = None;
         assert!(validate_deletion_barrier_root(&original, &missing_receipt).is_err());
 
-        let mutations: [fn(&mut oxideloop_controller_api::DeletionCleanupReceipt); 6] = [
-            |receipt: &mut oxideloop_controller_api::DeletionCleanupReceipt| {
+        let mutations: [fn(&mut controller_api::DeletionCleanupReceipt); 6] = [
+            |receipt: &mut controller_api::DeletionCleanupReceipt| {
                 receipt.deletion_id = "f".repeat(64);
             },
-            |receipt: &mut oxideloop_controller_api::DeletionCleanupReceipt| {
+            |receipt: &mut controller_api::DeletionCleanupReceipt| {
                 receipt.deletion_start_generation += 1;
             },
-            |receipt: &mut oxideloop_controller_api::DeletionCleanupReceipt| {
+            |receipt: &mut controller_api::DeletionCleanupReceipt| {
                 receipt.cleanup_token = "f".repeat(64);
             },
-            |receipt: &mut oxideloop_controller_api::DeletionCleanupReceipt| {
+            |receipt: &mut controller_api::DeletionCleanupReceipt| {
                 receipt.state_name = "other-state".into();
             },
-            |receipt: &mut oxideloop_controller_api::DeletionCleanupReceipt| {
+            |receipt: &mut controller_api::DeletionCleanupReceipt| {
                 receipt.state_uid = "other-state-uid".into();
             },
-            |receipt: &mut oxideloop_controller_api::DeletionCleanupReceipt| {
+            |receipt: &mut controller_api::DeletionCleanupReceipt| {
                 receipt.root_uid = "other-root-uid".into();
             },
         ];
@@ -3963,8 +4001,6 @@ mod tests {
             automation_version: "v1".into(),
             bundle_digest: BUNDLE_DIGEST.into(),
             program: ProgramBundleReference {
-                config_map_name: "bundle".into(),
-                key: "program.mjs".into(),
                 digest: BUNDLE_DIGEST.into(),
             },
             action_module_identity: "actions/driver-test.mjs".into(),
@@ -4026,8 +4062,6 @@ mod tests {
 
     fn automation_candidate_actor_for_digest(bundle_digest: &str) -> RootActorV0 {
         let program = ProgramBundleReference {
-            config_map_name: "bundle".into(),
-            key: "program.mjs".into(),
             digest: bundle_digest.into(),
         };
         RootActorV0::new(
@@ -4078,8 +4112,6 @@ mod tests {
                         message: None,
                         expose: false,
                         program: ProgramBundleReference {
-                            config_map_name: "bundle".into(),
-                            key: "program.mjs".into(),
                             digest: BUNDLE_DIGEST.into(),
                         },
                     },
@@ -4143,8 +4175,6 @@ mod tests {
                     message: None,
                     expose: false,
                     program: ProgramBundleReference {
-                        config_map_name: "bundle".into(),
-                        key: "program.mjs".into(),
                         digest: BUNDLE_DIGEST.into(),
                     },
                 },
@@ -4260,7 +4290,7 @@ mod tests {
             diagnostics: vec![],
         })
         .expect("render output serializes");
-        let frozen = oxideloop_controller_core::FrozenInputV0 {
+        let frozen = controller_core::FrozenInputV0 {
             root_generation: root.generation,
             state_resource_version: preconditions.state_resource_version,
             observation_token: input.observation_token.clone(),
@@ -4268,7 +4298,7 @@ mod tests {
             final_observation_fence_token: sha256_hex(
                 format!("prewrite-status-fence/v0/{}", input.observation_token).as_bytes(),
             ),
-            render_input_hash: oxideloop_renderer_abi::parse_validate_render_input(&input_json)
+            render_input_hash: renderer_abi::parse_validate_render_input(&input_json)
                 .expect("canonical render input")
                 .sha256,
         };
@@ -4308,8 +4338,8 @@ mod tests {
                 "uid":root.uid,
                 "resourceVersion":resource_version,
                 "generation":root.generation,
-                "finalizers":[oxideloop_controller_api::ROOT_FINALIZER],
-                "annotations":{oxideloop_kube_transport::ROOT_UID_ANNOTATION:root.uid},
+                "finalizers":[controller_api::ROOT_FINALIZER],
+                "annotations":{kube_transport::ROOT_UID_ANNOTATION:root.uid},
             },
             "spec":spec,
             "status":status,
@@ -4326,8 +4356,8 @@ mod tests {
                 "namespace":root.namespace,
                 "uid":root.state_uid,
                 "resourceVersion":resource_version,
-                "finalizers":[oxideloop_controller_api::STATE_FINALIZER],
-                "annotations":{oxideloop_kube_transport::ROOT_UID_ANNOTATION:root.uid},
+                "finalizers":[controller_api::STATE_FINALIZER],
+                "annotations":{kube_transport::ROOT_UID_ANNOTATION:root.uid},
                 "ownerReferences":[{
                     "apiVersion":"demo.oxideloop.dev/v1alpha1",
                     "kind":"WebApplication",
@@ -4344,8 +4374,8 @@ mod tests {
 
     fn receipt_bounded_root_only_machine() -> MachineStateV0 {
         let mut root = automation_candidate_actor().state().root().clone();
-        let state_name = oxideloop_controller_api::state_name(&root.uid)
-            .expect("deterministic deleted-state name");
+        let state_name =
+            controller_api::state_name(&root.uid).expect("deterministic deleted-state name");
         root.deleting = true;
         root.root_finalizer_present = true;
         root.state_name.clear();
@@ -4353,7 +4383,7 @@ mod tests {
         root.state_resource_version.clear();
         root.state_finalizer_present = false;
         root.status = WebApplicationStatus {
-            deletion_cleanup_receipt: Some(oxideloop_controller_api::DeletionCleanupReceipt {
+            deletion_cleanup_receipt: Some(controller_api::DeletionCleanupReceipt {
                 root_uid: root.uid.clone(),
                 deletion_id: "d".repeat(64),
                 deletion_start_generation: root.generation,
@@ -4396,7 +4426,7 @@ mod tests {
     }
 
     fn retired_machine_with(
-        mutator: impl FnOnce(&mut oxideloop_controller_core::RootSnapshotV0),
+        mutator: impl FnOnce(&mut controller_core::RootSnapshotV0),
     ) -> MachineStateV0 {
         let mut root = receipt_bounded_retired_state_machine().root().clone();
         mutator(&mut root);
@@ -4444,11 +4474,9 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn deletion_authority_cuts_require_the_same_root_receipt_link_and_state_pins() {
-        let started_retired = oxideloop_controller_core::reduce(
-            receipt_bounded_retired_state_machine(),
-            EventV0::Start,
-        )
-        .expect("retired State starts its one delete");
+        let started_retired =
+            controller_core::reduce(receipt_bounded_retired_state_machine(), EventV0::Start)
+                .expect("retired State starts its one delete");
         let delete = started_retired.commands[0].clone();
         let active_retired = started_retired.state;
         let fresh_retired = receipt_bounded_retired_state_machine();
@@ -4469,7 +4497,7 @@ mod tests {
             } => (token.clone(), preconditions.clone()),
             command => panic!("unexpected retired State command: {command:?}"),
         };
-        let started_root_only = oxideloop_controller_core::reduce(
+        let started_root_only = controller_core::reduce(
             active_retired,
             EventV0::RetiredStateDeleted {
                 token: delete_token,
@@ -4493,7 +4521,7 @@ mod tests {
 
         let root_uid_replacement = retired_machine_with(|root| {
             let replacement_uid = "replacement-root-uid".to_owned();
-            let replacement_name = oxideloop_controller_api::state_name(&replacement_uid)
+            let replacement_name = controller_api::state_name(&replacement_uid)
                 .expect("replacement deterministic name");
             root.uid = replacement_uid.clone();
             root.state_name = replacement_name.clone();
@@ -4669,11 +4697,11 @@ mod tests {
         BundleDescriptorV0 {
             descriptor_version: "bundle.oxideloop.dev/v0".into(),
             renderer_abi_version: ABI_VERSION_V0.into(),
-            render_module: oxideloop_bundle_contract::DescriptorModuleV0 {
+            render_module: bundle_contract::DescriptorModuleV0 {
                 identity: "render.mjs".into(),
                 digest: "c".repeat(64),
             },
-            action_modules: vec![oxideloop_bundle_contract::DescriptorModuleV0 {
+            action_modules: vec![bundle_contract::DescriptorModuleV0 {
                 identity: "actions/source.mjs".into(),
                 digest: ACTION_DIGEST.into(),
             }],
@@ -4740,7 +4768,6 @@ mod tests {
         metadata_echo_sent: bool,
         root_status: bool,
         root_statuses: Vec<serde_json::Value>,
-        descriptor_reads: usize,
         requests: Vec<String>,
     }
 
@@ -4863,7 +4890,7 @@ mod tests {
                 "replicas":1,
                 "message":"fresh bootstrap",
                 "expose":false,
-                "program": {"configMapName":"bundle","key":"program.mjs","digest":bundle_digest}
+                "program": {"digest":bundle_digest}
             },
             "status":status.unwrap_or_else(|| json!({})),
         });
@@ -4874,32 +4901,6 @@ mod tests {
                 .remove("finalizers");
         }
         root
-    }
-
-    fn base64_encode(bytes: &[u8]) -> String {
-        const ALPHABET: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
-        for chunk in bytes.chunks(3) {
-            let first = chunk[0];
-            let second = *chunk.get(1).unwrap_or(&0);
-            let third = *chunk.get(2).unwrap_or(&0);
-            encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
-            encoded.push(char::from(
-                ALPHABET[usize::from((first & 0x03) << 4 | second >> 4)],
-            ));
-            encoded.push(if chunk.len() > 1 {
-                char::from(ALPHABET[usize::from((second & 0x0f) << 2 | third >> 6)])
-            } else {
-                '='
-            });
-            encoded.push(if chunk.len() > 2 {
-                char::from(ALPHABET[usize::from(third & 0x3f)])
-            } else {
-                '='
-            });
-        }
-        encoded
     }
 
     fn bundle_file(path: &str, bytes: &[u8]) -> FileIntegrityV0 {
@@ -5010,9 +5011,100 @@ mod tests {
         (archive, digest)
     }
 
+    fn embedded_program_paths(label: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "oxideloop-embedded-program-{label}-{}",
+            std::process::id()
+        ));
+        let archive = root.join("bundle.archive");
+        let digest = root.join("bundle.digest");
+        (root, archive, digest)
+    }
+
+    fn embedded_program_config(
+        store: PathBuf,
+        archive: PathBuf,
+        digest: PathBuf,
+    ) -> DriverConfigV0 {
+        DriverConfigV0 {
+            namespace: "ns".into(),
+            root_name: "root".into(),
+            bundle_store: store,
+            embedded_bundle_archive: archive,
+            embedded_bundle_digest: digest,
+            renderer_unix_socket: PathBuf::from("/tmp/oxideloop-embedded-program.sock"),
+            #[cfg(feature = "test-failpoints")]
+            failpoint_unix_socket: None,
+        }
+    }
+
+    fn cleanup_embedded_program_test(root: &Path, digest: &str) {
+        let installed = root.join("store").join(digest);
+        if installed.exists() {
+            unseal_test_bundle_directory(&installed)
+                .expect("unseal immutable embedded test bundle for cleanup");
+        }
+        std::fs::remove_dir_all(root).expect("embedded program test cleanup");
+    }
+
+    #[test]
+    fn embedded_program_is_verified_before_the_store_can_serve_its_descriptor() {
+        let (archive_bytes, digest) = valid_bundle_archive();
+        let (root, archive_path, digest_path) = embedded_program_paths("valid");
+        std::fs::create_dir_all(&root).expect("embedded test directory");
+        std::fs::write(&archive_path, archive_bytes).expect("embedded test archive");
+        std::fs::write(&digest_path, format!("{digest}\n")).expect("embedded test digest");
+        let config = embedded_program_config(root.join("store"), archive_path, digest_path);
+
+        let store = prepare_embedded_store(&config)
+            .expect("valid embedded program prepares without Kubernetes transport");
+        assert!(
+            descriptor_for_program(
+                &store,
+                &ProgramBundleReference {
+                    digest: digest.clone(),
+                },
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            descriptor_for_program(
+                &store,
+                &ProgramBundleReference {
+                    digest: "f".repeat(64),
+                },
+            ),
+            Err(RuntimeErrorV0::Hold(message)) if message == "image does not contain the root's verified program digest"
+        ));
+        cleanup_embedded_program_test(&root, &digest);
+    }
+
+    #[test]
+    fn malformed_or_mismatched_embedded_program_never_prepares_a_store() {
+        let (archive_bytes, actual_digest) = valid_bundle_archive();
+        for (label, digest_contents) in [
+            ("malformed", "not-a-sha256\n".to_owned()),
+            ("mismatched", format!("{}\n", "e".repeat(64))),
+        ] {
+            let (root, archive_path, digest_path) = embedded_program_paths(label);
+            std::fs::create_dir_all(&root).expect("embedded test directory");
+            std::fs::write(&archive_path, &archive_bytes).expect("embedded test archive");
+            std::fs::write(&digest_path, digest_contents).expect("embedded test digest");
+            let config = embedded_program_config(root.join("store"), archive_path, digest_path);
+
+            assert!(matches!(
+                prepare_embedded_store(&config),
+                Err(RuntimeErrorV0::Hold(_))
+            ));
+            let store = BundleStore::new(&config.bundle_store).expect("test store opens");
+            assert!(store.open_installed(&actual_digest).is_err());
+            cleanup_embedded_program_test(&root, &actual_digest);
+        }
+    }
+
     fn bootstrap_wire_state(
         state_name: &str,
-        state: &oxideloop_controller_api::OxideLoopStateSpec,
+        state: &controller_api::OxideLoopStateSpec,
         token: &str,
         state_finalizer: bool,
     ) -> serde_json::Value {
@@ -5154,7 +5246,7 @@ mod tests {
             }
         });
         let transport = KubeTransportV0::test_from_client(Client::new(service, "default"));
-        let address = oxideloop_kube_transport::RootAddressV0 {
+        let address = kube_transport::RootAddressV0 {
             namespace: "ns".into(),
             name: "root".into(),
             state_name: expected_state_name.clone(),
@@ -6405,7 +6497,6 @@ mod tests {
         // driver's list/watch/run sequencing rather than duplicating the
         // durable journal constructor.
         let (archive, bundle_digest) = valid_bundle_archive();
-        let archive = base64_encode(&archive);
         let installed_digest = bundle_digest.clone();
         let mut expected = automation_candidate_actor_for_digest(&bundle_digest);
         expected.start();
@@ -6433,6 +6524,7 @@ mod tests {
         let service_wire = Arc::clone(&wire);
         let service_root_present = Arc::clone(&root_present);
         let service_bootstrap_sender = bootstrap_sender.clone();
+        let service_bundle_digest = bundle_digest.clone();
         let service = service_fn(move |request: Request<Body>| {
             let wire = Arc::clone(&service_wire);
             let root_present = Arc::clone(&service_root_present);
@@ -6440,8 +6532,7 @@ mod tests {
             let token = token.clone();
             let state_name = state_name.clone();
             let state = state.clone();
-            let bundle_digest = bundle_digest.clone();
-            let archive = archive.clone();
+            let bundle_digest = service_bundle_digest.clone();
             async move {
                 let method = request.method().clone();
                 let path = request.uri().path().to_owned();
@@ -6591,19 +6682,6 @@ mod tests {
                         None,
                         &bundle_digest,
                     ))
-                } else if path.ends_with("/configmaps/bundle") && method == http::Method::GET {
-                    wire.descriptor_reads += 1;
-                    wire_json(json!({
-                        "apiVersion":"v1",
-                        "kind":"ConfigMap",
-                        "metadata": {
-                            "name":"bundle",
-                            "namespace":"ns",
-                            "uid":"bundle-uid",
-                            "resourceVersion":"bundle-rv-1"
-                        },
-                        "binaryData":{"program.mjs":archive}
-                    }))
                 } else {
                     panic!("unexpected composed-driver request {method} {path}");
                 };
@@ -6615,11 +6693,16 @@ mod tests {
         transport.test_push_watch(bootstrap_watch);
         let store =
             std::env::temp_dir().join(format!("oxideloop-driver-run-smoke-{}", std::process::id()));
+        let preinstalled_store = BundleStore::new(&store).expect("test bundle store");
+        install_archive(&preinstalled_store, &archive, &bundle_digest)
+            .expect("test program installs before the driver opens Kubernetes transport");
         let driver = ControllerDriverV0::new(
             DriverConfigV0 {
                 namespace: "ns".into(),
                 root_name: "root".into(),
                 bundle_store: store.clone(),
+                embedded_bundle_archive: store.join("bundle.archive"),
+                embedded_bundle_digest: store.join("bundle.digest"),
                 renderer_unix_socket: store.join("renderer.sock"),
                 #[cfg(feature = "test-failpoints")]
                 failpoint_unix_socket: None,
@@ -6709,10 +6792,6 @@ mod tests {
             json!(installed_digest),
             "the promoted root-status write carries the installed bundle digest"
         );
-        assert_eq!(
-            wire.descriptor_reads, 1,
-            "the verified descriptor is read once before the renderer is contacted"
-        );
         unseal_test_bundle_directory(&store.join(installed_digest))
             .expect("unseal immutable test bundle for cleanup");
         std::fs::remove_dir_all(store).expect("smoke store cleanup");
@@ -6739,8 +6818,6 @@ mod tests {
                 "message":"appeared in list/watch gap",
                 "expose":false,
                 "program": {
-                    "configMapName":"bundle",
-                    "key":"program.mjs",
                     "digest":BUNDLE_DIGEST
                 }
             }
@@ -6789,6 +6866,8 @@ mod tests {
             namespace: "ns".into(),
             root_name: "root".into(),
             bundle_store: std::env::temp_dir().join("unused-root-barrier-store"),
+            embedded_bundle_archive: "/unused/bundle.archive".into(),
+            embedded_bundle_digest: "/unused/bundle.digest".into(),
             renderer_unix_socket: "/tmp/renderer.sock".into(),
             #[cfg(feature = "test-failpoints")]
             failpoint_unix_socket: None,
@@ -6858,7 +6937,7 @@ mod tests {
             sender
                 .try_send(Err(TransportErrorV0::Conflict(
                     ConflictProvenanceV0::WatchTerminal {
-                        stage: oxideloop_kube_transport::WatchStageV0::Stream,
+                        stage: kube_transport::WatchStageV0::Stream,
                         resource: ResourceKindV0::AutomationRun,
                     },
                 )))
@@ -6873,7 +6952,7 @@ mod tests {
             error,
             RuntimeErrorV0::Discovery(TransportErrorV0::Conflict(
                 ConflictProvenanceV0::WatchTerminal {
-                    stage: oxideloop_kube_transport::WatchStageV0::Stream,
+                    stage: kube_transport::WatchStageV0::Stream,
                     resource: ResourceKindV0::AutomationRun,
                 }
             ))
@@ -6900,7 +6979,7 @@ mod tests {
         assert!(matches!(
             error,
             RuntimeErrorV0::Discovery(TransportErrorV0::Conflict(ConflictProvenanceV0::Read {
-                operation: oxideloop_kube_transport::ReadOperationV0::List,
+                operation: kube_transport::ReadOperationV0::List,
                 resource: ResourceKindV0::AutomationRun,
             }))
         ));
@@ -6919,7 +6998,7 @@ mod tests {
                 "image":"example.invalid/web:latest",
                 "replicas":1,
                 "message":"drain root", "expose":false,
-                "program": {"configMapName":"bundle", "key":"program.mjs", "digest":BUNDLE_DIGEST}
+                "program": {"digest":BUNDLE_DIGEST}
             }
         })
     }
@@ -6929,6 +7008,8 @@ mod tests {
             namespace: "ns".into(),
             root_name: "root".into(),
             bundle_store: std::env::temp_dir().join("unused-drain-root-store"),
+            embedded_bundle_archive: "/unused/bundle.archive".into(),
+            embedded_bundle_digest: "/unused/bundle.digest".into(),
             renderer_unix_socket: "/tmp/renderer.sock".into(),
             #[cfg(feature = "test-failpoints")]
             failpoint_unix_socket: None,
@@ -6975,7 +7056,7 @@ mod tests {
             TransportErrorV0::WatchGone,
             TransportErrorV0::WatchOverflow,
             TransportErrorV0::Conflict(ConflictProvenanceV0::WatchTerminal {
-                stage: oxideloop_kube_transport::WatchStageV0::Stream,
+                stage: kube_transport::WatchStageV0::Stream,
                 resource: ResourceKindV0::WebApplication,
             }),
         ] {
@@ -7097,7 +7178,7 @@ mod tests {
             actor.next_command(),
             Ok(Some(CommandV0::Persist { operation, .. }))
                 if operation.purpose
-                    == oxideloop_controller_api::PersistPurpose::AutomationBaseline
+                    == controller_api::PersistPurpose::AutomationBaseline
         ));
     }
 
@@ -7362,10 +7443,10 @@ mod tests {
         // that authenticated child change is reduced.
         let (actor, _) = prewrite_status_actor();
         let root = actor.state().root().clone();
-        let operation = oxideloop_controller_api::PersistOperation {
+        let operation = controller_api::PersistOperation {
             token: "c".repeat(64),
             purpose: PersistPurpose::MutationResult,
-            phase: oxideloop_controller_api::DurablePhase::MutationResult,
+            phase: controller_api::DurablePhase::MutationResult,
             old_state_resource_version: root.state_resource_version.clone(),
             root_generation: root.generation,
         };
@@ -8271,6 +8352,8 @@ mod tests {
             namespace: "ns".into(),
             root_name: "root".into(),
             bundle_store: PathBuf::from("/unused/coverage-race-bundles"),
+            embedded_bundle_archive: PathBuf::from("/unused/bundle.archive"),
+            embedded_bundle_digest: PathBuf::from("/unused/bundle.digest"),
             renderer_unix_socket: PathBuf::from("/unused/coverage-race.sock"),
             #[cfg(feature = "test-failpoints")]
             failpoint_unix_socket: None,
@@ -8361,6 +8444,8 @@ mod tests {
                 namespace: "ns".into(),
                 root_name: "root".into(),
                 bundle_store: PathBuf::from("/unused/pre-finalization-bundles"),
+                embedded_bundle_archive: PathBuf::from("/unused/bundle.archive"),
+                embedded_bundle_digest: PathBuf::from("/unused/bundle.digest"),
                 renderer_unix_socket: PathBuf::from("/unused/pre-finalization.sock"),
                 #[cfg(feature = "test-failpoints")]
                 failpoint_unix_socket: None,
@@ -8584,7 +8669,7 @@ mod tests {
             diagnostics: vec![],
         })
         .expect("render output serializes");
-        let blocked = oxideloop_controller_core::reduce(
+        let blocked = controller_core::reduce(
             actor.state().clone(),
             EventV0::Rendered {
                 frozen: FrozenInputV0 {
@@ -8607,7 +8692,7 @@ mod tests {
                         name: "foreign".into(),
                     },
                     observation: MutationObservation::Existing {
-                        identity: oxideloop_mutation_model::ObjectIdentity {
+                        identity: mutation_model::ObjectIdentity {
                             uid: "foreign-uid".into(),
                             resource_version: "foreign-rv".into(),
                         },
@@ -8680,7 +8765,7 @@ mod tests {
             diagnostics: vec![],
         })
         .expect("empty output serializes");
-        let first = oxideloop_controller_core::reduce(
+        let first = controller_core::reduce(
             actor.state().clone(),
             EventV0::Rendered {
                 frozen: frozen.clone(),
@@ -8701,7 +8786,7 @@ mod tests {
                 ..
             } = &first.commands[0]
             {
-                let status_persisted = oxideloop_controller_core::reduce(
+                let status_persisted = controller_core::reduce(
                     first.state,
                     EventV0::RootStatusPersisted {
                         token: token.clone(),
@@ -8743,7 +8828,7 @@ mod tests {
                         .expect("render input validates")
                         .sha256,
                 };
-                let prepared = oxideloop_controller_core::reduce(
+                let prepared = controller_core::reduce(
                     status_persisted.state,
                     EventV0::Rendered {
                         frozen: frozen.clone(),
@@ -8763,7 +8848,7 @@ mod tests {
                 prepared.commands[0]
             );
         };
-        let revalidate = oxideloop_controller_core::reduce(
+        let revalidate = controller_core::reduce(
             prepared.state,
             EventV0::Persisted {
                 token: operation.token.clone(),
@@ -8774,7 +8859,7 @@ mod tests {
         )
         .expect("prepared receipt schedules revalidation");
         completion_frozen.state_resource_version = "state-rv-revalidate".into();
-        let completed = oxideloop_controller_core::reduce(
+        let completed = controller_core::reduce(
             revalidate.state,
             EventV0::Revalidated {
                 frozen: completion_frozen,
@@ -8787,7 +8872,7 @@ mod tests {
         let CommandV0::Persist { operation, .. } = &completed.commands[0] else {
             panic!("completed revalidation must persist result");
         };
-        let ready = oxideloop_controller_core::reduce(
+        let ready = controller_core::reduce(
             completed.state,
             EventV0::Persisted {
                 token: operation.token.clone(),
@@ -8921,7 +9006,7 @@ mod tests {
         ));
         let record =
             actor.observability_record("watching_blocked_foreign_collision", None, None, None);
-        assert_eq!(record["component"], "oxideloop-controller-runtime");
+        assert_eq!(record["component"], "controller-runtime");
         assert_eq!(record["root_uid"], ROOT_UID);
         assert_eq!(record["root_resource_version"], "root-rv-after-descriptor");
         assert_eq!(record["command_class"], "none");

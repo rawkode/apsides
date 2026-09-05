@@ -6,21 +6,21 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use http::{Method, Request, Response, StatusCode};
-use kube::{Client, client::Body};
-use oxideloop_controller_api::{
+use controller_api::{
     OxideLoopStateSpec, RootBinding, StateBody, bootstrap_id,
     state_name as deterministic_state_name,
 };
-use oxideloop_controller_core::CommandV0;
-use oxideloop_kube_transport::{
+use controller_core::CommandV0;
+use http::{Method, Request, Response, StatusCode};
+use kube::{Client, client::Body};
+use kube_transport::{
     BOOTSTRAP_AUTHORITY_VERSION_ANNOTATION, BOOTSTRAP_AUTHORITY_VERSION_V1,
     BOOTSTRAP_PROOF_TOKEN_ANNOTATION, BOOTSTRAP_STATE_NAME_ANNOTATION,
     BOOTSTRAP_STATE_SPEC_DIGEST_ANNOTATION, BOOTSTRAP_STATE_UID_ANNOTATION, COMMAND_ID_ANNOTATION,
     CommandOutcomeV0, KubeTransportV0, ROOT_UID_ANNOTATION, RootAddressV0,
     TRANSACTION_ID_ANNOTATION, TransportErrorV0,
 };
-use oxideloop_renderer_abi::{canonical_bytes, sha256_hex};
+use renderer_abi::{canonical_bytes, sha256_hex};
 use serde_json::{Value, json};
 use tower::service_fn;
 
@@ -147,7 +147,7 @@ fn root(metadata: bool, link: bool, rv: &str, divergent: bool) -> Value {
     json!({"apiVersion":"demo.oxideloop.dev/v1alpha1","kind":"WebApplication",
         "metadata":{"name":"app-a","namespace":"tenant-a","uid":ROOT_UID,"resourceVersion":rv,"generation":1,
           "finalizers":if metadata { json!(["demo.oxideloop.dev/finalizer"]) } else { json!([]) },"annotations":annotations.unwrap_or_default()},
-        "spec":if divergent { json!({"changed":true}) } else { json!({"image":"example.invalid/web:latest","replicas":1,"message":"hello","expose":false,"program":{"configMapName":"bundle","key":"bundle","digest":"b".repeat(64)}}) },"status":status})
+        "spec":if divergent { json!({"changed":true}) } else { json!({"image":"example.invalid/web:latest","replicas":1,"message":"hello","expose":false,"program":{"digest":"b".repeat(64)}}) },"status":status})
 }
 
 fn apply_managed_fields() -> Value {

@@ -26,14 +26,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use oxideloop_bundle_contract::{BundleStore, ExecutionPhaseV0, InstalledBundle};
-use oxideloop_renderer_abi::sha256_hex;
-use oxideloop_renderer_abi::{parse_validate_action_input, parse_validate_render_input};
-use oxideloop_renderer_protocol::{
+use bundle_contract::{BundleStore, ExecutionPhaseV0, InstalledBundle};
+use renderer_abi::sha256_hex;
+use renderer_abi::{parse_validate_action_input, parse_validate_render_input};
+use renderer_host::{HostError, Invocation, Limits, RendererHost};
+use renderer_protocol::{
     ErrorCategoryV0, FrameV0, MAX_DURATION_MILLIS, PhaseV0, ProtocolError, RequestV0,
     ResponseStatusV0, ResponseV0, phase_cap, read_frame, write_frame,
 };
-use renderer_host::{HostError, Invocation, Limits, RendererHost};
 use thiserror::Error;
 
 const HOST_TERMINATION_GRACE: Duration = Duration::from_millis(100);

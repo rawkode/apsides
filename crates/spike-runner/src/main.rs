@@ -4,8 +4,8 @@ use std::{
     process::ExitCode,
 };
 
-use oxideloop_mutation_model::{ProbeCaseV0, plan};
-use oxideloop_renderer_abi::model::{Dependency, RenderDisposition};
+use mutation_model::{ProbeCaseV0, plan};
+use renderer_abi::model::{Dependency, RenderDisposition};
 use renderer_host::{HostError, Invocation, Limits, RendererHost};
 use serde::Serialize;
 

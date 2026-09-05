@@ -5,9 +5,7 @@
 
 use std::{collections::BTreeMap, fmt::Write as _};
 
-use oxideloop_renderer_abi::{
-    ActionInputV0, ActionOutputV0, Validated, canonical_bytes, sha256_hex,
-};
+use renderer_abi::{ActionInputV0, ActionOutputV0, Validated, canonical_bytes, sha256_hex};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -308,9 +306,9 @@ fn check_input(
             "ActionInputV0 does not match immutable run correlation",
         ));
     }
-    if let Some(context) = oxideloop_renderer_abi::action_context_v1(&i.event_metadata)
+    if let Some(context) = renderer_abi::action_context_v1(&i.event_metadata)
         .map_err(|error| bad(error.to_string()))?
-        && !oxideloop_renderer_abi::action_context_source_matches(
+        && !renderer_abi::action_context_source_matches(
             &context,
             &corr.source.api_version,
             &corr.source.kind,
@@ -564,7 +562,7 @@ pub fn semantically_equal(a: &Value, b: &Value) -> Result<bool, PlannerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideloop_renderer_abi::{parse_validate_action_input, parse_validate_action_output};
+    use renderer_abi::{parse_validate_action_input, parse_validate_action_output};
     use serde_json::json;
 
     fn source() -> ObjectRef {

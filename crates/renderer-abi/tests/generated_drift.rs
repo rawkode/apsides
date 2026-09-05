@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use oxideloop_renderer_abi::generate::generated_artifacts;
+use renderer_abi::generate::generated_artifacts;
 
 #[test]
 fn generated_schemas_and_types_are_current() {
@@ -11,7 +11,7 @@ fn generated_schemas_and_types_are_current() {
             .unwrap_or_else(|error| panic!("{}: {error}", artifact.relative_path));
         assert_eq!(
             checked_in, artifact.contents,
-            "{} drifted; run `cargo run -p oxideloop-renderer-abi --bin generate -- .`",
+            "{} drifted; run `cargo run -p renderer-abi --bin generate -- .`",
             artifact.relative_path
         );
     }

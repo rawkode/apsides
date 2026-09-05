@@ -1,4 +1,4 @@
-// Generated from oxideloop-renderer-abi Rust types. Do not edit.
+// Generated from renderer-abi Rust types. Do not edit.
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 

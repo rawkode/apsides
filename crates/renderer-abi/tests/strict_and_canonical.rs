@@ -1,4 +1,4 @@
-use oxideloop_renderer_abi::{
+use renderer_abi::{
     AbiError, canonical_bytes,
     limits::{MAX_CANONICAL_BYTES, MAX_DEPTH, MAX_STRING_BYTES, validate_json_limits},
     parse_strict_value, sha256_hex,

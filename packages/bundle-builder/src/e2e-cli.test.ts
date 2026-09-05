@@ -66,6 +66,7 @@ try {
   const render = built.manifest.renderModules[0];
   if (!action || !render) throw new Error("fixture manifest is missing a module");
   if (first.buildBundle.bundleDigest !== built.bundleDigest) throw new Error("metadata bundle digest is incorrect");
+  if (first.buildBundle.sourceSha256 !== built.sourceSha256) throw new Error("metadata source SHA-256 is incorrect");
   if (first.buildBundle.actionModule.identity !== action.identity || first.buildBundle.actionModule.digest !== action.sha256) {
     throw new Error("metadata action module integrity is incorrect");
   }

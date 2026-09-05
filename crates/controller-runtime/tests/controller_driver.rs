@@ -19,16 +19,16 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use http::{Request, Response};
-use kube::{Client, client::Body};
-use oxideloop_controller_core::{CommandV0, EventV0};
-use oxideloop_controller_runtime::{
+use controller_core::{CommandV0, EventV0};
+use controller_runtime::{
     ControllerDriverV0, DriverConfigV0, ModeV0, RootActorV0, RuntimeErrorV0,
     load_machine_from_transport,
 };
+use http::{Request, Response};
+use kube::{Client, client::Body};
 #[cfg(feature = "test-failpoints")]
-use oxideloop_kube_transport::WatchHandleV0;
-use oxideloop_kube_transport::{CommandOutcomeV0, KubeTransportV0, RootAddressV0};
+use kube_transport::WatchHandleV0;
+use kube_transport::{CommandOutcomeV0, KubeTransportV0, RootAddressV0};
 use serde_json::json;
 use tower::service_fn;
 
@@ -110,8 +110,6 @@ fn receipt_bounded_root(
             "message":"receipt-bounded deletion",
             "expose":false,
             "program":{
-                "configMapName":"bundle",
-                "key":"program.mjs",
                 "digest":ROOT_ONLY_DIGEST,
             },
         },
@@ -168,7 +166,7 @@ fn deleting_linked_root(
             "image":"example.invalid/web:latest",
             "replicas":1,
             "message":"deletion barrier", "expose":false,
-            "program":{"configMapName":"bundle","key":"program.mjs","digest":ROOT_ONLY_DIGEST},
+            "program":{"digest":ROOT_ONLY_DIGEST},
         },
         "status":status,
     })
@@ -205,7 +203,7 @@ fn deleting_linked_state(
             "stateVersion":1,
             "root":{
                 "uid":"root-uid",
-                "bootstrapId":oxideloop_controller_api::bootstrap_id("root-uid")
+                "bootstrapId":controller_api::bootstrap_id("root-uid")
                     .expect("bootstrap ID"),
                 "bundleDigest":ROOT_ONLY_DIGEST,
             },
@@ -269,6 +267,8 @@ async fn driver_accepts_only_explicit_production_configuration() {
         namespace: "ns".into(),
         root_name: "root".into(),
         bundle_store: store.clone(),
+        embedded_bundle_archive: store.join("bundle.archive"),
+        embedded_bundle_digest: store.join("bundle.digest"),
         renderer_unix_socket: PathBuf::from("/tmp/renderer.sock"),
         #[cfg(feature = "test-failpoints")]
         failpoint_unix_socket: None,
@@ -284,6 +284,8 @@ async fn driver_rejects_a_non_unix_renderer_endpoint() {
         namespace: "ns".into(),
         root_name: "root".into(),
         bundle_store: store_path(),
+        embedded_bundle_archive: PathBuf::from("/tmp/bundle.archive"),
+        embedded_bundle_digest: PathBuf::from("/tmp/bundle.digest"),
         renderer_unix_socket: PathBuf::from("relative.sock"),
         #[cfg(feature = "test-failpoints")]
         failpoint_unix_socket: None,
@@ -301,7 +303,7 @@ async fn driver_rejects_a_non_unix_renderer_endpoint() {
 )]
 async fn root_only_deletion_composes_loader_reducer_transport_and_original_uid_absence() {
     let state_name =
-        oxideloop_controller_api::state_name("root-uid").expect("deterministic deleted-state name");
+        controller_api::state_name("root-uid").expect("deterministic deleted-state name");
     let receipt_cleanup_token = "e".repeat(64);
     let root_removed = Arc::new(AtomicBool::new(false));
     let service_root_removed = Arc::clone(&root_removed);
@@ -484,6 +486,8 @@ async fn driver_accepts_a_failpoint_after_reaching_actor_absent_idle_wait() {
             namespace: "ns".into(),
             root_name: "root".into(),
             bundle_store: store.clone(),
+            embedded_bundle_archive: store.join("bundle.archive"),
+            embedded_bundle_digest: store.join("bundle.digest"),
             renderer_unix_socket: PathBuf::from("/tmp/renderer.sock"),
             failpoint_unix_socket: Some(socket.clone()),
         },
@@ -532,7 +536,7 @@ async fn driver_accepts_a_failpoint_after_reaching_actor_absent_idle_wait() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn driver_deletion_barrier_crashes_after_exact_state_finalizer_effect_and_uds_release() {
-    let state_name = oxideloop_controller_api::state_name("root-uid").expect("state name");
+    let state_name = controller_api::state_name("root-uid").expect("state name");
     let state_finalizer_removed = Arc::new(AtomicBool::new(false));
     let state_resource_version = Arc::new(AtomicU64::new(1));
     let state_rereads_after_finalizer = Arc::new(AtomicU64::new(0));
@@ -699,6 +703,8 @@ async fn driver_deletion_barrier_crashes_after_exact_state_finalizer_effect_and_
             namespace: "ns".into(),
             root_name: "root".into(),
             bundle_store: store.clone(),
+            embedded_bundle_archive: store.join("bundle.archive"),
+            embedded_bundle_digest: store.join("bundle.digest"),
             renderer_unix_socket: PathBuf::from("/tmp/renderer.sock"),
             failpoint_unix_socket: Some(socket.clone()),
         },
@@ -798,7 +804,7 @@ async fn driver_deletion_barrier_crashes_after_exact_state_finalizer_effect_and_
     assert!(matches!(
         result,
         Err(RuntimeErrorV0::InjectedCrash(
-            oxideloop_controller_runtime::FailpointV0::AfterStateFinalizerBeforeRootFinalizer
+            controller_runtime::FailpointV0::AfterStateFinalizerBeforeRootFinalizer
         ))
     ));
     assert_eq!(

@@ -59,8 +59,7 @@ fn sort_json(value: Value) -> Value {
 }
 
 fn typescript_declarations() -> String {
-    let mut output =
-        String::from("// Generated from oxideloop-bundle-contract Rust types. Do not edit.\n\n");
+    let mut output = String::from("// Generated from bundle-contract Rust types. Do not edit.\n\n");
     macro_rules! declaration {
         ($type:ty) => {{
             let declaration = <$type>::decl();

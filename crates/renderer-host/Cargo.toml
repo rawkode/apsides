@@ -15,7 +15,7 @@ path = "src/bin/renderer-host-probe.rs"
 
 [dependencies]
 deno_core = "=0.411.0"
-renderer-abi = { package = "oxideloop-renderer-abi", path = "../renderer-abi" }
+renderer-abi = { package = "renderer-abi", path = "../renderer-abi" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.53.1", features = ["rt", "time"] }

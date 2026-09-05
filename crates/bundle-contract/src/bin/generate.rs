@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use oxideloop_bundle_contract::generate::generated_artifacts;
+use bundle_contract::generate::generated_artifacts;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);

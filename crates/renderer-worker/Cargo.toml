@@ -1,5 +1,5 @@
 [package]
-name = "oxideloop-renderer-worker"
+name = "renderer-worker"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,9 +15,9 @@ name = "renderer-worker"
 path = "src/main.rs"
 
 [dependencies]
-oxideloop-bundle-contract = { path = "../bundle-contract" }
-oxideloop-renderer-abi = { path = "../renderer-abi" }
-oxideloop-renderer-protocol = { path = "../renderer-protocol" }
+bundle-contract = { path = "../bundle-contract" }
+renderer-abi = { path = "../renderer-abi" }
+renderer-protocol = { path = "../renderer-protocol" }
 renderer-host = { path = "../renderer-host" }
 thiserror = "2"
 rustix = { version = "1", features = ["process"] }

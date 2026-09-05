@@ -121,32 +121,22 @@ fn raw_sha256(value: &str, field: &'static str) -> Result<(), SpecValidationErro
     }
 }
 
-/// Immutable reference to an already verified program bundle in a `ConfigMap`.
+/// Immutable digest of the program bundle embedded in the controller image.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct ProgramBundleReference {
-    #[schemars(length(min = 1, max = 253))]
-    pub config_map_name: String,
-    #[schemars(length(min = 1, max = 253))]
-    pub key: String,
     #[schemars(length(min = 64, max = 64), regex(pattern = "^[0-9a-f]{64}$"))]
     pub digest: String,
 }
 
 impl ProgramBundleReference {
-    /// Validates the bounded bundle reference fields.
+    /// Validates the image-embedded bundle digest.
     ///
     /// # Errors
     ///
     /// Returns an error when a required field is empty or exceeds its bound.
     pub fn validate(&self) -> Result<(), SpecValidationError> {
-        non_empty_within(
-            &self.config_map_name,
-            "program.configMapName",
-            MAX_IDENTIFIER_BYTES,
-        )?;
-        non_empty_within(&self.key, "program.key", MAX_IDENTIFIER_BYTES)?;
         raw_sha256(&self.digest, "program.digest")
     }
 }
@@ -1597,8 +1587,8 @@ pub struct AutomationRunSpec {
     pub automation_version: String,
     #[schemars(length(min = 64, max = 64))]
     pub bundle_digest: String,
-    /// Exact ConfigMap/key/digest authority for fetching the immutable action
-    /// program. The digest is required to equal `bundleDigest`.
+    /// Exact digest of the immutable, image-embedded action program. The
+    /// digest is required to equal `bundleDigest`.
     pub program: ProgramBundleReference,
     #[schemars(length(min = 1, max = 128))]
     pub action_module_identity: String,
@@ -1625,7 +1615,7 @@ pub struct AutomationRunSpec {
 
 impl AutomationRunSpec {
     /// Validates the immutable replay record and proves its indexed pins match
-    /// the exact canonical [`ActionInputV0`](oxideloop_renderer_abi::ActionInputV0).
+    /// the exact canonical [`ActionInputV0`](renderer_abi::ActionInputV0).
     ///
     /// # Errors
     ///
@@ -1709,7 +1699,7 @@ impl AutomationRunSpec {
             });
         }
 
-        let validated = oxideloop_renderer_abi::parse_validate_action_input(&self.action_input_v0)
+        let validated = renderer_abi::parse_validate_action_input(&self.action_input_v0)
             .map_err(|error| SpecValidationError::InvalidActionInput(error.to_string()))?;
         if validated.canonical_bytes != self.action_input_v0.as_bytes() {
             return Err(SpecValidationError::NonCanonicalActionInput);
@@ -1718,9 +1708,9 @@ impl AutomationRunSpec {
             return Err(SpecValidationError::ActionInputHashMismatch);
         }
         let input = validated.document;
-        let event_metadata_hash = oxideloop_renderer_abi::canonical_bytes(&input.event_metadata)
+        let event_metadata_hash = renderer_abi::canonical_bytes(&input.event_metadata)
             .map_err(|error| SpecValidationError::InvalidActionInput(error.to_string()))
-            .map(|bytes| oxideloop_renderer_abi::sha256_hex(&bytes))?;
+            .map(|bytes| renderer_abi::sha256_hex(&bytes))?;
         if event_metadata_hash != self.event_metadata_hash {
             return Err(SpecValidationError::EventMetadataHashMismatch);
         }
@@ -1737,9 +1727,9 @@ impl AutomationRunSpec {
         {
             return Err(SpecValidationError::ActionInputPinMismatch);
         }
-        if let Some(context) = oxideloop_renderer_abi::action_context_v1(&input.event_metadata)
+        if let Some(context) = renderer_abi::action_context_v1(&input.event_metadata)
             .map_err(|error| SpecValidationError::InvalidActionInput(error.to_string()))?
-            && !oxideloop_renderer_abi::action_context_source_matches(
+            && !renderer_abi::action_context_source_matches(
                 &context,
                 &self.source.api_version,
                 &self.source.kind,
@@ -1948,8 +1938,8 @@ mod tests {
     }
 
     fn run_spec() -> AutomationRunSpec {
-        let input = oxideloop_renderer_abi::ActionInputV0 {
-            abi_version: oxideloop_renderer_abi::model::ABI_VERSION_V0.into(),
+        let input = renderer_abi::ActionInputV0 {
+            abi_version: renderer_abi::model::ABI_VERSION_V0.into(),
             bundle_digest: "a".repeat(64),
             automation_identity: "smoke".into(),
             automation_version: "v1".into(),
@@ -1963,11 +1953,10 @@ mod tests {
         };
         let value = serde_json::to_value(input).unwrap();
         let action_input_v0 =
-            String::from_utf8(oxideloop_renderer_abi::canonical_bytes(&value).unwrap()).unwrap();
-        let action_input_hash = oxideloop_renderer_abi::sha256_hex(action_input_v0.as_bytes());
-        let event_metadata_hash = oxideloop_renderer_abi::sha256_hex(
-            &oxideloop_renderer_abi::canonical_bytes(&serde_json::json!({"reason": "changed"}))
-                .unwrap(),
+            String::from_utf8(renderer_abi::canonical_bytes(&value).unwrap()).unwrap();
+        let action_input_hash = renderer_abi::sha256_hex(action_input_v0.as_bytes());
+        let event_metadata_hash = renderer_abi::sha256_hex(
+            &renderer_abi::canonical_bytes(&serde_json::json!({"reason": "changed"})).unwrap(),
         );
         AutomationRunSpec {
             occurrence_id: "occurrence-1".into(),
@@ -1980,13 +1969,11 @@ mod tests {
             automation_version: "v1".into(),
             bundle_digest: "a".repeat(64),
             program: ProgramBundleReference {
-                config_map_name: "bundle".into(),
-                key: "program.mjs".into(),
                 digest: "a".repeat(64),
             },
             action_module_identity: "actions/smoke.mjs".into(),
             action_module_digest: "b".repeat(64),
-            renderer_abi_version: oxideloop_renderer_abi::model::ABI_VERSION_V0.into(),
+            renderer_abi_version: renderer_abi::model::ABI_VERSION_V0.into(),
             action_input_v0,
             action_input_hash,
             event_metadata_hash,
@@ -1998,12 +1985,10 @@ mod tests {
             serde_json::from_str(&run.action_input_v0).expect("canonical action input");
         action_input["eventMetadata"] = event_metadata.clone();
         run.action_input_v0 =
-            String::from_utf8(oxideloop_renderer_abi::canonical_bytes(&action_input).unwrap())
-                .unwrap();
-        run.action_input_hash = oxideloop_renderer_abi::sha256_hex(run.action_input_v0.as_bytes());
-        run.event_metadata_hash = oxideloop_renderer_abi::sha256_hex(
-            &oxideloop_renderer_abi::canonical_bytes(event_metadata).unwrap(),
-        );
+            String::from_utf8(renderer_abi::canonical_bytes(&action_input).unwrap()).unwrap();
+        run.action_input_hash = renderer_abi::sha256_hex(run.action_input_v0.as_bytes());
+        run.event_metadata_hash =
+            renderer_abi::sha256_hex(&renderer_abi::canonical_bytes(event_metadata).unwrap());
     }
 
     fn action_context_metadata() -> serde_json::Value {
@@ -2043,8 +2028,6 @@ mod tests {
             message: None,
             expose: false,
             program: ProgramBundleReference {
-                config_map_name: "bundle".into(),
-                key: "program.mjs".into(),
                 digest: "a".repeat(64),
             },
         };
@@ -2077,8 +2060,6 @@ mod tests {
             "image": "ghcr.io/example/web:v1",
             "expose": true,
             "program": {
-                "configMapName": "bundle",
-                "key": "program.mjs",
                 "digest": "a".repeat(64),
             },
         });
@@ -2093,8 +2074,6 @@ mod tests {
             "message": "legacy message",
             "expose": true,
             "program": {
-                "configMapName": "bundle",
-                "key": "program.mjs",
                 "digest": "a".repeat(64),
             },
         }))
@@ -2106,8 +2085,6 @@ mod tests {
         let missing_image = serde_json::json!({
             "expose": true,
             "program": {
-                "configMapName": "bundle",
-                "key": "program.mjs",
                 "digest": "a".repeat(64),
             },
         });
@@ -2122,8 +2099,6 @@ mod tests {
             message: None,
             expose: true,
             program: ProgramBundleReference {
-                config_map_name: "bundle".into(),
-                key: "program.mjs".into(),
                 digest: "a".repeat(64),
             },
         };
@@ -2146,33 +2121,33 @@ mod tests {
         assert!(!serialized_spec.contains_key("message"));
         assert!(!serialized_spec.contains_key("replicas"));
 
-        let canonical = oxideloop_renderer_abi::canonical_bytes(&projection).unwrap();
+        let canonical = renderer_abi::canonical_bytes(&projection).unwrap();
         let canonical = String::from_utf8(canonical).unwrap();
         assert_eq!(
             canonical,
             concat!(
-                r#"{"apiVersion":"demo.oxideloop.dev/v1alpha1","generation":1,"kind":"WebApplication","name":"portal","namespace":"demo","spec":{"expose":true,"image":"ghcr.io/example/web:v1","program":{"configMapName":"bundle","digest":""#,
+                r#"{"apiVersion":"demo.oxideloop.dev/v1alpha1","generation":1,"kind":"WebApplication","name":"portal","namespace":"demo","spec":{"expose":true,"image":"ghcr.io/example/web:v1","program":{"digest":""#,
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                r#"","key":"program.mjs"}},"uid":"root-uid"}"#,
+                r#""}},"uid":"root-uid"}"#,
             )
         );
-        let base_hash = oxideloop_renderer_abi::sha256_hex(canonical.as_bytes());
+        let base_hash = renderer_abi::sha256_hex(canonical.as_bytes());
         assert_eq!(
             base_hash,
-            "437a5cc166ddee7faf80f4103a09003fa350aac1abbaad68bf0753a0b9657917"
+            "bc162cb74cc868f012c2a4d086701bbb23e16a2ffefab260fc1541c14d7eade3"
         );
 
         let mut image_changed = spec.clone();
         image_changed.image = "ghcr.io/example/web:v2".into();
-        let image_hash = oxideloop_renderer_abi::sha256_hex(
-            &oxideloop_renderer_abi::canonical_bytes(&root_projection(image_changed)).unwrap(),
+        let image_hash = renderer_abi::sha256_hex(
+            &renderer_abi::canonical_bytes(&root_projection(image_changed)).unwrap(),
         );
         assert_ne!(image_hash, base_hash);
 
         let mut replicas_changed = spec;
         replicas_changed.replicas = Some(2);
-        let replicas_hash = oxideloop_renderer_abi::sha256_hex(
-            &oxideloop_renderer_abi::canonical_bytes(&root_projection(replicas_changed)).unwrap(),
+        let replicas_hash = renderer_abi::sha256_hex(
+            &renderer_abi::canonical_bytes(&root_projection(replicas_changed)).unwrap(),
         );
         assert_ne!(replicas_hash, base_hash);
     }
@@ -2180,8 +2155,6 @@ mod tests {
     #[test]
     fn program_bundle_digest_is_an_exact_raw_sha256_pin() {
         let mut program = ProgramBundleReference {
-            config_map_name: "bundle".into(),
-            key: "program.mjs".into(),
             digest: "a".repeat(64),
         };
         assert!(program.validate().is_ok());
@@ -2288,10 +2261,9 @@ mod tests {
             serde_json::from_str(&metadata_changed.action_input_v0).unwrap();
         action_input["eventMetadata"] = serde_json::json!({"reason": "restarted"});
         metadata_changed.action_input_v0 =
-            String::from_utf8(oxideloop_renderer_abi::canonical_bytes(&action_input).unwrap())
-                .unwrap();
+            String::from_utf8(renderer_abi::canonical_bytes(&action_input).unwrap()).unwrap();
         metadata_changed.action_input_hash =
-            oxideloop_renderer_abi::sha256_hex(metadata_changed.action_input_v0.as_bytes());
+            renderer_abi::sha256_hex(metadata_changed.action_input_v0.as_bytes());
         assert_eq!(
             metadata_changed.validate(),
             Err(SpecValidationError::EventMetadataHashMismatch)
@@ -2342,7 +2314,7 @@ mod tests {
     fn action_input_bound_matches_the_action_protocol_cap() {
         assert_eq!(
             MAX_ACTION_INPUT_CANONICAL_BYTES,
-            oxideloop_renderer_protocol::phase_cap(oxideloop_renderer_protocol::PhaseV0::Action)
+            renderer_protocol::phase_cap(renderer_protocol::PhaseV0::Action)
         );
         let mut run = run_spec();
         run.action_input_v0 = "€".repeat((MAX_ACTION_INPUT_CANONICAL_BYTES / 3) + 1);

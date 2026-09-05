@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use oxideloop_mutation_model::{
+use mutation_model::{
     CONTROLLER_FIELD_MANAGER, MutationDecision, MutationIntent, ProbeCaseV0, plan,
 };
 

@@ -1,7 +1,7 @@
 //! Small async engine loops which connect actor cache epochs to adapter errors.
 
-use oxideloop_kube_transport::{ConflictProvenanceV0, ResourceKindV0, TransportErrorV0};
-use oxideloop_renderer_abi::RenderInputV0;
+use kube_transport::{ConflictProvenanceV0, ResourceKindV0, TransportErrorV0};
+use renderer_abi::RenderInputV0;
 
 use crate::{
     FixedPointPortV0, FixedPointResultV0, RootActorV0, RuntimeErrorV0,

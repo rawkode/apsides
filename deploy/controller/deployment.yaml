@@ -60,7 +60,7 @@ spec:
       containers:
         - name: controller
           image: ghcr.io/oxideloop/oxideloop:production
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Never
           args:
             - --namespace
             - $(POD_NAMESPACE)
@@ -68,6 +68,10 @@ spec:
             - $(ROOT_NAME)
             - --bundle-store
             - /var/lib/oxideloop/bundles
+            - --embedded-bundle-archive
+            - /usr/share/oxideloop/bundle.archive
+            - --embedded-bundle-digest
+            - /usr/share/oxideloop/bundle.digest
             - --renderer-unix-socket
             - /run/oxideloop/renderer/renderer.sock
           env:
@@ -109,7 +113,7 @@ spec:
               readOnly: true
         - name: renderer
           image: ghcr.io/oxideloop/oxideloop:production
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Never
           command: ["/usr/local/bin/renderer-worker"]
           args:
             - --listen-unix

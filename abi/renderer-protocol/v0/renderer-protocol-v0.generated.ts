@@ -1,4 +1,4 @@
-// Generated from oxideloop-renderer-protocol Rust types. Do not edit.
+// Generated from renderer-protocol Rust types. Do not edit.
 
 export type PhaseV0 = "descriptor" | "render" | "action";
 

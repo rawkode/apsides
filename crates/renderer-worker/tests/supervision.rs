@@ -8,12 +8,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use oxideloop_bundle_contract::{
+use bundle_contract::{
     BUNDLE_MANIFEST_VERSION_V0, BundleIntegrityManifestV0, BundleStore, ExecutionPhaseV0,
     FileIntegrityV0, ModuleIntegrityV0, PhaseModuleV0, ToolIdentityV0, parse_validate_manifest,
 };
-use oxideloop_renderer_abi::sha256_hex;
-use oxideloop_renderer_protocol::{
+use renderer_abi::sha256_hex;
+use renderer_protocol::{
     ErrorCategoryV0, FrameV0, PhaseV0, RequestIdV0, RequestV0, ResponseStatusV0, ResponseV0,
     read_frame, write_frame,
 };

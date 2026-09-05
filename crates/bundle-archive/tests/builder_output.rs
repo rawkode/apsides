@@ -1,8 +1,8 @@
 use std::{env, fs};
 
-use oxideloop_bundle_archive::install_archive;
-use oxideloop_bundle_contract::{BundleStore, ExecutionPhaseV0};
-use oxideloop_renderer_abi::sha256_hex;
+use bundle_archive::install_archive;
+use bundle_contract::{BundleStore, ExecutionPhaseV0};
+use renderer_abi::sha256_hex;
 use tempfile::TempDir;
 
 #[test]
