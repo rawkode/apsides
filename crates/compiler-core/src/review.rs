@@ -73,7 +73,7 @@ pub fn review_documents(plan: &CompiledPlan) -> BTreeMap<&'static str, Value> {
             json!({"schemaVersion":"reakt.dev/compatibility/v1","irDigest":plan.ir_digest,
             "schemaLibrary":"k8s-openapi/0.28.0","schemaKubernetesMinor":"1.36","requiredApis":apis,
             "qualifiedCreatePreconditionServers":["v1.34.3"],"fieldValidation":"Strict",
-            "transitionPlanSchema":"reakt.dev/transition-plan/v2","runtimeReplicas":1}),
+            "transitionPlanSchema":"reakt.dev/transition-plan/v3","runtimeReplicas":1}),
         ),
         (
             "ir-source-map.json",

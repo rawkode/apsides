@@ -128,3 +128,38 @@ fn pending_same_build_precedes_old_active_transition_and_rollback_is_fresh() {
         .push(allocation);
     assert!(default_transition(&registry, "example", BUILD, "policy-1").starts_with("deploy-g3-"));
 }
+
+#[test]
+fn review_uses_metadata_predecessor_but_rejects_unverified_historical_details() -> Result<()> {
+    let mut registry = registry();
+    let original = registry.transition("install")?.clone();
+    let initial = crate::review::transition_review(&registry, "install")?;
+    assert!(initial["reactions"]["before"].is_null());
+
+    let mut request = original.plan.request.clone();
+    request.transition_id = "upgrade".into();
+    request.next.generation_id = "g2".into();
+    request.registry.generation_history = registry
+        .histories
+        .get("example")
+        .ok_or("history missing")?
+        .clone();
+    request.previous = Some(deploy::PreviousGeneration::Metadata(Box::new(
+        deploy::predecessor_metadata(
+            &original.plan.request.next,
+            &original.plan.generation_reservation,
+            &request.registry.claims,
+        )?,
+    )));
+    let plan = plan_transition(&request)?;
+    let mut upgrade = original;
+    upgrade.record = begin(&plan, "job-2")?;
+    upgrade.plan = plan;
+    registry.transitions.insert("upgrade".into(), upgrade);
+    // The routing fixture marks its historical phase committed without receipts.
+    // Review must verify that history before using its old desired fields.
+    assert!(crate::review::transition_review(&registry, "upgrade").is_err());
+    registry.transitions.remove("install");
+    assert!(crate::review::transition_review(&registry, "upgrade").is_err());
+    Ok(())
+}

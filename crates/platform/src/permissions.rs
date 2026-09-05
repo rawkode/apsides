@@ -2,7 +2,7 @@
 //! grants RBAC nor claims that authorization or admission will allow a request.
 use crate::{Result, invalid};
 use compiler_core::Capability;
-use deploy::{TransitionPlan, generation_inventory, plan_transition, service_account_name};
+use deploy::{TransitionPlan, plan_transition};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -114,6 +114,9 @@ impl Requests {
 
 /// Enumerate the isolated-proxy executor's required access, conditional Role
 /// delegation, and the broader RBAC scopes needed for generated names.
+/// This report grants no authority. An upgrade's retirement namespaces must be
+/// authenticated against protected history by reservation before the report can
+/// be used to provision access; canonicality alone cannot establish that history.
 /// # Errors
 /// Rejects noncanonical plans and invalid generation identities.
 pub fn deployment_permissions(plan: &TransitionPlan) -> Result<DeploymentPermissions> {
@@ -246,14 +249,14 @@ fn stage_generation(plan: &TransitionPlan, requests: &mut Requests) -> Vec<RoleD
 }
 
 fn previous_generation(plan: &TransitionPlan, requests: &mut Requests) -> Result<()> {
-    let Some(previous) = &plan.request.previous else {
+    let Some(previous) = plan.request.predecessor()? else {
         return Ok(());
     };
-    let control = &previous.compiled.ir.domain.control_namespace;
-    let name = service_account_name(previous)?;
-    let proxy = format!("reakt-proxy-{}", previous.generation_id);
-    requests.add(Some(control), "", "serviceaccounts", "get", Some(&name));
-    requests.add(Some(control), "", "serviceaccounts", "delete", Some(&name));
+    let control = &previous.control_namespace;
+    let name = &previous.allocation.service_account_name;
+    let proxy = format!("reakt-proxy-{}", previous.allocation.generation_id);
+    requests.add(Some(control), "", "serviceaccounts", "get", Some(name));
+    requests.add(Some(control), "", "serviceaccounts", "delete", Some(name));
     requests.add(
         Some(control),
         "",
@@ -269,25 +272,18 @@ fn previous_generation(plan: &TransitionPlan, requests: &mut Requests) -> Result
     requests.add(Some(control), "", "pods", "get", None);
     // kube-core 4.2's WebSocket exec request uses HTTP GET, not POST.
     requests.add(Some(control), "", "pods/exec", "get", None);
-    let namespaces: BTreeSet<_> = previous
-        .compiled
-        .capabilities
-        .iter()
-        .map(|capability| capability.namespace.as_str())
-        .collect();
-    for namespace in namespaces {
+    for namespace in &previous.retirement_role_binding_namespaces {
         for verb in ["get", "delete"] {
             requests.add(
                 Some(namespace),
                 "rbac.authorization.k8s.io",
                 "rolebindings",
                 verb,
-                Some(&name),
+                Some(name),
             );
         }
     }
-    let (_, inventory) = generation_inventory(previous, &plan.request.registry.claims)?;
-    for resource in inventory.resources {
+    for resource in &previous.inventory.resources {
         requests.add(
             Some(&resource.identity.namespace),
             &resource.identity.api_group,

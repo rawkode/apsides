@@ -231,6 +231,9 @@ impl PlatformClient {
                 "request was not planned against this protected registry snapshot",
             ));
         }
+        if let Some(previous) = request.predecessor()? {
+            crate::predecessor::authenticate(&current.value, previous)?;
+        }
         let policy = self.load_policy(&domain.id).await?;
         if policy.value.runtime_ceiling != request.runtime_ceiling
             || policy.value.cleanup_ceiling != request.cleanup_ceiling

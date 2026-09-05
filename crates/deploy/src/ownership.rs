@@ -132,6 +132,7 @@ fn runtime_fields(target: &GenerationPlan, resource: &Resource) -> Vec<String> {
 pub(crate) fn validate_intents(request: &DeploymentRequest) -> Result<()> {
     let mut names = BTreeSet::new();
     let mut identities = BTreeSet::new();
+    let previous = request.predecessor()?;
     if request.ownership_intents.len() > request.next.compiled.ir.resources.len() {
         return Err(Error::Plan("too many ownership intents".into()));
     }
@@ -140,10 +141,12 @@ pub(crate) fn validate_intents(request: &DeploymentRequest) -> Result<()> {
         if !names.insert(&intent.object_name) || !identities.insert(&intent.approval.identity) {
             return Err(Error::Plan("duplicate ownership intent identity".into()));
         }
-        if request.previous.as_ref().is_some_and(|previous| {
-            previous.compiled.ir.resources.iter().any(|resource| {
-                crate::planner::identity(resource)
-                    .is_ok_and(|identity| identity == intent.approval.identity)
+        if previous.is_some_and(|previous| {
+            previous.inventory.resources.iter().any(|resource| {
+                resource.identity.api_group == intent.approval.identity.api_group
+                    && resource.identity.resource == intent.approval.identity.resource
+                    && resource.identity.namespace == intent.approval.identity.namespace
+                    && resource.identity.name == intent.approval.identity.name
             })
         }) {
             return Err(Error::Plan(

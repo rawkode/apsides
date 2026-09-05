@@ -14,8 +14,8 @@
 //! verification are deliberately outside this model's authority.
 mod inventory;
 pub use inventory::{
-    generation_inventory, inventory_metadata_digest, validate_inventory_checkpoint,
-    validate_transition_inventory,
+    generation_inventory, inventory_metadata_digest, predecessor_metadata,
+    validate_inventory_checkpoint, validate_transition_inventory,
 };
 mod model;
 mod ownership;

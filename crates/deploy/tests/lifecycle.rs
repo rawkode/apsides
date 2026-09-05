@@ -1,6 +1,7 @@
 use compiler_core::{Capability, DeletionPolicy, PermissionCeiling, parse_and_validate};
 use deploy::*;
 use serde_json::json;
+use std::collections::BTreeSet;
 
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -156,6 +157,9 @@ fn request(previous: Option<GenerationPlan>, next: GenerationPlan) -> Deployment
             });
         }
     }
+    let previous_allocation = previous
+        .as_ref()
+        .map(|previous| allocation(previous, "old-transition"));
     let generation_history = GenerationHistory {
         domain_id: next.compiled.ir.domain.id.clone(),
         cluster_binding: next.compiled.ir.domain.cluster_binding.clone(),
@@ -163,11 +167,20 @@ fn request(previous: Option<GenerationPlan>, next: GenerationPlan) -> Deployment
         active_generation_id: previous
             .as_ref()
             .map(|previous| previous.generation_id.clone()),
-        allocations: previous
+        allocations: previous_allocation
             .as_ref()
-            .map(|previous| vec![allocation(previous, "old-transition")])
+            .map(|allocation| vec![allocation.clone()])
             .unwrap_or_default(),
     };
+    let previous = previous
+        .zip(previous_allocation)
+        .map(|(generation, allocation)| {
+            PreviousGeneration::Metadata(Box::new(fixture_predecessor(
+                &generation,
+                &allocation,
+                &claims,
+            )))
+        });
     DeploymentRequest {
         transition_id: "transition-2".into(),
         previous,
@@ -184,22 +197,82 @@ fn request(previous: Option<GenerationPlan>, next: GenerationPlan) -> Deployment
     }
 }
 
+fn fixture_predecessor(
+    generation: &GenerationPlan,
+    allocation: &GenerationAllocation,
+    claims: &[ProtectedClaim],
+) -> PredecessorGeneration {
+    let domain = &generation.compiled.ir.domain;
+    let mut resources = generation
+        .compiled
+        .ir
+        .resources
+        .iter()
+        .map(|resource| {
+            let uid = claims
+                .iter()
+                .find(|claim| claim.identity.name == resource.name)
+                .and_then(|claim| claim.uid.clone());
+            inventory::TrackedResource::from_resource(resource, "configmaps".into(), uid)
+        })
+        .collect::<Vec<_>>();
+    resources.sort_by(|a, b| a.identity.cmp(&b.identity));
+    PredecessorGeneration {
+        allocation: allocation.clone(),
+        scope: inventory::InventoryScope {
+            cluster: domain.cluster_binding.clone(),
+            namespace: domain.namespace.clone(),
+            controller: domain.id.clone(),
+        },
+        control_namespace: domain.control_namespace.clone(),
+        inventory: inventory::InventorySnapshot {
+            schema_version: inventory::INVENTORY_SCHEMA.into(),
+            generation: generation.generation_id.clone(),
+            resources,
+        },
+        retirement_role_binding_namespaces: generation
+            .compiled
+            .capabilities
+            .iter()
+            .map(|capability| capability.namespace.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn predecessor_mut(
+    request: &mut DeploymentRequest,
+) -> std::result::Result<&mut PredecessorGeneration, &'static str> {
+    match request.previous.as_mut() {
+        Some(PreviousGeneration::Metadata(previous)) => Ok(previous),
+        Some(PreviousGeneration::Legacy(_)) => Err("legacy fixture predecessor"),
+        None => Err("missing fixture predecessor"),
+    }
+}
+
 fn events(plan: &TransitionPlan) -> Vec<Event> {
-    let quiescence = plan.request.previous.as_ref().map_or(
-        Quiescence::InitialInstallation {
+    let quiescence = match &plan.request.previous {
+        None => Quiescence::InitialInstallation {
             verification_epoch: 0,
         },
-        |old| {
-            Quiescence::OldGeneration(TerminationEvidence {
-                generation_id: old.generation_id.clone(),
-                executor_id: "executor".into(),
-                verification_epoch: 0,
-                environment_qualification_digest: DIGEST.into(),
-                process_termination_receipt_digest: DIGEST.into(),
-                access_revocation_receipt_digest: DIGEST.into(),
-            })
-        },
-    );
+        Some(PreviousGeneration::Metadata(old)) => Quiescence::OldGeneration(TerminationEvidence {
+            generation_id: old.allocation.generation_id.clone(),
+            executor_id: "executor".into(),
+            verification_epoch: 0,
+            environment_qualification_digest: DIGEST.into(),
+            process_termination_receipt_digest: DIGEST.into(),
+            access_revocation_receipt_digest: DIGEST.into(),
+        }),
+        Some(PreviousGeneration::Legacy(old)) => Quiescence::OldGeneration(TerminationEvidence {
+            generation_id: old.generation_id.clone(),
+            executor_id: "executor".into(),
+            verification_epoch: 0,
+            environment_qualification_digest: DIGEST.into(),
+            process_termination_receipt_digest: DIGEST.into(),
+            access_revocation_receipt_digest: DIGEST.into(),
+        }),
+    };
     vec![
         Event::Staged {
             event_id: "staged".into(),
@@ -435,6 +508,16 @@ fn previous_policy_and_protected_uid_govern_removal_not_runtime_inventory() {
         .find(|claim| claim.identity.name == "remove")
         .unwrap()
         .uid = None;
+    if let Some(PreviousGeneration::Metadata(previous)) = request.previous.as_mut() {
+        for resource in previous
+            .inventory
+            .resources
+            .iter_mut()
+            .filter(|resource| resource.identity.name == "remove")
+        {
+            resource.uid = None;
+        }
+    }
     let absence_only = plan_transition(&request).unwrap();
     assert!(
         absence_only
@@ -1001,13 +1084,11 @@ fn persisted_inventory_must_match_approved_resource_metadata()
         Some(initial.next.clone()),
         generation("g2", &[("new", "delete")]),
     );
-    let (_, snapshot) = generation_inventory(
-        upgrade
-            .previous
-            .as_ref()
-            .ok_or("missing fixture predecessor")?,
-        &upgrade.registry.claims,
-    )?;
+    let snapshot = upgrade
+        .predecessor()?
+        .ok_or("missing fixture predecessor")?
+        .inventory
+        .clone();
     validate_transition_inventory(&upgrade, Some(&snapshot))?;
     assert!(validate_transition_inventory(&upgrade, None).is_err());
     assert!(validate_transition_inventory(&initial, Some(&snapshot)).is_err());
@@ -1090,6 +1171,16 @@ fn protected_metadata_commitment_excludes_desired_values_and_requires_legacy_rec
     assert!(error.to_string().contains("explicit recovery"));
 
     let record = begin(&original_plan, "executor")?;
+    let mut pre_v3_plan = original_plan.clone();
+    pre_v3_plan.schema_version = "reakt.dev/transition-plan/v2".into();
+    for outcome in [
+        begin(&pre_v3_plan, "executor").map(|_| ()),
+        verify_record(&pre_v3_plan, &record),
+    ] {
+        let error = outcome.err().ok_or("pre-v3 transition accepted")?;
+        assert!(error.to_string().contains("explicit recovery"));
+    }
+
     let mut legacy_plan = original_plan;
     legacy_plan.generation_reservation.inventory_metadata_digest = None;
     for outcome in [
@@ -1099,5 +1190,134 @@ fn protected_metadata_commitment_excludes_desired_values_and_requires_legacy_rec
         let error = outcome.err().ok_or("legacy transition accepted")?;
         assert!(error.to_string().contains("explicit recovery"));
     }
+    Ok(())
+}
+
+#[test]
+fn predecessor_metadata_rejects_forged_allocation_policy_uid_transition_and_membership()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let prior = generation("g1", &[("old", "orphan")]);
+    let baseline = request(Some(prior.clone()), generation("g2", &[]));
+    plan_transition(&baseline)?;
+    let allocation = baseline
+        .registry
+        .generation_history
+        .allocations
+        .first()
+        .ok_or("missing fixture allocation")?;
+    assert_eq!(
+        predecessor_metadata(&prior, allocation, &baseline.registry.claims)?,
+        baseline
+            .predecessor()?
+            .ok_or("missing fixture predecessor")?
+            .clone()
+    );
+
+    let mut forged_allocation = baseline.clone();
+    predecessor_mut(&mut forged_allocation)?
+        .allocation
+        .artifact_digest =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+    assert!(plan_transition(&forged_allocation).is_err());
+
+    let mut forged_policy = baseline.clone();
+    predecessor_mut(&mut forged_policy)?
+        .inventory
+        .resources
+        .first_mut()
+        .ok_or("missing fixture resource")?
+        .deletion_policy = DeletionPolicy::Delete;
+    assert!(plan_transition(&forged_policy).is_err());
+
+    let mut forged_uid = baseline.clone();
+    forged_uid
+        .registry
+        .claims
+        .first_mut()
+        .ok_or("missing fixture claim")?
+        .uid = Some("replacement-uid".into());
+    assert!(plan_transition(&forged_uid).is_err());
+
+    let mut forged_transition = baseline.clone();
+    forged_transition
+        .registry
+        .claims
+        .first_mut()
+        .ok_or("missing fixture claim")?
+        .transition_id = "other-transition".into();
+    assert!(plan_transition(&forged_transition).is_err());
+
+    let mut missing_claim = baseline.clone();
+    missing_claim.registry.claims.clear();
+    assert!(plan_transition(&missing_claim).is_err());
+
+    let mut extra_claim = baseline.clone();
+    let mut claim = extra_claim
+        .registry
+        .claims
+        .first()
+        .ok_or("missing fixture claim")?
+        .clone();
+    claim.identity.name = "extra".into();
+    extra_claim.registry.claims.push(claim);
+    assert!(plan_transition(&extra_claim).is_err());
+    Ok(())
+}
+
+#[test]
+fn predecessor_metadata_validates_scope_retirement_namespaces_and_absent_uids()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let baseline = request(
+        Some(generation("g1", &[("old", "delete")])),
+        generation("g2", &[]),
+    );
+
+    let mut absent = baseline.clone();
+    absent
+        .registry
+        .claims
+        .first_mut()
+        .ok_or("missing fixture claim")?
+        .uid = None;
+    predecessor_mut(&mut absent)?
+        .inventory
+        .resources
+        .first_mut()
+        .ok_or("missing fixture resource")?
+        .uid = None;
+    plan_transition(&absent)?;
+
+    let mut wrong_scope = baseline.clone();
+    predecessor_mut(&mut wrong_scope)?.scope.namespace = "other".into();
+    assert!(plan_transition(&wrong_scope).is_err());
+
+    let mut duplicate_namespace = baseline.clone();
+    predecessor_mut(&mut duplicate_namespace)?.retirement_role_binding_namespaces =
+        vec!["workload".into(), "workload".into()];
+    assert!(plan_transition(&duplicate_namespace).is_err());
+
+    let mut malformed_namespace = baseline;
+    predecessor_mut(&mut malformed_namespace)?.retirement_role_binding_namespaces =
+        vec!["Not-A-Namespace".into()];
+    assert!(plan_transition(&malformed_namespace).is_err());
+    Ok(())
+}
+
+#[test]
+fn legacy_full_predecessor_decodes_but_requires_explicit_recovery()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let predecessor = generation("g1", &[("old", "delete")]);
+    let request = request(Some(predecessor.clone()), generation("g2", &[]));
+    let mut encoded = serde_json::to_value(request)?;
+    encoded["previous"] = serde_json::to_value(predecessor)?;
+    let decoded: DeploymentRequest = serde_json::from_value(encoded)?;
+    assert!(matches!(
+        decoded.previous,
+        Some(PreviousGeneration::Legacy(_))
+    ));
+    let error = plan_transition(&decoded)
+        .err()
+        .ok_or("legacy predecessor replay was accepted")?;
+    assert!(error.to_string().contains("explicit recovery"));
     Ok(())
 }

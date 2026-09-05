@@ -1,12 +1,16 @@
 //! Deployment review derived from protected prior and validated next plans.
 use compiler_core::{Capability, Resource};
-use deploy::TransitionPlan;
+use deploy::{Phase, TransitionPlan};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub fn transition_review(plan: &TransitionPlan) -> crate::Result<Value> {
+pub fn transition_review(
+    registry: &platform::NamespaceRegistry,
+    transition: &str,
+) -> crate::Result<Value> {
+    let plan = &registry.transition(transition)?.plan;
     let next = &plan.request.next.compiled;
-    let prior = plan.request.previous.as_ref().map(|p| &p.compiled);
+    let prior = prior_compiled(registry, plan)?;
     let before = prior.map_or(&[][..], |p| p.ir.resources.as_slice());
     let resource_key = |r: &Resource| (r.namespace.clone(), r.kind.clone(), r.name.clone());
     let old: BTreeMap<_, _> = before.iter().map(|r| (resource_key(r), r)).collect();
@@ -62,6 +66,36 @@ pub fn transition_review(plan: &TransitionPlan) -> crate::Result<Value> {
     }))
 }
 
+// The predecessor carries only metadata. Until historical registry compaction,
+// detailed review can separately verify the old release retained by the platform.
+fn prior_compiled<'a>(
+    registry: &'a platform::NamespaceRegistry,
+    plan: &TransitionPlan,
+) -> crate::Result<Option<&'a compiler_core::CompiledPlan>> {
+    let Some(predecessor) = plan.request.predecessor()? else {
+        return Ok(None);
+    };
+    let transition = &predecessor.allocation.transition_id;
+    let stored = registry.transition(transition)?;
+    if stored.record.phase != Phase::Committed
+        || stored.plan.request.transition_id != *transition
+        || stored.record.transition_id != *transition
+        || stored.plan.generation_reservation != predecessor.allocation
+    {
+        return Err("review predecessor differs from its protected transition".into());
+    }
+    deploy::verify_record(&stored.plan, &stored.record)?;
+    let expected = deploy::predecessor_metadata(
+        &stored.plan.request.next,
+        &stored.plan.generation_reservation,
+        &plan.request.registry.claims,
+    )?;
+    if &expected != predecessor {
+        return Err("review predecessor metadata differs from its protected release".into());
+    }
+    Ok(Some(&stored.plan.request.next.compiled))
+}
+
 fn capability_changes(before: &[Capability], after: &[Capability]) -> Value {
     let old: BTreeSet<_> = before.iter().collect();
     let new: BTreeSet<_> = after.iter().collect();
@@ -100,7 +134,7 @@ fn compatibility(plan: &compiler_core::CompiledPlan) -> crate::Result<Value> {
 mod tests {
     use super::*;
     #[test]
-    fn field_diffs_escape_pointers_and_never_emit_values() {
+    fn field_diffs_escape_pointers_and_never_emit_values() -> crate::Result<()> {
         let mut changes = Vec::new();
         changed_paths(
             &json!({"metadata":{"a/b~c":"old"},"gone":1}),
@@ -116,10 +150,7 @@ mod tests {
                 json!({"path":"/metadata/a~1b~0c","change":"changed"})
             ]
         );
-        assert!(
-            !serde_json::to_string(&changes)
-                .unwrap()
-                .contains("private-value")
-        );
+        assert!(!serde_json::to_string(&changes)?.contains("private-value"));
+        Ok(())
     }
 }

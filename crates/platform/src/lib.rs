@@ -13,6 +13,7 @@
 //! Kubernetes-backed protected state. Hashes identify content; authenticated
 //! Kubernetes transport and platform-owned RBAC establish the writer boundary.
 mod permissions;
+mod predecessor;
 pub use permissions::{
     CreationTarget, DeploymentPermissions, ResourceAccess, RoleDelegation, deployment_permissions,
 };

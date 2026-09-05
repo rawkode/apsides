@@ -100,7 +100,8 @@ async fn deploy(options: &BTreeMap<String, String>) -> Result<Value> {
         std::io::stderr().lock(),
         "{}",
         serde_json::to_string_pretty(&crate::review::transition_review(
-            &prepared.value.transition(&transition_id)?.plan,
+            &prepared.value,
+            &transition_id,
         )?)?
     );
     let committed = drive_transition(&platform, &verified, &transition_id, &executor).await?;
@@ -168,6 +169,7 @@ async fn reserve_new_transition(
     }
     let request = prepare_request(
         platform,
+        inventory,
         &registry,
         verified,
         transition_id,
@@ -270,7 +272,7 @@ fn deployment_report(
         "releaseDigest":verified.release_digest(),"irDigest":verified.compiled().ir_digest,"compatibility":compatibility,
         "inventory":{"revision":tracking.revision,"snapshotId":tracking.snapshot_id},
         "credentialExpiresAt":expires_at,"requestDrainQualification":stored.request_drain_qualification,
-        "review":crate::review::transition_review(&stored.plan)?,
+        "review":crate::review::transition_review(&committed.value, transition_id)?,
         "workloadReadiness":"not-established-by-deployment-commit"}),
     )
 }
@@ -334,6 +336,7 @@ async fn compatibility(client: &Client, plan: &CompiledPlan) -> Result<Value> {
 
 async fn prepare_request(
     platform: &PlatformClient,
+    inventory: &dyn inventory::InventoryStore,
     registry: &platform::Versioned<platform::NamespaceRegistry>,
     verified: &release::VerifiedRelease,
     transition_id: &str,
@@ -348,25 +351,7 @@ async fn prepare_request(
         .cloned()
         .ok_or("platform has not provisioned this domain history")?;
     history.revision.clone_from(&registry.resource_version);
-    let previous = if let Some(active) = &history.active_generation_id {
-        let prior = registry
-            .value
-            .transitions
-            .values()
-            .find(|s| {
-                &s.plan.request.next.generation_id == active && s.record.phase == Phase::Committed
-            })
-            .ok_or("active generation has no committed protected plan")?;
-        if !matches!(
-            prior.request_drain_qualification,
-            Some(platform::RequestDrainQualification::IsolatedEnvoy { .. })
-        ) {
-            return Err("previous generation has no qualified request-drain transport".into());
-        }
-        Some(prior.plan.request.next.clone())
-    } else {
-        None
-    };
+    let previous = prepare_predecessor(inventory, &registry.value, domain, &history).await?;
     let generation_id = format!(
         "g{}-{}",
         history.allocations.len() + 1,
@@ -407,6 +392,69 @@ async fn prepare_request(
         ownership_intents,
     };
     Ok(request)
+}
+
+async fn prepare_predecessor(
+    inventory: &dyn inventory::InventoryStore,
+    registry: &platform::NamespaceRegistry,
+    domain: &compiler_core::Domain,
+    history: &deploy::GenerationHistory,
+) -> Result<Option<deploy::PreviousGeneration>> {
+    let Some(active) = &history.active_generation_id else {
+        return Ok(None);
+    };
+    let mut allocations = history
+        .allocations
+        .iter()
+        .filter(|a| &a.generation_id == active);
+    let allocation = allocations.next().ok_or("active allocation missing")?;
+    if allocations.next().is_some() {
+        return Err("active allocation is ambiguous".into());
+    }
+    let prior = registry
+        .transitions
+        .get(&allocation.transition_id)
+        .ok_or("active generation has no committed protected plan")?;
+    deploy::verify_record(&prior.plan, &prior.record)?;
+    if prior.record.phase != Phase::Committed
+        || &prior.plan.generation_reservation != allocation
+        || prior.plan.request.next.compiled.ir.domain.id != domain.id
+    {
+        return Err("active generation differs from its protected transition".into());
+    }
+    if !matches!(
+        prior.request_drain_qualification,
+        Some(platform::RequestDrainQualification::IsolatedEnvoy { .. })
+    ) {
+        return Err("previous generation has no qualified request-drain transport".into());
+    }
+    let head = crate::inventory_connection::load(inventory, domain)
+        .await?
+        .ok_or("active inventory missing; explicit recovery required")?;
+    let predecessor = deploy::PredecessorGeneration {
+        allocation: allocation.clone(),
+        scope: inventory::InventoryScope {
+            cluster: domain.cluster_binding.clone(),
+            namespace: domain.namespace.clone(),
+            controller: domain.id.clone(),
+        },
+        control_namespace: domain.control_namespace.clone(),
+        inventory: head.snapshot,
+        retirement_role_binding_namespaces: prior
+            .plan
+            .request
+            .next
+            .compiled
+            .capabilities
+            .iter()
+            .map(|c| c.namespace.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+    };
+    Ok(Some(deploy::PreviousGeneration::Metadata(Box::new(
+        predecessor,
+    ))))
 }
 
 fn default_transition(

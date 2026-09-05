@@ -1,6 +1,9 @@
-use crate::{Error, GenerationPlan, ProtectedClaim, Result};
+use crate::{
+    ClaimState, Error, GenerationAllocation, GenerationPlan, PredecessorGeneration, ProtectedClaim,
+    ResourceIdentity, Result, service_account_name, valid_digest, valid_id,
+};
 use inventory::{INVENTORY_SCHEMA, InventoryScope, InventorySnapshot, TrackedResource};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Project a verified generation and matching claims into metadata-only tracking.
 /// This projection grants no ownership or deletion authority.
@@ -61,6 +64,90 @@ pub fn generation_inventory(
     Ok((scope, snapshot))
 }
 
+/// Project a trusted historical generation into the complete metadata needed by
+/// a future planner. The allocation remains the protected authority for the
+/// immutable inventory metadata; active claims bind its captured UIDs.
+/// # Errors
+/// Rejects altered compiler output, allocation mismatches, incomplete claims,
+/// or malformed inventory and identity metadata.
+pub fn predecessor_metadata(
+    generation: &GenerationPlan,
+    allocation: &GenerationAllocation,
+    claims: &[ProtectedClaim],
+) -> Result<PredecessorGeneration> {
+    if !valid_id(&generation.generation_id)
+        || !valid_digest(&generation.artifact_digest)
+        || !valid_id(&allocation.transition_id)
+        || !valid_id(&allocation.service_account_name)
+        || allocation.generation_id != generation.generation_id
+        || allocation.artifact_digest != generation.artifact_digest
+        || allocation.ir_digest != generation.compiled.ir_digest
+        || allocation.service_account_name != service_account_name(generation)?
+    {
+        return Err(Error::Plan(
+            "predecessor generation differs from its protected allocation".into(),
+        ));
+    }
+    let (scope, inventory) = generation_inventory(generation, claims)?;
+    validate_inventory_checkpoint(&scope, &inventory, allocation)?;
+
+    let resources: BTreeMap<_, _> = inventory
+        .resources
+        .iter()
+        .map(|resource| {
+            (
+                ResourceIdentity {
+                    api_group: resource.identity.api_group.clone(),
+                    resource: resource.identity.resource.clone(),
+                    namespace: resource.identity.namespace.clone(),
+                    name: resource.identity.name.clone(),
+                },
+                resource,
+            )
+        })
+        .collect();
+    let mut seen = BTreeSet::new();
+    for claim in claims {
+        if claim.domain_id != scope.controller {
+            continue;
+        }
+        let tracked = resources.get(&claim.identity).ok_or_else(|| {
+            Error::Plan("protected predecessor claim is absent from its inventory".into())
+        })?;
+        if !seen.insert(&claim.identity)
+            || claim.state != ClaimState::Active
+            || claim.generation_id != allocation.generation_id
+            || claim.transition_id != allocation.transition_id
+            || claim.uid != tracked.uid
+        {
+            return Err(Error::Plan(
+                "protected predecessor claim differs from its allocation or inventory".into(),
+            ));
+        }
+    }
+    if resources.keys().any(|identity| !seen.contains(identity)) {
+        return Err(Error::Plan(
+            "predecessor inventory lacks complete active claims".into(),
+        ));
+    }
+
+    let retirement_role_binding_namespaces = generation
+        .compiled
+        .capabilities
+        .iter()
+        .map(|capability| capability.namespace.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(PredecessorGeneration {
+        allocation: allocation.clone(),
+        scope,
+        control_namespace: generation.compiled.ir.domain.control_namespace.clone(),
+        inventory,
+        retirement_role_binding_namespaces,
+    })
+}
+
 /// Validate persisted tracking against the approved predecessor and protected
 /// claims. A generation name alone cannot establish inventory completeness.
 /// # Errors
@@ -71,11 +158,10 @@ pub fn validate_transition_inventory(
     persisted: Option<&InventorySnapshot>,
 ) -> Result<()> {
     crate::plan_transition(request)?;
-    match (&request.previous, persisted) {
+    match (request.predecessor()?, persisted) {
         (None, None) => Ok(()),
         (Some(previous), Some(persisted)) => {
-            let (_, expected) = generation_inventory(previous, &request.registry.claims)?;
-            if &expected != persisted {
+            if &previous.inventory != persisted {
                 return Err(Error::Plan("persisted inventory differs from the approved predecessor and protected claims".into()));
             }
             Ok(())

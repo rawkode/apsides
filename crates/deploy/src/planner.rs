@@ -48,6 +48,26 @@ fn resources(generation: &GenerationPlan) -> Result<BTreeMap<ResourceIdentity, &
         .collect()
 }
 
+fn inventory_resources(
+    previous: &inventory::InventorySnapshot,
+) -> BTreeMap<ResourceIdentity, &inventory::TrackedResource> {
+    previous
+        .resources
+        .iter()
+        .map(|resource| {
+            (
+                ResourceIdentity {
+                    api_group: resource.identity.api_group.clone(),
+                    resource: resource.identity.resource.clone(),
+                    namespace: resource.identity.namespace.clone(),
+                    name: resource.identity.name.clone(),
+                },
+                resource,
+            )
+        })
+        .collect()
+}
+
 fn valid_request(request: &DeploymentRequest) -> Result<()> {
     if compiler_core::canonical_bytes(request)?.len() > 1024 * 1024 {
         return Err(Error::Plan(
@@ -69,18 +89,16 @@ fn valid_request(request: &DeploymentRequest) -> Result<()> {
     validate_generation_history(request)?;
     validate_ceiling(&request.next.compiled, &request.runtime_ceiling)?;
     let next = &request.next.compiled.ir.domain;
-    if let Some(previous) = &request.previous {
-        generation_valid(previous)?;
-        let old = &previous.compiled.ir.domain;
-        if previous.generation_id == request.next.generation_id {
+    if let Some(previous) = request.predecessor()? {
+        if previous.allocation.generation_id == request.next.generation_id {
             return Err(Error::Plan(
                 "activation must allocate a new generation even for rollback".into(),
             ));
         }
-        if old.id != next.id
-            || old.cluster_binding != next.cluster_binding
-            || old.namespace != next.namespace
-            || old.control_namespace != next.control_namespace
+        if previous.scope.controller != next.id
+            || previous.scope.cluster != next.cluster_binding
+            || previous.scope.namespace != next.namespace
+            || previous.control_namespace != next.control_namespace
         {
             return Err(Error::Plan(
                 "domain, cluster and namespace migration is unsupported".into(),
@@ -116,11 +134,9 @@ fn allocation(generation: &GenerationPlan, transition_id: &str) -> Result<Genera
 fn validate_generation_history(request: &DeploymentRequest) -> Result<()> {
     let history = &request.registry.generation_history;
     let domain = &request.next.compiled.ir.domain;
+    let previous = request.predecessor()?;
     if history.active_generation_id.as_ref()
-        != request
-            .previous
-            .as_ref()
-            .map(|previous| &previous.generation_id)
+        != previous.map(|previous| &previous.allocation.generation_id)
     {
         return Err(Error::Plan(
             "previous generation does not match protected active-generation authority".into(),
@@ -166,23 +182,39 @@ fn validate_generation_history(request: &DeploymentRequest) -> Result<()> {
             return Err(Error::Plan("generation, runtime identity, or transition ID was allocated previously; rollback requires fresh activation identities".into()));
         }
     }
-    if let Some(previous) = &request.previous {
+    if let Some(previous) = previous {
         let entry = history
             .allocations
             .iter()
-            .find(|entry| entry.generation_id == previous.generation_id)
+            .find(|entry| entry.generation_id == previous.allocation.generation_id)
             .ok_or_else(|| {
                 Error::Plan("prior generation is absent from protected generation history".into())
             })?;
-        let (scope, snapshot) = crate::generation_inventory(previous, &request.registry.claims)?;
-        crate::validate_inventory_checkpoint(&scope, &snapshot, entry)?;
-        if entry.artifact_digest != previous.artifact_digest
-            || entry.ir_digest != previous.compiled.ir_digest
-            || entry.service_account_name != service_account_name(previous)?
-        {
+        crate::validate_inventory_checkpoint(&previous.scope, &previous.inventory, entry)?;
+        if entry != &previous.allocation {
             return Err(Error::Plan(
                 "prior generation differs from its protected allocation history".into(),
             ));
+        }
+        previous
+            .inventory
+            .encode(&previous.scope)
+            .map_err(|_| Error::Plan("invalid predecessor inventory metadata".into()))?;
+        if previous.retirement_role_binding_namespaces.len() > 4096 {
+            return Err(Error::Plan(
+                "too many predecessor retirement namespaces".into(),
+            ));
+        }
+        let mut prior_namespace: Option<&str> = None;
+        for namespace in &previous.retirement_role_binding_namespaces {
+            if !valid_namespace(namespace)
+                || prior_namespace.is_some_and(|prior| prior >= namespace.as_str())
+            {
+                return Err(Error::Plan(
+                    "predecessor retirement namespaces must be sorted and unique".into(),
+                ));
+            }
+            prior_namespace = Some(namespace);
         }
     }
     Ok(())
@@ -190,8 +222,9 @@ fn validate_generation_history(request: &DeploymentRequest) -> Result<()> {
 
 fn claims<'a>(
     request: &'a DeploymentRequest,
-    previous: &BTreeMap<ResourceIdentity, &Resource>,
+    previous: &BTreeMap<ResourceIdentity, &inventory::TrackedResource>,
 ) -> Result<BTreeMap<ResourceIdentity, &'a ProtectedClaim>> {
+    let predecessor = request.predecessor()?;
     let mut claims = BTreeMap::new();
     for claim in &request.registry.claims {
         if !bounded_identity(&claim.identity) {
@@ -218,23 +251,18 @@ fn claims<'a>(
             ));
         }
     }
-    for id in previous.keys() {
+    for (id, tracked) in previous {
         let claim = claims
             .get(id)
             .ok_or_else(|| Error::Plan("prior approved resource lacks a protected claim".into()))?;
+        let allocation = &predecessor
+            .ok_or_else(|| Error::Plan("predecessor claim lacks predecessor metadata".into()))?
+            .allocation;
         if claim.state != ClaimState::Active
             || claim.domain_id != request.next.compiled.ir.domain.id
-            || Some(&claim.generation_id)
-                != request.previous.as_ref().map(|prior| &prior.generation_id)
-            || !request
-                .registry
-                .generation_history
-                .allocations
-                .iter()
-                .any(|allocation| {
-                    allocation.generation_id == claim.generation_id
-                        && allocation.transition_id == claim.transition_id
-                })
+            || claim.generation_id != allocation.generation_id
+            || claim.transition_id != allocation.transition_id
+            || claim.uid != tracked.uid
         {
             return Err(Error::Plan(
                 "prior resource claim has a conflicting owner, generation or unfinished transition"
@@ -243,6 +271,22 @@ fn claims<'a>(
         }
     }
     Ok(claims)
+}
+
+fn valid_namespace(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
 }
 
 fn bounded_identity(identity: &ResourceIdentity) -> bool {
@@ -300,15 +344,13 @@ fn cleanup_allowed(capabilities: &[Capability], ceiling: &PermissionCeiling) -> 
 /// Recompute an immutable lifecycle plan from approved generations and protected claims.
 ///
 /// # Errors
-/// Rejects conflicting claims, generation reuse, missing UID authority, unsupported
+/// Rejects conflicting claims, generation reuse, mismatched UID authority, unsupported
 /// migrations, or permissions outside independently supplied platform ceilings.
 pub fn plan_transition(request: &DeploymentRequest) -> Result<TransitionPlan> {
     valid_request(request)?;
-    let previous = request
-        .previous
-        .as_ref()
-        .map(resources)
-        .transpose()?
+    let predecessor = request.predecessor()?;
+    let previous = predecessor
+        .map(|previous| inventory_resources(&previous.inventory))
         .unwrap_or_default();
     let next = resources(&request.next)?;
     let claims = claims(request, &previous)?;
@@ -338,25 +380,17 @@ pub fn plan_transition(request: &DeploymentRequest) -> Result<TransitionPlan> {
         reservations.push(ClaimReservation {
             identity: id.clone(),
             prior_generation_id: if previous.contains_key(id) {
-                request
-                    .previous
-                    .as_ref()
-                    .map(|prior| prior.generation_id.clone())
+                predecessor.map(|prior| prior.allocation.generation_id.clone())
             } else {
                 None
             },
             next_generation_id: request.next.generation_id.clone(),
         });
     }
-    let prior_inventory = request
-        .previous
-        .as_ref()
-        .map(|generation| crate::generation_inventory(generation, &request.registry.claims))
-        .transpose()?;
-    let (cleanup, capabilities) = match &prior_inventory {
-        Some((scope, snapshot)) => plan_inventory_cleanup(
-            scope,
-            snapshot,
+    let (cleanup, capabilities) = match predecessor {
+        Some(previous) => plan_inventory_cleanup(
+            &previous.scope,
+            &previous.inventory,
             &next.keys().cloned().collect(),
             &request.registry.claims,
             &request.cleanup_ceiling,
@@ -366,7 +400,7 @@ pub fn plan_transition(request: &DeploymentRequest) -> Result<TransitionPlan> {
     cleanup_allowed(&capabilities, &request.cleanup_ceiling)?;
     let generation_reservation = allocation(&request.next, &request.transition_id)?;
     let mut plan = TransitionPlan {
-        schema_version: "reakt.dev/transition-plan/v2".into(),
+        schema_version: "reakt.dev/transition-plan/v3".into(),
         plan_digest: String::new(), request: request.clone(), reservations,
         generation_reservation, cleanup, cleanup_capabilities: capabilities,
         warnings: vec!["uncertain old-writer termination blocks activation; short-lived credentials do not undo durable changes".into()],

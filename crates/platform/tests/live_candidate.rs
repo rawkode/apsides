@@ -160,8 +160,8 @@ async fn reserve(
     let previous = history
         .active_generation_id
         .as_ref()
-        .map(|generation| {
-            registry
+        .map(|generation| -> Result<deploy::PreviousGeneration> {
+            let stored = registry
                 .value
                 .transitions
                 .values()
@@ -169,8 +169,14 @@ async fn reserve(
                     s.record.phase == Phase::Committed
                         && s.plan.request.next.generation_id == *generation
                 })
-                .map(|s| s.plan.request.next.clone())
-                .ok_or("active plan absent")
+                .ok_or("active plan absent")?;
+            Ok(deploy::PreviousGeneration::Metadata(Box::new(
+                deploy::predecessor_metadata(
+                    &stored.plan.request.next,
+                    &stored.plan.generation_reservation,
+                    &registry.value.claims,
+                )?,
+            )))
         })
         .transpose()?;
     let policy = platform.load_policy(&domain.id).await?.value;

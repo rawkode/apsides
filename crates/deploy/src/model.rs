@@ -72,6 +72,27 @@ pub struct GenerationAllocation {
     pub inventory_metadata_digest: Option<String>,
 }
 
+/// Metadata used to authenticate predecessor state without retaining its
+/// compiled artifact or source.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PredecessorGeneration {
+    pub allocation: GenerationAllocation,
+    pub scope: inventory::InventoryScope,
+    pub control_namespace: String,
+    pub inventory: inventory::InventorySnapshot,
+    pub retirement_role_binding_namespaces: Vec<String>,
+}
+
+/// Legacy full-generation requests remain decodable for explicit recovery, but
+/// normal planning accepts only the metadata projection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PreviousGeneration {
+    Metadata(Box<PredecessorGeneration>),
+    Legacy(Box<GenerationPlan>),
+}
+
 /// Runtime-written information is diagnostic input only. It does not grant
 /// lifecycle authority, add claims or substitute for trusted UID evidence.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,7 +106,7 @@ pub struct RuntimeObservation {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeploymentRequest {
     pub transition_id: String,
-    pub previous: Option<GenerationPlan>,
+    pub previous: Option<PreviousGeneration>,
     pub next: GenerationPlan,
     pub runtime_ceiling: PermissionCeiling,
     pub cleanup_ceiling: PermissionCeiling,
@@ -93,6 +114,21 @@ pub struct DeploymentRequest {
     pub observations: Vec<RuntimeObservation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ownership_intents: Vec<crate::OwnershipIntent>,
+}
+
+impl DeploymentRequest {
+    /// Return predecessor metadata for validation by the planner or platform.
+    /// # Errors
+    /// Legacy requests require an explicit recovery flow and cannot be replayed.
+    pub fn predecessor(&self) -> crate::Result<Option<&PredecessorGeneration>> {
+        match &self.previous {
+            None => Ok(None),
+            Some(PreviousGeneration::Metadata(previous)) => Ok(Some(previous)),
+            Some(PreviousGeneration::Legacy(_)) => Err(crate::Error::Plan(
+                "legacy predecessor generation requires explicit recovery".into(),
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

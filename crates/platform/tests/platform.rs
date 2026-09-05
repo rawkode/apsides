@@ -733,10 +733,13 @@ async fn initial_activation_rejects_changed_trust_without_writes() {
 }
 
 #[cfg(feature = "deployer")]
-fn staged_upgrade_fixture() -> NamespaceRegistry {
+fn staged_upgrade_fixture() -> std::result::Result<NamespaceRegistry, Box<dyn std::error::Error>> {
     use deploy::{Event, Phase, Quiescence, RegistrySnapshot, advance, begin, plan_transition};
     let (mut registry, _, _, _, _) = staged_initial_fixture();
-    let previous = registry.transitions.get_mut("transition-a").unwrap();
+    let previous = registry
+        .transitions
+        .get_mut("transition-a")
+        .ok_or("initial transition missing")?;
     for event in [
         Event::Quiesced {
             event_id: "initial-quiesce".into(),
@@ -747,7 +750,7 @@ fn staged_upgrade_fixture() -> NamespaceRegistry {
         Event::Activated {
             event_id: "initial-active".into(),
             generation_id: "generation-a".into(),
-            activation_receipt_digest: digest(&"active").unwrap(),
+            activation_receipt_digest: digest(&"active")?,
             verification_epoch: 0,
         },
         Event::Cleaning {
@@ -756,7 +759,7 @@ fn staged_upgrade_fixture() -> NamespaceRegistry {
         Event::Committed {
             event_id: "initial-commit".into(),
             cleanup_receipts: vec![],
-            obsolete_identity_retirement_digest: digest(&"no predecessor").unwrap(),
+            obsolete_identity_retirement_digest: digest(&"no predecessor")?,
         },
     ] {
         previous.record = advance(
@@ -765,31 +768,43 @@ fn staged_upgrade_fixture() -> NamespaceRegistry {
             previous.record.revision,
             "executor-a",
             event,
-        )
-        .unwrap();
+        )?;
     }
     assert_eq!(previous.record.phase, Phase::Committed);
     let previous = previous.clone();
     registry
         .histories
         .get_mut("example")
-        .unwrap()
+        .ok_or("domain history missing")?
         .active_generation_id = Some("generation-a".into());
     for claim in &mut registry.claims {
         claim.state = ClaimState::Active;
+        claim
+            .transition_id
+            .clone_from(&previous.plan.request.transition_id);
     }
     let mut request = previous.plan.request.clone();
     request.transition_id = "transition-b".into();
-    request.previous = Some(previous.plan.request.next.clone());
+    request.previous = Some(deploy::PreviousGeneration::Metadata(Box::new(
+        deploy::predecessor_metadata(
+            &previous.plan.request.next,
+            &previous.plan.generation_reservation,
+            &registry.claims,
+        )?,
+    )));
     request.next.generation_id = "generation-b".into();
     request.registry = RegistrySnapshot {
         revision: "42".into(),
         claims: registry.claims.clone(),
-        generation_history: registry.histories["example"].clone(),
+        generation_history: registry
+            .histories
+            .get("example")
+            .ok_or("domain history missing")?
+            .clone(),
     };
-    let plan = plan_transition(&request).unwrap();
+    let plan = plan_transition(&request)?;
     let mut current = previous;
-    current.record = begin(&plan, "executor-b").unwrap();
+    current.record = begin(&plan, "executor-b")?;
     current.record = advance(
         &plan,
         &current.record,
@@ -799,22 +814,144 @@ fn staged_upgrade_fixture() -> NamespaceRegistry {
             event_id: "stage-b".into(),
             generation_id: "generation-b".into(),
             service_account_name: plan.generation_reservation.service_account_name.clone(),
-            registry_cas_receipt_digest: digest(&"new source staging").unwrap(),
+            registry_cas_receipt_digest: digest(&"new source staging")?,
             verification_epoch: 0,
         },
-    )
-    .unwrap();
+    )?;
     current.plan = plan;
-    current.runtime_binding.as_mut().unwrap().generation_id = "generation-b".into();
+    current
+        .runtime_binding
+        .as_mut()
+        .ok_or("runtime binding missing")?
+        .generation_id = "generation-b".into();
     registry.transitions.insert("transition-b".into(), current);
-    registry
+    Ok(registry)
 }
 
 #[cfg(feature = "deployer")]
 #[tokio::test]
-async fn direct_api_predecessor_is_durably_blocked_and_forged_phase_never_writes() {
+async fn predecessor_metadata_requires_exact_protected_retirement_authority_before_reservation()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    for alteration in [
+        "extra-namespace",
+        "missing-namespace",
+        "wrong-transition",
+        "wrong-scope",
+        "wrong-control",
+        "duplicate-record",
+        "record-transition",
+        "uncommitted",
+    ] {
+        let mut registry = staged_upgrade_fixture()?;
+        let mut request = registry
+            .transitions
+            .remove("transition-b")
+            .ok_or("upgrade transition missing")?
+            .plan
+            .request;
+        let Some(deploy::PreviousGeneration::Metadata(previous)) = request.previous.as_mut() else {
+            return Err("fixture must use predecessor metadata".into());
+        };
+        match alteration {
+            "extra-namespace" => previous
+                .retirement_role_binding_namespaces
+                .push("unapproved".into()),
+            "missing-namespace" => previous.retirement_role_binding_namespaces.clear(),
+            "wrong-transition" => previous.allocation.transition_id = "unrelated-transition".into(),
+            "wrong-scope" => previous.scope.namespace = "unrelated".into(),
+            "wrong-control" => previous.control_namespace = "unrelated".into(),
+            "duplicate-record" => {
+                registry.transitions.insert(
+                    "duplicate".into(),
+                    registry.transition("transition-a")?.clone(),
+                );
+            }
+            "record-transition" => {
+                registry
+                    .transitions
+                    .get_mut("transition-a")
+                    .ok_or("initial transition missing")?
+                    .record
+                    .transition_id = "unrelated".into();
+            }
+            "uncommitted" => {
+                registry
+                    .transitions
+                    .get_mut("transition-a")
+                    .ok_or("initial transition missing")?
+                    .record
+                    .phase = deploy::Phase::Staged;
+            }
+            _ => return Err("unknown fixture alteration".into()),
+        }
+        let (client, calls) = wire(vec![object("registry", &registry, "registry-uid", "42")]);
+        let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+        assert!(
+            platform
+                .reserve_transition(&request, "executor-b")
+                .await
+                .is_err(),
+            "{alteration}"
+        );
+        let calls = calls.lock().map_err(|_| "request lock poisoned")?;
+        assert_eq!(
+            calls.len(),
+            1,
+            "{alteration} must reject before policy or writes"
+        );
+        assert_eq!(calls.first().ok_or("registry read missing")?.0, "GET");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "deployer")]
+#[tokio::test]
+async fn authenticated_metadata_predecessor_reserves_without_embedding_old_plan()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut registry = staged_upgrade_fixture()?;
+    let request = registry
+        .transitions
+        .remove("transition-b")
+        .ok_or("upgrade transition missing")?
+        .plan
+        .request;
+    let policy = policy(&request.next.compiled);
+    let (client, calls) = wire(vec![
+        object("registry", &registry, "registry-uid", "42"),
+        object("policy", &policy, "policy-uid", "40"),
+        object("registry", &registry, "registry-uid", "42"),
+        json!("echo-put"),
+    ]);
+    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let reserved = platform.reserve_transition(&request, "executor-b").await?;
+    let previous = serde_json::to_value(
+        &reserved
+            .value
+            .transition("transition-b")?
+            .plan
+            .request
+            .previous,
+    )?;
+    assert!(previous.get("compiled").is_none());
+    assert!(previous.get("inventory").is_some());
+    assert_eq!(
+        calls
+            .lock()
+            .map_err(|_| "request lock poisoned")?
+            .iter()
+            .filter(|call| call.0 == "PUT")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[cfg(feature = "deployer")]
+#[tokio::test]
+async fn direct_api_predecessor_is_durably_blocked_and_forged_phase_never_writes()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     use deploy::Phase;
-    let registry = staged_upgrade_fixture();
+    let registry = staged_upgrade_fixture()?;
     let (client, calls) = wire(vec![
         object("reakt-registry-workload", &registry, "registry-uid", "42"),
         object("reakt-registry-workload", &registry, "registry-uid", "42"),
@@ -866,6 +1003,7 @@ async fn direct_api_predecessor_is_durably_blocked_and_forged_phase_never_writes
         assert_eq!(calls.lock().unwrap().len(), 1);
         assert_eq!(calls.lock().unwrap()[0].0, "GET");
     }
+    Ok(())
 }
 
 #[cfg(feature = "deployer")]
@@ -1453,15 +1591,11 @@ fn ci_permission_report_distinguishes_creation_scope_and_runtime_authority()
 #[test]
 fn upgrade_ci_permissions_cover_retirement_and_actual_exec_method()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let registry = staged_upgrade_fixture();
+    let registry = staged_upgrade_fixture()?;
     let plan = &registry.transition("transition-b")?.plan;
     let report = deployment_permissions(plan)?;
-    let previous = plan
-        .request
-        .previous
-        .as_ref()
-        .ok_or("missing predecessor")?;
-    let account = deploy::service_account_name(previous)?;
+    let previous = plan.request.predecessor()?.ok_or("missing predecessor")?;
+    let account = previous.allocation.service_account_name.clone();
     for (resource, verb, name) in [
         ("serviceaccounts", "delete", account.clone()),
         ("rolebindings", "delete", account.clone()),
@@ -1469,7 +1603,7 @@ fn upgrade_ci_permissions_cover_retirement_and_actual_exec_method()
         (
             "deployments",
             "update",
-            format!("reakt-proxy-{}", previous.generation_id),
+            format!("reakt-proxy-{}", previous.allocation.generation_id),
         ),
     ] {
         assert!(report.required_resources.iter().any(|access| {
@@ -1504,7 +1638,7 @@ fn upgrade_ci_permissions_cover_retirement_and_actual_exec_method()
 #[tokio::test]
 async fn active_uid_capture_uses_inventory_and_rejects_missing_records()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let mut registry = staged_upgrade_fixture();
+    let mut registry = staged_upgrade_fixture()?;
     registry.transitions.remove("transition-b");
     let snapshot: inventory::InventorySnapshot = serde_json::from_value(json!({
         "schemaVersion":"reakt.dev/resource-inventory/v1", "generation":"generation-a",
@@ -1555,7 +1689,7 @@ async fn captured_uid_publication_preserves_metadata_and_uses_authoritative_clai
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("inventory.db");
     let store = LibsqlInventory::open_local(&path).await?;
-    let mut registry = staged_upgrade_fixture();
+    let mut registry = staged_upgrade_fixture()?;
     registry.transitions.remove("transition-b");
     let (scope, snapshot) = deploy::generation_inventory(
         &registry.transition("transition-a")?.plan.request.next,
@@ -1613,7 +1747,7 @@ async fn captured_uid_publication_rejects_known_uid_change_without_overwrite()
     use inventory::{InventoryStore, LibsqlInventory};
     let directory = tempfile::tempdir()?;
     let store = LibsqlInventory::open_local(&directory.path().join("inventory.db")).await?;
-    let mut registry = staged_upgrade_fixture();
+    let mut registry = staged_upgrade_fixture()?;
     registry.transitions.remove("transition-b");
     registry.claims.first_mut().ok_or("claim missing")?.uid = Some("original-uid".into());
     let (scope, snapshot) = deploy::generation_inventory(
@@ -1652,7 +1786,7 @@ async fn inventory_checkpoint_rejects_tampered_policy_and_legacy_authority_befor
     for corruption in ["policy", "legacy", "duplicate-allocation"] {
         let directory = tempfile::tempdir()?;
         let store = LibsqlInventory::open_local(&directory.path().join("inventory.db")).await?;
-        let mut registry = staged_upgrade_fixture();
+        let mut registry = staged_upgrade_fixture()?;
         registry.transitions.remove("transition-b");
         let (scope, mut snapshot) = deploy::generation_inventory(
             &registry.transition("transition-a")?.plan.request.next,
@@ -1711,7 +1845,7 @@ async fn inventory_checkpoint_rejects_tampered_policy_and_legacy_authority_befor
 
     let directory = tempfile::tempdir()?;
     let store = LibsqlInventory::open_local(&directory.path().join("inventory.db")).await?;
-    let mut registry = staged_upgrade_fixture();
+    let mut registry = staged_upgrade_fixture()?;
     registry.transitions.remove("transition-b");
     let (scope, snapshot) = deploy::generation_inventory(
         &registry.transition("transition-a")?.plan.request.next,

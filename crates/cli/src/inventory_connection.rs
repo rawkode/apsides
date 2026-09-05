@@ -84,7 +84,7 @@ pub async fn require_head(
     Ok(())
 }
 
-async fn load(
+pub(crate) async fn load(
     store: &dyn InventoryStore,
     domain: &compiler_core::Domain,
 ) -> Result<Option<VersionedInventory>> {

@@ -83,6 +83,9 @@ pub fn verify_record(plan: &TransitionPlan, record: &TransitionRecord) -> Result
 }
 
 fn require_inventory_checkpoint(plan: &TransitionPlan) -> Result<()> {
+    if plan.schema_version != "reakt.dev/transition-plan/v3" {
+        return Err(reject("pre-v3 transition plan requires explicit recovery"));
+    }
     if plan
         .generation_reservation
         .inventory_metadata_digest
@@ -222,9 +225,8 @@ fn advance_phase(plan: &TransitionPlan, record: &TransitionRecord, event: &Event
             }
             if plan
                 .request
-                .previous
-                .as_ref()
-                .is_some_and(|old| service_account_name(old).as_ref() == Ok(name))
+                .predecessor()?
+                .is_some_and(|old| old.allocation.service_account_name == *name)
             {
                 return Err(reject(
                     "new generation cannot reuse the old runtime identity",
@@ -279,14 +281,14 @@ fn verify_quiescence(
     record: &TransitionRecord,
     evidence: &Quiescence,
 ) -> Result<()> {
-    match (&plan.request.previous, evidence) {
+    match (plan.request.predecessor()?, evidence) {
         (None, Quiescence::InitialInstallation { verification_epoch })
             if *verification_epoch == record.verification_epoch =>
         {
             Ok(())
         }
         (Some(previous), Quiescence::OldGeneration(evidence)) => {
-            if evidence.generation_id != previous.generation_id
+            if evidence.generation_id != previous.allocation.generation_id
                 || evidence.executor_id != record.executor_id
                 || evidence.verification_epoch != record.verification_epoch
                 || !valid_digest(&evidence.environment_qualification_digest)

@@ -200,8 +200,7 @@ impl PlatformClient {
         let previous = stored
             .plan
             .request
-            .previous
-            .as_ref()
+            .predecessor()?
             .ok_or_else(|| invalid("previous generation missing"))?;
         let domain = &stored.plan.request.next.compiled.ir.domain.id;
         let generation = &stored.plan.request.next.generation_id;
@@ -210,11 +209,9 @@ impl PlatformClient {
             .histories
             .get_mut(domain)
             .ok_or_else(|| invalid("domain history missing"))?;
-        if !history
-            .active_generation_id
-            .as_ref()
-            .is_some_and(|active| active == &previous.generation_id || active == generation)
-        {
+        if !history.active_generation_id.as_ref().is_some_and(|active| {
+            active == &previous.allocation.generation_id || active == generation
+        }) {
             return Err(invalid("active generation differs from transition"));
         }
         for approved in approved_claims(&registry.value, stored)? {
@@ -231,7 +228,7 @@ impl PlatformClient {
                 .find(|c| c.identity == item.identity)
                 .ok_or_else(|| invalid("prior cleanup claim missing"))?;
             if claim.domain_id != *domain
-                || claim.generation_id != previous.generation_id
+                || claim.generation_id != previous.allocation.generation_id
                 || claim.uid != item.expected_uid
             {
                 return Err(invalid("prior cleanup claim replaced"));

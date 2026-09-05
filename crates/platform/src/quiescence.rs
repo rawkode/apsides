@@ -425,22 +425,9 @@ pub(crate) fn previous_transition<'a>(
     let previous = current
         .plan
         .request
-        .previous
-        .as_ref()
+        .predecessor()?
         .ok_or_else(|| invalid("initial generation has no previous writer"))?;
-    let matches: Vec<_> = registry
-        .value
-        .transitions
-        .values()
-        .filter(|s| s.record.phase == Phase::Committed && s.plan.request.next == *previous)
-        .collect();
-    let [previous] = matches.as_slice() else {
-        return Err(invalid(
-            "previous generation has no unique committed record",
-        ));
-    };
-    verify_record(previous)?;
-    Ok(previous)
+    crate::predecessor::authenticate(&registry.value, previous)
 }
 
 fn verify_record(stored: &StoredTransition) -> Result<()> {
