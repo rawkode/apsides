@@ -3,9 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "exports": { ".": "./src/index.ts" },
+  "exports": {
+    ".": "./src/index.ts",
+    "./legacy": "./src/legacy.ts",
+    "./jsx-runtime": "./src/jsx-runtime.ts",
+    "./jsx-dev-runtime": "./src/jsx-dev-runtime.ts"
+  },
   "scripts": {
-    "typecheck": "deno check src/index.ts src/index.test.ts",
-    "test": "deno run src/index.test.ts"
+    "typecheck": "deno check src/index.ts src/compiler.ts src/jsx-dev-runtime.ts src/index.test.ts src/traversal.test.ts",
+    "test": "deno run src/index.test.ts && deno run src/traversal.test.ts"
   }
 }

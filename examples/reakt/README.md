@@ -1,17 +1,36 @@
-# Reakt TypeScript example
+# Reakt TSX example
 
-Run the complete authoring example with Deno and access only to the source file whose digest it records:
+`program.tsx` declares the controller boundary and composes the reusable `Api`
+component from `api.tsx`. The component declares Kubernetes resources with JSX
+and observations with `useConfigMap` and `useSecret`. `rolloutOn` connects opaque
+input projections to a Deployment; it never reads live values during the build.
 
-```sh
-deno run --allow-read=examples/reakt/program.ts examples/reakt/domain.ts --production
-```
-
-The default and `--production` write raw production IR. The small Deno wrapper hashes `program.ts` and passes that digest into the author module; the author module itself performs no filesystem or network I/O. `--fixture` writes raw fixture-substituted IR for the compiler's explicitly test-only path. `--fixture-bundle` writes the companion artifact that records synthetic observed ConfigMap and Secret values and the workload overlay as `testOnly: true` and `productionReady: false`. The overlay replaces every workload container with the locally loaded `reakt-fixture:local` image and `imagePullPolicy: Never`; neither it nor the synthetic input values enter production IR.
-
-The supported source-build path uses the checked-in canonical lock:
+Compile the digest-locked example from the repository root:
 
 ```sh
-scripts/reakt/source-build.sh examples/reakt/program.ts work/reakt-source
+scripts/reakt/source-build.sh examples/reakt/program.tsx work/reakt-source
 ```
 
-After changing source, refresh the explicit closure with `scripts/reakt/source-lock.sh examples/reakt/program.ts`. List every additional relative source module as another argument. The build performs a Deno type check, two independent Oxc/Rolldown builds, and two fresh denied-permission Deno evaluations in a pinned SES Compartment. It emits production and fixture IR, a real bundle source map, declaration source mapping, the build-input/toolchain receipt, a compiler-reconstructed overlay diff, the fixture catalogue, and source-linked coverage requirements. Output must be a fresh directory.
+Choose a fresh output directory for each build. The compiler supplies source
+locations and provenance, evaluates the component tree in its isolated build
+process, and emits data for a native Kubernetes controller. No React or
+TypeScript runtime is deployed into the cluster.
+
+After editing either source file, refresh the explicit source lock:
+
+```sh
+scripts/reakt/source-lock.sh examples/reakt/program.tsx examples/reakt/api.tsx
+```
+
+The source build performs a Deno type check, two Oxc/Rolldown builds and two
+permission-restricted Deno/SES evaluations. It generates production IR,
+separate test fixtures, source maps and the toolchain receipt. Generated files
+stay in ignored output directories. Fixtures never enter production IR.
+
+Resource locations identify their JSX declarations. Observation hooks currently
+identify the containing component's JSX invocation, rather than the hook's
+individual line. These locations are diagnostics, not authorization.
+
+The workload image digest is illustrative. The `api-workload` ServiceAccount
+and external ConfigMap/Secret are platform prerequisites. Compilation does not
+establish deployment or production release readiness.

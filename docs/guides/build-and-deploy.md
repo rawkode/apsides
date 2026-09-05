@@ -23,12 +23,12 @@ running the deployment protocol.
 cargo build -p cli
 
 target/debug/reakt compile \
-  --source examples/reakt/program.ts \
+  --source examples/reakt/program.tsx \
   --output work/reakt-compiled
 
 # First prepare a build profile using the contract below, then:
 target/debug/reakt build \
-  --source examples/reakt/program.ts \
+  --source examples/reakt/program.tsx \
   --output work/reakt-native \
   --profile /path/to/reakt.build.json
 

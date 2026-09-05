@@ -4,7 +4,7 @@ description: Documentation for the Reakt compiled Kubernetes controller toolchai
 template: splash
 hero:
   title: Compiled reactive GitOps for Kubernetes
-  tagline: Author a bounded resource graph in TypeScript, compile it into a fixed plan and native controller, then let privileged CI verify and deploy each generation.
+  tagline: Author a bounded resource graph with TSX components, compile it into a fixed plan and native controller, then let privileged CI verify and deploy each generation.
   actions:
     - text: Get started
       link: /getting-started/
@@ -31,7 +31,7 @@ those names until a separate rename is implemented.
 ## The working model
 
 <div class="architecture-flow">
-  <div><strong>Declare</strong><span>TypeScript describes fixed resources, selected observations and rollout reactions.</span></div>
+  <div><strong>Declare</strong><span>TSX components describe fixed resources, selected observations and rollout reactions.</span></div>
   <div><strong>Compile</strong><span>The source closure is evaluated with denied host permissions and becomes validated IR.</span></div>
   <div><strong>Review</strong><span>Capabilities, force risks, lifecycle policy, provenance and release evidence are checked.</span></div>
   <div><strong>Deploy</strong><span>Privileged CI stages a native controller generation, quiesces the old writer and publishes inventory.</span></div>

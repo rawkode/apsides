@@ -35,7 +35,7 @@ source staging directory.
 
 ```sh
 target/debug/reakt compile \
-  --source examples/reakt/program.ts \
+  --source examples/reakt/program.tsx \
   --output work/reakt-compiled
 ```
 

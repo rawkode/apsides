@@ -1,132 +1,91 @@
 ---
-title: TypeScript authoring
-description: Declare bounded Kubernetes resources, observations and rollout reactions.
+title: TSX authoring
+description: Compose Kubernetes resources and declare observations with build-time components and hooks.
 ---
 
-The `@reakt/kubernetes` package describes a fixed domain. Authoring code runs
-during compilation and emits data; it is not shipped as a cluster-side evaluator.
+Author controllers as TSX component trees. Components run during compilation;
+the cluster runs a native controller compiled from their declarations.
 
-## A minimal domain
+## Components and observations
 
-```ts
+```tsx
 import {
-  ConfigMap,
-  Deployment,
-  defineDomain,
-  watch,
+  Controller, ConfigMap, Deployment,
+  useConfigMap, useResourceRef, useSecret,
 } from "@reakt/kubernetes";
 
-const source = { file: "program.ts", line: 1, column: 1 };
+function Api({ image }: { image: string }) {
+  const config = useResourceRef("ConfigMap");
+  const settings = useConfigMap({ name: "external-settings" });
+  const credentials = useSecret({ name: "database-credentials" });
 
-const domain = defineDomain({
-  id: "team-api-production",
-  namespace: "production",
-  controlNamespace: "reakt-system",
-  clusterBinding: "production-cluster",
-  policyRef: "platform/team-api",
-  enforcement: "api-bound",
-  budgets: {
-    maxResources: 16,
-    maxInputs: 16,
-    maxReactions: 16,
-    maxObjectBytes: 262_144,
-    maxQueueDepth: 128,
-    maxConcurrentRequests: 4,
-  },
-  provenance: {
-    inputs: [{ path: "program.ts", sha256: "<supplied-by-build-wrapper>" }],
-  },
-  force: false,
-  prune: false,
-});
-
-const settings = domain.observe(ConfigMap, {
-  id: "settings",
-  name: "api-settings",
-  namespace: "production",
-  projection: ["data"],
-  missing: "block-dependent-mutations",
-  source,
-});
-
-const api = domain.manage(new Deployment({
-  id: "api",
-  metadata: { name: "api", namespace: "production" },
-  spec: {
-    replicas: 3,
-    selector: { matchLabels: { app: "api" } },
-    template: {
-      metadata: { labels: { app: "api" } },
-      spec: {
-        containers: [{
-          name: "api",
-          image: "registry.example.com/api@sha256:<digest>",
-        }],
-      },
-    },
-  },
-}), {
-  deletionPolicy: "orphan",
-  force: false,
-  source,
-});
-
-watch(settings).project("data").rollout(api, {
-  id: "settings-rollout",
-  source,
-});
-
-export default domain.toIR();
+  return <>
+    <ConfigMap
+      ref={config}
+      metadata={{ name: "api-config", namespace: "production" }}
+      data={{ LOG_LEVEL: "info" }}
+    />
+    <Deployment
+      metadata={{ name: "api", namespace: "production" }}
+      rolloutOn={[config.data, settings.data, credentials.data]}
+      spec={{
+        replicas: 3,
+        selector: { matchLabels: { app: "api" } },
+        template: {
+          metadata: { labels: { app: "api" } },
+          spec: { containers: [{ name: "api", image }] },
+        },
+      }}
+    />
+  </>;
+}
 ```
 
-Use the checked-in [complete example](https://github.com/rawkode/apsides/tree/main/examples/reakt)
-for executable source. The abbreviated snippet above shows the shape of the API;
-the build wrapper supplies real source digests and locations.
+Place `<Api image={...} />` inside a `<Controller>` with explicit identity,
+namespace, policy and budgets. The [complete example](https://github.com/rawkode/apsides/tree/main/examples/reakt)
+shows that boundary and the corresponding Service.
 
-## Resources and observations
+Resources accept Kubernetes-shaped `metadata` and `spec` props. Write reusable
+components to encapsulate repeated workload configuration. Fragments group
+resources without creating a Kubernetes object.
 
-The current conservative resource surface supports `ConfigMap`, `Service` and
-`Deployment`. Observations support named `ConfigMap` and `Secret` inputs with a
-`data` projection. Sensitive input values are used to derive reactions but do
-not enter production IR.
+## Hooks declare inputs
 
-All names are fixed at build time and must stay within the domain namespace.
-Unknown fields, cross-domain writes, the reserved `reakt.dev/revision`
-annotation, ambient accessors and unsupported resource shapes fail validation.
+`useConfigMap` and `useSecret` declare named observations in the controller's
+namespace. Their `.data` properties are opaque projection handles, not live
+values. They cannot be read to choose resources, inspect secrets or execute
+callbacks. A missing observation blocks its dependent mutations.
 
-## Reactions
+`useResourceRef("ConfigMap")` creates a handle bound by a ConfigMap component's
+`ref` prop. Its `.data` projection can also trigger a rollout. The compiler
+resolves these relationships after traversing the tree, so a target can precede
+its input declaration. Unbound or foreign references are rejected.
 
-`watch(input).project("data").rollout(deployment)` declares a fixed reaction.
-When the selected data changes, the runtime computes a deterministic revision
-and applies the declared Deployment. It does not invoke an author callback.
+Hooks must run synchronously inside a component under a Controller. Components
+cannot return promises. State and effect hooks, browser APIs, runtime JavaScript
+and arbitrary runtime callbacks are outside this authoring contract.
 
-Missing observed input uses the only current policy,
-`block-dependent-mutations`: dependent writes pause rather than guessing a
-value.
+## Force and deletion
 
-## Force and deletion policy
+Controller `force` and `prune` options set defaults. Resources may override
+`force` and `deletionPolicy` independently. Force requests SSA field ownership
+takeover subject to policy; it does not bypass adoption or UID checks. A removed
+resource's previous deletion policy controls whether cleanup deletes or orphans it.
 
-The domain's `force` and `prune` options set defaults. Each managed resource can
-override them:
+## Compiler-owned metadata
 
-```ts
-domain.manage(resource, {
-  force: true,
-  deletionPolicy: "delete",
-  source,
-});
-```
+Application components do not supply source digests, source locations or test
+fixtures. The compiler captures the locked source closure and SDK modules,
+typechecks and lowers TSX with Oxc, and evaluates the tree in isolated Deno/SES
+processes. Only validated data and fixed rollout reactions enter the native IR.
 
-`force: true` requests SSA field-ownership takeover and creates a separately
-reviewed policy risk. `deletionPolicy: "delete"` authorizes only the later
-UID-checked cleanup path. Neither option grants adoption or bypasses platform
-policy.
+Resource locations identify JSX declarations. Hook locations currently identify
+the containing component invocation, not the hook expression itself. Source
+locations assist diagnostics; they do not confer authority.
 
-## Source and fixture boundaries
+The earlier imperative API remains available at `@reakt/kubernetes/legacy` for
+existing fixtures. New application examples use TSX.
 
-The normal source build records every declared input and compares independent
-bundle/evaluation runs. Test fixtures are explicit, carry `testOnly: true` and
-`productionReady: false`, and cannot be promoted as production artifacts.
-
-See the [IR contract](/reakt/ir-contract/) for the accepted schema and the
-[toolchain](/reakt/toolchain/) for compiler isolation details.
+See the [IR contract](/reakt/ir-contract/) and [toolchain](/reakt/toolchain/) for
+the underlying constraints. The [implementation status](/reakt/status/) records
+the remaining production release gates.

@@ -10,7 +10,7 @@ const root = await mkdtemp(join(tmpdir(), "reakt-source-tests-"));
 const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
 let sequence = 0;
 
-const valid = `import { ConfigMap, Deployment, Secret, defineDomain, watch } from "@reakt/kubernetes";
+const valid = `import { ConfigMap, Deployment, Secret, defineDomain, watch } from "@reakt/kubernetes/legacy";
 const source = {file:"source.ts",line:2,column:1};
 export default function build(context: {sourceDigest:string;provenance:{inputs:{path:string;sha256:string}[]}}) {
   const domain = defineDomain({id:"test",namespace:"workload",controlNamespace:"reakt-system",clusterBinding:"fixture",policyRef:"platform/test",enforcement:"api-bound",budgets:{maxResources:8,maxInputs:8,maxReactions:8,maxObjectBytes:32768,maxQueueDepth:8,maxConcurrentRequests:2},provenance:context.provenance});
@@ -94,13 +94,16 @@ try {
   const mixedCoverage = buildFixtureOutputs(mixed, undefined).coverage;
   assert.equal(mixedCoverage.summary.requiredCases, 21, "mixed reactions retain common, observed, managed, and mutation cases");
   const mixedReaction = mixedCoverage.reactions[0];
+  assert.ok(mixedReaction);
   assert.deepEqual(mixedReaction.cases.find((entry: {scenario:string}) => entry.scenario === "initial-evaluation")?.applicability, {inputModes:["managed","observed"],inputIds:["managed-config","secret"],managedResourceIds:["config"]});
   assert.deepEqual(mixedReaction.cases.find((entry: {scenario:string}) => entry.scenario === "projected-change")?.applicability, {inputModes:["observed"],inputIds:["secret"],managedResourceIds:[]});
   assert.deepEqual(mixedReaction.cases.find((entry: {scenario:string}) => entry.scenario === "managed-drift-repair")?.applicability, {inputModes:["managed"],inputIds:["managed-config"],managedResourceIds:["config"]});
   const emptyManaged = structuredClone(production);
   emptyManaged.resources.find((resource: {id:string}) => resource.id === "config").desired.data = {};
   emptyManaged.reactions = [emptyManaged.reactions.find((reaction: {id:string}) => reaction.id === "config-rollout")];
-  const emptyManagedCases = buildFixtureOutputs(emptyManaged, undefined).coverage.reactions[0].cases;
+  const emptyManagedReaction = buildFixtureOutputs(emptyManaged, undefined).coverage.reactions[0];
+  assert.ok(emptyManagedReaction);
+  const emptyManagedCases = emptyManagedReaction.cases;
   assert.ok(!emptyManagedCases.some((entry: {scenario:string}) => entry.scenario === "managed-drift-repair"), "empty managed data has no owned value that can prove repair");
   assert.deepEqual(emptyManagedCases.filter((entry: {scenario:string}) => entry.scenario.startsWith("managed-")).map((entry: {scenario:string}) => entry.scenario), ["managed-missing","managed-read-denial","managed-unavailable"]);
   assert.ok(coverage.reactions.every((reaction: {source:{file:string}}) => reaction.source.file === "source.ts"));
@@ -127,6 +130,9 @@ try {
   }
   const tamed = await fixture(valid.replace("return domain;", "if ('b'.localeCompare('a') <= 0 || new Error().stack !== '') throw new Error('unsafe SES taming'); return domain;"));
   await compileReakt(tamed.sourcePath,tamed.output);
+  const asyncLegacy = await fixture(valid.replace("export default function build", "export default async function build"));
+  await compileReakt(asyncLegacy.sourcePath, asyncLegacy.output);
+  assert.equal(JSON.parse(await readFile(join(asyncLegacy.output, "ir.json"), "utf8")).domain.id, "test", "legacy async default factories remain compatible");
   const prototypeKey = await fixture(valid.replace("return domain;", `return {productionIR:domain,fixtures:{inputs:[{inputId:"secret",source,synthetic:true,state:"present",data:JSON.parse('{"__proto__":"fixture"}')} ]}};`));
   await compileReakt(prototypeKey.sourcePath,prototypeKey.output);
   const prototypeFixtures = JSON.parse(await readFile(join(prototypeKey.output,"fixtures.json"),"utf8"));

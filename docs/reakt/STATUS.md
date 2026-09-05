@@ -12,6 +12,7 @@ Historical OCI retrieval is not required for upgrades. Earlier artifact-recovery
 
 ## Implemented boundaries
 
+- TSX authoring now composes Controller, ConfigMap, Deployment and Service elements with synchronous build-time observation hooks and opaque rollout projections. Oxc emits JSX source locations; the trusted compiler traverses the tree and injects provenance. Hook locations identify the containing component invocation. All six SDK modules are captured in the compiler receipt. The imperative SDK remains at `/legacy` for existing fixtures.
 - Source compilation uses Oxc/Rolldown, permission-restricted Deno, and SES compartments. Declared source closure and tool identities are digest-bound; independent bundling/evaluation runs must agree.
 - Native controllers use kube-rs, fixed resource plans, bounded queues/watches/backoff, strict SSA dry-runs, exact object ownership, durable UID inventory, activation/policy checks, and non-sensitive diagnostics.
 - OCI verification binds the signed IR, native executable, exact approved base index/manifest/config/layers, compiler source closure, reports and SBOM. Real OpenSSH verification and a pinned GitHub Actions attestation verifier are supported. Fixture artifacts cannot be promoted.
@@ -24,6 +25,7 @@ The API-bound profile does not claim field-level confinement. Exact checks of Re
 
 ## Current evidence
 
+- TSX integration: SDK typecheck/traversal tests and bundle-builder typecheck/full tests pass, including locked multi-file reproducibility, isolated configuration, restricted imports and opaque-reference rejection. Independent adversarial review found and fixed time-varying Proxy rereads and non-enumerable property materialization at the native-data boundary; both regression reproductions pass the corrected snapshot contract. Real CLI compile/check of `examples/reakt/program.tsx` emits a valid native plan with three resources, three inputs and three rollout reactions. This is source/compiler evidence, not new cluster or final release acceptance.
 - Release verifier: 18 tests passed, including real signatures, assertion contracts, compiler closure linkage, OCI/executable coherence and promotion rejection. The version 2 compiler closure includes the complete build context, packaging/CLI sources, build profile, and six host executable identities. Strict Clippy passed at this checkpoint.
 - Native runtime: 21 unit/wire tests and 3 integration tests passed, including live-resource-version cache invalidation, durable created-UID handling and safe HTTP-status-based SSA conflict/authorization diagnostics. Strict Clippy passed.
 - Platform executor: 13 unit, 16 wire and 2 credential tests passed at the latest platform checkpoint. Independent review found and fixed proxy epoch, Role/config drift and activation-resume gaps. The adoption wire test additionally verifies approval/object replacement rejection and strict non-force UID/resourceVersion-bound dry-run before reservation; it does not establish live adoption acceptance.

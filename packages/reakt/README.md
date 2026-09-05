@@ -1,33 +1,28 @@
 # `@reakt/kubernetes`
 
-This package is the additive TypeScript authoring surface for the initial Reakt IR. TypeScript runs only while building declarations; `.toIR()` contains data and the fixed `rollout` operation, never callbacks.
+Reakt uses TSX components and hooks to describe a fixed Kubernetes controller. Components execute only during isolated compilation. The compiler lowers their tree into the existing validated native IR; runtime reconciliation executes no JavaScript callbacks.
 
-```ts
-const domain = defineDomain({
-  id: "team-api-production",
-  namespace: "production",
-  controlNamespace: "reakt-system",
-  clusterBinding: "production-cluster",
-  policyRef: "platform/team-api",
-  enforcement: "api-bound",
-  budgets,
-  provenance: { inputs: [{ path: "domain.ts", sha256 }] },
-});
+```tsx
+function Api() {
+  const config = useResourceRef("ConfigMap");
+  const credentials = useSecret({ name: "credentials" });
+  return <>
+    <ConfigMap ref={config} metadata={{ name: "config", namespace: "workload" }} data={{ level: "info" }} />
+    <Deployment {...deploymentDefinition} rolloutOn={[config.data, credentials.data]} />
+  </>;
+}
 
-const config = domain.manage(new ConfigMap({
-  id: "config",
-  metadata: { name: "api-config", namespace: "production" },
-  data: { LOG_LEVEL: "info" },
-}), { deletionPolicy: "orphan", source: { file: "domain.ts", line: 1, column: 1 } });
-
-// `api` is a managed Deployment in this domain.
-watch(config).project("data").rollout(api);
-const ir = domain.toIR();
-// ir.testOnly is always false; only the test compiler can set it true.
+export default <Controller {...domainOptions}><Api /></Controller>;
 ```
 
-All names are fixed and must use the domain namespace. Sources must name a declared provenance input. `ConfigMap`, `Service`, and `Deployment` accept a conservative Kubernetes subset. Observations are named `ConfigMap` or `Secret` inputs with the `data` projection and block dependent mutations when missing. Cross-domain writes, unknown fields, ambient accessor values, non-data values, and the reserved `reakt.dev/revision` annotation are rejected.
+Import components and hooks from `@reakt/kubernetes`. `Controller` accepts explicit domain options: identity, workload/control namespaces, cluster binding, policy, enforcement, budgets, and optional force/prune defaults. Provenance is supplied by the compiler. `ConfigMap`, `Service`, and `Deployment` use the conservative Kubernetes-shaped definitions documented in the IR contract, plus optional `force` and `deletionPolicy` props. Deployment alone accepts `rolloutOn`.
 
-`generateFixtureBundle(ir, { workloadImage: "reakt-fixture:local" })` derives synthetic observed ConfigMap/Secret fixtures and complete Deployment container substitutions from the production IR. Explicit `defineTestFixture`, `defineWorkloadFixture`, and `defineFixtureBundle` declarations remain available for supported overrides. Test inputs carry a `synthetic: true` assertion. `materializeFixtureIR` changes the IR marker to `testOnly: true`; fixture values never enter production IR.
+`useConfigMap({name, namespace?, id?})` and `useSecret(...)` declare named observed inputs. Their `.data` properties are opaque projection tokens, not values. `useResourceRef("ConfigMap")` creates a managed reference whose `.data` can participate in `rolloutOn`; bind it exactly once with `<ConfigMap ref={reference} ... />`. Deployment and Service refs are also supported for binding but have no data projection. Unbound, reused, wrong-kind, and foreign-render references fail compilation. Managed ConfigMap drift remains authoritative desired state, not a new accepted external revision.
 
-This SDK validates declarations. The source compiler supplies the locked input closure, a pinned SES Compartment with only the hardened declared input, denied Deno host permissions, repeated evaluation, and provenance replacement described in `docs/reakt/TOOLCHAIN.md`.
+Hooks run synchronously in custom components inside one `Controller`. JSX factories are inert; compiler traversal establishes the domain before invoking components. Forward references resolve after the complete tree is visited. Composition, fragments, arrays, and finite build-time conditionals are supported. Async components, runtime effects/state, callbacks in resource fields, dynamic runtime resource creation, and nested/multiple controllers are unsupported. Every build emits a fixed graph; changes to its identities or effects require another build.
+
+Oxc supplies resource and rollout JSX locations. Hook input locations identify the containing component's JSX invocation, not the hook statement itself. Source maps use paths relative to the locked source root. Locations aid diagnostics; they are not an authorization boundary.
+
+The compiler captures and verifies the complete SDK module closure and author source lock, then evaluates twice in a pinned SES Compartment hosted by Deno with denied host permissions. Native validation independently checks the resulting IR. Projection tokens cannot enter native resource fields, and observed Secret values never enter authoring evaluation. Compiler fixture generation supplies separate synthetic inputs and workload images.
+
+The previous imperative API remains available through `@reakt/kubernetes/legacy` for existing source definitions and fixture utilities. The compiler renderer is internal and is not a public package export.

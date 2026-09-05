@@ -1,1 +1,1 @@
-{"imports":{"@reakt/kubernetes":"../../../../packages/reakt/src/index.ts"}}
+{"imports":{"@reakt/kubernetes/legacy":"../../../../packages/reakt/src/legacy.ts"}}

@@ -22,6 +22,7 @@
     "typecheck": "tsc -p tsconfig.json",
     "bundle": "tsx src/cli.ts",
     "bundle:e2e": "tsx src/e2e-cli.ts",
-    "test": "tsx src/index.test.ts && tsx src/e2e-cli.test.ts && tsx src/reakt.test.ts && tsx src/reakt-cli.test.ts"
+    "test:reakt": "tsx src/reakt.test.ts && tsx src/reakt-tsx.test.ts && tsx src/reakt-cli.test.ts",
+    "test": "tsx src/index.test.ts && tsx src/e2e-cli.test.ts && tsx src/reakt.test.ts && tsx src/reakt-tsx.test.ts && tsx src/reakt-cli.test.ts"
   }
 }

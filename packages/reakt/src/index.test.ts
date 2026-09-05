@@ -12,7 +12,7 @@ import {
   watch,
   type DomainBudgets,
   type SourceLocation,
-} from "./index.ts";
+} from "./legacy.ts";
 
 const source: SourceLocation = { file: "domain.ts", line: 10, column: 3 };
 const budgets: DomainBudgets = {
@@ -191,10 +191,10 @@ function containsFunction(value: unknown, seen = new Set<object>()): boolean {
     source, force: false, deletionPolicy: "orphan",
   });
   const output = value.toIR();
-  equal(output.resources[0].force, true, "controller force default resolves on resource");
-  equal(output.resources[0].lifecycle.deletionPolicy, "delete", "prune default resolves to recorded deletion policy");
-  equal(output.resources[1].force, undefined, "resource override disables force");
-  equal(output.resources[1].lifecycle.deletionPolicy, "orphan", "explicit lifecycle overrides prune");
+  equal(output.resources[0]!.force, true, "controller force default resolves on resource");
+  equal(output.resources[0]!.lifecycle.deletionPolicy, "delete", "prune default resolves to recorded deletion policy");
+  equal(output.resources[1]!.force, undefined, "resource override disables force");
+  equal(output.resources[1]!.lifecycle.deletionPolicy, "orphan", "explicit lifecycle overrides prune");
   equal("force" in output.domain, false, "force default is not ambient runtime configuration");
   equal("prune" in output.domain, false, "prune default is not retroactive cleanup authority");
 }

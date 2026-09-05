@@ -3,7 +3,7 @@
   "inputs": [
     {
       "path": "program.ts",
-      "sha256": "1faf4565dbc22d3e897add3724f4a109c0d4777ff1de4fae442f0a59151c03aa"
+      "sha256": "6bb371eeb9a5fb522b5c3fad922019d56416c7461b0640057cb79ef07793934a"
     }
   ],
   "schemaVersion": "reakt.dev/source-lock/v1"

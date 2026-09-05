@@ -54,7 +54,7 @@ Evidence logs are under `work/reakt-migration/oci-prepare-v3.log`, `oci-build-v3
 
 ## Complete CLI build
 
-`reakt build --source examples/reakt/program.ts --output dist/build --profile reakt.build.json`
+`reakt build --source examples/reakt/program.tsx --output dist/build --profile reakt.build.json`
 composes source compilation, offline Cargo vendoring, BuildKit image creation,
 Docker rootfs binary extraction, cargo-cyclonedx SBOM generation, and compiler
 closure assembly. It emits `build-result.json`, `image/controller.oci.tar`,

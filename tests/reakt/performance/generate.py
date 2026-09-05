@@ -41,7 +41,7 @@ def archive(objects):
 
 def source(name, managed, image):
     desired = deployment(name, image)
-    lines = ['import {ConfigMap, Deployment, defineDomain, watch} from "@reakt/kubernetes";',
+    lines = ['import {ConfigMap, Deployment, defineDomain, watch} from "@reakt/kubernetes/legacy";',
         'export default function program(context: {readonly sourceDigest: string}) {',
         'const source = {file:"program.ts", line:1, column:1};',
         'const domain = defineDomain(' + json.dumps({"id": name, "namespace": NAMESPACE, "controlNamespace": CONTROL,

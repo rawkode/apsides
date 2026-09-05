@@ -1,4 +1,4 @@
-import {ConfigMap, Service, defineDomain} from "@reakt/kubernetes";
+import {ConfigMap, Service, defineDomain} from "@reakt/kubernetes/legacy";
 
 // Synthetic source used only by the disposable deployment integration suite.
 export default function program(buildInputs: {readonly sourceDigest: string}) {

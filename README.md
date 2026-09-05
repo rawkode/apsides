@@ -8,29 +8,32 @@ The production migration follows [specification 0.2](docs/reakt/SPEC-v0.2.md). *
 
 ## Authoring
 
-```typescript
-const domain = defineDomain({ /* platform identity, scope and budgets */ });
-const config = domain.observe(ConfigMap, {
-  name: "api-settings",
-  namespace: "production",
-  projection: ["data"],
-  missing: "block-dependent-mutations",
-});
-const api = domain.manage(new Deployment({ /* fixed desired resource */ }), {
-  deletionPolicy: "orphan",
-});
-watch(config).project("data").rollout(api);
+The [TSX example](examples/reakt/program.tsx) composes a reusable
+[`Api` component](examples/reakt/api.tsx) inside a controller boundary:
+
+```tsx
+<Controller {...platformOptions}>
+  <Api name="api" namespace="production" image={images.api} />
+</Controller>
 ```
 
-The [complete example](examples/reakt/README.md) includes explicit domain identity, source locations, and a separately marked fixture overlay. The [IR contract](docs/reakt/IR-CONTRACT.md) documents the current accepted subset. Unsupported operations fail validation.
+Components return Kubernetes resource elements. `useConfigMap` and `useSecret`
+declare observations; a Deployment's `rolloutOn` prop connects opaque input
+projections to the fixed native rollout operation. Components run at build time,
+not in Kubernetes. The compiler supplies source locations, provenance and
+separate synthetic test fixtures.
+
+The [complete example guide](examples/reakt/README.md) explains source locking and
+compilation. The [IR contract](docs/reakt/IR-CONTRACT.md) documents the supported
+resource subset; unsupported operations fail validation.
 
 ## Local compiler
 
 ```sh
 cargo build -p cli
-target/debug/reakt compile --source examples/reakt/program.ts --output work/reakt-compiled
+target/debug/reakt compile --source examples/reakt/program.tsx --output work/reakt-compiled
 target/debug/reakt check --ir work/reakt-compiled/ir.json
-target/debug/reakt build --source examples/reakt/program.ts --output work/reakt-native --profile reakt.build.json
+target/debug/reakt build --source examples/reakt/program.tsx --output work/reakt-native --profile reakt.build.json
 target/debug/reakt verify --artifact work/reakt-native
 ```
 

@@ -30,8 +30,8 @@ can implement the same immutable-snapshot and conditional-head contract.
 
 ## Prune is a compiled lifecycle choice
 
-`defineDomain({ prune: true })` makes `delete` the default for resources removed
-by a later generation. `prune: false` defaults to `orphan`. A resource-level
+`<Controller prune={true} ...>` makes `delete` the default for resources removed
+by a later generation. `prune={false}` defaults to `orphan`. A resource-level
 `deletionPolicy` overrides the domain default. The effective policy is stored
 with that resource in the approved plan and inventory.
 

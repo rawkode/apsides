@@ -1,5 +1,5 @@
 {
   "extends": "../../tsconfig.base.json",
-  "compilerOptions": { "allowImportingTsExtensions": true },
-  "include": ["src/**/*.ts"]
+  "compilerOptions": { "allowImportingTsExtensions": true, "jsxImportSource": "@reakt/kubernetes" },
+  "include": ["src/**/*.ts", "src/**/*.tsx"]
 }

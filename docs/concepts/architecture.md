@@ -14,9 +14,10 @@ Kubernetes operations.
   <div><strong>Runtime</strong><span>A generation-specific controller reconciles only its approved plan through a constrained proxy.</span></div>
 </div>
 
-## Build-time TypeScript
+## Build-time TSX
 
-The authoring program declares a fixed graph. It cannot make Kubernetes calls,
+The authoring program composes TSX components into a fixed graph. Observation
+hooks declare inputs, and resource props declare desired state and rollout dependencies. It cannot make Kubernetes calls,
 read arbitrary files, use the network, inspect environment variables or supply
 runtime callbacks. The supported source path type-checks the declared closure,
 runs independent bundle and evaluation passes, and then validates the emitted
@@ -51,8 +52,8 @@ coordination records form the writer-quiescence boundary.
 ## Policy and force
 
 SSA force defaults to `false`. Authors may set a domain default with
-`defineDomain({ force })` and override it for one resource with
-`manage(resource, { force })`. Compilation records the effective value and emits
+the Controller `force` prop and override it with an individual resource
+component's `force` prop. Compilation records the effective value and emits
 an exact `force-apply:<Kind>/<namespace>/<name>` risk. Independent platform
 policy must accept that risk before deployment.
 

@@ -12,6 +12,24 @@ tasks: {
 		{command: "cargo", args: ["run", "--locked", "-p", "bundle-contract", "--bin", "generate-bundle-contract", "--", "."]},
 		{command: "cargo", args: ["run", "--locked", "-p", "mutation-model", "--bin", "generate-probe-schema", "--", "."]},
 	]
+	authorCompilerTest: {
+		dependsOn: [install]
+		command: "pnpm"
+		env: {CI: "1"}
+		args: ["--filter", "@oxideloop/bundle-builder", "run", "test:reakt"]
+	}
+	authorCheck: {
+		dependsOn: [install]
+		command: "pnpm"
+		env: {CI: "1"}
+		args: ["--filter", "@reakt/kubernetes", "typecheck"]
+	}
+	authorTest: {
+		dependsOn: [install]
+		command: "pnpm"
+		env: {CI: "1"}
+		args: ["--filter", "@reakt/kubernetes", "test"]
+	}
 	docsInstall: {command: "npm", args: ["ci", "--prefix", "docs", "--no-audit", "--no-fund"]}
 	docsContent: {command: "npm", args: ["--prefix", "docs", "run", "prepare:content"]}
 	docsBuild: {
