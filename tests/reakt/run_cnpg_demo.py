@@ -148,7 +148,7 @@ def missing_capability(initial, successor):
     added = [item for item in successor["capabilities"] if shared.canonical(item) not in previous]
     if not added:
         raise shared.QualificationError("successor has no added capability")
-    return sorted(added, key=shared.canonical)[0]
+    return added[0]
 
 
 class CnpgDemoRunner(base.CeilingRunner):

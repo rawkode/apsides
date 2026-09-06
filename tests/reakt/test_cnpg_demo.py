@@ -8,6 +8,13 @@ import run_cnpg_demo as demo
 
 
 class DemoChecks(unittest.TestCase):
+    def test_missing_capability_preserves_compiler_order(self):
+        first = {"namespace": "control", "apiGroup": "", "resource": "secrets"}
+        second = {"namespace": "workload", "apiGroup": "", "resource": "configmaps"}
+        self.assertEqual(demo.missing_capability(
+            {"capabilities": []}, {"capabilities": [first, second]},
+        ), first)
+
     def runner(self):
         runner = object.__new__(demo.CnpgDemoRunner)
         runner.cluster = "owned-test"
