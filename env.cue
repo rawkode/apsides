@@ -9,6 +9,7 @@ tasks: {
 	productionEvidenceLive: {command: "cargo", args: ["test", "--locked", "-p", "release", "--lib", "assembled_reproducibility_evidence", "--", "--ignored"]}
 	inputIsolationEvidenceLive: {command: "cargo", args: ["test", "--locked", "-p", "release", "--lib", "assembled_input_isolation_evidence", "--", "--ignored"]}
 	reactorEvidenceLive: {command: "cargo", args: ["test", "--locked", "-p", "release", "--lib", "reactor_evidence_live::assembled_reactor_evidence_matches_production_contract", "--", "--ignored", "--exact"]}
+	fixturePromotionLive: {command: "cargo", args: ["test", "--locked", "-p", "release", "--test", "fixture_promotion", "fixture_promotion_step", "--", "--ignored", "--exact", "--nocapture"]}
 	releaseCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "release", "--features", "test-support", "--all-targets", "--", "-D", "warnings"]}
 	reproducibilityTest: {command: "python3", args: ["-m", "unittest", "tests/reakt/test_reproducibility.py"]}
 	inputIsolationTest: {command: "python3", args: ["tests/reakt/test_input_isolation.py"]}

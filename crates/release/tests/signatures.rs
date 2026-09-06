@@ -574,7 +574,7 @@ fn add_evidence(
     let mut fixture = serde_json::to_value(&plan.ir).unwrap();
     fixture["testOnly"] = json!(true);
     let fixture_digest = digest(&fixture).unwrap();
-    let overlay = json!({"schemaVersion":"reakt.dev/fixture-overlay/v1","testOnly":true,"productionIrSha256":plan.ir_digest,"fixtureIrSha256":fixture_digest});
+    let overlay = json!({"schemaVersion":"reakt.dev/fixture-overlay/v1","testOnly":true,"productionReady":false,"productionIrSha256":plan.ir_digest.strip_prefix("sha256:"),"fixtureIrSha256":fixture_digest.strip_prefix("sha256:")});
     let artifact = json!({"schemaVersion":"reakt.dev/local-artifact/v1","irDigest":fixture_digest});
     let artifact_bytes = write_json(root, "tested-artifact-manifest.json", &artifact);
     for (name, value) in [

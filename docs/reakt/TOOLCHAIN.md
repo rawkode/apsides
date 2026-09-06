@@ -22,4 +22,14 @@ Deno evaluates the closed IIFE bundle twice in fresh processes using the fixed `
 
 Source builds also emit production `ir.json`, `program.mjs` and its map, `source-map.json`, and test-only `fixtures.json`, `fixture-ir.json`, `fixture-overlay.json`, `fixture-catalogue.json`, and `fixture-coverage.json`. The compiler reconstructs the fixture IR itself, permits only the `testOnly` marker plus Deployment container image/pull-policy changes, and compares the full diff. It derives synthetic observed inputs and all Deployment container substitutions from IR. The coverage catalogue retains reaction IDs, source locations, fixture and overlay identities, expected primitive assertions, test layer, and execution status for every required scenario. Fixture output remains unauthenticated test evidence until the artifact verifier and runner bind and execute it.
 
+`reakt build --source <program.tsx> --output <fresh-directory> --mode fixture`
+builds the compiler-emitted fixture through the same native binary and OCI
+pipeline. Production remains the default. The selector validates the explicit
+production/fixture markers, both canonical IR digests in the overlay, and the
+complete allowed substitution before emitting the artifact. Fixture mode is
+available only for source image builds. Its release remains test-only and cannot
+be promoted. This build path alone does not qualify fixture-promotion rejection;
+that evidence must also bind the fixture to the exact production candidate and
+exercise the release verifier.
+
 CI's interface remains `reakt deploy`, independent of the Kubernetes provider. The command integrates trusted release verification, protected Kubernetes state, short-lived issued identity, durable metadata and writer retirement. Deployment still requires every release and platform gate to pass. The disposable lifecycle runner uses signed, unpromoted test candidates; successful fixture runs do not satisfy the complete production release gate. See [implementation status](/reakt/status/) for the remaining qualifications.

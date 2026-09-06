@@ -142,7 +142,7 @@ pub(crate) fn validate_record(
         MAX_DOCUMENT,
     )?)?;
     let production = json(&bounded_read(&contained(root, "ir.json")?, MAX_DOCUMENT)?)?;
-    validate_fixture_substitution(&production, &fixture)?;
+    crate::validate_fixture_projection(&production, &fixture, &overlay)?;
     if fixture["testOnly"] != true
         || digest(&fixture)? != evidence.fixture_ir_digest
         || digest(&overlay)? != evidence.overlay_digest
@@ -189,54 +189,4 @@ fn validate_runner_source(root: &Path, release: &ReleaseManifest, claimed: &str)
         return reject("reactor runner source differs from its claimed digest");
     }
     Ok(())
-}
-
-fn validate_fixture_substitution(production: &Value, fixture: &Value) -> Result<()> {
-    let mut expected = production.clone();
-    expected
-        .as_object_mut()
-        .ok_or_else(|| crate::Error::Rejected("production IR is not an object".into()))?
-        .insert("testOnly".into(), Value::Bool(true));
-    for resource in expected
-        .get_mut("resources")
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| crate::Error::Rejected("fixture resources missing".into()))?
-    {
-        if resource["kind"] == "Deployment" {
-            let containers = resource
-                .pointer_mut("/desired/spec/template/spec/containers")
-                .and_then(Value::as_array_mut)
-                .ok_or_else(|| crate::Error::Rejected("fixture containers missing".into()))?;
-            for container in containers {
-                let container = container.as_object_mut().ok_or_else(|| {
-                    crate::Error::Rejected("fixture container is not an object".into())
-                })?;
-                container.insert("image".into(), Value::String("reakt-fixture:local".into()));
-                container.insert("imagePullPolicy".into(), Value::String("Never".into()));
-            }
-        }
-    }
-    if &expected != fixture {
-        return reject("fixture substitution changes the approved reaction contract");
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::validate_fixture_substitution;
-    use serde_json::json;
-
-    #[test]
-    fn malformed_fixture_structures_return_errors() {
-        for production in [
-            json!(null),
-            json!([]),
-            json!({"resources":{}}),
-            json!({"resources":[{"kind":"Deployment","desired":{"spec":[]}}]}),
-            json!({"resources":[{"kind":"Deployment","desired":{"spec":{"template":{"spec":{"containers":[null]}}}}}]}),
-        ] {
-            assert!(validate_fixture_substitution(&production, &json!({})).is_err());
-        }
-    }
 }

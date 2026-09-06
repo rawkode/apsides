@@ -13,9 +13,11 @@ mod assertion_contract;
 mod compiler;
 mod evidence;
 mod fetch;
+mod fixture;
 pub use fetch::{
     FetchedRelease, OrasTool, ReleaseReference, ResolvedRelease, fetch_release, resolve_release,
 };
+pub use fixture::validate_fixture_projection;
 mod manifest;
 mod merge_evidence;
 pub use merge_evidence::{MergeSummary, merge_evidence};

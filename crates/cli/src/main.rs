@@ -17,9 +17,11 @@ mod evidence_command;
 mod inventory_connection;
 mod release_command;
 mod review;
+mod source_build;
 
 use compiler_core::{PermissionCeiling, parse_and_validate, validate_ceiling};
 use serde_json::json;
+use source_build::{source_mode, source_plan};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::{
@@ -52,7 +54,7 @@ fn run() -> Result<()> {
     if matches!(command.as_str(), "help" | "--help" | "-h") {
         writeln!(
             std::io::stdout().lock(),
-            "Reakt — compiled reactive GitOps for Kubernetes\n\n  reakt check --ir FILE\n  reakt plan --ir FILE --ceiling FILE\n  reakt compile (--source FILE | --ir FILE) --output DIR\n  reakt build --source FILE --output DIR [--profile FILE]\n  reakt test --ir FILE --output DIR\n  reakt verify --artifact DIR\n  reakt verify-release --artifact DIR --trust-policy FILE\n  reakt merge-evidence --artifact DIR --fragments FILE --output DIR\n  reakt deploy [--artifact DIR | --artifact-reference FILE] [--transition ID --capacity resize]\n  reakt audit --domain NAME --transition ID --cluster-binding NAME --namespace NAME --control-namespace NAME\n\ncompile emits validated plans and a Rust controller project.\nbuild produces a pinned Linux OCI image, native binary, SBOM and compiler closure.\ndeploy reads dist/reakt by default and uses protected Kubernetes policy and short-lived identity.\n--capacity resize expands an existing untouched upgrade, then reviews and resumes it with a fresh session."
+            "Reakt — compiled reactive GitOps for Kubernetes\n\n  reakt check --ir FILE\n  reakt plan --ir FILE --ceiling FILE\n  reakt compile (--source FILE | --ir FILE) --output DIR\n  reakt build --source FILE --output DIR [--profile FILE] [--mode production|fixture]\n  reakt test --ir FILE --output DIR\n  reakt verify --artifact DIR\n  reakt verify-release --artifact DIR --trust-policy FILE\n  reakt merge-evidence --artifact DIR --fragments FILE --output DIR\n  reakt deploy [--artifact DIR | --artifact-reference FILE] [--transition ID --capacity resize]\n  reakt audit --domain NAME --transition ID --cluster-binding NAME --namespace NAME --control-namespace NAME\n\ncompile emits validated plans and a Rust controller project.\nbuild produces a pinned Linux OCI image, native binary, SBOM and compiler closure.\ndeploy reads dist/reakt by default and uses protected Kubernetes policy and short-lived identity.\n--capacity resize expands an existing untouched upgrade, then reviews and resumes it with a fresh session."
         )?;
         return Ok(());
     }
@@ -239,8 +241,16 @@ fn verify_release_command(options: &BTreeMap<String, String>) -> Result<()> {
 fn compile_command(options: &BTreeMap<String, String>, command: &str) -> Result<()> {
     only(
         options,
-        &["--ir", "--source", "--output", "--profile", "--cache"],
+        &[
+            "--ir",
+            "--source",
+            "--output",
+            "--profile",
+            "--cache",
+            "--mode",
+        ],
     )?;
+    let source_mode = source_mode(options, command)?;
     let no_cache = match options.get("--cache").map(String::as_str) {
         None => false,
         Some("disabled") if command == "build" => true,
@@ -257,38 +267,9 @@ fn compile_command(options: &BTreeMap<String, String>, command: &str) -> Result<
     if options.contains_key("--ir") == options.contains_key("--source") {
         return Err("supply exactly one of --ir or --source".into());
     }
-    let source_stage = if let Some(source) = options.get("--source") {
-        let stage = output.with_extension("source");
-        if stage.exists() {
-            return Err("source staging directory already exists; choose a fresh output".into());
-        }
-        if let Some(parent) = stage.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()?;
-        let status = Command::new("node")
-            .arg(root.join("packages/compiler/src/compiler.ts"))
-            .arg(fs::canonicalize(source)?)
-            .arg(&stage)
-            .env_clear()
-            .env("PATH", env::var_os("PATH").unwrap_or_default())
-            .status()?;
-        if !status.success() {
-            return Err("Oxc/Deno source compilation failed".into());
-        }
-        Some(stage)
-    } else {
-        None
-    };
+    let source_stage = compile_source_stage(options.get("--source").map(String::as_str), &output)?;
     let plan = if let Some(stage) = &source_stage {
-        read_plan(
-            stage
-                .join("ir.json")
-                .to_str()
-                .ok_or("non UTF-8 source output path")?,
-        )?
+        source_plan(stage, source_mode)?
     } else {
         read_plan(required(options, "--ir")?)?
     };
@@ -298,30 +279,12 @@ fn compile_command(options: &BTreeMap<String, String>, command: &str) -> Result<
         artifact::record_source(&output, stage)?;
     }
     if command == "build" {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()?;
-        let mut builder = Command::new("python3");
-        builder
-            .arg(root.join("scripts/reakt/build.py"))
-            .env("REAKT_CLI", env::current_exe()?)
-            .arg("--artifact")
-            .arg(&output)
-            .arg("--source-output")
-            .arg(source_stage.as_ref().ok_or("source output missing")?)
-            .arg("--profile")
-            .arg(
-                options
-                    .get("--profile")
-                    .map_or("reakt.build.json", String::as_str),
-            );
-        if no_cache {
-            builder.arg("--no-cache");
-        }
-        let status = builder.status()?;
-        if !status.success() {
-            return Err("controller image build failed; no deployable release was produced".into());
-        }
+        build_native(
+            options,
+            source_stage.as_ref().ok_or("source output missing")?,
+            &output,
+            no_cache,
+        )?;
     }
     writeln!(
         std::io::stdout().lock(),
@@ -333,9 +296,69 @@ fn compile_command(options: &BTreeMap<String, String>, command: &str) -> Result<
     Ok(())
 }
 
+fn compile_source_stage(source: Option<&str>, output: &Path) -> Result<Option<PathBuf>> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let stage = output.with_extension("source");
+    if stage.exists() {
+        return Err("source staging directory already exists; choose a fresh output".into());
+    }
+    if let Some(parent) = stage.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()?;
+    let status = Command::new("node")
+        .arg(root.join("packages/compiler/src/compiler.ts"))
+        .arg(fs::canonicalize(source)?)
+        .arg(&stage)
+        .env_clear()
+        .env("PATH", env::var_os("PATH").unwrap_or_default())
+        .status()?;
+    if !status.success() {
+        return Err("Oxc/Deno source compilation failed".into());
+    }
+    Ok(Some(stage))
+}
+
+fn build_native(
+    options: &BTreeMap<String, String>,
+    source_stage: &Path,
+    output: &Path,
+    no_cache: bool,
+) -> Result<()> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()?;
+    let mut builder = Command::new("python3");
+    builder
+        .arg(root.join("scripts/reakt/build.py"))
+        .env("REAKT_CLI", env::current_exe()?)
+        .arg("--artifact")
+        .arg(output)
+        .arg("--source-output")
+        .arg(source_stage)
+        .arg("--profile")
+        .arg(
+            options
+                .get("--profile")
+                .map_or("reakt.build.json", String::as_str),
+        );
+    if no_cache {
+        builder.arg("--no-cache");
+    }
+    if !builder.status()?.success() {
+        return Err("controller image build failed; no deployable release was produced".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn ambiguous_arguments_fail_closed() {
         assert!(parse_options(&["--ir".into()]).is_err());
