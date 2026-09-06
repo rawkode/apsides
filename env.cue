@@ -5,6 +5,11 @@ import "github.com/cuenv/cuenv/schema"
 schema.#Project & {name: "apsides"}
 
 tasks: {
+	coordinationTest: {command: "cargo", args: ["test", "--locked", "-p", "coordination"]}
+	coordinationCheck: [
+		{command: "cargo", args: ["clippy", "--locked", "-p", "coordination", "--all-targets", "--", "-D", "warnings"]},
+		{command: "cargo", args: ["check", "--locked", "-p", "coordination", "--no-default-features"]},
+	]
 	generate: [
 		{command: "cargo", args: ["run", "--locked", "-p", "controller-api", "--bin", "generate-controller-api"]},
 		{command: "cargo", args: ["run", "--locked", "-p", "renderer-abi", "--bin", "generate", "--", "."]},

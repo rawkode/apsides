@@ -1,0 +1,28 @@
+[package]
+name = "coordination"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = ["libsql-backend"]
+libsql-backend = ["dep:libsql", "dep:url"]
+
+[dependencies]
+async-trait = "0.1"
+compiler-core = { path = "../compiler-core" }
+deploy = { path = "../deploy" }
+libsql = { version = "=0.9.30", default-features = false, features = ["core", "remote", "tls"], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+url = { version = "2", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+
+[lints]
+workspace = true
