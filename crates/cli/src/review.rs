@@ -1,6 +1,6 @@
 //! Deployment review derived from protected prior and validated next plans.
 use compiler_core::{Capability, Resource};
-use deploy::{Phase, TransitionPlan};
+use deploy::{Phase, PredecessorGeneration, ResourceIdentity};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -8,10 +8,84 @@ pub fn transition_review(
     registry: &platform::NamespaceRegistry,
     transition: &str,
 ) -> crate::Result<Value> {
-    let plan = &registry.transition(transition)?.plan;
+    let current = registry.transition(transition)?;
+    let plan = &current.plan;
     let next = &plan.request.next.compiled;
-    let prior = prior_compiled(registry, plan)?;
-    let before = prior.map_or(&[][..], |p| p.ir.resources.as_slice());
+    let prior = prior_review(registry, current)?;
+    let resources = match prior {
+        PriorReview::Initial => detailed_resources(&[], next),
+        PriorReview::Detailed(compiled) => detailed_resources(&compiled.ir.resources, next),
+        PriorReview::Metadata(metadata) => metadata_resources(&metadata.inventory, next)?,
+    };
+    let unavailable = || unavailable_detail("historical-compiled-plan-not-retained");
+    let (detail_availability, limitations) = match prior {
+        PriorReview::Initial => ("initial", Vec::new()),
+        PriorReview::Detailed(_) => ("verified-history", Vec::new()),
+        PriorReview::Metadata(_) => (
+            "metadata-only",
+            vec![
+                "old-field-structure".to_owned(),
+                "old-source-locations".to_owned(),
+                "old-reactions".to_owned(),
+                "old-input-authority".to_owned(),
+                "old-runtime-permissions".to_owned(),
+                "old-compatibility".to_owned(),
+            ],
+        ),
+    };
+    let reactions_before = match prior {
+        PriorReview::Initial => Value::Null,
+        PriorReview::Detailed(compiled) => json!(&compiled.ir.reactions),
+        PriorReview::Metadata(_) => unavailable(),
+    };
+    let inputs_before = match prior {
+        PriorReview::Initial => Value::Null,
+        PriorReview::Detailed(compiled) => json!(&compiled.ir.inputs),
+        PriorReview::Metadata(_) => unavailable(),
+    };
+    let runtime_permissions = match prior {
+        PriorReview::Initial => capability_changes(&[], &next.capabilities),
+        PriorReview::Detailed(compiled) => {
+            capability_changes(&compiled.capabilities, &next.capabilities)
+        }
+        PriorReview::Metadata(_) => unavailable_runtime_permissions(&next.capabilities),
+    };
+    let compatibility_before = match prior {
+        PriorReview::Initial => Value::Null,
+        PriorReview::Detailed(compiled) => compatibility(compiled)?,
+        PriorReview::Metadata(_) => unavailable(),
+    };
+    let has_predecessor = !matches!(prior, PriorReview::Initial);
+    Ok(json!({
+        "schemaVersion":"reakt.dev/deployment-review/v2",
+        "detailAvailability":detail_availability,
+        "detailLimitations":limitations,
+        "planDigest":plan.plan_digest,"resources":resources,
+        "ownershipIntents":plan.request.ownership_intents.iter().map(|intent| json!({
+            "objectName":intent.object_name,"objectUid":intent.object_uid,"objectResourceVersion":intent.object_resource_version,
+            "identity":intent.approval.identity,"action":intent.approval.action,"observedUid":intent.approval.observed_uid,
+            "priorManagedFieldsDigest":intent.approval.prior_managed_fields_digest,"priorManagerConflicts":intent.approval.prior_manager_conflicts,
+            "permittedRuntimeFields":intent.approval.permitted_runtime_fields,"deletionPolicy":intent.approval.deletion_policy,
+        })).collect::<Vec<_>>(),"ownershipMode":"explicit-protected-approval-required-for-existing-objects",
+        "reactions":{"before":reactions_before,"after":next.ir.reactions},
+        "inputAuthority":{"before":inputs_before,"after":next.ir.inputs},
+        "permissions":{
+            "runtime":runtime_permissions,
+            "cleanup":{"requested":plan.cleanup_capabilities,"ceiling":plan.request.cleanup_ceiling,"decision":"approved-by-transition-planner"},
+            "deployment":{"identity":"platform-provisioned-short-lived-deployer","sourceMayChangeAuthority":false,
+                "required":platform::deployment_permissions(plan)?,"effectiveAuthority":"not-evaluated; external-platform-rbac-and-admission-boundary"}
+        },
+        "policy":{"runtimeCeiling":plan.request.runtime_ceiling,"decision":"approved-by-transition-planner"},
+        "enforcementGaps":next.enforcement_gaps,"indirectPrivileges":next.indirect_risks,
+        "cleanup":plan.cleanup,"warnings":plan.warnings,
+        "irreversibleOperations":plan.cleanup.iter().filter(|i| i.policy == compiler_core::DeletionPolicy::Delete).collect::<Vec<_>>(),
+        "compatibility":{"before":compatibility_before,"after":compatibility(next)?},
+        "expectedInterruption":if has_predecessor {"reconciliation pauses from old proxy freeze until new generation activation; workloads remain running subject to declared changes"} else {"initial reconciliation starts after activation"},
+        "valuesOmitted":true
+    }))
+}
+
+fn detailed_resources(before: &[Resource], next: &compiler_core::CompiledPlan) -> Vec<Value> {
     let resource_key = |r: &Resource| (r.namespace.clone(), r.kind.clone(), r.name.clone());
     let old: BTreeMap<_, _> = before.iter().map(|r| (resource_key(r), r)).collect();
     let new: BTreeMap<_, _> = next
@@ -21,7 +95,7 @@ pub fn transition_review(
         .map(|r| (resource_key(r), r))
         .collect();
     let keys: BTreeSet<_> = old.keys().chain(new.keys()).collect();
-    let resources: Vec<_> = keys.into_iter().map(|key| {
+    keys.into_iter().map(|key| {
         let left = old.get(key).copied();
         let right = new.get(key).copied();
         let change = match (left, right) {
@@ -36,47 +110,152 @@ pub fn transition_review(
             "fieldChanges":fields,"beforeSource":left.map(|r| &r.source),"afterSource":right.map(|r| &r.source),
             "beforeLifecycle":left.map(|r| &r.lifecycle),"afterLifecycle":right.map(|r| &r.lifecycle),
             "beforeForce":left.map(|r| r.force),"afterForce":right.map(|r| r.force)})
-    }).collect();
-    let prior_capabilities = prior.map_or(&[][..], |p| p.capabilities.as_slice());
-    Ok(json!({
-        "schemaVersion":"reakt.dev/deployment-review/v1",
-        "planDigest":plan.plan_digest,"resources":resources,
-        "ownershipIntents":plan.request.ownership_intents.iter().map(|intent| json!({
-            "objectName":intent.object_name,"objectUid":intent.object_uid,"objectResourceVersion":intent.object_resource_version,
-            "identity":intent.approval.identity,"action":intent.approval.action,"observedUid":intent.approval.observed_uid,
-            "priorManagedFieldsDigest":intent.approval.prior_managed_fields_digest,"priorManagerConflicts":intent.approval.prior_manager_conflicts,
-            "permittedRuntimeFields":intent.approval.permitted_runtime_fields,"deletionPolicy":intent.approval.deletion_policy,
-        })).collect::<Vec<_>>(),"ownershipMode":"explicit-protected-approval-required-for-existing-objects",
-        "reactions":{"before":prior.map(|p| &p.ir.reactions),"after":next.ir.reactions},
-        "inputAuthority":{"before":prior.map(|p| &p.ir.inputs),"after":next.ir.inputs},
-        "permissions":{
-            "runtime":capability_changes(prior_capabilities, &next.capabilities),
-            "cleanup":{"requested":plan.cleanup_capabilities,"ceiling":plan.request.cleanup_ceiling,"decision":"approved-by-transition-planner"},
-            "deployment":{"identity":"platform-provisioned-short-lived-deployer","sourceMayChangeAuthority":false,
-                "required":platform::deployment_permissions(plan)?,"effectiveAuthority":"not-evaluated; external-platform-rbac-and-admission-boundary"}
-        },
-        "policy":{"runtimeCeiling":plan.request.runtime_ceiling,"decision":"approved-by-transition-planner"},
-        "enforcementGaps":next.enforcement_gaps,"indirectPrivileges":next.indirect_risks,
-        "cleanup":plan.cleanup,"warnings":plan.warnings,
-        "irreversibleOperations":plan.cleanup.iter().filter(|i| i.policy == compiler_core::DeletionPolicy::Delete).collect::<Vec<_>>(),
-        "compatibility":{"before":prior.map(compatibility).transpose()?,
-            "after":compatibility(next)?},
-        "expectedInterruption":if prior.is_some() {"reconciliation pauses from old proxy freeze until new generation activation; workloads remain running subject to declared changes"} else {"initial reconciliation starts after activation"},
-        "valuesOmitted":true
-    }))
+    }).collect()
 }
 
-// The predecessor carries only metadata. Until historical registry compaction,
-// detailed review can separately verify the old release retained by the platform.
-fn prior_compiled<'a>(
+fn metadata_resources(
+    before: &inventory::InventorySnapshot,
+    next: &compiler_core::CompiledPlan,
+) -> crate::Result<Vec<Value>> {
+    let old: BTreeMap<_, _> = before
+        .resources
+        .iter()
+        .map(|resource| {
+            (
+                ResourceIdentity {
+                    api_group: resource.identity.api_group.clone(),
+                    resource: resource.identity.resource.clone(),
+                    namespace: resource.identity.namespace.clone(),
+                    name: resource.identity.name.clone(),
+                },
+                resource,
+            )
+        })
+        .collect();
+    let new: BTreeMap<_, _> = next
+        .ir
+        .resources
+        .iter()
+        .map(|resource| Ok((resource_identity(resource)?, resource)))
+        .collect::<crate::Result<_>>()?;
+    let keys: BTreeSet<_> = old.keys().chain(new.keys()).cloned().collect();
+    let unavailable = || unavailable_detail("historical-compiled-plan-not-retained");
+
+    keys
+        .into_iter()
+        .map(|key| {
+            let left = old.get(&key).copied();
+            let right = new.get(&key).copied();
+            let (api_version, kind) = match (left, right) {
+                (_, Some(resource)) => (&resource.api_version, &resource.kind),
+                (Some(resource), None) => (&resource.api_version, &resource.kind),
+                (None, None) => return Err("review resource identity disappeared".into()),
+            };
+            let change = match (left, right) {
+                (None, Some(_)) => "added",
+                (Some(_), None) => "removed",
+                (Some(_), Some(_)) => "unknown",
+                (None, None) => return Err("review resource identity disappeared".into()),
+            };
+            let field_changes = match (left, right) {
+                (None, Some(resource)) => {
+                    let mut fields = Vec::new();
+                    changed_paths(&json!({}), &resource.desired, "", &mut fields);
+                    json!(fields)
+                }
+                _ => unavailable(),
+            };
+            let before_source = if left.is_some() {
+                unavailable()
+            } else {
+                Value::Null
+            };
+            let before_force = if left.is_some() {
+                unavailable()
+            } else {
+                Value::Null
+            };
+            Ok(json!({
+                "apiVersion":api_version,
+                "namespace":key.namespace,
+                "kind":kind,
+                "name":key.name,
+                "beforeApiVersion":left.map(|resource| &resource.api_version),
+                "afterApiVersion":right.map(|resource| &resource.api_version),
+                "beforeKind":left.map(|resource| &resource.kind),
+                "afterKind":right.map(|resource| &resource.kind),
+                "change":change,
+                "fieldChanges":field_changes,
+                "beforeSource":before_source,
+                "afterSource":right.map(|resource| &resource.source),
+                "beforeLifecycle":left.map(|resource| json!({"deletionPolicy":resource.deletion_policy})),
+                "afterLifecycle":right.map(|resource| &resource.lifecycle),
+                "beforeForce":before_force,
+                "afterForce":right.map(|resource| resource.force),
+            }))
+        })
+        .collect()
+}
+
+fn resource_identity(resource: &Resource) -> crate::Result<ResourceIdentity> {
+    let (api_group, plural) = match (resource.api_version.as_str(), resource.kind.as_str()) {
+        ("v1", "ConfigMap") => ("", "configmaps"),
+        ("v1", "Service") => ("", "services"),
+        ("apps/v1", "Deployment") => ("apps", "deployments"),
+        _ => return Err("review encountered an unsupported lifecycle resource".into()),
+    };
+    Ok(ResourceIdentity {
+        api_group: api_group.to_owned(),
+        resource: plural.to_owned(),
+        namespace: resource.namespace.clone(),
+        name: resource.name.clone(),
+    })
+}
+
+fn unavailable_detail(reason: &str) -> Value {
+    json!({"status":"unavailable","reason":reason})
+}
+
+fn unavailable_runtime_permissions(after: &[Capability]) -> Value {
+    json!({
+        "status":"unavailable",
+        "reason":"historical-compiled-plan-not-retained",
+        "after":after,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum PriorReview<'a> {
+    Initial,
+    Detailed(&'a compiler_core::CompiledPlan),
+    Metadata(&'a PredecessorGeneration),
+}
+
+fn prior_review<'a>(
     registry: &'a platform::NamespaceRegistry,
-    plan: &TransitionPlan,
-) -> crate::Result<Option<&'a compiler_core::CompiledPlan>> {
+    current: &'a platform::StoredTransition,
+) -> crate::Result<PriorReview<'a>> {
+    let plan = &current.plan;
     let Some(predecessor) = plan.request.predecessor()? else {
-        return Ok(None);
+        return Ok(PriorReview::Initial);
     };
     let transition = &predecessor.allocation.transition_id;
-    let stored = registry.transition(transition)?;
+    let Some(stored) = registry.transitions.get(transition) else {
+        if deploy::plan_transition(&plan.request)? != *plan {
+            return Err("metadata-only review requires a canonical current plan".into());
+        }
+        let checkpoint = current.previous_writer_checkpoint.as_ref().ok_or(
+            "metadata-only review requires an authenticated predecessor writer checkpoint",
+        )?;
+        let domain = &plan.request.next.compiled.ir.domain;
+        checkpoint.validate(
+            predecessor,
+            &domain.control_namespace,
+            &domain.namespace,
+            &domain.cluster_binding,
+        )?;
+        return Ok(PriorReview::Metadata(predecessor));
+    };
     if stored.record.phase != Phase::Committed
         || stored.plan.request.transition_id != *transition
         || stored.record.transition_id != *transition
@@ -93,7 +272,7 @@ fn prior_compiled<'a>(
     if &expected != predecessor {
         return Err("review predecessor metadata differs from its protected release".into());
     }
-    Ok(Some(&stored.plan.request.next.compiled))
+    Ok(PriorReview::Detailed(&stored.plan.request.next.compiled))
 }
 
 fn capability_changes(before: &[Capability], after: &[Capability]) -> Value {
@@ -133,6 +312,81 @@ fn compatibility(plan: &compiler_core::CompiledPlan) -> crate::Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resource(name: &str, force: bool) -> Resource {
+        Resource {
+            force,
+            id: name.to_owned(),
+            api_version: "v1".to_owned(),
+            kind: "ConfigMap".to_owned(),
+            name: name.to_owned(),
+            namespace: "workload".to_owned(),
+            desired: json!({"data":{"private":"must-not-appear"}}),
+            lifecycle: compiler_core::Lifecycle {
+                deletion_policy: compiler_core::DeletionPolicy::Orphan,
+            },
+            source: compiler_core::SourceLocation {
+                file: "next.tsx".to_owned(),
+                line: 2,
+                column: 3,
+            },
+        }
+    }
+
+    fn compiled(resources: Vec<Resource>) -> compiler_core::CompiledPlan {
+        compiler_core::CompiledPlan {
+            ir_digest: "digest".to_owned(),
+            ir: compiler_core::Ir {
+                test_only: false,
+                schema_version: compiler_core::IR_SCHEMA.to_owned(),
+                domain: compiler_core::Domain {
+                    id: "controller".to_owned(),
+                    namespace: "workload".to_owned(),
+                    control_namespace: "control".to_owned(),
+                    cluster_binding: "cluster".to_owned(),
+                    policy_ref: "policy".to_owned(),
+                    enforcement: "enforced".to_owned(),
+                    budgets: compiler_core::Budgets {
+                        max_resources: 3,
+                        max_inputs: 0,
+                        max_reactions: 0,
+                        max_object_bytes: 1_000,
+                        max_queue_depth: 1,
+                        max_concurrent_requests: 1,
+                    },
+                },
+                resources,
+                inputs: Vec::new(),
+                reactions: Vec::new(),
+                provenance: compiler_core::Provenance {
+                    compiler: "test".to_owned(),
+                    inputs: Vec::new(),
+                },
+            },
+            effects: Vec::new(),
+            request_plan: Vec::new(),
+            capabilities: Vec::new(),
+            enforcement_gaps: Vec::new(),
+            indirect_risks: Vec::new(),
+            test_plan: Vec::new(),
+        }
+    }
+
+    fn tracked(name: &str, policy: compiler_core::DeletionPolicy) -> inventory::TrackedResource {
+        inventory::TrackedResource {
+            identity: inventory::ResourceKey {
+                api_group: String::new(),
+                resource: "configmaps".to_owned(),
+                namespace: "workload".to_owned(),
+                name: name.to_owned(),
+            },
+            api_version: "v1".to_owned(),
+            kind: "ConfigMap".to_owned(),
+            uid: Some(format!("uid-{name}")),
+            deletion_policy: policy,
+        }
+    }
+
     #[test]
     fn field_diffs_escape_pointers_and_never_emit_values() -> crate::Result<()> {
         let mut changes = Vec::new();
@@ -151,6 +405,78 @@ mod tests {
             ]
         );
         assert!(!serde_json::to_string(&changes)?.contains("private-value"));
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_review_preserves_membership_without_inventing_old_structure() -> crate::Result<()> {
+        let before = inventory::InventorySnapshot {
+            schema_version: inventory::INVENTORY_SCHEMA.to_owned(),
+            generation: "generation".to_owned(),
+            resources: vec![
+                tracked("retained", compiler_core::DeletionPolicy::Delete),
+                tracked("removed", compiler_core::DeletionPolicy::Orphan),
+            ],
+        };
+        let after = compiled(vec![resource("added", false), resource("retained", true)]);
+
+        let review = metadata_resources(&before, &after)?;
+        assert_eq!(
+            review,
+            vec![
+                json!({
+                    "apiVersion":"v1","namespace":"workload","kind":"ConfigMap","name":"added",
+                    "beforeApiVersion":null,"afterApiVersion":"v1","beforeKind":null,"afterKind":"ConfigMap",
+                    "change":"added","fieldChanges":[{"path":"/data","change":"added"}],
+                    "beforeSource":null,"afterSource":{"file":"next.tsx","line":2,"column":3},
+                    "beforeLifecycle":null,"afterLifecycle":{"deletionPolicy":"orphan"},
+                    "beforeForce":null,"afterForce":false,
+                }),
+                json!({
+                    "apiVersion":"v1","namespace":"workload","kind":"ConfigMap","name":"removed",
+                    "beforeApiVersion":"v1","afterApiVersion":null,"beforeKind":"ConfigMap","afterKind":null,
+                    "change":"removed","fieldChanges":{"status":"unavailable","reason":"historical-compiled-plan-not-retained"},
+                    "beforeSource":{"status":"unavailable","reason":"historical-compiled-plan-not-retained"},"afterSource":null,
+                    "beforeLifecycle":{"deletionPolicy":"orphan"},"afterLifecycle":null,
+                    "beforeForce":{"status":"unavailable","reason":"historical-compiled-plan-not-retained"},"afterForce":null,
+                }),
+                json!({
+                    "apiVersion":"v1","namespace":"workload","kind":"ConfigMap","name":"retained",
+                    "beforeApiVersion":"v1","afterApiVersion":"v1","beforeKind":"ConfigMap","afterKind":"ConfigMap",
+                    "change":"unknown","fieldChanges":{"status":"unavailable","reason":"historical-compiled-plan-not-retained"},
+                    "beforeSource":{"status":"unavailable","reason":"historical-compiled-plan-not-retained"},"afterSource":{"file":"next.tsx","line":2,"column":3},
+                    "beforeLifecycle":{"deletionPolicy":"delete"},"afterLifecycle":{"deletionPolicy":"orphan"},
+                    "beforeForce":{"status":"unavailable","reason":"historical-compiled-plan-not-retained"},"afterForce":true,
+                }),
+            ]
+        );
+        assert!(!serde_json::to_string(&review)?.contains("must-not-appear"));
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_runtime_permissions_never_emit_false_empty_diffs() -> crate::Result<()> {
+        let capability = Capability {
+            namespace: "workload".to_owned(),
+            api_group: String::new(),
+            resource: "configmaps".to_owned(),
+            subresource: None,
+            verb: "get".to_owned(),
+            names: vec!["owned".to_owned()],
+        };
+        let review = unavailable_runtime_permissions(&[capability]);
+        assert_eq!(
+            review,
+            json!({
+                "status":"unavailable",
+                "reason":"historical-compiled-plan-not-retained",
+                "after":[{
+                    "namespace":"workload","apiGroup":"","resource":"configmaps",
+                    "subresource":null,"verb":"get","names":["owned"]
+                }]
+            })
+        );
+        serde_json::to_string(&review)?;
         Ok(())
     }
 }

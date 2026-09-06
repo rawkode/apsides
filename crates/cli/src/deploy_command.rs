@@ -180,6 +180,7 @@ async fn reserve_new_transition(
         .get(&domain.id)
         .is_some_and(|h| h.active_allocation.is_some())
     {
+        platform.ensure_active_writer_checkpoint(&domain.id).await?;
         registry = crate::inventory_connection::capture_active(platform, inventory, domain).await?;
     }
     let request = prepare_request(
@@ -420,47 +421,25 @@ async fn prepare_predecessor(
     let Some(allocation) = &history.active_allocation else {
         return Ok(None);
     };
-    let prior = registry
-        .transitions
-        .get(&allocation.transition_id)
-        .ok_or("active generation has no committed protected plan")?;
-    deploy::verify_record(&prior.plan, &prior.record)?;
-    if prior.record.phase != Phase::Committed
-        || &prior.plan.generation_reservation != allocation
-        || prior.plan.request.next.compiled.ir.domain.id != domain.id
+    let checkpoint = registry
+        .active_writer_checkpoints
+        .get(&domain.id)
+        .ok_or("active writer checkpoint missing; explicit recovery required")?;
+    if &checkpoint.allocation != allocation
+        || checkpoint.control_namespace != domain.control_namespace
     {
-        return Err("active generation differs from its protected transition".into());
+        return Err("active writer checkpoint differs from protected allocation".into());
     }
-    if !matches!(
-        prior.request_drain_qualification,
-        Some(platform::RequestDrainQualification::IsolatedEnvoy { .. })
-    ) {
-        return Err("previous generation has no qualified request-drain transport".into());
-    }
+
     let head = crate::inventory_connection::load(inventory, domain)
         .await?
         .ok_or("active inventory missing; explicit recovery required")?;
-    let predecessor = deploy::PredecessorGeneration {
-        allocation: allocation.clone(),
-        scope: inventory::InventoryScope {
-            cluster: domain.cluster_binding.clone(),
-            namespace: domain.namespace.clone(),
-            controller: domain.id.clone(),
-        },
-        control_namespace: domain.control_namespace.clone(),
-        inventory: head.snapshot,
-        retirement_role_binding_namespaces: prior
-            .plan
-            .request
-            .next
-            .compiled
-            .capabilities
-            .iter()
-            .map(|c| c.namespace.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect(),
+    let scope = inventory::InventoryScope {
+        cluster: domain.cluster_binding.clone(),
+        namespace: domain.namespace.clone(),
+        controller: domain.id.clone(),
     };
+    let predecessor = checkpoint.predecessor_metadata(&scope, &head.snapshot)?;
     Ok(Some(deploy::PreviousGeneration::Metadata(Box::new(
         predecessor,
     ))))

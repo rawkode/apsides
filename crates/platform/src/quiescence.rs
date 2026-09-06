@@ -29,6 +29,8 @@ impl PlatformClient {
         transition: &str,
         executor: &str,
     ) -> Result<Versioned<NamespaceRegistry>> {
+        self.verify_new_writer_qualification(transition, executor)
+            .await?;
         let result = self.quiesce_previous_inner(transition, executor).await;
         if let Err(crate::Error::Invalid(reason)) = &result {
             let registry = self.load_registry().await?;

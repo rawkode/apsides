@@ -83,7 +83,8 @@ fn registry() -> NamespaceRegistry {
         previous_writer_checkpoint: None,
     };
     NamespaceRegistry {
-        schema_version: platform::SCHEMA_VERSION.into(),
+        active_writer_checkpoints: BTreeMap::new(),
+        schema_version: platform::REGISTRY_SCHEMA_VERSION.into(),
         registry_uid: REGISTRY_UID.into(),
         next_sequence: 2,
         cluster_binding: "cluster-a".into(),
@@ -183,5 +184,88 @@ fn review_uses_metadata_predecessor_but_rejects_unverified_historical_details() 
     assert!(crate::review::transition_review(&registry, TRANSITION_2).is_err());
     registry.transitions.remove(TRANSITION_1);
     assert!(crate::review::transition_review(&registry, TRANSITION_2).is_err());
+    let predecessor = registry
+        .transition(TRANSITION_2)?
+        .plan
+        .request
+        .predecessor()?
+        .ok_or("predecessor missing")?;
+    let checkpoint = review_checkpoint(predecessor)?;
+    registry
+        .transitions
+        .get_mut(TRANSITION_2)
+        .ok_or("upgrade missing")?
+        .previous_writer_checkpoint = Some(checkpoint);
+    let review = crate::review::transition_review(&registry, TRANSITION_2)?;
+    assert_eq!(review["schemaVersion"], "reakt.dev/deployment-review/v2");
+    assert_eq!(review["detailAvailability"], "metadata-only");
+    assert_eq!(review["permissions"]["runtime"]["status"], "unavailable");
+    assert!(review["permissions"]["runtime"].get("added").is_none());
     Ok(())
+}
+
+fn review_checkpoint(
+    predecessor: &deploy::PredecessorGeneration,
+) -> Result<platform::WriterCheckpoint> {
+    let allocation = &predecessor.allocation;
+    let name = &allocation.service_account_name;
+    let generation = &allocation.generation_id;
+    let control = &predecessor.control_namespace;
+    let mut retirement = BTreeMap::from([(
+        format!("v1/ServiceAccount/{control}/{name}"),
+        "credential-uid".into(),
+    )]);
+    for namespace in &predecessor.retirement_role_binding_namespaces {
+        retirement.insert(
+            format!("rbac.authorization.k8s.io/v1/RoleBinding/{namespace}/{name}"),
+            format!("{namespace}-role-uid"),
+        );
+    }
+    let checkpoint = platform::WriterCheckpoint {
+        schema_version: "reakt.dev/writer-checkpoint/v1".into(),
+        allocation: allocation.clone(),
+        control_namespace: control.clone(),
+        runtime_binding: RuntimeBinding {
+            domain_id: predecessor.scope.controller.clone(),
+            cluster_binding: predecessor.scope.cluster.clone(),
+            generation_id: generation.clone(),
+            build_digest: allocation.artifact_digest.clone(),
+            ir_digest: allocation.ir_digest.clone(),
+            policy_digest: BUILD.into(),
+            capability_digest: BUILD.into(),
+            service_account_name: name.clone(),
+            controller_image: format!("registry.example/controller@{BUILD}"),
+        },
+        request_drain_qualification: platform::RequestDrainQualification::IsolatedEnvoy {
+            qualification_digest: BUILD.into(),
+            node_image_digest: OTHER.into(),
+        },
+        proxy_identity: platform::ProxyIdentity {
+            policy_digest: BUILD.into(),
+            deployment_name: format!("reakt-proxy-{generation}"),
+            deployment_uid: "proxy-deployment-uid".into(),
+            node_name: "worker".into(),
+            node_uid: "node-uid".into(),
+            pod_name: "proxy-pod".into(),
+            pod_uid: "pod-uid".into(),
+            pod_spec_digest: BUILD.into(),
+            envoy_container_id: "containerd://envoy".into(),
+            admin_container_id: "containerd://admin".into(),
+            config_map_name: format!("reakt-proxy-{generation}-config"),
+            config_map_uid: "config-uid".into(),
+            config_digest: BUILD.into(),
+            qualification_digest: BUILD.into(),
+        },
+        controller_deployment_uid: "controller-uid".into(),
+        activation_uid: "activation-uid".into(),
+        inventory_uid: "inventory-uid".into(),
+        retirement_identity_uids: retirement,
+    };
+    checkpoint.validate(
+        predecessor,
+        control,
+        &predecessor.scope.namespace,
+        &predecessor.scope.cluster,
+    )?;
+    Ok(checkpoint)
 }

@@ -47,6 +47,10 @@ impl PlatformClient {
                 "initial activation requires the owning staged initial transition",
             ));
         }
+        deploy::verify_record(&stored.plan, &stored.record)?;
+        if stored.record.phase != Phase::Committed {
+            crate::writer_checkpoint::require_qualified(&stored)?;
+        }
         let binding = stored
             .runtime_binding
             .clone()
@@ -239,16 +243,23 @@ impl PlatformClient {
             event,
         )?;
         if entry.record.phase == Phase::Committed {
+            let domain = entry.plan.request.next.compiled.ir.domain.id.clone();
+            let predecessor = entry
+                .plan
+                .request
+                .predecessor()?
+                .map(|p| p.allocation.clone());
+            let allocation = entry.plan.generation_reservation.clone();
+            let checkpoint = crate::writer_checkpoint::project_committed(&next, transition_id)?;
             let history = next
                 .histories
-                .get_mut(&entry.plan.request.next.compiled.ir.domain.id)
+                .get_mut(&domain)
                 .ok_or_else(|| invalid("domain history missing at commit"))?;
-            if history.active_allocation.as_ref()
-                != entry.plan.request.predecessor()?.map(|p| &p.allocation)
-            {
+            if history.active_allocation.as_ref() != predecessor.as_ref() {
                 return Err(invalid("active allocation changed before commit"));
             }
-            history.active_allocation = Some(entry.plan.generation_reservation.clone());
+            history.active_allocation = Some(allocation);
+            next.active_writer_checkpoints.insert(domain, checkpoint);
         }
         self.persist_registry(registry, &next).await
     }

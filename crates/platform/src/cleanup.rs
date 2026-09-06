@@ -412,6 +412,7 @@ mod tests {
     fn cleanup_registry_fixture() -> crate::Versioned<NamespaceRegistry> {
         crate::Versioned {
             value: NamespaceRegistry {
+                active_writer_checkpoints: std::collections::BTreeMap::default(),
                 registry_uid: "11111111-1111-4111-8111-111111111111".into(),
                 next_sequence: 1,
                 schema_version: crate::REGISTRY_SCHEMA_VERSION.into(),

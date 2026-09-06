@@ -157,7 +157,7 @@ class LifecycleRunner:
         registry_name = "reakt-registry-" + self.workload
         registry = self.get("configmap", registry_name, self.control)
         state = json.loads(registry["data"]["state.json"]) if registry else {"schemaVersion": "reakt.dev/namespace-registry/v2", "clusterBinding": self.binding,
-                 "workloadNamespace": self.workload, "nextSequence": "1", "claims": [], "transitions": {}, "histories": {}}
+                 "workloadNamespace": self.workload, "nextSequence": "1", "activeWriterCheckpoints": {}, "claims": [], "transitions": {}, "histories": {}}
         if state["clusterBinding"] != self.binding or state["workloadNamespace"] != self.workload or self.domain in state["histories"]:
             raise RuntimeError("test bootstrap refuses to replace existing domain history or scope")
         state["histories"][self.domain] = {"domainId": self.domain, "clusterBinding": self.binding, "revision": "bootstrap", "activeAllocation": None}

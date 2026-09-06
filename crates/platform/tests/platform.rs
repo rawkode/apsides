@@ -18,6 +18,10 @@ const GENERATION_B: &str = "gceirceircfardairceirceirce-2";
 const TRANSITION_A: &str = "tceirceircfardairceirceirce-1";
 const TRANSITION_B: &str = "tceirceircfardairceirceirce-2";
 
+#[cfg(feature = "deployer")]
+#[path = "support/qualified_writer.rs"]
+mod qualified_writer;
+
 type Calls = Arc<Mutex<Vec<(String, String, Value)>>>;
 fn registry_authority() -> Value {
     let mut authority = object(
@@ -319,6 +323,7 @@ async fn namespace_claim_reservation_is_one_conditional_update_and_rejects_stale
         active_allocation: None,
     };
     let registry = NamespaceRegistry {
+        active_writer_checkpoints: BTreeMap::new(),
         registry_uid: REGISTRY_UID.into(),
         next_sequence: 1,
         schema_version: REGISTRY_SCHEMA_VERSION.into(),
@@ -608,6 +613,7 @@ fn staged_initial_fixture() -> (
     let mut claim = activation.approved_claims[0].claim.clone();
     claim.state = ClaimState::Reserved;
     let registry = NamespaceRegistry {
+        active_writer_checkpoints: BTreeMap::new(),
         registry_uid: REGISTRY_UID.into(),
         next_sequence: 2,
         schema_version: REGISTRY_SCHEMA_VERSION.into(),
@@ -640,6 +646,10 @@ fn stateful_wire_with_drift(
                 let resource = match o["kind"].as_str().unwrap() {
                     "Deployment" => "deployments",
                     "ServiceAccount" => "serviceaccounts",
+                    "Pod" => "pods",
+                    "Node" => "nodes",
+                    "Secret" => "secrets",
+                    "Service" => "services",
                     "Role" => "roles",
                     "RoleBinding" => "rolebindings",
                     _ => "configmaps",
@@ -647,7 +657,9 @@ fn stateful_wire_with_drift(
                 (
                     format!(
                         "{}/{resource}/{}",
-                        o["metadata"]["namespace"].as_str().unwrap(),
+                        o["metadata"]["namespace"]
+                            .as_str()
+                            .map_or("v1", |namespace| namespace),
                         o["metadata"]["name"].as_str().unwrap()
                     ),
                     o,
@@ -718,9 +730,11 @@ fn stateful_wire_with_drift(
 
 #[cfg(feature = "deployer")]
 #[tokio::test]
-async fn initial_activation_starts_only_after_protected_authority_and_resumes_committed() {
+async fn initial_activation_starts_only_after_protected_authority_and_resumes_committed()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     let (mut registry, activation, policy, trust, deployment) = staged_initial_fixture();
     let mut objects = initial_support_fixture(&mut registry);
+    objects.extend(qualified_writer::qualify(&mut registry, TRANSITION_A)?);
     objects.extend(vec![
         object("reakt-registry-workload", &registry, REGISTRY_UID, "42"),
         object(
@@ -745,6 +759,34 @@ async fn initial_activation_starts_only_after_protected_authority_and_resumes_co
     );
     assert_eq!(committed.value.claims[0].state, ClaimState::Active);
     let first = calls.lock().unwrap().clone();
+    for (_, _, payload) in first.iter().filter(|(method, path, _)| {
+        method == "PUT" && path.ends_with("/configmaps/reakt-registry-workload")
+    }) {
+        let encoded = payload["data"]["state.json"]
+            .as_str()
+            .ok_or("registry state missing")?;
+        let state: NamespaceRegistry = serde_json::from_str(encoded)?;
+        let record = state.transition(TRANSITION_A)?;
+        let history = state
+            .histories
+            .get("example")
+            .ok_or("domain history missing")?;
+        if record.record.phase == deploy::Phase::Committed {
+            let checkpoint = state
+                .active_writer_checkpoints
+                .get("example")
+                .ok_or("committed checkpoint missing")?;
+            assert_eq!(
+                history.active_allocation.as_ref(),
+                Some(&checkpoint.allocation)
+            );
+            assert_eq!(checkpoint.allocation, record.plan.generation_reservation);
+        } else {
+            assert!(history.active_allocation.is_none());
+            assert!(state.active_writer_checkpoints.is_empty());
+        }
+    }
+
     let activate = first
         .iter()
         .position(|c| c.0 == "PUT" && c.1.contains("/reakt-activation-example"))
@@ -761,12 +803,15 @@ async fn initial_activation_starts_only_after_protected_authority_and_resumes_co
         .unwrap();
     let subsequent = calls.lock().unwrap();
     assert!(subsequent[first.len()..].iter().all(|c| c.0 == "GET"));
+    Ok(())
 }
 
 #[cfg(feature = "deployer")]
 #[tokio::test]
-async fn initial_activation_rejects_changed_trust_without_writes() {
-    let (registry, _, _, _, _) = staged_initial_fixture();
+async fn initial_activation_rejects_changed_trust_without_writes()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let (mut registry, _, _, _, _) = staged_initial_fixture();
+    qualified_writer::qualify(&mut registry, TRANSITION_A)?;
     let (client, calls) = wire(vec![
         object("reakt-registry-workload", &registry, REGISTRY_UID, "42"),
         object(
@@ -784,6 +829,7 @@ async fn initial_activation_rejects_changed_trust_without_writes() {
             .is_err()
     );
     assert!(calls.lock().unwrap().iter().all(|c| c.0 == "GET"));
+    Ok(())
 }
 
 #[cfg(feature = "deployer")]
@@ -895,11 +941,10 @@ async fn predecessor_metadata_requires_exact_protected_retirement_authority_befo
         "wrong-transition",
         "wrong-scope",
         "wrong-control",
-        "duplicate-record",
-        "record-transition",
-        "uncommitted",
+        "missing-checkpoint",
+        "changed-writer",
     ] {
-        let mut registry = qualified_upgrade_fixture()?;
+        let mut registry = with_active_checkpoint(qualified_upgrade_fixture()?).await?;
         let mut request = registry
             .transitions
             .remove(TRANSITION_B)
@@ -918,27 +963,16 @@ async fn predecessor_metadata_requires_exact_protected_retirement_authority_befo
             "wrong-transition" => previous.allocation.transition_id = "unrelated-transition".into(),
             "wrong-scope" => previous.scope.namespace = "unrelated".into(),
             "wrong-control" => previous.control_namespace = "unrelated".into(),
-            "duplicate-record" => {
-                registry.transitions.insert(
-                    "duplicate".into(),
-                    registry.transition(TRANSITION_A)?.clone(),
-                );
+            "missing-checkpoint" => {
+                registry.active_writer_checkpoints.clear();
             }
-            "record-transition" => {
+            "changed-writer" => {
                 registry
-                    .transitions
-                    .get_mut(TRANSITION_A)
-                    .ok_or("initial transition missing")?
-                    .record
-                    .transition_id = "unrelated".into();
-            }
-            "uncommitted" => {
-                registry
-                    .transitions
-                    .get_mut(TRANSITION_A)
-                    .ok_or("initial transition missing")?
-                    .record
-                    .phase = deploy::Phase::Staged;
+                    .active_writer_checkpoints
+                    .get_mut("example")
+                    .ok_or("checkpoint missing")?
+                    .runtime_binding
+                    .generation_id = "foreign".into();
             }
             _ => return Err("unknown fixture alteration".into()),
         }
@@ -966,7 +1000,8 @@ async fn predecessor_metadata_requires_exact_protected_retirement_authority_befo
 #[tokio::test]
 async fn authenticated_metadata_predecessor_reserves_without_embedding_old_plan()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let mut registry = qualified_upgrade_fixture()?;
+    let mut registry = with_active_checkpoint(qualified_upgrade_fixture()?).await?;
+    registry.transitions.remove(TRANSITION_A);
     let request = registry
         .transitions
         .remove(TRANSITION_B)
@@ -1017,8 +1052,10 @@ async fn authenticated_metadata_predecessor_reserves_without_embedding_old_plan(
 async fn direct_api_predecessor_is_durably_blocked_and_forged_phase_never_writes()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     use deploy::Phase;
-    let registry = staged_upgrade_fixture()?;
+    let mut registry = staged_upgrade_fixture()?;
+    qualified_writer::qualify(&mut registry, TRANSITION_B)?;
     let (client, calls) = wire(vec![
+        object("reakt-registry-workload", &registry, REGISTRY_UID, "42"),
         object("reakt-registry-workload", &registry, REGISTRY_UID, "42"),
         object("reakt-registry-workload", &registry, REGISTRY_UID, "42"),
         object("reakt-registry-workload", &registry, REGISTRY_UID, "42"),
@@ -1031,10 +1068,10 @@ async fn direct_api_predecessor_is_durably_blocked_and_forged_phase_never_writes
             .await
             .is_err()
     );
-    assert_eq!(calls.lock().unwrap().len(), 6);
-    assert_eq!(calls.lock().unwrap()[5].0, "PUT");
+    assert_eq!(calls.lock().unwrap().len(), 8);
+    assert_eq!(calls.lock().unwrap()[7].0, "PUT");
     let blocked: NamespaceRegistry = serde_json::from_str(
-        calls.lock().unwrap()[5].2["data"]["state.json"]
+        calls.lock().unwrap()[7].2["data"]["state.json"]
             .as_str()
             .unwrap(),
     )
@@ -1129,10 +1166,12 @@ fn initial_support_fixture(registry: &mut NamespaceRegistry) -> Vec<Value> {
 
 #[cfg(feature = "deployer")]
 #[tokio::test]
-async fn broadened_staged_role_and_recreated_config_block_before_activation() {
+async fn broadened_staged_role_and_recreated_config_block_before_activation()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     for changed_kind in ["Role", "ConfigMap"] {
         let (mut registry, activation, policy, trust, deployment) = staged_initial_fixture();
         let mut objects = initial_support_fixture(&mut registry);
+        objects.extend(qualified_writer::qualify(&mut registry, TRANSITION_A)?);
         let changed = objects
             .iter_mut()
             .find(|o| o["kind"] == changed_kind)
@@ -1164,11 +1203,13 @@ async fn broadened_staged_role_and_recreated_config_block_before_activation() {
         );
         assert!(calls.lock().unwrap().iter().all(|c| c.0 == "GET"));
     }
+    Ok(())
 }
 
 #[cfg(feature = "deployer")]
 #[tokio::test]
-async fn crash_after_start_resume_rechecks_authority_before_replica_one_fast_path() {
+async fn crash_after_start_resume_rechecks_authority_before_replica_one_fast_path()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     use deploy::{Event, Quiescence, advance};
     let (mut registry, activation, policy, trust, mut deployment) = staged_initial_fixture();
     let entry = registry.transitions.get_mut(TRANSITION_A).unwrap();
@@ -1197,6 +1238,7 @@ async fn crash_after_start_resume_rechecks_authority_before_replica_one_fast_pat
     }
     deployment["spec"]["replicas"] = json!(1);
     let mut objects = initial_support_fixture(&mut registry);
+    objects.extend(qualified_writer::qualify(&mut registry, TRANSITION_A)?);
     objects.extend(vec![
         object("reakt-registry-workload", &registry, REGISTRY_UID, "42"),
         object("reakt-policy-example", &policy, "policy-uid", "44"),
@@ -1228,6 +1270,7 @@ async fn crash_after_start_resume_rechecks_authority_before_replica_one_fast_pat
         roles >= 3,
         "resume must recheck after initially valid two-namespace role reads"
     );
+    Ok(())
 }
 
 fn adoption_request() -> (NamespaceRegistry, PolicyState, deploy::DeploymentRequest) {
@@ -1240,6 +1283,7 @@ fn adoption_request() -> (NamespaceRegistry, PolicyState, deploy::DeploymentRequ
         active_allocation: None,
     };
     let registry = NamespaceRegistry {
+        active_writer_checkpoints: BTreeMap::new(),
         registry_uid: REGISTRY_UID.into(),
         next_sequence: 1,
         schema_version: REGISTRY_SCHEMA_VERSION.into(),
@@ -2451,6 +2495,174 @@ async fn another_domain_uses_the_registry_counter_after_domain_entry_removal()
             .filter(|(method, _, _)| method == "PUT")
             .count(),
         1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn active_writer_backfill_survives_historical_plan_removal()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut registry = qualified_upgrade_fixture()?;
+    registry.transitions.remove(TRANSITION_B);
+    let (scope, inventory) = deploy::generation_inventory(
+        &registry.transition(TRANSITION_A)?.plan.request.next,
+        &registry.claims,
+    )?;
+    let (client, calls) = stateful_wire(vec![object(
+        "reakt-registry-workload",
+        &registry,
+        REGISTRY_UID,
+        "42",
+    )]);
+    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let captured = platform.ensure_active_writer_checkpoint("example").await?;
+    let checkpoint = captured
+        .value
+        .active_writer_checkpoints
+        .get("example")
+        .ok_or("active writer checkpoint missing")?;
+    let predecessor = checkpoint.predecessor_metadata(&scope, &inventory)?;
+    assert_eq!(predecessor.allocation.generation_id, GENERATION_A);
+    assert_eq!(
+        predecessor.retirement_role_binding_namespaces,
+        ["control", "workload"]
+    );
+    let bytes = serde_json::to_string(checkpoint)?;
+    for excluded in ["compiled", "desired", "stagedContentDigests", "source"] {
+        assert!(!bytes.contains(excluded), "{excluded}");
+    }
+    platform.ensure_active_writer_checkpoint("example").await?;
+    {
+        let recorded = calls.lock().map_err(|_| "wire calls lock poisoned")?;
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|(method, _, _)| method == "PUT")
+                .count(),
+            1
+        );
+    }
+    let mut compacted = captured.value;
+    compacted.transitions.clear();
+    let (client, calls) = wire(vec![object(
+        "reakt-registry-workload",
+        &compacted,
+        REGISTRY_UID,
+        "43",
+    )]);
+    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let retained = platform.ensure_active_writer_checkpoint("example").await?;
+    assert_eq!(
+        retained.value.active_writer_checkpoints.get("example"),
+        compacted.active_writer_checkpoints.get("example")
+    );
+    let recorded = calls.lock().map_err(|_| "wire calls lock poisoned")?;
+    assert!(recorded.iter().all(|(method, _, _)| method == "GET"));
+    Ok(())
+}
+
+#[cfg(feature = "deployer")]
+async fn with_active_checkpoint(
+    mut registry: NamespaceRegistry,
+) -> std::result::Result<NamespaceRegistry, Box<dyn std::error::Error>> {
+    let mut committed = registry.clone();
+    committed.transitions.remove(TRANSITION_B);
+    let (client, _) = stateful_wire(vec![object(
+        "reakt-registry-workload",
+        &committed,
+        REGISTRY_UID,
+        "42",
+    )]);
+    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    registry.active_writer_checkpoints = platform
+        .ensure_active_writer_checkpoint("example")
+        .await?
+        .value
+        .active_writer_checkpoints;
+    Ok(registry)
+}
+
+#[tokio::test]
+async fn active_writer_backfill_rejects_pending_claim_changes_and_registry_races()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let registry = qualified_upgrade_fixture()?;
+    let (client, calls) = wire(vec![object(
+        "reakt-registry-workload",
+        &registry,
+        REGISTRY_UID,
+        "42",
+    )]);
+    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let error = platform
+        .ensure_active_writer_checkpoint("example")
+        .await
+        .err()
+        .ok_or("unfinished transition unexpectedly allowed backfill")?;
+    assert!(
+        error.to_string().contains("undisturbed committed claims"),
+        "{error}"
+    );
+    assert!(
+        calls
+            .lock()
+            .map_err(|_| "calls lock poisoned")?
+            .iter()
+            .all(|(method, _, _)| method == "GET")
+    );
+    let mut committed = registry;
+    committed.transitions.remove(TRANSITION_B);
+    let (client, calls) = wire(vec![
+        object("reakt-registry-workload", &committed, REGISTRY_UID, "42"),
+        object("reakt-registry-workload", &committed, REGISTRY_UID, "43"),
+    ]);
+    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let error = platform
+        .ensure_active_writer_checkpoint("example")
+        .await
+        .err()
+        .ok_or("registry race unexpectedly allowed backfill")?;
+    assert!(
+        error.to_string().contains("UID/resourceVersion changed"),
+        "{error}"
+    );
+    assert!(
+        calls
+            .lock()
+            .map_err(|_| "calls lock poisoned")?
+            .iter()
+            .all(|(method, _, _)| method == "GET")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unqualified_initial_writer_rejects_before_activation_mutations()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let (registry, _, _, _, _) = staged_initial_fixture();
+    let (client, calls) = wire(vec![object(
+        "reakt-registry-workload",
+        &registry,
+        REGISTRY_UID,
+        "42",
+    )]);
+    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let error = platform
+        .activate_initial(TRANSITION_A, "executor-a")
+        .await
+        .err()
+        .ok_or("unqualified writer unexpectedly activated")?;
+    assert!(
+        error
+            .to_string()
+            .contains("qualified isolated proxy before activation"),
+        "{error}"
+    );
+    assert!(
+        calls
+            .lock()
+            .map_err(|_| "calls lock poisoned")?
+            .iter()
+            .all(|(method, _, _)| method == "GET")
     );
     Ok(())
 }

@@ -191,6 +191,9 @@ impl PlatformClient {
                 }
             }
         }
+        for domain in registry.value.active_writer_checkpoints.keys() {
+            crate::writer_checkpoint::active(&registry.value, domain, &self.control_namespace)?;
+        }
         let mut sequences = std::collections::BTreeSet::new();
         for (transition_id, stored) in &registry.value.transitions {
             let allocation = &stored.plan.generation_reservation;
@@ -226,6 +229,70 @@ impl PlatformClient {
             stored.staged_content_digests.remove(&key);
         }
         Ok(registry)
+    }
+
+    /// Capture the currently committed writer authority for pre-checkpoint v4 state.
+    /// Present checkpoints are validated and never replaced.
+    /// # Errors
+    /// Rejects altered history, unfinished transitions, missing qualified evidence or CAS races.
+    pub async fn ensure_active_writer_checkpoint(
+        &self,
+        domain: &str,
+    ) -> Result<Versioned<NamespaceRegistry>> {
+        let current = self.load_registry().await?;
+        let history = current
+            .value
+            .histories
+            .get(domain)
+            .ok_or_else(|| invalid("active writer history missing"))?;
+        let Some(allocation) = &history.active_allocation else {
+            return Ok(current);
+        };
+        if current.value.active_writer_checkpoints.contains_key(domain) {
+            crate::writer_checkpoint::active(&current.value, domain, &self.control_namespace)?;
+            return Ok(current);
+        }
+        if current.value.transitions.values().any(|stored| {
+            stored.plan.request.next.compiled.ir.domain.id == domain
+                && stored.record.phase != deploy::Phase::Committed
+        }) {
+            return Err(invalid(
+                "active writer backfill requires undisturbed committed claims; explicit recovery required",
+            ));
+        }
+        let checkpoint =
+            crate::writer_checkpoint::project_committed(&current.value, &allocation.transition_id)?;
+        if &checkpoint.allocation != allocation {
+            return Err(invalid(
+                "active writer checkpoint differs from protected allocation",
+            ));
+        }
+        let mut next = current.value.clone();
+        next.active_writer_checkpoints
+            .insert(domain.into(), checkpoint);
+        crate::writer_checkpoint::active(&next, domain, &self.control_namespace)?;
+        let written = self.persist_registry(&current, &next).await?;
+        let reloaded = self.load_registry().await?;
+        if reloaded.uid != written.uid || reloaded.resource_version != written.resource_version {
+            return Err(invalid(
+                "registry changed after active writer capture; retry",
+            ));
+        }
+        Ok(reloaded)
+    }
+
+    pub(crate) async fn verify_new_writer_qualification(
+        &self,
+        transition: &str,
+        executor: &str,
+    ) -> Result<()> {
+        let registry = self.load_registry().await?;
+        let stored = registry.value.transition(transition)?;
+        deploy::verify_record(&stored.plan, &stored.record)?;
+        if stored.record.executor_id != executor {
+            return Err(invalid("writer qualification requires owning executor"));
+        }
+        crate::writer_checkpoint::require_qualified(stored)
     }
 
     /// Capture missing writer authority for an already-reserved upgrade.
@@ -331,30 +398,18 @@ impl PlatformClient {
         .await
     }
 
-    /// Atomically consume one registry sequence and reserve claims and transition
-    /// ownership in one platform-provisioned namespace registry `ConfigMap`.
-    /// # Errors
-    /// Rejects stale plans, concurrent deployers, claim overlap and identity reuse.
-    pub async fn reserve_transition(
+    fn validate_reservation_snapshot(
         &self,
+        current: &Versioned<NamespaceRegistry>,
         request: &DeploymentRequest,
-        executor_id: &str,
-    ) -> Result<Versioned<NamespaceRegistry>> {
-        let current = self.load_registry().await?;
-        let next_sequence = current
-            .value
-            .next_sequence
-            .checked_add(1)
-            .ok_or_else(|| invalid("registry allocation counter exhausted"))?;
+    ) -> Result<Option<crate::WriterCheckpoint>> {
         let domain = &request.next.compiled.ir.domain;
         let mut history = current
             .value
             .histories
             .get(&domain.id)
             .cloned()
-            .ok_or_else(|| {
-                invalid("platform must provision the complete domain generation history")
-            })?;
+            .ok_or_else(|| invalid("platform must provision domain allocation authority"))?;
         history.revision.clone_from(&current.resource_version);
         let expected = RegistrySnapshot {
             registry_uid: current.uid.clone(),
@@ -372,10 +427,42 @@ impl PlatformClient {
                 "request was not planned against this protected registry snapshot",
             ));
         }
-        let previous_writer_checkpoint = request
+        request
             .predecessor()?
-            .map(|previous| crate::writer_checkpoint::project(&current.value, previous))
-            .transpose()?;
+            .map(|previous| {
+                let checkpoint = crate::writer_checkpoint::active(
+                    &current.value,
+                    &domain.id,
+                    &self.control_namespace,
+                )?;
+                checkpoint.validate(
+                    previous,
+                    &self.control_namespace,
+                    &self.workload_namespace,
+                    &self.cluster_binding,
+                )?;
+                Ok::<_, crate::Error>(checkpoint.clone())
+            })
+            .transpose()
+    }
+
+    /// Atomically consume one registry sequence and reserve claims and transition
+    /// ownership in one platform-provisioned namespace registry `ConfigMap`.
+    /// # Errors
+    /// Rejects stale plans, concurrent deployers, claim overlap and identity reuse.
+    pub async fn reserve_transition(
+        &self,
+        request: &DeploymentRequest,
+        executor_id: &str,
+    ) -> Result<Versioned<NamespaceRegistry>> {
+        let current = self.load_registry().await?;
+        let next_sequence = current
+            .value
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| invalid("registry allocation counter exhausted"))?;
+        let domain = &request.next.compiled.ir.domain;
+        let previous_writer_checkpoint = self.validate_reservation_snapshot(&current, request)?;
         let policy = self.load_policy(&domain.id).await?;
         if policy.value.runtime_ceiling != request.runtime_ceiling
             || policy.value.cleanup_ceiling != request.cleanup_ceiling

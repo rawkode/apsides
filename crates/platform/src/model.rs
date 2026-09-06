@@ -149,6 +149,9 @@ pub struct NamespaceRegistry {
     pub workload_namespace: String,
     pub claims: Vec<ProtectedClaim>,
     pub histories: BTreeMap<String, GenerationHistory>,
+    /// Missing only on pre-checkpoint v4 registries; requires authenticated backfill.
+    #[serde(default)]
+    pub active_writer_checkpoints: BTreeMap<String, crate::WriterCheckpoint>,
     pub transitions: BTreeMap<String, StoredTransition>,
 }
 

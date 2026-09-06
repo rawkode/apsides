@@ -24,6 +24,8 @@ impl PlatformClient {
         transition: &str,
         executor: &str,
     ) -> Result<Versioned<NamespaceRegistry>> {
+        self.verify_new_writer_qualification(transition, executor)
+            .await?;
         let mut registry = self
             .ensure_previous_writer_checkpoint(transition, executor)
             .await?;
@@ -72,6 +74,8 @@ impl PlatformClient {
         transition: &str,
         executor: &str,
     ) -> Result<Versioned<NamespaceRegistry>> {
+        self.verify_new_writer_qualification(transition, executor)
+            .await?;
         let registry = self
             .ensure_previous_writer_checkpoint(transition, executor)
             .await?;
@@ -133,6 +137,7 @@ impl PlatformClient {
             .get_mut(transition)
             .ok_or_else(|| invalid("transition missing"))?
             .record = updated;
+        let checkpoint = crate::writer_checkpoint::project_committed(&next, transition)?;
         let history = next
             .histories
             .get_mut(&stored.plan.request.next.compiled.ir.domain.id)
@@ -143,6 +148,10 @@ impl PlatformClient {
             return Err(invalid("active allocation changed before commit"));
         }
         history.active_allocation = Some(stored.plan.generation_reservation.clone());
+        next.active_writer_checkpoints.insert(
+            stored.plan.request.next.compiled.ir.domain.id.clone(),
+            checkpoint,
+        );
         self.persist_registry(&registry, &next).await
     }
 
