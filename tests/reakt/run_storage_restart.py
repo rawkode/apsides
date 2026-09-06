@@ -93,6 +93,11 @@ def file_digest(path):
 
 
 class StorageRunner:
+    PACKAGE = "inventory"
+    RESULT_SCHEMA = "apsides.dev/storage-restart-qualification/v1"
+    SCOPE = "local-libsql-on-kind-local-pv-sigkill-reopen"
+    BOUNDARY = "static local PV backed by the owned kind node; no CSI, node-failure, power-loss, Turso, fencing, or interruption-inside-publish claim"
+
     def __init__(self, arguments):
         self.output = arguments.output.resolve()
         self.output.mkdir(parents=True, exist_ok=False)
@@ -131,12 +136,13 @@ class StorageRunner:
         if not isinstance(receipt, dict) or set(receipt) != expected:
             raise RuntimeError("storage image build receipt is invalid")
         digest = receipt.get("imageDigest")
-        archive = self.image_directory / "inventory-pvc.oci.tar"
+        archive_name = f"{self.PACKAGE}-pvc.oci.tar"
+        archive = self.image_directory / archive_name
         archive_record = receipt.get("archive")
         builder = receipt.get("builder")
-        if (receipt.get("schemaVersion") != "reakt.dev/inventory-pvc-test-image/v1"
+        if (receipt.get("schemaVersion") != f"reakt.dev/{self.PACKAGE}-pvc-test-image/v1"
                 or receipt.get("platform") != "linux/arm64"
-                or receipt.get("target") != {"package": "inventory", "test": "pvc_restart"}
+                or receipt.get("target") != {"package": self.PACKAGE, "test": "pvc_restart"}
                 or receipt.get("qualification") != "test-only; not a production release artifact"
                 or not isinstance(builder, dict)
                 or builder.get("reference") != BUILDER_IMAGE
@@ -146,7 +152,7 @@ class StorageRunner:
                 or not valid_digest(receipt.get("platformManifestDigest"))
                 or not valid_digest(receipt.get("configDigest"))
                 or not isinstance(archive_record, dict)
-                or archive_record.get("path") != "inventory-pvc.oci.tar"
+                or archive_record.get("path") != archive_name
                 or not valid_digest(archive_record.get("sha256"))
                 or not archive.is_file() or archive.is_symlink()
                 or archive.stat().st_size <= 0):
@@ -154,7 +160,7 @@ class StorageRunner:
         archive_digest = file_digest(archive)
         if archive_digest != archive_record["sha256"]:
             raise RuntimeError("storage image archive digest differs")
-        return {"reference": "localhost/apsides-inventory-pvc@" + digest,
+        return {"reference": f"localhost/apsides-{self.PACKAGE}-pvc@" + digest,
                 "digest": digest, "platformManifestDigest": receipt["platformManifestDigest"],
                 "configDigest": receipt["configDigest"], "archive": archive,
                 "archiveSha256": archive_digest}
@@ -212,7 +218,7 @@ class StorageRunner:
             imported = subprocess.run([
                 "docker", "exec", "-i", self.node, "ctr", "-n", "k8s.io", "images",
                 "import", "--digests", "--platform", "linux/arm64", "--base-name",
-                "localhost/apsides-inventory-pvc", "-",
+                f"localhost/apsides-{self.PACKAGE}-pvc", "-",
             ], stdin=archive, text=False, capture_output=True, check=False, timeout=180)
         if imported.returncode:
             raise RuntimeError("containerd image import failed")
@@ -553,10 +559,10 @@ class StorageRunner:
         except OSError:
             success = False
         result = {
-            "schemaVersion": "apsides.dev/storage-restart-qualification/v1",
+            "schemaVersion": self.RESULT_SCHEMA,
             "passed": bool(success), "cluster": self.cluster, "nodeImage": NODE_IMAGE,
-            "scope": "local-libsql-on-kind-local-pv-sigkill-reopen",
-            "storageBoundary": "static local PV backed by the owned kind node; no CSI, node-failure, power-loss, Turso, fencing, or interruption-inside-publish claim",
+            "scope": self.SCOPE,
+            "storageBoundary": self.BOUNDARY,
             "clusterDisposition": "deleted" if cleanup["stage"] == "complete" else cleanup["stage"],
             "credentialsRemoved": not self.kubeconfig.exists(), "cleanup": cleanup,
             "image": {"reference": self.image["reference"],
@@ -585,10 +591,10 @@ def parse_arguments(arguments=None):
     return parser.parse_args(arguments)
 
 
-def main(arguments=None):
+def main(arguments=None, runner_class=None):
     os.umask(0o077)
     try:
-        runner = StorageRunner(parse_arguments(arguments))
+        runner = (runner_class or StorageRunner)(parse_arguments(arguments))
     except (KeyError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         print(json.dumps({"passed": False, "error": closed_error(error)}))
         return 1

@@ -20,7 +20,7 @@ SPEC.loader.exec_module(storage_build)
 
 WORKSPACE_MANIFEST = """[workspace]
 resolver = "3"
-members = ["crates/compiler-core", "crates/inventory"]
+members = ["crates/compiler-core", "crates/deploy", "crates/inventory", "crates/coordination"]
 
 [workspace.package]
 version = "0.0.0"
@@ -47,14 +47,24 @@ class StorageBuildTests(unittest.TestCase):
         (self.repository / "Cargo.toml").write_text(WORKSPACE_MANIFEST)
         (self.repository / "Cargo.lock").write_text("version = 4\n")
         compiler = self.repository / "crates/compiler-core"
+        deploy = self.repository / "crates/deploy"
         inventory = self.repository / "crates/inventory"
+        coordination = self.repository / "crates/coordination"
         (compiler / "src").mkdir(parents=True)
+        (deploy / "src").mkdir(parents=True)
         (inventory / "src").mkdir(parents=True)
+        (coordination / "src").mkdir(parents=True)
         (inventory / "tests/support").mkdir(parents=True)
+        (coordination / "tests/support").mkdir(parents=True)
         (compiler / "Cargo.toml").write_text(
             '[package]\nname="compiler-core"\nversion="0.1.0"\nedition.workspace=true\n'
         )
         (compiler / "src/lib.rs").write_text("// compiler metadata\n")
+        (deploy / "Cargo.toml").write_text(
+            '[package]\nname="deploy"\nversion="0.1.0"\nedition.workspace=true\n'
+            '[dependencies]\ncompiler-core={path="../compiler-core"}\n'
+        )
+        (deploy / "src/lib.rs").write_text("// deploy model\n")
         (inventory / "Cargo.toml").write_text(
             '[package]\nname="inventory"\nversion="0.1.0"\nedition.workspace=true\n'
             '[dependencies]\ncompiler-core={path="../compiler-core"}\n'
@@ -62,6 +72,13 @@ class StorageBuildTests(unittest.TestCase):
         (inventory / "src/lib.rs").write_text("// inventory store\n")
         (inventory / "tests/pvc_restart.rs").write_text("mod support;\n")
         (inventory / "tests/support/mod.rs").write_text("// recursive test support\n")
+        (coordination / "Cargo.toml").write_text(
+            '[package]\nname="coordination"\nversion="0.1.0"\nedition.workspace=true\n'
+            '[dependencies]\ncompiler-core={path="../compiler-core"}\ndeploy={path="../deploy"}\n'
+        )
+        (coordination / "src/lib.rs").write_text("// coordination stores\n")
+        (coordination / "tests/pvc_restart.rs").write_text("mod support;\n")
+        (coordination / "tests/support/mod.rs").write_text("// coordination support\n")
         (self.repository / ".cargo").mkdir()
         (self.repository / ".cargo/credentials.toml").write_text("private-canary\n")
         self.calls = []
@@ -87,11 +104,12 @@ class StorageBuildTests(unittest.TestCase):
             "localImageId": "sha256:" + "b" * 64,
         }
 
-    def archive(self, path):
+    def archive(self, path, package="inventory"):
+        executable = storage_build.profile(package)["executable"]
         config = json.dumps({
             "architecture": "arm64",
             "os": "linux",
-            "config": {"User": "65532:65532", "Entrypoint": ["/usr/local/bin/inventory-pvc-probe"]},
+            "config": {"User": "65532:65532", "Entrypoint": [f"/usr/local/bin/{executable}"]},
         }, sort_keys=True, separators=(",", ":")).encode()
         config_digest = storage_build.sha256(config)
         manifest = json.dumps({
@@ -125,6 +143,7 @@ class StorageBuildTests(unittest.TestCase):
             metadata = storage_build.prepare_context(self.repository, context, self.builder())
         self.assertEqual(storage_build.verify_context(context, metadata), (context / "context.json").read_bytes())
         self.assertEqual((context / "crates/inventory/tests/support/mod.rs").read_text(), "// recursive test support\n")
+        self.assertFalse((context / "crates/coordination/tests").exists())
         self.assertFalse((context / ".cargo/credentials.toml").exists())
         self.assertEqual((context / "storage-crash").read_bytes(), storage_build.CRASH_WRAPPER.read_bytes())
         vendor = next(call for call in self.calls if call[:2] == ["cargo", "vendor"])
@@ -133,6 +152,30 @@ class StorageBuildTests(unittest.TestCase):
             self.assertIn("--locked", call)
             self.assertIn("--offline", call)
         self.assertEqual(metadata["builder"]["localImageId"], "sha256:" + "b" * 64)
+
+    def test_coordination_context_copies_only_its_selected_test_tree(self):
+        context = self.repository / "coordination-context"
+        with patch.object(storage_build, "run", self.command):
+            metadata = storage_build.prepare_context(
+                self.repository, context, self.builder(), "coordination"
+            )
+        self.assertEqual(
+            storage_build.verify_context(context, metadata, "coordination"),
+            (context / "context.json").read_bytes(),
+        )
+        self.assertEqual(metadata["schemaVersion"], "reakt.dev/coordination-pvc-build-context/v1")
+        self.assertEqual(metadata["target"], {"package": "coordination", "test": "pvc_restart"})
+        self.assertEqual(
+            (context / "crates/coordination/tests/support/mod.rs").read_text(),
+            "// coordination support\n",
+        )
+        self.assertFalse((context / "crates/inventory/tests").exists())
+
+    def test_coordination_profile_rejects_an_additional_inventory_dependency(self):
+        manifest = self.repository / "crates/coordination/Cargo.toml"
+        manifest.write_text(manifest.read_text() + 'inventory={path="../inventory"}\n')
+        with self.assertRaisesRegex(ValueError, "local dependency closure changed"):
+            storage_build.validate_repository(self.repository, "coordination")
 
     def test_cargo_json_selector_requires_one_exact_executable(self):
         directory = self.repository / "selector"
@@ -210,7 +253,9 @@ class StorageBuildTests(unittest.TestCase):
             self.assertIn("--pull=false", args)
             self.assertIn("--network=none", args)
             self.assertIn(storage_build.PLATFORM, args)
+            self.assertEqual(args[args.index("--target") + 1], "inventory")
             self.assertIn(f"BUILDER_IMAGE={storage_build.BUILDER}", args)
+            self.assertIn("PACKAGE=inventory", args)
             metadata = Path(args[args.index("--metadata-file") + 1])
             archive_spec = args[args.index("--output") + 1]
             archive = Path(archive_spec.rsplit("dest=", 1)[1])
@@ -225,17 +270,45 @@ class StorageBuildTests(unittest.TestCase):
             receipt = storage_build.build(self.repository, output)
         self.assertEqual(receipt["qualification"], "test-only; not a production release artifact")
         self.assertEqual(receipt["imageDigest"], "sha256:" + "c" * 64)
-        self.assertEqual(receipt["archive"]["sha256"], storage_build.sha256((output / storage_build.ARCHIVE_NAME).read_bytes()))
+        archive_name = storage_build.profile("inventory")["archive"]
+        self.assertEqual(receipt["archive"]["sha256"], storage_build.sha256((output / archive_name).read_bytes()))
         self.assertEqual(receipt["platformManifestDigest"], self.manifest_digest)
         self.assertEqual(receipt["configDigest"], self.config_digest)
         self.assertEqual(json.loads((output / "build.json").read_text()), receipt)
-        self.assertTrue((output / storage_build.ARCHIVE_NAME).is_file())
+        self.assertTrue((output / archive_name).is_file())
+
+    def test_coordination_build_has_distinct_target_archive_schema_and_entrypoint(self):
+        output = self.repository / "work/coordination-image"
+
+        def buildkit(argv, check):
+            self.assertTrue(check)
+            args = [str(value) for value in argv]
+            self.assertEqual(args[args.index("--target") + 1], "coordination")
+            self.assertIn("PACKAGE=coordination", args)
+            metadata = Path(args[args.index("--metadata-file") + 1])
+            archive = Path(args[args.index("--output") + 1].rsplit("dest=", 1)[1])
+            metadata.write_text(json.dumps({"containerimage.digest": "sha256:" + "d" * 64}))
+            self.archive(archive, "coordination")
+
+        with (
+            patch.object(storage_build, "run", self.command),
+            patch.object(storage_build, "pinned_image", return_value=self.builder()),
+            patch.object(storage_build.subprocess, "run", buildkit),
+        ):
+            receipt = storage_build.build(self.repository, output, "coordination")
+        self.assertEqual(receipt["schemaVersion"], "reakt.dev/coordination-pvc-test-image/v1")
+        self.assertEqual(receipt["target"], {"package": "coordination", "test": "pvc_restart"})
+        self.assertEqual(receipt["archive"]["path"], "coordination-pvc.oci.tar")
+        self.assertTrue((output / "coordination-pvc.oci.tar").is_file())
 
     def test_dockerfile_selects_the_exact_cargo_json_target(self):
         source = storage_build.DOCKERFILE.read_text()
-        self.assertIn("cargo test --frozen --offline --release -p inventory --test pvc_restart --no-run --message-format=json", source)
+        self.assertIn('cargo test --frozen --offline --release -p "${PACKAGE}" --test pvc_restart --no-run --message-format=json', source)
         self.assertIn("python3 /usr/local/bin/select-target /tmp/cargo.json", source)
         self.assertIn("/usr/local/bin/inventory-pvc-probe", source)
+        self.assertIn("/usr/local/bin/coordination-pvc-probe", source)
+        self.assertIn("FROM runtime AS inventory", source)
+        self.assertIn("FROM runtime AS coordination", source)
         self.assertIn("/usr/local/bin/storage-crash", source)
         self.assertIn("USER 65532:65532", source)
 

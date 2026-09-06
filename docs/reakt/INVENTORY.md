@@ -82,11 +82,22 @@ recovery after SIGKILL with an observed populated rollback journal. Read-only
 refusal and subsequent healthy reopen also passed. These results cover the
 inventory store on the tested local PV, not the other durable stores.
 
+Current-format claim, review and audit records separately passed a writable
+seed followed by exact reference/body verification in a second Pod on the same
+local PV. The second Pod mounted the volume read-only, and all three store write
+methods rejected writes. This uses a small synthetic fixture; it does not prove
+coordination-store concurrency, retained history, crash recovery or backup.
+
+```sh
+cuenv exec python3 tests/reakt/storage/build.py --package coordination --output work/coordination-image
+cuenv exec python3 tests/reakt/run_coordination_restart.py --image-directory work/coordination-image --output work/coordination-results
+```
+
 Canonical state and completion-envelope budgets reject oversized records before
 publication. The implementation does not provide snapshot garbage collection,
 cross-executor takeover, automatic recovery for missing authority, or completed
 live qualification of remote Turso recovery or persistent-volume recovery for
-claim, review and audit stores.
+claim, review and audit stores after interrupted writes or backup restoration.
 
 See [Inventory, prune and upgrades](/concepts/inventory-prune-upgrades/),
 [Transition audit history](/reakt/audit/), [State capacity](/reakt/state-capacity/),

@@ -118,8 +118,11 @@ Inventory storage has passed a separate local-PV qualification with 2,220,976
 bytes of canonical metadata, exact history across Pods, one winner and one
 conflict from competing publishers, and recovery after an uncommitted database
 writer is killed and reaped. Read-only refusal and healthy reopen also passed.
-This covers process termination on the tested local PV; it does not qualify
-claim, review or audit stores, CSI storage, node failure, or remote Turso.
+This covers inventory process termination on the tested local PV; it does not
+qualify CSI storage, node failure, or remote Turso. A separate small-fixture
+qualification verified current claim, review and audit bodies across two Pods,
+with a read-only mount and rejection of all three write methods in the second
+Pod. Coordination concurrency, interrupted writes and backup remain unqualified.
 
 ## Remaining production work
 
@@ -132,9 +135,9 @@ claim, review or audit stores, CSI storage, node failure, or remote Turso.
   executor label and recorded credential expiry do not prove that an earlier
   executor cannot mint credentials, complete admitted requests, or write the
   metadata store.
-- Extend persistent-volume qualification to claim, review and audit stores, and
-  qualify backup and remote Turso/libSQL restart, unavailable-storage, conflict
-  and recovery behavior.
+- Complete claim, review and audit persistent-volume concurrency and interrupted
+  write qualification, and qualify backup and remote Turso/libSQL restart,
+  unavailable-storage, conflict and recovery behavior.
 - Complete production API authorization and admission qualification for the
   supported Kubernetes versions, including the declared preview permissions and
   request-drain profile.

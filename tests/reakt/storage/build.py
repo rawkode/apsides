@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the disposable inventory PVC probe image from cached inputs only."""
+"""Build a disposable storage PVC probe image from cached inputs only."""
 
 import argparse
 import json
@@ -20,10 +20,33 @@ DOCKERFILE = SCRIPT.with_name("Dockerfile")
 CRASH_WRAPPER = SCRIPT.with_name("crash.sh")
 BUILDER = "rust@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922"
 PLATFORM = "linux/arm64"
-CONTEXT_SCHEMA = "reakt.dev/inventory-pvc-build-context/v1"
-BUILD_SCHEMA = "reakt.dev/inventory-pvc-test-image/v1"
 TARGET_NAME = "pvc_restart"
-ARCHIVE_NAME = "inventory-pvc.oci.tar"
+PROFILES = {
+    "inventory": {
+        "context_schema": "reakt.dev/inventory-pvc-build-context/v1",
+        "build_schema": "reakt.dev/inventory-pvc-test-image/v1",
+        "archive": "inventory-pvc.oci.tar",
+        "executable": "inventory-pvc-probe",
+        "dependencies": {"compiler-core": {"path": "../compiler-core"}},
+    },
+    "coordination": {
+        "context_schema": "reakt.dev/coordination-pvc-build-context/v1",
+        "build_schema": "reakt.dev/coordination-pvc-test-image/v1",
+        "archive": "coordination-pvc.oci.tar",
+        "executable": "coordination-pvc-probe",
+        "dependencies": {
+            "compiler-core": {"path": "../compiler-core"},
+            "deploy": {"path": "../deploy"},
+        },
+    },
+}
+
+
+def profile(package):
+    try:
+        return PROFILES[package]
+    except (KeyError, TypeError) as error:
+        raise ValueError("unsupported storage probe package") from error
 
 sys.path.insert(0, str(ROOT / "scripts/reakt"))
 from package_oci import file_manifest, pinned_image, read_regular, sha256  # noqa: E402
@@ -102,7 +125,8 @@ def copy_tree(source, destination):
             copy_regular(here / name, destination / (here / name).relative_to(source))
 
 
-def validate_repository(repository):
+def validate_repository(repository, package="inventory"):
+    selected = profile(package)
     repository = repository.resolve()
     root = tomllib.loads(read_regular(repository / "Cargo.toml").decode())
     if root.get("workspace", {}).get("resolver") != "3":
@@ -112,19 +136,33 @@ def validate_repository(repository):
         not isinstance(members, list)
         or not all(isinstance(member, str) and re.fullmatch(r"crates/[a-z][a-z0-9-]*", member) for member in members)
         or len(members) != len(set(members))
-        or not all(member in members for member in ["crates/compiler-core", "crates/inventory"])
+        or not all(member in members for member in ["crates/compiler-core", f"crates/{package}"])
     ):
-        raise ValueError("inventory source closure is not a workspace member")
+        raise ValueError("storage source closure is not a workspace member")
     manifests = {}
     for member in members:
         directory = (repository / member).resolve()
         if directory.parent != repository / "crates":
             raise ValueError("workspace member escapes the trusted crate directory")
         manifests[member] = tomllib.loads(read_regular(directory / "Cargo.toml").decode())
-    inventory = manifests["crates/inventory"]
-    dependency = inventory.get("dependencies", {}).get("compiler-core")
-    if dependency != {"path": "../compiler-core"}:
-        raise ValueError("inventory local dependency closure changed")
+    package_manifest = manifests[f"crates/{package}"]
+    local_dependencies = {}
+    dependency_tables = [("root", package_manifest)]
+    dependency_tables.extend(
+        (f"target.{target}", table)
+        for target, table in package_manifest.get("target", {}).items()
+    )
+    for table_name, table in dependency_tables:
+        for section in ["dependencies", "dev-dependencies", "build-dependencies"]:
+            for name, value in table.get(section, {}).items():
+                if isinstance(value, dict) and "path" in value:
+                    local_dependencies[(table_name, section, name)] = value
+    expected_dependencies = {
+        ("root", "dependencies", name): value
+        for name, value in selected["dependencies"].items()
+    }
+    if local_dependencies != expected_dependencies:
+        raise ValueError("storage local dependency closure changed")
     member_directories = {(repository / member).resolve() for member in members}
     for member, manifest in manifests.items():
         tables = [manifest, *manifest.get("target", {}).values()]
@@ -135,13 +173,14 @@ def validate_repository(repository):
                         dependency_directory = ((repository / member) / value["path"]).resolve()
                         if dependency_directory not in member_directories:
                             raise ValueError("source dependency escapes the exact workspace")
-    if not (repository / "crates/inventory/tests/pvc_restart.rs").is_file():
+    if not (repository / f"crates/{package}/tests/{TARGET_NAME}.rs").is_file():
         raise ValueError("PVC integration test source is missing")
     return repository, members
 
 
-def prepare_context(repository, context, builder):
-    repository, members = validate_repository(repository)
+def prepare_context(repository, context, builder, package="inventory"):
+    selected = profile(package)
+    repository, members = validate_repository(repository, package)
     context.mkdir()
     copy_regular(repository / "Cargo.toml", context / "Cargo.toml")
     copy_regular(repository / "Cargo.lock", context / "Cargo.lock")
@@ -151,7 +190,7 @@ def prepare_context(repository, context, builder):
         build_script = repository / member / "build.rs"
         if build_script.exists() or build_script.is_symlink():
             copy_regular(build_script, context / member / "build.rs")
-    copy_tree(repository / "crates/inventory/tests", context / "crates/inventory/tests")
+    copy_tree(repository / f"crates/{package}/tests", context / f"crates/{package}/tests")
     copy_regular(DOCKERFILE, context / "Dockerfile")
     copy_regular(CRASH_WRAPPER, context / "storage-crash")
     copy_regular(SCRIPT, context / "build.py")
@@ -193,10 +232,10 @@ def prepare_context(repository, context, builder):
         cwd=context,
     )
     metadata = {
-        "schemaVersion": CONTEXT_SCHEMA,
+        "schemaVersion": selected["context_schema"],
         "builder": builder,
         "platform": PLATFORM,
-        "target": {"package": "inventory", "test": TARGET_NAME},
+        "target": {"package": package, "test": TARGET_NAME},
         "cargoLockDigest": sha256(lock),
         "files": file_manifest(context),
         "qualification": "test-only; no production or release authority",
@@ -205,10 +244,11 @@ def prepare_context(repository, context, builder):
     return metadata
 
 
-def verify_context(context, expected):
+def verify_context(context, expected, package="inventory"):
+    selected = profile(package)
     encoded = read_regular(context / "context.json")
     actual = json.loads(encoded)
-    if actual != expected or actual.get("schemaVersion") != CONTEXT_SCHEMA:
+    if actual != expected or actual.get("schemaVersion") != selected["context_schema"]:
         raise ValueError("prepared storage build context metadata changed")
     if actual.get("qualification") != "test-only; no production or release authority":
         raise ValueError("prepared storage build context has an invalid claim")
@@ -249,7 +289,8 @@ def archive_blob(archive, digest):
     return value
 
 
-def inspect_oci_archive(path):
+def inspect_oci_archive(path, package="inventory"):
+    selected = profile(package)
     try:
         with tarfile.open(path) as archive:
             index = archive_json(archive, "index.json")
@@ -282,14 +323,15 @@ def inspect_oci_archive(path):
         or config.get("os") != "linux"
         or not isinstance(runtime, dict)
         or runtime.get("User") != "65532:65532"
-        or runtime.get("Entrypoint") != ["/usr/local/bin/inventory-pvc-probe"]
+        or runtime.get("Entrypoint") != [f"/usr/local/bin/{selected['executable']}"]
     ):
         raise ValueError("OCI runtime identity differs")
     return manifest_digest, config_digest
 
 
-def build(repository, output):
-    repository, _ = validate_repository(repository)
+def build(repository, output, package="inventory"):
+    selected = profile(package)
+    repository, _ = validate_repository(repository, package)
     output = output.absolute()
     work = (repository / "work").resolve()
     try:
@@ -303,14 +345,14 @@ def build(repository, output):
         raise ValueError("the exact cached Linux ARM64 builder is required")
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=".inventory-pvc-image-", dir=output.parent))
+    staging = Path(tempfile.mkdtemp(prefix=f".{package}-pvc-image-", dir=output.parent))
     try:
         context = staging / "context"
-        prepared = prepare_context(repository, context, builder)
-        context_bytes = verify_context(context, prepared)
+        prepared = prepare_context(repository, context, builder, package)
+        context_bytes = verify_context(context, prepared, package)
         if pinned_image(BUILDER) != builder:
             raise ValueError("cached builder identity changed during preparation")
-        archive = staging / ARCHIVE_NAME
+        archive = staging / selected["archive"]
         buildkit = staging / "buildkit-metadata.json"
         argv = [
             "docker",
@@ -322,8 +364,12 @@ def build(repository, output):
             "--sbom=false",
             "--platform",
             PLATFORM,
+            "--target",
+            package,
             "--build-arg",
             f"BUILDER_IMAGE={BUILDER}",
+            "--build-arg",
+            f"PACKAGE={package}",
             "--build-arg",
             "SOURCE_DATE_EPOCH=0",
             "--metadata-file",
@@ -333,24 +379,24 @@ def build(repository, output):
             str(context),
         ]
         subprocess.run(argv, check=True)
-        if verify_context(context, prepared) != context_bytes:
+        if verify_context(context, prepared, package) != context_bytes:
             raise ValueError("storage build context changed during BuildKit execution")
         image_metadata = json.loads(read_regular(buildkit))
         image_digest = image_metadata.get("containerimage.digest")
         if not isinstance(image_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest):
             raise ValueError("BuildKit did not report one canonical image digest")
         archive_bytes = read_regular(archive)
-        platform_manifest_digest, config_digest = inspect_oci_archive(archive)
+        platform_manifest_digest, config_digest = inspect_oci_archive(archive, package)
         receipt = {
-            "schemaVersion": BUILD_SCHEMA,
+            "schemaVersion": selected["build_schema"],
             "builder": builder,
             "platform": PLATFORM,
-            "target": {"package": "inventory", "test": TARGET_NAME},
+            "target": {"package": package, "test": TARGET_NAME},
             "contextDigest": sha256(context_bytes),
             "imageDigest": image_digest,
             "platformManifestDigest": platform_manifest_digest,
             "configDigest": config_digest,
-            "archive": {"path": ARCHIVE_NAME, "sha256": sha256(archive_bytes)},
+            "archive": {"path": selected["archive"], "sha256": sha256(archive_bytes)},
             "qualification": "test-only; not a production release artifact",
         }
         (staging / "build.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
@@ -363,9 +409,10 @@ def build(repository, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--package", choices=sorted(PROFILES), default="inventory")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    result = build(ROOT, args.output)
+    result = build(ROOT, args.output, args.package)
     print(json.dumps({"output": str(args.output.absolute()), "imageDigest": result["imageDigest"], "qualification": result["qualification"]}, sort_keys=True))
 
 
