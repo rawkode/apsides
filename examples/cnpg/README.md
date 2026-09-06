@@ -7,9 +7,8 @@ through a `secretKeyRef` to CloudNativePG's `database-app` Secret. Secret values
 do not enter the TypeScript build or generated IR.
 
 Changes to the managed API ConfigMap, the observed `api-settings` ConfigMap or
-the observed database Secret declare a rollout of PostgREST. The declarations
-do not claim that those reactions or drift correction have run in a live
-cluster.
+the observed database Secret declare a rollout of PostgREST. The local rehearsal
+below exercises the `api-settings` reaction and database Secret consumption.
 
 From the repository root, build the CLI and regenerate the typed component from
 the pinned CloudNativePG 1.30.0 CRD:
@@ -59,6 +58,18 @@ It owns the same database and ConfigMap; this version adds the API workload and
 its observed inputs.
 
 ## Local upgrade rehearsal
+
+The rehearsal passed on kind running through OrbStack at source revision
+`207a405`, using the signed initial and successor examples from `5ed7b25` and
+CloudNativePG 1.30.0. It verified initial database readiness, refusal of the
+permission expansion under the initial policy, writer retirement, successor
+activation, and HTTP responses changing from two rows to one after a ConfigMap
+update. The Deployment UID stayed stable while the Pod, ReplicaSet and rollout
+revision changed. Cleanup restored the prior cluster and container inventories
+and removed the rehearsal credentials.
+
+This is local signed-candidate demo evidence; production release acceptance is
+still pending. It does not verify Secret rotation or drift correction.
 
 The repository's test driver accepts two signed, integrity-verified candidates
 built from the initial and parent examples. It uses the real lifecycle protocol
