@@ -15,6 +15,7 @@ pub(crate) struct Selection {
     plan: Arc<TransitionPlan>,
     previous_writer_checkpoint: Option<crate::WriterCheckpoint>,
     trust_policy_digest: Option<String>,
+    capacity: crate::CapacityAdmission,
 }
 
 /// A selected release capability. Every lifecycle reload revalidates its frozen inputs.
@@ -77,6 +78,16 @@ impl Deref for ResolvedStoredTransition {
 }
 
 impl PlatformClient {
+    pub(crate) fn selecting_capacity(&self, capacity: crate::CapacityAdmission) -> Result<Self> {
+        let mut selection = self.selection.as_deref().cloned().ok_or_else(|| {
+            invalid("capacity resize requires an authenticated transition session")
+        })?;
+        selection.capacity = capacity;
+        let mut client = self.clone();
+        client.selection = Some(Arc::new(selection));
+        Ok(client)
+    }
+
     /// Reconstruct one transition from a freshly verified release and immutable metadata.
     /// # Errors
     /// Rejects unavailable snapshots, policy drift, changed release or nonexact replay.
@@ -175,6 +186,7 @@ impl PlatformClient {
             plan: Arc::new(plan),
             previous_writer_checkpoint: stored.previous_writer_checkpoint.clone(),
             trust_policy_digest: Some(trust_policy_digest.into()),
+            capacity: stored.capacity.clone(),
         }));
         client.selected(&registry, transition)?;
         Ok(TransitionSession {
@@ -196,6 +208,7 @@ impl PlatformClient {
             || registry.resource_version.is_empty()
             || stored.inputs != selection.inputs
             || stored.previous_writer_checkpoint != selection.previous_writer_checkpoint
+            || stored.capacity != selection.capacity
             || transition != selection.plan.request.transition_id
             || stored.allocation() != &selection.plan.generation_reservation
             || stored.plan_digest() != selection.plan.plan_digest
@@ -205,6 +218,7 @@ impl PlatformClient {
             ));
         }
         deploy::verify_record(&selection.plan, &stored.record)?;
+        crate::completion_envelope::validate_selected(&registry.value, &selection.plan)?;
         match (
             selection.plan.request.predecessor()?,
             &stored.previous_writer_checkpoint,
@@ -276,6 +290,7 @@ impl PlatformClient {
         &self,
         plan: &TransitionPlan,
         previous: Option<&crate::WriterCheckpoint>,
+        capacity: &crate::CapacityAdmission,
     ) -> Result<Self> {
         let policy = crate::PolicyState {
             schema_version: crate::SCHEMA_VERSION.into(),
@@ -299,6 +314,7 @@ impl PlatformClient {
             plan: Arc::new(plan.clone()),
             previous_writer_checkpoint: previous.cloned(),
             trust_policy_digest: None,
+            capacity: capacity.clone(),
         }));
         Ok(client)
     }

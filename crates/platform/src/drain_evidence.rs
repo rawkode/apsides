@@ -43,7 +43,8 @@ mod tests {
                 "serviceAccountName": "runtime-account",
                 "pods": [{
                     "name": "runtime-pod", "uid": "runtime-pod-uid",
-                    "nodeName": "node-a", "nodeUid": "node-uid"
+                    "nodeName": "node-a", "nodeUid": "node-uid",
+                    "containers": {"regular": [{"name":"controller","containerId":"containerd://runtime"}],"init":[],"ephemeral":[]}
                 }]
             },
             "proxyWriters": {
@@ -52,7 +53,8 @@ mod tests {
                 "serviceAccountName": "runtime-account",
                 "pods": [{
                     "name": "proxy-pod", "uid": "proxy-pod-uid",
-                    "nodeName": "node-a", "nodeUid": "node-uid"
+                    "nodeName": "node-a", "nodeUid": "node-uid",
+                    "containers": {"regular": [{"name":"envoy","containerId":"containerd://envoy"},{"name":"admin","containerId":"containerd://admin"}],"init":[],"ephemeral":[]}
                 }]
             },
             "runtimeTermination": {

@@ -1,8 +1,80 @@
-# Proposed state capacity contract
+# State capacity admission
 
-Status: proposed and unimplemented. Registry v5 bounds retained transition count;
-it does not yet reserve space for a pending transition's future evidence. This
-document proposes the next implementation, not a claim that v5 provides it.
+Status: implemented in registry v6 with source, reducer and Kubernetes-wire
+verification. Live maximal-profile completion and production release qualification
+remain unverified. The design discussion below records the preceding v5 gaps and
+the contract used for this implementation.
+
+## Implemented contract
+
+Each pending transition carries a protected `CapacityAdmission` outside its frozen
+planning inputs. It reserves canonical serialized bytes for the whole domain's
+remaining lifecycle, including retained predecessor state, staged metadata,
+termination observations, receipts and the successor checkpoint. Registry loads
+and publications account for every pending domain's reservation, so one domain
+cannot consume another's unused space. Reservation rejects aggregate overflow
+before publishing claim snapshots. Registry and individual control objects remain
+limited to 512 KiB; admission never grants ownership or deletion authority.
+
+Typed evidence profiles bound captured runtime Pods (at most 64), regular, init
+and ephemeral container totals, encoded UID/resource-version/container-ID strings,
+and complete drain evidence (at most 128 KiB). Before an upgrade reserves space,
+CI verifies the exact Active predecessor and captures the retained Pod topology
+twice through Pod → ReplicaSet → Deployment ownership. Quiescence captures and
+persists exact current identities before freezing the old writer. A profile is a
+size allowance, not evidence that a process terminated.
+
+Registry v6 admits at most eight recovery resumes and forty receipts. Remaining
+success and failure slots are checked before lifecycle effects. The underlying
+pure reducer retains its independent 256-event bound. Old registries, already
+exhausted records and irreducible profile outgrowth require explicit recovery;
+there is no automatic cancellation or legacy migration.
+
+Activation and runtime inventory use separate completion ceilings covering both
+previous and next generations. Controller image references are bounded to 4096
+ASCII graphic bytes. Activation UIDs and resource versions use a fixed 128-byte
+canonical JSON string limit, also enforced by the runtime without registry
+credentials. Other writer evidence supports larger admitted scalar tiers. An
+out-of-profile Kubernetes response stops further dependent writes; admission
+cannot promise progress under arbitrary external metadata or topology changes.
+
+The owning CI session can monotonically enlarge an untouched Planned/Staged
+upgrade's capacity. It must have no durable drain and the exact predecessor must
+still be Active before and after capture. The CAS changes only capacity, never
+frozen planning inputs. A changed admission invalidates the old session, requiring
+fresh verified-release binding before lifecycle work resumes. Errors before a
+durable drain leave this route available; errors after it cannot authorize resize.
+
+For CLI recovery, rerun the same verified artifact and executor with
+`reakt deploy ... --transition ID --capacity resize`. This requires an existing
+untouched upgrade, emits a metadata-only before/after capacity report, reconstructs
+the verified session and resumes normal deployment. It cannot create a transition,
+resize a committed deployment or cancel an upgrade. A topology/profile mismatch
+returns this actionable recovery instruction instead of waiting on a generic
+pending condition.
+
+## Verification boundary
+
+Focused tests cover canonical accounting across all four registry maps, escaped
+keys, maximum counter widths, competing pending domains, forged small ceilings,
+and reducer-replayed initial-installation success/failure paths through eight
+resumes. Wire tests cover ownership substitution, container epoch drift,
+retirement UID tier selection, resize session invalidation, Active-state races,
+registry-version conflicts, and read-only no-op resize.
+
+The aggregate-overflow regression verifies zero claim-store publications and zero
+Kubernetes writes. The oversized activation CREATE response regression verifies
+that its resource version is rejected before inventory creation. Secret
+commitments and unexpected staged keys are rejected without writes. Independent
+source and regression review found no remaining blocker in these boundaries.
+
+These tests do not establish full maximal-profile end-to-end completion, live Pod
+upgrades, PV reattachment or a remote Turso primary. The initial-installation
+receipt trajectory does not cover every upgrade cleanup payload. Metadata-store
+privacy remains unchanged: no manifests, desired values, source, credentials or
+private-content hashes are added.
+
+## Earlier design and v5 boundary
 
 ## Requirement and current boundary
 

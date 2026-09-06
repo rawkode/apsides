@@ -1,4 +1,6 @@
 use crate::{Result, only};
+#[path = "deploy_capacity.rs"]
+mod capacity;
 use compiler_core::CompiledPlan;
 use deploy::{DeploymentRequest, GenerationPlan, Phase, RegistrySnapshot};
 use kube::{Client, Config, config::AuthInfo};
@@ -20,10 +22,12 @@ pub fn command(options: &BTreeMap<String, String>) -> Result<()> {
             "--transition",
             "--executor",
             "--ownership-intents",
+            "--capacity",
         ],
     )?;
+    let resize_capacity = capacity::requested(options)?;
     let runtime = tokio::runtime::Runtime::new()?;
-    let report = runtime.block_on(deploy(options))?;
+    let report = runtime.block_on(deploy(options, resize_capacity))?;
     writeln!(
         std::io::stdout().lock(),
         "{}",
@@ -32,17 +36,16 @@ pub fn command(options: &BTreeMap<String, String>) -> Result<()> {
     Ok(())
 }
 
-async fn deploy(options: &BTreeMap<String, String>) -> Result<Value> {
+async fn deploy(options: &BTreeMap<String, String>, resize_capacity: bool) -> Result<Value> {
     platform::install_rustls_ring_provider()?;
     let inventory = crate::inventory_connection::connect().await?;
     let artifact = crate::artifact_input::open(options).await?;
-    let root = artifact.path();
     let DeploymentContext {
         platform,
         verified,
         compatibility,
         expires_at,
-    } = connect(root, artifact.expected_digest()).await?;
+    } = connect(artifact.path(), artifact.expected_digest()).await?;
     let domain = &verified.compiled().ir.domain;
     let executor = executor_id(options)?;
     let registry = platform.load_registry().await?;
@@ -60,27 +63,25 @@ async fn deploy(options: &BTreeMap<String, String>) -> Result<Value> {
         options.get("--ownership-intents"),
         registry.value.transitions.get(&transition_id),
     )?;
-    match check_existing(
+    let existing = check_existing(
         &registry.value,
         &transition_id,
         &verified,
         &executor,
         &policy_digest,
-    )? {
+    )?;
+    if resize_capacity {
+        capacity::require_target(&existing, registry.value.transitions.get(&transition_id))?;
+    }
+    match existing {
         ExistingTransition::Committed => {
-            let session = platform
-                .transition_session(&verified, inventory.as_ref(), &transition_id)
-                .await?;
-            let selected = session.load_registry().await?;
-            let tracking = crate::inventory_connection::publish(
-                &session,
+            return already_committed_report(
+                &platform,
+                &verified,
                 inventory.as_ref(),
-                &selected.value,
                 &transition_id,
             )
-            .await?;
-            let report = json!({"status":"already-committed","transition":transition_id,"releaseDigest":verified.release_digest(),"inventory":{"revision":tracking.revision,"snapshotId":tracking.snapshot_id}});
-            return Ok(report);
+            .await;
         }
         ExistingTransition::Resume => {}
         ExistingTransition::Absent => {
@@ -99,14 +100,20 @@ async fn deploy(options: &BTreeMap<String, String>) -> Result<Value> {
     let session = platform
         .transition_session(&verified, inventory.as_ref(), &transition_id)
         .await?;
-    let resolved = session.resolve().await?;
-    crate::inventory_connection::require_request(inventory.as_ref(), &resolved.plan().request)
-        .await?;
-    let _ = writeln!(
-        std::io::stderr().lock(),
-        "{}",
-        serde_json::to_string_pretty(&crate::review::transition_review(&resolved)?)?
-    );
+    let session = if resize_capacity {
+        Box::pin(capacity::resize_and_rebind(
+            &platform,
+            session,
+            &verified,
+            inventory.as_ref(),
+            &transition_id,
+            &executor,
+        ))
+        .await?
+    } else {
+        session
+    };
+    review_transition(&session, inventory.as_ref()).await?;
     let committed = Box::pin(drive_transition(
         &session,
         &verified,
@@ -128,6 +135,40 @@ async fn deploy(options: &BTreeMap<String, String>) -> Result<Value> {
         &expires_at,
         &tracking,
     )
+}
+
+async fn review_transition(
+    session: &platform::TransitionSession,
+    inventory: &dyn inventory::InventoryStore,
+) -> Result<()> {
+    let resolved = session.resolve().await?;
+    crate::inventory_connection::require_request(inventory, &resolved.plan().request).await?;
+    writeln!(
+        std::io::stderr().lock(),
+        "{}",
+        serde_json::to_string_pretty(&crate::review::transition_review(&resolved)?)?
+    )?;
+    Ok(())
+}
+
+async fn already_committed_report(
+    platform: &PlatformClient,
+    verified: &release::VerifiedRelease,
+    inventory: &dyn inventory::InventoryStore,
+    transition: &str,
+) -> Result<Value> {
+    let session = platform
+        .transition_session(verified, inventory, transition)
+        .await?;
+    let selected = session.load_registry().await?;
+    let tracking =
+        crate::inventory_connection::publish(&session, inventory, &selected.value, transition)
+            .await?;
+    Ok(json!({
+        "status": "already-committed", "transition": transition,
+        "releaseDigest": verified.release_digest(),
+        "inventory": {"revision": tracking.revision, "snapshotId": tracking.snapshot_id},
+    }))
 }
 
 fn verify_resumed_intents(
@@ -534,6 +575,9 @@ async fn drive_transition(
         };
         match result {
             Ok(_) => {}
+            Err(platform::Error::CapacityResizeRequired) => {
+                return Err(capacity::required_error(transition));
+            }
             Err(platform::Error::Pending(reason)) if tokio::time::Instant::now() < deadline => {
                 let _ = writeln!(std::io::stderr().lock(), "reakt: {reason}");
                 tokio::time::sleep(Duration::from_secs(1)).await;

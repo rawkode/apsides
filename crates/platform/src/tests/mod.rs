@@ -15,6 +15,10 @@ use std::{
 };
 use tower::service_fn;
 
+#[cfg(feature = "deployer")]
+mod capacity_accounting;
+#[cfg(feature = "deployer")]
+mod capacity_topology;
 mod event_capacity;
 
 const REGISTRY_UID: &str = "11111111-1111-4111-8111-111111111111";
@@ -48,6 +52,18 @@ impl LifecycleRegistry {
         self.plans.get(transition).ok_or("fixture plan missing")
     }
 
+    #[cfg(feature = "deployer")]
+    fn admit(&mut self, transition: &str) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let profile = self.transition(transition)?.capacity.profile.clone();
+        let capacity =
+            crate::completion_envelope::calculate(self, self.plan(transition)?, &profile)?;
+        self.transitions
+            .get_mut(transition)
+            .ok_or("fixture transition missing")?
+            .capacity = capacity;
+        Ok(())
+    }
+
     fn bind(
         &self,
         client: Client,
@@ -66,6 +82,7 @@ impl LifecycleRegistry {
         .bind_test_plan(
             self.plan(transition)?,
             stored.previous_writer_checkpoint.as_ref(),
+            &stored.capacity,
         )?)
     }
 }
@@ -171,9 +188,7 @@ async fn reserve_test_transition(
     if let Some(previous) = request.predecessor()? {
         inventory.seed(&previous.scope, &previous.inventory)?;
     }
-    platform
-        .reserve_authenticated(request, executor, &inventory, None)
-        .await
+    Box::pin(platform.reserve_authenticated(request, executor, &inventory, None)).await
 }
 
 impl MemoryClaimStore {
@@ -418,7 +433,24 @@ fn wire_with_authority(responses: Vec<Value>, authority: Value) -> (Client, Call
                         .pop_front()
                         .ok_or_else(|| std::io::Error::other("unexpected Kubernetes request"))?
                 };
-                if reply == json!("echo-put") {
+                let status = reply
+                    .get("wireHttpStatus")
+                    .and_then(Value::as_u64)
+                    .map(u16::try_from)
+                    .transpose()
+                    .map_err(std::io::Error::other)?
+                    .unwrap_or(200);
+                if reply.get("wireHttpStatus").is_some() {
+                    reply = reply
+                        .get("body")
+                        .cloned()
+                        .ok_or_else(|| std::io::Error::other("wire response body missing"))?;
+                }
+                if reply == json!("echo-activation-create-large-rv") {
+                    reply = data;
+                    reply["metadata"]["uid"] = json!("activation-uid");
+                    reply["metadata"]["resourceVersion"] = json!("9".repeat(129));
+                } else if reply == json!("echo-put") {
                     reply = data;
                     reply["metadata"]["resourceVersion"] = json!("43");
                 } else if reply == json!("echo-mutated-registry-put") {
@@ -434,6 +466,7 @@ fn wire_with_authority(responses: Vec<Value>, authority: Value) -> (Client, Call
                     reply["metadata"]["resourceVersion"] = json!("43");
                 }
                 Response::builder()
+                    .status(status)
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&reply).map_err(std::io::Error::other)?,
@@ -816,6 +849,14 @@ fn expected_writers() -> ExpectedWriters {
             uid: "pod-uid".into(),
             node_name: "node".into(),
             node_uid: "node-uid".into(),
+            containers: CapturedContainers {
+                regular: vec![CapturedContainer {
+                    name: "controller".into(),
+                    container_id: "containerd://one".into(),
+                }],
+                init: vec![],
+                ephemeral: vec![],
+            },
         }],
     }
 }
@@ -1005,13 +1046,9 @@ fn staged_initial_fixture() -> std::result::Result<StagedInitialFixture, Box<dyn
         BTreeMap::new(),
         [(TRANSITION_A.into(), entry)].into(),
     )?;
-    Ok((
-        LifecycleRegistry { registry, plans },
-        activation,
-        policy,
-        trust,
-        deployment,
-    ))
+    let mut registry = LifecycleRegistry { registry, plans };
+    registry.admit(TRANSITION_A)?;
+    Ok((registry, activation, policy, trust, deployment))
 }
 
 #[cfg(feature = "deployer")]
@@ -1026,6 +1063,9 @@ fn staged_initial_transition(
         activation.binding.service_account_name
     );
     Ok(StoredTransition {
+        capacity: CapacityAdmission::projection_placeholder(
+            crate::completion_envelope::initial_profile(),
+        ),
         inputs,
         record,
         staged_identity_uids: [
@@ -1383,15 +1423,47 @@ fn staged_upgrade_fixture() -> std::result::Result<LifecycleRegistry, Box<dyn st
         },
     )?;
     current.inputs = transition_inputs(&plan, &policy)?;
+    let current = retarget_staged_identity(current, &previous_plan, &plan)?;
+    registry.transitions.insert(TRANSITION_B.into(), current);
+    registry.plans.insert(TRANSITION_B.into(), plan);
+    registry.next_sequence = 3;
+    // This intermediate fixture has no qualified predecessor checkpoint.
+    // qualified_upgrade_fixture completes authority before admitting the upgrade.
+    Ok(registry)
+}
+
+#[cfg(feature = "deployer")]
+fn retarget_staged_identity(
+    mut current: StoredTransition,
+    previous_plan: &deploy::TransitionPlan,
+    plan: &deploy::TransitionPlan,
+) -> std::result::Result<StoredTransition, Box<dyn std::error::Error>> {
     current
         .runtime_binding
         .as_mut()
         .ok_or("runtime binding missing")?
         .generation_id = GENERATION_B.into();
-    registry.transitions.insert(TRANSITION_B.into(), current);
-    registry.plans.insert(TRANSITION_B.into(), plan);
-    registry.next_sequence = 3;
-    Ok(registry)
+    let old_account = previous_plan
+        .generation_reservation
+        .service_account_name
+        .as_str();
+    let new_account = plan.generation_reservation.service_account_name.as_str();
+    current
+        .runtime_binding
+        .as_mut()
+        .ok_or("runtime binding missing")?
+        .service_account_name = new_account.into();
+    current.staged_identity_uids = current
+        .staged_identity_uids
+        .into_iter()
+        .map(|(key, uid)| (key.replace(old_account, new_account), uid))
+        .collect();
+    current.staged_content_digests = current
+        .staged_content_digests
+        .into_iter()
+        .map(|(key, value)| (key.replace(old_account, new_account), value))
+        .collect();
+    Ok(current)
 }
 
 #[cfg(feature = "deployer")]
@@ -1458,6 +1530,7 @@ async fn predecessor_metadata_requires_exact_protected_retirement_authority_befo
 async fn authenticated_metadata_predecessor_reserves_without_embedding_old_plan()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut registry = with_active_checkpoint(qualified_upgrade_fixture()?)?;
+    let topology = capacity_topology::admission_reads(&mut registry)?;
     registry.plans.remove(TRANSITION_A);
     let request = registry.plan(TRANSITION_B)?.request.clone();
     registry
@@ -1466,12 +1539,16 @@ async fn authenticated_metadata_predecessor_reserves_without_embedding_old_plan(
         .ok_or("upgrade transition missing")?;
     registry.next_sequence = request.registry.next_sequence;
     let policy = policy(&request.next.compiled);
-    let (client, calls) = wire(vec![
+    let mut responses = vec![
         registry_object(&registry, REGISTRY_UID, "42")?,
         object("policy", &policy, "policy-uid", "40"),
+    ];
+    responses.extend(topology);
+    responses.extend([
         registry_object(&registry, REGISTRY_UID, "42")?,
         json!("echo-put"),
     ]);
+    let (client, calls) = wire(responses);
     let platform = platform_client(client, "control", "workload", "cluster-a")?;
     let reserved = reserve_test_transition(&platform, &request, "executor-b").await?;
     assert!(
@@ -1509,11 +1586,10 @@ async fn authenticated_metadata_predecessor_reserves_without_embedding_old_plan(
 
 #[cfg(feature = "deployer")]
 #[tokio::test]
-async fn direct_api_predecessor_is_durably_blocked_and_forged_phase_never_writes()
+async fn unqualified_predecessor_and_forged_phase_never_write()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     use deploy::Phase;
-    let mut registry = staged_upgrade_fixture()?;
-    qualified_writer::qualify(&mut registry, TRANSITION_B)?;
+    let registry = staged_upgrade_fixture()?;
     let (client, calls) = wire(vec![
         registry_object(&registry, REGISTRY_UID, "42")?,
         registry_object(&registry, REGISTRY_UID, "42")?,
@@ -2592,6 +2668,7 @@ fn qualified_upgrade_fixture() -> std::result::Result<LifecycleRegistry, Box<dyn
         .get_mut(TRANSITION_B)
         .ok_or("upgrade transition missing")?
         .previous_writer_checkpoint = Some(checkpoint);
+    registry.admit(TRANSITION_B)?;
     Ok(registry)
 }
 
@@ -2628,13 +2705,14 @@ async fn writer_checkpoint_is_private_and_independent_of_old_history()
     previous
         .staged_identity_uids
         .insert(tls_key.clone(), "tls-uid".into());
+    let unrelated = format!(
+        "v1/ConfigMap/control/{}-config",
+        previous.allocation().service_account_name
+    );
+    let public_digest = digest(&"public configuration fixture")?;
     previous
         .staged_content_digests
-        .insert(tls_key.clone(), "private-hash-canary".into());
-    let unrelated = "v1/ConfigMap/control/public-config";
-    previous
-        .staged_content_digests
-        .insert(unrelated.into(), "public-digest-canary".into());
+        .insert(unrelated.clone(), public_digest.clone());
     let policy = policy(&registry.plan(TRANSITION_B)?.request.next.compiled);
     let (client, calls) = stateful_wire(vec![
         registry_object(&registry, REGISTRY_UID, "42")?,
@@ -2669,9 +2747,9 @@ async fn writer_checkpoint_is_private_and_independent_of_old_history()
     assert_eq!(
         prior
             .staged_content_digests
-            .get(unrelated)
+            .get(&unrelated)
             .map(String::as_str),
-        Some("public-digest-canary")
+        Some(public_digest.as_str())
     );
     let again = platform
         .ensure_previous_writer_checkpoint(TRANSITION_B, "executor-b")

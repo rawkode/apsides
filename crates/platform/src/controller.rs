@@ -152,6 +152,7 @@ impl PlatformClient {
                 approved_claims: claims,
                 rollout_key_id: key_id,
             };
+            crate::control_capacity::validate_activation(stored, &activation)?;
             let domain = &binding.domain_id;
             let activation_name = format!("reakt-activation-{domain}");
             let activation_object = self
@@ -167,6 +168,12 @@ impl PlatformClient {
             let activation: Versioned<ActivationState> = decode_state(&serde_json::from_value(
                 serde_json::to_value(activation_object)?,
             )?)?;
+            crate::control_capacity::validate_control_metadata(
+                stored,
+                &activation.uid,
+                &activation.resource_version,
+            )?;
+            crate::control_capacity::validate_activation(stored, &activation.value)?;
             let inventory = RuntimeInventory {
                 schema_version: SCHEMA_VERSION.into(),
                 binding: binding.clone(),
@@ -176,6 +183,7 @@ impl PlatformClient {
                 conditions: vec![],
                 drained: false,
             };
+            crate::control_capacity::validate_inventory(stored, &inventory)?;
             let inventory_name = format!("reakt-inventory-{domain}");
             self.stage_object(
                 registry,
@@ -267,7 +275,7 @@ impl PlatformClient {
                 "verified release or independent policy changed before staging",
             ));
         }
-        Ok(RuntimeBinding {
+        let binding = RuntimeBinding {
             domain_id: domain.id.clone(),
             cluster_binding: domain.cluster_binding.clone(),
             generation_id: next.generation_id.clone(),
@@ -281,7 +289,9 @@ impl PlatformClient {
                 .service_account_name
                 .clone(),
             controller_image: release.image.into(),
-        })
+        };
+        crate::runtime::validate_binding(&binding)?;
+        Ok(binding)
     }
 
     pub(crate) async fn preprovisioned_key_id(

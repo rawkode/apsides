@@ -673,7 +673,11 @@ fn prepare_pending_third_transition(
     let plan = deploy::plan_transition(&request)?;
     let record = deploy::begin(&plan, "executor-c")?;
     let inputs = transition_inputs(&plan, &policy(&plan.request.next.compiled))?;
-    let mut stored = StoredTransition::reserved(inputs, record);
+    let mut stored = StoredTransition::reserved(
+        inputs,
+        record,
+        CapacityAdmission::projection_placeholder(crate::completion_envelope::initial_profile()),
+    );
     stored.previous_writer_checkpoint = Some(
         registry
             .active_writer_checkpoints
@@ -686,6 +690,7 @@ fn prepare_pending_third_transition(
         .insert(names.transition_id.clone(), stored);
     registry.plans.insert(names.transition_id.clone(), plan);
     registry.next_sequence = 4;
+    registry.admit(&names.transition_id)?;
     Ok((registry, names.transition_id))
 }
 

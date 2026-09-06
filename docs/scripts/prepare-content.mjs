@@ -30,6 +30,7 @@ const references = [
   ["reakt/PERFORMANCE.md", "reakt/performance.md", "Performance comparison contract"],
   ["reakt/PLATFORM-CONTRACT.md", "reakt/platform-contract.md", "Platform contract"],
   ["reakt/SPEC-v0.2.md", "reakt/spec-v0-2.md", "Reakt specification 0.2"],
+  ["reakt/STATE-CAPACITY.md", "reakt/state-capacity.md", "State capacity admission"],
   ["reakt/STATE-MIGRATION.md", "reakt/state-migration.md", "State migration contract"],
   ["reakt/STATUS.md", "reakt/status.md", "Reakt implementation status"],
   ["reakt/TOOLCHAIN.md", "reakt/toolchain.md", "Toolchain choices"],
@@ -38,6 +39,14 @@ const references = [
 function withFrontmatter(source, title) {
   const withoutHeading = source
     .replace(/^# .+\n+/, "")
+    .replace(
+      /\]\(STATE-CAPACITY\.md(#[^)]+)?\)/g,
+      (_, fragment = "") => `](../state-capacity/${fragment})`,
+    )
+    .replace(
+      /\]\(SPEC-v0\.2\.md(#[^)]+)?\)/g,
+      (_, fragment = "") => `](../spec-v0-2/${fragment})`,
+    )
     .replace(
       /\]\(AUDIT\.md(#[^)]+)?\)/g,
       (_, fragment = "") => `](../audit/${fragment})`,

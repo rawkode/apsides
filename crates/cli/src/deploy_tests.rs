@@ -11,6 +11,27 @@ const TRANSITION_1: &str = "tceirceircfardairceirceirce-1";
 const TRANSITION_2: &str = "tceirceircfardairceirceirce-2";
 const SERVICE_ACCOUNT_1: &str = "rceirceircfardairceirceirce-1";
 
+fn routing_capacity() -> platform::CapacityAdmission {
+    platform::CapacityAdmission {
+        schema_version: "reakt.dev/capacity-admission/v1".into(),
+        revision: 0,
+        profile: platform::EvidenceProfile {
+            schema_version: "reakt.dev/evidence-profile/v1".into(),
+            max_controller_pods: 1,
+            max_regular_containers: 1,
+            max_init_containers: 0,
+            max_ephemeral_containers: 0,
+            max_uid_json_bytes: 128,
+            max_resource_version_json_bytes: 128,
+            max_container_id_json_bytes: 256,
+            max_drain_bytes: 131_072,
+        },
+        domain_bytes: 131_072,
+        activation_bytes: 16_384,
+        inventory_bytes: 262_144,
+    }
+}
+
 fn registry() -> Result<(NamespaceRegistry, deploy::TransitionPlan)> {
     let compiled = compiler_core::parse_and_validate(&json!({
         "testOnly":false,"schemaVersion":"reakt.dev/ir/v1",
@@ -60,6 +81,7 @@ fn registry() -> Result<(NamespaceRegistry, deploy::TransitionPlan)> {
     record.phase = Phase::Committed;
     history.active_allocation = Some(plan.generation_reservation.clone());
     let stored = StoredTransition {
+        capacity: routing_capacity(),
         inputs: frozen_inputs(&plan)?,
         record,
         staged_identity_uids: BTreeMap::new(),
@@ -301,4 +323,39 @@ fn review_checkpoint(
         &predecessor.scope.cluster,
     )?;
     Ok(checkpoint)
+}
+
+#[test]
+fn capacity_recovery_targets_only_untouched_upgrade_phases() -> Result<()> {
+    let (registry, _) = registry()?;
+    let mut stored = registry.transition(TRANSITION_1)?.clone();
+    stored.record.phase = Phase::Planned;
+    assert!(capacity::require_target(&ExistingTransition::Resume, Some(&stored)).is_err());
+    // Routing metadata is deliberately independent of release authentication.
+    stored.inputs.previous = Some(platform::FrozenPredecessor {
+        allocation: stored.allocation().clone(),
+        scope: inventory::InventoryScope {
+            cluster: "cluster-a".into(),
+            namespace: "workload".into(),
+            controller: "example".into(),
+        },
+        control_namespace: "control".into(),
+        snapshot_id: BUILD.into(),
+        retirement_role_binding_namespaces: vec!["control".into()],
+    });
+    for phase in [Phase::Planned, Phase::Staged] {
+        stored.record.phase = phase;
+        capacity::require_target(&ExistingTransition::Resume, Some(&stored))?;
+    }
+    for phase in [
+        Phase::Quiesced,
+        Phase::Activated,
+        Phase::Cleaning,
+        Phase::Committed,
+        Phase::Blocked,
+    ] {
+        stored.record.phase = phase;
+        assert!(capacity::require_target(&ExistingTransition::Resume, Some(&stored)).is_err());
+    }
+    Ok(())
 }

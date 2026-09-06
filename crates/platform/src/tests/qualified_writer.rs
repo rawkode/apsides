@@ -70,6 +70,7 @@ pub fn qualify(registry: &mut LifecycleRegistry, transition: &str) -> Result<Vec
     for object in &objects {
         record_support(stored, object)?;
     }
+    registry.admit(transition)?;
     Ok(objects)
 }
 
@@ -150,6 +151,16 @@ fn support_objects(
 fn record_support(stored: &mut StoredTransition, value: &Value) -> Result<()> {
     let mut object: DynamicObject = serde_json::from_value(value.clone())?;
     let types = object.types.as_ref().ok_or("support type missing")?;
+    // Pods and platform policy are observed support, not created stage objects.
+    if types.kind == "Pod"
+        || object
+            .metadata
+            .name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("reakt-proxy-policy-"))
+    {
+        return Ok(());
+    }
     let Some(namespace) = object.metadata.namespace.as_deref() else {
         return Ok(());
     };

@@ -4,13 +4,10 @@ use crate::{
 };
 use compiler_core::digest;
 use deploy::{Event, Phase, Quiescence, TerminationEvidence};
-use k8s_openapi::api::{
-    apps::v1::Deployment,
-    core::v1::{Node, Pod},
-};
+use k8s_openapi::api::apps::v1::Deployment;
 use kube::{
     Api,
-    api::{ApiResource, DeleteParams, DynamicObject, ListParams, PostParams, Preconditions},
+    api::{ApiResource, DeleteParams, DynamicObject, PostParams, Preconditions},
     core::GroupVersionKind,
 };
 
@@ -30,12 +27,13 @@ impl PlatformClient {
     ) -> Result<Versioned<NamespaceRegistry>> {
         self.verify_new_writer_qualification(transition, executor)
             .await?;
-        let result = self.quiesce_previous_inner(transition, executor).await;
+        let result = Box::pin(self.quiesce_previous_inner(transition, executor)).await;
         if let Err(crate::Error::Invalid(reason)) = &result {
             let registry = self.load_registry().await?;
             if let Some(stored) = registry.value.transitions.get(transition)
                 && stored.record.phase == Phase::Staged
                 && stored.record.executor_id == executor
+                && stored.upgrade_drain.is_some()
             {
                 self.transition_event(
                     &registry,
@@ -78,8 +76,11 @@ impl PlatformClient {
             .ok_or_else(|| invalid("drain checkpoint missing"))?;
         let proxy = &previous.proxy_identity;
         if drain.final_proxy_ledger.is_none() {
+            current.capacity.profile.validate_drain(&drain)?;
+            self.verify_runtime_topology(&previous, &drain.runtime_writers)
+                .await?;
             self.freeze_proxy_admission(proxy).await?;
-            self.mark_previous_draining(&previous).await?;
+            self.mark_previous_draining(&current, &previous).await?;
             self.wait_for_frozen_writes(proxy).await?;
             self.scale_writer_zero(&drain.runtime_writers).await?;
             let terminated = self
@@ -151,6 +152,7 @@ impl PlatformClient {
         transition: &str,
         previous: &WriterCheckpoint,
     ) -> Result<Versioned<NamespaceRegistry>> {
+        self.require_active_predecessor(previous).await?;
         self.verify_previous_writer_proxy(previous).await?;
         let proxy = &previous.proxy_identity;
         let binding = &previous.runtime_binding;
@@ -167,6 +169,20 @@ impl PlatformClient {
                     uid: proxy.pod_uid.clone(),
                     node_name: proxy.node_name.clone(),
                     node_uid: proxy.node_uid.clone(),
+                    containers: crate::CapturedContainers {
+                        regular: vec![
+                            crate::CapturedContainer {
+                                name: "envoy".into(),
+                                container_id: proxy.envoy_container_id.clone(),
+                            },
+                            crate::CapturedContainer {
+                                name: "admin".into(),
+                                container_id: proxy.admin_container_id.clone(),
+                            },
+                        ],
+                        init: vec![],
+                        ephemeral: vec![],
+                    },
                 }],
             },
             runtime_termination: None,
@@ -174,6 +190,13 @@ impl PlatformClient {
             proxy_termination: None,
             retired_identity_uids: std::collections::BTreeMap::default(),
         };
+        registry
+            .value
+            .transition(transition)?
+            .capacity
+            .profile
+            .validate_drain(&drain)
+            .map_err(|_| crate::Error::CapacityResizeRequired)?;
         return self.persist_drain(registry, transition, drain).await;
     }
 
@@ -221,7 +244,11 @@ impl PlatformClient {
         self.persist_registry(registry, &next).await
     }
 
-    async fn mark_previous_draining(&self, previous: &WriterCheckpoint) -> Result<()> {
+    async fn mark_previous_draining(
+        &self,
+        stored: &crate::StoredTransition,
+        previous: &WriterCheckpoint,
+    ) -> Result<()> {
         let binding = &previous.runtime_binding;
         let name = format!("reakt-activation-{}", binding.domain_id);
         let state: Versioned<ActivationState> =
@@ -238,7 +265,8 @@ impl PlatformClient {
         if state.value.status == ActivationStatus::Active {
             let mut next = state.value.clone();
             next.status = ActivationStatus::Draining;
-            crate::store::replace_state(
+            crate::control_capacity::validate_activation(stored, &next)?;
+            let written = crate::store::replace_state(
                 &self.client,
                 &self.control_namespace,
                 &name,
@@ -246,6 +274,15 @@ impl PlatformClient {
                 &next,
             )
             .await?;
+            crate::control_capacity::validate_control_metadata(
+                stored,
+                &written.uid,
+                &written.resource_version,
+            )?;
+            crate::control_capacity::validate_activation(stored, &written.value)?;
+            if written.value != next {
+                return Err(invalid("admission changed the old draining activation"));
+            }
         }
         Ok(())
     }
@@ -281,61 +318,7 @@ impl PlatformClient {
         &self,
         previous: &WriterCheckpoint,
     ) -> Result<ExpectedWriters> {
-        let binding = &previous.runtime_binding;
-        let deployment_uid = previous.controller_deployment_uid.clone();
-        let service_account = format!("{}-process", binding.service_account_name);
-        let api: Api<Pod> = Api::namespaced(self.client.clone(), &self.control_namespace);
-        let listed = api
-            .list(
-                &ListParams::default()
-                    .fields(&format!("spec.serviceAccountName={service_account}")),
-            )
-            .await?;
-        if listed.items.is_empty()
-            || listed.items.len() > 64
-            || listed.metadata.continue_.is_some_and(|s| !s.is_empty())
-        {
-            return Err(invalid(
-                "current tokenless controller stop set is absent or incomplete",
-            ));
-        }
-        let nodes: Api<Node> = Api::all(self.client.clone());
-        let mut pods = Vec::new();
-        for pod in listed.items {
-            if !pod
-                .metadata
-                .finalizers
-                .as_ref()
-                .is_some_and(|fs| fs.iter().any(|f| f == crate::TERMINATION_FINALIZER))
-            {
-                return Err(invalid("old controller lacks termination retention"));
-            }
-            let node_name = pod
-                .spec
-                .as_ref()
-                .and_then(|s| s.node_name.clone())
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| invalid("old controller node unknown"))?;
-            let node = nodes.get(&node_name).await?;
-            pods.push(ExpectedPod {
-                name: pod
-                    .metadata
-                    .name
-                    .ok_or_else(|| invalid("Pod name missing"))?,
-                uid: pod.metadata.uid.ok_or_else(|| invalid("Pod UID missing"))?,
-                node_name,
-                node_uid: node
-                    .metadata
-                    .uid
-                    .ok_or_else(|| invalid("Node UID missing"))?,
-            });
-        }
-        Ok(ExpectedWriters {
-            deployment_name: binding.service_account_name.clone(),
-            deployment_uid,
-            service_account_name: service_account,
-            pods,
-        })
+        self.capture_runtime_topology(previous).await
     }
 
     async fn retire_previous_identity(

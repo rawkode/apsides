@@ -151,6 +151,7 @@ impl PlatformClient {
         } else {
             let mut next = activation.value.clone();
             next.status = ActivationStatus::Active;
+            crate::control_capacity::validate_activation(&entry, &next)?;
             replace_state(
                 &self.client,
                 &self.control_namespace,
@@ -160,6 +161,12 @@ impl PlatformClient {
             )
             .await?
         };
+        crate::control_capacity::validate_control_metadata(
+            &entry,
+            &active.uid,
+            &active.resource_version,
+        )?;
+        crate::control_capacity::validate_activation(&entry, &active.value)?;
         let epoch = registry
             .value
             .transition(transition_id)?

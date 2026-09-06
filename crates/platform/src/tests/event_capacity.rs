@@ -49,7 +49,7 @@ async fn staging_and_activation_refuse_exhausted_receipts_before_writes() -> Tes
     assert!(
         error
             .to_string()
-            .contains("receipt capacity for completion or failure"),
+            .contains("transition exceeds its admitted recovery allowance"),
         "{error}"
     );
     assert!(
@@ -89,7 +89,7 @@ async fn staging_and_activation_refuse_exhausted_receipts_before_writes() -> Tes
     assert!(
         error
             .to_string()
-            .contains("receipt capacity for completion or failure"),
+            .contains("transition exceeds its admitted recovery allowance"),
         "{error}"
     );
     assert!(
@@ -140,7 +140,7 @@ async fn quiescence_and_cleanup_refuse_exhausted_receipts_before_writes() -> Tes
     assert!(
         error
             .to_string()
-            .contains("receipt capacity for completion or failure"),
+            .contains("transition exceeds its admitted recovery allowance"),
         "{error}"
     );
     assert!(
@@ -194,7 +194,7 @@ async fn quiescence_and_cleanup_refuse_exhausted_receipts_before_writes() -> Tes
     assert!(
         error
             .to_string()
-            .contains("receipt capacity for completion or failure"),
+            .contains("transition exceeds its admitted recovery allowance"),
         "{error}"
     );
     assert!(

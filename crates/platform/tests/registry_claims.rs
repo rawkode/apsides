@@ -217,7 +217,7 @@ async fn bootstrap_checks_exact_admission_response() -> Result {
 
 #[tokio::test]
 async fn legacy_registry_requires_explicit_recovery() -> Result {
-    for version in ["v2", "v3", "v4"] {
+    for version in ["v2", "v3", "v4", "v5"] {
         let mut old = state()?;
         old["schemaVersion"] = json!(format!("reakt.dev/namespace-registry/{version}"));
         let (client, calls) = client(Some(old), false);

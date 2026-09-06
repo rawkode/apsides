@@ -55,6 +55,7 @@ export default defineConfig({
             { label: "OCI packaging", slug: "reakt/oci-packaging" },
             { label: "Resource inventory", slug: "reakt/inventory" },
             { label: "Transition audit history", slug: "reakt/audit" },
+            { label: "State capacity", slug: "reakt/state-capacity" },
             { label: "State migration", slug: "reakt/state-migration" },
             { label: "Toolchain", slug: "reakt/toolchain" },
             { label: "Performance contract", slug: "reakt/performance" },

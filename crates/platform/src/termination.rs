@@ -16,6 +16,7 @@ pub struct ExpectedPod {
     pub uid: String,
     pub node_name: String,
     pub node_uid: String,
+    pub containers: crate::CapturedContainers,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +159,7 @@ async fn inspect_pod(
     terminated_containers(
         spec.containers.iter().map(|c| c.name.as_str()),
         status.container_statuses.as_deref(),
+        &expected_pod.containers.regular,
         container_ids,
     )?;
     terminated_containers(
@@ -166,6 +168,7 @@ async fn inspect_pod(
             .flatten()
             .map(|c| c.name.as_str()),
         status.init_container_statuses.as_deref(),
+        &expected_pod.containers.init,
         container_ids,
     )?;
     terminated_containers(
@@ -174,6 +177,7 @@ async fn inspect_pod(
             .flatten()
             .map(|c| c.name.as_str()),
         status.ephemeral_container_statuses.as_deref(),
+        &expected_pod.containers.ephemeral,
         container_ids,
     )?;
     Ok(())
@@ -258,11 +262,17 @@ fn verify_stopped_deployment(deployment: &Deployment, expected: &ExpectedWriters
 fn terminated_containers<'a>(
     names: impl Iterator<Item = &'a str>,
     statuses: Option<&[ContainerStatus]>,
+    captured: &[crate::CapturedContainer],
     ids: &mut Vec<String>,
 ) -> Result<()> {
     let expected: BTreeSet<_> = names.collect();
     let statuses = statuses.unwrap_or_default();
-    if statuses.len() != expected.len() {
+    if statuses.len() != expected.len()
+        || captured.len() != expected.len()
+        || captured
+            .iter()
+            .any(|container| !expected.contains(container.name.as_str()))
+    {
         return Err(invalid(
             "writer container termination evidence is incomplete",
         ));
@@ -280,6 +290,10 @@ fn terminated_containers<'a>(
         if terminal.finished_at.is_none()
             || terminal.reason.as_deref() == Some("ContainerStatusUnknown")
             || terminal.container_id.as_ref().is_none_or(String::is_empty)
+            || !captured.iter().any(|container| {
+                container.name == status.name
+                    && terminal.container_id.as_ref() == Some(&container.container_id)
+            })
         {
             return Err(invalid("writer container termination is unqualified"));
         }

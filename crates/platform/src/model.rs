@@ -104,6 +104,7 @@ pub struct RuntimeInventory {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoredTransition {
     pub inputs: crate::TransitionInputs,
+    pub capacity: crate::CapacityAdmission,
     pub record: TransitionRecord,
     pub staged_identity_uids: BTreeMap<String, String>,
     pub staged_content_digests: BTreeMap<String, String>,
@@ -133,9 +134,14 @@ impl StoredTransition {
     }
 
     #[cfg(feature = "deployer")]
-    pub(crate) fn reserved(inputs: crate::TransitionInputs, record: TransitionRecord) -> Self {
+    pub(crate) fn reserved(
+        inputs: crate::TransitionInputs,
+        record: TransitionRecord,
+        capacity: crate::CapacityAdmission,
+    ) -> Self {
         Self {
             inputs,
+            capacity,
             record,
             staged_identity_uids: BTreeMap::new(),
             staged_content_digests: BTreeMap::new(),

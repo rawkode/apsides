@@ -12,9 +12,25 @@
 #![forbid(unsafe_code)]
 //! Kubernetes-backed protected state. Hashes identify content; authenticated
 //! Kubernetes transport and platform-owned RBAC establish the writer boundary.
+mod capacity_checks;
+#[cfg(feature = "deployer")]
+mod capacity_resize;
+#[cfg(feature = "deployer")]
+mod completion_envelope;
+mod control_capacity;
+#[cfg(feature = "deployer")]
+mod envelope_record;
+#[cfg(feature = "deployer")]
+mod envelope_writer;
+mod evidence_profile;
 mod permissions;
+mod state_capacity;
+#[cfg(feature = "deployer")]
+mod topology_capture;
 mod transition_inputs;
 mod transition_record;
+pub use evidence_profile::{CapturedContainer, CapturedContainers, EvidenceProfile};
+pub use state_capacity::CapacityAdmission;
 pub use transition_inputs::{FrozenPredecessor, FrozenRegistrySnapshot, TransitionInputs};
 #[cfg(feature = "deployer")]
 mod transition_session;
@@ -87,7 +103,7 @@ pub fn registry_authority_name(
 }
 
 pub const REGISTRY_AUTHORITY_NAMESPACE: &str = "reakt-platform";
-pub const REGISTRY_SCHEMA_VERSION: &str = "reakt.dev/namespace-registry/v5";
+pub const REGISTRY_SCHEMA_VERSION: &str = "reakt.dev/namespace-registry/v6";
 pub const REGISTRY_AUTHORITY_SCHEMA_VERSION: &str = "reakt.dev/registry-authority/v1";
 pub const SCHEMA_VERSION: &str = "reakt.dev/platform/v1";
 pub const MAX_STATE_BYTES: usize = 512 * 1024;
@@ -98,6 +114,8 @@ pub enum Error {
     Invalid(String),
     #[error("platform operation pending: {0}")]
     Pending(String),
+    #[error("writer topology exceeds admitted evidence capacity; resize before quiescence")]
+    CapacityResizeRequired,
     #[error("platform activation is not active")]
     Inactive,
     #[error("Kubernetes platform request failed: {0}")]

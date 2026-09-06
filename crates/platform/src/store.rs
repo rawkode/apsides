@@ -364,6 +364,7 @@ impl PlatformClient {
     ) -> Result<Versioned<NamespaceRegistry>> {
         if request.next.compiled != *verified.compiled()
             || request.next.artifact_digest != verified.release_digest()
+            || verified.manifest().image.reference.len() > 4096
         {
             return Err(invalid(
                 "reservation requires the exact freshly verified release",
@@ -374,12 +375,12 @@ impl PlatformClient {
             verified.trust_policy_digest(),
         )
         .await?;
-        self.reserve_authenticated(
+        Box::pin(self.reserve_authenticated(
             request,
             executor_id,
             inventory,
             Some(verified.trust_policy_digest()),
-        )
+        ))
         .await
     }
 
@@ -430,6 +431,9 @@ impl PlatformClient {
         self.verify_ownership_intents(request).await?;
         let record = begin(&plan, executor_id)?;
         deploy::require_event_capacity(&plan, &record)?;
+        let profile = self
+            .select_evidence_profile(previous_writer_checkpoint.as_ref())
+            .await?;
         let mut next = current.value.clone();
         if next.transitions.values().any(|entry| {
             entry.domain_id() == domain.id && entry.record.phase != deploy::Phase::Committed
@@ -469,10 +473,19 @@ impl PlatformClient {
             current.value.claim_snapshot()?.reference()?,
             &policy.value,
         )?;
-        let mut stored = StoredTransition::reserved(inputs, record);
+        let mut stored = StoredTransition::reserved(
+            inputs,
+            record,
+            crate::CapacityAdmission::projection_placeholder(profile.clone()),
+        );
         stored.previous_writer_checkpoint = previous_writer_checkpoint;
         next.transitions
             .insert(request.transition_id.clone(), stored);
+        let capacity = crate::completion_envelope::calculate(&next, &plan, &profile)?;
+        next.transitions
+            .get_mut(&request.transition_id)
+            .ok_or_else(|| invalid("reserved transition disappeared during capacity admission"))?
+            .capacity = capacity;
         if let Some(trust) = trust_policy_digest {
             self.verify_release_trust(&domain.id, trust).await?;
         }

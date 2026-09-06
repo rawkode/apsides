@@ -40,6 +40,7 @@ impl PlatformClient {
         let candidate = authorization.candidate();
         if request.next.compiled != *candidate.compiled()
             || request.next.artifact_digest != candidate.release_digest()
+            || candidate.manifest().image.reference.len() > 4096
         {
             return Err(invalid("test reservation differs from signed candidate"));
         }
@@ -48,12 +49,12 @@ impl PlatformClient {
             candidate.trust_policy_digest(),
         )
         .await?;
-        self.reserve_authenticated(
+        Box::pin(self.reserve_authenticated(
             request,
             executor,
             inventory,
             Some(candidate.trust_policy_digest()),
-        )
+        ))
         .await
     }
 

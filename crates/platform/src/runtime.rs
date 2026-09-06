@@ -44,6 +44,10 @@ impl RuntimeAuthority {
             &format!("reakt-activation-{}", self.binding.domain_id),
         )
         .await?;
+        crate::control_capacity::validate_runtime_control_metadata(
+            &state.uid,
+            &state.resource_version,
+        )?;
         if state.value.schema_version != SCHEMA_VERSION || state.value.binding != self.binding {
             return Err(invalid("activation binding differs from this controller"));
         }
@@ -110,6 +114,10 @@ impl RuntimeAuthority {
             &format!("reakt-inventory-{}", self.binding.domain_id),
         )
         .await?;
+        crate::control_capacity::validate_runtime_control_metadata(
+            &inventory.value.activation_uid,
+            &inventory.value.activation_resource_version,
+        )?;
         if inventory.value.schema_version != SCHEMA_VERSION
             || inventory.value.binding != self.binding
         {
@@ -166,6 +174,10 @@ impl RuntimeAuthority {
         authority: &VerifiedActivation,
         next: RuntimeInventory,
     ) -> Result<Versioned<RuntimeInventory>> {
+        crate::control_capacity::validate_runtime_control_metadata(
+            &next.activation_uid,
+            &next.activation_resource_version,
+        )?;
         if previous.value.binding != self.binding
             || next.binding != self.binding
             || authority.state().binding != self.binding
@@ -275,6 +287,8 @@ pub(crate) fn validate_binding(binding: &RuntimeBinding) -> Result<()> {
             .controller_image
             .rsplit_once('@')
             .is_some_and(|(name, hash)| !name.is_empty() && valid_digest(hash))
+        || binding.controller_image.len() > 4096
+        || binding.controller_image.chars().any(char::is_whitespace)
     {
         return Err(invalid(
             "invalid runtime binding or unpinned controller image",
@@ -348,4 +362,34 @@ fn verify_claims(plan: &CompiledPlan, activation: &ActivationState) -> Result<()
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::validate_binding;
+    use crate::RuntimeBinding;
+
+    fn binding(image: String) -> RuntimeBinding {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        RuntimeBinding {
+            domain_id: "example".into(),
+            cluster_binding: "cluster-a".into(),
+            generation_id: "generation-a".into(),
+            build_digest: digest.clone(),
+            ir_digest: digest.clone(),
+            policy_digest: digest.clone(),
+            capability_digest: digest,
+            service_account_name: "controller".into(),
+            controller_image: image,
+        }
+    }
+
+    #[test]
+    fn controller_image_accepts_exact_bound_and_rejects_larger_or_whitespace() {
+        let suffix = format!("@sha256:{}", "b".repeat(64));
+        let exact = format!("{}{}", "a".repeat(4096 - suffix.len()), suffix);
+        assert!(validate_binding(&binding(exact.clone())).is_ok());
+        assert!(validate_binding(&binding(format!("a{exact}"))).is_err());
+        assert!(validate_binding(&binding(format!("a b{suffix}"))).is_err());
+    }
 }

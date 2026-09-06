@@ -270,6 +270,8 @@ impl PlatformClient {
     }
 
     fn validate_registry_allocations(&self, registry: &NamespaceRegistry) -> Result<()> {
+        let reference = registry.claim_snapshot()?.reference()?;
+        crate::state_capacity::validate_reserved_capacity(&registry.state(&reference)?)?;
         for (domain_id, history) in &registry.histories {
             if &history.domain_id != domain_id
                 || history.cluster_binding != registry.cluster_binding
@@ -293,6 +295,7 @@ impl PlatformClient {
         self.validate_registry_retention(registry)?;
         let mut sequences = BTreeSet::new();
         for (transition_id, stored) in &registry.transitions {
+            crate::capacity_checks::validate(stored)?;
             let allocation = stored.allocation();
             stored
                 .inputs

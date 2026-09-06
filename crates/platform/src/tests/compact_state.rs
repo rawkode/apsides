@@ -113,7 +113,11 @@ async fn selected_session_rejects_substituted_frozen_planning_authority() -> Tes
     let client = platform_client(client, "control", "workload", "cluster-a")?;
     let written = reserve_test_transition(&client, &request, "ci_job_1").await?;
     let plan = deploy::plan_transition(&request)?;
-    let bound = client.bind_test_plan(&plan, None)?;
+    let bound = client.bind_test_plan(
+        &plan,
+        None,
+        &written.value.transition(TRANSITION_A)?.capacity,
+    )?;
     bound.selected(&written, TRANSITION_A)?;
     for change in 0..3 {
         let mut substituted = written.clone();

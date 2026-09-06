@@ -295,6 +295,7 @@ impl PlatformClient {
             approved_claims: approved_claims(&registry.value, &stored)?,
             rollout_key_id: self.preprovisioned_key_id(&stored).await?,
         };
+        crate::control_capacity::validate_activation(&stored, &next)?;
         let active = if current.value == next {
             current
         } else {
@@ -307,6 +308,12 @@ impl PlatformClient {
             )
             .await?
         };
+        crate::control_capacity::validate_control_metadata(
+            &stored,
+            &active.uid,
+            &active.resource_version,
+        )?;
+        crate::control_capacity::validate_activation(&stored, &active.value)?;
         let inventory_name = format!("reakt-inventory-{}", binding.domain_id);
         let inventory: Versioned<RuntimeInventory> =
             read_state(&self.client, &self.control_namespace, &inventory_name).await?;
@@ -325,6 +332,7 @@ impl PlatformClient {
             conditions: vec![],
             drained: false,
         };
+        crate::control_capacity::validate_inventory(&stored, &fresh_inventory)?;
         replace_state(
             &self.client,
             &self.control_namespace,
