@@ -9,7 +9,11 @@ use compiler_core::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) fn identity(resource: &Resource) -> Result<ResourceIdentity> {
+/// Project a compiler resource into its canonical lifecycle identity.
+///
+/// # Errors
+/// Rejects resource types outside the supported lifecycle set.
+pub fn resource_identity(resource: &Resource) -> Result<ResourceIdentity> {
     let (api_group, plural) = match (resource.api_version.as_str(), resource.kind.as_str()) {
         ("v1", "ConfigMap") => ("", "configmaps"),
         ("v1", "Service") => ("", "services"),
@@ -44,7 +48,7 @@ fn resources(generation: &GenerationPlan) -> Result<BTreeMap<ResourceIdentity, &
         .ir
         .resources
         .iter()
-        .map(|resource| Ok((identity(resource)?, resource)))
+        .map(|resource| Ok((resource_identity(resource)?, resource)))
         .collect()
 }
 

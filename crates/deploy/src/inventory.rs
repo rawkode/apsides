@@ -34,7 +34,7 @@ pub fn generation_inventory(
     }
     let mut resources = Vec::new();
     for resource in &generation.compiled.ir.resources {
-        let identity = crate::planner::identity(resource)?;
+        let identity = crate::planner::resource_identity(resource)?;
         let uid = match by_identity.get(&identity) {
             Some(claim) => {
                 if claim.domain_id != domain.id || claim.generation_id != generation.generation_id {

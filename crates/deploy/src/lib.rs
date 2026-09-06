@@ -30,7 +30,7 @@ pub use ownership::{
     OwnershipIntent, freeze_ownership_intents, restore_ownership_intents,
     validate_frozen_ownership_intents, validate_ownership_intent,
 };
-pub use planner::{cleanup_decision, plan_inventory_cleanup, plan_transition};
+pub use planner::{cleanup_decision, plan_inventory_cleanup, plan_transition, resource_identity};
 pub use reducer::{advance, begin, require_event_capacity, service_account_name, verify_record};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

@@ -153,7 +153,7 @@ pub fn restore_ownership_intents(
             .resources
             .iter()
             .find(|resource| {
-                crate::planner::identity(resource)
+                crate::planner::resource_identity(resource)
                     .is_ok_and(|identity| identity == metadata.identity)
             })
             .ok_or_else(|| {
@@ -229,7 +229,8 @@ pub fn validate_ownership_intent(
         .resources
         .iter()
         .find(|resource| {
-            crate::planner::identity(resource).is_ok_and(|identity| identity == approval.identity)
+            crate::planner::resource_identity(resource)
+                .is_ok_and(|identity| identity == approval.identity)
         })
         .ok_or_else(|| {
             Error::Plan("ownership intent target is outside the compiled plan".into())
