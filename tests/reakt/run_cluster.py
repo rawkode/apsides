@@ -1049,7 +1049,7 @@ echo REAKT_INIT_EGRESS_DENIED
                     mutated = self.expected_revision(reaction, omitted_reaction=reaction["id"])
                     if actual != expected or mutated == expected:
                         raise RuntimeError("reaction-removal mutation was not detected by the independent revision oracle")
-                    evidence_files = ["reactor-evidence.json"]
+                    evidence_files = ["cluster-transcript.json"]
                     assertions = [assertion("baseline-revision", expected, actual),
                                   assertion("omitted-reaction-changes-revision", True, mutated != expected)]
                 else:

@@ -22,6 +22,8 @@ mod production_evidence;
 #[cfg(test)]
 mod production_evidence_live;
 mod provenance;
+#[cfg(test)]
+mod reactor_evidence_live;
 mod runner_evidence;
 
 pub use assertion_contract::validate_assertions;

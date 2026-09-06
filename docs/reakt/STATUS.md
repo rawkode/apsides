@@ -4,6 +4,15 @@ Reakt implements specification 0.2 in the workspace crates and the `@reakt/kuber
 
 ## Current integration checkpoint
 
+A fresh current-runtime reactor run passed all 43 required core cases and 46
+compiler fixture cases in its owned Kubernetes v1.34.3 cluster, then deleted the
+cluster (`work/reactor-b986698-results/result.json`). The fixture contract binds
+to the production IR measured at `3a45749`. Release staging subsequently failed
+because successful mutation cases referenced the receipt itself instead of the
+transcript containing their observations. That reference is corrected; historical
+receipts remain untouched. No assembled-evidence interoperability is claimed from
+this failed overall run. A fresh run is required for the corrected producer.
+
 Reactor evidence packaging now stages only successful runs into a flat release
 evidence directory, fixes all receipt references to the release namespace, and
 binds the coverage fragment to the production IR. Raw controller logs and cluster

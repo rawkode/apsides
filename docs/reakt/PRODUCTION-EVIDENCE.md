@@ -128,3 +128,11 @@ scan does not establish the absence of all possible secret material. The release
 verifier binds `evidence/run_cluster.py` to the runner source digest, and staging
 rejects source drift during measurement. `cuenv task reactorPackagingTest` verifies this
 boundary using synthetic records; it does not establish fresh cluster acceptance.
+
+`cuenv task reactorEvidenceLive`, with `APS_REACTOR_EVIDENCE_RELEASE` selecting an
+absolute assembled release directory, checks production payload integrity, exact
+production/fixture test-plan equality, every required core reactor case and the
+three fixture checks through the actual evidence validator. It accepts no extra
+case or check keys. This opt-in consumer grants no `VerifiedRelease`, does not
+verify signatures or the remaining production checks, and does not separately
+accept each supplemental `fixtureCases` entry.

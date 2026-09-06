@@ -188,6 +188,40 @@ class ReactorPackagingTests(unittest.TestCase):
             fixture.stage()
         self.assert_not_published(fixture)
 
+    def test_reaction_removal_mutation_uses_packaged_transcript_evidence(self):
+        runner = RUNNER.ReactorRunner.__new__(RUNNER.ReactorRunner)
+        reaction = {"id": "reaction-a"}
+        case = {"reactionId": reaction["id"], "scenario": "reaction-contribution-removed"}
+        runner.ir = {"reactions": [reaction]}
+        runner.fixture_cases = [case]
+        runner.fixture_results = {}
+        runner.target_revision = lambda _: "revision-before"
+        runner.expected_revision = (
+            lambda _, omitted_reaction=None:
+                "revision-before" if omitted_reaction is None else "revision-after-removal"
+        )
+
+        runner.bind_fixture_coverage()
+        row = runner.fixture_results[(reaction["id"], case["scenario"])]
+        self.assertEqual(row["status"], "passed")
+        self.assertEqual(row["evidenceFiles"], ["cluster-transcript.json"])
+        self.assertNotIn("reactor-evidence.json", row["evidenceFiles"])
+
+        fixture = self.fixture()
+        fixture.receipt["fixtureCases"] = {
+            row["caseDigest"]: {
+                "status": row["status"],
+                "assertions": row["assertions"],
+                "evidenceFiles": row["evidenceFiles"],
+            },
+        }
+        fixture.stage()
+        packaged = json.loads((fixture.output / "evidence/reactor-evidence.json").read_text())
+        packaged_row = packaged["fixtureCases"][row["caseDigest"]]
+        self.assertEqual(packaged_row["assertions"], row["assertions"])
+        self.assertEqual(packaged_row["evidenceFiles"], ["evidence/cluster-transcript.json"])
+        self.assertTrue((fixture.output / packaged_row["evidenceFiles"][0]).is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
