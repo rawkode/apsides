@@ -302,7 +302,8 @@ async fn connect(root: &Path, expected_digest: Option<&str>) -> Result<Deploymen
         &domain.cluster_binding,
     )?
     .with_claim_store(coordination.clone())
-    .with_audit_store(coordination);
+    .with_audit_store(coordination.clone())
+    .with_review_store(coordination);
     Ok(DeploymentContext {
         platform,
         verified,

@@ -117,6 +117,8 @@ async fn selected_session_rejects_substituted_frozen_planning_authority() -> Tes
         &plan,
         None,
         &written.value.transition(TRANSITION_A)?.capacity,
+        &crate::project_review_metadata(&plan)?,
+        None,
     )?;
     bound.selected(&written, TRANSITION_A)?;
     for change in 0..3 {

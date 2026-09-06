@@ -86,6 +86,8 @@ fn registry() -> Result<(NamespaceRegistry, deploy::TransitionPlan)> {
     record.phase = Phase::Committed;
     history.active_allocation = Some(plan.generation_reservation.clone());
     let stored = StoredTransition {
+        next_review_metadata: platform::project_review_metadata(&plan)?.reference()?,
+        previous_review_metadata: None,
         capacity: routing_capacity(),
         inputs: frozen_inputs(&plan)?,
         record,

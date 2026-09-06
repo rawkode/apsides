@@ -7,7 +7,7 @@ type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const PRIVATE_STAGE_KEY: &str = "private-stage-key-canary";
 
-fn prepare_cleaning_upgrade() -> TestResult<LifecycleRegistry> {
+pub(super) fn prepare_cleaning_upgrade() -> TestResult<LifecycleRegistry> {
     let mut registry = qualified_upgrade_fixture()?;
     let plan = registry.plan(TRANSITION_B)?.clone();
     let account = plan.generation_reservation.service_account_name.clone();
@@ -138,7 +138,7 @@ fn prepare_cleaning_initial() -> TestResult<LifecycleRegistry> {
     Ok(registry)
 }
 
-fn committed_event(id: &str) -> TestResult<Event> {
+pub(super) fn committed_event(id: &str) -> TestResult<Event> {
     Ok(Event::Committed {
         event_id: id.to_owned(),
         cleanup_receipts: Vec::new(),
@@ -677,6 +677,13 @@ fn prepare_pending_third_transition(
         inputs,
         record,
         CapacityAdmission::projection_placeholder(crate::completion_envelope::initial_profile()),
+        fixture_review_store().seed(crate::project_review_metadata(&plan)?)?,
+        Some(
+            registry
+                .transition(&predecessor_plan.request.transition_id)?
+                .next_review_metadata
+                .clone(),
+        ),
     );
     stored.previous_writer_checkpoint = Some(
         registry

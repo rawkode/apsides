@@ -24,6 +24,7 @@ mod envelope_record;
 mod envelope_writer;
 mod evidence_profile;
 mod permissions;
+mod review_metadata;
 mod review_projection;
 mod state_capacity;
 #[cfg(feature = "deployer")]
@@ -105,7 +106,7 @@ pub fn registry_authority_name(
 }
 
 pub const REGISTRY_AUTHORITY_NAMESPACE: &str = "reakt-platform";
-pub const REGISTRY_SCHEMA_VERSION: &str = "reakt.dev/namespace-registry/v6";
+pub const REGISTRY_SCHEMA_VERSION: &str = "reakt.dev/namespace-registry/v7";
 pub const REGISTRY_AUTHORITY_SCHEMA_VERSION: &str = "reakt.dev/registry-authority/v1";
 pub const SCHEMA_VERSION: &str = "reakt.dev/platform/v1";
 pub const MAX_STATE_BYTES: usize = 512 * 1024;

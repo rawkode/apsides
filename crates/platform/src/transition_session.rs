@@ -3,6 +3,7 @@ use crate::{
     NamespaceRegistry, PlatformClient, Result, StoredTransition, TransitionInputs, Versioned,
     invalid,
 };
+use coordination::{ReviewMetadataV1, ReviewRef};
 use deploy::{
     DeploymentRequest, GenerationPlan, PreviousGeneration, RegistrySnapshot, TransitionPlan,
 };
@@ -16,6 +17,15 @@ pub(crate) struct Selection {
     previous_writer_checkpoint: Option<crate::WriterCheckpoint>,
     trust_policy_digest: Option<String>,
     capacity: crate::CapacityAdmission,
+    reviews: AuthenticatedReviews,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct AuthenticatedReviews {
+    next_reference: ReviewRef,
+    previous_reference: Option<ReviewRef>,
+    next: Arc<ReviewMetadataV1>,
+    previous: Option<Arc<ReviewMetadataV1>>,
 }
 
 /// A selected release capability. Every lifecycle reload revalidates its frozen inputs.
@@ -53,6 +63,16 @@ impl ResolvedTransition {
     pub fn transition_id(&self) -> &str {
         &self.selected.stored.allocation().transition_id
     }
+    /// Return the selected release's complete authenticated declaration metadata.
+    #[must_use]
+    pub fn next_review_metadata(&self) -> &ReviewMetadataV1 {
+        &self.selected.reviews.next
+    }
+    /// Return the authenticated predecessor declaration when this is an upgrade.
+    #[must_use]
+    pub fn previous_review_metadata(&self) -> Option<&ReviewMetadataV1> {
+        self.selected.reviews.previous.as_deref()
+    }
 }
 impl TransitionSession {
     /// Load and resolve review evidence from the authenticated protected registry.
@@ -68,7 +88,8 @@ impl TransitionSession {
 #[derive(Clone)]
 pub(crate) struct ResolvedStoredTransition {
     pub plan: Arc<TransitionPlan>,
-    stored: StoredTransition,
+    stored: Box<StoredTransition>,
+    reviews: AuthenticatedReviews,
 }
 impl Deref for ResolvedStoredTransition {
     type Target = StoredTransition;
@@ -181,17 +202,45 @@ impl PlatformClient {
                 "rehydrated transition differs from protected plan commitment",
             ));
         }
+        let reviews = Box::pin(client.authenticate_reviews(stored, &plan)).await?;
         client.selection = Some(Arc::new(Selection {
             inputs: inputs.clone(),
             plan: Arc::new(plan),
             previous_writer_checkpoint: stored.previous_writer_checkpoint.clone(),
             trust_policy_digest: Some(trust_policy_digest.into()),
             capacity: stored.capacity.clone(),
+            reviews,
         }));
         client.selected(&registry, transition)?;
         Ok(TransitionSession {
             client,
             transition_id: transition.into(),
+        })
+    }
+
+    async fn authenticate_reviews(
+        &self,
+        stored: &StoredTransition,
+        plan: &TransitionPlan,
+    ) -> Result<AuthenticatedReviews> {
+        let next_reference = stored.next_review_metadata.clone();
+        let next = self.read_review_metadata(&next_reference).await?;
+        let projected = crate::project_review_metadata(plan)?;
+        if projected != next || projected.reference()? != next_reference {
+            return Err(invalid(
+                "selected release differs from protected review metadata",
+            ));
+        }
+        let previous_reference = stored.previous_review_metadata.clone();
+        let previous = match previous_reference.as_ref() {
+            Some(reference) => Some(Arc::new(self.read_review_metadata(reference).await?)),
+            None => None,
+        };
+        Ok(AuthenticatedReviews {
+            next_reference,
+            previous_reference,
+            next: Arc::new(next),
+            previous,
         })
     }
 
@@ -209,6 +258,8 @@ impl PlatformClient {
             || stored.inputs != selection.inputs
             || stored.previous_writer_checkpoint != selection.previous_writer_checkpoint
             || stored.capacity != selection.capacity
+            || stored.next_review_metadata != selection.reviews.next_reference
+            || stored.previous_review_metadata != selection.reviews.previous_reference
             || transition != selection.plan.request.transition_id
             || stored.allocation() != &selection.plan.generation_reservation
             || stored.plan_digest() != selection.plan.plan_digest
@@ -238,7 +289,8 @@ impl PlatformClient {
         }
         Ok(ResolvedStoredTransition {
             plan: selection.plan.clone(),
-            stored: stored.clone(),
+            stored: Box::new(stored.clone()),
+            reviews: selection.reviews.clone(),
         })
     }
 
@@ -254,7 +306,11 @@ impl PlatformClient {
                 )
                 .await?;
             }
-            self.selected(registry, &selection.plan.request.transition_id)?;
+            let stored = self.selected(registry, &selection.plan.request.transition_id)?;
+            let reviews = Box::pin(self.authenticate_reviews(&stored, &selection.plan)).await?;
+            if reviews != selection.reviews {
+                return Err(invalid("selected transition review metadata changed"));
+            }
             let policy = self
                 .load_policy(&selection.inputs.registry.generation_history.domain_id)
                 .await?;
@@ -291,6 +347,8 @@ impl PlatformClient {
         plan: &TransitionPlan,
         previous: Option<&crate::WriterCheckpoint>,
         capacity: &crate::CapacityAdmission,
+        next_review_metadata: &ReviewMetadataV1,
+        previous_review_metadata: Option<&ReviewMetadataV1>,
     ) -> Result<Self> {
         let policy = crate::PolicyState {
             schema_version: crate::SCHEMA_VERSION.into(),
@@ -308,6 +366,19 @@ impl PlatformClient {
             claims: plan.request.registry.claims.clone(),
         };
         let inputs = TransitionInputs::freeze(plan, claims.reference()?, &policy)?;
+        if crate::project_review_metadata(plan)? != *next_review_metadata {
+            return Err(invalid("test review metadata differs from plan"));
+        }
+        let next_review_reference = next_review_metadata.reference()?;
+        let previous_review_reference = previous_review_metadata
+            .map(ReviewMetadataV1::reference)
+            .transpose()?;
+        let reviews = AuthenticatedReviews {
+            next_reference: next_review_reference,
+            previous_reference: previous_review_reference,
+            next: Arc::new(next_review_metadata.clone()),
+            previous: previous_review_metadata.cloned().map(Arc::new),
+        };
         let mut client = self.clone();
         client.selection = Some(Arc::new(Selection {
             inputs,
@@ -315,6 +386,7 @@ impl PlatformClient {
             previous_writer_checkpoint: previous.cloned(),
             trust_policy_digest: None,
             capacity: capacity.clone(),
+            reviews,
         }));
         Ok(client)
     }

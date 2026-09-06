@@ -54,7 +54,25 @@ impl LifecycleRegistry {
 
     #[cfg(feature = "deployer")]
     fn admit(&mut self, transition: &str) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let profile = self.transition(transition)?.capacity.profile.clone();
+        let next =
+            fixture_review_store().seed(crate::project_review_metadata(self.plan(transition)?)?)?;
+        let previous = self
+            .transition(transition)?
+            .inputs
+            .previous
+            .as_ref()
+            .map(|prior| {
+                self.transition(&prior.allocation.transition_id)
+                    .map(|stored| stored.next_review_metadata.clone())
+            })
+            .transpose()?;
+        let stored = self
+            .transitions
+            .get_mut(transition)
+            .ok_or("fixture transition missing")?;
+        stored.next_review_metadata = next;
+        stored.previous_review_metadata = previous;
+        let profile = stored.capacity.profile.clone();
         let capacity =
             crate::completion_envelope::calculate(self, self.plan(transition)?, &profile)?;
         self.transitions
@@ -83,6 +101,21 @@ impl LifecycleRegistry {
             self.plan(transition)?,
             stored.previous_writer_checkpoint.as_ref(),
             &stored.capacity,
+            &fixture_review_store()
+                .read(&stored.next_review_metadata)?
+                .ok_or("fixture next review missing")?,
+            stored
+                .previous_review_metadata
+                .as_ref()
+                .map(|reference| {
+                    fixture_review_store()
+                        .read(reference)?
+                        .ok_or(coordination::Error::Invalid(
+                            "fixture previous review missing",
+                        ))
+                })
+                .transpose()?
+                .as_ref(),
         )?)
     }
 }
@@ -93,6 +126,12 @@ mod audit_support;
 mod compact_state;
 #[cfg(feature = "deployer")]
 mod qualified_writer;
+#[cfg(feature = "deployer")]
+mod review_bindings;
+#[cfg(feature = "deployer")]
+mod review_upgrade;
+#[path = "../../tests/support/review.rs"]
+mod review_support;
 
 type Calls = Arc<Mutex<Vec<(String, String, Value)>>>;
 
@@ -271,6 +310,11 @@ fn fixture_claim_store() -> &'static Arc<MemoryClaimStore> {
     STORE.get_or_init(|| Arc::new(MemoryClaimStore::default()))
 }
 
+fn fixture_review_store() -> &'static Arc<review_support::MemoryReviewStore> {
+    static STORE: OnceLock<Arc<review_support::MemoryReviewStore>> = OnceLock::new();
+    STORE.get_or_init(|| Arc::new(review_support::MemoryReviewStore::default()))
+}
+
 fn platform_client(
     client: Client,
     control_namespace: &str,
@@ -284,7 +328,8 @@ fn platform_client(
         cluster_binding,
     )?
     .with_claim_store(fixture_claim_store().clone())
-    .with_audit_store(Arc::new(audit_support::MemoryAuditStore::default())))
+    .with_audit_store(Arc::new(audit_support::MemoryAuditStore::default()))
+    .with_review_store(fixture_review_store().clone()))
 }
 
 fn claim_snapshot(registry: &NamespaceRegistry) -> platform::Result<ClaimSnapshotV1> {
@@ -1036,7 +1081,7 @@ fn staged_initial_fixture() -> std::result::Result<StagedInitialFixture, Box<dyn
     let deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":activation.binding.service_account_name,"namespace":"control","uid":"controller-uid","resourceVersion":"50"},"spec":{"replicas":0}});
     let inputs = transition_inputs(&plan, &policy)?;
     let plans = BTreeMap::from([(TRANSITION_A.into(), plan.clone())]);
-    let entry = staged_initial_transition(inputs, record, &activation, &trust)?;
+    let entry = staged_initial_transition(inputs, record, &activation, &trust, &plan)?;
     let mut claim = activation.approved_claims[0].claim.clone();
     claim.state = ClaimState::Reserved;
     let registry = hydrated_registry(
@@ -1057,12 +1102,15 @@ fn staged_initial_transition(
     record: deploy::TransitionRecord,
     activation: &ActivationState,
     trust: &Value,
+    plan: &deploy::TransitionPlan,
 ) -> std::result::Result<StoredTransition, Box<dyn std::error::Error>> {
     let deployment_key = format!(
         "apps/v1/Deployment/control/{}",
         activation.binding.service_account_name
     );
     Ok(StoredTransition {
+        next_review_metadata: fixture_review_store().seed(crate::project_review_metadata(plan)?)?,
+        previous_review_metadata: None,
         capacity: CapacityAdmission::projection_placeholder(
             crate::completion_envelope::initial_profile(),
         ),
@@ -1422,6 +1470,9 @@ fn staged_upgrade_fixture() -> std::result::Result<LifecycleRegistry, Box<dyn st
             verification_epoch: 0,
         },
     )?;
+    current.previous_review_metadata = Some(current.next_review_metadata.clone());
+    current.next_review_metadata =
+        fixture_review_store().seed(crate::project_review_metadata(&plan)?)?;
     current.inputs = transition_inputs(&plan, &policy)?;
     let current = retarget_staged_identity(current, &previous_plan, &plan)?;
     registry.transitions.insert(TRANSITION_B.into(), current);

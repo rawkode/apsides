@@ -127,6 +127,7 @@ pub struct PlatformClient {
     pub(crate) selection: Option<std::sync::Arc<crate::transition_session::Selection>>,
     pub(crate) claim_store: Option<std::sync::Arc<dyn coordination::ClaimStore>>,
     pub(crate) audit_store: Option<std::sync::Arc<dyn coordination::AuditStore>>,
+    pub(crate) review_store: Option<std::sync::Arc<dyn coordination::ReviewStore>>,
     pub(crate) client: Client,
     pub(crate) control_namespace: String,
     pub(crate) workload_namespace: String,
@@ -161,6 +162,7 @@ impl PlatformClient {
             selection: None,
             claim_store: None,
             audit_store: None,
+            review_store: None,
             client,
             control_namespace: control_namespace.into(),
             workload_namespace: workload_namespace.into(),
@@ -179,6 +181,17 @@ impl PlatformClient {
     #[must_use]
     pub fn with_audit_store(mut self, store: std::sync::Arc<dyn coordination::AuditStore>) -> Self {
         self.audit_store = Some(store);
+        self
+    }
+
+    /// Attach immutable declaration metadata storage for deployment sessions and reviews.
+    /// Runtime registry reads do not require this backend.
+    #[must_use]
+    pub fn with_review_store(
+        mut self,
+        store: std::sync::Arc<dyn coordination::ReviewStore>,
+    ) -> Self {
+        self.review_store = Some(store);
         self
     }
 
@@ -428,6 +441,8 @@ impl PlatformClient {
             ));
         }
         let plan = plan_transition(request)?;
+        let (review_metadata, previous_review_metadata) =
+            self.prepare_review_metadata(&current.value, &plan).await?;
         self.verify_ownership_intents(request).await?;
         let record = begin(&plan, executor_id)?;
         deploy::require_event_capacity(&plan, &record)?;
@@ -442,31 +457,7 @@ impl PlatformClient {
                 "domain has an unfinished transition; recover it without takeover",
             ));
         }
-        for reservation in &plan.reservations {
-            let uid = next
-                .claims
-                .iter()
-                .find(|claim| claim.identity == reservation.identity)
-                .and_then(|claim| claim.uid.clone())
-                .or_else(|| {
-                    request
-                        .ownership_intents
-                        .iter()
-                        .find(|intent| intent.approval.identity == reservation.identity)
-                        .map(|intent| intent.approval.observed_uid.clone())
-                });
-            next.claims
-                .retain(|claim| claim.identity != reservation.identity);
-            next.claims.push(ProtectedClaim {
-                identity: reservation.identity.clone(),
-                domain_id: domain.id.clone(),
-                generation_id: request.next.generation_id.clone(),
-                transition_id: request.transition_id.clone(),
-                state: ClaimState::Reserved,
-                uid,
-            });
-        }
-        next.claims.sort_by(|a, b| a.identity.cmp(&b.identity));
+        reserve_claims(&mut next, &plan);
         next.next_sequence = next_sequence;
         let inputs = crate::TransitionInputs::freeze(
             &plan,
@@ -477,6 +468,8 @@ impl PlatformClient {
             inputs,
             record,
             crate::CapacityAdmission::projection_placeholder(profile.clone()),
+            review_metadata.reference()?,
+            previous_review_metadata,
         );
         stored.previous_writer_checkpoint = previous_writer_checkpoint;
         next.transitions
@@ -486,6 +479,11 @@ impl PlatformClient {
             .get_mut(&request.transition_id)
             .ok_or_else(|| invalid("reserved transition disappeared during capacity admission"))?
             .capacity = capacity;
+        self.registry_candidate(&next)?;
+        if let Some(trust) = trust_policy_digest {
+            self.verify_release_trust(&domain.id, trust).await?;
+        }
+        self.publish_review_metadata(&review_metadata).await?;
         if let Some(trust) = trust_policy_digest {
             self.verify_release_trust(&domain.id, trust).await?;
         }
@@ -572,4 +570,34 @@ impl PlatformClient {
             service_account_uid: expected_sa_uid.into(),
         })
     }
+}
+
+#[cfg(feature = "deployer")]
+fn reserve_claims(next: &mut NamespaceRegistry, plan: &deploy::TransitionPlan) {
+    let request = &plan.request;
+    for reservation in &plan.reservations {
+        let uid = next
+            .claims
+            .iter()
+            .find(|claim| claim.identity == reservation.identity)
+            .and_then(|claim| claim.uid.clone())
+            .or_else(|| {
+                request
+                    .ownership_intents
+                    .iter()
+                    .find(|intent| intent.approval.identity == reservation.identity)
+                    .map(|intent| intent.approval.observed_uid.clone())
+            });
+        next.claims
+            .retain(|claim| claim.identity != reservation.identity);
+        next.claims.push(ProtectedClaim {
+            identity: reservation.identity.clone(),
+            domain_id: request.next.compiled.ir.domain.id.clone(),
+            generation_id: request.next.generation_id.clone(),
+            transition_id: request.transition_id.clone(),
+            state: ClaimState::Reserved,
+            uid,
+        });
+    }
+    next.claims.sort_by(|a, b| a.identity.cmp(&b.identity));
 }

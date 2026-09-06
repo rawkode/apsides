@@ -61,7 +61,7 @@ impl PlatformClient {
             != Some(crate::REGISTRY_SCHEMA_VERSION)
         {
             return Err(invalid(
-                "registry claim snapshot schema requires explicit recovery; automatic legacy migration is forbidden",
+                "registry review reference schema requires explicit recovery; automatic legacy migration is forbidden",
             ));
         }
         let state: NamespaceRegistryState = serde_json::from_value(raw.value)
@@ -139,7 +139,7 @@ impl PlatformClient {
                 "registry mutation changed its captured scope or incarnation",
             ));
         }
-        self.validate_registry_allocations(next)?;
+        let (snapshot, state) = self.registry_candidate(next)?;
         #[cfg(feature = "deployer")]
         self.validate_selection(&Versioned {
             value: next.clone(),
@@ -147,10 +147,6 @@ impl PlatformClient {
             resource_version: previous.resource_version.clone(),
         })
         .await?;
-        let snapshot = next.claim_snapshot()?;
-        let expected = snapshot.reference()?;
-        let state = next.state(&expected)?;
-        validate_state_size(&state)?;
         self.publish_claims(&snapshot).await?;
         let written = replace_state_at(
             &self.client,
@@ -173,6 +169,19 @@ impl PlatformClient {
             uid: written.uid,
             resource_version: written.resource_version,
         })
+    }
+
+    /// Validate the complete prospective wire state before any metadata publication.
+    #[cfg(feature = "deployer")]
+    pub(crate) fn registry_candidate(
+        &self,
+        next: &NamespaceRegistry,
+    ) -> Result<(ClaimSnapshotV1, NamespaceRegistryState)> {
+        self.validate_registry_allocations(next)?;
+        let snapshot = next.claim_snapshot()?;
+        let state = next.state(&snapshot.reference()?)?;
+        validate_state_size(&state)?;
+        Ok((snapshot, state))
     }
 
     /// Initialize a truly empty registry after its Kubernetes UID and authority anchor exist.
@@ -293,6 +302,7 @@ impl PlatformClient {
             crate::writer_checkpoint::active(registry, domain, &self.control_namespace)?;
         }
         self.validate_registry_retention(registry)?;
+        crate::review_metadata::validate_review_references(registry)?;
         let mut sequences = BTreeSet::new();
         for (transition_id, stored) in &registry.transitions {
             crate::capacity_checks::validate(stored)?;

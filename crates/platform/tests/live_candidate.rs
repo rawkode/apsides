@@ -52,7 +52,8 @@ async fn transition_step() -> Result<()> {
         &domain.cluster_binding,
     )?
     .with_claim_store(claim_store.clone())
-    .with_audit_store(claim_store.clone());
+    .with_audit_store(claim_store.clone())
+    .with_review_store(claim_store.clone());
     let trust = serde_json::from_value(bootstrap.load_trust_policy(&domain.id).await?.value)?;
     let candidate = release::verify_candidate(Path::new(artifact), &trust).await?;
     let authorization = candidate.authorize_test_staging(TestStagingScope {
@@ -93,7 +94,8 @@ async fn transition_step() -> Result<()> {
         &domain.cluster_binding,
     )?
     .with_claim_store(claim_store.clone())
-    .with_audit_store(claim_store);
+    .with_audit_store(claim_store.clone())
+    .with_review_store(claim_store);
     Box::pin(run_action(
         action,
         &settings,

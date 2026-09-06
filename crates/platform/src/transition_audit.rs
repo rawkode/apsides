@@ -159,6 +159,7 @@ impl PlatformClient {
             || old.allocation() != &metadata.allocation
             || active.allocation != metadata.allocation
             || selected.previous_writer_checkpoint.as_ref() != Some(active)
+            || selected.previous_review_metadata.as_ref() != Some(&old.next_review_metadata)
         {
             return Err(invalid(
                 "archive predecessor differs from committed active writer authority",
@@ -180,11 +181,11 @@ impl PlatformClient {
         if written != expected || self.read_audit_exact(&written).await? != audit {
             return Err(invalid("transition audit publication verification failed"));
         }
-        if next
-            .transitions
-            .get(successor)
-            .is_none_or(|stored| stored.record.phase != Phase::Committed)
-            || next.transitions.get(&metadata.allocation.transition_id) != Some(old)
+        if next.transitions.get(successor).is_none_or(|stored| {
+            stored.record.phase != Phase::Committed
+                || stored.next_review_metadata != selected.next_review_metadata
+                || stored.previous_review_metadata != selected.previous_review_metadata
+        }) || next.transitions.get(&metadata.allocation.transition_id) != Some(old)
             || next.audit_heads.get(domain) != previous.value.audit_heads.get(domain)
         {
             return Err(invalid(

@@ -105,6 +105,10 @@ pub struct RuntimeInventory {
 pub struct StoredTransition {
     pub inputs: crate::TransitionInputs,
     pub capacity: crate::CapacityAdmission,
+    /// Complete declaration metadata published before this reservation's registry CAS.
+    pub next_review_metadata: coordination::ReviewRef,
+    /// Immutable baseline copied from the protected active committed transition.
+    pub previous_review_metadata: Option<coordination::ReviewRef>,
     pub record: TransitionRecord,
     pub staged_identity_uids: BTreeMap<String, String>,
     pub staged_content_digests: BTreeMap<String, String>,
@@ -138,10 +142,14 @@ impl StoredTransition {
         inputs: crate::TransitionInputs,
         record: TransitionRecord,
         capacity: crate::CapacityAdmission,
+        next_review_metadata: coordination::ReviewRef,
+        previous_review_metadata: Option<coordination::ReviewRef>,
     ) -> Self {
         Self {
             inputs,
             capacity,
+            next_review_metadata,
+            previous_review_metadata,
             record,
             staged_identity_uids: BTreeMap::new(),
             staged_content_digests: BTreeMap::new(),

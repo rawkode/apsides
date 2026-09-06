@@ -1,6 +1,6 @@
 # State capacity admission
 
-Status: implemented in registry v6 with source, reducer and Kubernetes-wire
+Status: implemented in registry v6 and retained in v7 with source, reducer and Kubernetes-wire
 verification. Live maximal-profile completion and production release qualification
 remain unverified. The design discussion below records the preceding v5 gaps and
 the contract used for this implementation.
@@ -9,7 +9,7 @@ the contract used for this implementation.
 
 Each pending transition carries a protected `CapacityAdmission` outside its frozen
 planning inputs. It reserves canonical serialized bytes for the whole domain's
-remaining lifecycle, including retained predecessor state, staged metadata,
+remaining lifecycle, including both immutable review references, retained predecessor state, staged metadata,
 termination observations, receipts and the successor checkpoint. Registry loads
 and publications account for every pending domain's reservation, so one domain
 cannot consume another's unused space. Reservation rejects aggregate overflow
