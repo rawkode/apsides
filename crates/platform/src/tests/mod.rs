@@ -1,14 +1,16 @@
+use crate as platform;
+use crate::*;
 use compiler_core::{CompiledPlan, PermissionCeiling, digest, parse_and_validate};
 use coordination::{ClaimRef, ClaimSnapshotV1, ClaimStore};
 use deploy::{ClaimState, ProtectedClaim, ResourceIdentity};
 use http::{Request, Response};
 use http_body_util::BodyExt;
 use kube::{Client, client::Body};
-use platform::*;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
     convert::Infallible,
+    ops::{Deref, DerefMut},
     sync::{Arc, Mutex, OnceLock},
 };
 use tower::service_fn;
@@ -19,8 +21,55 @@ const GENERATION_B: &str = "gceirceircfardairceirceirce-2";
 const TRANSITION_A: &str = "tceirceircfardairceirceirce-1";
 const TRANSITION_B: &str = "tceirceircfardairceirceirce-2";
 
+#[derive(Clone)]
+struct LifecycleRegistry {
+    registry: NamespaceRegistry,
+    plans: BTreeMap<String, deploy::TransitionPlan>,
+}
+
+impl Deref for LifecycleRegistry {
+    type Target = NamespaceRegistry;
+
+    fn deref(&self) -> &Self::Target {
+        &self.registry
+    }
+}
+
+impl DerefMut for LifecycleRegistry {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.registry
+    }
+}
+
+impl LifecycleRegistry {
+    fn plan(&self, transition: &str) -> std::result::Result<&deploy::TransitionPlan, &'static str> {
+        self.plans.get(transition).ok_or("fixture plan missing")
+    }
+
+    fn bind(
+        &self,
+        client: Client,
+        control_namespace: &str,
+        workload_namespace: &str,
+        cluster_binding: &str,
+        transition: &str,
+    ) -> std::result::Result<PlatformClient, Box<dyn std::error::Error>> {
+        let stored = self.transition(transition)?;
+        Ok(platform_client(
+            client,
+            control_namespace,
+            workload_namespace,
+            cluster_binding,
+        )?
+        .bind_test_plan(
+            self.plan(transition)?,
+            stored.previous_writer_checkpoint.as_ref(),
+        )?)
+    }
+}
+
+mod compact_state;
 #[cfg(feature = "deployer")]
-#[path = "support/qualified_writer.rs"]
 mod qualified_writer;
 
 type Calls = Arc<Mutex<Vec<(String, String, Value)>>>;
@@ -36,6 +85,90 @@ struct LyingClaimStore {
 
 struct CorruptClaimStore {
     snapshot: ClaimSnapshotV1,
+}
+
+#[derive(Default)]
+struct MemoryInventoryStore {
+    rows: Mutex<BTreeMap<String, inventory::InventorySnapshot>>,
+}
+
+impl MemoryInventoryStore {
+    fn key(scope: &inventory::InventoryScope, snapshot_id: &str) -> String {
+        format!(
+            "{}\0{}\0{}\0{snapshot_id}",
+            scope.cluster, scope.namespace, scope.controller
+        )
+    }
+
+    fn seed(
+        &self,
+        scope: &inventory::InventoryScope,
+        snapshot: &inventory::InventorySnapshot,
+    ) -> inventory::Result<()> {
+        let id = inventory::snapshot_id(scope, snapshot)?;
+        self.rows
+            .lock()
+            .map_err(|_| inventory::Error::Backend("test inventory lock"))?
+            .insert(Self::key(scope, &id), snapshot.clone());
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl inventory::InventoryStore for MemoryInventoryStore {
+    async fn load(
+        &self,
+        _: &inventory::InventoryScope,
+    ) -> inventory::Result<Option<inventory::VersionedInventory>> {
+        Ok(None)
+    }
+
+    async fn read_snapshot(
+        &self,
+        scope: &inventory::InventoryScope,
+        snapshot_id: &str,
+    ) -> inventory::Result<Option<inventory::InventorySnapshot>> {
+        let snapshot = self
+            .rows
+            .lock()
+            .map_err(|_| inventory::Error::Backend("test inventory lock"))?
+            .get(&Self::key(scope, snapshot_id))
+            .cloned();
+        if let Some(snapshot) = &snapshot
+            && inventory::snapshot_id(scope, snapshot)? != snapshot_id
+        {
+            return Err(inventory::Error::Invalid("test inventory integrity"));
+        }
+        Ok(snapshot)
+    }
+
+    async fn publish(
+        &self,
+        scope: &inventory::InventoryScope,
+        _: Option<&str>,
+        snapshot: &inventory::InventorySnapshot,
+    ) -> inventory::Result<inventory::VersionedInventory> {
+        self.seed(scope, snapshot)?;
+        Ok(inventory::VersionedInventory {
+            revision: "1".into(),
+            snapshot_id: inventory::snapshot_id(scope, snapshot)?,
+            snapshot: snapshot.clone(),
+        })
+    }
+}
+
+async fn reserve_test_transition(
+    platform: &PlatformClient,
+    request: &deploy::DeploymentRequest,
+    executor: &str,
+) -> platform::Result<Versioned<NamespaceRegistry>> {
+    let inventory = MemoryInventoryStore::default();
+    if let Some(previous) = request.predecessor()? {
+        inventory.seed(&previous.scope, &previous.inventory)?;
+    }
+    platform
+        .reserve_authenticated(request, executor, &inventory, None)
+        .await
 }
 
 impl MemoryClaimStore {
@@ -197,6 +330,24 @@ fn hydrated_registry(
         transitions,
     }
     .hydrate(&snapshot)?)
+}
+
+fn transition_inputs(
+    plan: &deploy::TransitionPlan,
+    policy: &PolicyState,
+) -> std::result::Result<TransitionInputs, Box<dyn std::error::Error>> {
+    let domain = &plan.request.next.compiled.ir.domain;
+    let claims = ClaimSnapshotV1 {
+        schema_version: coordination::CLAIM_SNAPSHOT_SCHEMA.to_owned(),
+        scope: coordination::ClaimScope {
+            registry_uid: plan.request.registry.registry_uid.clone(),
+            cluster_binding: domain.cluster_binding.clone(),
+            control_namespace: domain.control_namespace.clone(),
+            workload_namespace: domain.namespace.clone(),
+        },
+        claims: plan.request.registry.claims.clone(),
+    };
+    Ok(TransitionInputs::freeze(plan, claims.reference()?, policy)?)
 }
 fn registry_authority() -> Value {
     let mut authority = object(
@@ -563,10 +714,14 @@ async fn namespace_claim_reservation_is_one_conditional_update_and_rejects_stale
         json!("echo-put"),
     ]);
     let platform = platform_client(client, "control", "workload", "cluster-a")?;
-    let changed = platform.reserve_transition(&request, "executor-a").await?;
+    let changed = reserve_test_transition(&platform, &request, "ci_job_1").await?;
     assert_eq!(changed.value.claims.len(), 1);
     assert_eq!(changed.value.claims[0].state, ClaimState::Reserved);
     assert_eq!(changed.value.next_sequence, 2);
+    assert_eq!(
+        changed.value.transition(TRANSITION_A)?.record.executor_id,
+        "ci_job_1"
+    );
     assert!(
         changed.value.histories["example"]
             .active_allocation
@@ -588,10 +743,9 @@ async fn namespace_claim_reservation_is_one_conditional_update_and_rejects_stale
     let mut stale = request.clone();
     stale.registry.revision = "41".into();
     let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
+    let platform = platform_client(client, "control", "workload", "cluster-a").unwrap();
     assert!(
-        platform_client(client, "control", "workload", "cluster-a")
-            .unwrap()
-            .reserve_transition(&stale, "executor-b")
+        reserve_test_transition(&platform, &stale, "executor-b")
             .await
             .is_err()
     );
@@ -609,8 +763,7 @@ async fn namespace_claim_reservation_is_one_conditional_update_and_rejects_stale
     let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?
         .with_claim_store(Arc::new(lying_store));
     assert!(
-        platform
-            .reserve_transition(&request, "executor-b")
+        reserve_test_transition(&platform, &request, "executor-b")
             .await
             .is_err()
     );
@@ -628,9 +781,9 @@ async fn namespace_claim_reservation_is_one_conditional_update_and_rejects_stale
         registry_response,
         json!("echo-mutated-registry-put"),
     ]);
+    let platform = platform_client(client, "control", "workload", "cluster-a")?;
     assert!(
-        platform_client(client, "control", "workload", "cluster-a")?
-            .reserve_transition(&request, "executor-b")
+        reserve_test_transition(&platform, &request, "executor-b")
             .await
             .is_err()
     );
@@ -767,7 +920,7 @@ async fn missing_pod_or_changed_node_never_proves_termination() {
 
 #[cfg(feature = "deployer")]
 type StagedInitialFixture = (
-    NamespaceRegistry,
+    LifecycleRegistry,
     ActivationState,
     PolicyState,
     Value,
@@ -833,34 +986,9 @@ fn staged_initial_fixture() -> std::result::Result<StagedInitialFixture, Box<dyn
     )
     .unwrap();
     let deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":activation.binding.service_account_name,"namespace":"control","uid":"controller-uid","resourceVersion":"50"},"spec":{"replicas":0}});
-    let deployment_key = format!(
-        "apps/v1/Deployment/control/{}",
-        activation.binding.service_account_name
-    );
-    let entry = StoredTransition {
-        plan,
-        record,
-        staged_identity_uids: [
-            (deployment_key.clone(), "controller-uid".into()),
-            (
-                "v1/ConfigMap/control/reakt-activation-example".into(),
-                "activation-uid".into(),
-            ),
-        ]
-        .into(),
-        staged_content_digests: [(
-            deployment_key,
-            digest(&json!({"spec":{"replicas":0}})).unwrap(),
-        )]
-        .into(),
-        runtime_binding: Some(activation.binding.clone()),
-        staged_trust_policy_digest: Some(digest(&trust).unwrap()),
-        staged_provenance_digest: Some(digest(&"verified provenance").unwrap()),
-        request_drain_qualification: Some(RequestDrainQualification::UnqualifiedDirectApi),
-        proxy_identity: None,
-        upgrade_drain: None,
-        previous_writer_checkpoint: None,
-    };
+    let inputs = transition_inputs(&plan, &policy)?;
+    let plans = BTreeMap::from([(TRANSITION_A.into(), plan.clone())]);
+    let entry = staged_initial_transition(inputs, record, &activation, &trust)?;
     let mut claim = activation.approved_claims[0].claim.clone();
     claim.state = ClaimState::Reserved;
     let registry = hydrated_registry(
@@ -870,7 +998,46 @@ fn staged_initial_fixture() -> std::result::Result<StagedInitialFixture, Box<dyn
         BTreeMap::new(),
         [(TRANSITION_A.into(), entry)].into(),
     )?;
-    Ok((registry, activation, policy, trust, deployment))
+    Ok((
+        LifecycleRegistry { registry, plans },
+        activation,
+        policy,
+        trust,
+        deployment,
+    ))
+}
+
+#[cfg(feature = "deployer")]
+fn staged_initial_transition(
+    inputs: TransitionInputs,
+    record: deploy::TransitionRecord,
+    activation: &ActivationState,
+    trust: &Value,
+) -> std::result::Result<StoredTransition, Box<dyn std::error::Error>> {
+    let deployment_key = format!(
+        "apps/v1/Deployment/control/{}",
+        activation.binding.service_account_name
+    );
+    Ok(StoredTransition {
+        inputs,
+        record,
+        staged_identity_uids: [
+            (deployment_key.clone(), "controller-uid".into()),
+            (
+                "v1/ConfigMap/control/reakt-activation-example".into(),
+                "activation-uid".into(),
+            ),
+        ]
+        .into(),
+        staged_content_digests: [(deployment_key, digest(&json!({"spec":{"replicas":0}}))?)].into(),
+        runtime_binding: Some(activation.binding.clone()),
+        staged_trust_policy_digest: Some(digest(trust)?),
+        staged_provenance_digest: Some(digest(&"verified provenance")?),
+        request_drain_qualification: Some(RequestDrainQualification::UnqualifiedDirectApi),
+        proxy_identity: None,
+        upgrade_drain: None,
+        previous_writer_checkpoint: None,
+    })
 }
 
 #[cfg(feature = "deployer")]
@@ -980,7 +1147,7 @@ fn stateful_wire_with_drift(
 async fn initial_activation_starts_only_after_protected_authority_and_resumes_committed()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (mut registry, activation, policy, trust, deployment) = staged_initial_fixture()?;
-    let mut objects = initial_support_fixture(&mut registry);
+    let mut objects = initial_support_fixture(&mut registry)?;
     objects.extend(qualified_writer::qualify(&mut registry, TRANSITION_A)?);
     objects.extend(vec![
         registry_object(&registry, REGISTRY_UID, "42")?,
@@ -995,7 +1162,9 @@ async fn initial_activation_starts_only_after_protected_authority_and_resumes_co
         deployment,
     ]);
     let (client, calls) = stateful_wire(objects);
-    let platform = platform_client(client, "control", "workload", "cluster-a").unwrap();
+    let platform = registry
+        .bind(client, "control", "workload", "cluster-a", TRANSITION_A)
+        .unwrap();
     let committed = platform
         .activate_initial(TRANSITION_A, "executor-a")
         .await
@@ -1027,7 +1196,7 @@ async fn initial_activation_starts_only_after_protected_authority_and_resumes_co
                 history.active_allocation.as_ref(),
                 Some(&checkpoint.allocation)
             );
-            assert_eq!(checkpoint.allocation, record.plan.generation_reservation);
+            assert_eq!(checkpoint.allocation, *record.allocation());
         } else {
             assert!(history.active_allocation.is_none());
             assert!(state.active_writer_checkpoints.is_empty());
@@ -1057,7 +1226,7 @@ async fn initial_activation_starts_only_after_protected_authority_and_resumes_co
 #[tokio::test]
 async fn initial_activation_rejects_changed_trust_without_writes()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let (mut registry, _, _, _, _) = staged_initial_fixture()?;
+    let (mut registry, _, _, trust, _) = staged_initial_fixture()?;
     qualified_writer::qualify(&mut registry, TRANSITION_A)?;
     let (client, calls) = wire(vec![
         registry_object(&registry, REGISTRY_UID, "42")?,
@@ -1068,21 +1237,63 @@ async fn initial_activation_rejects_changed_trust_without_writes()
             "43",
         ),
     ]);
+    let platform = registry
+        .bind(client, "control", "workload", "cluster-a", TRANSITION_A)?
+        .with_test_trust(&digest(&trust)?)?;
     assert!(
-        platform_client(client, "control", "workload", "cluster-a")
-            .unwrap()
+        platform
             .activate_initial(TRANSITION_A, "executor-a")
             .await
             .is_err()
     );
-    assert!(calls.lock().unwrap().iter().all(|c| c.0 == "GET"));
+    let calls = calls.lock().map_err(|_| "calls lock poisoned")?;
+    assert!(calls.iter().all(|call| call.0 == "GET"));
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.1.ends_with("/configmaps/reakt-trust-example"))
+    );
     Ok(())
 }
 
 #[cfg(feature = "deployer")]
-fn staged_upgrade_fixture() -> std::result::Result<NamespaceRegistry, Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn runtime_identity_stage_rejects_changed_bound_trust_before_writes()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let (registry, _, _, trust, _) = staged_initial_fixture()?;
+    let (client, calls) = wire(vec![
+        registry_object(&registry, REGISTRY_UID, "42")?,
+        object(
+            "reakt-trust-example",
+            &json!({"platform":"changed"}),
+            "trust-uid",
+            "43",
+        ),
+    ]);
+    let platform = registry
+        .bind(client, "control", "workload", "cluster-a", TRANSITION_A)?
+        .with_test_trust(&digest(&trust)?)?;
+    assert!(
+        platform
+            .stage_runtime_identity(TRANSITION_A, "executor-a")
+            .await
+            .is_err()
+    );
+    let calls = calls.lock().map_err(|_| "calls lock poisoned")?;
+    assert!(calls.iter().all(|call| call.0 == "GET"));
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.1.ends_with("/configmaps/reakt-trust-example"))
+    );
+    Ok(())
+}
+
+#[cfg(feature = "deployer")]
+fn staged_upgrade_fixture() -> std::result::Result<LifecycleRegistry, Box<dyn std::error::Error>> {
     use deploy::{Event, Phase, Quiescence, RegistrySnapshot, advance, begin, plan_transition};
-    let (mut registry, _, _, _, _) = staged_initial_fixture()?;
+    let (mut registry, _, policy, _, _) = staged_initial_fixture()?;
+    let previous_plan = registry.plan(TRANSITION_A)?.clone();
     let previous = registry
         .transitions
         .get_mut(TRANSITION_A)
@@ -1110,7 +1321,7 @@ fn staged_upgrade_fixture() -> std::result::Result<NamespaceRegistry, Box<dyn st
         },
     ] {
         previous.record = advance(
-            &previous.plan,
+            &previous_plan,
             &previous.record,
             previous.record.revision,
             "executor-a",
@@ -1123,19 +1334,19 @@ fn staged_upgrade_fixture() -> std::result::Result<NamespaceRegistry, Box<dyn st
         .histories
         .get_mut("example")
         .ok_or("domain history missing")?
-        .active_allocation = Some(previous.plan.generation_reservation.clone());
+        .active_allocation = Some(previous_plan.generation_reservation.clone());
     for claim in &mut registry.claims {
         claim.state = ClaimState::Active;
         claim
             .transition_id
-            .clone_from(&previous.plan.request.transition_id);
+            .clone_from(&previous_plan.request.transition_id);
     }
-    let mut request = previous.plan.request.clone();
+    let mut request = previous_plan.request.clone();
     request.transition_id = TRANSITION_B.into();
     request.previous = Some(deploy::PreviousGeneration::Metadata(Box::new(
         deploy::predecessor_metadata(
-            &previous.plan.request.next,
-            &previous.plan.generation_reservation,
+            &previous_plan.request.next,
+            &previous_plan.generation_reservation,
             &registry.claims,
         )?,
     )));
@@ -1167,13 +1378,14 @@ fn staged_upgrade_fixture() -> std::result::Result<NamespaceRegistry, Box<dyn st
             verification_epoch: 0,
         },
     )?;
-    current.plan = plan;
+    current.inputs = transition_inputs(&plan, &policy)?;
     current
         .runtime_binding
         .as_mut()
         .ok_or("runtime binding missing")?
         .generation_id = GENERATION_B.into();
     registry.transitions.insert(TRANSITION_B.into(), current);
+    registry.plans.insert(TRANSITION_B.into(), plan);
     registry.next_sequence = 3;
     Ok(registry)
 }
@@ -1191,13 +1403,12 @@ async fn predecessor_metadata_requires_exact_protected_retirement_authority_befo
         "missing-checkpoint",
         "changed-writer",
     ] {
-        let mut registry = with_active_checkpoint(qualified_upgrade_fixture()?).await?;
-        let mut request = registry
+        let mut registry = with_active_checkpoint(qualified_upgrade_fixture()?)?;
+        let mut request = registry.plan(TRANSITION_B)?.request.clone();
+        registry
             .transitions
             .remove(TRANSITION_B)
-            .ok_or("upgrade transition missing")?
-            .plan
-            .request;
+            .ok_or("upgrade transition missing")?;
         registry.next_sequence = request.registry.next_sequence;
         let Some(deploy::PreviousGeneration::Metadata(previous)) = request.previous.as_mut() else {
             return Err("fixture must use predecessor metadata".into());
@@ -1226,19 +1437,14 @@ async fn predecessor_metadata_requires_exact_protected_retirement_authority_befo
         let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
         let platform = platform_client(client, "control", "workload", "cluster-a")?;
         assert!(
-            platform
-                .reserve_transition(&request, "executor-b")
+            reserve_test_transition(&platform, &request, "executor-b")
                 .await
                 .is_err(),
             "{alteration}"
         );
         let calls = calls.lock().map_err(|_| "request lock poisoned")?;
-        assert_eq!(
-            calls.len(),
-            2,
-            "{alteration} must reject before policy or writes"
-        );
-        assert_eq!(calls.first().ok_or("registry read missing")?.0, "GET");
+        assert!(calls.iter().all(|call| call.0 == "GET"));
+        assert!(calls.len() <= 2, "{alteration} must reject before policy");
     }
     Ok(())
 }
@@ -1247,14 +1453,13 @@ async fn predecessor_metadata_requires_exact_protected_retirement_authority_befo
 #[tokio::test]
 async fn authenticated_metadata_predecessor_reserves_without_embedding_old_plan()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let mut registry = with_active_checkpoint(qualified_upgrade_fixture()?).await?;
+    let mut registry = with_active_checkpoint(qualified_upgrade_fixture()?)?;
     registry.transitions.remove(TRANSITION_A);
-    let request = registry
+    let request = registry.plan(TRANSITION_B)?.request.clone();
+    registry
         .transitions
         .remove(TRANSITION_B)
-        .ok_or("upgrade transition missing")?
-        .plan
-        .request;
+        .ok_or("upgrade transition missing")?;
     registry.next_sequence = request.registry.next_sequence;
     let policy = policy(&request.next.compiled);
     let (client, calls) = wire(vec![
@@ -1264,7 +1469,7 @@ async fn authenticated_metadata_predecessor_reserves_without_embedding_old_plan(
         json!("echo-put"),
     ]);
     let platform = platform_client(client, "control", "workload", "cluster-a")?;
-    let reserved = platform.reserve_transition(&request, "executor-b").await?;
+    let reserved = reserve_test_transition(&platform, &request, "executor-b").await?;
     assert!(
         reserved
             .value
@@ -1272,16 +1477,20 @@ async fn authenticated_metadata_predecessor_reserves_without_embedding_old_plan(
             .previous_writer_checkpoint
             .is_some()
     );
-    let previous = serde_json::to_value(
-        &reserved
-            .value
-            .transition(TRANSITION_B)?
-            .plan
-            .request
-            .previous,
-    )?;
+    let previous = serde_json::to_value(&request.previous)?;
     assert!(previous.get("compiled").is_none());
     assert!(previous.get("inventory").is_some());
+    let compact = serde_json::to_string(reserved.value.transition(TRANSITION_B)?)?;
+    for forbidden in [
+        "\"compiled\"",
+        "\"desired\"",
+        "\"source\"",
+        "\"claims\"",
+        "\"inventory\"",
+        "\"permittedApply\"",
+    ] {
+        assert!(!compact.contains(forbidden), "{forbidden}");
+    }
     assert_eq!(
         calls
             .lock()
@@ -1308,25 +1517,17 @@ async fn direct_api_predecessor_is_durably_blocked_and_forged_phase_never_writes
         registry_object(&registry, REGISTRY_UID, "42")?,
         json!("echo-put"),
     ]);
-    let platform = platform_client(client, "control", "workload", "cluster-a").unwrap();
+    let platform = registry
+        .bind(client, "control", "workload", "cluster-a", TRANSITION_B)
+        .unwrap();
     assert!(
         platform
             .quiesce_previous(TRANSITION_B, "executor-b")
             .await
             .is_err()
     );
-    assert_eq!(calls.lock().unwrap().len(), 8);
-    assert_eq!(calls.lock().unwrap()[7].0, "PUT");
-    let blocked = hydrate_registry(
-        calls.lock().unwrap()[7].2["data"]["state.json"]
-            .as_str()
-            .unwrap(),
-    )?;
-    assert_eq!(
-        blocked.transitions[TRANSITION_B].record.phase,
-        Phase::Blocked
-    );
-    assert_eq!(calls.lock().unwrap()[0].0, "GET");
+    assert_eq!(calls.lock().unwrap().len(), 2);
+    assert!(calls.lock().unwrap().iter().all(|call| call.0 == "GET"));
 
     for phase in [Phase::Quiesced, Phase::Activated, Phase::Cleaning] {
         let mut forged = registry.clone();
@@ -1337,7 +1538,9 @@ async fn direct_api_predecessor_is_durably_blocked_and_forged_phase_never_writes
             .record
             .phase = phase;
         let (client, calls) = wire(vec![registry_object(&forged, REGISTRY_UID, "42")?]);
-        let platform = platform_client(client, "control", "workload", "cluster-a").unwrap();
+        let platform = forged
+            .bind(client, "control", "workload", "cluster-a", TRANSITION_B)
+            .unwrap();
         assert!(
             platform
                 .activate_upgrade(TRANSITION_B, "executor-b")
@@ -1351,19 +1554,21 @@ async fn direct_api_predecessor_is_durably_blocked_and_forged_phase_never_writes
 }
 
 #[cfg(feature = "deployer")]
-fn initial_support_fixture(registry: &mut NamespaceRegistry) -> Vec<Value> {
-    let stored = registry.transitions.get_mut(TRANSITION_A).unwrap();
-    let name = stored
-        .plan
-        .generation_reservation
-        .service_account_name
-        .clone();
-    let annotations = json!({"reakt.dev/transition":TRANSITION_A,"reakt.dev/generation":GENERATION_A,"reakt.dev/plan-digest":stored.plan.plan_digest});
+fn initial_support_fixture(
+    registry: &mut LifecycleRegistry,
+) -> std::result::Result<Vec<Value>, Box<dyn std::error::Error>> {
+    let plan = registry.plan(TRANSITION_A)?.clone();
+    let stored = registry
+        .transitions
+        .get_mut(TRANSITION_A)
+        .ok_or("initial transition missing")?;
+    let name = stored.allocation().service_account_name.clone();
+    let annotations = json!({"reakt.dev/transition":TRANSITION_A,"reakt.dev/generation":GENERATION_A,"reakt.dev/plan-digest":stored.plan_digest()});
     let mut objects = vec![
         json!({"apiVersion":"v1","kind":"ServiceAccount","metadata":{"name":name,"namespace":"control","annotations":annotations},"automountServiceAccountToken":false}),
     ];
     let mut rules: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-    for capability in &stored.plan.request.next.compiled.capabilities {
+    for capability in &plan.request.next.compiled.capabilities {
         let resource = capability.subresource.as_ref().map_or_else(
             || capability.resource.clone(),
             |s| format!("{}/{s}", capability.resource),
@@ -1402,7 +1607,7 @@ fn initial_support_fixture(registry: &mut NamespaceRegistry) -> Vec<Value> {
             );
         }
     }
-    objects
+    Ok(objects)
 }
 
 #[cfg(feature = "deployer")]
@@ -1411,7 +1616,7 @@ async fn broadened_staged_role_and_recreated_config_block_before_activation()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     for changed_kind in ["Role", "ConfigMap"] {
         let (mut registry, activation, policy, trust, deployment) = staged_initial_fixture()?;
-        let mut objects = initial_support_fixture(&mut registry);
+        let mut objects = initial_support_fixture(&mut registry)?;
         objects.extend(qualified_writer::qualify(&mut registry, TRANSITION_A)?);
         let changed = objects
             .iter_mut()
@@ -1435,7 +1640,9 @@ async fn broadened_staged_role_and_recreated_config_block_before_activation()
             deployment,
         ]);
         let (client, calls) = stateful_wire(objects);
-        let platform = platform_client(client, "control", "workload", "cluster-a").unwrap();
+        let platform = registry
+            .bind(client, "control", "workload", "cluster-a", TRANSITION_A)
+            .unwrap();
         assert!(
             platform
                 .activate_initial(TRANSITION_A, "executor-a")
@@ -1453,6 +1660,7 @@ async fn crash_after_start_resume_rechecks_authority_before_replica_one_fast_pat
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     use deploy::{Event, Quiescence, advance};
     let (mut registry, activation, policy, trust, mut deployment) = staged_initial_fixture()?;
+    let plan = registry.plan(TRANSITION_A)?.clone();
     let entry = registry.transitions.get_mut(TRANSITION_A).unwrap();
     for event in [
         Event::Quiesced {
@@ -1469,7 +1677,7 @@ async fn crash_after_start_resume_rechecks_authority_before_replica_one_fast_pat
         },
     ] {
         entry.record = advance(
-            &entry.plan,
+            &plan,
             &entry.record,
             entry.record.revision,
             "executor-a",
@@ -1478,7 +1686,7 @@ async fn crash_after_start_resume_rechecks_authority_before_replica_one_fast_pat
         .unwrap();
     }
     deployment["spec"]["replicas"] = json!(1);
-    let mut objects = initial_support_fixture(&mut registry);
+    let mut objects = initial_support_fixture(&mut registry)?;
     objects.extend(qualified_writer::qualify(&mut registry, TRANSITION_A)?);
     objects.extend(vec![
         registry_object(&registry, REGISTRY_UID, "42")?,
@@ -1493,7 +1701,9 @@ async fn crash_after_start_resume_rechecks_authority_before_replica_one_fast_pat
         deployment,
     ]);
     let (client, calls) = stateful_wire_with_drift(objects, true);
-    let platform = platform_client(client, "control", "workload", "cluster-a").unwrap();
+    let platform = registry
+        .bind(client, "control", "workload", "cluster-a", TRANSITION_A)
+        .unwrap();
     assert!(
         platform
             .activate_initial(TRANSITION_A, "executor-a")
@@ -1611,10 +1821,8 @@ async fn adoption_reservation_rechecks_operator_approval_and_uses_non_force_uid_
             registry_object,
             json!("echo-put"),
         ]);
-        let result = platform_client(client, "control", "workload", "cluster-a")
-            .unwrap()
-            .reserve_transition(&request, "executor-a")
-            .await;
+        let platform = platform_client(client, "control", "workload", "cluster-a").unwrap();
+        let result = reserve_test_transition(&platform, &request, "executor-a").await;
         let calls = calls.lock().unwrap();
         assert_eq!(
             calls[3].1,
@@ -1644,9 +1852,10 @@ async fn adoption_reservation_rechecks_operator_approval_and_uses_non_force_uid_
 
 #[cfg(feature = "deployer")]
 fn committed_inventory_fixture()
--> std::result::Result<NamespaceRegistry, Box<dyn std::error::Error>> {
+-> std::result::Result<LifecycleRegistry, Box<dyn std::error::Error>> {
     use deploy::{Event, Quiescence, advance};
     let (mut registry, _, _, _, _) = staged_initial_fixture()?;
+    let plan = registry.plan(TRANSITION_A)?.clone();
     let stored = registry.transitions.get_mut(TRANSITION_A).unwrap();
     for event in [
         Event::Quiesced {
@@ -1671,7 +1880,7 @@ fn committed_inventory_fixture()
         },
     ] {
         stored.record = advance(
-            &stored.plan,
+            &plan,
             &stored.record,
             stored.record.revision,
             "executor-a",
@@ -1683,7 +1892,7 @@ fn committed_inventory_fixture()
         .histories
         .get_mut("example")
         .unwrap()
-        .active_allocation = Some(stored.plan.generation_reservation.clone());
+        .active_allocation = Some(plan.generation_reservation.clone());
     registry.claims[0].state = ClaimState::Active;
     registry.claims[0].uid = Some("observed-uid".into());
     Ok(registry)
@@ -1695,9 +1904,15 @@ async fn committed_inventory_persists_metadata_and_retries_after_reopen()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     use inventory::{InventoryStore, LibsqlInventory};
     let registry = committed_inventory_fixture()?;
+    let policy = policy(&registry.plan(TRANSITION_A)?.request.next.compiled);
     let response = registry_object(&registry, REGISTRY_UID, "42")?;
-    let (client, calls) = wire(vec![response; 6]);
-    let platform = platform_client(client, "control", "workload", "cluster-a").unwrap();
+    let (client, calls) = stateful_wire(vec![
+        response,
+        object("reakt-policy-example", &policy, "policy-uid", "44"),
+    ]);
+    let platform = registry
+        .bind(client, "control", "workload", "cluster-a", TRANSITION_A)
+        .unwrap();
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("inventory.db");
     let stored = {
@@ -1719,12 +1934,10 @@ async fn committed_inventory_persists_metadata_and_retries_after_reopen()
             .unwrap(),
         stored
     );
-    let scope = deploy::generation_inventory(
-        &registry.transitions[TRANSITION_A].plan.request.next,
-        &registry.claims,
-    )
-    .unwrap()
-    .0;
+    let scope =
+        deploy::generation_inventory(&registry.plan(TRANSITION_A)?.request.next, &registry.claims)
+            .unwrap()
+            .0;
     assert_eq!(reopened.load(&scope).await.unwrap(), Some(stored));
     let bytes = std::fs::read(path).unwrap();
     for private in [
@@ -1736,10 +1949,11 @@ async fn committed_inventory_persists_metadata_and_retries_after_reopen()
         assert!(!bytes.windows(private.len()).any(|window| window == private));
     }
     let calls = calls.lock().unwrap();
-    assert_eq!(calls.len(), 12);
+    assert_eq!(calls.len(), 18);
     assert!(calls.iter().all(|call| {
         call.0 == "GET"
             && (call.1.ends_with("/configmaps/reakt-registry-workload")
+                || call.1.ends_with("/configmaps/reakt-policy-example")
                 || call
                     .1
                     .ends_with("/configmaps/reakt-registry-authority.control.workload"))
@@ -1753,26 +1967,44 @@ async fn registry_races_do_not_report_inventory_completion()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     use inventory::{InventoryStore, LibsqlInventory};
     let registry = committed_inventory_fixture()?;
-    let scope = deploy::generation_inventory(
-        &registry.transitions[TRANSITION_A].plan.request.next,
-        &registry.claims,
-    )
-    .unwrap()
-    .0;
+    let scope =
+        deploy::generation_inventory(&registry.plan(TRANSITION_A)?.request.next, &registry.claims)
+            .unwrap()
+            .0;
     let stable = registry_object(&registry, REGISTRY_UID, "42")?;
     let changed = registry_object(&registry, REGISTRY_UID, "43")?;
+    let policy = object(
+        "reakt-policy-example",
+        &policy(&registry.plan(TRANSITION_A)?.request.next.compiled),
+        "policy-uid",
+        "44",
+    );
     for after_commit in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let store = LibsqlInventory::open_local(&directory.path().join("inventory.db"))
             .await
             .unwrap();
         let replies = if after_commit {
-            vec![stable.clone(), stable.clone(), changed.clone()]
+            vec![
+                stable.clone(),
+                policy.clone(),
+                stable.clone(),
+                policy.clone(),
+                changed.clone(),
+                policy.clone(),
+            ]
         } else {
-            vec![stable.clone(), changed.clone()]
+            vec![
+                stable.clone(),
+                policy.clone(),
+                changed.clone(),
+                policy.clone(),
+            ]
         };
         let (client, _) = wire(replies);
-        let platform = platform_client(client, "control", "workload", "cluster-a").unwrap();
+        let platform = registry
+            .bind(client, "control", "workload", "cluster-a", TRANSITION_A)
+            .unwrap();
         assert!(
             platform
                 .publish_committed_inventory(&store, TRANSITION_A, "executor-a")
@@ -1782,8 +2014,17 @@ async fn registry_races_do_not_report_inventory_completion()
                 .contains("registry changed")
         );
         assert_eq!(store.load(&scope).await.unwrap().is_some(), after_commit);
-        let (client, _) = wire(vec![changed.clone(); 3]);
-        let platform = platform_client(client, "control", "workload", "cluster-a").unwrap();
+        let (client, _) = wire(vec![
+            changed.clone(),
+            policy.clone(),
+            changed.clone(),
+            policy.clone(),
+            changed.clone(),
+            policy.clone(),
+        ]);
+        let platform = registry
+            .bind(client, "control", "workload", "cluster-a", TRANSITION_A)
+            .unwrap();
         assert!(
             platform
                 .publish_committed_inventory(&store, TRANSITION_A, "executor-a")
@@ -1812,13 +2053,7 @@ async fn inventory_refuses_forged_commits_wrong_claims_and_uid_regression()
     ] {
         let mut registry = committed_inventory_fixture()?;
         let (scope, mut snapshot) = deploy::generation_inventory(
-            &registry
-                .transitions
-                .get(TRANSITION_A)
-                .ok_or("missing fixture transition")?
-                .plan
-                .request
-                .next,
+            &registry.plan(TRANSITION_A)?.request.next,
             &registry.claims,
         )?;
         if corrupt == "head" {
@@ -1867,8 +2102,12 @@ async fn inventory_refuses_forged_commits_wrong_claims_and_uid_regression()
             "head" | "missing-resource" | "policy" | "api-type" => {}
             _ => return Err("unknown fixture corruption".into()),
         }
-        let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
-        let platform = platform_client(client, "control", "workload", "cluster-a")?;
+        let policy = policy(&registry.plan(TRANSITION_A)?.request.next.compiled);
+        let (client, calls) = wire(vec![
+            registry_object(&registry, REGISTRY_UID, "42")?,
+            object("reakt-policy-example", &policy, "policy-uid", "44"),
+        ]);
+        let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_A)?;
         assert!(
             platform
                 .publish_committed_inventory(&store, TRANSITION_A, "executor-a")
@@ -1877,7 +2116,9 @@ async fn inventory_refuses_forged_commits_wrong_claims_and_uid_regression()
             "{corrupt}"
         );
         assert_eq!(store.load(&scope).await?, Some(published));
-        assert_eq!(calls.lock().map_err(|_| "calls lock poisoned")?.len(), 2);
+        let calls = calls.lock().map_err(|_| "calls lock poisoned")?;
+        assert!(calls.len() <= 3);
+        assert!(calls.iter().all(|call| call.0 == "GET"));
     }
     Ok(())
 }
@@ -1887,7 +2128,7 @@ async fn inventory_refuses_forged_commits_wrong_claims_and_uid_regression()
 fn ci_permission_report_distinguishes_creation_scope_and_runtime_authority()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (registry, _, _, _, _) = staged_initial_fixture()?;
-    let plan = &registry.transition(TRANSITION_A)?.plan;
+    let plan = registry.plan(TRANSITION_A)?;
     let report = deployment_permissions(plan)?;
     let authority_access: Vec<_> = report
         .required_resources
@@ -1969,7 +2210,7 @@ fn ci_permission_report_distinguishes_creation_scope_and_runtime_authority()
 fn upgrade_ci_permissions_cover_retirement_and_actual_exec_method()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let registry = staged_upgrade_fixture()?;
-    let plan = &registry.transition(TRANSITION_B)?.plan;
+    let plan = registry.plan(TRANSITION_B)?;
     let report = deployment_permissions(plan)?;
     let previous = plan.request.predecessor()?.ok_or("missing predecessor")?;
     let account = previous.allocation.service_account_name.clone();
@@ -2015,46 +2256,51 @@ fn upgrade_ci_permissions_cover_retirement_and_actual_exec_method()
 #[tokio::test]
 async fn active_uid_capture_uses_inventory_and_rejects_missing_records()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let mut registry = staged_upgrade_fixture()?;
-    registry.transitions.remove(TRANSITION_B);
-    let snapshot: inventory::InventorySnapshot = serde_json::from_value(json!({
-        "schemaVersion":"reakt.dev/resource-inventory/v1", "generation":GENERATION_A,
-        "resources":[{"identity":{"apiGroup":"","resource":"configmaps","namespace":"workload","name":"config"},
-            "apiVersion":"v1","kind":"ConfigMap","uid":null,"deletionPolicy":"orphan"}]
-    }))?;
-    let control = registry_object(&registry, REGISTRY_UID, "42")?;
-    let live = json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{
-        "name":"config","namespace":"workload","uid":"captured-uid","resourceVersion":"9",
-        "managedFields":[{"manager":"reakt-example","operation":"Apply","apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{}}]
-    }});
-    let (client, calls) = wire(vec![
-        control.clone(),
-        live,
-        control.clone(),
-        json!("echo-put"),
-    ]);
-    let captured = platform_client(client, "control", "workload", "cluster-a")?
-        .capture_active_claim_uids("example", &snapshot)
-        .await?;
-    assert_eq!(
-        captured
-            .value
-            .claims
-            .first()
-            .and_then(|claim| claim.uid.as_deref()),
-        Some("captured-uid")
-    );
-    assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 5);
-    let mut missing = snapshot;
-    missing.resources.clear();
-    let (client, calls) = wire(vec![control]);
-    assert!(
-        platform_client(client, "control", "workload", "cluster-a")?
-            .capture_active_claim_uids("example", &missing)
-            .await
-            .is_err()
-    );
-    assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 2);
+    for remove_history in [false, true] {
+        let mut registry = staged_upgrade_fixture()?;
+        registry.transitions.remove(TRANSITION_B);
+        if remove_history {
+            registry.transitions.clear();
+        }
+        let snapshot: inventory::InventorySnapshot = serde_json::from_value(json!({
+            "schemaVersion":"reakt.dev/resource-inventory/v1", "generation":GENERATION_A,
+            "resources":[{"identity":{"apiGroup":"","resource":"configmaps","namespace":"workload","name":"config"},
+                "apiVersion":"v1","kind":"ConfigMap","uid":null,"deletionPolicy":"orphan"}]
+        }))?;
+        let control = registry_object(&registry, REGISTRY_UID, "42")?;
+        let live = json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{
+            "name":"config","namespace":"workload","uid":"captured-uid","resourceVersion":"9",
+            "managedFields":[{"manager":"reakt-example","operation":"Apply","apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{}}]
+        }});
+        let (client, calls) = wire(vec![
+            control.clone(),
+            live,
+            control.clone(),
+            json!("echo-put"),
+        ]);
+        let captured = platform_client(client, "control", "workload", "cluster-a")?
+            .capture_active_claim_uids("example", &snapshot)
+            .await?;
+        assert_eq!(
+            captured
+                .value
+                .claims
+                .first()
+                .and_then(|claim| claim.uid.as_deref()),
+            Some("captured-uid")
+        );
+        assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 5);
+        let mut missing = snapshot;
+        missing.resources.clear();
+        let (client, calls) = wire(vec![control]);
+        assert!(
+            platform_client(client, "control", "workload", "cluster-a")?
+                .capture_active_claim_uids("example", &missing)
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 2);
+    }
     Ok(())
 }
 
@@ -2068,14 +2314,12 @@ async fn captured_uid_publication_preserves_metadata_and_uses_authoritative_clai
     let store = LibsqlInventory::open_local(&path).await?;
     let mut registry = staged_upgrade_fixture()?;
     registry.transitions.remove(TRANSITION_B);
-    let (scope, snapshot) = deploy::generation_inventory(
-        &registry.transition(TRANSITION_A)?.plan.request.next,
-        &registry.claims,
-    )?;
+    let (scope, snapshot) =
+        deploy::generation_inventory(&registry.plan(TRANSITION_A)?.request.next, &registry.claims)?;
     let head = store.publish(&scope, None, &snapshot).await?;
     registry.claims.first_mut().ok_or("claim missing")?.uid = Some("authoritative-uid".into());
     let mut captured = Versioned {
-        value: registry.clone(),
+        value: registry.registry.clone(),
         uid: REGISTRY_UID.into(),
         resource_version: "42".into(),
     };
@@ -2127,14 +2371,12 @@ async fn captured_uid_publication_rejects_known_uid_change_without_overwrite()
     let mut registry = staged_upgrade_fixture()?;
     registry.transitions.remove(TRANSITION_B);
     registry.claims.first_mut().ok_or("claim missing")?.uid = Some("original-uid".into());
-    let (scope, snapshot) = deploy::generation_inventory(
-        &registry.transition(TRANSITION_A)?.plan.request.next,
-        &registry.claims,
-    )?;
+    let (scope, snapshot) =
+        deploy::generation_inventory(&registry.plan(TRANSITION_A)?.request.next, &registry.claims)?;
     let head = store.publish(&scope, None, &snapshot).await?;
     registry.claims.first_mut().ok_or("claim missing")?.uid = Some("different-uid".into());
     let captured = Versioned {
-        value: registry.clone(),
+        value: registry.registry.clone(),
         uid: REGISTRY_UID.into(),
         resource_version: "42".into(),
     };
@@ -2162,7 +2404,7 @@ async fn inventory_checkpoint_rejects_tampered_policy_and_legacy_authority_befor
         registry.transitions.remove(TRANSITION_B);
         let mut control = registry_object(&registry, REGISTRY_UID, "42")?;
         let (scope, mut snapshot) = deploy::generation_inventory(
-            &registry.transition(TRANSITION_A)?.plan.request.next,
+            &registry.plan(TRANSITION_A)?.request.next,
             &registry.claims,
         )?;
         if corruption == "policy" {
@@ -2201,7 +2443,7 @@ async fn inventory_checkpoint_rejects_tampered_policy_and_legacy_authority_befor
         }
         let head = store.publish(&scope, None, &snapshot).await?;
         let captured = Versioned {
-            value: registry.clone(),
+            value: registry.registry.clone(),
             uid: REGISTRY_UID.into(),
             resource_version: "42".into(),
         };
@@ -2239,10 +2481,8 @@ async fn inventory_checkpoint_rejects_wrong_transition_claim_snapshot_before_cap
     registry.transitions.remove(TRANSITION_B);
     let control = registry_object(&registry, REGISTRY_UID, "42")?;
     let mut corrupt_snapshot = registry.claim_snapshot()?;
-    let (scope, snapshot) = deploy::generation_inventory(
-        &registry.transition(TRANSITION_A)?.plan.request.next,
-        &registry.claims,
-    )?;
+    let (scope, snapshot) =
+        deploy::generation_inventory(&registry.plan(TRANSITION_A)?.request.next, &registry.claims)?;
     let head = store.publish(&scope, None, &snapshot).await?;
     registry
         .claims
@@ -2251,7 +2491,7 @@ async fn inventory_checkpoint_rejects_wrong_transition_claim_snapshot_before_cap
         .transition_id = "wrong-transition".into();
     corrupt_snapshot.claims.clone_from(&registry.claims);
     let captured = Versioned {
-        value: registry.clone(),
+        value: registry.registry.clone(),
         uid: REGISTRY_UID.into(),
         resource_version: "42".into(),
     };
@@ -2273,9 +2513,10 @@ async fn inventory_checkpoint_rejects_wrong_transition_claim_snapshot_before_cap
 }
 
 #[cfg(feature = "deployer")]
-fn qualified_upgrade_fixture() -> std::result::Result<NamespaceRegistry, Box<dyn std::error::Error>>
+fn qualified_upgrade_fixture() -> std::result::Result<LifecycleRegistry, Box<dyn std::error::Error>>
 {
     let mut registry = staged_upgrade_fixture()?;
+    let previous_plan = registry.plan(TRANSITION_A)?.clone();
     let previous = registry
         .transitions
         .get_mut(TRANSITION_A)
@@ -2324,7 +2565,7 @@ fn qualified_upgrade_fixture() -> std::result::Result<NamespaceRegistry, Box<dyn
     ] {
         previous.staged_identity_uids.insert(key, uid.into());
     }
-    for capability in &previous.plan.request.next.compiled.capabilities {
+    for capability in &previous_plan.request.next.compiled.capabilities {
         previous.staged_identity_uids.insert(
             format!(
                 "rbac.authorization.k8s.io/v1/RoleBinding/{}/{}",
@@ -2333,12 +2574,38 @@ fn qualified_upgrade_fixture() -> std::result::Result<NamespaceRegistry, Box<dyn
             format!("{}-binding-uid", capability.namespace),
         );
     }
+    let checkpoint = fixture_writer_checkpoint(&registry)?;
+    registry
+        .active_writer_checkpoints
+        .insert("example".into(), checkpoint.clone());
+    registry
+        .transitions
+        .get_mut(TRANSITION_B)
+        .ok_or("upgrade transition missing")?
+        .previous_writer_checkpoint = Some(checkpoint);
     Ok(registry)
 }
 
 #[cfg(feature = "deployer")]
+fn fixture_writer_checkpoint(
+    registry: &LifecycleRegistry,
+) -> std::result::Result<WriterCheckpoint, Box<dyn std::error::Error>> {
+    let (client, _) = wire(Vec::new());
+    let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_A)?;
+    let protected = Versioned {
+        value: registry.registry.clone(),
+        uid: REGISTRY_UID.into(),
+        resource_version: "42".into(),
+    };
+    let selected = platform.selected(&protected, TRANSITION_A)?;
+    Ok(crate::writer_checkpoint::project_committed(
+        registry, &selected,
+    )?)
+}
+
+#[cfg(feature = "deployer")]
 #[tokio::test]
-async fn writer_checkpoint_backfill_is_atomic_private_and_independent_of_old_history()
+async fn writer_checkpoint_is_private_and_independent_of_old_history()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut registry = qualified_upgrade_fixture()?;
     let previous = registry
@@ -2347,7 +2614,7 @@ async fn writer_checkpoint_backfill_is_atomic_private_and_independent_of_old_his
         .ok_or("predecessor missing")?;
     let tls_key = format!(
         "v1/Secret/control/{}-tls",
-        previous.plan.generation_reservation.service_account_name
+        previous.allocation().service_account_name
     );
     previous
         .staged_identity_uids
@@ -2359,8 +2626,12 @@ async fn writer_checkpoint_backfill_is_atomic_private_and_independent_of_old_his
     previous
         .staged_content_digests
         .insert(unrelated.into(), "public-digest-canary".into());
-    let (client, calls) = stateful_wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
-    let platform = platform_client(client, "control", "workload", "cluster-a")?;
+    let policy = policy(&registry.plan(TRANSITION_B)?.request.next.compiled);
+    let (client, calls) = stateful_wire(vec![
+        registry_object(&registry, REGISTRY_UID, "42")?,
+        object("reakt-policy-example", &policy, "policy-uid", "44"),
+    ]);
+    let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_B)?;
     let captured = platform
         .ensure_previous_writer_checkpoint(TRANSITION_B, "executor-b")
         .await?;
@@ -2403,35 +2674,45 @@ async fn writer_checkpoint_backfill_is_atomic_private_and_independent_of_old_his
             .iter()
             .filter(|(method, _, _)| method == "PUT")
             .collect();
-        assert_eq!(writes.len(), 1);
-        assert!(
-            !serde_json::to_string(&writes.first().ok_or("write absent")?.2)?
-                .contains("private-hash-canary")
-        );
+        assert!(writes.is_empty());
     }
 
-    let mut compacted = captured.value;
+    let mut compacted = LifecycleRegistry {
+        registry: captured.value,
+        plans: registry.plans.clone(),
+    };
     compacted.transitions.remove(TRANSITION_A);
-    let (client, calls) = wire(vec![registry_object(&compacted, REGISTRY_UID, "43")?]);
-    let restored = platform_client(client, "control", "workload", "cluster-a")?
+    let (client, calls) = wire(vec![
+        registry_object(&compacted, REGISTRY_UID, "43")?,
+        object("reakt-policy-example", &policy, "policy-uid", "44"),
+    ]);
+    let restored = compacted
+        .bind(client, "control", "workload", "cluster-a", TRANSITION_B)?
         .ensure_previous_writer_checkpoint(TRANSITION_B, "executor-b")
         .await?;
-    assert_eq!(restored.value, compacted);
-    assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 2);
+    assert_eq!(restored.value, compacted.registry);
+    assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 3);
     Ok(())
 }
 
 #[cfg(feature = "deployer")]
 #[tokio::test]
-async fn writer_checkpoint_backfill_rejects_registry_races_without_writes()
+async fn missing_previous_writer_checkpoint_requires_explicit_recovery_without_writes()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let registry = qualified_upgrade_fixture()?;
+    let mut registry = qualified_upgrade_fixture()?;
+    registry
+        .transitions
+        .get_mut(TRANSITION_B)
+        .ok_or("upgrade transition missing")?
+        .previous_writer_checkpoint = None;
+    let policy = policy(&registry.plan(TRANSITION_B)?.request.next.compiled);
     let (client, calls) = wire(vec![
         registry_object(&registry, REGISTRY_UID, "42")?,
-        registry_object(&registry, REGISTRY_UID, "43")?,
+        object("reakt-policy-example", &policy, "policy-uid", "44"),
     ]);
+    let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_B)?;
     assert!(
-        platform_client(client, "control", "workload", "cluster-a")?
+        platform
             .ensure_previous_writer_checkpoint(TRANSITION_B, "executor-b")
             .await
             .is_err()
@@ -2457,8 +2738,12 @@ async fn writer_checkpoint_backfill_rejects_registry_races_without_writes()
 async fn writer_checkpoint_substitution_never_overwrites_recorded_authority()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let registry = qualified_upgrade_fixture()?;
-    let (client, _) = stateful_wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
-    let platform = platform_client(client, "control", "workload", "cluster-a")?;
+    let policy = policy(&registry.plan(TRANSITION_B)?.request.next.compiled);
+    let (client, _) = stateful_wire(vec![
+        registry_object(&registry, REGISTRY_UID, "42")?,
+        object("reakt-policy-example", &policy, "policy-uid", "44"),
+    ]);
+    let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_B)?;
     let captured = platform
         .ensure_previous_writer_checkpoint(TRANSITION_B, "executor-b")
         .await?;
@@ -2471,7 +2756,10 @@ async fn writer_checkpoint_substitution_never_overwrites_recorded_authority()
         "extra-identity",
         "missing-identity",
     ] {
-        let mut changed = captured.value.clone();
+        let mut changed = LifecycleRegistry {
+            registry: captured.value.clone(),
+            plans: registry.plans.clone(),
+        };
         let checkpoint = changed
             .transitions
             .get_mut(TRANSITION_B)
@@ -2496,9 +2784,13 @@ async fn writer_checkpoint_substitution_never_overwrites_recorded_authority()
             }
             _ => return Err("unknown fixture alteration".into()),
         }
-        let (client, calls) = wire(vec![registry_object(&changed, REGISTRY_UID, "43")?]);
+        let (client, calls) = wire(vec![
+            registry_object(&changed, REGISTRY_UID, "43")?,
+            object("reakt-policy-example", &policy, "policy-uid", "44"),
+        ]);
         assert!(
-            platform_client(client, "control", "workload", "cluster-a")?
+            changed
+                .bind(client, "control", "workload", "cluster-a", TRANSITION_B)?
                 .ensure_previous_writer_checkpoint(TRANSITION_B, "executor-b")
                 .await
                 .is_err(),
@@ -2511,7 +2803,7 @@ async fn writer_checkpoint_substitution_never_overwrites_recorded_authority()
 
 #[cfg(feature = "deployer")]
 #[tokio::test]
-async fn writer_checkpoint_backfill_rejects_unapproved_capability_commitment()
+async fn immutable_writer_checkpoint_does_not_reread_historical_capability_commitment()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut registry = qualified_upgrade_fixture()?;
     registry
@@ -2520,14 +2812,19 @@ async fn writer_checkpoint_backfill_rejects_unapproved_capability_commitment()
         .and_then(|stored| stored.runtime_binding.as_mut())
         .ok_or("binding missing")?
         .capability_digest = digest(&"unapproved-capabilities")?;
-    let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
+    let policy = policy(&registry.plan(TRANSITION_B)?.request.next.compiled);
+    let (client, calls) = wire(vec![
+        registry_object(&registry, REGISTRY_UID, "42")?,
+        object("reakt-policy-example", &policy, "policy-uid", "44"),
+    ]);
+    let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_B)?;
     assert!(
-        platform_client(client, "control", "workload", "cluster-a")?
+        platform
             .ensure_previous_writer_checkpoint(TRANSITION_B, "executor-b")
             .await
-            .is_err()
+            .is_ok()
     );
-    assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 2);
+    assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 3);
     Ok(())
 }
 
@@ -2566,15 +2863,14 @@ fn wire_fixture_identities_match_the_production_allocator()
 async fn exhausted_allocator_rejects_reservation_without_writes()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (mut registry, _, _, _, _) = staged_initial_fixture()?;
-    let mut request = registry.transition(TRANSITION_A)?.plan.request.clone();
+    let mut request = registry.plan(TRANSITION_A)?.request.clone();
     registry.next_sequence = u64::MAX;
     registry.claims.clear();
     registry.transitions.clear();
     request.registry.next_sequence = u64::MAX;
     let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
     let platform = platform_client(client, "control", "workload", "cluster-a")?;
-    let error = platform
-        .reserve_transition(&request, "executor-a")
+    let error = reserve_test_transition(&platform, &request, "executor-a")
         .await
         .err()
         .ok_or("exhausted reservation unexpectedly succeeded")?;
@@ -2631,7 +2927,7 @@ async fn registry_authority_rejects_wrong_incarnation_scope_and_deletion()
 async fn competing_reservation_cannot_overwrite_the_winning_allocation()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (winner, _, policy, _, _) = staged_initial_fixture()?;
-    let request = winner.transition(TRANSITION_A)?.plan.request.clone();
+    let request = winner.plan(TRANSITION_A)?.request.clone();
     let mut initial = winner.clone();
     initial.next_sequence = 1;
     initial.claims.clear();
@@ -2642,8 +2938,7 @@ async fn competing_reservation_cannot_overwrite_the_winning_allocation()
         registry_object(&winner, REGISTRY_UID, "43")?,
     ]);
     let platform = platform_client(client, "control", "workload", "cluster-a")?;
-    let error = platform
-        .reserve_transition(&request, "executor-b")
+    let error = reserve_test_transition(&platform, &request, "executor-b")
         .await
         .err()
         .ok_or("competing reservation unexpectedly succeeded")?;
@@ -2660,7 +2955,7 @@ async fn competing_reservation_cannot_overwrite_the_winning_allocation()
 async fn another_domain_uses_the_registry_counter_after_domain_entry_removal()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (mut registry, _, _, _, _) = staged_initial_fixture()?;
-    let mut request = registry.transition(TRANSITION_A)?.plan.request.clone();
+    let mut request = registry.plan(TRANSITION_A)?.request.clone();
     registry.histories.remove("example");
     let history = deploy::GenerationHistory {
         domain_id: "other".into(),
@@ -2695,14 +2990,13 @@ async fn another_domain_uses_the_registry_counter_after_domain_entry_removal()
         json!("echo-put"),
     ]);
     let platform = platform_client(client, "control", "workload", "cluster-a")?;
-    let reserved = platform.reserve_transition(&request, "executor-b").await?;
+    let reserved = reserve_test_transition(&platform, &request, "executor-b").await?;
     assert_eq!(reserved.value.next_sequence, 3);
     assert_eq!(
         reserved
             .value
             .transition(&names.transition_id)?
-            .plan
-            .generation_reservation
+            .allocation()
             .sequence,
         2
     );
@@ -2723,14 +3017,12 @@ async fn another_domain_uses_the_registry_counter_after_domain_entry_removal()
 }
 
 #[tokio::test]
-async fn active_writer_backfill_survives_historical_plan_removal()
+async fn active_writer_checkpoint_survives_historical_transition_removal()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut registry = qualified_upgrade_fixture()?;
     registry.transitions.remove(TRANSITION_B);
-    let (scope, inventory) = deploy::generation_inventory(
-        &registry.transition(TRANSITION_A)?.plan.request.next,
-        &registry.claims,
-    )?;
+    let (scope, inventory) =
+        deploy::generation_inventory(&registry.plan(TRANSITION_A)?.request.next, &registry.claims)?;
     let (client, calls) = stateful_wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
     let platform = platform_client(client, "control", "workload", "cluster-a")?;
     let captured = platform.ensure_active_writer_checkpoint("example").await?;
@@ -2757,7 +3049,7 @@ async fn active_writer_backfill_survives_historical_plan_removal()
                 .iter()
                 .filter(|(method, _, _)| method == "PUT")
                 .count(),
-            1
+            0
         );
     }
     let mut compacted = captured.value;
@@ -2775,36 +3067,32 @@ async fn active_writer_backfill_survives_historical_plan_removal()
 }
 
 #[cfg(feature = "deployer")]
-async fn with_active_checkpoint(
-    mut registry: NamespaceRegistry,
-) -> std::result::Result<NamespaceRegistry, Box<dyn std::error::Error>> {
-    let mut committed = registry.clone();
-    committed.transitions.remove(TRANSITION_B);
-    let (client, _) = stateful_wire(vec![registry_object(&committed, REGISTRY_UID, "42")?]);
-    let platform = platform_client(client, "control", "workload", "cluster-a")?;
-    registry.active_writer_checkpoints = platform
-        .ensure_active_writer_checkpoint("example")
-        .await?
-        .value
-        .active_writer_checkpoints;
+fn with_active_checkpoint(
+    mut registry: LifecycleRegistry,
+) -> std::result::Result<LifecycleRegistry, Box<dyn std::error::Error>> {
+    let checkpoint = fixture_writer_checkpoint(&registry)?;
+    registry
+        .active_writer_checkpoints
+        .insert("example".into(), checkpoint.clone());
+    if let Some(stored) = registry.transitions.get_mut(TRANSITION_B) {
+        stored.previous_writer_checkpoint = Some(checkpoint);
+    }
     Ok(registry)
 }
 
 #[tokio::test]
-async fn active_writer_backfill_rejects_pending_claim_changes_and_registry_races()
+async fn missing_or_changed_active_writer_checkpoint_requires_explicit_recovery()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let registry = qualified_upgrade_fixture()?;
+    let mut registry = qualified_upgrade_fixture()?;
+    registry.active_writer_checkpoints.clear();
     let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
     let platform = platform_client(client, "control", "workload", "cluster-a")?;
     let error = platform
         .ensure_active_writer_checkpoint("example")
         .await
         .err()
-        .ok_or("unfinished transition unexpectedly allowed backfill")?;
-    assert!(
-        error.to_string().contains("undisturbed committed claims"),
-        "{error}"
-    );
+        .ok_or("missing checkpoint unexpectedly accepted")?;
+    assert!(error.to_string().contains("explicit recovery"), "{error}");
     assert!(
         calls
             .lock()
@@ -2812,20 +3100,22 @@ async fn active_writer_backfill_rejects_pending_claim_changes_and_registry_races
             .iter()
             .all(|(method, _, _)| method == "GET")
     );
-    let mut committed = registry;
-    committed.transitions.remove(TRANSITION_B);
-    let (client, calls) = wire(vec![
-        registry_object(&committed, REGISTRY_UID, "42")?,
-        registry_object(&committed, REGISTRY_UID, "43")?,
-    ]);
+    let mut changed = qualified_upgrade_fixture()?;
+    changed
+        .active_writer_checkpoints
+        .get_mut("example")
+        .ok_or("checkpoint missing")?
+        .allocation
+        .generation_id = "other-generation".into();
+    let (client, calls) = wire(vec![registry_object(&changed, REGISTRY_UID, "42")?]);
     let platform = platform_client(client, "control", "workload", "cluster-a")?;
     let error = platform
         .ensure_active_writer_checkpoint("example")
         .await
         .err()
-        .ok_or("registry race unexpectedly allowed backfill")?;
+        .ok_or("changed checkpoint unexpectedly accepted")?;
     assert!(
-        error.to_string().contains("UID/resourceVersion changed"),
+        error.to_string().contains("allocation or scope differs"),
         "{error}"
     );
     assert!(
@@ -2842,8 +3132,12 @@ async fn active_writer_backfill_rejects_pending_claim_changes_and_registry_races
 async fn unqualified_initial_writer_rejects_before_activation_mutations()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (registry, _, _, _, _) = staged_initial_fixture()?;
-    let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
-    let platform = platform_client(client, "control", "workload", "cluster-a")?;
+    let policy = policy(&registry.plan(TRANSITION_A)?.request.next.compiled);
+    let (client, calls) = wire(vec![
+        registry_object(&registry, REGISTRY_UID, "42")?,
+        object("reakt-policy-example", &policy, "policy-uid", "44"),
+    ]);
+    let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_A)?;
     let error = platform
         .activate_initial(TRANSITION_A, "executor-a")
         .await

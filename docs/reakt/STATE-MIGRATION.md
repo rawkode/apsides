@@ -1,6 +1,22 @@
 # State migration contract
 
-Status: implementation in progress. Historical OCI retrieval is not an upgrade prerequisite.
+Status: implementation in progress. Historical OCI retrieval is not an upgrade prerequisite. The current cutover below supersedes the historical implementation checkpoints later in this document.
+
+## Current compact transition cutover (automated checks passed; live qualification pending)
+
+Registry schema `reakt.dev/namespace-registry/v4` replaces stored full plans with `TransitionInputs`. Canonical in-memory plans remain `reakt.dev/transition-plan/v4`; these are separate schema versions. No full compiled plan is part of the new registry wire type.
+
+Frozen inputs select the original pre-reservation claim snapshot, registry revision/counter/history, next allocation, policy digest and plan digest. Upgrades also select the exact predecessor inventory snapshot by scope and snapshot ID, its allocation and retirement namespaces. Frozen ownership metadata retains approval object identity/version and observed resource identity/version. Permitted apply payloads are reconstructed from the verified new release. The metadata database contains no desired values or their hashes; protected Kubernetes coordination still retains plan, artifact, IR and policy commitments.
+
+Reservation independently verifies that claim and predecessor inventory snapshots are readable and exact before the registry CAS. Nonempty runtime observations are rejected because this format does not freeze them. Resume requires a `TransitionSession` created from a `VerifiedRelease` and the immutable stores. It reconstructs the request, requires exact canonical plan digest/allocation, and verifies record replay. Missing or corrupt snapshots, changed policy or a different release fail; none can become empty state.
+
+The selected plan lives only in memory, outside `NamespaceRegistry`. Lifecycle reloads pin exact frozen inputs and the immutable predecessor writer checkpoint, and recheck protected release trust and runtime policy. Read-only review resolves its own authenticated registry load; callers cannot pair a plan with arbitrary copied registry state. It grants no mutation authority. Other compact records receive structural validation without historical release retrieval. Full event replay applies to the selected release-bound transition.
+
+Active UID capture no longer searches historical transitions. Final commit publishes the active writer checkpoint, and upgrade reservation freezes it on the new transition. Missing checkpoints require explicit recovery; the new registry schema does not backfill from old plans. Pre-v4 registries require administrative recovery, with no automatic migration implemented.
+
+Review reports known prior membership and deletion policy, with unavailable historical structure explicitly marked. Complete specification section 25 reporting remains unresolved. Transition/event history, resource-sized evidence maps, activation approvals, the planner's reconstructed-request size limit and registry object limit also remain. Removing manifests alone does not establish bounded production state.
+
+`cuenv task registryTest` passed 116 tests with two live tests skipped (`work/compact-registry-final-tests.log`), and `cuenv task registryCheck` passed strict all-target Clippy (`work/compact-registry-final-clippy.log`). Independent production, CLI, harness and test-diff review found no remaining blockers. Tests cover exact frozen-input substitution, meaningful trust-revocation rejection before writes, actual registry-wire private canaries, legacy schema rejection, local database reopen and the retained lifecycle cases. Formatting, whitespace and lifecycle harness syntax checks passed. The later historical sections record preceding checkpoints. No live Pod upgrade, persistent-volume attachment, Turso-primary behavior or greater-than-one-MiB end-to-end acceptance is claimed for this cutover. Snapshot garbage collection must preserve every reachable reference, including original planning snapshots needed for resume; garbage collection is not implemented.
 
 CI supplies the new compiled controller and updates its Roles, RoleBindings and image. Previous resource identities, UIDs and deletion policies come from persistent metadata-only inventory. The executor must not need old manifests, source or compiled artifacts to prune or preserve omitted resources.
 
@@ -24,7 +40,11 @@ CI supplies the new compiled controller and updates its Roles, RoleBindings and 
 
 Exercise omitted-resource delete and orphan policy, retained resources, replacement UIDs, finalizer-delayed cleanup, concurrent deployers, interruption across each storage/Kubernetes boundary, idempotent recovery and revoked old writers. Prove that more than one MiB of resource tracking and repeated upgrades do not enlarge a Kubernetes object without bound. Scan persisted inventory for private-value canaries and their hashes. Verify local persistent libSQL and a TLS Turso primary separately.
 
-The current executor still serializes full transition plans in ConfigMaps. This document does not claim that migration is complete.
+## Superseded implementation checkpoints
+
+The following sections describe intermediate commits before the compact registry v4 cutover above. References to retained full plans and checkpoint backfill are historical behavior, not supported recovery paths in the current schema. Plan v4 and registry v4 are distinct version numbers.
+
+At the first migration checkpoint, the executor still serialized full transition plans in ConfigMaps. The following checks did not establish completion of that migration.
 
 ## Protected inventory checkpoint
 

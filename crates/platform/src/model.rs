@@ -1,7 +1,5 @@
 use compiler_core::{DeletionPolicy, PermissionCeiling};
-use deploy::{
-    GenerationHistory, ProtectedClaim, RuntimeObservation, TransitionPlan, TransitionRecord,
-};
+use deploy::{GenerationHistory, ProtectedClaim, RuntimeObservation, TransitionRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -105,7 +103,7 @@ pub struct RuntimeInventory {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoredTransition {
-    pub plan: TransitionPlan,
+    pub inputs: crate::TransitionInputs,
     pub record: TransitionRecord,
     pub staged_identity_uids: BTreeMap<String, String>,
     pub staged_content_digests: BTreeMap<String, String>,
@@ -121,9 +119,23 @@ pub struct StoredTransition {
 }
 
 impl StoredTransition {
-    pub(crate) fn reserved(plan: TransitionPlan, record: TransitionRecord) -> Self {
+    #[must_use]
+    pub fn domain_id(&self) -> &str {
+        &self.inputs.registry.generation_history.domain_id
+    }
+    #[must_use]
+    pub fn allocation(&self) -> &deploy::GenerationAllocation {
+        &self.inputs.allocation
+    }
+    #[must_use]
+    pub fn plan_digest(&self) -> &str {
+        &self.inputs.plan_digest
+    }
+
+    #[cfg(feature = "deployer")]
+    pub(crate) fn reserved(inputs: crate::TransitionInputs, record: TransitionRecord) -> Self {
         Self {
-            plan,
+            inputs,
             record,
             staged_identity_uids: BTreeMap::new(),
             staged_content_digests: BTreeMap::new(),

@@ -151,8 +151,11 @@ impl InventorySnapshot {
     }
 }
 
-#[cfg(feature = "libsql-backend")]
-pub(crate) fn snapshot_id(snapshot: &InventorySnapshot) -> Result<String> {
+/// Validate a snapshot in its scope and return its canonical content identifier.
+/// # Errors
+/// Rejects malformed, foreign, unsorted or oversized inventory metadata.
+pub fn snapshot_id(scope: &InventoryScope, snapshot: &InventorySnapshot) -> Result<String> {
+    snapshot.encode(scope)?;
     compiler_core::digest(snapshot).map_err(|_| Error::Invalid("snapshot digest"))
 }
 

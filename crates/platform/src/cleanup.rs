@@ -20,10 +20,12 @@ impl PlatformClient {
         inventory: &inventory::InventorySnapshot,
     ) -> Result<Versioned<NamespaceRegistry>> {
         let current = self.load_registry().await?;
-        if current.value.transitions.values().any(|s| {
-            s.plan.request.next.compiled.ir.domain.id == domain_id
-                && s.record.phase != Phase::Committed
-        }) {
+        if current
+            .value
+            .transitions
+            .values()
+            .any(|s| s.domain_id() == domain_id && s.record.phase != Phase::Committed)
+        {
             return Err(invalid(
                 "cannot capture active claims during an unfinished transition",
             ));
@@ -34,16 +36,6 @@ impl PlatformClient {
             .get(domain_id)
             .and_then(|h| h.active_allocation.as_ref().map(|a| &a.generation_id))
             .ok_or_else(|| invalid("domain has no active generation"))?;
-        let stored = current
-            .value
-            .transitions
-            .values()
-            .find(|s| {
-                s.record.phase == Phase::Committed
-                    && s.plan.request.next.generation_id == *generation
-                    && s.plan.request.next.compiled.ir.domain.id == domain_id
-            })
-            .ok_or_else(|| invalid("active generation lacks its committed approved plan"))?;
         let scope = inventory::InventoryScope {
             cluster: self.cluster_binding.clone(),
             namespace: self.workload_namespace.clone(),
@@ -80,7 +72,7 @@ impl PlatformClient {
                 .ok_or_else(|| invalid("claim absent"))?;
             if claim.domain_id != domain_id
                 || claim.generation_id != *generation
-                || claim.transition_id != stored.plan.request.transition_id
+                || claim.transition_id != allocation.transition_id
                 || claim.state != ClaimState::Active
                 || resource
                     .uid
@@ -261,11 +253,7 @@ impl PlatformClient {
         executor_id: &str,
     ) -> Result<CleanupProgress> {
         let registry = self.load_registry().await?;
-        let stored = registry
-            .value
-            .transitions
-            .get(transition_id)
-            .ok_or_else(|| invalid("unknown cleanup transition"))?;
+        let stored = self.selected(&registry, transition_id)?;
         if stored.record.executor_id != executor_id || stored.record.phase != Phase::Cleaning {
             return Err(invalid("cleanup requires the owning executor in Cleaning"));
         }

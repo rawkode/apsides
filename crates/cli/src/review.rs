@@ -1,26 +1,45 @@
-//! Deployment review derived from protected prior and validated next plans.
+//! Deployment review of a release-bound plan and authenticated predecessor metadata.
 use compiler_core::{Capability, Resource};
-use deploy::{Phase, PredecessorGeneration, ResourceIdentity};
+use deploy::{PredecessorGeneration, ResourceIdentity};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub fn transition_review(
-    registry: &platform::NamespaceRegistry,
+pub fn transition_review(resolved: &platform::ResolvedTransition) -> crate::Result<Value> {
+    render_review(resolved.stored(), resolved.plan(), resolved.transition_id())
+}
+
+#[cfg(test)]
+pub(crate) fn transition_review_fixture(
+    current: &platform::StoredTransition,
+    plan: &deploy::TransitionPlan,
     transition: &str,
 ) -> crate::Result<Value> {
-    let current = registry.transition(transition)?;
-    let plan = &current.plan;
+    render_review(current, plan, transition)
+}
+
+fn render_review(
+    current: &platform::StoredTransition,
+    plan: &deploy::TransitionPlan,
+    transition: &str,
+) -> crate::Result<Value> {
+    if plan.request.transition_id != transition
+        || current.record.transition_id != transition
+        || plan.generation_reservation != *current.allocation()
+        || plan.plan_digest != current.plan_digest()
+        || deploy::plan_transition(&plan.request)? != *plan
+    {
+        return Err("review requires the exact resolved transition plan".into());
+    }
+    deploy::verify_record(plan, &current.record)?;
     let next = &plan.request.next.compiled;
-    let prior = prior_review(registry, current)?;
+    let prior = prior_review(current, plan)?;
     let resources = match prior {
         PriorReview::Initial => detailed_resources(&[], next),
-        PriorReview::Detailed(compiled) => detailed_resources(&compiled.ir.resources, next),
         PriorReview::Metadata(metadata) => metadata_resources(&metadata.inventory, next)?,
     };
     let unavailable = || unavailable_detail("historical-compiled-plan-not-retained");
     let (detail_availability, limitations) = match prior {
         PriorReview::Initial => ("initial", Vec::new()),
-        PriorReview::Detailed(_) => ("verified-history", Vec::new()),
         PriorReview::Metadata(_) => (
             "metadata-only",
             vec![
@@ -35,24 +54,18 @@ pub fn transition_review(
     };
     let reactions_before = match prior {
         PriorReview::Initial => Value::Null,
-        PriorReview::Detailed(compiled) => json!(&compiled.ir.reactions),
         PriorReview::Metadata(_) => unavailable(),
     };
     let inputs_before = match prior {
         PriorReview::Initial => Value::Null,
-        PriorReview::Detailed(compiled) => json!(&compiled.ir.inputs),
         PriorReview::Metadata(_) => unavailable(),
     };
     let runtime_permissions = match prior {
         PriorReview::Initial => capability_changes(&[], &next.capabilities),
-        PriorReview::Detailed(compiled) => {
-            capability_changes(&compiled.capabilities, &next.capabilities)
-        }
         PriorReview::Metadata(_) => unavailable_runtime_permissions(&next.capabilities),
     };
     let compatibility_before = match prior {
         PriorReview::Initial => Value::Null,
-        PriorReview::Detailed(compiled) => compatibility(compiled)?,
         PriorReview::Metadata(_) => unavailable(),
     };
     let has_predecessor = !matches!(prior, PriorReview::Initial);
@@ -227,52 +240,31 @@ fn unavailable_runtime_permissions(after: &[Capability]) -> Value {
 #[derive(Clone, Copy)]
 enum PriorReview<'a> {
     Initial,
-    Detailed(&'a compiler_core::CompiledPlan),
     Metadata(&'a PredecessorGeneration),
 }
 
 fn prior_review<'a>(
-    registry: &'a platform::NamespaceRegistry,
-    current: &'a platform::StoredTransition,
+    current: &platform::StoredTransition,
+    plan: &'a deploy::TransitionPlan,
 ) -> crate::Result<PriorReview<'a>> {
-    let plan = &current.plan;
     let Some(predecessor) = plan.request.predecessor()? else {
+        if current.previous_writer_checkpoint.is_some() {
+            return Err("initial review cannot contain predecessor authority".into());
+        }
         return Ok(PriorReview::Initial);
     };
-    let transition = &predecessor.allocation.transition_id;
-    let Some(stored) = registry.transitions.get(transition) else {
-        if deploy::plan_transition(&plan.request)? != *plan {
-            return Err("metadata-only review requires a canonical current plan".into());
-        }
-        let checkpoint = current.previous_writer_checkpoint.as_ref().ok_or(
-            "metadata-only review requires an authenticated predecessor writer checkpoint",
-        )?;
-        let domain = &plan.request.next.compiled.ir.domain;
-        checkpoint.validate(
-            predecessor,
-            &domain.control_namespace,
-            &domain.namespace,
-            &domain.cluster_binding,
-        )?;
-        return Ok(PriorReview::Metadata(predecessor));
-    };
-    if stored.record.phase != Phase::Committed
-        || stored.plan.request.transition_id != *transition
-        || stored.record.transition_id != *transition
-        || stored.plan.generation_reservation != predecessor.allocation
-    {
-        return Err("review predecessor differs from its protected transition".into());
-    }
-    deploy::verify_record(&stored.plan, &stored.record)?;
-    let expected = deploy::predecessor_metadata(
-        &stored.plan.request.next,
-        &stored.plan.generation_reservation,
-        &plan.request.registry.claims,
+    let checkpoint = current
+        .previous_writer_checkpoint
+        .as_ref()
+        .ok_or("metadata-only review requires an authenticated predecessor writer checkpoint")?;
+    let domain = &plan.request.next.compiled.ir.domain;
+    checkpoint.validate(
+        predecessor,
+        &domain.control_namespace,
+        &domain.namespace,
+        &domain.cluster_binding,
     )?;
-    if &expected != predecessor {
-        return Err("review predecessor metadata differs from its protected release".into());
-    }
-    Ok(PriorReview::Detailed(&stored.plan.request.next.compiled))
+    Ok(PriorReview::Metadata(predecessor))
 }
 
 fn capability_changes(before: &[Capability], after: &[Capability]) -> Value {

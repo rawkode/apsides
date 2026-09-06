@@ -1,7 +1,7 @@
 //! Protected shutdown identities, independent of the historical desired program.
 use crate::{
-    NamespaceRegistry, ProxyIdentity, RequestDrainQualification, Result, RuntimeBinding,
-    StoredTransition, invalid, valid_digest, valid_name,
+    NamespaceRegistry, ProxyIdentity, RequestDrainQualification, Result, RuntimeBinding, invalid,
+    valid_digest, valid_name,
 };
 use deploy::{GenerationAllocation, PredecessorGeneration};
 use serde::{Deserialize, Serialize};
@@ -248,7 +248,8 @@ fn valid_uid(value: &str) -> bool {
     !value.is_empty() && value.len() <= 1024 && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
-pub(crate) fn require_qualified(stored: &StoredTransition) -> Result<()> {
+#[cfg(feature = "deployer")]
+pub(crate) fn require_qualified(stored: &crate::StoredTransition) -> Result<()> {
     if !matches!(
         stored.request_drain_qualification,
         Some(RequestDrainQualification::IsolatedEnvoy { .. })
@@ -261,11 +262,11 @@ pub(crate) fn require_qualified(stored: &StoredTransition) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "deployer")]
 pub(crate) fn project_committed(
     registry: &NamespaceRegistry,
-    transition: &str,
+    stored: &crate::transition_session::ResolvedStoredTransition,
 ) -> Result<WriterCheckpoint> {
-    let stored = registry.transition(transition)?;
     deploy::verify_record(&stored.plan, &stored.record)?;
     if stored.record.phase != deploy::Phase::Committed {
         return Err(invalid(
@@ -277,7 +278,7 @@ pub(crate) fn project_committed(
         &stored.plan.generation_reservation,
         &registry.claims,
     )?;
-    project(registry, &metadata)
+    project_stored(stored, &metadata)
 }
 
 pub(crate) fn active<'a>(
@@ -311,16 +312,9 @@ pub(crate) fn active<'a>(
     Ok(checkpoint)
 }
 
-pub(crate) fn project(
-    registry: &NamespaceRegistry,
-    metadata: &PredecessorGeneration,
-) -> Result<WriterCheckpoint> {
-    let stored = crate::predecessor::authenticate(registry, metadata)?;
-    project_stored(stored, metadata)
-}
-
+#[cfg(feature = "deployer")]
 fn project_stored(
-    stored: &StoredTransition,
+    stored: &crate::transition_session::ResolvedStoredTransition,
     metadata: &PredecessorGeneration,
 ) -> Result<WriterCheckpoint> {
     let binding = stored
@@ -398,6 +392,7 @@ fn project_stored(
     Ok(checkpoint)
 }
 
+#[cfg(feature = "deployer")]
 pub(crate) fn select_retirement_identities<'a>(
     name: &str,
     control: &str,

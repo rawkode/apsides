@@ -11,13 +11,13 @@ const TRANSITION_1: &str = "tceirceircfardairceirceirce-1";
 const TRANSITION_2: &str = "tceirceircfardairceirceirce-2";
 const SERVICE_ACCOUNT_1: &str = "rceirceircfardairceirceirce-1";
 
-fn registry() -> Result<NamespaceRegistry> {
+fn registry() -> Result<(NamespaceRegistry, deploy::TransitionPlan)> {
     let compiled = compiler_core::parse_and_validate(&json!({
         "testOnly":false,"schemaVersion":"reakt.dev/ir/v1",
         "domain":{"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound",
         "budgets":{"maxResources":16,"maxInputs":16,"maxReactions":16,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},
         "resources":[],"inputs":[],"reactions":[],"provenance":{"compiler":"reakt/0.1","inputs":[{"path":"program.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
-    }).to_string()).unwrap();
+    }).to_string())?;
     let ceiling = compiler_core::PermissionCeiling {
         policy_ref: "platform/example".into(),
         domain_id: "example".into(),
@@ -54,13 +54,13 @@ fn registry() -> Result<NamespaceRegistry> {
         observations: vec![],
         ownership_intents: vec![],
     };
-    let plan = plan_transition(&request).unwrap();
-    let mut record = begin(&plan, "job-1").unwrap();
+    let plan = plan_transition(&request)?;
+    let mut record = begin(&plan, "job-1")?;
     // Routing fixtures do not purport to be authenticated/replayable cluster records.
     record.phase = Phase::Committed;
     history.active_allocation = Some(plan.generation_reservation.clone());
     let stored = StoredTransition {
-        plan,
+        inputs: frozen_inputs(&plan)?,
         record,
         staged_identity_uids: BTreeMap::new(),
         staged_content_digests: BTreeMap::new(),
@@ -92,7 +92,7 @@ fn registry() -> Result<NamespaceRegistry> {
         },
         claims: vec![],
     };
-    platform::NamespaceRegistryState {
+    let registry = platform::NamespaceRegistryState {
         active_writer_checkpoints: BTreeMap::new(),
         schema_version: platform::REGISTRY_SCHEMA_VERSION.into(),
         registry_uid: REGISTRY_UID.into(),
@@ -103,13 +103,13 @@ fn registry() -> Result<NamespaceRegistry> {
         histories: BTreeMap::from([("example".into(), history)]),
         transitions: BTreeMap::from([(TRANSITION_1.into(), stored)]),
     }
-    .hydrate(&snapshot)
-    .map_err(Into::into)
+    .hydrate(&snapshot)?;
+    Ok((registry, plan))
 }
 
 #[test]
 fn active_release_is_idempotent_but_changed_policy_allocates_a_generation() -> Result<()> {
-    let registry = registry()?;
+    let (registry, _) = registry()?;
     assert_eq!(
         default_transition(&registry, "example", BUILD, "policy-1")?,
         TRANSITION_1
@@ -123,10 +123,10 @@ fn active_release_is_idempotent_but_changed_policy_allocates_a_generation() -> R
 
 #[test]
 fn pending_same_build_precedes_old_active_transition_and_rollback_is_fresh() -> Result<()> {
-    let mut registry = registry()?;
-    let mut next = registry.transitions[TRANSITION_1].clone();
-    next.plan.request.transition_id = TRANSITION_2.into();
-    next.plan.request.next.generation_id = GENERATION_2.into();
+    let (mut registry, _) = registry()?;
+    let mut next = registry.transition(TRANSITION_1)?.clone();
+    next.inputs.allocation.transition_id = TRANSITION_2.into();
+    next.inputs.allocation.generation_id = GENERATION_2.into();
     next.record.phase = Phase::Staged;
     registry.transitions.insert(TRANSITION_2.into(), next);
     assert_eq!(
@@ -138,12 +138,12 @@ fn pending_same_build_precedes_old_active_transition_and_rollback_is_fresh() -> 
         .get_mut(TRANSITION_2)
         .ok_or("pending transition missing")?;
     next.record.phase = Phase::Committed;
-    next.plan.request.next.artifact_digest = OTHER.into();
+    next.inputs.allocation.artifact_digest = OTHER.into();
     next.runtime_binding
         .as_mut()
         .ok_or("pending runtime binding missing")?
         .generation_id = GENERATION_2.into();
-    let mut allocation = next.plan.generation_reservation.clone();
+    let mut allocation = next.inputs.allocation.clone();
     allocation.sequence = 2;
     allocation.generation_id = GENERATION_2.into();
     allocation.transition_id = TRANSITION_2.into();
@@ -151,7 +151,7 @@ fn pending_same_build_precedes_old_active_transition_and_rollback_is_fresh() -> 
     registry
         .histories
         .get_mut("example")
-        .unwrap()
+        .ok_or("domain history missing")?
         .active_allocation = Some(allocation);
     registry.next_sequence = 3;
     assert_eq!(
@@ -161,19 +161,48 @@ fn pending_same_build_precedes_old_active_transition_and_rollback_is_fresh() -> 
     Ok(())
 }
 
+fn frozen_inputs(plan: &deploy::TransitionPlan) -> Result<platform::TransitionInputs> {
+    let request = &plan.request;
+    let domain = &request.next.compiled.ir.domain;
+    let snapshot = coordination::ClaimSnapshotV1 {
+        schema_version: coordination::CLAIM_SNAPSHOT_SCHEMA.into(),
+        scope: coordination::ClaimScope {
+            registry_uid: request.registry.registry_uid.clone(),
+            cluster_binding: domain.cluster_binding.clone(),
+            control_namespace: domain.control_namespace.clone(),
+            workload_namespace: domain.namespace.clone(),
+        },
+        claims: request.registry.claims.clone(),
+    };
+    Ok(platform::TransitionInputs::freeze(
+        plan,
+        snapshot.reference()?,
+        &platform::PolicyState {
+            schema_version: "reakt.dev/platform-policy/v1".into(),
+            runtime_ceiling: request.runtime_ceiling.clone(),
+            cleanup_ceiling: request.cleanup_ceiling.clone(),
+        },
+    )?)
+}
+
 #[test]
-fn review_uses_metadata_predecessor_but_rejects_unverified_historical_details() -> Result<()> {
-    let mut registry = registry()?;
-    let original = registry.transition(TRANSITION_1)?.clone();
-    let initial = crate::review::transition_review(&registry, TRANSITION_1)?;
+fn review_requires_exact_replay_and_predecessor_checkpoint() -> Result<()> {
+    let (registry, original_plan) = registry()?;
+    let mut original = registry.transition(TRANSITION_1)?.clone();
+    // The routing fixture marks Committed without receipts. The report renderer
+    // must reject it, even though routing itself only reads identity metadata.
+    assert!(
+        crate::review::transition_review_fixture(&original, &original_plan, TRANSITION_1).is_err()
+    );
+    original.record = begin(&original_plan, "job-1")?;
+    let initial =
+        crate::review::transition_review_fixture(&original, &original_plan, TRANSITION_1)?;
     assert!(initial["reactions"]["before"].is_null());
 
-    let mut request = original.plan.request.clone();
+    let mut request = original_plan.request.clone();
     request.transition_id = TRANSITION_2.into();
     request.next.generation_id = GENERATION_2.into();
-    request.registry.registry_uid = registry.registry_uid.clone();
     request.registry.next_sequence = registry.next_sequence;
-    request.registry.revision = "1".into();
     request.registry.generation_history = registry
         .histories
         .get("example")
@@ -181,38 +210,29 @@ fn review_uses_metadata_predecessor_but_rejects_unverified_historical_details() 
         .clone();
     request.previous = Some(deploy::PreviousGeneration::Metadata(Box::new(
         deploy::predecessor_metadata(
-            &original.plan.request.next,
-            &original.plan.generation_reservation,
+            &original_plan.request.next,
+            &original_plan.generation_reservation,
             &request.registry.claims,
         )?,
     )));
     let plan = plan_transition(&request)?;
     let mut upgrade = original;
     upgrade.record = begin(&plan, "job-2")?;
-    upgrade.plan = plan;
-    registry.transitions.insert(TRANSITION_2.into(), upgrade);
-    // The routing fixture marks its historical phase committed without receipts.
-    // Review must verify that history before using its old desired fields.
-    assert!(crate::review::transition_review(&registry, TRANSITION_2).is_err());
-    registry.transitions.remove(TRANSITION_1);
-    assert!(crate::review::transition_review(&registry, TRANSITION_2).is_err());
-    let predecessor = registry
-        .transition(TRANSITION_2)?
-        .plan
-        .request
-        .predecessor()?
-        .ok_or("predecessor missing")?;
-    let checkpoint = review_checkpoint(predecessor)?;
-    registry
-        .transitions
-        .get_mut(TRANSITION_2)
-        .ok_or("upgrade missing")?
-        .previous_writer_checkpoint = Some(checkpoint);
-    let review = crate::review::transition_review(&registry, TRANSITION_2)?;
+    upgrade.inputs = frozen_inputs(&plan)?;
+    assert!(crate::review::transition_review_fixture(&upgrade, &plan, TRANSITION_2).is_err());
+    let predecessor = plan.request.predecessor()?.ok_or("predecessor missing")?;
+    upgrade.previous_writer_checkpoint = Some(review_checkpoint(predecessor)?);
+    let review = crate::review::transition_review_fixture(&upgrade, &plan, TRANSITION_2)?;
     assert_eq!(review["schemaVersion"], "reakt.dev/deployment-review/v2");
     assert_eq!(review["detailAvailability"], "metadata-only");
     assert_eq!(review["permissions"]["runtime"]["status"], "unavailable");
     assert!(review["permissions"]["runtime"].get("added").is_none());
+    let checkpoint = upgrade
+        .previous_writer_checkpoint
+        .as_mut()
+        .ok_or("checkpoint missing")?;
+    checkpoint.allocation.artifact_digest = OTHER.into();
+    assert!(crate::review::transition_review_fixture(&upgrade, &plan, TRANSITION_2).is_err());
     Ok(())
 }
 

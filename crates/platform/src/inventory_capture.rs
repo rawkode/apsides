@@ -28,10 +28,11 @@ impl PlatformClient {
             .get(domain)
             .and_then(|history| history.active_allocation.as_ref().map(|a| &a.generation_id))
             != Some(generation)
-            || registry.value.transitions.values().any(|entry| {
-                entry.plan.request.next.compiled.ir.domain.id == domain
-                    && entry.record.phase != Phase::Committed
-            })
+            || registry
+                .value
+                .transitions
+                .values()
+                .any(|entry| entry.domain_id() == domain && entry.record.phase != Phase::Committed)
         {
             return Err(invalid(
                 "UID publication requires the protected active generation",

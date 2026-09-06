@@ -25,12 +25,7 @@ impl PlatformClient {
         executor_id: &str,
     ) -> Result<Versioned<NamespaceRegistry>> {
         let mut registry = self.load_registry().await?;
-        let stored = registry
-            .value
-            .transitions
-            .get(transition_id)
-            .cloned()
-            .ok_or_else(|| invalid("unknown transition"))?;
+        let stored = self.selected(&registry, transition_id)?;
         if stored.record.executor_id != executor_id
             || stored.plan.request.previous.is_some()
             || !stored.plan.cleanup.is_empty()
@@ -107,7 +102,7 @@ impl PlatformClient {
         if registry.value.transition(transition_id)?.record.phase == Phase::Cleaning {
             let no_previous = digest(&(
                 "initial-installation-no-obsolete-identity",
-                &registry.value.transition(transition_id)?.plan.plan_digest,
+                registry.value.transition(transition_id)?.plan_digest(),
             ))?;
             registry = self
                 .transition_event(
@@ -138,9 +133,9 @@ impl PlatformClient {
         let name = format!("reakt-activation-{}", binding.domain_id);
         let activation: Versioned<ActivationState> =
             read_state(&self.client, &self.control_namespace, &name).await?;
-        let entry = registry.value.transition(transition_id)?;
+        let entry = self.selected(&registry, transition_id)?;
         let key = format!("v1/ConfigMap/{}/{name}", self.control_namespace);
-        let claims = approved_claims(&registry.value, entry)?;
+        let claims = approved_claims(&registry.value, &entry)?;
         if entry.staged_identity_uids.get(&key) != Some(&activation.uid)
             || &activation.value.binding != binding
             || activation.value.approved_claims != claims
@@ -193,8 +188,8 @@ impl PlatformClient {
         registry: &Versioned<NamespaceRegistry>,
         transition_id: &str,
     ) -> Result<Versioned<NamespaceRegistry>> {
-        let entry = registry.value.transition(transition_id)?;
-        let claims = approved_claims(&registry.value, entry)?;
+        let entry = self.selected(registry, transition_id)?;
+        let claims = approved_claims(&registry.value, &entry)?;
         let domain = &entry.plan.request.next.compiled.ir.domain.id;
         let generation = &entry.plan.request.next.generation_id;
         let history = registry
@@ -230,27 +225,38 @@ impl PlatformClient {
         executor_id: &str,
         event: Event,
     ) -> Result<Versioned<NamespaceRegistry>> {
+        let selected = self.selected(registry, transition_id)?;
         let mut next = registry.value.clone();
         let entry = next
             .transitions
             .get_mut(transition_id)
             .ok_or_else(|| invalid("unknown transition"))?;
         entry.record = advance(
-            &entry.plan,
+            &selected.plan,
             &entry.record,
             entry.record.revision,
             executor_id,
             event,
         )?;
         if entry.record.phase == Phase::Committed {
-            let domain = entry.plan.request.next.compiled.ir.domain.id.clone();
-            let predecessor = entry
+            let domain = selected.plan.request.next.compiled.ir.domain.id.clone();
+            let predecessor = selected
                 .plan
                 .request
                 .predecessor()?
                 .map(|p| p.allocation.clone());
-            let allocation = entry.plan.generation_reservation.clone();
-            let checkpoint = crate::writer_checkpoint::project_committed(&next, transition_id)?;
+            let allocation = selected.plan.generation_reservation.clone();
+            let checkpoint = crate::writer_checkpoint::project_committed(
+                &next,
+                &self.selected(
+                    &Versioned {
+                        value: next.clone(),
+                        uid: registry.uid.clone(),
+                        resource_version: registry.resource_version.clone(),
+                    },
+                    transition_id,
+                )?,
+            )?;
             let history = next
                 .histories
                 .get_mut(&domain)
@@ -269,7 +275,7 @@ impl PlatformClient {
         registry: &Versioned<NamespaceRegistry>,
         transition_id: &str,
     ) -> Result<DynamicObject> {
-        let entry = registry.value.transition(transition_id)?;
+        let entry = self.selected(registry, transition_id)?;
         let binding = entry
             .runtime_binding
             .as_ref()
@@ -311,9 +317,9 @@ impl PlatformClient {
         let mut object = self
             .verify_staged_controller(registry, transition_id)
             .await?;
-        let entry = registry.value.transition(transition_id)?;
-        self.verify_runtime_identity(entry).await?;
-        self.verify_controller_support(entry).await?;
+        let entry = self.selected(registry, transition_id)?;
+        self.verify_runtime_identity(&entry).await?;
+        self.verify_controller_support(&entry).await?;
         let binding = entry
             .runtime_binding
             .as_ref()

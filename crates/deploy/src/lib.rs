@@ -26,8 +26,9 @@ mod planner;
 mod reducer;
 pub use model::*;
 pub use ownership::{
-    OWNERSHIP_INTENT_SCHEMA, OwnershipAction, OwnershipApproval, OwnershipIntent,
-    validate_ownership_intent,
+    FrozenOwnershipIntent, OWNERSHIP_INTENT_SCHEMA, OwnershipAction, OwnershipApproval,
+    OwnershipIntent, freeze_ownership_intents, restore_ownership_intents,
+    validate_frozen_ownership_intents, validate_ownership_intent,
 };
 pub use planner::{cleanup_decision, plan_inventory_cleanup, plan_transition};
 pub use reducer::{advance, begin, service_account_name, verify_record};

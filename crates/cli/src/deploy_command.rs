@@ -68,21 +68,21 @@ async fn deploy(options: &BTreeMap<String, String>) -> Result<Value> {
         &policy_digest,
     )? {
         ExistingTransition::Committed => {
+            let session = platform
+                .transition_session(&verified, inventory.as_ref(), &transition_id)
+                .await?;
+            let selected = session.load_registry().await?;
             let tracking = crate::inventory_connection::publish(
-                &platform,
+                &session,
                 inventory.as_ref(),
-                &registry.value,
+                &selected.value,
                 &transition_id,
             )
             .await?;
             let report = json!({"status":"already-committed","transition":transition_id,"releaseDigest":verified.release_digest(),"inventory":{"revision":tracking.revision,"snapshotId":tracking.snapshot_id}});
             return Ok(report);
         }
-        ExistingTransition::Resume => {
-            let stored = registry.value.transition(&transition_id)?;
-            crate::inventory_connection::require_request(inventory.as_ref(), &stored.plan.request)
-                .await?;
-        }
+        ExistingTransition::Resume => {}
         ExistingTransition::Absent => {
             reserve_new_transition(
                 &platform,
@@ -96,26 +96,33 @@ async fn deploy(options: &BTreeMap<String, String>) -> Result<Value> {
             .await?;
         }
     }
-    let prepared = platform.load_registry().await?;
+    let session = platform
+        .transition_session(&verified, inventory.as_ref(), &transition_id)
+        .await?;
+    let resolved = session.resolve().await?;
+    crate::inventory_connection::require_request(inventory.as_ref(), &resolved.plan().request)
+        .await?;
     let _ = writeln!(
         std::io::stderr().lock(),
         "{}",
-        serde_json::to_string_pretty(&crate::review::transition_review(
-            &prepared.value,
-            &transition_id,
-        )?)?
+        serde_json::to_string_pretty(&crate::review::transition_review(&resolved)?)?
     );
-    let committed = drive_transition(&platform, &verified, &transition_id, &executor).await?;
+    let committed = Box::pin(drive_transition(
+        &session,
+        &verified,
+        &transition_id,
+        &executor,
+    ))
+    .await?;
     let tracking = crate::inventory_connection::publish(
-        &platform,
+        &session,
         inventory.as_ref(),
         &committed.value,
         &transition_id,
     )
     .await?;
     deployment_report(
-        &committed,
-        &transition_id,
+        &session.resolve().await?,
         &verified,
         &compatibility,
         &expires_at,
@@ -130,8 +137,7 @@ fn verify_resumed_intents(
     if let (Some(names), Some(stored)) = (names, stored) {
         let supplied: BTreeSet<_> = names.split(',').collect();
         let recorded: BTreeSet<_> = stored
-            .plan
-            .request
+            .inputs
             .ownership_intents
             .iter()
             .map(|i| i.object_name.as_str())
@@ -193,7 +199,9 @@ async fn reserve_new_transition(
     )
     .await?;
     crate::inventory_connection::require_request(inventory, &request).await?;
-    platform.reserve_transition(&request, executor).await?;
+    platform
+        .reserve_transition(&request, executor, verified, inventory)
+        .await?;
     Ok(())
 }
 
@@ -276,20 +284,20 @@ fn verify_artifact_binding(
 }
 
 fn deployment_report(
-    committed: &platform::Versioned<platform::NamespaceRegistry>,
-    transition_id: &str,
+    resolved: &platform::ResolvedTransition,
     verified: &release::VerifiedRelease,
     compatibility: &Value,
     expires_at: &str,
     tracking: &inventory::VersionedInventory,
 ) -> Result<Value> {
-    let stored = committed.value.transition(transition_id)?;
+    let stored = resolved.stored();
+    let transition_id = resolved.transition_id();
     Ok(
-        json!({"status":"committed","transition":transition_id,"generation":stored.plan.request.next.generation_id,
+        json!({"status":"committed","transition":transition_id,"generation":stored.allocation().generation_id,
         "releaseDigest":verified.release_digest(),"irDigest":verified.compiled().ir_digest,"compatibility":compatibility,
         "inventory":{"revision":tracking.revision,"snapshotId":tracking.snapshot_id},
         "credentialExpiresAt":expires_at,"requestDrainQualification":stored.request_drain_qualification,
-        "review":crate::review::transition_review(&committed.value, transition_id)?,
+        "review":crate::review::transition_review(resolved)?,
         "workloadReadiness":"not-established-by-deployment-commit"}),
     )
 }
@@ -453,8 +461,7 @@ fn default_transition(
     policy: &str,
 ) -> Result<String> {
     let matching = |s: &&platform::StoredTransition| {
-        s.plan.request.next.compiled.ir.domain.id == domain
-            && s.plan.request.next.artifact_digest == release
+        s.domain_id() == domain && s.allocation().artifact_digest == release
     };
     if let Some(pending) = registry
         .transitions
@@ -462,19 +469,19 @@ fn default_transition(
         .filter(matching)
         .find(|s| s.record.phase != Phase::Committed)
     {
-        return Ok(pending.plan.request.transition_id.clone());
+        return Ok(pending.allocation().transition_id.clone());
     }
     if let Some(active) = registry.transitions.values().filter(matching).find(|s| {
         registry
             .histories
             .get(domain)
             .and_then(|h| h.active_allocation.as_ref().map(|a| &a.generation_id))
-            == Some(&s.plan.request.next.generation_id)
+            == Some(&s.allocation().generation_id)
             && s.runtime_binding
                 .as_ref()
                 .is_some_and(|b| b.policy_digest == policy)
     }) {
-        return Ok(active.plan.request.transition_id.clone());
+        return Ok(active.allocation().transition_id.clone());
     }
     Ok(deploy::allocation_names(&registry.registry_uid, registry.next_sequence)?.transition_id)
 }
@@ -493,7 +500,7 @@ async fn drive_transition(
             .transitions
             .get(transition)
             .ok_or("transition disappeared")?;
-        let upgrade = stored.plan.request.previous.is_some();
+        let upgrade = stored.inputs.previous.is_some();
         let result = match stored.record.phase {
             Phase::Committed => return Ok(registry),
             Phase::Blocked => {
@@ -549,9 +556,9 @@ fn check_existing(
 ) -> Result<ExistingTransition> {
     let domain = &verified.compiled().ir.domain.id;
     if registry.transitions.values().any(|s| {
-        s.plan.request.next.compiled.ir.domain.id == *domain
+        s.domain_id() == *domain
             && s.record.phase != Phase::Committed
-            && s.plan.request.next.artifact_digest != verified.release_digest()
+            && s.allocation().artifact_digest != verified.release_digest()
     }) {
         return Err(
             "domain has an unfinished transition for another artifact; finish or recover it first"
@@ -561,8 +568,8 @@ fn check_existing(
     let Some(stored) = registry.transitions.get(transition) else {
         return Ok(ExistingTransition::Absent);
     };
-    if stored.plan.request.next.artifact_digest != verified.release_digest()
-        || stored.plan.request.next.compiled != *verified.compiled()
+    if stored.allocation().artifact_digest != verified.release_digest()
+        || stored.allocation().ir_digest != verified.compiled().ir_digest
     {
         return Err("transition belongs to another artifact".into());
     }
@@ -571,7 +578,7 @@ fn check_existing(
             .histories
             .get(domain)
             .and_then(|h| h.active_allocation.as_ref().map(|a| &a.generation_id))
-            != Some(&stored.plan.request.next.generation_id)
+            != Some(&stored.allocation().generation_id)
             || stored
                 .runtime_binding
                 .as_ref()

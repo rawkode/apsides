@@ -2,7 +2,7 @@ use crate::store::decode_state;
 use crate::tls_integrity::{TlsSecretExpectation, validate_tls_secret};
 use crate::{
     ActivationState, ActivationStatus, ApprovedClaim, NamespaceRegistry, PlatformClient, Result,
-    RuntimeBinding, RuntimeInventory, SCHEMA_VERSION, StoredTransition, Versioned, invalid,
+    RuntimeBinding, RuntimeInventory, SCHEMA_VERSION, Versioned, invalid,
 };
 use compiler_core::{canonical_bytes, digest};
 use deploy::{ClaimState, Event, advance};
@@ -36,7 +36,10 @@ impl<'a> From<&'a VerifiedRelease> for StagingArtifact<'a> {
 }
 
 impl PlatformClient {
-    pub(crate) async fn verify_controller_support(&self, stored: &StoredTransition) -> Result<()> {
+    pub(crate) async fn verify_controller_support(
+        &self,
+        stored: &crate::transition_session::ResolvedStoredTransition,
+    ) -> Result<()> {
         let binding = stored
             .runtime_binding
             .as_ref()
@@ -83,7 +86,7 @@ impl PlatformClient {
 
     async fn verify_recorded_support(
         &self,
-        stored: &StoredTransition,
+        stored: &crate::transition_session::ResolvedStoredTransition,
         kind: &str,
         name: &str,
     ) -> Result<()> {
@@ -114,12 +117,7 @@ impl PlatformClient {
     ) -> Result<Versioned<NamespaceRegistry>> {
         let artifact = StagingArtifact::from(release);
         let reserved = self.load_registry().await?;
-        let stored = reserved
-            .value
-            .transitions
-            .get(transition_id)
-            .cloned()
-            .ok_or_else(|| invalid("unknown transition"))?;
+        let stored = self.selected(&reserved, transition_id)?;
         if stored.plan.request.previous.is_some() {
             return Err(invalid(
                 "controller upgrade staging requires a qualified proxy transport",
@@ -138,7 +136,7 @@ impl PlatformClient {
     pub(crate) async fn stage_initial_controller_resources(
         &self,
         registry: &mut Versioned<NamespaceRegistry>,
-        stored: &StoredTransition,
+        stored: &crate::transition_session::ResolvedStoredTransition,
         binding: &RuntimeBinding,
         proxy_secret: Option<&str>,
     ) -> Result<()> {
@@ -211,6 +209,7 @@ impl PlatformClient {
         binding: RuntimeBinding,
         release: &StagingArtifact<'_>,
     ) -> Result<Versioned<NamespaceRegistry>> {
+        let selected = self.selected(registry, transition_id)?;
         let mut next = registry.value.clone();
         let entry = next
             .transitions
@@ -225,8 +224,8 @@ impl PlatformClient {
         }
         let event = Event::Staged {
             event_id: format!("stage-{}", entry.record.verification_epoch),
-            generation_id: entry.plan.request.next.generation_id.clone(),
-            service_account_name: entry
+            generation_id: selected.plan.request.next.generation_id.clone(),
+            service_account_name: selected
                 .plan
                 .generation_reservation
                 .service_account_name
@@ -239,7 +238,7 @@ impl PlatformClient {
             verification_epoch: entry.record.verification_epoch,
         };
         entry.record = advance(
-            &entry.plan,
+            &selected.plan,
             &entry.record,
             entry.record.revision,
             executor_id,
@@ -250,7 +249,7 @@ impl PlatformClient {
 
     pub(crate) async fn release_binding(
         &self,
-        stored: &StoredTransition,
+        stored: &crate::transition_session::ResolvedStoredTransition,
         release: &StagingArtifact<'_>,
     ) -> Result<RuntimeBinding> {
         let next = &stored.plan.request.next;
@@ -286,7 +285,7 @@ impl PlatformClient {
 
     pub(crate) async fn preprovisioned_key_id(
         &self,
-        stored: &StoredTransition,
+        stored: &crate::transition_session::ResolvedStoredTransition,
     ) -> Result<Option<String>> {
         if !stored
             .plan
@@ -343,7 +342,7 @@ impl PlatformClient {
         let api: Api<DynamicObject> =
             Api::namespaced_with(self.client.clone(), &self.control_namespace, &ar);
         let key = format!("{api_version}/{kind}/{}/{name}", self.control_namespace);
-        let entry = registry.value.transition(transition_id)?;
+        let entry = self.selected(registry, transition_id)?;
         let mut desired: DynamicObject = serde_json::from_value(desired)?;
         desired.metadata.annotations = Some(
             [
@@ -428,7 +427,7 @@ fn stage_annotations_match(
 
 pub(crate) fn approved_claims(
     registry: &NamespaceRegistry,
-    stored: &StoredTransition,
+    stored: &crate::transition_session::ResolvedStoredTransition,
 ) -> Result<Vec<ApprovedClaim>> {
     stored
         .plan

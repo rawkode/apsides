@@ -1,18 +1,28 @@
 //! Already-staged isolated writer evidence for activation and resume wire tests.
+use super::LifecycleRegistry;
+use crate::{
+    ADMIN_IMAGE, ENVOY_IMAGE, MAX_PROXY_LEDGER_BYTES, ProxyIdentity, ProxyPolicy,
+    RequestDrainQualification, RuntimeBinding, RuntimeInventory, SCHEMA_VERSION, StoredTransition,
+    envoy_configuration, envoy_token_sds,
+};
 use compiler_core::{canonical_bytes, digest};
 use k8s_openapi::api::core::v1::{ConfigMap, Pod};
 use kube::core::DynamicObject;
-use platform::{
-    ADMIN_IMAGE, ENVOY_IMAGE, MAX_PROXY_LEDGER_BYTES, NamespaceRegistry, ProxyIdentity,
-    ProxyPolicy, RequestDrainQualification, RuntimeBinding, RuntimeInventory, SCHEMA_VERSION,
-    StoredTransition, envoy_configuration, envoy_token_sds,
-};
 use serde_json::{Value, json};
 use std::error::Error;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-pub fn qualify(registry: &mut NamespaceRegistry, transition: &str) -> Result<Vec<Value>> {
+pub fn qualify(registry: &mut LifecycleRegistry, transition: &str) -> Result<Vec<Value>> {
+    let control = registry
+        .plan(transition)?
+        .request
+        .next
+        .compiled
+        .ir
+        .domain
+        .control_namespace
+        .clone();
     let stored = registry
         .transitions
         .get_mut(transition)
@@ -21,15 +31,6 @@ pub fn qualify(registry: &mut NamespaceRegistry, transition: &str) -> Result<Vec
         .runtime_binding
         .clone()
         .ok_or("runtime binding missing")?;
-    let control = stored
-        .plan
-        .request
-        .next
-        .compiled
-        .ir
-        .domain
-        .control_namespace
-        .clone();
     let name = format!("reakt-proxy-{}", binding.generation_id);
     let policy = policy(&binding)?;
     let config = configuration(&binding, &control)?;

@@ -71,6 +71,40 @@ fn adoption_requires_exact_bound_fields_and_cannot_expand_authority() {
 }
 
 #[test]
+fn frozen_ownership_metadata_reconstructs_exact_approved_fields()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut request = request(None, generation("g1", &[("existing", "orphan")]));
+    request.ownership_intents.push(adoption_intent(&request));
+    let frozen = freeze_ownership_intents(&request)?;
+    let encoded = serde_json::to_string(&frozen)?;
+    assert!(!encoded.contains("permittedApply"));
+    assert!(!encoded.contains("permittedRuntimeFields"));
+    assert!(!encoded.contains("deletionPolicy"));
+    assert!(!encoded.contains("approved"));
+    assert_eq!(
+        restore_ownership_intents(&request.next, &request.transition_id, &frozen)?,
+        request.ownership_intents
+    );
+
+    let mut invalid = frozen.clone();
+    invalid
+        .first_mut()
+        .ok_or("frozen ownership intent missing")?
+        .observed_uid
+        .clear();
+    assert!(restore_ownership_intents(&request.next, &request.transition_id, &invalid).is_err());
+    invalid = frozen.clone();
+    invalid.push(
+        frozen
+            .first()
+            .ok_or("frozen ownership intent missing")?
+            .clone(),
+    );
+    assert!(restore_ownership_intents(&request.next, &request.transition_id, &invalid).is_err());
+    Ok(())
+}
+
+#[test]
 fn empty_ownership_intents_preserve_existing_serialized_plan_identity() {
     let request = request(None, generation("g1", &[("config", "orphan")]));
     let encoded = serde_json::to_value(&request).unwrap();

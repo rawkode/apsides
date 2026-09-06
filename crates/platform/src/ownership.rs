@@ -1,14 +1,16 @@
 use crate::{PlatformClient, Result, invalid, store::read_state, valid_name};
+#[cfg(feature = "deployer")]
 use compiler_core::digest;
-use deploy::{
-    DeploymentRequest, GenerationPlan, OwnershipAction, OwnershipApproval, OwnershipIntent,
-    validate_ownership_intent,
-};
+#[cfg(feature = "deployer")]
+use deploy::{DeploymentRequest, OwnershipAction};
+use deploy::{GenerationPlan, OwnershipApproval, OwnershipIntent, validate_ownership_intent};
+#[cfg(feature = "deployer")]
 use kube::{
     Api,
     api::{ApiResource, DynamicObject, Patch, PatchParams},
     core::GroupVersionKind,
 };
+#[cfg(feature = "deployer")]
 use serde_json::Value;
 
 /// Separately administered from writable per-domain control state. Deployment
@@ -57,6 +59,7 @@ impl PlatformClient {
         Ok(intents)
     }
 
+    #[cfg(feature = "deployer")]
     pub(crate) async fn verify_ownership_intents(&self, request: &DeploymentRequest) -> Result<()> {
         if request.ownership_intents.is_empty() {
             return Ok(());
@@ -80,6 +83,7 @@ impl PlatformClient {
         Ok(())
     }
 
+    #[cfg(feature = "deployer")]
     pub(crate) async fn preflight_adoption(
         &self,
         target: &GenerationPlan,

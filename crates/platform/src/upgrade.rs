@@ -1,6 +1,6 @@
 use crate::{
     ActivationState, ActivationStatus, Error, NamespaceRegistry, PlatformClient, Result,
-    RuntimeInventory, SCHEMA_VERSION, StoredTransition, Versioned, invalid,
+    RuntimeInventory, SCHEMA_VERSION, Versioned, invalid,
 };
 use crate::{
     controller::approved_claims,
@@ -88,7 +88,7 @@ impl PlatformClient {
         if stored.record.phase == Phase::Committed {
             return Ok(registry);
         }
-        self.verify_upgrade_authority(stored).await?;
+        self.verify_upgrade_authority(&stored).await?;
         let progress = self.execute_cleanup(transition, executor).await?;
         if !progress.pending.is_empty() {
             return Err(Error::Pending(
@@ -137,7 +137,17 @@ impl PlatformClient {
             .get_mut(transition)
             .ok_or_else(|| invalid("transition missing"))?
             .record = updated;
-        let checkpoint = crate::writer_checkpoint::project_committed(&next, transition)?;
+        let checkpoint = crate::writer_checkpoint::project_committed(
+            &next,
+            &self.selected(
+                &Versioned {
+                    value: next.clone(),
+                    uid: registry.uid.clone(),
+                    resource_version: registry.resource_version.clone(),
+                },
+                transition,
+            )?,
+        )?;
         let history = next
             .histories
             .get_mut(&stored.plan.request.next.compiled.ir.domain.id)
@@ -155,7 +165,10 @@ impl PlatformClient {
         self.persist_registry(&registry, &next).await
     }
 
-    async fn verify_upgrade_authority(&self, stored: &StoredTransition) -> Result<()> {
+    async fn verify_upgrade_authority(
+        &self,
+        stored: &crate::transition_session::ResolvedStoredTransition,
+    ) -> Result<()> {
         let binding = stored
             .runtime_binding
             .as_ref()
@@ -208,7 +221,7 @@ impl PlatformClient {
         registry: &Versioned<NamespaceRegistry>,
         transition: &str,
     ) -> Result<Versioned<NamespaceRegistry>> {
-        let stored = registry.value.transition(transition)?;
+        let stored = self.selected(registry, transition)?;
         let previous = stored
             .plan
             .request
@@ -223,7 +236,7 @@ impl PlatformClient {
         if history.active_allocation.as_ref() != Some(&previous.allocation) {
             return Err(invalid("active generation differs from transition"));
         }
-        for approved in approved_claims(&registry.value, stored)? {
+        for approved in approved_claims(&registry.value, &stored)? {
             next.claims
                 .iter_mut()
                 .find(|c| c.identity == approved.claim.identity)
@@ -254,8 +267,8 @@ impl PlatformClient {
         transition: &str,
         executor: &str,
     ) -> Result<Versioned<NamespaceRegistry>> {
-        let stored = registry.value.transition(transition)?;
-        let previous = self.previous_writer(stored)?;
+        let stored = self.selected(registry, transition)?;
+        let previous = self.previous_writer(&stored)?;
         let binding = stored
             .runtime_binding
             .as_ref()
@@ -277,8 +290,8 @@ impl PlatformClient {
             schema_version: SCHEMA_VERSION.into(),
             binding: binding.clone(),
             status: ActivationStatus::Active,
-            approved_claims: approved_claims(&registry.value, stored)?,
-            rollout_key_id: self.preprovisioned_key_id(stored).await?,
+            approved_claims: approved_claims(&registry.value, &stored)?,
+            rollout_key_id: self.preprovisioned_key_id(&stored).await?,
         };
         let active = if current.value == next {
             current
@@ -328,7 +341,7 @@ impl PlatformClient {
             .staged_identity_uids
             .insert(inventory_key, inventory.uid);
         entry.record = advance(
-            &entry.plan,
+            &stored.plan,
             &entry.record,
             entry.record.revision,
             executor,

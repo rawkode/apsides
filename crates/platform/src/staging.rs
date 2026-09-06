@@ -13,7 +13,7 @@ impl PlatformClient {
     #[cfg(feature = "deployer")]
     pub(crate) async fn verify_runtime_identity(
         &self,
-        stored: &crate::StoredTransition,
+        stored: &crate::transition_session::ResolvedStoredTransition,
     ) -> Result<()> {
         let name = &stored.plan.generation_reservation.service_account_name;
         for (api_version, kind, namespace, desired) in
@@ -52,15 +52,10 @@ impl PlatformClient {
         executor_id: &str,
     ) -> Result<Versioned<NamespaceRegistry>> {
         let mut registry = self.load_registry().await?;
-        let stored = registry
-            .value
-            .transitions
-            .get(transition_id)
-            .cloned()
-            .ok_or_else(|| invalid("unknown reserved transition"))?;
+        let stored = self.selected(&registry, transition_id)?;
         if stored.record.executor_id != executor_id
             || stored.record.phase != Phase::Planned
-            || plan_transition(&stored.plan.request)? != stored.plan
+            || plan_transition(&stored.plan.request)? != *stored.plan
         {
             return Err(invalid(
                 "identity staging requires the owning Planned transition",
@@ -140,7 +135,7 @@ fn role_rule(capability: &Capability) -> Value {
 }
 
 fn identity_resources(
-    stored: &crate::StoredTransition,
+    stored: &crate::transition_session::ResolvedStoredTransition,
     control_namespace: &str,
     workload_namespace: &str,
 ) -> Result<Vec<(&'static str, &'static str, String, Value)>> {

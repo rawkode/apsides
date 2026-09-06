@@ -17,11 +17,7 @@ impl PlatformClient {
         executor_id: &str,
     ) -> Result<VersionedInventory> {
         let registry = self.load_registry().await?;
-        let stored = registry
-            .value
-            .transitions
-            .get(transition_id)
-            .ok_or_else(|| invalid("unknown inventory transition"))?;
+        let stored = self.selected(&registry, transition_id)?;
         verify_record(&stored.plan, &stored.record)?;
         let generation = &stored.plan.request.next;
         let domain = &generation.compiled.ir.domain;
@@ -37,8 +33,7 @@ impl PlatformClient {
                 .and_then(|h| h.active_allocation.as_ref().map(|a| &a.generation_id))
                 != Some(&generation.generation_id)
             || registry.value.transitions.values().any(|entry| {
-                entry.plan.request.next.compiled.ir.domain.id == domain.id
-                    && entry.record.phase != Phase::Committed
+                entry.domain_id() == domain.id && entry.record.phase != Phase::Committed
             })
         {
             return Err(invalid(

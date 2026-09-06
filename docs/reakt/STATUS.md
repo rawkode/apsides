@@ -2,6 +2,12 @@
 
 Reakt implements specification 0.2 in the workspace crates and the `@reakt/kubernetes` SDK. The complete production release gate is **not yet satisfied**. A successful local compile, signed candidate, or individual cluster test is not a production release.
 
+## Current integration checkpoint
+
+The registry v4 cutover replaces stored full transition plans with compact replay inputs and immutable metadata references. The CLI now resolves the selected plan through a verified-release session before lifecycle execution and review. `cuenv task registryTest` passed 116 tests with two live tests skipped (`work/compact-registry-final-tests.log`). `cuenv task registryCheck` passed strict all-target Clippy (`work/compact-registry-final-clippy.log`). Independent production, harness, CLI and test-diff reviews passed. Reservation wire canaries, substituted replay authority, trust revocation before writes, old-schema recovery errors, local libSQL reopen and lifecycle regressions are covered. These checks do not establish live Pod upgrades, PV/Turso behavior or final production qualification. See [the current state contract](STATE-MIGRATION.md) for the remaining size, review and live-upgrade requirements.
+
+The sections below record earlier implementation checkpoints. Their claims about retained full plans, checkpoint backfill and unavailable repository/reviewer access describe those earlier states and are superseded by the current contract. The repository is now private `rawkode/apsides`; independent review is active.
+
 ## Pending architecture changes from user direction
 
 Historical OCI retrieval is not required for upgrades. Earlier artifact-recovery notes below describe a superseded direction. CI supplies the new release; previous inventory and compact writer/ownership state must be sufficient. Automatic transition recovery-location recording has been removed. OCI remains optional distribution for a requested release.

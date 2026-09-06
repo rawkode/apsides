@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 impl PlatformClient {
-    fn claims_backend(&self) -> Result<&dyn ClaimStore> {
+    pub(crate) fn claims_backend(&self) -> Result<&dyn ClaimStore> {
         self.claim_store
             .as_deref()
             .ok_or_else(|| invalid("registry operations require a configured claim store"))
@@ -94,6 +94,8 @@ impl PlatformClient {
         };
         self.validate_registry_allocations(&registry.value)?;
         remove_obsolete_tls_digests(&mut registry.value);
+        #[cfg(feature = "deployer")]
+        self.validate_selection(&registry).await?;
         Ok(registry)
     }
 
@@ -118,6 +120,7 @@ impl PlatformClient {
         Ok(stored)
     }
 
+    #[cfg(feature = "deployer")]
     pub(crate) async fn persist_registry(
         &self,
         previous: &Versioned<NamespaceRegistry>,
@@ -135,6 +138,13 @@ impl PlatformClient {
             ));
         }
         self.validate_registry_allocations(next)?;
+        #[cfg(feature = "deployer")]
+        self.validate_selection(&Versioned {
+            value: next.clone(),
+            uid: previous.uid.clone(),
+            resource_version: previous.resource_version.clone(),
+        })
+        .await?;
         let snapshot = next.claim_snapshot()?;
         let expected = snapshot.reference()?;
         let state = next.state(&expected)?;
@@ -278,14 +288,23 @@ impl PlatformClient {
         }
         let mut sequences = BTreeSet::new();
         for (transition_id, stored) in &registry.transitions {
-            let allocation = &stored.plan.generation_reservation;
+            let allocation = stored.allocation();
+            stored
+                .inputs
+                .validate(transition_id, &registry.captured_claim_scope)?;
+            crate::transition_record::validate(stored)?;
+            if stored.record.transition_id != *transition_id
+                || stored.record.plan_digest != stored.plan_digest()
+            {
+                return Err(invalid("compact transition record identity mismatch"));
+            }
             deploy::validate_allocation(allocation)?;
             if allocation.registry_uid != registry.registry_uid
                 || allocation.sequence >= registry.next_sequence
                 || !sequences.insert(allocation.sequence)
                 || transition_id != &allocation.transition_id
-                || stored.plan.request.registry.registry_uid != registry.registry_uid
-                || stored.plan.request.registry.next_sequence != allocation.sequence
+                || stored.inputs.registry.claim_snapshot.scope.registry_uid != registry.registry_uid
+                || stored.inputs.registry.next_sequence != allocation.sequence
             {
                 return Err(invalid(
                     "stored reservation is outside protected registry allocation authority",
@@ -308,14 +327,12 @@ fn remove_obsolete_tls_digests(registry: &mut NamespaceRegistry) {
         let key = format!(
             "v1/Secret/{}/{}-tls",
             stored
-                .plan
-                .request
-                .next
-                .compiled
-                .ir
-                .domain
+                .inputs
+                .registry
+                .claim_snapshot
+                .scope
                 .control_namespace,
-            stored.plan.generation_reservation.service_account_name
+            stored.allocation().service_account_name
         );
         stored.staged_content_digests.remove(&key);
     }

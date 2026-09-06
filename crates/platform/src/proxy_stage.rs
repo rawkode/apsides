@@ -61,12 +61,7 @@ impl PlatformClient {
         release: &crate::controller::StagingArtifact<'_>,
     ) -> Result<Versioned<NamespaceRegistry>> {
         let reserved = self.load_registry().await?;
-        let stored = reserved
-            .value
-            .transitions
-            .get(transition_id)
-            .cloned()
-            .ok_or_else(|| invalid("unknown transition"))?;
+        let stored = self.selected(&reserved, transition_id)?;
         if stored.record.phase != Phase::Planned || stored.record.executor_id != executor_id {
             return Err(invalid(
                 "proxy staging requires an owning Planned transition",
@@ -169,7 +164,7 @@ impl PlatformClient {
     ) -> Result<()> {
         let api: Api<Secret> = Api::namespaced(self.client.clone(), &self.control_namespace);
         let key = format!("v1/Secret/{}/{name}", self.control_namespace);
-        let entry = registry.value.transition(transition)?;
+        let entry = self.selected(registry, transition)?;
         let known = entry.staged_identity_uids.get(&key);
         let uid = match (
             api.get_opt(name)

@@ -1,7 +1,6 @@
 use crate::{
     ActivationState, ActivationStatus, ExpectedPod, ExpectedWriters, NamespaceRegistry,
-    PlatformClient, Result, StoredTransition, UpgradeDrainState, Versioned, WriterCheckpoint,
-    invalid,
+    PlatformClient, Result, UpgradeDrainState, Versioned, WriterCheckpoint, invalid,
 };
 use compiler_core::digest;
 use deploy::{Event, Phase, Quiescence, TerminationEvidence};
@@ -180,18 +179,14 @@ impl PlatformClient {
         return self.persist_drain(registry, transition, drain).await;
     }
 
-    pub(crate) fn owning_upgrade<'a>(
+    pub(crate) fn owning_upgrade(
         &self,
-        registry: &'a Versioned<NamespaceRegistry>,
+        registry: &Versioned<NamespaceRegistry>,
         transition: &str,
         executor: &str,
         phases: &[Phase],
-    ) -> Result<&'a StoredTransition> {
-        let stored = registry
-            .value
-            .transitions
-            .get(transition)
-            .ok_or_else(|| invalid("unknown transition"))?;
+    ) -> Result<crate::transition_session::ResolvedStoredTransition> {
+        let stored = self.selected(registry, transition)?;
         if stored
             .plan
             .request
@@ -205,11 +200,11 @@ impl PlatformClient {
             || stored.record.executor_id != executor
             || !phases.contains(&stored.record.phase)
             || stored.plan.request.previous.is_none()
-            || deploy::plan_transition(&stored.plan.request)? != stored.plan
+            || deploy::plan_transition(&stored.plan.request)? != *stored.plan
         {
             return Err(invalid("operation requires owning validated upgrade phase"));
         }
-        verify_record(stored)?;
+        verify_record(&stored)?;
         Ok(stored)
     }
 
@@ -398,7 +393,7 @@ impl PlatformClient {
 impl PlatformClient {
     pub(crate) fn previous_writer<'a>(
         &self,
-        current: &'a StoredTransition,
+        current: &'a crate::transition_session::ResolvedStoredTransition,
     ) -> Result<&'a WriterCheckpoint> {
         let metadata = current
             .plan
@@ -418,7 +413,7 @@ impl PlatformClient {
     }
 }
 
-fn verify_record(stored: &StoredTransition) -> Result<()> {
+fn verify_record(stored: &crate::transition_session::ResolvedStoredTransition) -> Result<()> {
     let replayed = if let Some(receipt) = stored.record.receipts.last() {
         deploy::advance(
             &stored.plan,

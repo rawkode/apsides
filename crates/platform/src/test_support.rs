@@ -24,6 +24,62 @@ pub struct DisposableTestCluster {
 }
 
 impl PlatformClient {
+    /// Reserve only a signed candidate bound to a disposable cluster marker.
+    /// # Errors
+    /// Rejects mismatched candidate bytes, target identity or immutable inventory.
+    pub async fn reserve_test_candidate(
+        &self,
+        request: &deploy::DeploymentRequest,
+        executor: &str,
+        authorization: &TestStagingAuthorization,
+        target: &TestClusterTarget,
+        inventory: &dyn inventory::InventoryStore,
+    ) -> Result<Versioned<NamespaceRegistry>> {
+        self.verify_test_cluster_target(authorization, target)
+            .await?;
+        let candidate = authorization.candidate();
+        if request.next.compiled != *candidate.compiled()
+            || request.next.artifact_digest != candidate.release_digest()
+        {
+            return Err(invalid("test reservation differs from signed candidate"));
+        }
+        self.verify_release_trust(
+            &request.next.compiled.ir.domain.id,
+            candidate.trust_policy_digest(),
+        )
+        .await?;
+        self.reserve_authenticated(
+            request,
+            executor,
+            inventory,
+            Some(candidate.trust_policy_digest()),
+        )
+        .await
+    }
+
+    /// Resolve one signed candidate for an explicitly marked disposable target.
+    /// # Errors
+    /// Rejects target drift, missing metadata or nonexact transition replay.
+    pub async fn transition_test_session(
+        &self,
+        authorization: &TestStagingAuthorization,
+        target: &TestClusterTarget,
+        inventory: &dyn inventory::InventoryStore,
+        transition: &str,
+    ) -> Result<crate::TransitionSession> {
+        self.verify_test_cluster_target(authorization, target)
+            .await?;
+        let candidate = authorization.candidate();
+        self.bind_release(
+            candidate.compiled(),
+            candidate.release_digest(),
+            candidate.trust_policy_digest(),
+            inventory,
+            transition,
+        )
+        .await
+    }
+
     /// Stage an integrity/provenance verified candidate on an explicitly marked
     /// disposable API target. This is not available in the production CLI build.
     /// # Errors

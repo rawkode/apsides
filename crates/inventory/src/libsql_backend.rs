@@ -194,7 +194,7 @@ impl InventoryStore for LibsqlInventory {
             .map_err(|_| Error::Invalid("snapshot bytes"))?;
         let snapshot: InventorySnapshot =
             serde_json::from_slice(&bytes).map_err(|_| Error::Invalid("snapshot shape"))?;
-        if snapshot.encode(scope)? != bytes || snapshot_id(&snapshot)? != id {
+        if snapshot.encode(scope)? != bytes || snapshot_id(scope, &snapshot)? != id {
             return Err(Error::Invalid("snapshot integrity"));
         }
         Ok(Some(snapshot))
@@ -208,7 +208,7 @@ impl InventoryStore for LibsqlInventory {
     ) -> Result<VersionedInventory> {
         let key = scope.key()?;
         let bytes = snapshot.encode(scope)?;
-        let id = snapshot_id(snapshot)?;
+        let id = snapshot_id(scope, snapshot)?;
         let connection = self.connection()?;
         if self.local {
             connection

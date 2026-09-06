@@ -1,8 +1,11 @@
+#[cfg(feature = "deployer")]
+use crate::StoredTransition;
 use crate::{
     DeploymentCredential, MAX_STATE_BYTES, NamespaceRegistry, PolicyState, Result, SCHEMA_VERSION,
-    StoredTransition, Versioned, invalid, valid_name,
+    Versioned, invalid, valid_name,
 };
 use compiler_core::{canonical_bytes, parse_strict};
+#[cfg(feature = "deployer")]
 use deploy::{
     ClaimState, DeploymentRequest, ProtectedClaim, RegistrySnapshot, begin, plan_transition,
 };
@@ -120,6 +123,8 @@ pub(crate) async fn replace_state_at<T: Serialize + DeserializeOwned>(
 
 #[derive(Clone)]
 pub struct PlatformClient {
+    #[cfg(feature = "deployer")]
+    pub(crate) selection: Option<std::sync::Arc<crate::transition_session::Selection>>,
     pub(crate) claim_store: Option<std::sync::Arc<dyn coordination::ClaimStore>>,
     pub(crate) client: Client,
     pub(crate) control_namespace: String,
@@ -151,6 +156,8 @@ impl PlatformClient {
             ));
         }
         Ok(Self {
+            #[cfg(feature = "deployer")]
+            selection: None,
             claim_store: None,
             client,
             control_namespace: control_namespace.into(),
@@ -166,8 +173,8 @@ impl PlatformClient {
         self
     }
 
-    /// Capture the currently committed writer authority for pre-checkpoint v4 state.
-    /// Present checkpoints are validated and never replaced.
+    /// Validate the committed writer checkpoint. Missing pre-cutover evidence
+    /// requires explicit recovery; this schema cannot recover it from old manifests.
     /// # Errors
     /// Rejects altered history, unfinished transitions, missing qualified evidence or CAS races.
     pub async fn ensure_active_writer_checkpoint(
@@ -180,69 +187,45 @@ impl PlatformClient {
             .histories
             .get(domain)
             .ok_or_else(|| invalid("active writer history missing"))?;
-        let Some(allocation) = &history.active_allocation else {
+        let Some(_) = &history.active_allocation else {
             return Ok(current);
         };
         if current.value.active_writer_checkpoints.contains_key(domain) {
             crate::writer_checkpoint::active(&current.value, domain, &self.control_namespace)?;
             return Ok(current);
         }
-        if current.value.transitions.values().any(|stored| {
-            stored.plan.request.next.compiled.ir.domain.id == domain
-                && stored.record.phase != deploy::Phase::Committed
-        }) {
-            return Err(invalid(
-                "active writer backfill requires undisturbed committed claims; explicit recovery required",
-            ));
-        }
-        let checkpoint =
-            crate::writer_checkpoint::project_committed(&current.value, &allocation.transition_id)?;
-        if &checkpoint.allocation != allocation {
-            return Err(invalid(
-                "active writer checkpoint differs from protected allocation",
-            ));
-        }
-        let mut next = current.value.clone();
-        next.active_writer_checkpoints
-            .insert(domain.into(), checkpoint);
-        crate::writer_checkpoint::active(&next, domain, &self.control_namespace)?;
-        let written = self.persist_registry(&current, &next).await?;
-        let reloaded = self.load_registry().await?;
-        if reloaded.uid != written.uid || reloaded.resource_version != written.resource_version {
-            return Err(invalid(
-                "registry changed after active writer capture; retry",
-            ));
-        }
-        Ok(reloaded)
+        Err(invalid(
+            "active writer checkpoint missing; manifest-free schema requires explicit recovery",
+        ))
     }
 
+    #[cfg(feature = "deployer")]
     pub(crate) async fn verify_new_writer_qualification(
         &self,
         transition: &str,
         executor: &str,
     ) -> Result<()> {
         let registry = self.load_registry().await?;
-        let stored = registry.value.transition(transition)?;
+        let stored = self.selected(&registry, transition)?;
         deploy::verify_record(&stored.plan, &stored.record)?;
         if stored.record.executor_id != executor {
             return Err(invalid("writer qualification requires owning executor"));
         }
-        crate::writer_checkpoint::require_qualified(stored)
+        crate::writer_checkpoint::require_qualified(&stored)
     }
 
-    /// Capture missing writer authority for an already-reserved upgrade.
-    /// Existing checkpoints are validated and never replaced. This operation
-    /// requires the same executor and authenticated historical state; it grants
-    /// no writer-termination evidence.
+    /// Validate the immutable writer authority captured with an upgrade reservation.
+    /// Missing evidence requires explicit recovery; it is never inferred from history.
     /// # Errors
-    /// Rejects forged records, unavailable history, changed authority or CAS races.
+    /// Rejects forged records, missing checkpoints and changed authority.
+    #[cfg(feature = "deployer")]
     pub async fn ensure_previous_writer_checkpoint(
         &self,
         transition: &str,
         executor: &str,
     ) -> Result<Versioned<NamespaceRegistry>> {
         let current = self.load_registry().await?;
-        let stored = current.value.transition(transition)?;
+        let stored = self.selected(&current, transition)?;
         deploy::verify_record(&stored.plan, &stored.record)?;
         if stored.record.executor_id != executor {
             return Err(invalid("writer checkpoint requires the owning executor"));
@@ -261,26 +244,9 @@ impl PlatformClient {
             )?;
             return Ok(current);
         }
-        let checkpoint = crate::writer_checkpoint::project(&current.value, metadata)?;
-        checkpoint.validate(
-            metadata,
-            &self.control_namespace,
-            &self.workload_namespace,
-            &self.cluster_binding,
-        )?;
-        let mut next = current.value.clone();
-        next.transitions
-            .get_mut(transition)
-            .ok_or_else(|| invalid("transition disappeared"))?
-            .previous_writer_checkpoint = Some(checkpoint);
-        let written = self.persist_registry(&current, &next).await?;
-        let reloaded = self.load_registry().await?;
-        if reloaded.uid != written.uid || reloaded.resource_version != written.resource_version {
-            return Err(invalid(
-                "registry changed after writer checkpoint capture; retry",
-            ));
-        }
-        Ok(reloaded)
+        Err(invalid(
+            "previous writer checkpoint missing; explicit recovery required",
+        ))
     }
 
     /// # Errors
@@ -326,6 +292,7 @@ impl PlatformClient {
         .await
     }
 
+    #[cfg(feature = "deployer")]
     fn validate_reservation_snapshot(
         &self,
         current: &Versioned<NamespaceRegistry>,
@@ -378,11 +345,62 @@ impl PlatformClient {
     /// ownership in one platform-provisioned namespace registry `ConfigMap`.
     /// # Errors
     /// Rejects stale plans, concurrent deployers, claim overlap and identity reuse.
+    #[cfg(feature = "deployer")]
     pub async fn reserve_transition(
         &self,
         request: &DeploymentRequest,
         executor_id: &str,
+        verified: &release::VerifiedRelease,
+        inventory: &dyn inventory::InventoryStore,
     ) -> Result<Versioned<NamespaceRegistry>> {
+        if request.next.compiled != *verified.compiled()
+            || request.next.artifact_digest != verified.release_digest()
+        {
+            return Err(invalid(
+                "reservation requires the exact freshly verified release",
+            ));
+        }
+        self.verify_release_trust(
+            &request.next.compiled.ir.domain.id,
+            verified.trust_policy_digest(),
+        )
+        .await?;
+        self.reserve_authenticated(
+            request,
+            executor_id,
+            inventory,
+            Some(verified.trust_policy_digest()),
+        )
+        .await
+    }
+
+    #[cfg(feature = "deployer")]
+    pub(crate) async fn reserve_authenticated(
+        &self,
+        request: &DeploymentRequest,
+        executor_id: &str,
+        inventory: &dyn inventory::InventoryStore,
+        trust_policy_digest: Option<&str>,
+    ) -> Result<Versioned<NamespaceRegistry>> {
+        if !request.observations.is_empty() {
+            return Err(invalid("compact transitions require empty observations"));
+        }
+        if let Some(previous) = request.predecessor()? {
+            let id = inventory::snapshot_id(&previous.scope, &previous.inventory)?;
+            let snapshot = inventory
+                .read_snapshot(&previous.scope, &id)
+                .await?
+                .ok_or_else(|| {
+                    invalid("predecessor inventory snapshot missing before reservation")
+                })?;
+            if snapshot != previous.inventory
+                || inventory::snapshot_id(&previous.scope, &snapshot)? != id
+            {
+                return Err(invalid(
+                    "predecessor inventory snapshot differs before reservation",
+                ));
+            }
+        }
         let current = self.load_registry().await?;
         let next_sequence = current
             .value
@@ -404,8 +422,7 @@ impl PlatformClient {
         let record = begin(&plan, executor_id)?;
         let mut next = current.value.clone();
         if next.transitions.values().any(|entry| {
-            entry.plan.request.next.compiled.ir.domain.id == domain.id
-                && entry.record.phase != deploy::Phase::Committed
+            entry.domain_id() == domain.id && entry.record.phase != deploy::Phase::Committed
         }) {
             return Err(invalid(
                 "domain has an unfinished transition; recover it without takeover",
@@ -437,10 +454,18 @@ impl PlatformClient {
         }
         next.claims.sort_by(|a, b| a.identity.cmp(&b.identity));
         next.next_sequence = next_sequence;
-        let mut stored = StoredTransition::reserved(plan, record);
+        let inputs = crate::TransitionInputs::freeze(
+            &plan,
+            current.value.claim_snapshot()?.reference()?,
+            &policy.value,
+        )?;
+        let mut stored = StoredTransition::reserved(inputs, record);
         stored.previous_writer_checkpoint = previous_writer_checkpoint;
         next.transitions
             .insert(request.transition_id.clone(), stored);
+        if let Some(trust) = trust_policy_digest {
+            self.verify_release_trust(&domain.id, trust).await?;
+        }
         self.persist_registry(&current, &next).await
     }
 

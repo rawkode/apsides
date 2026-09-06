@@ -199,18 +199,20 @@ async fn bootstrap_checks_exact_admission_response() -> Result {
 
 #[tokio::test]
 async fn legacy_registry_requires_explicit_recovery() -> Result {
-    let mut old = state()?;
-    old["schemaVersion"] = json!("reakt.dev/namespace-registry/v2");
-    let (client, calls) = client(Some(old), false);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?
-        .with_claim_store(Arc::new(Store(Fault::None)));
-    let error = platform
-        .load_registry()
-        .await
-        .err()
-        .ok_or("legacy registry accepted")?;
-    assert!(error.to_string().contains("explicit recovery"));
-    assert_eq!(methods(&calls)?, ["GET"]);
+    for version in ["v2", "v3"] {
+        let mut old = state()?;
+        old["schemaVersion"] = json!(format!("reakt.dev/namespace-registry/{version}"));
+        let (client, calls) = client(Some(old), false);
+        let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?
+            .with_claim_store(Arc::new(Store(Fault::None)));
+        let error = platform
+            .load_registry()
+            .await
+            .err()
+            .ok_or("legacy registry accepted")?;
+        assert!(error.to_string().contains("explicit recovery"));
+        assert_eq!(methods(&calls)?, ["GET"]);
+    }
     Ok(())
 }
 

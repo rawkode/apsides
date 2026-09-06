@@ -1,6 +1,6 @@
 use crate::{
-    NamespaceRegistry, PlatformClient, ProxyIdentity, Result, RuntimeBinding, StoredTransition,
-    Versioned, WriterCheckpoint, invalid,
+    NamespaceRegistry, PlatformClient, ProxyIdentity, Result, RuntimeBinding, Versioned,
+    WriterCheckpoint, invalid,
 };
 use compiler_core::digest;
 use k8s_openapi::{
@@ -145,7 +145,10 @@ impl PlatformClient {
         ready_node(&node)
     }
 
-    pub(crate) async fn verify_staged_proxy(&self, stored: &StoredTransition) -> Result<()> {
+    pub(crate) async fn verify_staged_proxy(
+        &self,
+        stored: &crate::transition_session::ResolvedStoredTransition,
+    ) -> Result<()> {
         self.verify_runtime_identity(stored).await?;
         self.verify_controller_support(stored).await?;
         match (&stored.request_drain_qualification, &stored.proxy_identity) {

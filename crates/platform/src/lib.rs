@@ -13,7 +13,15 @@
 //! Kubernetes-backed protected state. Hashes identify content; authenticated
 //! Kubernetes transport and platform-owned RBAC establish the writer boundary.
 mod permissions;
-mod predecessor;
+mod transition_inputs;
+mod transition_record;
+pub use transition_inputs::{FrozenPredecessor, FrozenRegistrySnapshot, TransitionInputs};
+#[cfg(feature = "deployer")]
+mod transition_session;
+#[cfg(feature = "deployer")]
+pub use transition_session::{ResolvedTransition, TransitionSession};
+#[cfg(all(test, feature = "deployer"))]
+mod tests;
 mod writer_checkpoint;
 pub use permissions::{
     CreationTarget, DeploymentPermissions, ResourceAccess, RoleDelegation, deployment_permissions,
@@ -44,6 +52,7 @@ mod registry;
 mod registry_model;
 pub use ownership::OWNERSHIP_INTENT_NAMESPACE;
 mod runtime;
+#[cfg(feature = "deployer")]
 mod staging;
 mod store;
 mod termination;
@@ -77,7 +86,7 @@ pub fn registry_authority_name(
 }
 
 pub const REGISTRY_AUTHORITY_NAMESPACE: &str = "reakt-platform";
-pub const REGISTRY_SCHEMA_VERSION: &str = "reakt.dev/namespace-registry/v3";
+pub const REGISTRY_SCHEMA_VERSION: &str = "reakt.dev/namespace-registry/v4";
 pub const REGISTRY_AUTHORITY_SCHEMA_VERSION: &str = "reakt.dev/registry-authority/v1";
 pub const SCHEMA_VERSION: &str = "reakt.dev/platform/v1";
 pub const MAX_STATE_BYTES: usize = 512 * 1024;
