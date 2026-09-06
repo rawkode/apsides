@@ -17,6 +17,8 @@ const TEST_NONCE: &str = "0123456789abcdef0123456789abcdef";
 
 #[path = "support/backup.rs"]
 mod backup;
+#[path = "support/write_failure.rs"]
+mod write_failure;
 
 #[derive(Clone, Copy)]
 enum Phase {

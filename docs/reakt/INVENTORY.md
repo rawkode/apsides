@@ -43,8 +43,8 @@ test certificate; it does not qualify a live Turso deployment or host trust stor
 Writable deployment initialization creates and validates the required tables.
 Inventory and coordination expose local and remote read-only openers without DDL
 or repair. These client guards do not replace server-side credential restrictions.
-Missing tables, malformed schema,
-corrupt rows, foreign scope and oversized records fail closed.
+Missing tables, malformed schema, corrupt rows, foreign scope and oversized records
+fail closed.
 
 `LibsqlInventory::open_local_read_only` opens an existing local database with
 SQLite read-only flags. It checks the supported version and required columns
@@ -66,6 +66,14 @@ committed transition and immutable snapshot. An existing identical snapshot is
 idempotent; a conflicting object under the same reference is an error. Inventory
 does not prove writer termination, authorize mutation, fill a missing protected
 claim UID, or turn missing history into an initial installation.
+
+Local write-failure tests exercise the public claim, review and audit publication
+methods with a SQLite trigger that fails after insertion. A raw SQL control
+checks that the failed statement retains its inserted row inside the transaction;
+the store call must roll it back, preserve prior records and return a static error.
+A fresh read-only handle verifies absence, then removing the injected failure
+permits an exact, idempotent retry. This covers returned statement errors, not
+process termination, failed commits, remote storage or cross-store atomicity.
 
 ## Upgrade use
 
