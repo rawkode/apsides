@@ -22,8 +22,9 @@ use kube::{
     api::{DynamicObject, ListParams, Patch},
 };
 use platform::{
-    ActivationStatus, ApprovedClaim, RuntimeAuthority, RuntimeBinding, RuntimeCondition,
-    RuntimeInventory, SCHEMA_VERSION, VerifiedActivation, Versioned,
+    ActivationStatus, ApplyPrecondition, ApprovedClaim, RuntimeAuthority, RuntimeBinding,
+    RuntimeCondition, RuntimeInventory, SCHEMA_VERSION, VerifiedActivation, Versioned,
+    conditional_apply_request,
 };
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
@@ -33,7 +34,7 @@ use tokio::sync::{Mutex, RwLock, watch};
 
 use crate::{
     KubeRuntimeClient, Observation, RuntimeClient, RuntimeError, block_reason, insert_revision,
-    normalized_object, strict_apply_params, validate_exact_apply_owner,
+    normalized_object, validate_exact_apply_owner,
 };
 
 const MAX_POLL_MILLIS: u64 = 30_000;
@@ -930,27 +931,31 @@ async fn apply_absent_claimed(
                 resource.kind, resource.name
             ))
         })?;
-    let mut conditional = desired.clone();
-    let metadata = conditional
-        .get_mut("metadata")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| RuntimeError::Plan("desired metadata is missing".into()))?;
-    metadata.insert("resourceVersion".into(), Value::String(list_version.into()));
-    let params = strict_apply_params(&controller.kube.field_manager, resource.force);
-    api.patch(
+    let request = conditional_apply_request(
+        desired,
         &resource.name,
-        &params.clone().dry_run(),
-        &Patch::Apply(&conditional),
-    )
-    .await
-    .map_err(|error| write_api_error("conditional-create-dry-run", resource, &error))?;
+        &resource.namespace,
+        &controller.kube.field_manager,
+        resource.force,
+        ApplyPrecondition::Absent {
+            list_resource_version: list_version,
+        },
+    )?;
+    let dry_run = request.dry_run_params();
+    api.patch(&resource.name, &dry_run, &Patch::Apply(request.payload()))
+        .await
+        .map_err(|error| write_api_error("conditional-create-dry-run", resource, &error))?;
     if controller.terminating.load(Ordering::Acquire) {
         return Err(RuntimeError::Terminating);
     }
     let current = controller.authority.verify(&controller.plan).await?;
     ensure_same_claim(approved, approved_claim(&current, resource)?)?;
     let created = api
-        .patch(&resource.name, &params, &Patch::Apply(&conditional))
+        .patch(
+            &resource.name,
+            request.params(),
+            &Patch::Apply(request.payload()),
+        )
         .await
         .map_err(|error| write_api_error("conditional-create-apply", resource, &error))?;
     validate_exact_apply_owner(
@@ -1005,20 +1010,20 @@ async fn apply_existing_claimed(
     {
         return Ok(existing);
     }
-    let mut conditional = desired.clone();
-    let metadata = conditional
-        .get_mut("metadata")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| RuntimeError::Plan("desired metadata is missing".into()))?;
-    metadata.insert("uid".into(), Value::String(expected_uid.into()));
-    metadata.insert("resourceVersion".into(), Value::String(version.into()));
-    let params = strict_apply_params(&controller.kube.field_manager, resource.force);
+    let request = conditional_apply_request(
+        desired,
+        &resource.name,
+        &resource.namespace,
+        &controller.kube.field_manager,
+        resource.force,
+        ApplyPrecondition::Existing {
+            uid: expected_uid,
+            resource_version: version,
+        },
+    )?;
+    let dry_run = request.dry_run_params();
     let projected = api
-        .patch(
-            &resource.name,
-            &params.clone().dry_run(),
-            &Patch::Apply(&conditional),
-        )
+        .patch(&resource.name, &dry_run, &Patch::Apply(request.payload()))
         .await
         .map_err(|error| write_api_error("conditional-dry-run", resource, &error))?;
     if already_owned && normalized_object(&existing)? == normalized_object(&projected)? {
@@ -1031,7 +1036,11 @@ async fn apply_existing_claimed(
     let current = controller.authority.verify(&controller.plan).await?;
     ensure_same_claim(approved, approved_claim(&current, resource)?)?;
     let applied = api
-        .patch(&resource.name, &params, &Patch::Apply(&conditional))
+        .patch(
+            &resource.name,
+            request.params(),
+            &Patch::Apply(request.payload()),
+        )
         .await
         .map_err(|error| write_api_error("conditional-apply", resource, &error))?;
     if applied.metadata.uid.as_deref() != Some(expected_uid) {

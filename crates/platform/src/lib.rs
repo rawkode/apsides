@@ -26,12 +26,14 @@ mod evidence_profile;
 mod permissions;
 mod review_metadata;
 mod review_projection;
+mod ssa_request;
 mod state_capacity;
 #[cfg(feature = "deployer")]
 mod topology_capture;
 mod transition_inputs;
 mod transition_record;
 pub use evidence_profile::{CapturedContainer, CapturedContainers, EvidenceProfile};
+pub use ssa_request::{ApplyPrecondition, ConditionalApplyRequest, conditional_apply_request};
 pub use state_capacity::CapacityAdmission;
 pub use transition_inputs::{FrozenPredecessor, FrozenRegistrySnapshot, TransitionInputs};
 #[cfg(feature = "deployer")]

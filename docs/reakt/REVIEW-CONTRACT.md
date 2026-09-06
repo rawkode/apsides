@@ -106,6 +106,26 @@ The exact-generation transport is a proposed integration, not an existing previe
 
 If approved CI capabilities are used, disclose that they permit real requests too; Kubernetes RBAC has no dry-run-only grant. Derive the required named access in the deployment permission report and obtain the independent policy approval before use. Admission may depend on identity, so a CI-identity preview cannot be presented as proof of the generation identity's eventual admission result. The report must either limit that claim explicitly or require an equivalent qualified context.
 
+### Proposed issued-deployer integration
+
+The selected implementation direction is a fixed static preview under the issued deployer, with explicit opt-in in a separately versioned deployment-identity policy. Existing identity documents must not opt in implicitly. Fresh deployment preview runs before reservation and accepts the verified release and exact planning snapshot, reusing reservation's trust, policy, ownership and inventory checks. It must not describe that snapshot as a selected transition session. Pending transitions use a session adapter to the same fixed preview operation and disclose their current phase; resumed observations are not historical pre-deployment evidence.
+
+Report the exact named LIST and PATCH requirements for managed targets, plus CREATE permissions required for absent SSA by the qualified API contract. A CREATE grant can cover other names in that namespace/GVR; report exact intended creation targets and the admission limitation. No preview requests target observed inputs, production Secrets, rollout keys or generation credentials. Missing independent approval rejects; bootstrap credentials are never a fallback. This direction adds no permissions until that policy and request path are implemented.
+
+Before returning a preview, reobserve target UID/resourceVersion or exact absence and revalidate the exact registry snapshot, trust, policy and identity approval. Reject races, incomplete reports and oversized responses. Reservation and execution retain their independent checks. A future typed live-impact report must label the issued-deployer admission context, observation interval and runtime-conditional targets, and must remain ephemeral. Real API and credential tests still gate claims about absent SSA, admission, field ownership and non-persistence.
+
+## Shared request construction
+
+The runtime's existing-object and absent-object apply paths now use the shared `platform::conditional_apply_request` builder. It preserves strict validation, the stable field manager and declared force, and installs an explicit UID/resourceVersion or absent-list resourceVersion precondition on a cloned desired object. Supplied concurrency metadata replaces any such metadata in the desired value. The builder performs no requests and establishes neither ownership nor absence; callers retain their authenticated claim checks, version qualification, dry-run interpretation and pre-write authority checks. The request type deliberately has no debug representation because it carries desired values.
+
+This is a prerequisite for preview, not a preview endpoint. Preview must request dry-run parameters explicitly and must never call the runtime helpers that subsequently write. Its transport must also avoid the Kubernetes client's normal API-error decoding: that path can log response bodies before application-level sanitization. Use the client's raw response interface, bound successful bodies before deserialization, discard error bodies and expose only fixed error classifications. Do not print raw `FieldsV1` keys: list selectors can embed values, and live map keys are not automatically approved report metadata.
+
+## Privacy boundary for live field classification
+
+The proposed projection compares presence and values transiently only at authenticated previous/next declaration paths and the fixed rollout annotation path. Its output classifies those approved paths as added, removed, changed or unchanged. Arrays retain aggregate declaration paths; a changed array does not establish which Kubernetes list element changed ownership. The API server remains the merge authority. Do not infer schema-aware ownership from the compiler's aggregate array representation.
+
+Fields outside that approved catalog may produce only a coarse server-difference classification. Ownership fieldsets may be compared transiently to disclose a coarse changed, unchanged or unknown ownership result, but their raw selectors, manager names, key names, values, hashes and cardinalities must not enter the report. Exact element-level ownership requires a separate schema-aware implementation and real API-server qualification. These limits must remain visible in the report rather than being described as complete field ownership analysis.
+
 ## Runtime-derived fields
 
 A compiled base alone is not the effective desired state. Sending it under the stable field manager can incorrectly preview removal of a runtime-owned rollout annotation.
