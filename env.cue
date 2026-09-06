@@ -5,6 +5,7 @@ import "github.com/cuenv/cuenv/schema"
 schema.#Project & {name: "apsides"}
 
 tasks: {
+	cnpgDemoTest: {command: "python3", args: ["tests/reakt/test_cnpg_demo.py"]}
 	cnpgInitialTypes: {
 		dependsOn: [install]
 		command: "node"

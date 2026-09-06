@@ -57,3 +57,39 @@ verification.
 For the first deployment in the upgrade demo, use [the initial version](initial/README.md).
 It owns the same database and ConfigMap; this version adds the API workload and
 its observed inputs.
+
+## Local upgrade rehearsal
+
+The repository's test driver accepts two signed, integrity-verified candidates
+built from the initial and parent examples. It uses the real lifecycle protocol
+on a new kind cluster, including the rejected permission expansion and verified
+writer retirement. It does not bypass the production `aps deploy` release gate
+or produce a production acceptance receipt.
+
+```sh
+cuenv exec -- python3 tests/reakt/run_cnpg_demo.py \
+  --initial-artifact "$INITIAL_CANDIDATE" \
+  --successor-artifact "$SUCCESSOR_CANDIDATE" \
+  --trust-policy "$TRUST_POLICY" \
+  --operator-manifest "$PINNED_OPERATOR_MANIFEST" \
+  --operator-sha256 "$OPERATOR_MANIFEST_DIGEST" \
+  --output "$PWD/work/cnpg-rehearsal"
+```
+
+Input paths must be absolute and the output directory must be new. The operator
+manifest must be CNPG 1.30.0 with its operator image and `OPERATOR_IMAGE_NAME`
+pinned to the same digest. The driver runs the existing Envoy canary first;
+its environment evidence supplements the upgrade's separate live drain,
+termination and credential-revocation checks.
+
+The HTTP checks expect the synthetic `messages` table. After the upgrade, a
+ConfigMap change sets `PGRST_DB_MAX_ROWS` from 100 to 1; the checks require a new
+Pod and ReplicaSet, a changed rollout revision and an HTTP response with one row
+instead of two. Database access verifies consumption of the CNPG Secret; this
+flow does not claim to demonstrate credential rotation.
+
+By default the driver deletes its cluster and credentials, preserving existing
+clusters. `--retain-on-success` keeps the successful demo cluster and a private
+admin kubeconfig in the output directory, while removing issuer credentials.
+Failure is never treated as successful release evidence. Offline runner
+regressions are available through `cuenv task cnpgDemoTest`.
