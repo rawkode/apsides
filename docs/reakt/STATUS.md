@@ -4,6 +4,19 @@ Reakt implements specification 0.2 in the workspace crates and the `@reakt/kuber
 
 ## Current integration checkpoint
 
+The corrected producer passed a fresh two-build run from commit `3a45749`, and
+the real CLI assembled its flat evidence directory into a release. The Rust
+consumer then validated the assembled payload and reproducibility receipt
+(`work/production-prefix-after.log`: one explicitly invoked test passed). Evidence
+is under `work/production-reproducibility-3a45749/` and
+`work/production-assembly-3a45749/`. Signing that incomplete bundle with a
+disposable local test key still caused `verify-release` to reject missing required
+reactor coverage; the temporary private key was removed. These results prove
+local two-build reproducibility and producer/package/consumer interoperability.
+Independent review rehashed the packaged evidence and payloads and found no blockers.
+They do not establish production signer trust, the other fifteen release checks,
+reactor acceptance, image publication, or a deployable production release.
+
 Two real cache-disabled production builds of the TSX example completed with
 identical native binary, OCI archive, image manifest, IR, compiler closure and
 canonical build inputs (`work/production-reproducibility-1341522-docker/`).
@@ -12,7 +25,7 @@ BuildKit logs. Real release assembly then exposed an evidence-path mismatch:
 the CLI prefixes evidence files with `evidence/`, while the original receipt used
 bare names. The producer now emits a flat staging directory with the correct
 references. The opt-in assembled-evidence check reproduces the original rejection;
-the corrected producer still requires its fresh assembly/consumer qualification.
+the fresh positive qualification above supersedes that failed interoperability run.
 
 Release evidence now separates fixture reactor conformance from exact production
 payload checks. Thirteen checks require production evidence bound to the signed
