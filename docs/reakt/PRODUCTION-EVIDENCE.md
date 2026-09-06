@@ -51,6 +51,17 @@ cuenv exec python3 tests/reakt/run_reproducibility.py \
 Prepare the build profile and build the CLI with `cuenv task build` first. This
 command measures local image archives; it does not push an image to that repository.
 
+Successful runs create a flat `OUTPUT/evidence/` directory containing the receipt,
+runner source and two build transcripts. Pass this directory to `reakt release
+--evidence`; internal receipt references already use the release's `evidence/`
+prefix. Coverage must reference `evidence/production-evidence.json`. Build outputs
+remain outside this flat directory.
+
+`cuenv task productionEvidenceLive`, with `APS_PRODUCTION_EVIDENCE_RELEASE` set to
+an absolute assembled-release directory, invokes the actual payload and
+reproducibility-evidence validators. This opt-in check does not verify signatures
+or satisfy the other release checks.
+
 The build profile, pinned tools and local image prerequisites remain the normal
 build requirements. A mismatch or build failure is a failed qualification; it is
 not permission to discard differing payload fields. Matching builds establish

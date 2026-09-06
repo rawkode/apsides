@@ -4,6 +4,16 @@ Reakt implements specification 0.2 in the workspace crates and the `@reakt/kuber
 
 ## Current integration checkpoint
 
+Two real cache-disabled production builds of the TSX example completed with
+identical native binary, OCI archive, image manifest, IR, compiler closure and
+canonical build inputs (`work/production-reproducibility-1341522-docker/`).
+Independent review recomputed the hashes and confirmed both compiler runs in the
+BuildKit logs. Real release assembly then exposed an evidence-path mismatch:
+the CLI prefixes evidence files with `evidence/`, while the original receipt used
+bare names. The producer now emits a flat staging directory with the correct
+references. The opt-in assembled-evidence check reproduces the original rejection;
+the corrected producer still requires its fresh assembly/consumer qualification.
+
 Release evidence now separates fixture reactor conformance from exact production
 payload checks. Thirteen checks require production evidence bound to the signed
 IR, compiler, binary, image/platform, build inputs and authenticated runner source;

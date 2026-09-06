@@ -19,6 +19,8 @@ pub use fetch::{
 mod manifest;
 mod oci;
 mod production_evidence;
+#[cfg(test)]
+mod production_evidence_live;
 mod provenance;
 mod runner_evidence;
 

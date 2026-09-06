@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -321,7 +322,7 @@ def qualify(source, profile, cli, output, image_repository):
         },
         "sourceInputsDigest": first_identity["sourceInputsDigest"],
         "payloadFiles": first_identity["payloadFiles"],
-        "runnerSourceFile": runner.name,
+        "runnerSourceFile": "evidence/" + runner.name,
         "runnerSourceDigest": digest_file(runner),
         "checks": {
             "reproducible-payload": {
@@ -340,7 +341,7 @@ def qualify(source, profile, cli, output, image_repository):
                         "passed": True,
                     },
                 ],
-                "evidenceFiles": ["build-1.log", "build-2.log"],
+                "evidenceFiles": ["evidence/build-1.log", "evidence/build-2.log"],
             }
         },
     }
@@ -349,7 +350,11 @@ def qualify(source, profile, cli, output, image_repository):
     ).encode()
     if len(receipt_bytes) > MAX_EVIDENCE_BYTES:
         raise QualificationError("reproducibility evidence is oversized")
-    (output / "production-evidence.json").write_bytes(receipt_bytes)
+    evidence = output / "evidence"
+    evidence.mkdir()
+    for name in [runner.name, "build-1.log", "build-2.log"]:
+        shutil.copyfile(output / name, evidence / name)
+    (evidence / "production-evidence.json").write_bytes(receipt_bytes)
     return receipt
 
 
@@ -376,7 +381,7 @@ def main(arguments=None):
     except (OSError, QualificationError, subprocess.SubprocessError):
         print("reakt: reproducibility qualification failed", file=sys.stderr)
         return 1
-    print(json.dumps({"evidence": str(options.output / "production-evidence.json"), "schemaVersion": receipt["schemaVersion"]}))
+    print(json.dumps({"evidence": str(options.output / "evidence/production-evidence.json"), "schemaVersion": receipt["schemaVersion"]}))
     return 0
 
 

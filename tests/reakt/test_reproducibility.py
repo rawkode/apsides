@@ -207,11 +207,18 @@ class ReproducibilityTests(unittest.TestCase):
             [assertion["checkId"] for assertion in check["assertions"]],
             ["independent-builds", "payload-digests-equal"],
         )
-        self.assertEqual(check["evidenceFiles"], ["build-1.log", "build-2.log"])
+        self.assertEqual(check["evidenceFiles"], ["evidence/build-1.log", "evidence/build-2.log"])
         self.assertEqual(
             receipt["runnerSourceDigest"],
             PRODUCER.digest_file(fixture.output / receipt["runnerSourceFile"]),
         )
+        # The release CLI copies a flat --evidence directory beneath evidence/.
+        staged = fixture.output / "evidence"
+        published = {"evidence/" + path.name: PRODUCER.digest_file(path)
+                     for path in staged.iterdir()}
+        self.assertEqual(published[receipt["runnerSourceFile"]], receipt["runnerSourceDigest"])
+        self.assertTrue(all(name in published for name in check["evidenceFiles"]))
+        self.assertIn("evidence/production-evidence.json", published)
 
     def test_every_required_identity_mismatch_rejects_without_a_receipt(self):
         for mismatch in ["binary", "image", "archive", "ir", "compiled", "compiler", "inputs"]:
@@ -220,7 +227,7 @@ class ReproducibilityTests(unittest.TestCase):
                 with self.assertRaises(PRODUCER.QualificationError):
                     fixture.qualify()
                 self.assertEqual(len(fixture.builds), 2)
-                self.assertFalse((fixture.output / "production-evidence.json").exists())
+                self.assertFalse((fixture.output / "evidence/production-evidence.json").exists())
 
     def test_failed_second_build_never_emits_reproducibility_evidence(self):
         fixture = self.fixture(fail_second=True)
@@ -228,7 +235,7 @@ class ReproducibilityTests(unittest.TestCase):
             fixture.qualify()
         self.assertEqual(len(fixture.builds), 2)
         self.assertTrue((fixture.output / "build-2.log").is_file())
-        self.assertFalse((fixture.output / "production-evidence.json").exists())
+        self.assertFalse((fixture.output / "evidence/production-evidence.json").exists())
 
     def test_oversized_build_transcript_never_emits_evidence(self):
         fixture = self.fixture()
@@ -245,7 +252,7 @@ class ReproducibilityTests(unittest.TestCase):
                 PRODUCER.qualify(fixture.source, fixture.profile, fixture.cli,
                                  fixture.output, "registry.example/controller")
         self.assertEqual(len(fixture.builds), 1)
-        self.assertFalse((fixture.output / "production-evidence.json").exists())
+        self.assertFalse((fixture.output / "evidence/production-evidence.json").exists())
 
     def test_dirty_source_before_or_after_builds_is_rejected(self):
         for statuses, expected_builds in [([" M program.tsx\n"], 0), (["", "?? changed\n"], 2)]:
@@ -254,14 +261,14 @@ class ReproducibilityTests(unittest.TestCase):
                 with self.assertRaises(PRODUCER.QualificationError):
                     fixture.qualify()
                 self.assertEqual(len(fixture.builds), expected_builds)
-                self.assertFalse((fixture.output / "production-evidence.json").exists())
+                self.assertFalse((fixture.output / "evidence/production-evidence.json").exists())
 
     def test_source_head_change_after_builds_is_rejected(self):
         fixture = self.fixture(heads=["a" * 40, "b" * 40])
         with self.assertRaises(PRODUCER.QualificationError):
             fixture.qualify()
         self.assertEqual(len(fixture.builds), 2)
-        self.assertFalse((fixture.output / "production-evidence.json").exists())
+        self.assertFalse((fixture.output / "evidence/production-evidence.json").exists())
 
 
 if __name__ == "__main__":
