@@ -18,6 +18,7 @@ pub use fetch::{
 };
 mod manifest;
 mod oci;
+mod production_evidence;
 mod provenance;
 mod runner_evidence;
 
@@ -29,6 +30,7 @@ pub use manifest::{
 };
 #[cfg(feature = "test-support")]
 pub use manifest::{TestStagingAuthorization, TestStagingScope};
+pub use production_evidence::ProductionEvidence;
 pub use provenance::{
     SignaturePolicy, TrustPolicy, VerifierTool, verify_candidate, verify_release,
 };

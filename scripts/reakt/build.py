@@ -13,7 +13,7 @@ from sbom import generate
 from toolchain_snapshot import capture as capture_tools, verify as verify_tools
 
 
-def assemble(artifact, source, profile_path):
+def assemble(artifact, source, profile_path, *, no_cache=False):
     artifact, source, profile_path = artifact.resolve(), source.resolve(), profile_path.resolve()
     profile_bytes = profile_path.read_bytes()
     profile = json.loads(profile_bytes)
@@ -34,7 +34,7 @@ def assemble(artifact, source, profile_path):
     metadata = prepare(artifact, context, builder_image=profile["builderImage"], source_date_epoch=profile["sourceDateEpoch"])
     if metadata["builder"]["platform"] != profile["platform"]:
         raise ValueError("cached builder platform differs from build profile")
-    build(context, profile["runtimeImage"], image)
+    build(context, profile["runtimeImage"], image, no_cache=no_cache)
     binary_digest = extract(image, artifact / "linux-binary")
     sbom_digest = generate(context, tool, profile["sbomToolSha256"], targets[profile["platform"]], artifact / "sbom")
     base = artifact / "runtime-base.oci.tar"
@@ -59,7 +59,8 @@ if __name__ == "__main__":
         parser.add_argument("--artifact", type=Path, required=True)
         parser.add_argument("--source-output", type=Path, required=True)
         parser.add_argument("--profile", type=Path, required=True)
+        parser.add_argument("--no-cache", action="store_true")
         args = parser.parse_args()
-        print(json.dumps(assemble(args.artifact, args.source_output, args.profile), sort_keys=True))
+        print(json.dumps(assemble(args.artifact, args.source_output, args.profile, no_cache=args.no_cache), sort_keys=True))
     except Exception:
         raise SystemExit("reakt: image build failed") from None

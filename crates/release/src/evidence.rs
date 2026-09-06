@@ -73,6 +73,13 @@ pub(crate) fn validate(root: &Path, manifest: &ReleaseManifest, plan: &CompiledP
     {
         return reject("coverage is not bound to the approved production IR");
     }
+    if report
+        .checks
+        .keys()
+        .any(|name| !REQUIRED_CHECKS.contains(&name.as_str()))
+    {
+        return reject("coverage contains an unsupported release check");
+    }
     let mut expected = BTreeMap::new();
     for case in plan.test_plan.iter().filter(|case| case.required) {
         expected.insert(digest(&serde_json::to_value(case)?)?, case);
@@ -108,7 +115,11 @@ pub(crate) fn validate(root: &Path, manifest: &ReleaseManifest, plan: &CompiledP
         };
         passed(result, manifest)?;
         for file in &result.evidence_files {
-            crate::runner_evidence::validate_record(root, manifest, file, name, false, None)?;
+            if crate::production_evidence::fixture_check(name) {
+                crate::runner_evidence::validate_record(root, manifest, file, name, false, None)?;
+            } else {
+                crate::production_evidence::validate_record(root, manifest, file, name)?;
+            }
         }
     }
     Ok(())

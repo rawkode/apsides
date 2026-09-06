@@ -254,7 +254,8 @@ fn release(root: &Path) -> TrustPolicy {
         hash(&fs::read(root.join("controller.oci.tar")).unwrap()),
     );
     add_evidence(root, &plan, &mut files);
-    let manifest = json!({"schemaVersion":"reakt.dev/release/v1","mode":"production","irDigest":plan.ir_digest,"image":{"reference":format!("example.invalid/controller@{}",image_digest),"platform":"linux/arm64"},"source":{"repository":"https://github.com/example/reakt","commit":"a".repeat(40),"inputsDigest":digest(&inputs).unwrap()},"compilerDigest":compiler,"binaryDigest":hash(&binary),"files":files});
+    let mut manifest = json!({"schemaVersion":"reakt.dev/release/v1","mode":"production","irDigest":plan.ir_digest,"image":{"reference":format!("example.invalid/controller@{}",image_digest),"platform":"linux/arm64"},"source":{"repository":"https://github.com/example/reakt","commit":"a".repeat(40),"inputsDigest":digest(&inputs).unwrap()},"compilerDigest":compiler,"binaryDigest":hash(&binary),"files":files});
+    add_production_evidence(root, &mut manifest);
     let bytes = write_json(root, "release.json", &manifest);
     write_json(
         root,
@@ -552,7 +553,7 @@ fn add_evidence(
         .map(|name| {
             (
                 *name,
-                json!({"status":"passed","evidenceFiles":["test-evidence.json"]}),
+                json!({"status":"passed","evidenceFiles":[if fixture_check(name) { "test-evidence.json" } else { "production-evidence.json" }]}),
             )
         })
         .collect();
@@ -584,6 +585,7 @@ fn add_evidence(
         .collect();
     let check_records: BTreeMap<_, _> = release::REQUIRED_CHECKS
         .iter()
+        .filter(|name| fixture_check(name))
         .map(|c| {
             (
                 *c,
@@ -599,6 +601,265 @@ fn add_evidence(
         "test-evidence.json".into(),
         hash(&write_json(root, "test-evidence.json", &evidence)),
     );
+}
+
+fn fixture_check(name: &str) -> bool {
+    matches!(
+        name,
+        "offline-reactor-suite" | "secret-canary-scan" | "reaction-mutation-check"
+    )
+}
+
+fn add_production_evidence(root: &Path, manifest: &mut Value) {
+    // Synthetic verifier fixtures establish validation behavior, not execution coverage.
+    let source = write_json(
+        root,
+        "runner-source.py",
+        &json!("verifier fixture source only"),
+    );
+    manifest["files"]["runner-source.py"] = json!(hash(&source));
+    let checks: BTreeMap<_, _> = release::REQUIRED_CHECKS
+        .iter()
+        .filter(|name| !fixture_check(name))
+        .map(|name| {
+            (
+                *name,
+                json!({"status":"passed", "assertions":check_assertions(name),
+            "evidenceFiles":["runner-source.py"]}),
+            )
+        })
+        .collect();
+    let payload_files: BTreeMap<_, _> = [
+        "build-inputs.json",
+        "controller.oci.tar",
+        "reakt-controller",
+    ]
+    .into_iter()
+    .map(|name| (name, manifest["files"][name].clone()))
+    .collect();
+    let evidence = json!({
+        "schemaVersion":"reakt.dev/production-evidence/v1",
+        "irDigest":manifest["irDigest"], "compilerDigest":manifest["compilerDigest"],
+        "binaryDigest":manifest["binaryDigest"], "image":manifest["image"],
+        "sourceInputsDigest":manifest["source"]["inputsDigest"], "payloadFiles":payload_files,
+        "runnerSourceFile":"runner-source.py", "runnerSourceDigest":hash(&source), "checks":checks
+    });
+    let bytes = write_json(root, "production-evidence.json", &evidence);
+    manifest["files"]["production-evidence.json"] = json!(hash(&bytes));
+}
+
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+fn read_fixture(root: &Path, name: &str) -> Result<Value, Box<dyn std::error::Error>> {
+    Ok(serde_json::from_slice(&fs::read(root.join(name))?)?)
+}
+
+fn replace_signed_document(root: &Path, name: &str, document: &Value) -> TestResult {
+    let bytes = canonical_bytes(document)?;
+    fs::write(root.join(name), &bytes)?;
+    let mut manifest = read_fixture(root, "release.json")?;
+    manifest["files"][name] = json!(hash(&bytes));
+    fs::write(root.join("release.json"), canonical_bytes(&manifest)?)?;
+    resign(root);
+    Ok(())
+}
+
+async fn require_evidence_rejection(
+    root: &Path,
+    policy: &TrustPolicy,
+    expected: &str,
+) -> TestResult {
+    // The envelope and real SSH signature remain valid: failure must come from coverage.
+    verify_candidate(root, policy).await?;
+    match verify_release(root, policy).await {
+        Ok(_) => return Err("signed invalid production evidence was accepted".into()),
+        Err(error) => assert!(
+            error.to_string().contains(expected),
+            "unexpected evidence rejection branch"
+        ),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn signed_production_evidence_must_match_every_payload_subject() -> TestResult {
+    for (pointer, replacement) in [
+        ("/irDigest", json!(hash(b"another IR"))),
+        ("/compilerDigest", json!(hash(b"another compiler"))),
+        ("/binaryDigest", json!(hash(b"another binary"))),
+        ("/sourceInputsDigest", json!(hash(b"another source"))),
+        (
+            "/image/reference",
+            json!(format!("example.invalid/other@{}", hash(b"another image"))),
+        ),
+        ("/image/platform", json!("linux/amd64")),
+        (
+            "/payloadFiles/build-inputs.json",
+            json!(hash(b"other build inputs")),
+        ),
+        (
+            "/payloadFiles/controller.oci.tar",
+            json!(hash(b"other OCI bytes")),
+        ),
+        (
+            "/payloadFiles/reakt-controller",
+            json!(hash(b"other controller bytes")),
+        ),
+    ] {
+        let root = tempfile::tempdir()?;
+        let policy = release(root.path());
+        verify_release(root.path(), &policy).await?;
+        let mut evidence = read_fixture(root.path(), "production-evidence.json")?;
+        *evidence
+            .pointer_mut(pointer)
+            .ok_or("subject fixture path missing")? = replacement;
+        replace_signed_document(root.path(), "production-evidence.json", &evidence)?;
+        let expected = if pointer.starts_with("/payloadFiles/") {
+            "production evidence payload files differ"
+        } else {
+            "production evidence refers to another production payload"
+        };
+        require_evidence_rejection(root.path(), &policy, expected).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn signed_fixture_evidence_cannot_satisfy_a_production_check() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let policy = release(root.path());
+    verify_release(root.path(), &policy).await?;
+    let mut fixture = read_fixture(root.path(), "test-evidence.json")?;
+    fixture["checks"]["reproducible-payload"] = json!({"status":"passed",
+        "assertions":check_assertions("reproducible-payload"), "evidenceFiles":[]});
+    replace_signed_document(root.path(), "test-evidence.json", &fixture)?;
+    let mut coverage = read_fixture(root.path(), "coverage.json")?;
+    coverage["checks"]["reproducible-payload"]["evidenceFiles"] = json!(["test-evidence.json"]);
+    replace_signed_document(root.path(), "coverage.json", &coverage)?;
+    require_evidence_rejection(root.path(), &policy, "unknown field").await
+}
+
+#[tokio::test]
+async fn signed_production_runner_source_must_be_bound_and_match() -> TestResult {
+    for mutation in ["unbound", "digest", "changed-source"] {
+        let root = tempfile::tempdir()?;
+        let policy = release(root.path());
+        verify_release(root.path(), &policy).await?;
+        let mut evidence = read_fixture(root.path(), "production-evidence.json")?;
+        match mutation {
+            "unbound" => {
+                fs::write(root.path().join("unsigned-runner.py"), b"unsigned runner")?;
+                evidence["runnerSourceFile"] = json!("unsigned-runner.py");
+                evidence["runnerSourceDigest"] = json!(hash(b"unsigned runner"));
+            }
+            "digest" => evidence["runnerSourceDigest"] = json!(hash(b"different runner")),
+            _ => {
+                replace_signed_document(root.path(), "runner-source.py", &json!("changed runner"))?;
+            }
+        }
+        replace_signed_document(root.path(), "production-evidence.json", &evidence)?;
+        require_evidence_rejection(
+            root.path(),
+            &policy,
+            "production evidence runner source is not authenticated",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn signed_production_evidence_rejects_open_schema_and_wrong_check_kinds() -> TestResult {
+    for (field, value, expected) in [
+        ("unexpected", json!(true), "unknown field"),
+        ("cases", json!({}), "unknown field"),
+        (
+            "unknown-check",
+            json!({"status":"passed", "assertions":check_assertions("reproducible-payload"),
+            "evidenceFiles":[]}),
+            "production evidence contains an unsupported check",
+        ),
+        (
+            "offline-reactor-suite",
+            json!({"status":"passed", "assertions":check_assertions("offline-reactor-suite"),
+            "evidenceFiles":[]}),
+            "production evidence contains an unsupported check",
+        ),
+    ] {
+        let root = tempfile::tempdir()?;
+        let policy = release(root.path());
+        verify_release(root.path(), &policy).await?;
+        let mut evidence = read_fixture(root.path(), "production-evidence.json")?;
+        if matches!(field, "unexpected" | "cases") {
+            evidence[field] = value;
+        } else {
+            evidence["checks"][field] = value;
+        }
+        replace_signed_document(root.path(), "production-evidence.json", &evidence)?;
+        require_evidence_rejection(root.path(), &policy, expected).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn signed_coverage_cannot_add_an_unknown_release_check() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let policy = release(root.path());
+    verify_release(root.path(), &policy).await?;
+    let mut coverage = read_fixture(root.path(), "coverage.json")?;
+    coverage["checks"]["unknown-check"] =
+        json!({"status":"passed", "evidenceFiles":["production-evidence.json"]});
+    replace_signed_document(root.path(), "coverage.json", &coverage)?;
+    require_evidence_rejection(
+        root.path(),
+        &policy,
+        "coverage contains an unsupported release check",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn signed_production_assertions_must_satisfy_the_exact_contract() -> TestResult {
+    for (mutation, expected) in [
+        (
+            "missing",
+            "evidence does not contain the exact required assertion set",
+        ),
+        ("wrong-id", "evidence is missing a required assertion"),
+        (
+            "wrong-actual",
+            "evidence assertion does not satisfy its independent expected contract",
+        ),
+    ] {
+        let root = tempfile::tempdir()?;
+        let policy = release(root.path());
+        verify_release(root.path(), &policy).await?;
+        let mut evidence = read_fixture(root.path(), "production-evidence.json")?;
+        let assertions = evidence["checks"]["reproducible-payload"]["assertions"]
+            .as_array_mut()
+            .ok_or("production assertion fixture missing")?;
+        match mutation {
+            "missing" => {
+                assertions
+                    .pop()
+                    .ok_or("production assertion fixture empty")?;
+            }
+            "wrong-id" => {
+                assertions
+                    .first_mut()
+                    .ok_or("production assertion fixture empty")?["checkId"] =
+                    json!("invented-build-count");
+            }
+            _ => {
+                assertions
+                    .first_mut()
+                    .ok_or("production assertion fixture empty")?["actual"] = json!(1);
+            }
+        }
+        replace_signed_document(root.path(), "production-evidence.json", &evidence)?;
+        require_evidence_rejection(root.path(), &policy, expected).await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]

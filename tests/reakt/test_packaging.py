@@ -130,10 +130,11 @@ class PackagingTests(unittest.TestCase):
         def fake_build(argv, check):
             self.assertIn("--network=none", argv)
             self.assertIn("--pull=false", argv)
+            self.assertIn("--no-cache", argv)
             (destination / "controller.oci.tar").write_bytes(b"mock build output")
             (destination / "buildkit-metadata.json").write_text("{}")
         with patch.object(packaging, "command", self.fake_command), patch.object(packaging.subprocess, "run", fake_build):
-            packaging.build(self.output, packaging.BUILDER, destination)
+            packaging.build(self.output, packaging.BUILDER, destination, no_cache=True)
         receipt = json.loads((destination / "packaging-inputs.json").read_text())
         self.assertEqual(receipt["contextDigest"], packaging.sha256(initial))
         self.assertEqual(receipt["releaseStatus"], "blocked")

@@ -235,7 +235,16 @@ fn verify_release_command(options: &BTreeMap<String, String>) -> Result<()> {
 }
 
 fn compile_command(options: &BTreeMap<String, String>, command: &str) -> Result<()> {
-    only(options, &["--ir", "--source", "--output", "--profile"])?;
+    only(
+        options,
+        &["--ir", "--source", "--output", "--profile", "--cache"],
+    )?;
+    let no_cache = match options.get("--cache").map(String::as_str) {
+        None => false,
+        Some("disabled") if command == "build" => true,
+        Some("enabled") if command == "build" => false,
+        _ => return Err("--cache requires build and either enabled or disabled".into()),
+    };
     if command == "compile" && options.contains_key("--profile") {
         return Err("--profile applies only to image builds".into());
     }
@@ -290,7 +299,8 @@ fn compile_command(options: &BTreeMap<String, String>, command: &str) -> Result<
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .canonicalize()?;
-        let status = Command::new("python3")
+        let mut builder = Command::new("python3");
+        builder
             .arg(root.join("scripts/reakt/build.py"))
             .env("REAKT_CLI", env::current_exe()?)
             .arg("--artifact")
@@ -302,8 +312,11 @@ fn compile_command(options: &BTreeMap<String, String>, command: &str) -> Result<
                 options
                     .get("--profile")
                     .map_or("reakt.build.json", String::as_str),
-            )
-            .status()?;
+            );
+        if no_cache {
+            builder.arg("--no-cache");
+        }
+        let status = builder.status()?;
         if !status.success() {
             return Err("controller image build failed; no deployable release was produced".into());
         }

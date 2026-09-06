@@ -4,6 +4,18 @@ Reakt implements specification 0.2 in the workspace crates and the `@reakt/kuber
 
 ## Current integration checkpoint
 
+Release evidence now separates fixture reactor conformance from exact production
+payload checks. Thirteen checks require production evidence bound to the signed
+IR, compiler, binary, image/platform, build inputs and authenticated runner source;
+fixture receipts cannot satisfy them. Signed negative tests cover subject swaps,
+unbound runner sources, unknown checks and malformed assertions. The release suite
+passed 29 tests with two integration tests ignored. Release and deploy/platform/CLI
+strict Clippy passed. The new reproducibility producer invokes two builds with
+BuildKit caching disabled, checks the locked source and resulting payloads, and
+emits only its measured check. Six mocked producer tests and nine packaging tests
+pass; these are not evidence that two real production builds match. See
+`PRODUCTION-EVIDENCE.md` for the contracts and remaining acceptance boundary.
+
 Issued-credential SSA qualification now passes against a fresh disposable kind
 cluster pinned to Kubernetes `v1.34.3`. `cuenv task previewQualification` uses the
 client minted by `IssuedDeployment` for version discovery, named LIST and

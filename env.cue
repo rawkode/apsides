@@ -5,6 +5,9 @@ import "github.com/cuenv/cuenv/schema"
 schema.#Project & {name: "apsides"}
 
 tasks: {
+	releaseTest: {command: "cargo", args: ["test", "--locked", "-p", "release", "--features", "test-support"]}
+	releaseCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "release", "--features", "test-support", "--all-targets", "--", "-D", "warnings"]}
+	reproducibilityTest: {command: "python3", args: ["-m", "unittest", "tests/reakt/test_reproducibility.py"]}
 	coordinationTest: {command: "cargo", args: ["test", "--locked", "-p", "coordination"]}
 	coordinationCheck: [
 		{command: "cargo", args: ["clippy", "--locked", "-p", "coordination", "--all-targets", "--", "-D", "warnings"]},

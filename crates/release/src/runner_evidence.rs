@@ -64,7 +64,7 @@ fn scalar(value: &Value) -> bool {
         _ => false,
     }
 }
-fn record(record: &EvidenceRecord, release: &ReleaseManifest) -> Result<()> {
+pub(crate) fn record(record: &EvidenceRecord, release: &ReleaseManifest) -> Result<()> {
     if record.status != "passed"
         || record.assertions.is_empty()
         || record.assertions.len() > 128
