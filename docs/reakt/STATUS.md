@@ -19,6 +19,11 @@ establish narrower properties.
 - The native controller reconciles its fixed resource set through conditional
   Server-Side Apply. It has no JavaScript evaluator and cannot expand its
   approved scope.
+- Runtime diagnostics retain completed-cycle blocked counts and specific reasons
+  throughout reconciliation backoff. Operational failures replace those with a
+  pending cache state and their own reason. `/readyz` stays unavailable while
+  degraded; a clean cycle restores readiness. These probes describe the
+  controller, not application workload health.
 
 ### Release and evidence
 

@@ -449,8 +449,7 @@ impl ProductionController {
             };
             self.record_cycle(&conditions, &mut last_reason).await;
             if !conditions.is_empty() {
-                self.retry(&mut attempt, "reconciliation-degraded", &mut shutdown)
-                    .await?;
+                self.wait_to_retry(&mut attempt, &mut shutdown).await?;
                 continue;
             }
             attempt = 0;
@@ -551,7 +550,6 @@ impl ProductionController {
         reason: &'static str,
         shutdown: &mut watch::Receiver<bool>,
     ) -> Result<(), RuntimeError> {
-        self.diagnostics.errors.fetch_add(1, Ordering::Relaxed);
         self.diagnostics
             .update(
                 DiagnosticPhase::Degraded,
@@ -560,6 +558,17 @@ impl ProductionController {
                 Some(reason),
             )
             .await;
+        self.wait_to_retry(attempt, shutdown).await
+    }
+
+    // A completed degraded cycle already recorded its synchronized cache and
+    // specific conditions. Waiting must not replace those with an API failure.
+    async fn wait_to_retry(
+        &self,
+        attempt: &mut u32,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<(), RuntimeError> {
+        self.diagnostics.errors.fetch_add(1, Ordering::Relaxed);
         let shift = (*attempt).min(16);
         let exponential = self
             .config
@@ -1653,6 +1662,128 @@ mod tests {
         assert_eq!(body["triggerToCycleMicrosCount"], 1);
         assert_eq!(body["triggerToCycleMicrosSum"], 7);
         assert_eq!(body["triggerToCycleMicrosMax"], 7);
+    }
+
+    async fn diagnostic_json(
+        diagnostics: &Arc<Diagnostics>,
+        path: &str,
+    ) -> Result<(StatusCode, Value), Box<dyn std::error::Error + Send + Sync>> {
+        let request = Request::builder().uri(path).body(())?;
+        let response = diagnostics_response(request, diagnostics.clone()).await?;
+        let status = response.status();
+        let body = response.into_body().collect().await?.to_bytes();
+        Ok((status, serde_json::from_slice(&body)?))
+    }
+
+    #[tokio::test]
+    async fn completed_cycle_conditions_remain_visible_during_backoff()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let plan = plan();
+        let policy = policy(&plan);
+        let activation = activation(&plan, &policy, None);
+        let runtime = controller(&plan, &activation, wire(vec![]).0);
+        let mut last_reason = None;
+        let mut attempt = 0;
+        for (index, reason) in ["input-missing", "field-or-version-conflict"]
+            .into_iter()
+            .enumerate()
+        {
+            runtime
+                .record_cycle(
+                    &[
+                        RuntimeCondition {
+                            reason_code: reason.into(),
+                            resource_name: Some("target-a".into()),
+                        },
+                        RuntimeCondition {
+                            reason_code: "input-unavailable".into(),
+                            resource_name: Some("target-b".into()),
+                        },
+                    ],
+                    &mut last_reason,
+                )
+                .await;
+            let (shutdown, mut receiver) = watch::channel(false);
+            let waiting = runtime.wait_to_retry(&mut attempt, &mut receiver);
+            tokio::pin!(waiting);
+            if !matches!(
+                futures_util::poll!(waiting.as_mut()),
+                std::task::Poll::Pending
+            ) {
+                return Err("degraded cycle did not enter retry wait".into());
+            }
+            let (status, body) = diagnostic_json(&runtime.diagnostics, "/status").await?;
+            if status != StatusCode::OK
+                || body["phase"] != "degraded"
+                || body["cache"] != "synchronized"
+                || body["blockedTargets"] != 2
+                || body["lastReasonCode"] != reason
+                || body["errors"] != json!(index + 1)
+            {
+                return Err("retry wait erased completed cycle diagnostics".into());
+            }
+            if diagnostic_json(&runtime.diagnostics, "/readyz").await?.0
+                != StatusCode::SERVICE_UNAVAILABLE
+                || diagnostic_json(&runtime.diagnostics, "/livez").await?.0 != StatusCode::OK
+            {
+                return Err("degraded cycle probe status differs".into());
+            }
+            shutdown.send(true)?;
+            waiting.await?;
+        }
+        runtime.record_cycle(&[], &mut last_reason).await;
+        let (_, body) = diagnostic_json(&runtime.diagnostics, "/status").await?;
+        if body["phase"] != "ready"
+            || body["cache"] != "synchronized"
+            || body["blockedTargets"] != 0
+            || !body["lastReasonCode"].is_null()
+            || diagnostic_json(&runtime.diagnostics, "/readyz").await?.0 != StatusCode::OK
+        {
+            return Err("successful cycle did not clear degraded diagnostics".into());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn operational_retry_replaces_stale_completed_cycle_diagnostics()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let plan = plan();
+        let policy = policy(&plan);
+        let activation = activation(&plan, &policy, None);
+        let runtime = controller(&plan, &activation, wire(vec![]).0);
+        runtime
+            .record_cycle(
+                &[RuntimeCondition {
+                    reason_code: "field-or-version-conflict".into(),
+                    resource_name: Some("target".into()),
+                }],
+                &mut None,
+            )
+            .await;
+        let (shutdown, mut receiver) = watch::channel(false);
+        let mut attempt = 0;
+        let waiting = runtime.retry(&mut attempt, "activation-unavailable", &mut receiver);
+        tokio::pin!(waiting);
+        if !matches!(
+            futures_util::poll!(waiting.as_mut()),
+            std::task::Poll::Pending
+        ) {
+            return Err("operational failure did not enter retry wait".into());
+        }
+        let (_, body) = diagnostic_json(&runtime.diagnostics, "/status").await?;
+        if body["phase"] != "degraded"
+            || body["cache"] != "pending"
+            || body["blockedTargets"] != 0
+            || body["lastReasonCode"] != "activation-unavailable"
+            || body["errors"] != 1
+            || diagnostic_json(&runtime.diagnostics, "/readyz").await?.0
+                != StatusCode::SERVICE_UNAVAILABLE
+        {
+            return Err("operational failure retained stale cycle diagnostics".into());
+        }
+        shutdown.send(true)?;
+        waiting.await?;
+        Ok(())
     }
 
     #[tokio::test]
