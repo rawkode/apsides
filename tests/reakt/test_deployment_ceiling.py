@@ -50,6 +50,10 @@ def stdout(value):
 
 def cleanup_runner(root):
     runner = CEILING.CeilingRunner.__new__(CEILING.CeilingRunner)
+    runner.output = root
+    runner.phase = "measurement"
+    runner.failures = []
+    runner.primary_failure = None
     runner.cluster = "reakt-qual-0123456789abcdef0123456789abcdef"
     runner.node_image_id = "sha256:" + "a" * 64
     runner.container_id = None
@@ -314,7 +318,7 @@ class CleanupTests(unittest.TestCase):
                                              ["retained-cluster", runner.cluster])
             self.assertTrue(runner.cleanup())
             self.assertTrue(deleted)
-            self.assertIn(["kind", "delete", "cluster", "--name", runner.cluster], calls)
+            self.assertIn(["kind", "delete", "cluster", "--name", runner.cluster, "--kubeconfig", runner.admin], calls)
             self.assertEqual(runner.prior_clusters, ["retained-cluster"])
             self.assertEqual(runner.prior_containers, ["retained-container"])
             self.assertFalse(runner.admin.exists())
@@ -382,6 +386,9 @@ class FailureTests(unittest.TestCase):
                     self.output.mkdir()
                     self.cluster = "reakt-qual-failed"
                     self.owned = False
+                    self.phase = "measurement"
+                    self.failures = []
+                    self.primary_failure = None
                     self.cleanup_confirmed = False
                     self.admin = self.output / "admin.kubeconfig"
                     self.issuer = self.output / "issuer.kubeconfig"
@@ -436,6 +443,9 @@ class FailureTests(unittest.TestCase):
                     self.output.mkdir()
                     self.cluster = "reakt-qual-failed-cleanup"
                     self.owned = False
+                    self.phase = "measurement"
+                    self.failures = []
+                    self.primary_failure = None
                     self.cleanup_confirmed = False
                     self.admin = self.output / "admin.kubeconfig"
                     self.issuer = self.output / "issuer.kubeconfig"
@@ -479,6 +489,45 @@ class FailureTests(unittest.TestCase):
             self.assertFalse(failure["passed"])
             self.assertFalse(failure["cleanupConfirmed"])
             self.assertTrue(failure["credentialsRemoved"])
+
+
+class FailureDiagnosticsTests(unittest.TestCase):
+    def test_cleanup_failure_preserves_primary_subprocess_failure(self):
+        runner = CEILING.CeilingRunner.__new__(CEILING.CeilingRunner)
+        runner.driver = Path("/tmp/ceiling-driver")
+        runner.phase = "measurement"
+        runner.failures = []
+        runner.driver_error_reasons = {"positive reservation failed"}
+        result = CEILING.subprocess.CompletedProcess(
+            [], 1, "", 'Error: DriverError("positive reservation failed")')
+        with mock.patch.object(CEILING.subprocess, "run", return_value=result):
+            with self.assertRaises(CEILING.shared.QualificationError):
+                runner.command([runner.driver])
+            runner.phase = "cleanup"
+            for _ in range(2):
+                with self.assertRaises(CEILING.shared.QualificationError):
+                    runner.command(["kind", "delete", "cluster"])
+        self.assertEqual(len(runner.failures), 2)
+        self.assertEqual(runner.failures[0]["phase"], "measurement")
+        self.assertEqual(runner.failures[0]["driverReason"], "positive reservation failed")
+        self.assertEqual(runner.failures[1]["phase"], "cleanup")
+        self.assertEqual(runner.failures[1]["program"], "kind")
+        self.assertNotIn("driverReason", runner.failures[1])
+
+    def test_only_static_driver_errors_enter_failure_metadata(self):
+        for message, expected in [("positive reservation failed", "positive reservation failed"),
+                                  ("synthetic-private-canary", None)]:
+            runner = CEILING.CeilingRunner.__new__(CEILING.CeilingRunner)
+            runner.driver = Path("/tmp/ceiling-driver")
+            runner.phase = "measurement"
+            runner.failures = []
+            runner.driver_error_reasons = {"positive reservation failed"}
+            result = CEILING.subprocess.CompletedProcess([], 1, "", 'Error: DriverError("' + message + '")')
+            with mock.patch.object(CEILING.subprocess, "run", return_value=result):
+                with self.assertRaises(CEILING.shared.QualificationError):
+                    runner.command([runner.driver, "deployment_ceiling_step"])
+            self.assertEqual(runner.failures[0].get("driverReason"), expected)
+            self.assertNotIn("synthetic-private-canary", json.dumps(runner.failures))
 
 
 if __name__ == "__main__":

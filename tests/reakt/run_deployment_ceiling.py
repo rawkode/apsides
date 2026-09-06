@@ -4,6 +4,7 @@ import argparse
 from collections import Counter
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -114,9 +115,15 @@ class CeilingRunner:
         self.cleanup_confirmed = False
         self.container_id = None
         self.steps = []
+        self.failures = []
+        self.primary_failure = None
+        self.phase = "prepare"
         self.sources = [Path(__file__).resolve(), Path(shared.__file__).resolve(),
                         Path(observations.__file__).resolve(), ROOT / "crates/platform/tests/deployment_ceiling.rs"]
         self.sources += sorted((ROOT / "crates/platform/tests/support").glob("deployment_ceiling*.rs"))
+        self.driver_error_reasons = set(re.findall(r'DriverError\(\s*"([a-zA-Z0-9 -]+)"',
+            (ROOT / "crates/platform/tests/support/deployment_ceiling_driver.rs").read_text()))
+        self.failure_reasons = set(re.findall(r'(?:QualificationError|RuntimeError)\(\s*"([^"\n]+)"', Path(__file__).read_text()))
         self.source_digests = {path.name: shared.digest_file(path) for path in self.sources}
         if len(self.source_digests) != len(self.sources):
             raise shared.QualificationError("ceiling runner source filenames collide")
@@ -135,6 +142,13 @@ class CeilingRunner:
                                 capture_output=True, timeout=timeout, check=False,
                                 cwd=ROOT, env=environment)
         if result.returncode or len(result.stdout.encode()) > shared.MAX_EVIDENCE_BYTES:
+            failure = {"program": Path(arguments[0]).name, "returnCode": result.returncode, "phase": self.phase}
+            if hasattr(self, "driver") and arguments[0] == str(self.driver):
+                observed = re.findall(r'DriverError\("([a-zA-Z0-9 -]+)"\)', result.stderr + result.stdout)
+                if len(observed) == 1 and observed[0] in self.driver_error_reasons:
+                    failure["driverReason"] = observed[0]
+            if len(self.failures) < 2:
+                self.failures.append(failure)
             raise shared.QualificationError("ceiling subprocess failed or exceeded its output limit")
         return result.stdout
 
@@ -189,6 +203,7 @@ class CeilingRunner:
                               environment=environment, timeout=180)
         result = result_record(output, expected)
         self.steps.append(result)
+        (self.output / "steps.json").write_bytes(shared.canonical(self.steps))
         return result
 
     def cluster_names(self):
@@ -446,11 +461,15 @@ class CeilingRunner:
                             or labels.get("io.x-k8s.kind.role") != "control-plane"
                             or (self.container_id and container.get("Id") != self.container_id)):
                         raise shared.QualificationError("owned cluster container identity changed; deletion refused")
-                    self.command(["kind", "delete", "cluster", "--name", self.cluster], timeout=180)
+                    self.command(["kind", "delete", "cluster", "--name", self.cluster, "--kubeconfig", self.admin], timeout=180)
                 deleted = self.cluster not in self.cluster_names() and not self.command([
                     "docker", "ps", "-aq", "--filter", "name=^/" + self.cluster + "-control-plane$"]).strip()
-                if (not deleted or sorted(self.cluster_names()) != self.prior_clusters
-                        or sorted(self.command(["docker", "ps", "-aq", "--no-trunc"]).splitlines()) != self.prior_containers):
+                current_clusters = sorted(self.cluster_names())
+                current_containers = sorted(self.command(["docker", "ps", "-aq", "--no-trunc"]).splitlines())
+                (self.output / "cleanup.json").write_bytes(shared.canonical({"cluster": self.cluster, "deleted": deleted,
+                    "previousClusters": self.prior_clusters, "currentClusters": current_clusters,
+                    "previousContainerIds": self.prior_containers, "currentContainerIds": current_containers}))
+                if (not deleted or current_clusters != self.prior_clusters or current_containers != self.prior_containers):
                     raise shared.QualificationError("cluster/container cleanup or preservation was not confirmed")
         finally:
             failed = False
@@ -496,6 +515,10 @@ class CeilingRunner:
         return evidence
 
 
+def failure_reason(runner, error):
+    return str(error) if str(error) in getattr(runner, "failure_reasons", set()) else type(error).__name__
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ["artifact", "trust-policy", "output"]:
@@ -506,22 +529,31 @@ def main():
         runner = CeilingRunner(args)
         try:
             runner.prepare()
+            runner.phase = "cluster-create"
             runner.create_cluster()
+            runner.phase = "bootstrap"
             runner.bootstrap()
+            runner.phase = "measurement"
             runner.measure()
+        except Exception as error:
+            runner.primary_failure = {"phase": runner.phase, "reason": failure_reason(runner, error)}
+            raise
         finally:
+            runner.phase = "cleanup"
             deleted = runner.cleanup()
         if not deleted:
             raise shared.QualificationError("ceiling measurement did not own and delete its cluster")
+        runner.phase = "publication"
         evidence = runner.publish()
         result = {"passed": True, "releaseVerified": False, "evidence": str(evidence),
                   "cluster": runner.cluster, "clusterDeleted": True, "credentialsRemoved": True}
         (runner.output / "result.json").write_bytes(shared.canonical(result))
         print(json.dumps(result))
-    except (RuntimeError, shared.QualificationError, OSError, ValueError, KeyError, subprocess.TimeoutExpired):
+    except Exception as error:
+        reason = failure_reason(runner, error)
         if runner:
             (runner.output / "result.json").write_bytes(shared.canonical({"passed": False, "releaseVerified": False,
-                "cluster": runner.cluster, "owned": runner.owned, "cleanupConfirmed": runner.cleanup_confirmed, "credentialsRemoved": not runner.admin.exists() and not runner.issuer.exists()}))
+                "cluster": runner.cluster, "phase": runner.phase, "failureReason": reason, "primaryFailure": runner.primary_failure, "subprocessFailures": runner.failures, "owned": runner.owned, "cleanupConfirmed": runner.cleanup_confirmed, "credentialsRemoved": not runner.admin.exists() and not runner.issuer.exists()}))
         print("Deployment ceiling qualification failed; no completed evidence is available.", file=sys.stderr)
         return 1
     return 0
