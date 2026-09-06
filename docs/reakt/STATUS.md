@@ -44,8 +44,8 @@ establish narrower properties.
 - `reakt merge-evidence` combines selected receipts against one exact production
   candidate using the existing validators. It copies only referenced files, rejects
   conflicts and duplicate coverage, and reports missing checks without claiming
-  release verification. The current producers cover three production checks and
-  three reactor checks; ten production check producers remain unfinished.
+  release verification. The current producers cover four production checks and
+  three reactor checks; nine production check producers remain unfinished.
 - The deployment-ceiling producer passed on a dedicated kind cluster: removing
   one required capability rejected the exact signed candidate without state
   changes; restoring the policy allowed the same allocation to reach `Planned`.
@@ -53,6 +53,13 @@ establish narrower properties.
   started, the temporary cluster and credentials were removed, and existing
   clusters were preserved. This qualifies reservation with the recorded runner;
   it does not execute the candidate binary or qualify GitHub Actions identity.
+- The ownership-collision producer passed with two independently signed exact
+  candidates on a dedicated kind cluster. The first reserved their shared target;
+  the second received the protected claim-collision rejection without changing
+  Kubernetes or metadata state. Both generations' writer targets remained absent,
+  cleanup preserved existing clusters, and the receipt merged with the other six
+  checks and all 43 reactor cases. One qualification executor was authorized for
+  both domains; this does not establish isolation between distinct principals.
 - Production evidence binds the exact binary, image, IR, compiler closure, build
   inputs, runner source, and diagnostic files. Reactor evidence has a separate,
   narrower fixture contract.
@@ -199,7 +206,7 @@ recovery, or production restore authority.
   supported Kubernetes versions, including the declared preview permissions and
   request-drain profile.
 - Complete scope-matched performance evidence, workload readiness and status,
-  uncertain-writer refusal, ownership collision, last-resource-type cleanup,
+  uncertain-writer refusal, last-resource-type cleanup,
   finalizer preservation, fixture-promotion rejection, and API-gap conformance
   under their production evidence contracts.
 - Define operator recovery for incompatible or corrupt protected state. Current

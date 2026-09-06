@@ -149,10 +149,10 @@ plan, frozen inputs, protected policy, and stored review must agree. The contend
 must receive the exact claim-collision rejection through authenticated reservation;
 registry, policy, review, trust, and disposable-target checks must remain stable.
 
-Pure state tests and compilation do not qualify this check. The two-candidate
-public-method test, immutable marker replacement, live state comparisons, and
-receipt verification remain unfinished. No ownership-collision receipt is emitted by
-this API, and it cannot admit a non-colliding second reservation.
+Pure state tests and compilation alone do not qualify this check. The live
+producer has exercised the two-candidate public method, immutable marker
+replacement, exact state comparisons, and successful receipt validation. The API
+itself emits no receipt and cannot admit a non-colliding second reservation.
 
 `tests/reakt/run_ownership_collision.py` runs that experiment with two signed
 production candidates. The contender is the unchanged subject of the resulting
@@ -174,8 +174,11 @@ One qualification executor is authorized for both domains. This experiment does
 not prove credential isolation between distinct principals. Candidate payloads,
 raw state, credentials, and trust bodies are excluded from evidence; the owner is
 bound separately by source and payload digests. The same owned-cluster cleanup
-and receipt-last rules as the ceiling runner apply. `cuenv task
-ownershipCollisionTest` checks orchestration contracts without a live cluster.
+and receipt-last rules as the ceiling runner apply. Archived source filenames are
+scoped to this check, with a repository-relative source mapping, so older receipts
+can retain different versions of shared helpers without filename conflicts.
+`cuenv task ownershipCollisionTest` checks orchestration contracts without a live
+cluster.
 
 ## Reproducibility runner
 
