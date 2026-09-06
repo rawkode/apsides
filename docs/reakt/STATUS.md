@@ -4,6 +4,22 @@ Reakt implements specification 0.2 in the workspace crates and the `@reakt/kuber
 
 ## Current integration checkpoint
 
+The disposable lifecycle harness now starts with only the first candidate's
+runtime ceiling. Before approving the successor it requires a typed ceiling
+rejection and unchanged registry UID/resourceVersion/data, authenticated claims,
+generation object identities and Role/RoleBinding contents. Cleanup approval
+remains separate. Only after that rejection does the harness explicitly approve
+the combined A+B runtime ceiling, preserving A until retirement, and continue
+the existing handoff. The test driver checks the ceiling before predecessor
+metadata capture or publication. This is a
+qualification harness change awaiting a fresh signed-candidate run, not a passed
+production upgrade check or a `VerifiedRelease` deployment.
+Six mocked harness tests and the typed Rust classification test pass; strict
+deploy/platform/CLI Clippy and docs build/link checks pass. Independent source
+review found no blockers. This verifies the harness's compiler-policy preflight;
+the disposable deployer still has broader Kubernetes RBAC, and the result does
+not establish API-server rejection. Evidence: `work/lifecycle-ceiling-*.log`.
+
 The corrected reactor producer at `72f761a` passed a fresh run: all 43 core cases
 and 46 compiler fixture cases passed, network denials were observed, and the owned
 Kubernetes v1.34.3 cluster was deleted. Its six-file evidence directory staged

@@ -21,10 +21,61 @@ async fn candidate_transition_step() -> Result<()> {
         );
         println!(
             "REAKT_TEST_ERROR={}",
-            json!({"pending":pending,"message":error.to_string()})
+            json!({"pending":pending,"kind":error_kind(error.as_ref()),"message":error.to_string()})
         );
     }
     outcome
+}
+
+fn error_kind(error: &(dyn std::error::Error + 'static)) -> &'static str {
+    let ceiling = matches!(
+        error.downcast_ref::<compiler_core::Error>(),
+        Some(compiler_core::Error::Ceiling(_))
+    ) || matches!(
+        error.downcast_ref::<deploy::Error>(),
+        Some(deploy::Error::Core(compiler_core::Error::Ceiling(_)))
+    ) || matches!(
+        error.downcast_ref::<platform::Error>(),
+        Some(
+            platform::Error::Core(compiler_core::Error::Ceiling(_))
+                | platform::Error::Deploy(deploy::Error::Core(compiler_core::Error::Ceiling(_)))
+        )
+    );
+    if ceiling {
+        "permission-ceiling"
+    } else {
+        "other"
+    }
+}
+
+#[test]
+fn ceiling_error_kind_requires_a_typed_ceiling_variant() {
+    let ceiling = || compiler_core::Error::Ceiling("typed fixture".into());
+    let positives: Vec<Box<dyn std::error::Error>> = vec![
+        Box::new(ceiling()),
+        Box::new(deploy::Error::Core(ceiling())),
+        Box::new(platform::Error::Core(ceiling())),
+        Box::new(platform::Error::Deploy(deploy::Error::Core(ceiling()))),
+    ];
+    for error in positives {
+        assert_eq!(error_kind(error.as_ref()), "permission-ceiling");
+    }
+    let invalid = || compiler_core::Error::Invalid("permission ceiling exceeded".into());
+    let unrelated: Vec<Box<dyn std::error::Error>> = vec![
+        Box::new(invalid()),
+        Box::new(deploy::Error::Core(invalid())),
+        Box::new(platform::Error::Core(invalid())),
+        Box::new(platform::Error::Deploy(deploy::Error::Core(invalid()))),
+        Box::new(deploy::Error::Plan("permission-ceiling".into())),
+        Box::new(platform::Error::Pending(
+            "permission ceiling exceeded".into(),
+        )),
+        Box::new(platform::Error::CapacityResizeRequired),
+        Box::new(std::io::Error::other("permission-ceiling")),
+    ];
+    for error in unrelated {
+        assert_eq!(error_kind(error.as_ref()), "other");
+    }
 }
 
 async fn transition_step() -> Result<()> {
@@ -232,6 +283,8 @@ async fn reserve(
 ) -> Result<()> {
     let candidate = authorization.candidate();
     let domain = &candidate.compiled().ir.domain;
+    let policy = platform.load_policy(&domain.id).await?.value;
+    compiler_core::validate_ceiling(candidate.compiled(), &policy.runtime_ceiling)?;
     let mut registry = platform.load_registry().await?;
     if registry.value.transitions.contains_key(transition) {
         return Err("test transition already exists".into());
@@ -278,7 +331,6 @@ async fn reserve(
         .ok_or("test domain history missing")?
         .clone();
     history.revision.clone_from(&registry.resource_version);
-    let policy = platform.load_policy(&domain.id).await?.value;
     let names = deploy::allocation_names(&registry.uid, registry.value.next_sequence)?;
     if transition != names.transition_id {
         return Err("test transition must match the protected allocation identity".into());

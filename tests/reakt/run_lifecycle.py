@@ -20,6 +20,25 @@ CONTROL, WORKLOAD, DOMAIN = "reakt-test-control", "reakt-test-workload", "lifecy
 BINDING = "reakt-disposable-test"
 
 
+def runtime_ceiling(plan):
+    domain = plan["ir"]["domain"]
+    return {"policyRef": domain["policyRef"], "domainId": domain["id"],
+            "clusterBinding": domain["clusterBinding"], "workloadNamespace": domain["namespace"],
+            "controlNamespace": domain["controlNamespace"], "capabilities": plan["capabilities"],
+            "acceptedEnforcementGaps": sorted(plan["enforcementGaps"]),
+            "acceptedIndirectRisks": sorted(plan["indirectRisks"])}
+
+
+def handoff_ceiling(plans):
+    ceiling = runtime_ceiling(plans[-1])
+    capabilities = {json.dumps(capability, sort_keys=True): capability
+                    for plan in plans for capability in plan["capabilities"]}
+    ceiling["capabilities"] = [capabilities[key] for key in sorted(capabilities)]
+    ceiling["acceptedEnforcementGaps"] = sorted({gap for plan in plans for gap in plan["enforcementGaps"]})
+    ceiling["acceptedIndirectRisks"] = sorted({risk for plan in plans for risk in plan["indirectRisks"]})
+    return ceiling
+
+
 def digest(value):
     return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -134,18 +153,16 @@ class LifecycleRunner:
         for plan in plans:
             if plan["ir"]["domain"]["clusterBinding"] != self.binding:
                 raise RuntimeError("candidate scope differs from disposable cluster")
-        capabilities = {json.dumps(c, sort_keys=True): c for p in plans for c in p["capabilities"]}
-        ceiling = {"policyRef": plans[0]["ir"]["domain"]["policyRef"], "domainId": self.domain, "clusterBinding": self.binding, "workloadNamespace": self.workload,
-                   "controlNamespace": self.control, "capabilities": list(capabilities.values()),
-                   "acceptedEnforcementGaps": sorted({g for p in plans for g in p["enforcementGaps"]}),
-                   "acceptedIndirectRisks": sorted({g for p in plans for g in p["indirectRisks"]})}
+        self.runtime_ceilings = [runtime_ceiling(plans[0]), handoff_ceiling(plans)]
+        ceiling = self.runtime_ceilings[0]
         cleanup = dict(ceiling)
         identities = {(r["kind"], r["name"]) for plan in plans for r in plan["ir"]["resources"]}
         kinds = {"ConfigMap": ("", "configmaps"), "Service": ("", "services"), "Deployment": ("apps", "deployments")}
         cleanup["capabilities"] = [{"namespace": self.workload, "apiGroup": kinds[kind][0], "resource": kinds[kind][1],
                                     "subresource": None, "verb": verb, "names": [name]}
                                    for kind, name in sorted(identities) for verb in ["get", "delete"]]
-        self.state("reakt-policy-" + self.domain, {"schemaVersion": "reakt.dev/platform/v1", "runtimeCeiling": ceiling, "cleanupCeiling": cleanup})
+        self.cleanup_ceiling = cleanup
+        self.approve_runtime(0)
         public_key = self.args.public_key.read_text().strip()
         self.state("reakt-trust-" + self.domain, {"schemaVersion": "reakt.dev/trust/v1", "repository": self.manifests[0]["source"]["repository"],
                     "approvedCompilerDigests": sorted({m["compilerDigest"] for m in self.manifests}),
@@ -224,6 +241,48 @@ class LifecycleRunner:
                     "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": name},
                     "subjects": [{"kind": "ServiceAccount", "name": "test-deployer", "namespace": self.control}]})
 
+    def approve_runtime(self, index):
+        self.state("reakt-policy-" + self.domain, {
+            "schemaVersion": "reakt.dev/platform/v1",
+            "runtimeCeiling": self.runtime_ceilings[index],
+            "cleanupCeiling": self.cleanup_ceiling,
+        })
+
+    def protected_snapshot(self):
+        registry = self.get("configmap", "reakt-registry-" + self.workload, self.control)
+        if registry is None:
+            raise RuntimeError("protected registry is absent during upgrade qualification")
+        objects, permissions = {}, {}
+        for namespace in [self.control, self.workload]:
+            for kind in ["configmaps", "secrets", "serviceaccounts", "roles", "rolebindings", "deployments", "services"]:
+                # Keep only object identities, never Secret bodies or volatile status fields.
+                response = self.k("get", kind, "-n", namespace, "--no-headers",
+                                  "-o", "custom-columns=NAME:.metadata.name,UID:.metadata.uid")
+                objects[(namespace, kind)] = sorted(response.stdout.splitlines())
+            for kind in ["roles", "rolebindings"]:
+                items = json.loads(self.k("get", kind, "-n", namespace, "-o", "json").stdout)["items"]
+                permissions[(namespace, kind)] = sorted([
+                    {"name": item["metadata"]["name"], "uid": item["metadata"]["uid"],
+                     "resourceVersion": item["metadata"]["resourceVersion"],
+                     **{key: item[key] for key in ["rules", "roleRef", "subjects"] if key in item}}
+                    for item in items], key=lambda item: item["name"])
+        metadata = registry["metadata"]
+        return {"registry": {"uid": metadata["uid"], "resourceVersion": metadata["resourceVersion"],
+                             "data": registry.get("data", {})},
+                "claims": self.claims(), "objects": objects, "permissions": permissions}
+
+    def reject_unapproved_upgrade(self):
+        self.allocation(self.candidates[1], "upgrade")
+        before = self.protected_snapshot()
+        self.step(self.candidates[1], "upgrade", "reserve", expected_kind="permission-ceiling")
+        if self.protected_snapshot() != before:
+            raise RuntimeError("rejected successor changed protected state or created generation objects")
+        self.results.append({"check": "unapproved-successor-rejected-before-reservation",
+                             "passed": True, "rejectionKind": "permission-ceiling",
+                             "protectedRegistryUnchanged": True, "claimsUnchanged": True,
+                             "objectIdentitiesUnchanged": True, "permissionsUnchanged": True})
+        (self.output / "steps.json").write_text(json.dumps(self.results, indent=2))
+
     def driver_environment(self, path, kubeconfig):
         environment = dict(os.environ, KUBECONFIG=str(kubeconfig), REAKT_TEST_STEP=str(path),
                            REAKT_INVENTORY_DATABASE=str(self.output / "metadata.db"))
@@ -255,7 +314,7 @@ class LifecycleRunner:
             self.allocations[alias] = records[0]
         return self.allocations[alias]
 
-    def step(self, candidate, transition, action, timeout=120, expected_pending=False, expected_error=None):
+    def step(self, candidate, transition, action, timeout=120, expected_pending=False, expected_error=None, expected_kind=None):
         path = self.output / "step.json"
         path.write_text(json.dumps({"artifact": str(candidate), "transition": self.allocation(candidate, transition)["transition"], "action": action, "target": self.target,
                                    "ownershipIntents": ["adopt-retained"] if self.adopted_uid and transition == "install" else []}))
@@ -266,6 +325,10 @@ class LifecycleRunner:
             records = [json.loads(line.split("=", 1)[1]) for line in result.stdout.splitlines() if line.startswith("REAKT_TEST_RESULT=") or line.startswith("REAKT_TEST_ERROR=")]
             self.results.append({"transition": transition, "action": action, "records": records, "exitCode": result.returncode})
             (self.output / "steps.json").write_text(json.dumps(self.results, indent=2))
+            if expected_kind is not None:
+                if result.returncode and len(records) == 1 and records[0].get("pending") is False and records[0].get("kind") == expected_kind:
+                    return
+                raise RuntimeError("candidate did not produce the required typed rejection")
             if expected_error is not None:
                 if result.returncode and records and not records[-1].get("pending") and expected_error in records[-1].get("message", ""):
                     return
@@ -412,6 +475,8 @@ class LifecycleRunner:
                 if time.monotonic() >= deadline:
                     raise RuntimeError("initial generation did not create all lifecycle targets")
                 time.sleep(1)
+            self.reject_unapproved_upgrade()
+            self.approve_runtime(1)
             self.step(self.candidates[1], "upgrade", "reserve")
             obsolete = self.get("service", "obsolete-service")
             obsolete_uid = obsolete["metadata"]["uid"]
