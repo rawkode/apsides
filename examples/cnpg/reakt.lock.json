@@ -7,7 +7,7 @@
     },
     {
       "path": "program.tsx",
-      "sha256": "90adcee5344d7d9bcdb79710b69ecd349403f00886ecc2a07b5328f23f570b56"
+      "sha256": "f6878dc81056a775082f833bfdc8d88f18b6aef1d3f8521847418d39987f93c0"
     }
   ],
   "schemaVersion": "reakt.dev/source-lock/v1"

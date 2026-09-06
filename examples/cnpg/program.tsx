@@ -16,6 +16,7 @@ function DatabaseApi() {
         deletionPolicy="orphan"
         spec={{
           instances: 1,
+          imageName: "ghcr.io/cloudnative-pg/postgresql:17@sha256:70664ebcfa1100361b5bdc28bbf06fdbe08db2dc4ad7bd14de33c5e05fe8ea8e",
           storage: { size: "1Gi" },
           bootstrap: {
             initdb: {

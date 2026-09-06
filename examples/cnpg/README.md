@@ -53,3 +53,7 @@ project. It does not install the CloudNativePG operator or CRD, create the
 observed ConfigMap, deploy PostgREST, or prove database readiness, rollouts and
 drift correction. Those require a separately prepared cluster and live
 verification.
+
+For the first deployment in the upgrade demo, use [the initial version](initial/README.md).
+It owns the same database and ConfigMap; this version adds the API workload and
+its observed inputs.

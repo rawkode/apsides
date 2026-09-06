@@ -5,6 +5,11 @@ import "github.com/cuenv/cuenv/schema"
 schema.#Project & {name: "apsides"}
 
 tasks: {
+	cnpgInitialTypes: {
+		dependsOn: [install]
+		command: "node"
+		args: ["packages/compiler/src/crds.ts", "https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_clusters.yaml", "Cluster", "examples/cnpg/initial/.aps/crds/cnpg.ts", "v1"]
+	}
 	cnpgTypes: {
 		dependsOn: [install]
 		command: "node"

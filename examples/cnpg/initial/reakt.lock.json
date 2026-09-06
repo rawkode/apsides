@@ -1,0 +1,14 @@
+{
+  "entry": "program.tsx",
+  "inputs": [
+    {
+      "path": ".aps/crds/cnpg.ts",
+      "sha256": "1f2697a30e002f2b48ebc25abba36384d76e3987a7095dc885d24f1651f48e72"
+    },
+    {
+      "path": "program.tsx",
+      "sha256": "2f1453f14dfb114ad4613b2dedf7dc6d62017ba37788dabd5172bc2406aff106"
+    }
+  ],
+  "schemaVersion": "reakt.dev/source-lock/v1"
+}
