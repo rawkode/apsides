@@ -424,3 +424,22 @@ async fn every_marker_binding_field_is_required_and_exact() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn version_checks_reject_replacement_and_restored_content() {
+    let expected = Versioned {
+        uid: "original".into(),
+        resource_version: "1".into(),
+        value: json!({"approved": true}),
+    };
+    assert!(same_version(&expected, &expected));
+    let mut replaced = expected.clone();
+    replaced.uid = "replacement".into();
+    assert!(!same_version(&replaced, &expected));
+    let mut restored = expected.clone();
+    restored.resource_version = "3".into();
+    assert!(!same_version(&restored, &expected));
+    let mut altered = expected.clone();
+    altered.value = json!({"approved": false});
+    assert!(!same_version(&altered, &expected));
+}

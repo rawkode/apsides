@@ -139,6 +139,21 @@ snapshot failures with mocks; it does not qualify a live cluster. Feed successfu
 receipts through `merge-evidence` and the existing release validators before
 counting this check toward production coverage.
 
+## Ownership collision qualification
+
+The `test-support` method `qualify_candidate_collision` is a negative-only
+prerequisite for the ownership-collision producer. It accepts two exact verified
+candidates in the same scope, with distinct domains and one shared resource
+identity. The owner must be the sole untouched `Planned` reservation. Its compiled
+plan, frozen inputs, protected policy, and stored review must agree. The contender
+must receive the exact claim-collision rejection through authenticated reservation;
+registry, policy, review, trust, and disposable-target checks must remain stable.
+
+Pure state tests and compilation do not qualify this check. The two-candidate
+public-method test, immutable marker replacement, live state comparisons, and
+receipt producer remain unfinished. No ownership-collision receipt is emitted by
+this API, and it cannot admit a non-colliding second reservation.
+
 ## Reproducibility runner
 
 `tests/reakt/run_reproducibility.py` runs two fresh CLI builds with
