@@ -27,6 +27,12 @@ establish narrower properties.
   their own reason, clearing the per-target list and conflict count. `/readyz` stays unavailable while
   degraded; a clean cycle restores readiness. These probes describe the
   controller, not application workload health.
+- A signed disposable-candidate live check observed two distinct SSA conflict
+  cycles with advancing reconciliation/error counters, `/readyz` returning 503
+  and `/livez` returning 200. Relinquishing the foreign field manager restored
+  exact data and readiness while preserving resource UID and controller identity.
+  This qualifies controller diagnostics for that fixture, not workload health
+  or the complete production release gate.
 
 ### Release and evidence
 

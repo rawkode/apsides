@@ -30,6 +30,8 @@ class Runner:
         self.replica_uid = "rs-uid"
         self.pod_uid = "pod-uid"
         self.image = "registry.example/controller@sha256:" + "a" * 64
+        self.reported_image = "sha256:" + "d" * 64
+        self.image_id = "docker-pullable://" + self.image
 
     def get(self, kind, name, namespace=None):
         if kind == "configmap":
@@ -61,8 +63,8 @@ class Runner:
             "spec": {"serviceAccountName": "reakt-generation-a-process",
                      "containers": [{"name": "controller", "image": self.image}]},
             "status": {"phase": "Running", "containerStatuses": [{
-                "name": "controller", "image": self.image,
-                "imageID": "docker-pullable://" + self.image,
+                "name": "controller", "image": self.reported_image,
+                "imageID": self.image_id,
                 "containerID": "containerd://controller", "restartCount": 0,
             }]},
         }
@@ -118,6 +120,7 @@ class LifecycleDiagnosticsTests(unittest.TestCase):
                 "ownerDeploymentUid": "deployment-uid", "generation": "generation-a",
                 "serviceAccount": "reakt-generation-a-process", "image": runner.image,
                 "imageID": "docker-pullable://" + runner.image,
+                "reportedImage": runner.reported_image,
                 "containerID": "containerd://controller", "restartCount": 0,
                 "buildDigest": "sha256:" + "b" * 64,
                 "registryUid": "registry-uid", "registryResourceVersion": "43",
@@ -130,6 +133,8 @@ class LifecycleDiagnosticsTests(unittest.TestCase):
             allocation = {"generation": "generation-a", "transition": "transition-a"}
             for attribute, changed in [("deployment_uid", "replacement"),
                                        ("replica_uid", "replacement"),
+                                       ("image_id", "docker-pullable://registry.example/controller@sha256:" + "e" * 64),
+                                       ("reported_image", ""),
                                        ("image", "registry.example/wrong@sha256:" + "c" * 64)]:
                 runner = Runner(root)
                 setattr(runner, attribute, changed)

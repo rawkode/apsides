@@ -88,6 +88,7 @@ def _runtime_identity(runner, candidate, allocation):
     spec_container = _controller_container(pod.get("spec", {}).get("containers", []))
     status_container = _controller_container(pod.get("status", {}).get("containerStatuses", []))
     pod_uid = pod.get("metadata", {}).get("uid")
+    reported_image = status_container.get("image")
     image_id = status_container.get("imageID")
     container_id = status_container.get("containerID")
     restart_count = status_container.get("restartCount")
@@ -97,7 +98,7 @@ def _runtime_identity(runner, candidate, allocation):
             or pod.get("spec", {}).get("serviceAccountName") != expected_account
             or pod.get("metadata", {}).get("labels", {}).get("reakt.dev/generation") != generation
             or spec_container.get("image") != expected_image
-            or status_container.get("image") != expected_image
+            or not isinstance(reported_image, str) or not reported_image
             or not isinstance(pod_uid, str) or not pod_uid
             or not isinstance(image_id, str) or not image_id
             or not isinstance(container_id, str) or not container_id
@@ -109,6 +110,7 @@ def _runtime_identity(runner, candidate, allocation):
         "pod": pod["metadata"]["name"], "podUid": pod_uid,
         "ownerDeploymentUid": metadata["uid"], "generation": generation,
         "serviceAccount": expected_account, "image": expected_image, "imageID": image_id,
+        "reportedImage": reported_image,
         "containerID": container_id, "restartCount": restart_count,
         "buildDigest": active["artifactDigest"],
         "registryUid": registry_uid, "registryResourceVersion": registry_version,
