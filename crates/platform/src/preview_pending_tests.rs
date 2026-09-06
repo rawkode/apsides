@@ -63,6 +63,7 @@ fn fixture(mode: Mode) -> TestResult<Fixture> {
         "identity-uid",
         "1",
     )?;
+    bind_preview_executor(&mut registry, &plan, &identity)?;
     let registry_object =
         crate::tests::registry_object(&registry, &plan.request.registry.registry_uid, "43")?;
     let policy_object = state("reakt-policy-example", &policy, "policy-uid", "40")?;
@@ -77,7 +78,12 @@ fn fixture(mode: Mode) -> TestResult<Fixture> {
     group.extend([policy_object.clone(), trust_object.clone()]);
     let mut replies = resolve.clone(); // bind_release
     replies.extend(resolve.clone()); // PendingContext initial resolve
-    replies.extend([identity_object, version(), policy_object, trust_object]);
+    replies.extend([
+        identity_object.clone(),
+        version(),
+        policy_object,
+        trust_object,
+    ]);
     replies.extend(group.clone()); // authentication recheck
     replies.extend(group.clone()); // pre-capture recheck
     replies.push(target_list(&plan, matches!(mode, Mode::Replaced)));
@@ -96,7 +102,8 @@ fn fixture(mode: Mode) -> TestResult<Fixture> {
     });
     replies.extend(group); // final authority recheck
     replies.extend(resolve); // test's final authenticated resolve
-    let (client, calls) = crate::tests::wire(replies);
+    replies.retain(|reply| reply["metadata"]["name"] != "reakt-deploy-identity-example");
+    let (client, calls) = crate::tests::wire_with_identity(replies, identity_object);
     let platform = crate::tests::platform_client(client, "control", "workload", "cluster-a")?;
     let issued = IssuedDeployment::for_preview_test(
         platform,
@@ -113,6 +120,34 @@ fn fixture(mode: Mode) -> TestResult<Fixture> {
         calls,
     })
 }
+fn bind_preview_executor(
+    registry: &mut crate::NamespaceRegistry,
+    plan: &deploy::TransitionPlan,
+    identity: &crate::DeploymentIdentity,
+) -> TestResult {
+    let stored = registry
+        .transitions
+        .get_mut(&plan.request.transition_id)
+        .ok_or("fixture transition missing")?;
+    let binding = &mut stored.executor_binding;
+    binding.identity_approval_uid = "identity-uid".into();
+    binding.identity_approval_resource_version = "1".into();
+    binding.identity_approval_digest = compiler_core::digest(identity)?;
+    binding.service_account_name = identity.service_account_name.clone();
+    binding.service_account_uid = identity.service_account_uid.clone();
+    binding.binding_secret_name = identity.binding_secret_name.clone();
+    binding.binding_secret_uid = identity.binding_secret_uid.clone();
+    binding.audience = identity.audience.clone();
+    let profile = stored.capacity.profile.clone();
+    let capacity = crate::completion_envelope::calculate(registry, plan, &profile)?;
+    registry
+        .transitions
+        .get_mut(&plan.request.transition_id)
+        .ok_or("fixture transition missing")?
+        .capacity = capacity;
+    Ok(())
+}
+
 fn target_object(plan: &deploy::TransitionPlan, replaced: bool) -> Value {
     let mut value = plan.request.next.compiled.ir.resources[0].desired.clone();
     value["metadata"]["uid"] = json!(if replaced {

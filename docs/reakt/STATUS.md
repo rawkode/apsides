@@ -4,6 +4,33 @@ Reakt implements specification 0.2 in the workspace crates and the `@reakt/kuber
 
 ## Current integration checkpoint
 
+Registry v8 now binds each reservation to metadata from the actual issued
+deployment client. The reservation CAS includes the executor label, protected
+identity approval UID/version/digest, ServiceAccount and bound-Secret identities,
+audience, scope and original credential expiry. No token or Secret content is
+stored. Capacity admission includes the binding before publication. Selected
+lifecycle sessions pin it and recheck the current approval and their own token
+expiry; registry publication preserves it exactly and rechecks identity around
+claim publication. The canonical permission report now includes the exact named
+identity ConfigMap GET required by those checks.
+
+Renewal under the same approval preserves the original reservation expiry, which
+is historical evidence rather than proof of executor retirement. Old registries
+require explicit recovery; there is no inferred binding or automatic migration.
+Changed-executor transfer remains rejected, and archived audits retain only the
+executor label. The live candidate driver now uses `IssuedDeployment::connect`
+instead of constructing a client from a manually installed token, but a fresh
+live run of this v8 path is still required.
+
+The final combined deploy/platform/CLI suite passed 257 tests with four opt-in
+checks ignored (`work/executor-binding-final-tests.log`). Six focused tests cover
+wire binding, legacy rejection, historical-expiry preservation on selection,
+binding/identity drift and unissued entry-point rejection. These are unit/wire
+checks, not a live reconnect or new-CI-job recovery proof. Strict all-target
+Clippy passed (`work/executor-binding-clippy.log`), and independent production,
+permission and test-diff review found no blockers. No required production release
+check is closed by this prerequisite alone.
+
 The fresh UID-replacement lifecycle run at `b6a103b` passed
 (`work/lifecycle-b6a103b-uid-results/`). After verified old-writer retirement and
 successor activation, the harness deleted the obsolete Service and recreated it

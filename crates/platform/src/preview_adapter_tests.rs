@@ -115,7 +115,7 @@ fn fixture(scenario: Scenario) -> TestResult<Fixture> {
     let policy_object = state("reakt-policy-example", &policy, "policy-uid", "40")?;
     let trust_object = state("reakt-trust-example", &trust, "trust-uid", "43")?;
     let base = vec![
-        identity_object,
+        identity_object.clone(),
         registry_object,
         policy_object,
         trust_object,
@@ -147,7 +147,8 @@ fn fixture(scenario: Scenario) -> TestResult<Fixture> {
             } else {empty_list()});
         }
     }
-    let (client, calls) = crate::tests::wire(replies);
+    replies.retain(|reply| reply["metadata"]["name"] != "reakt-deploy-identity-example");
+    let (client, calls) = crate::tests::wire_with_identity(replies, identity_object);
     let platform = crate::tests::platform_client(client, "control", "workload", "cluster-a")?;
     let issued = IssuedDeployment::for_preview_test(
         platform,

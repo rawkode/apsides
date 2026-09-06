@@ -61,7 +61,7 @@ impl PlatformClient {
             != Some(crate::REGISTRY_SCHEMA_VERSION)
         {
             return Err(invalid(
-                "registry review reference schema requires explicit recovery; automatic legacy migration is forbidden",
+                "registry executor binding schema requires explicit recovery; automatic legacy migration is forbidden",
             ));
         }
         let state: NamespaceRegistryState = serde_json::from_value(raw.value)
@@ -147,7 +147,11 @@ impl PlatformClient {
             resource_version: previous.resource_version.clone(),
         })
         .await?;
+        self.verify_publication_executor(&previous.value, next)
+            .await?;
         self.publish_claims(&snapshot).await?;
+        self.verify_publication_executor(&previous.value, next)
+            .await?;
         let written = replace_state_at(
             &self.client,
             &self.control_namespace,
@@ -169,6 +173,31 @@ impl PlatformClient {
             uid: written.uid,
             resource_version: written.resource_version,
         })
+    }
+
+    #[cfg(feature = "deployer")]
+    async fn verify_publication_executor(
+        &self,
+        previous: &NamespaceRegistry,
+        next: &NamespaceRegistry,
+    ) -> Result<()> {
+        self.verify_selected_executor().await?;
+        for (id, stored) in &next.transitions {
+            if let Some(old) = previous.transitions.get(id) {
+                if old.executor_binding != stored.executor_binding {
+                    return Err(invalid("registry mutation changed the executor binding"));
+                }
+            } else {
+                self.require_executor_binding(
+                    &stored.executor_binding,
+                    stored.allocation(),
+                    stored.domain_id(),
+                    &stored.record.executor_id,
+                )?;
+                self.verify_issued_identity(stored.domain_id()).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Validate the complete prospective wire state before any metadata publication.
@@ -305,6 +334,12 @@ impl PlatformClient {
         crate::review_metadata::validate_review_references(registry)?;
         let mut sequences = BTreeSet::new();
         for (transition_id, stored) in &registry.transitions {
+            stored.executor_binding.validate(
+                &registry.captured_claim_scope,
+                stored.allocation(),
+                stored.domain_id(),
+                &stored.record.executor_id,
+            )?;
             crate::capacity_checks::validate(stored)?;
             let allocation = stored.allocation();
             stored

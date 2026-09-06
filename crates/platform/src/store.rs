@@ -125,6 +125,8 @@ pub(crate) async fn replace_state_at<T: Serialize + DeserializeOwned>(
 pub struct PlatformClient {
     #[cfg(feature = "deployer")]
     pub(crate) selection: Option<std::sync::Arc<crate::transition_session::Selection>>,
+    #[cfg(feature = "deployer")]
+    pub(crate) issued_executor: Option<std::sync::Arc<crate::executor_binding::IssuedExecutor>>,
     pub(crate) claim_store: Option<std::sync::Arc<dyn coordination::ClaimStore>>,
     pub(crate) audit_store: Option<std::sync::Arc<dyn coordination::AuditStore>>,
     pub(crate) review_store: Option<std::sync::Arc<dyn coordination::ReviewStore>>,
@@ -160,6 +162,8 @@ impl PlatformClient {
         Ok(Self {
             #[cfg(feature = "deployer")]
             selection: None,
+            #[cfg(feature = "deployer")]
+            issued_executor: None,
             claim_store: None,
             audit_store: None,
             review_store: None,
@@ -405,6 +409,8 @@ impl PlatformClient {
         inventory: &dyn inventory::InventoryStore,
         trust_policy_digest: Option<&str>,
     ) -> Result<Versioned<NamespaceRegistry>> {
+        self.verify_issued_identity(&request.next.compiled.ir.domain.id)
+            .await?;
         if !request.observations.is_empty() {
             return Err(invalid("compact transitions require empty observations"));
         }
@@ -441,6 +447,12 @@ impl PlatformClient {
             ));
         }
         let plan = plan_transition(request)?;
+        let executor_binding = self.reservation_executor_binding(
+            &current.uid,
+            &plan.generation_reservation,
+            &domain.id,
+            executor_id,
+        )?;
         let (review_metadata, previous_review_metadata) =
             self.prepare_review_metadata(&current.value, &plan).await?;
         self.verify_ownership_intents(request).await?;
@@ -470,6 +482,7 @@ impl PlatformClient {
             crate::CapacityAdmission::projection_placeholder(profile.clone()),
             review_metadata.reference()?,
             previous_review_metadata,
+            executor_binding,
         );
         stored.previous_writer_checkpoint = previous_writer_checkpoint;
         next.transitions
@@ -483,10 +496,12 @@ impl PlatformClient {
         if let Some(trust) = trust_policy_digest {
             self.verify_release_trust(&domain.id, trust).await?;
         }
+        self.verify_issued_identity(&domain.id).await?;
         self.publish_review_metadata(&review_metadata).await?;
         if let Some(trust) = trust_policy_digest {
             self.verify_release_trust(&domain.id, trust).await?;
         }
+        self.verify_issued_identity(&domain.id).await?;
         self.persist_registry(&current, &next).await
     }
 

@@ -508,6 +508,20 @@ fn conflict_wire(responses: Vec<Value>) -> (Client, Calls) {
                 } else {
                     serde_json::from_slice(&data).map_err(std::io::Error::other)?
                 };
+                if parts.method == http::Method::GET
+                    && parts
+                        .uri
+                        .path()
+                        .ends_with("/configmaps/reakt-deploy-identity-example")
+                {
+                    return Response::builder()
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&deployment_identity_object())
+                                .map_err(std::io::Error::other)?,
+                        ))
+                        .map_err(std::io::Error::other);
+                }
                 calls
                     .lock()
                     .map_err(|_| std::io::Error::other("calls lock poisoned"))?
@@ -672,6 +686,7 @@ fn prepare_pending_third_transition(
     };
     let plan = deploy::plan_transition(&request)?;
     let record = deploy::begin(&plan, "executor-c")?;
+    let executor_binding = fixture_executor_binding(&plan.generation_reservation, "executor-c")?;
     let inputs = transition_inputs(&plan, &policy(&plan.request.next.compiled))?;
     let mut stored = StoredTransition::reserved(
         inputs,
@@ -684,6 +699,7 @@ fn prepare_pending_third_transition(
                 .next_review_metadata
                 .clone(),
         ),
+        executor_binding,
     );
     stored.previous_writer_checkpoint = Some(
         registry

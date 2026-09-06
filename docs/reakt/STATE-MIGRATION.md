@@ -2,9 +2,27 @@
 
 Status: implementation in progress. Historical OCI retrieval is not an upgrade prerequisite. The current cutover below supersedes the historical implementation checkpoints later in this document.
 
-## Current state contract (registry v7)
+## Current state contract (registry v8)
 
-Registry schema `reakt.dev/namespace-registry/v7` retains the compact `TransitionInputs` introduced by registry v4 and requires protected audit heads, a typed capacity admission, and exact next/previous review references on retained transitions. Canonical in-memory plans remain `reakt.dev/transition-plan/v4`; these are separate schema versions. No full compiled plan is part of the new registry wire type.
+Registry schema `reakt.dev/namespace-registry/v8` retains the compact `TransitionInputs` introduced by registry v4 and requires protected audit heads, a typed capacity admission, exact next/previous review references, and an executor credential binding on retained transitions. Canonical in-memory plans remain `reakt.dev/transition-plan/v4`; these are separate schema versions. No full compiled plan is part of the new registry wire type.
+
+The executor binding records the protected deployment identity approval, its
+ServiceAccount and bound Secret identities, audience, executor label and exact
+transition scope. It comes from the privately constructed issued client, not a
+caller-supplied credential summary, and is published in the reservation CAS after
+capacity accounting. It contains no bearer token, Secret body or desired values.
+The original reservation credential expiry is historical evidence: later retries
+may mint another token, so it is not an executor retirement deadline. Sessions
+must use a currently unexpired issued credential under the same approved identity
+and pin the recorded binding. Generic history reads remain structural.
+
+This binding does not authorize executor transfer. The executor label is supplied
+by trusted CI and is not a cryptographic per-job identity. Recovery still needs
+proof that the old executor cannot obtain credentials, finish admitted writes or
+mutate the metadata store; neither the label nor the recorded expiry proves that.
+The binding remains with active and pending transitions. The existing immutable
+audit projection retains the executor label but does not archive this credential
+binding, so this cutover does not promise permanent credential attribution.
 
 Frozen inputs select the original pre-reservation claim snapshot, registry revision/counter/history, next allocation, policy digest and plan digest. Upgrades also select the exact predecessor inventory snapshot by scope and snapshot ID, its allocation and retirement namespaces. Frozen ownership metadata retains approval object identity/version and observed resource identity/version. Permitted apply payloads are reconstructed from the verified new release. The metadata database contains no desired values or their hashes; protected Kubernetes coordination still retains plan, artifact, IR and policy commitments.
 
@@ -12,7 +30,7 @@ Reservation independently verifies that claim and predecessor inventory snapshot
 
 The selected plan lives only in memory, outside `NamespaceRegistry`. Lifecycle reloads pin exact frozen inputs, capacity admission, the immutable predecessor writer checkpoint and review references, and recheck protected release trust and runtime policy. Read-only review resolves its own authenticated registry load; callers cannot pair a plan with arbitrary copied registry state. It grants no mutation authority. Other compact records receive structural validation without historical release retrieval. Full event replay applies to the selected release-bound transition.
 
-Active UID capture no longer searches historical transitions. Final commit publishes the active writer checkpoint, and upgrade reservation freezes it on the new transition. Missing checkpoints require explicit recovery; the new registry schema does not backfill from old plans. Pre-v7 registries require administrative recovery, with no automatic migration implemented.
+Active UID capture no longer searches historical transitions. Final commit publishes the active writer checkpoint, and upgrade reservation freezes it on the new transition. Missing checkpoints require explicit recovery; the new registry schema does not backfill from old plans. Pre-v8 registries require administrative recovery, with no automatic migration implemented. An old transition cannot acquire an inferred executor credential binding during a normal deployment.
 
 Review metadata is published and independently read back before claim publication and reservation CAS. Its content-addressed store permits multiple unbound candidates under an unconsumed allocation. The protected transition selects the exact next reference and, for upgrades, the unique active committed predecessor's reference. Both enter capacity accounting before publication. Commit preserves the predecessor reference on the successor while pruning the predecessor record in the existing allocation CAS. Generic registry loads validate reference scope and relationships without needing review-store credentials; selected deploy sessions additionally read and validate both bodies and compare the next body against the freshly reconstructed release. Missing v6 review history requires explicit recovery and cannot be inferred as empty.
 

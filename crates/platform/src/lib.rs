@@ -23,6 +23,8 @@ mod envelope_record;
 #[cfg(feature = "deployer")]
 mod envelope_writer;
 mod evidence_profile;
+mod executor_binding;
+pub use executor_binding::{EXECUTOR_BINDING_SCHEMA, ExecutorBinding};
 mod permissions;
 #[cfg(feature = "deployer")]
 mod preview_adapter;
@@ -138,7 +140,7 @@ pub fn registry_authority_name(
 }
 
 pub const REGISTRY_AUTHORITY_NAMESPACE: &str = "reakt-platform";
-pub const REGISTRY_SCHEMA_VERSION: &str = "reakt.dev/namespace-registry/v7";
+pub const REGISTRY_SCHEMA_VERSION: &str = "reakt.dev/namespace-registry/v8";
 pub const REGISTRY_AUTHORITY_SCHEMA_VERSION: &str = "reakt.dev/registry-authority/v1";
 pub const SCHEMA_VERSION: &str = "reakt.dev/platform/v1";
 pub const MAX_STATE_BYTES: usize = 512 * 1024;

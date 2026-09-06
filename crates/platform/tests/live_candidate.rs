@@ -2,8 +2,8 @@
 //! Explicitly invoked by the disposable lifecycle runner, never a release bypass.
 use deploy::{DeploymentRequest, GenerationPlan, RegistrySnapshot};
 use inventory::InventoryStore;
-use kube::{Client, Config, config::AuthInfo};
-use platform::{PlatformClient, TestClusterTarget};
+use kube::{Client, Config};
+use platform::{IssuedDeployment, PlatformClient, TestClusterTarget};
 use release::TestStagingScope;
 use serde_json::json;
 use std::{env, fs, path::Path, sync::Arc};
@@ -169,25 +169,19 @@ async fn transition_step() -> Result<()> {
             .await?;
         return Ok(());
     }
-    let credential = bootstrap.approved_deployment_credential(&domain.id).await?;
-    config.auth_info = AuthInfo {
-        token: Some(credential.token),
-        ..AuthInfo::default()
-    };
-    config.headers.clear();
-    let platform = PlatformClient::new(
-        Client::try_from(config)?,
+    let issued = IssuedDeployment::connect(
+        config,
         &domain.control_namespace,
         &domain.namespace,
         &domain.cluster_binding,
-    )?
-    .with_claim_store(claim_store.clone())
-    .with_audit_store(claim_store.clone())
-    .with_review_store(claim_store);
+        &domain.id,
+    )
+    .await?
+    .with_stores(claim_store.clone(), claim_store.clone(), claim_store);
     Box::pin(run_action(
         action,
         &settings,
-        &platform,
+        issued.platform(),
         &authorization,
         &target,
         transition,

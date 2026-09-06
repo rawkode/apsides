@@ -13,6 +13,7 @@ use std::{ops::Deref, sync::Arc};
 #[derive(Clone)]
 pub(crate) struct Selection {
     inputs: TransitionInputs,
+    executor_binding: crate::ExecutorBinding,
     plan: Arc<TransitionPlan>,
     previous_writer_checkpoint: Option<crate::WriterCheckpoint>,
     trust_policy_digest: Option<String>,
@@ -136,10 +137,17 @@ impl PlatformClient {
         inventory: &dyn InventoryStore,
         transition: &str,
     ) -> Result<TransitionSession> {
+        self.verify_issued_identity(&compiled.ir.domain.id).await?;
         let mut client = self.clone();
         client.selection = None;
         let registry = client.load_registry().await?;
         let stored = registry.value.transition(transition)?;
+        client.require_executor_binding(
+            &stored.executor_binding,
+            stored.allocation(),
+            stored.domain_id(),
+            &stored.record.executor_id,
+        )?;
         let inputs = &stored.inputs;
         if inputs.allocation.artifact_digest != artifact_digest
             || inputs.allocation.ir_digest != compiled.ir_digest
@@ -205,12 +213,14 @@ impl PlatformClient {
         let reviews = Box::pin(client.authenticate_reviews(stored, &plan)).await?;
         client.selection = Some(Arc::new(Selection {
             inputs: inputs.clone(),
+            executor_binding: stored.executor_binding.clone(),
             plan: Arc::new(plan),
             previous_writer_checkpoint: stored.previous_writer_checkpoint.clone(),
             trust_policy_digest: Some(trust_policy_digest.into()),
             capacity: stored.capacity.clone(),
             reviews,
         }));
+        client.verify_selected_executor().await?;
         client.selected(&registry, transition)?;
         Ok(TransitionSession {
             client,
@@ -256,6 +266,7 @@ impl PlatformClient {
         if registry.uid != selection.inputs.allocation.registry_uid
             || registry.resource_version.is_empty()
             || stored.inputs != selection.inputs
+            || stored.executor_binding != selection.executor_binding
             || stored.previous_writer_checkpoint != selection.previous_writer_checkpoint
             || stored.capacity != selection.capacity
             || stored.next_review_metadata != selection.reviews.next_reference
@@ -269,6 +280,12 @@ impl PlatformClient {
             ));
         }
         deploy::verify_record(&selection.plan, &stored.record)?;
+        self.require_executor_binding(
+            &stored.executor_binding,
+            stored.allocation(),
+            stored.domain_id(),
+            &stored.record.executor_id,
+        )?;
         crate::completion_envelope::validate_selected(&registry.value, &selection.plan)?;
         match (
             selection.plan.request.predecessor()?,
@@ -294,10 +311,19 @@ impl PlatformClient {
         })
     }
 
+    pub(crate) async fn verify_selected_executor(&self) -> Result<()> {
+        if let Some(selection) = &self.selection {
+            self.verify_issued_identity(&selection.inputs.registry.generation_history.domain_id)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn validate_selection(
         &self,
         registry: &Versioned<NamespaceRegistry>,
     ) -> Result<()> {
+        self.verify_selected_executor().await?;
         if let Some(selection) = &self.selection {
             if let Some(trust) = &selection.trust_policy_digest {
                 self.verify_release_trust(
@@ -349,6 +375,7 @@ impl PlatformClient {
         capacity: &crate::CapacityAdmission,
         next_review_metadata: &ReviewMetadataV1,
         previous_review_metadata: Option<&ReviewMetadataV1>,
+        executor_binding: &crate::ExecutorBinding,
     ) -> Result<Self> {
         let policy = crate::PolicyState {
             schema_version: crate::SCHEMA_VERSION.into(),
@@ -382,6 +409,7 @@ impl PlatformClient {
         let mut client = self.clone();
         client.selection = Some(Arc::new(Selection {
             inputs,
+            executor_binding: executor_binding.clone(),
             plan: Arc::new(plan.clone()),
             previous_writer_checkpoint: previous.cloned(),
             trust_policy_digest: None,

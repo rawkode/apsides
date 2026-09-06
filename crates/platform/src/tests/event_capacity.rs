@@ -3,6 +3,14 @@ use deploy::{Event, Phase, TransitionRecord};
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+fn only_gets(calls: &Calls) -> TestResult<bool> {
+    Ok(calls
+        .lock()
+        .map_err(|_| "calls lock poisoned")?
+        .iter()
+        .all(|call| call.0 == "GET"))
+}
+
 fn exhausted_planned(plan: &deploy::TransitionPlan) -> TestResult<TransitionRecord> {
     let mut record = deploy::begin(plan, "executor-a")?;
     for attempt in 0..126 {
@@ -52,13 +60,7 @@ async fn staging_and_activation_refuse_exhausted_receipts_before_writes() -> Tes
             .contains("transition exceeds its admitted recovery allowance"),
         "{error}"
     );
-    assert!(
-        calls
-            .lock()
-            .map_err(|_| "calls lock poisoned")?
-            .iter()
-            .all(|call| call.0 == "GET")
-    );
+    assert!(only_gets(&calls)?);
 
     let stored = registry
         .transitions
@@ -92,13 +94,7 @@ async fn staging_and_activation_refuse_exhausted_receipts_before_writes() -> Tes
             .contains("transition exceeds its admitted recovery allowance"),
         "{error}"
     );
-    assert!(
-        calls
-            .lock()
-            .map_err(|_| "calls lock poisoned")?
-            .iter()
-            .all(|call| call.0 == "GET")
-    );
+    assert!(only_gets(&calls)?);
     Ok(())
 }
 
@@ -117,11 +113,12 @@ async fn quiescence_and_cleanup_refuse_exhausted_receipts_before_writes() -> Tes
         verification_epoch: epoch,
     };
     record = deploy::advance(&plan, &record, record.revision, "executor-a", stage)?;
-    registry
+    let stored = registry
         .transitions
         .get_mut(TRANSITION_B)
-        .ok_or("transition missing")?
-        .record = record.clone();
+        .ok_or("transition missing")?;
+    stored.record = record.clone();
+    stored.executor_binding = fixture_executor_binding(&plan.generation_reservation, "executor-a")?;
     qualified_writer::qualify(&mut registry, TRANSITION_B)?;
     let control = registry_object(&registry, REGISTRY_UID, "42")?;
     let ceiling = object("reakt-policy-example", &policy, "policy-uid", "40");
@@ -143,13 +140,7 @@ async fn quiescence_and_cleanup_refuse_exhausted_receipts_before_writes() -> Tes
             .contains("transition exceeds its admitted recovery allowance"),
         "{error}"
     );
-    assert!(
-        calls
-            .lock()
-            .map_err(|_| "calls lock poisoned")?
-            .iter()
-            .all(|call| call.0 == "GET")
-    );
+    assert!(only_gets(&calls)?);
 
     for event in [
         Event::Quiesced {
@@ -197,12 +188,6 @@ async fn quiescence_and_cleanup_refuse_exhausted_receipts_before_writes() -> Tes
             .contains("transition exceeds its admitted recovery allowance"),
         "{error}"
     );
-    assert!(
-        calls
-            .lock()
-            .map_err(|_| "calls lock poisoned")?
-            .iter()
-            .all(|call| call.0 == "GET")
-    );
+    assert!(only_gets(&calls)?);
     Ok(())
 }

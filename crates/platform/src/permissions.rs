@@ -179,7 +179,10 @@ fn control_state(plan: &TransitionPlan, requests: &mut Requests) -> Result<()> {
         )?),
     );
     let namespace = &domain.control_namespace;
+    // The issued executor rechecks its protected approval during reservation
+    // and selected lifecycle operations; bootstrap discovery is separate.
     for name in [
+        format!("reakt-deploy-identity-{}", domain.id),
         format!("reakt-policy-{}", domain.id),
         format!("reakt-trust-{}", domain.id),
         format!("reakt-proxy-policy-{}", domain.id),

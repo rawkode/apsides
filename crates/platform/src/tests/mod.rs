@@ -20,12 +20,16 @@ mod capacity_accounting;
 #[cfg(feature = "deployer")]
 mod capacity_topology;
 mod event_capacity;
+#[cfg(feature = "deployer")]
+mod executor_binding;
 
 const REGISTRY_UID: &str = "11111111-1111-4111-8111-111111111111";
 const GENERATION_A: &str = "gceirceircfardairceirceirce-1";
 const GENERATION_B: &str = "gceirceircfardairceirceirce-2";
 const TRANSITION_A: &str = "tceirceircfardairceirceirce-1";
 const TRANSITION_B: &str = "tceirceircfardairceirceirce-2";
+#[cfg(feature = "deployer")]
+const FIXTURE_CREDENTIAL_EXPIRY: &str = "2099-01-01T00:00:00Z";
 
 #[derive(Clone)]
 struct LifecycleRegistry {
@@ -116,6 +120,7 @@ impl LifecycleRegistry {
                 })
                 .transpose()?
                 .as_ref(),
+            &stored.executor_binding,
         )?)
     }
 }
@@ -128,10 +133,10 @@ mod compact_state;
 mod qualified_writer;
 #[cfg(feature = "deployer")]
 mod review_bindings;
-#[cfg(feature = "deployer")]
-mod review_upgrade;
 #[path = "../../tests/support/review.rs"]
 mod review_support;
+#[cfg(feature = "deployer")]
+mod review_upgrade;
 
 type Calls = Arc<Mutex<Vec<(String, String, Value)>>>;
 
@@ -321,7 +326,39 @@ pub(crate) fn platform_client(
     workload_namespace: &str,
     cluster_binding: &str,
 ) -> platform::Result<PlatformClient> {
-    Ok(PlatformClient::new(
+    #[cfg(feature = "deployer")]
+    return platform_client_with_identity(
+        client,
+        control_namespace,
+        workload_namespace,
+        cluster_binding,
+        fixture_deployment_identity_approval(),
+        FIXTURE_CREDENTIAL_EXPIRY,
+    );
+    #[cfg(not(feature = "deployer"))]
+    {
+        Ok(PlatformClient::new(
+            client,
+            control_namespace,
+            workload_namespace,
+            cluster_binding,
+        )?
+        .with_claim_store(fixture_claim_store().clone())
+        .with_audit_store(Arc::new(audit_support::MemoryAuditStore::default()))
+        .with_review_store(fixture_review_store().clone()))
+    }
+}
+
+#[cfg(feature = "deployer")]
+pub(crate) fn platform_client_with_identity(
+    client: Client,
+    control_namespace: &str,
+    workload_namespace: &str,
+    cluster_binding: &str,
+    identity: Versioned<DeploymentIdentity>,
+    expires_at: &str,
+) -> platform::Result<PlatformClient> {
+    let client = PlatformClient::new(
         client,
         control_namespace,
         workload_namespace,
@@ -329,7 +366,61 @@ pub(crate) fn platform_client(
     )?
     .with_claim_store(fixture_claim_store().clone())
     .with_audit_store(Arc::new(audit_support::MemoryAuditStore::default()))
-    .with_review_store(fixture_review_store().clone()))
+    .with_review_store(fixture_review_store().clone());
+    client.with_test_issued_identity(identity, expires_at)
+}
+
+pub(crate) fn fixture_deployment_identity() -> DeploymentIdentity {
+    DeploymentIdentity {
+        schema_version: SCHEMA_VERSION.into(),
+        domain_id: "example".into(),
+        cluster_binding: "cluster-a".into(),
+        service_account_name: "deployer".into(),
+        service_account_uid: "deployer-uid".into(),
+        binding_secret_name: "deployer-binding".into(),
+        binding_secret_uid: "deployer-binding-uid".into(),
+        audience: "https://kubernetes.default.svc".into(),
+        lifetime_seconds: 600,
+        preview: None,
+    }
+}
+
+pub(crate) fn fixture_deployment_identity_approval() -> Versioned<DeploymentIdentity> {
+    Versioned {
+        value: fixture_deployment_identity(),
+        uid: "deployment-identity-uid".into(),
+        resource_version: "31".into(),
+    }
+}
+
+#[cfg(feature = "deployer")]
+pub(crate) fn fixture_executor_binding(
+    allocation: &deploy::GenerationAllocation,
+    executor: &str,
+) -> platform::Result<ExecutorBinding> {
+    let approval = fixture_deployment_identity_approval();
+    Ok(ExecutorBinding {
+        schema_version: EXECUTOR_BINDING_SCHEMA.into(),
+        scope: coordination::ClaimScope {
+            registry_uid: REGISTRY_UID.into(),
+            cluster_binding: "cluster-a".into(),
+            control_namespace: "control".into(),
+            workload_namespace: "workload".into(),
+        },
+        domain_id: "example".into(),
+        transition_id: allocation.transition_id.clone(),
+        sequence: allocation.sequence,
+        executor_id: executor.into(),
+        identity_approval_uid: approval.uid,
+        identity_approval_resource_version: approval.resource_version,
+        identity_approval_digest: compiler_core::digest(&approval.value)?,
+        service_account_name: approval.value.service_account_name,
+        service_account_uid: approval.value.service_account_uid,
+        binding_secret_name: approval.value.binding_secret_name,
+        binding_secret_uid: approval.value.binding_secret_uid,
+        audience: approval.value.audience,
+        reservation_credential_expires_at: FIXTURE_CREDENTIAL_EXPIRY.into(),
+    })
 }
 
 fn claim_snapshot(registry: &NamespaceRegistry) -> platform::Result<ClaimSnapshotV1> {
@@ -431,11 +522,34 @@ fn registry_authority() -> Value {
     authority
 }
 
+fn deployment_identity_object() -> Value {
+    let approval = fixture_deployment_identity_approval();
+    object(
+        "reakt-deploy-identity-example",
+        &approval.value,
+        &approval.uid,
+        &approval.resource_version,
+    )
+}
+
 pub(crate) fn wire(responses: Vec<Value>) -> (Client, Calls) {
     wire_with_authority(responses, registry_authority())
 }
 
 fn wire_with_authority(responses: Vec<Value>, authority: Value) -> (Client, Calls) {
+    wire_with_identity_and_authority(responses, deployment_identity_object(), authority, false)
+}
+
+pub(crate) fn wire_with_identity(responses: Vec<Value>, identity: Value) -> (Client, Calls) {
+    wire_with_identity_and_authority(responses, identity, registry_authority(), true)
+}
+
+fn wire_with_identity_and_authority(
+    responses: Vec<Value>,
+    identity: Value,
+    authority: Value,
+    record_identity_reads: bool,
+) -> (Client, Calls) {
     let replies = Arc::new(Mutex::new(VecDeque::from(responses)));
     let calls: Calls = Arc::default();
     let service = service_fn({
@@ -444,6 +558,7 @@ fn wire_with_authority(responses: Vec<Value>, authority: Value) -> (Client, Call
             let replies = replies.clone();
             let calls = calls.clone();
             let authority = authority.clone();
+            let identity = identity.clone();
             async move {
                 let (parts, body) = request.into_parts();
                 let data = body
@@ -456,21 +571,33 @@ fn wire_with_authority(responses: Vec<Value>, authority: Value) -> (Client, Call
                 } else {
                     serde_json::from_slice(&data).map_err(std::io::Error::other)?
                 };
-                calls
-                    .lock()
-                    .map_err(|_| std::io::Error::other("calls lock poisoned"))?
-                    .push((
-                        parts.method.to_string(),
-                        parts.uri.to_string(),
-                        data.clone(),
-                    ));
-                let mut reply = if parts.method == http::Method::GET
+                let registry_authority_read = parts.method == http::Method::GET
                     && parts
                         .uri
                         .path()
-                        .ends_with("/configmaps/reakt-registry-authority.control.workload")
-                {
+                        .ends_with("/configmaps/reakt-registry-authority.control.workload");
+                let identity_read = cfg!(feature = "deployer")
+                    && parts.method == http::Method::GET
+                    && parts
+                        .uri
+                        .path()
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|name| name.starts_with("reakt-deploy-identity-"));
+                if record_identity_reads || !identity_read {
+                    calls
+                        .lock()
+                        .map_err(|_| std::io::Error::other("calls lock poisoned"))?
+                        .push((
+                            parts.method.to_string(),
+                            parts.uri.to_string(),
+                            data.clone(),
+                        ));
+                }
+                let mut reply = if registry_authority_read {
                     authority
+                } else if identity_read {
+                    identity
                 } else {
                     replies
                         .lock()
@@ -845,7 +972,7 @@ async fn namespace_claim_reservation_is_one_conditional_update_and_rejects_stale
     let lying_store = LyingClaimStore {
         snapshot: registry.claim_snapshot()?,
     };
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?
+    let platform = platform_client(client, "control", "workload", "cluster-a")?
         .with_claim_store(Arc::new(lying_store));
     assert!(
         reserve_test_transition(&platform, &request, "executor-b")
@@ -1109,6 +1236,10 @@ fn staged_initial_transition(
         activation.binding.service_account_name
     );
     Ok(StoredTransition {
+        executor_binding: fixture_executor_binding(
+            &plan.generation_reservation,
+            &record.executor_id,
+        )?,
         next_review_metadata: fixture_review_store().seed(crate::project_review_metadata(plan)?)?,
         previous_review_metadata: None,
         capacity: CapacityAdmission::projection_placeholder(
@@ -1147,7 +1278,7 @@ fn stateful_wire_with_drift(
 ) -> (Client, Calls) {
     let objects = objects
         .into_iter()
-        .chain(std::iter::once(registry_authority()));
+        .chain([registry_authority(), deployment_identity_object()]);
     let store: Arc<Mutex<BTreeMap<String, Value>>> = Arc::new(Mutex::new(
         objects
             .into_iter()
@@ -1189,11 +1320,17 @@ fn stateful_wire_with_drift(
             } else {
                 serde_json::from_slice(&bytes).unwrap()
             };
-            capture.lock().unwrap().push((
-                parts.method.to_string(),
-                parts.uri.to_string(),
-                value.clone(),
-            ));
+            if !parts
+                .uri
+                .path()
+                .ends_with("/configmaps/reakt-deploy-identity-example")
+            {
+                capture.lock().unwrap().push((
+                    parts.method.to_string(),
+                    parts.uri.to_string(),
+                    value.clone(),
+                ));
+            }
             let segments: Vec<_> = parts.uri.path().split('/').collect();
             let key = segments[segments.len() - 3..].join("/");
             let mut store = store.lock().unwrap();
@@ -1474,6 +1611,8 @@ fn staged_upgrade_fixture() -> std::result::Result<LifecycleRegistry, Box<dyn st
     current.next_review_metadata =
         fixture_review_store().seed(crate::project_review_metadata(&plan)?)?;
     current.inputs = transition_inputs(&plan, &policy)?;
+    current.executor_binding =
+        fixture_executor_binding(&plan.generation_reservation, "executor-b")?;
     let current = retarget_staged_identity(current, &previous_plan, &plan)?;
     registry.transitions.insert(TRANSITION_B.into(), current);
     registry.plans.insert(TRANSITION_B.into(), plan);
@@ -2283,6 +2422,28 @@ fn ci_permission_report_distinguishes_creation_scope_and_runtime_authority()
             .creation_targets
             .iter()
             .all(|target| target.namespace != REGISTRY_AUTHORITY_NAMESPACE)
+    );
+    let identity_name = "reakt-deploy-identity-example";
+    let identity_access = report
+        .required_resources
+        .iter()
+        .filter(|access| {
+            access.namespace.as_deref() == Some("control")
+                && access.api_group.is_empty()
+                && access.resource == "configmaps"
+                && access
+                    .resource_names
+                    .iter()
+                    .any(|name| name == identity_name)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(identity_access.len(), 1);
+    assert!(identity_access.iter().all(|access| access.verb == "get"));
+    assert!(
+        report
+            .creation_targets
+            .iter()
+            .all(|target| target.name != identity_name)
     );
 
     for target in &report.creation_targets {
@@ -3123,13 +3284,31 @@ async fn another_domain_uses_the_registry_counter_after_domain_entry_removal()
         claims: registry.claims.clone(),
         generation_history: history,
     };
-    let (client, calls) = wire(vec![
-        registry_object(&registry, REGISTRY_UID, "42")?,
-        object("policy", &policy, "policy-uid", "40"),
-        registry_object(&registry, REGISTRY_UID, "42")?,
-        json!("echo-put"),
-    ]);
-    let platform = platform_client(client, "control", "workload", "cluster-a")?;
+    let mut identity = fixture_deployment_identity_approval();
+    identity.value.domain_id = "other".into();
+    let identity_object = object(
+        "reakt-deploy-identity-other",
+        &identity.value,
+        &identity.uid,
+        &identity.resource_version,
+    );
+    let (client, calls) = wire_with_identity(
+        vec![
+            registry_object(&registry, REGISTRY_UID, "42")?,
+            object("policy", &policy, "policy-uid", "40"),
+            registry_object(&registry, REGISTRY_UID, "42")?,
+            json!("echo-put"),
+        ],
+        identity_object,
+    );
+    let platform = platform_client_with_identity(
+        client,
+        "control",
+        "workload",
+        "cluster-a",
+        identity,
+        FIXTURE_CREDENTIAL_EXPIRY,
+    )?;
     let reserved = reserve_test_transition(&platform, &request, "executor-b").await?;
     assert_eq!(reserved.value.next_sequence, 3);
     assert_eq!(
@@ -3326,7 +3505,12 @@ pub(crate) fn preview_fresh_fixture() -> std::result::Result<
 
 // Protected pending-state fixture for the sealed preview adapter tests.
 pub(crate) fn preview_pending_fixture() -> std::result::Result<
-    (NamespaceRegistry, deploy::TransitionPlan, PolicyState, Value),
+    (
+        NamespaceRegistry,
+        deploy::TransitionPlan,
+        PolicyState,
+        Value,
+    ),
     Box<dyn std::error::Error>,
 > {
     let (staged, _, policy, trust, _) = staged_initial_fixture()?;

@@ -104,6 +104,7 @@ pub struct RuntimeInventory {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoredTransition {
     pub inputs: crate::TransitionInputs,
+    pub executor_binding: crate::ExecutorBinding,
     pub capacity: crate::CapacityAdmission,
     /// Complete declaration metadata published before this reservation's registry CAS.
     pub next_review_metadata: coordination::ReviewRef,
@@ -144,9 +145,11 @@ impl StoredTransition {
         capacity: crate::CapacityAdmission,
         next_review_metadata: coordination::ReviewRef,
         previous_review_metadata: Option<coordination::ReviewRef>,
+        executor_binding: crate::ExecutorBinding,
     ) -> Self {
         Self {
             inputs,
+            executor_binding,
             capacity,
             next_review_metadata,
             previous_review_metadata,

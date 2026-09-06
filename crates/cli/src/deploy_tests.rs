@@ -37,6 +37,26 @@ fn routing_capacity() -> platform::CapacityAdmission {
     }
 }
 
+fn routing_executor_binding(scope: coordination::ClaimScope) -> platform::ExecutorBinding {
+    platform::ExecutorBinding {
+        schema_version: "reakt.dev/executor-binding/v1".into(),
+        scope,
+        domain_id: "example".into(),
+        transition_id: TRANSITION_1.into(),
+        sequence: 1,
+        executor_id: "job-1".into(),
+        identity_approval_uid: "identity-uid".into(),
+        identity_approval_resource_version: "1".into(),
+        identity_approval_digest: BUILD.into(),
+        service_account_name: "deployer".into(),
+        service_account_uid: "deployer-uid".into(),
+        binding_secret_name: "deployment-token-binding".into(),
+        binding_secret_uid: "binding-uid".into(),
+        audience: "kubernetes".into(),
+        reservation_credential_expires_at: "2026-01-01T00:00:00Z".into(),
+    }
+}
+
 fn registry() -> Result<(NamespaceRegistry, deploy::TransitionPlan)> {
     let compiled = compiler_core::parse_and_validate(&json!({
         "testOnly":false,"schemaVersion":"reakt.dev/ir/v1",
@@ -85,11 +105,13 @@ fn registry() -> Result<(NamespaceRegistry, deploy::TransitionPlan)> {
     // Routing fixtures do not purport to be authenticated/replayable cluster records.
     record.phase = Phase::Committed;
     history.active_allocation = Some(plan.generation_reservation.clone());
+    let inputs = frozen_inputs(&plan)?;
     let stored = StoredTransition {
+        executor_binding: routing_executor_binding(inputs.registry.claim_snapshot.scope.clone()),
         next_review_metadata: platform::project_review_metadata(&plan)?.reference()?,
         previous_review_metadata: None,
         capacity: routing_capacity(),
-        inputs: frozen_inputs(&plan)?,
+        inputs,
         record,
         staged_identity_uids: BTreeMap::new(),
         staged_content_digests: BTreeMap::new(),

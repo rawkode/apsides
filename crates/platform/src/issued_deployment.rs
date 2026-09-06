@@ -54,7 +54,8 @@ impl IssuedDeployment {
             control_namespace,
             workload_namespace,
             cluster_binding,
-        )?;
+        )?
+        .install_issued_identity(identity.clone(), &credential.expires_at)?;
         let issued = Self {
             platform,
             identity,
@@ -184,7 +185,7 @@ impl IssuedDeployment {
         )
         .map_err(|_| invalid("test expiration invalid"))?;
         Ok(Self {
-            platform,
+            platform: platform.install_issued_identity(identity.clone(), &expires.to_string())?,
             identity,
             expires_at: expires.to_string(),
             expires,
