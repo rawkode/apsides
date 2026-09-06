@@ -17,6 +17,7 @@ tasks: {
 	lifecycleCeilingTest: {command: "python3", args: ["tests/reakt/test_lifecycle_ceiling.py"]}
 	lifecycleCleanupTest: {command: "python3", args: ["tests/reakt/test_lifecycle_cleanup.py"]}
 	lifecyclePermissionsTest: {command: "python3", args: ["tests/reakt/test_lifecycle_permissions.py"]}
+	lifecycleDiagnosticsTest: {command: "python3", args: ["tests/reakt/test_lifecycle_diagnostics.py"]}
 	lifecycleInterruptionTest: {command: "python3", args: ["tests/reakt/test_lifecycle_interruption.py"]}
 	storageProbeTest: {command: "cargo", args: ["test", "--locked", "-p", "inventory", "--test", "pvc_restart"]}
 	storageBuildTest: {command: "python3", args: ["tests/reakt/storage/test_build.py"]}

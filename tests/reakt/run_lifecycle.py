@@ -873,6 +873,9 @@ class LifecycleRunner:
                 if time.monotonic() >= deadline:
                     raise RuntimeError("initial generation did not create all lifecycle targets")
                 time.sleep(1)
+            if self.args.runtime_diagnostics:
+                from lifecycle_diagnostics import verify_runtime_diagnostics
+                verify_runtime_diagnostics(self, self.candidates[0], self.allocation(self.candidates[0], "install"))
             self.reject_unapproved_upgrade()
             self.approve_runtime(1)
             if self.interrupt_after_phase == "Planned":
@@ -1023,6 +1026,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ["first", "second", "public-key", "proxy-qualification", "output"]:
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--runtime-diagnostics", action="store_true", help="qualify live controller status through conflict and recovery before upgrade")
     parser.add_argument("--adopt-retained", action="store_true", help="exercise explicit operator-approved adoption before upgrade")
     parser.add_argument("--replace-cleanup-target", action="store_true", help="verify real cleanup rejects a replacement UID and retains its claim")
     parser.add_argument("--force-retained", action="store_true", help="verify policy-approved force repairs a foreign SSA field after writer retirement")
