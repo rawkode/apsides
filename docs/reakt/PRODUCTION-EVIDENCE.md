@@ -312,3 +312,25 @@ fixture image and the archived production candidate. Its local result is
 not a packaged `ProductionEvidence` receipt. Source-closure packaging and merge
 verification remain necessary before counting `fixture-promotion-rejection`
 in production coverage, which remains seven of sixteen checks.
+
+`tests/reakt/run_fixture_promotion.py` packages a fresh driver execution as a
+single production evidence check. It accepts existing candidates and the fixture
+compiler stage; it does not rebuild or modify them:
+
+```sh
+cuenv exec python3 tests/reakt/run_fixture_promotion.py \
+  --artifact "$PWD/work/deployment-ceiling-899233f-subject/candidate" \
+  --trust-policy "$PWD/work/deployment-ceiling-899233f-subject/trust.json" \
+  --fixture-artifact "$PWD/work/fixture-promotion-0a3b58b/candidate" \
+  --fixture-source "$PWD/work/fixture-promotion-build-0a3b58b.source" \
+  --output "$PWD/work/fixture-promotion-evidence"
+```
+
+The signed production candidate's fixture IR and overlay must match the supplied
+compiler stage byte-for-byte. The runner freezes both releases, their payloads,
+trust policy, stage inputs, verifier source closure and executable across the
+measurement. Only a successful exact rejection produces an evidence receipt.
+The fixture identity is supplemental; the receipt belongs to the production
+candidate. Namespaced source archives and the measurement accompany the receipt
+for the normal `reakt merge-evidence` consumer. `cuenv task fixturePromotionTest`
+checks orchestration contracts without substituting for the real verifier run.
