@@ -41,6 +41,11 @@ establish narrower properties.
 - The verifier requires every compiler-generated reactor case and all sixteen
   named release checks. Missing, duplicate, failed, fixture-substituted, or
   unauthenticated production checks reject the release.
+- `reakt merge-evidence` combines selected receipts against one exact production
+  candidate using the existing validators. It copies only referenced files, rejects
+  conflicts and duplicate coverage, and reports missing checks without claiming
+  release verification. The current producers cover two production checks and
+  three reactor checks; eleven production check producers remain unfinished.
 - Production evidence binds the exact binary, image, IR, compiler closure, build
   inputs, runner source, and diagnostic files. Reactor evidence has a separate,
   narrower fixture contract.

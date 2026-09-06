@@ -27,6 +27,47 @@ self-reference. The enclosing provenance signature authenticates the receipt.
 These are signer-attested measurements. An authenticated runner source file and
 assertions alone do not establish that the runner executed.
 
+## Combining measured evidence
+
+`reakt merge-evidence` combines explicit receipts against one structurally valid
+production candidate. The candidate establishes the payload identities; this
+command does not verify signature trust or perform the measurements again.
+
+Create a JSON list of receipt paths relative to the list file, for example:
+
+```json
+[
+  "reproducibility/evidence/production-evidence.json",
+  "input-isolation/evidence/isolation-evidence.json",
+  "reactor/evidence/reactor-evidence.json"
+]
+```
+
+```sh
+cuenv exec -- target/debug/reakt merge-evidence \
+  --artifact work/candidate \
+  --fragments work/fragments.json \
+  --output work/merged-evidence
+```
+
+The output contains `evidence/`, `coverage.json`, and `summary.json`. Publication
+uses exclusive directory creation and never replaces an existing destination.
+The directory is visible while files are written; `summary.json` is written last
+as the completion marker. Treat an output without that marker as incomplete.
+Cleanup after a write failure is best-effort. Only the receipts and their
+referenced files are included. Supplemental fixture-case diagnostics in a selected
+reactor receipt are validated and retained, but never counted as required coverage.
+Identical filenames deduplicate
+only when their bytes match; conflicting files, duplicate checks or cases,
+mismatched subjects, and invalid assertions reject the merge. Existing release
+validators check production and reactor receipts under their separate contracts.
+
+The summary reports missing required checks and cases and always records
+`releaseVerified: false`. Partial coverage remains partial. Pass `evidence/` and
+`coverage.json` to `reakt release --evidence` and `--coverage`, then sign and verify
+the assembled release through the normal trust policy. A successful merge alone
+cannot satisfy the production release gate.
+
 ## Reproducibility runner
 
 `tests/reakt/run_reproducibility.py` runs two fresh CLI builds with

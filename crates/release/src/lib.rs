@@ -17,6 +17,8 @@ pub use fetch::{
     FetchedRelease, OrasTool, ReleaseReference, ResolvedRelease, fetch_release, resolve_release,
 };
 mod manifest;
+mod merge_evidence;
+pub use merge_evidence::{MergeSummary, merge_evidence};
 mod oci;
 mod production_evidence;
 #[cfg(test)]
