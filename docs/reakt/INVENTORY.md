@@ -58,10 +58,35 @@ successor archives them.
 
 ## Current limits
 
+The local storage qualification is available through cuenv:
+
+```sh
+cuenv task storageProbeTest
+cuenv task storageBuildTest
+cuenv task storageRestartTest
+cuenv exec python3 tests/reakt/storage/build.py --output work/storage-image
+cuenv exec python3 tests/reakt/run_storage_restart.py --image-directory work/storage-image --output work/storage-results
+```
+
+Use fresh output directories. The live harness creates and removes its own kind
+cluster and isolated kubeconfig. Its static local PV uses the disposable node's
+filesystem. It checks inventory larger than 1 MiB, retained snapshots across Pods,
+concurrent conditional publication, rollback after a writer SIGKILL, and read-only
+storage refusal. This does not qualify CSI storage, node or power failure, remote
+Turso, writer fencing, or interruption inside inventory publication. Build outputs
+and results remain ignored; the image is a test artifact, not a production release.
+
+The local-PV qualification passed with a 2,220,976-byte canonical inventory,
+separate-Pod history reads, one successful and one conflicting publisher, and
+recovery after SIGKILL with an observed populated rollback journal. Read-only
+refusal and subsequent healthy reopen also passed. These results cover the
+inventory store on the tested local PV, not the other durable stores.
+
 Canonical state and completion-envelope budgets reject oversized records before
 publication. The implementation does not provide snapshot garbage collection,
 cross-executor takeover, automatic recovery for missing authority, or completed
-live qualification of persistent-volume and remote Turso recovery.
+live qualification of remote Turso recovery or persistent-volume recovery for
+claim, review and audit stores.
 
 See [Inventory, prune and upgrades](/concepts/inventory-prune-upgrades/),
 [Transition audit history](/reakt/audit/), [State capacity](/reakt/state-capacity/),

@@ -18,6 +18,11 @@ tasks: {
 	lifecycleCleanupTest: {command: "python3", args: ["tests/reakt/test_lifecycle_cleanup.py"]}
 	lifecyclePermissionsTest: {command: "python3", args: ["tests/reakt/test_lifecycle_permissions.py"]}
 	lifecycleInterruptionTest: {command: "python3", args: ["tests/reakt/test_lifecycle_interruption.py"]}
+	storageProbeTest: {command: "cargo", args: ["test", "--locked", "-p", "inventory", "--test", "pvc_restart"]}
+	storageBuildTest: {command: "python3", args: ["tests/reakt/storage/test_build.py"]}
+	storageRestartTest: {command: "python3", args: ["tests/reakt/storage/test_restart.py"]}
+	storagePrepare: {command: "python3", args: ["tests/reakt/storage/build.py"]}
+	storageRestart: {command: "python3", args: ["tests/reakt/run_storage_restart.py"]}
 	coordinationTest: {command: "cargo", args: ["test", "--locked", "-p", "coordination"]}
 	coordinationCheck: [
 		{command: "cargo", args: ["clippy", "--locked", "-p", "coordination", "--all-targets", "--", "-D", "warnings"]},
