@@ -88,7 +88,7 @@ identifier provides uniqueness, not authorization. Kubernetes observations check
 the current target identities; the marker's node image digest remains a host
 runner attestation. Neither alone proves that the runner created the cluster.
 
-This capability is a prerequisite, not a completed production evidence producer.
+This capability alone is a prerequisite, not a completed production evidence producer.
 The ceiling check still requires a live denial with an actually required
 capability removed from protected policy, unchanged registry and immutable store
 state, and no writer or RBAC mutation. Restoring the full policy must allow the

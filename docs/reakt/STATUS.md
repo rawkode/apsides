@@ -44,8 +44,15 @@ establish narrower properties.
 - `reakt merge-evidence` combines selected receipts against one exact production
   candidate using the existing validators. It copies only referenced files, rejects
   conflicts and duplicate coverage, and reports missing checks without claiming
-  release verification. The current producers cover two production checks and
-  three reactor checks; eleven production check producers remain unfinished.
+  release verification. The current producers cover three production checks and
+  three reactor checks; ten production check producers remain unfinished.
+- The deployment-ceiling producer passed on a dedicated kind cluster: removing
+  one required capability rejected the exact signed candidate without state
+  changes; restoring the policy allowed the same allocation to reach `Planned`.
+  Public registry readback and metadata row comparisons passed. No next writer
+  started, the temporary cluster and credentials were removed, and existing
+  clusters were preserved. This qualifies reservation with the recorded runner;
+  it does not execute the candidate binary or qualify GitHub Actions identity.
 - Production evidence binds the exact binary, image, IR, compiler closure, build
   inputs, runner source, and diagnostic files. Reactor evidence has a separate,
   narrower fixture contract.
