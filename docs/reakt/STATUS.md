@@ -153,9 +153,9 @@ recovery, or production restore authority.
 - Complete claim, review and audit persistent-volume interrupted-write
   qualification, and qualify remote Turso/libSQL restart,
   unavailable-storage, conflict and recovery behavior.
-- Enforce TLS for server-directed libSQL requests and qualify bounded, non-panicking
-  handling of remote error bodies. Initial endpoint validation does not establish
-  these properties for the pinned upstream client.
+- Qualify byte and time bounds and non-panicking handling of remote responses.
+  The store connectors reject non-HTTPS connection URIs, including server-directed libSQL
+  requests, but this does not bound response bodies in the pinned upstream client.
 - Complete production API authorization and admission qualification for the
   supported Kubernetes versions, including the declared preview permissions and
   request-drain profile.

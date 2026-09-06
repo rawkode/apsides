@@ -373,13 +373,18 @@ dependencies = [
  "async-trait",
  "compiler-core",
  "deploy",
+ "hyper 0.14.32",
+ "hyper-rustls 0.25.0",
  "inventory",
  "libsql",
+ "rustls 0.22.4",
+ "rustls-native-certs 0.7.3",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tower 0.4.13",
  "url",
 ]
 
@@ -1316,12 +1321,19 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "compiler-core",
+ "hyper 0.14.32",
+ "hyper-rustls 0.25.0",
  "libsql",
+ "rcgen",
+ "rustls 0.22.4",
+ "rustls-native-certs 0.7.3",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls 0.25.0",
+ "tower 0.4.13",
  "url",
 ]
 

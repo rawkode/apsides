@@ -4,7 +4,17 @@ use crate::{
 };
 use async_trait::async_trait;
 use libsql::{Builder, Connection, Database, TransactionBehavior, params};
-use std::{path::Path, time::Duration};
+use std::{io, path::Path, time::Duration};
+
+#[cfg(test)]
+#[path = "libsql_remote_tests.rs"]
+mod remote_tests;
+
+type HttpsPredicate = fn(hyper::Uri) -> std::result::Result<hyper::Uri, io::Error>;
+type RemoteConnector = tower::filter::Filter<
+    hyper_rustls::HttpsConnector<hyper::client::HttpConnector>,
+    HttpsPredicate,
+>;
 
 #[path = "libsql_review.rs"]
 mod review;
@@ -67,6 +77,7 @@ impl LibsqlCoordination {
     pub async fn open_remote(url: String, token: String) -> Result<Self> {
         validate_remote_configuration(&url, &token)?;
         let database = Builder::new_remote(url, token)
+            .connector(remote_connector()?)
             .build()
             .await
             .map_err(|_| Error::Backend("connect remote database"))?;
@@ -107,6 +118,7 @@ impl LibsqlCoordination {
     pub async fn open_remote_read_only(url: String, token: String) -> Result<Self> {
         validate_remote_configuration(&url, &token)?;
         let database = Builder::new_remote(url, token)
+            .connector(remote_connector()?)
             .build()
             .await
             .map_err(|_| Error::Backend("connect remote read-only database"))?;
@@ -372,6 +384,45 @@ impl AuditStore for LibsqlCoordination {
             })
             .transpose()
     }
+}
+
+fn require_https(uri: hyper::Uri) -> std::result::Result<hyper::Uri, io::Error> {
+    if uri.scheme_str() == Some("https") {
+        Ok(uri)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "remote connector requires HTTPS",
+        ))
+    }
+}
+
+fn guarded_connector<T>(inner: T) -> tower::filter::Filter<T, HttpsPredicate> {
+    tower::filter::Filter::new(inner, require_https as HttpsPredicate)
+}
+
+fn remote_connector() -> Result<RemoteConnector> {
+    let certificates = rustls_native_certs::load_native_certs()
+        .map_err(|_| Error::Backend("load native TLS roots"))?;
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in certificates {
+        let _ = roots.add(certificate);
+    }
+    if roots.is_empty() {
+        return Err(Error::Backend("load native TLS roots"));
+    }
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let mut http = hyper::client::HttpConnector::new();
+    http.enforce_http(false);
+    http.set_nodelay(true);
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_only()
+        .enable_http1()
+        .wrap_connector(http);
+    Ok(guarded_connector(connector))
 }
 
 fn validate_remote_configuration(url: &str, token: &str) -> Result<()> {

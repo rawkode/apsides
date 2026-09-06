@@ -29,8 +29,16 @@ Both store backends validate remote configuration before creating a client:
 endpoints must use `https` or `libsql`, contain a host and no embedded credentials,
 query, fragment or non-root path, and fit within 2,048 bytes. Tokens must contain
 1–8,192 bytes. Control characters are rejected, and errors omit supplied values.
-This validates connection inputs; end-to-end remote transport qualification is
-still incomplete.
+Both backends also filter every connection URI before the TLS connector: only
+HTTPS reaches the dialer, including requests directed by a server-returned
+libSQL `base_url`. Native certificate validation remains enabled; failure to load
+any usable native roots returns a closed error. This guard does not establish
+bounded response handling or remote recovery behavior.
+
+A controlled real-client test completes an authenticated TLS transaction start,
+then rejects the server's HTTP continuation before it reaches a plaintext
+listener. Its unguarded control reaches that listener. The fixture uses its own
+test certificate; it does not qualify a live Turso deployment or host trust store.
 
 Writable deployment initialization creates and validates the required tables.
 Read-only audit access performs no DDL or repair. Missing tables, malformed schema,
