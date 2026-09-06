@@ -112,7 +112,7 @@ class LifecycleCleanupTests(unittest.TestCase):
             cleanup = json.loads((runner.output / "cluster-cleanup.json").read_text())
             self.assertEqual(cleanup, {"stage": "complete", "deleteExitCode": 0, "absenceConfirmed": True})
             self.assertEqual(commands[-2:], [
-                ["kind", "delete", "cluster", "--name", runner.cluster],
+                ["kind", "delete", "cluster", "--name", runner.cluster, "--kubeconfig", runner.admin],
                 ["kind", "get", "clusters"],
             ])
             self.assertTrue(all(not path.exists() for path in [
@@ -194,7 +194,7 @@ class LifecycleCleanupTests(unittest.TestCase):
             self.assertFalse(result["diagnosticsComplete"])
             self.assertEqual(result["clusterDisposition"], "deleted")
             self.assertEqual(commands, [
-                ["kind", "delete", "cluster", "--name", runner.cluster],
+                ["kind", "delete", "cluster", "--name", runner.cluster, "--kubeconfig", runner.admin],
                 ["kind", "get", "clusters"],
             ])
 

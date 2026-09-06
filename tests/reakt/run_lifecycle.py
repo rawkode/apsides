@@ -964,7 +964,8 @@ class LifecycleRunner:
             return "not-owned"
         evidence = {"stage": "delete", "deleteExitCode": None, "absenceConfirmed": False}
         try:
-            result = self.command(["kind", "delete", "cluster", "--name", self.cluster], check=False)
+            result = self.command(["kind", "delete", "cluster", "--name", self.cluster,
+                                   "--kubeconfig", self.admin], check=False)
             evidence["deleteExitCode"] = result.returncode
             if result.returncode:
                 raise RuntimeError("owned disposable cluster deletion failed")
