@@ -20,7 +20,7 @@ NODE = "kindest/node:v1.34.3@sha256:08497ee19eace7b4b5348db5c6a1591d7752b164530a
 SCHEMA = "reakt.dev/deployment-ceiling-result/v1"
 MARKER = "reakt-candidate-qualification"
 BINDING_FIELDS = ["name", "namespace", "uid", "resourceVersion", "type", "immutable", "deletionTimestamp"]
-BINDING_PATH = 'jsonpath={.metadata.name}{"\t"}{.metadata.namespace}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}{"\t"}{.type}{"\t"}{.immutable}{"\t"}{.metadata.deletionTimestamp}'
+BINDING_PATH = r'jsonpath={.metadata.name}{"\t"}{.metadata.namespace}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}{"\t"}{.type}{"\t"}{.immutable}{"\t"}{.metadata.deletionTimestamp}'
 FIELDS = {
     "verified": {"releaseDigest", "irDigest", "domainId", "clusterBinding", "controlNamespace", "workloadNamespace"},
     "bootstrapped": {"registryUid", "registryResourceVersion"},
@@ -143,6 +143,10 @@ class CeilingRunner:
                                 cwd=ROOT, env=environment)
         if result.returncode or len(result.stdout.encode()) > shared.MAX_EVIDENCE_BYTES:
             failure = {"program": Path(arguments[0]).name, "returnCode": result.returncode, "phase": self.phase}
+            categories = {"permission-denied": "permission denied", "operation-not-permitted": "operation not permitted",
+                          "forbidden": "forbidden", "not-found": "notfound", "connection-refused": "connection refused",
+                          "timeout": "timed out", "jsonpath": "jsonpath", "discovery": "resource type"}
+            failure["errorClasses"] = [name for name, pattern in categories.items() if pattern in result.stderr.lower()]
             if hasattr(self, "driver") and arguments[0] == str(self.driver):
                 observed = re.findall(r'DriverError\("([a-zA-Z0-9 -]+)"\)', result.stderr + result.stdout)
                 if len(observed) == 1 and observed[0] in self.driver_error_reasons:
@@ -339,7 +343,7 @@ class CeilingRunner:
         for namespace in [self.control, self.workload, self.cluster, "reakt-platform"]:
             for resource in resources:
                 if resource == "secrets":
-                    metadata = self.k("get", "secrets", "-n", namespace, "-o", 'jsonpath={range .items[*]}{.metadata.name}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}{"\n"}{end}')
+                    metadata = self.k("get", "secrets", "-n", namespace, "-o", r'jsonpath={range .items[*]}{.metadata.name}{"\t"}{.metadata.uid}{"\t"}{.metadata.resourceVersion}{"\n"}{end}')
                     for line in metadata.splitlines():
                         fields = line.split("\t")
                         if len(fields) != 3 or any(not item for item in fields):
@@ -396,9 +400,13 @@ class CeilingRunner:
         raise shared.QualificationError("namespace bootstrap did not stabilize")
 
     def measure(self):
+        self.phase = "prepare-denial"
         prepared_denial = self.step("prepare", "prepared", self.issuer)
+        self.phase = "denial-target-absence"
         self.assert_targets_absent(prepared_denial)
+        self.phase = "denial-baseline"
         before = self.stable_baseline()
+        self.phase = "measure-denial"
         denied = self.step("measure", "ceiling-rejected", self.issuer, expectedMissingCapability=self.missing,
                            expectedRequestDigest=prepared_denial["requestDigest"])
         if any(denied[key] != prepared_denial[key] for key in ["requestDigest", "registryUid", "registryResourceVersion", "releaseDigest", "generation", "transition"]):
