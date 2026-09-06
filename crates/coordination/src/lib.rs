@@ -10,8 +10,8 @@
 //! Immutable coordination metadata, without a mutable authority pointer.
 //!
 //! A snapshot asserts a complete registry view; this library cannot prove that
-//! completeness or grant authority. A future protected registry pointer must bind
-//! its digest before consumers use it. Hydration belongs above `deploy`, which
+//! completeness or grant authority. The protected registry binds its exact
+//! digest before lifecycle consumers use it. Hydration belongs above `deploy`, which
 //! continues to accept `ProtectedClaim` values and never depends on this crate.
 mod model;
 pub use model::*;

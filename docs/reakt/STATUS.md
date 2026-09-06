@@ -114,6 +114,13 @@ within-phase interruption, transfer to a different CI executor, or recovery of a
 matching production release payload, and does not satisfy the production
 phase-recovery release check.
 
+Inventory storage has passed a separate local-PV qualification with 2,220,976
+bytes of canonical metadata, exact history across Pods, one winner and one
+conflict from competing publishers, and recovery after an uncommitted database
+writer is killed and reaped. Read-only refusal and healthy reopen also passed.
+This covers process termination on the tested local PV; it does not qualify
+claim, review or audit stores, CSI storage, node failure, or remote Turso.
+
 ## Remaining production work
 
 - Produce one signed production release containing every required reactor case
@@ -125,8 +132,9 @@ phase-recovery release check.
   executor label and recorded credential expiry do not prove that an earlier
   executor cannot mint credentials, complete admitted requests, or write the
   metadata store.
-- Qualify persistent-volume and remote Turso/libSQL operation, including restart,
-  unavailable storage, conflict, backup, and recovery behavior.
+- Extend persistent-volume qualification to claim, review and audit stores, and
+  qualify backup and remote Turso/libSQL restart, unavailable-storage, conflict
+  and recovery behavior.
 - Complete production API authorization and admission qualification for the
   supported Kubernetes versions, including the declared preview permissions and
   request-drain profile.
