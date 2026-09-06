@@ -39,6 +39,26 @@ fn cnpg_review_preserves_the_imported_api_mapping() -> TestResult {
         coordination::ReviewApiResourceScope::Namespaced
     );
     review.validate()?;
+    ir["resources"][0]["force"] = json!(true);
+    request.next.compiled = parse_and_validate(&ir.to_string())?;
+    assert!(deploy::plan_transition(&request).is_err());
+    let accepted = policy(&request.next.compiled);
+    request.runtime_ceiling = accepted.runtime_ceiling;
+    request.cleanup_ceiling = accepted.cleanup_ceiling;
+    let forced = crate::project_review_metadata(&deploy::plan_transition(&request)?)?;
+    assert!(
+        forced
+            .resources
+            .first()
+            .is_some_and(|resource| resource.force)
+    );
+    assert!(
+        forced
+            .enforcement
+            .indirect_risks
+            .contains(&"force-apply:Cluster/workload/database".into())
+    );
+    forced.validate()?;
     Ok(())
 }
 

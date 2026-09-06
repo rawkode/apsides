@@ -9,6 +9,14 @@ establish narrower properties.
 
 ### Authoring, compilation, and runtime
 
+- `aps init` creates a starter project with Deno and TypeScript configuration.
+  `aps crds fetch` generates ignored, importable types from a pinned CRD source.
+  A generated CloudNativePG import was checked through the TypeScript language
+  service with zero diagnostics and 55 property completions.
+- Imported namespaced resources retain their explicit plural, scope and schema
+  digest through compilation and deployment review. Force apply remains a
+  per-resource choice requiring explicit policy acceptance, including custom
+  resources. Managed Secrets remain unsupported; Secret inputs are observed.
 - `@reakt/kubernetes` provides the bounded TSX authoring surface for Controllers,
   ConfigMaps, Services, Deployments, declared inputs, and rollout reactions.
 - The compiler locks the complete author module closure, typechecks it, evaluates
@@ -120,6 +128,16 @@ establish narrower properties.
   effective authority.
 
 ## Verified boundaries
+
+The CNPG example passed a local exact signed-candidate lifecycle rehearsal on
+kind through OrbStack at `207a405`: initial database readiness and application
+Secret creation, refusal of the permission expansion without registry changes,
+approved successor staging, writer retirement, activation and commit. PostgREST
+returned two database rows, then one after a ConfigMap update caused a new Pod,
+ReplicaSet and rollout revision while preserving the Deployment UID. Cleanup
+restored the previous cluster/container inventories and removed credentials.
+This is not a production acceptance receipt and does not qualify force-enabled
+custom-resource writes, Secret rotation or drift correction.
 
 Automated suites cover strict schema and canonical replay, claim and metadata
 store immutability, registry concurrency, capacity accounting, review privacy,

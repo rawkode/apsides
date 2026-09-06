@@ -1,6 +1,24 @@
 use super::*;
 
 #[test]
+fn custom_force_risk_retains_the_kind_and_identity_contract() -> Result<()> {
+    for risk in [
+        "force-apply:Secret/workload/database".to_string(),
+        "force-apply:cluster/workload/database".into(),
+        "force-apply:Cluster!/workload/database".into(),
+        format!("force-apply:{}/workload/database", "C".repeat(64)),
+        "force-apply:Cluster/workload/database/extra".into(),
+        "force-apply:Cluster//database".into(),
+    ] {
+        let mut value = metadata()?;
+        value.enforcement.indirect_risks = vec![risk.clone()];
+        value.enforcement.runtime_ceiling.accepted_indirect_risks = vec![risk];
+        assert!(value.validate().is_err());
+    }
+    Ok(())
+}
+
+#[test]
 fn custom_resource_risk_requires_explicit_ceiling_acceptance() -> Result<()> {
     let mut value = metadata()?;
     let risk = "opaque-custom-resource-effects".to_string();

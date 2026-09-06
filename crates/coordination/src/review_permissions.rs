@@ -94,8 +94,12 @@ fn risk(value: &str) -> bool {
     }
     value.strip_prefix("force-apply:").is_some_and(|identity| {
         let mut parts = identity.split('/');
-        matches!(parts.next(), Some("ConfigMap" | "Service" | "Deployment"))
-            && parts.next().is_some_and(namespace)
+        parts.next().is_some_and(|kind| {
+            kind != "Secret"
+                && kind.len() <= 63
+                && kind.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+                && kind.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        }) && parts.next().is_some_and(namespace)
             && parts.next().is_some_and(name)
             && parts.next().is_none()
     })
