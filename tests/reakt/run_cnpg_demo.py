@@ -552,6 +552,8 @@ class CnpgDemoRunner(base.CeilingRunner):
                 capability["apiGroup"], [resource], [capability["verb"]], names,
             ))
         by_namespace.setdefault(self.workload, []).extend([
+            rule("", ["configmaps"], ["get"], ["api-config"]),
+            rule("postgresql.cnpg.io", ["clusters"], ["get"], ["database"]),
             rule("rbac.authorization.k8s.io", ["roles", "rolebindings"], ["get", "create"]),
             rule("rbac.authorization.k8s.io", ["rolebindings"], ["delete"]),
         ])
@@ -865,6 +867,18 @@ class CnpgDemoRunner(base.CeilingRunner):
         if initial["phase"] != "Committed":
             raise shared.QualificationError("initial candidate did not commit")
         self.wait_cnpg()
+        ownership = []
+        for kind, name in [("cluster.postgresql.cnpg.io", "database"), ("configmap", "api-config")]:
+            metadata = json.loads(self.k(
+                "get", kind, name, "-n", self.workload, "--show-managed-fields", "-o", "json",
+            ))["metadata"]
+            ownership.append({
+                "resource": kind, "name": name, "uid": metadata["uid"],
+                "managers": [{key: entry.get(key) for key in [
+                    "manager", "operation", "apiVersion", "fieldsType", "subresource",
+                ]} for entry in metadata.get("managedFields", [])],
+            })
+        (self.output / "initial-ownership.json").write_bytes(shared.canonical(ownership))
         self.create({
             "apiVersion": "v1", "kind": "ConfigMap",
             "metadata": {"name": "api-settings", "namespace": self.workload},
@@ -1008,6 +1022,7 @@ def main():
                 "failureReason": base.failure_reason(runner, error),
                 "primaryFailure": runner.primary_failure,
                 "subprocessFailures": runner.failures,
+                "checks": runner.checks,
                 "issuerCredentialsRemoved": not runner.issuer.exists(),
             }
             (runner.output / "result.json").write_bytes(shared.canonical(result))

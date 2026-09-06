@@ -101,7 +101,7 @@ async fn prepare_predecessor(
         *registry = platform
             .capture_active_claim_uids(&domain.id, &head.snapshot)
             .await
-            .map_err(|_| DriverError("active claim UID capture failed"))?;
+            .map_err(claim_capture_error)?;
         platform
             .publish_captured_inventory(inventory, &domain.id, registry, &head)
             .await
@@ -125,6 +125,22 @@ async fn prepare_predecessor(
         .map(Box::new)
         .map(Some)
         .map_err(|_| DriverError("predecessor metadata reconstruction failed"))
+}
+
+fn claim_capture_error(error: platform_api::Error) -> DriverError {
+    match error {
+        platform_api::Error::Kubernetes(kube::Error::Api(response)) if response.code == 403 =>
+            DriverError("active claim UID capture authorization denied"),
+        platform_api::Error::Kubernetes(_) =>
+            DriverError("active claim UID capture Kubernetes request failed"),
+        platform_api::Error::Invalid(message) if message == "live cleanup candidate lacks exact approved Apply ownership" =>
+            DriverError("active claim UID capture lacks approved Apply ownership"),
+        platform_api::Error::Invalid(message) if message == "live resource is a replacement of the protected UID" =>
+            DriverError("active claim UID capture observed a replacement"),
+        platform_api::Error::Coordination(_) =>
+            DriverError("active claim UID capture coordination failed"),
+        _ => DriverError("active claim UID capture failed"),
+    }
 }
 
 async fn bootstrap_platform(
