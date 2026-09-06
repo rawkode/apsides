@@ -222,11 +222,12 @@ fn review_requires_exact_replay_and_predecessor_checkpoint() -> Result<()> {
     // The routing fixture marks Committed without receipts. The report renderer
     // must reject it, even though routing itself only reads identity metadata.
     assert!(
-        crate::review::transition_review_fixture(&original, &original_plan, TRANSITION_1).is_err()
+        crate::review::transition_review_fixture(&original, &original_plan, TRANSITION_1, None)
+            .is_err()
     );
     original.record = begin(&original_plan, "job-1")?;
     let initial =
-        crate::review::transition_review_fixture(&original, &original_plan, TRANSITION_1)?;
+        crate::review::transition_review_fixture(&original, &original_plan, TRANSITION_1, None)?;
     assert_eq!(initial["reactions"]["before"], json!([]));
 
     let mut request = original_plan.request.clone();
@@ -246,33 +247,57 @@ fn review_requires_exact_replay_and_predecessor_checkpoint() -> Result<()> {
         )?,
     )));
     let plan = plan_transition(&request)?;
+    let previous_review = platform::project_review_metadata(&original_plan)?;
     let mut upgrade = original;
+    upgrade.next_review_metadata = platform::project_review_metadata(&plan)?.reference()?;
+    upgrade.previous_review_metadata = Some(previous_review.reference()?);
     upgrade.record = begin(&plan, "job-2")?;
     upgrade.inputs = frozen_inputs(&plan)?;
-    assert!(crate::review::transition_review_fixture(&upgrade, &plan, TRANSITION_2).is_err());
+    assert!(
+        crate::review::transition_review_fixture(
+            &upgrade,
+            &plan,
+            TRANSITION_2,
+            Some(&previous_review)
+        )
+        .is_err()
+    );
     let predecessor = plan.request.predecessor()?.ok_or("predecessor missing")?;
     upgrade.previous_writer_checkpoint = Some(review_checkpoint(predecessor)?);
-    let review = crate::review::transition_review_fixture(&upgrade, &plan, TRANSITION_2)?;
-    assert_eq!(review["schemaVersion"], "reakt.dev/deployment-review/v3");
-    assert_eq!(review["detailAvailability"], "metadata-only");
+    let review = crate::review::transition_review_fixture(
+        &upgrade,
+        &plan,
+        TRANSITION_2,
+        Some(&previous_review),
+    )?;
+    assert_eq!(review["schemaVersion"], "reakt.dev/deployment-review/v4");
+    assert_eq!(
+        review["detailAvailability"],
+        "authenticated-declaration-metadata"
+    );
     assert_eq!(
         review["permissions"]["runtime"]["after"],
         serde_json::to_value(&plan.request.next.compiled.capabilities)?
     );
     assert_eq!(
-        review["permissions"]["runtime"]["before"]["status"],
-        "unavailable"
+        review["permissions"]["runtime"]["before"],
+        serde_json::to_value(&previous_review.runtime_permissions)?
     );
-    assert_eq!(
-        review["permissions"]["runtime"]["added"]["status"],
-        "unavailable"
-    );
+    assert_eq!(review["permissions"]["runtime"]["added"], json!([]));
     let checkpoint = upgrade
         .previous_writer_checkpoint
         .as_mut()
         .ok_or("checkpoint missing")?;
     checkpoint.allocation.artifact_digest = OTHER.into();
-    assert!(crate::review::transition_review_fixture(&upgrade, &plan, TRANSITION_2).is_err());
+    assert!(
+        crate::review::transition_review_fixture(
+            &upgrade,
+            &plan,
+            TRANSITION_2,
+            Some(&previous_review)
+        )
+        .is_err()
+    );
     Ok(())
 }
 

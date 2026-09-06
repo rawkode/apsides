@@ -112,6 +112,7 @@ pub(super) fn adoption_fixture() -> Result<(platform::StoredTransition, deploy::
     }];
     let plan = plan_transition(&request)?;
     let mut stored = registry.transition(TRANSITION_1)?.clone();
+    stored.next_review_metadata = platform::project_review_metadata(&plan)?.reference()?;
     stored.inputs = frozen_inputs(&plan)?;
     stored.capacity = routing_capacity();
     stored.record = begin(&plan, "job-1")?;
@@ -142,10 +143,10 @@ fn resource_row<'a>(review: &'a Value, name: &str) -> Result<&'a Value> {
 #[test]
 fn authenticated_review_links_added_declaration_to_planned_adoption() -> Result<()> {
     let (stored, plan) = adoption_fixture()?;
-    let review = crate::review::transition_review_fixture(&stored, &plan, TRANSITION_1)?;
+    let review = crate::review::transition_review_fixture(&stored, &plan, TRANSITION_1, None)?;
     assert_eq!(
         review.get("schemaVersion").and_then(Value::as_str),
-        Some("reakt.dev/deployment-review/v3")
+        Some("reakt.dev/deployment-review/v4")
     );
     assert_eq!(
         review.get("actionSemantics").and_then(Value::as_str),
@@ -262,12 +263,15 @@ fn transfer_and_forged_adoption_plan_never_render_as_approved() -> Result<()> {
         .first_mut()
         .ok_or("ownership intent missing")?
         .object_uid = "forged-approval-uid".into();
-    assert!(crate::review::transition_review_fixture(&stored, &forged, TRANSITION_1).is_err());
+    assert!(
+        crate::review::transition_review_fixture(&stored, &forged, TRANSITION_1, None).is_err()
+    );
 
     let mut wrong_commitment = stored;
     wrong_commitment.inputs.plan_digest = OTHER.into();
     assert!(
-        crate::review::transition_review_fixture(&wrong_commitment, &plan, TRANSITION_1).is_err()
+        crate::review::transition_review_fixture(&wrong_commitment, &plan, TRANSITION_1, None)
+            .is_err()
     );
     Ok(())
 }

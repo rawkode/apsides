@@ -238,3 +238,40 @@ async fn protected_review_references_reject_foreign_scope_and_allocation() -> Te
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn preflight_baseline_requires_the_exact_planning_registry_revision() -> TestResult {
+    let registry = qualified_upgrade_fixture()?;
+    let expected =
+        fixture_review_store().read(&registry.transition(TRANSITION_A)?.next_review_metadata)?;
+    for (uid, revision, accepted) in [
+        (REGISTRY_UID, "42", true),
+        (REGISTRY_UID, "43", false),
+        ("foreign-uid", "42", false),
+    ] {
+        let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
+        let result = platform_client(client, "control", "workload", "cluster-a")?
+            .load_active_review_metadata("example", uid, revision)
+            .await;
+        if accepted {
+            assert_eq!(result?, expected);
+        } else {
+            let Err(error) = result else {
+                return Err("changed planning revision accepted".into());
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("review baseline registry revision changed")
+            );
+        }
+        assert!(
+            calls
+                .lock()
+                .map_err(|_| "calls lock")?
+                .iter()
+                .all(|(method, _, _)| method == "GET")
+        );
+    }
+    Ok(())
+}

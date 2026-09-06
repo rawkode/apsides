@@ -45,15 +45,24 @@ impl PlatformClient {
         Ok(written)
     }
 
-    /// Read the active declaration baseline through its authenticated registry reference.
+    /// Read the active declaration baseline at the exact authenticated planning revision.
     /// This grants no lifecycle authority and does not retrieve historical releases.
     /// # Errors
     /// Rejects unknown domains, unavailable metadata and mismatched protected references.
     pub async fn load_active_review_metadata(
         &self,
         domain: &str,
+        expected_registry_uid: &str,
+        expected_registry_revision: &str,
     ) -> Result<Option<ReviewMetadataV1>> {
         let registry = self.load_registry().await?;
+        if registry.uid != expected_registry_uid
+            || registry.resource_version != expected_registry_revision
+        {
+            return Err(invalid(
+                "review baseline registry revision changed; replan deployment",
+            ));
+        }
         match active_review_reference(&registry.value, domain)? {
             Some(reference) => self.read_review_metadata(reference).await.map(Some),
             None => Ok(None),

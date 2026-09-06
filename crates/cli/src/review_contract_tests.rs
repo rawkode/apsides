@@ -3,6 +3,8 @@ use compiler_core::canonical_bytes;
 
 #[path = "review_projection_tests.rs"]
 mod projection;
+#[path = "review_v4_tests.rs"]
+mod v4;
 
 fn source(line: u32) -> Value {
     json!({"file":"program.tsx","line":line,"column":3})
@@ -42,6 +44,7 @@ fn transition(ir: &Value) -> Result<(StoredTransition, deploy::TransitionPlan)> 
     request.runtime_ceiling.accepted_indirect_risks = compiled.indirect_risks.clone();
     request.cleanup_ceiling = request.runtime_ceiling.clone();
     let plan = plan_transition(&request)?;
+    stored.next_review_metadata = platform::project_review_metadata(&plan)?.reference()?;
     stored.inputs = frozen_inputs(&plan)?;
     stored.record = begin(&plan, "job-1")?;
     Ok((stored, plan))
@@ -49,13 +52,13 @@ fn transition(ir: &Value) -> Result<(StoredTransition, deploy::TransitionPlan)> 
 
 fn report(ir: &Value) -> Result<Value> {
     let (stored, plan) = transition(ir)?;
-    crate::review::transition_review_fixture(&stored, &plan, TRANSITION_1)
+    crate::review::transition_review_fixture(&stored, &plan, TRANSITION_1, None)
 }
 
 #[test]
 fn initial_review_uses_complete_compiler_fields_and_explicit_empty_baselines() -> Result<()> {
     let report = report(&declaration("private-value-canary")?)?;
-    assert_eq!(report["schemaVersion"], "reakt.dev/deployment-review/v3");
+    assert_eq!(report["schemaVersion"], "reakt.dev/deployment-review/v4");
     for category in [
         "reactions",
         "inputAuthority",
@@ -177,22 +180,22 @@ fn review_rejects_substituted_derived_fields_and_plan_receipts() -> Result<()> {
         .ok_or("effect missing")?
         .field_paths
         .push("/unapproved".into());
-    assert!(crate::review::transition_review_fixture(&stored, &plan, TRANSITION_1).is_err());
+    assert!(crate::review::transition_review_fixture(&stored, &plan, TRANSITION_1, None).is_err());
     let (mut stored, plan) = transition(&declaration("private-value-canary")?)?;
     stored.record.phase = Phase::Committed;
-    assert!(crate::review::transition_review_fixture(&stored, &plan, TRANSITION_1).is_err());
+    assert!(crate::review::transition_review_fixture(&stored, &plan, TRANSITION_1, None).is_err());
     Ok(())
 }
 
 #[test]
 fn review_preserves_canonical_graph_and_separates_permission_requirements() -> Result<()> {
     let (stored, plan) = transition(&declaration("private-value-canary")?)?;
-    crate::review::preflight(&plan)?;
-    let report = crate::review::transition_review_fixture(&stored, &plan, TRANSITION_1)?;
+    crate::review::preflight(&plan, None)?;
+    let report = crate::review::transition_review_fixture(&stored, &plan, TRANSITION_1, None)?;
     assert_eq!(
         report["dataflow"]["after"],
         json!([{
-            "reaction":"restart", "inputs":["managed","external","credentials"], "target":"api"
+            "reaction":"restart", "inputs":["credentials","external","managed"], "target":"api"
         }])
     );
     let effects = report["effects"]["after"]
@@ -202,6 +205,7 @@ fn review_preserves_canonical_graph_and_separates_permission_requirements() -> R
     for effect in &plan.request.next.compiled.effects {
         assert!(effects.iter().any(|row| row
             == &json!({
+                "id": if effect.operation == "server-side-apply" { format!("resource:{}", effect.target) } else { "reaction:restart".to_owned() },
                 "target":effect.target, "operation":effect.operation,
                 "fieldPaths":effect.field_paths, "source":effect.source
             })));

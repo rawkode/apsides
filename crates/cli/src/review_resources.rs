@@ -1,6 +1,8 @@
-//! Declaration membership and field contracts, independent of live apply impact.
-use super::declarations::{Detail, Unavailable};
-use compiler_core::{CompiledPlan, Lifecycle, Resource, SourceLocation};
+//! Kubernetes identity correlates declarations; declaration IDs remain visible across replacements.
+use coordination::{
+    ReviewDeletionPolicy, ReviewIdentity, ReviewLifecycle, ReviewMetadataV1, ReviewOwnershipPlan,
+    ReviewResource, ReviewSource,
+};
 use deploy::{OwnershipAction, OwnershipIntent, ResourceIdentity};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -9,6 +11,12 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(super) struct FieldChange<'a> {
     path: &'a str,
     change: &'static str,
+}
+#[derive(Serialize)]
+pub(super) struct FieldPaths<'a> {
+    added: Vec<&'a str>,
+    removed: Vec<&'a str>,
+    retained: Vec<&'a str>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,153 +30,253 @@ pub(super) struct OwnershipChange<'a> {
 #[serde(rename_all = "camelCase")]
 pub(super) struct ResourceChange<'a> {
     api_version: &'a str,
-    namespace: String,
+    namespace: &'a str,
     kind: &'a str,
-    name: String,
+    name: &'a str,
+    before: Option<&'a ReviewResource>,
+    after: Option<&'a ReviewResource>,
     before_api_version: Option<&'a str>,
     after_api_version: Option<&'a str>,
     before_kind: Option<&'a str>,
     after_kind: Option<&'a str>,
+    before_id: Option<&'a str>,
     after_id: Option<&'a str>,
+    before_uid: Option<&'a str>,
     change: &'static str,
     declaration_change: &'static str,
-    field_changes: Detail<Vec<FieldChange<'a>>>,
-    before_source: Detail<Option<&'a SourceLocation>>,
-    after_source: Option<&'a SourceLocation>,
-    before_lifecycle: Option<Lifecycle>,
-    after_lifecycle: Option<&'a Lifecycle>,
-    before_force: Detail<Option<bool>>,
+    field_changes: Vec<FieldChange<'a>>,
+    field_paths: FieldPaths<'a>,
+    before_source: Option<&'a ReviewSource>,
+    after_source: Option<&'a ReviewSource>,
+    before_lifecycle: Option<&'a ReviewLifecycle>,
+    after_lifecycle: Option<&'a ReviewLifecycle>,
+    before_force: Option<bool>,
     after_force: Option<bool>,
     ownership_change: OwnershipChange<'a>,
 }
 
 pub(super) fn resources<'a>(
-    before: Option<&'a inventory::InventorySnapshot>,
-    next: &'a CompiledPlan,
+    before: Option<&'a ReviewMetadataV1>,
+    next: &'a ReviewMetadataV1,
+    predecessor_inventory: Option<&'a inventory::InventorySnapshot>,
     intents: &'a [OwnershipIntent],
 ) -> crate::Result<Vec<ResourceChange<'a>>> {
-    let old: BTreeMap<_, _> = before
-        .into_iter()
-        .flat_map(|i| &i.resources)
-        .map(|r| {
+    next.validate()?;
+    if let Some(previous) = before {
+        previous.validate()?;
+    }
+    let tracked = inventory_map(before, predecessor_inventory)?;
+    resource_rows(
+        before.map_or(&[], |metadata| &metadata.resources),
+        &next.resources,
+        &tracked,
+        intents,
+    )
+}
+
+fn inventory_map<'a>(
+    before: Option<&ReviewMetadataV1>,
+    inventory: Option<&'a inventory::InventorySnapshot>,
+) -> crate::Result<BTreeMap<ReviewIdentity, &'a inventory::TrackedResource>> {
+    let (previous, inventory) = match (before, inventory) {
+        (None, None) => return Ok(BTreeMap::new()),
+        (Some(previous), Some(inventory)) => (previous, inventory),
+        _ => {
+            return Err(
+                "review predecessor metadata and inventory are missing or unexpected".into(),
+            );
+        }
+    };
+    let scope = inventory::InventoryScope {
+        cluster: previous.scope.claim_scope.cluster_binding.clone(),
+        namespace: previous.scope.claim_scope.workload_namespace.clone(),
+        controller: previous.scope.domain_id.clone(),
+    };
+    inventory.encode(&scope)?;
+    if inventory.generation
+        != deploy::allocation_names(
+            &previous.scope.claim_scope.registry_uid,
+            previous.scope.sequence,
+        )?
+        .generation_id
+    {
+        return Err("review inventory generation differs from its declaration baseline".into());
+    }
+    let tracked: BTreeMap<_, _> = inventory
+        .resources
+        .iter()
+        .map(|resource| {
             (
-                ResourceIdentity {
-                    api_group: r.identity.api_group.clone(),
-                    resource: r.identity.resource.clone(),
-                    namespace: r.identity.namespace.clone(),
-                    name: r.identity.name.clone(),
+                ReviewIdentity {
+                    api_group: resource.identity.api_group.clone(),
+                    resource: resource.identity.resource.clone(),
+                    namespace: resource.identity.namespace.clone(),
+                    name: resource.identity.name.clone(),
                 },
-                r,
+                resource,
             )
         })
         .collect();
-    let new: BTreeMap<_, _> = next
-        .ir
-        .resources
+    if tracked.len() != inventory.resources.len() || tracked.len() != previous.resources.len() {
+        return Err("review inventory membership differs from its declaration baseline".into());
+    }
+    for resource in &previous.resources {
+        let tracked = tracked
+            .get(&resource.identity)
+            .ok_or("review prior identity is absent from inventory")?;
+        let policy_matches = matches!(
+            (resource.lifecycle.deletion_policy, tracked.deletion_policy),
+            (
+                ReviewDeletionPolicy::Delete,
+                compiler_core::DeletionPolicy::Delete
+            ) | (
+                ReviewDeletionPolicy::Orphan,
+                compiler_core::DeletionPolicy::Orphan
+            )
+        );
+        if resource.api_version != tracked.api_version
+            || resource.kind != tracked.kind
+            || !policy_matches
+        {
+            return Err("review prior lifecycle differs from authenticated inventory".into());
+        }
+    }
+    Ok(tracked)
+}
+
+fn resource_rows<'a>(
+    before: &'a [ReviewResource],
+    next: &'a [ReviewResource],
+    tracked: &BTreeMap<ReviewIdentity, &'a inventory::TrackedResource>,
+    intents: &'a [OwnershipIntent],
+) -> crate::Result<Vec<ResourceChange<'a>>> {
+    let old: BTreeMap<_, _> = before
         .iter()
-        .map(|r| Ok((identity(r)?, r)))
-        .collect::<crate::Result<_>>()?;
-    let approvals = approval_map(intents, &new)?;
-    let keys: BTreeSet<_> = old.keys().chain(new.keys()).cloned().collect();
+        .map(|resource| (&resource.identity, resource))
+        .collect();
+    let new: BTreeMap<_, _> = next
+        .iter()
+        .map(|resource| (&resource.identity, resource))
+        .collect();
+    if old.len() != before.len() || new.len() != next.len() {
+        return Err("review encountered duplicate resource identities".into());
+    }
+    let approvals = approval_map(intents, &old, &new)?;
+    let keys: BTreeSet<_> = old.keys().chain(new.keys()).copied().collect();
     keys.into_iter()
         .map(|key| {
-            let left = old.get(&key).copied();
-            let right = new.get(&key).copied();
-            let (api_version, kind) = match (left, right) {
-                (_, Some(r)) => (r.api_version.as_str(), r.kind.as_str()),
-                (Some(r), None) => (r.api_version.as_str(), r.kind.as_str()),
-                _ => return Err("review resource identity disappeared".into()),
-            };
-            let change = match (left, right) {
-                (None, Some(_)) => "added",
-                (Some(_), None) => "removed",
-                _ => "unknown",
-            };
-            let field_changes = declared_fields(left.is_some(), right, next)?;
-            let intent = approvals.get(&key).copied();
-            let (ownership, status) = match (left, right, intent) {
-                (_, _, Some(_)) => ("adopted", "adoption-approved"),
-                (None, Some(_), None) => ("new", "create-if-absent"),
-                (Some(_), Some(_), None) => ("retained", "previously-managed"),
-                _ => ("released", "release-planned"),
-            };
-            Ok(ResourceChange {
-                api_version,
-                namespace: key.namespace,
-                kind,
-                name: key.name,
-                before_api_version: left.map(|r| r.api_version.as_str()),
-                after_api_version: right.map(|r| r.api_version.as_str()),
-                before_kind: left.map(|r| r.kind.as_str()),
-                after_kind: right.map(|r| r.kind.as_str()),
-                after_id: right.map(|r| r.id.as_str()),
-                change,
-                declaration_change: change,
-                field_changes,
-                before_source: if left.is_some() {
-                    Detail::Unavailable(Unavailable::historical())
-                } else {
-                    Detail::Available(None)
-                },
-                after_source: right.map(|r| &r.source),
-                before_lifecycle: left.map(|r| Lifecycle {
-                    deletion_policy: r.deletion_policy,
-                }),
-                after_lifecycle: right.map(|r| &r.lifecycle),
-                before_force: if left.is_some() {
-                    Detail::Unavailable(Unavailable::historical())
-                } else {
-                    Detail::Available(None)
-                },
-                after_force: right.map(|r| r.force),
-                ownership_change: OwnershipChange {
-                    change: ownership,
-                    status,
-                    execution: "not-evaluated",
-                    intent_object_name: intent.map(|i| i.object_name.as_str()),
-                },
-            })
+            resource_row(
+                old.get(key).copied(),
+                new.get(key).copied(),
+                tracked
+                    .get(key)
+                    .and_then(|resource| resource.uid.as_deref()),
+                approvals.get(key).copied(),
+            )
         })
         .collect()
 }
 
-fn declared_fields<'a>(
-    previously_managed: bool,
-    resource: Option<&Resource>,
-    next: &'a CompiledPlan,
-) -> crate::Result<Detail<Vec<FieldChange<'a>>>> {
-    if previously_managed {
-        return Ok(Detail::Unavailable(Unavailable::historical()));
-    }
-    let target = resource.ok_or("review resource identity disappeared")?;
-    let effect = next
-        .effects
-        .iter()
-        .find(|effect| effect.target == target.id && effect.operation == "server-side-apply")
-        .ok_or("review omitted canonical field contract")?;
-    Ok(Detail::Available(
-        effect
-            .field_paths
-            .iter()
-            .map(|path| FieldChange {
-                path,
-                change: "added",
-            })
-            .collect(),
-    ))
+fn resource_row<'a>(
+    before: Option<&'a ReviewResource>,
+    after: Option<&'a ReviewResource>,
+    before_uid: Option<&'a str>,
+    approval: Option<&'a OwnershipIntent>,
+) -> crate::Result<ResourceChange<'a>> {
+    let resource = after
+        .or(before)
+        .ok_or("review resource identity disappeared")?;
+    let change = match (before, after) {
+        (None, Some(_)) => "added",
+        (Some(_), None) => "removed",
+        (Some(left), Some(right)) if same_declaration(left, right) => "unchanged",
+        _ => "changed",
+    };
+    let (field_paths, field_changes) = fields(before, after);
+    Ok(ResourceChange {
+        api_version: &resource.api_version,
+        namespace: &resource.identity.namespace,
+        kind: &resource.kind,
+        name: &resource.identity.name,
+        before,
+        after,
+        before_api_version: before.map(|r| r.api_version.as_str()),
+        after_api_version: after.map(|r| r.api_version.as_str()),
+        before_kind: before.map(|r| r.kind.as_str()),
+        after_kind: after.map(|r| r.kind.as_str()),
+        before_id: before.map(|r| r.id.as_str()),
+        after_id: after.map(|r| r.id.as_str()),
+        before_uid,
+        change,
+        declaration_change: change,
+        field_changes,
+        field_paths,
+        before_source: before.map(|r| &r.source),
+        after_source: after.map(|r| &r.source),
+        before_lifecycle: before.map(|r| &r.lifecycle),
+        after_lifecycle: after.map(|r| &r.lifecycle),
+        before_force: before.map(|r| r.force),
+        after_force: after.map(|r| r.force),
+        ownership_change: ownership(before, after, approval)?,
+    })
+}
+
+fn same_declaration(before: &ReviewResource, after: &ReviewResource) -> bool {
+    before.id == after.id
+        && before.identity == after.identity
+        && before.api_version == after.api_version
+        && before.kind == after.kind
+        && before.apply_fields == after.apply_fields
+        && before.lifecycle == after.lifecycle
+        && before.force == after.force
+        && before.source == after.source
+}
+
+fn fields<'a>(
+    before: Option<&'a ReviewResource>,
+    after: Option<&'a ReviewResource>,
+) -> (FieldPaths<'a>, Vec<FieldChange<'a>>) {
+    let old: BTreeSet<_> = before
+        .into_iter()
+        .flat_map(|r| r.apply_fields.iter().map(String::as_str))
+        .collect();
+    let new: BTreeSet<_> = after
+        .into_iter()
+        .flat_map(|r| r.apply_fields.iter().map(String::as_str))
+        .collect();
+    let paths = FieldPaths {
+        added: new.difference(&old).copied().collect(),
+        removed: old.difference(&new).copied().collect(),
+        retained: old.intersection(&new).copied().collect(),
+    };
+    let changes = old
+        .union(&new)
+        .map(|path| FieldChange {
+            path,
+            change: if !old.contains(path) {
+                "added"
+            } else if !new.contains(path) {
+                "removed"
+            } else {
+                "retained"
+            },
+        })
+        .collect();
+    (paths, changes)
 }
 
 fn approval_map<'a>(
     intents: &'a [OwnershipIntent],
-    resources: &BTreeMap<ResourceIdentity, &Resource>,
-) -> crate::Result<BTreeMap<ResourceIdentity, &'a OwnershipIntent>> {
+    old: &BTreeMap<&ReviewIdentity, &ReviewResource>,
+    new: &BTreeMap<&ReviewIdentity, &ReviewResource>,
+) -> crate::Result<BTreeMap<ReviewIdentity, &'a OwnershipIntent>> {
     let mut approvals = BTreeMap::new();
     for intent in intents {
+        let key = identity(&intent.approval.identity);
         if !matches!(intent.approval.action, OwnershipAction::Adopt)
-            || !resources.contains_key(&intent.approval.identity)
-            || approvals
-                .insert(intent.approval.identity.clone(), intent)
-                .is_some()
+            || !new.contains_key(&key)
+            || old.contains_key(&key)
+            || approvals.insert(key, intent).is_some()
         {
             return Err("review encountered an ambiguous ownership approval".into());
         }
@@ -176,54 +284,68 @@ fn approval_map<'a>(
     Ok(approvals)
 }
 
-fn identity(resource: &Resource) -> crate::Result<ResourceIdentity> {
-    let (api_group, plural) = match (resource.api_version.as_str(), resource.kind.as_str()) {
-        ("v1", "ConfigMap") => ("", "configmaps"),
-        ("v1", "Service") => ("", "services"),
-        ("apps/v1", "Deployment") => ("apps", "deployments"),
-        _ => return Err("review encountered an unsupported lifecycle resource".into()),
+fn ownership<'a>(
+    before: Option<&ReviewResource>,
+    after: Option<&ReviewResource>,
+    approval: Option<&'a OwnershipIntent>,
+) -> crate::Result<OwnershipChange<'a>> {
+    let (change, status) = match (before, after, approval) {
+        (None, Some(resource), Some(intent))
+            if approval_matches(&resource.ownership_plan, intent) =>
+        {
+            ("adopted", "adoption-approved")
+        }
+        (None, Some(resource), None)
+            if resource.ownership_plan == ReviewOwnershipPlan::CreateIfAbsent =>
+        {
+            ("new", "create-if-absent")
+        }
+        (Some(_), Some(resource), None)
+            if resource.ownership_plan == ReviewOwnershipPlan::PreviouslyManaged =>
+        {
+            ("retained", "previously-managed")
+        }
+        (Some(_), None, None) => ("released", "release-planned"),
+        _ => {
+            return Err(
+                "review ownership plan differs from authenticated membership or approval".into(),
+            );
+        }
     };
-    Ok(ResourceIdentity {
-        api_group: api_group.into(),
-        resource: plural.into(),
-        namespace: resource.namespace.clone(),
-        name: resource.name.clone(),
+    Ok(OwnershipChange {
+        change,
+        status,
+        execution: "not-evaluated",
+        intent_object_name: approval.map(|intent| intent.object_name.as_str()),
     })
+}
+
+fn approval_matches(plan: &ReviewOwnershipPlan, intent: &OwnershipIntent) -> bool {
+    matches!(plan, ReviewOwnershipPlan::AdoptionApproved {
+        intent_object_name, object_uid, object_resource_version, observed_uid, observed_resource_version,
+    } if intent_object_name == &intent.object_name && object_uid == &intent.object_uid
+        && object_resource_version == &intent.object_resource_version
+        && observed_uid == &intent.approval.observed_uid
+        && observed_resource_version == &intent.approval.observed_resource_version)
+}
+
+fn identity(identity: &ResourceIdentity) -> ReviewIdentity {
+    ReviewIdentity {
+        api_group: identity.api_group.clone(),
+        resource: identity.resource.clone(),
+        namespace: identity.namespace.clone(),
+        name: identity.name.clone(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
-    fn proposed() -> crate::Result<CompiledPlan> {
-        let declaration = |name: &str, force| {
-            json!({
-                "id":format!("declaration-{name}"), "apiVersion":"v1", "kind":"ConfigMap",
-                "name":name,"namespace":"workload", "force":force,
-                "desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":"workload"},
-                    "data":{"private":"must-not-appear"}},
-                "lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"next.tsx","line":2,"column":3},
-            })
-        };
-        let ir = json!({
-            "schemaVersion":compiler_core::IR_SCHEMA,
-            "domain":{"id":"example","namespace":"workload","controlNamespace":"control",
-                "clusterBinding":"cluster","policyRef":"policy","enforcement":"api-bound",
-                "budgets":{"maxResources":3,"maxInputs":1,"maxReactions":1,"maxObjectBytes":4096,
-                    "maxQueueDepth":8,"maxConcurrentRequests":1}},
-            "resources":[declaration("added",false),declaration("retained",true)],
-            "inputs":[],"reactions":[],"provenance":{"compiler":"test","inputs":[{"path":"next.tsx","sha256":"a".repeat(64)}]},
-        });
-        Ok(compiler_core::parse_and_validate(&ir.to_string())?)
-    }
-
-    fn tracked(
-        name: &str,
-        deletion_policy: compiler_core::DeletionPolicy,
-    ) -> inventory::TrackedResource {
-        inventory::TrackedResource {
-            identity: inventory::ResourceKey {
+    fn declaration(name: &str, id: &str) -> ReviewResource {
+        ReviewResource {
+            id: id.into(),
+            identity: ReviewIdentity {
                 api_group: String::new(),
                 resource: "configmaps".into(),
                 namespace: "workload".into(),
@@ -231,58 +353,119 @@ mod tests {
             },
             api_version: "v1".into(),
             kind: "ConfigMap".into(),
-            uid: Some(format!("uid-{name}")),
-            deletion_policy,
+            apply_fields: vec!["/data/shared".into()],
+            lifecycle: ReviewLifecycle {
+                deletion_policy: ReviewDeletionPolicy::Orphan,
+            },
+            force: false,
+            source: ReviewSource {
+                file: "controller.tsx".into(),
+                line: 1,
+                column: 1,
+            },
+            ownership_plan: ReviewOwnershipPlan::CreateIfAbsent,
         }
     }
 
     #[test]
-    fn metadata_review_preserves_membership_without_inventing_old_structure() -> crate::Result<()> {
-        let before = inventory::InventorySnapshot {
-            schema_version: inventory::INVENTORY_SCHEMA.into(),
-            generation: "previous".into(),
-            resources: vec![
-                tracked("retained", compiler_core::DeletionPolicy::Delete),
-                tracked("removed", compiler_core::DeletionPolicy::Orphan),
-            ],
-        };
-        let next = proposed()?;
-        let rows = resources(Some(&before), &next, &[])?;
-        let review = serde_json::to_value(&rows)?;
-        let added = &review[0];
-        let removed = &review[1];
-        let retained = &review[2];
-        assert_eq!(added["name"], "added");
-        assert_eq!(added["afterId"], "declaration-added");
-        assert_eq!(added["declarationChange"], "added");
-        assert_eq!(
-            added["fieldChanges"],
-            json!([{"path":"/data/private","change":"added"}])
-        );
-        assert_eq!(removed["name"], "removed");
-        assert_eq!(removed["declarationChange"], "removed");
-        assert_eq!(removed["ownershipChange"]["change"], "released");
-        assert_eq!(removed["ownershipChange"]["status"], "release-planned");
-        assert_eq!(removed["ownershipChange"]["execution"], "not-evaluated");
-        assert_eq!(removed["beforeLifecycle"]["deletionPolicy"], "orphan");
-        assert_eq!(removed["afterLifecycle"], json!(null));
-        assert_eq!(retained["name"], "retained");
-        assert_eq!(retained["declarationChange"], "unknown");
-        assert_eq!(retained["ownershipChange"]["change"], "retained");
-        assert_eq!(retained["ownershipChange"]["status"], "previously-managed");
-        assert_eq!(retained["beforeLifecycle"]["deletionPolicy"], "delete");
-        assert_eq!(retained["afterLifecycle"]["deletionPolicy"], "orphan");
-        assert_eq!(retained["afterForce"], true);
-        assert_eq!(
-            retained["afterSource"],
-            json!({"file":"next.tsx","line":2,"column":3})
-        );
-        for row in [removed, retained] {
-            for field in ["fieldChanges", "beforeForce", "beforeSource"] {
-                assert_eq!(row[field]["status"], "unavailable");
+    fn retained_ownership_does_not_invent_a_declaration_change() -> crate::Result<()> {
+        let before = [declaration("config", "config")];
+        let mut retained = before[0].clone();
+        retained.ownership_plan = ReviewOwnershipPlan::PreviouslyManaged;
+        let next = [retained.clone()];
+        let rows = resource_rows(&before, &next, &BTreeMap::new(), &[])?;
+        let row = rows.first().ok_or("resource row missing")?;
+        assert_eq!(row.declaration_change, "unchanged");
+        assert_eq!(row.ownership_change.change, "retained");
+        assert_eq!(row.field_paths.retained, ["/data/shared"]);
+        for change in 0..5 {
+            let mut changed = retained.clone();
+            match change {
+                0 => changed.id = "renamed-declaration".into(),
+                1 => changed.source.line = 2,
+                2 => changed.force = true,
+                3 => changed.lifecycle.deletion_policy = ReviewDeletionPolicy::Delete,
+                _ => changed.apply_fields = vec!["/data/other".into()],
+            }
+            let next = [changed];
+            let rows = resource_rows(&before, &next, &BTreeMap::new(), &[])?;
+            let row = rows.first().ok_or("resource row missing")?;
+            assert_eq!(row.declaration_change, "changed");
+            assert_eq!(row.ownership_change.change, "retained");
+            assert_eq!(row.before_id, Some("config"));
+            if change == 0 {
+                assert_eq!(row.after_id, Some("renamed-declaration"));
             }
         }
-        assert!(!serde_json::to_string(&rows)?.contains("must-not-appear"));
+        Ok(())
+    }
+
+    #[test]
+    fn moving_an_id_replaces_identity_without_transferring_ownership() -> crate::Result<()> {
+        let before = [declaration("old", "stable-id")];
+        let next = [declaration("new", "stable-id")];
+        let rows = resource_rows(&before, &next, &BTreeMap::new(), &[])?;
+        assert_eq!(rows.len(), 2);
+        let removed = rows
+            .iter()
+            .find(|row| row.name == "old")
+            .ok_or("old row missing")?;
+        let added = rows
+            .iter()
+            .find(|row| row.name == "new")
+            .ok_or("new row missing")?;
+        assert_eq!(removed.declaration_change, "removed");
+        assert_eq!(removed.before_id, added.after_id);
+        assert_eq!(removed.ownership_change.status, "release-planned");
+        assert_eq!(added.declaration_change, "added");
+        assert_eq!(added.ownership_change.status, "create-if-absent");
+        assert_eq!(removed.field_paths.removed, ["/data/shared"]);
+        assert_eq!(added.field_paths.added, ["/data/shared"]);
+        Ok(())
+    }
+
+    #[test]
+    fn field_paths_and_prior_cleanup_metadata_remain_explicit() -> crate::Result<()> {
+        let mut old = declaration("config", "config");
+        old.apply_fields.insert(0, "/data/old".into());
+        old.lifecycle.deletion_policy = ReviewDeletionPolicy::Delete;
+        let mut new = declaration("config", "config");
+        new.apply_fields.insert(0, "/data/new".into());
+        new.ownership_plan = ReviewOwnershipPlan::PreviouslyManaged;
+        let before = [old];
+        let next = [new];
+        let tracked = inventory::TrackedResource {
+            identity: inventory::ResourceKey {
+                api_group: String::new(),
+                resource: "configmaps".into(),
+                namespace: "workload".into(),
+                name: "config".into(),
+            },
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            uid: Some("prior-uid".into()),
+            deletion_policy: compiler_core::DeletionPolicy::Delete,
+        };
+        let tracking = BTreeMap::from([(before[0].identity.clone(), &tracked)]);
+        let rows = resource_rows(&before, &next, &tracking, &[])?;
+        let row = rows.first().ok_or("resource row missing")?;
+        assert_eq!(row.before_uid, Some("prior-uid"));
+        assert_eq!(
+            row.before_lifecycle.map(|p| p.deletion_policy),
+            Some(ReviewDeletionPolicy::Delete)
+        );
+        assert_eq!(
+            row.after_lifecycle.map(|p| p.deletion_policy),
+            Some(ReviewDeletionPolicy::Orphan)
+        );
+        assert_eq!(row.field_paths.added, ["/data/new"]);
+        assert_eq!(row.field_paths.removed, ["/data/old"]);
+        assert_eq!(row.field_paths.retained, ["/data/shared"]);
+        let removed = resource_rows(&before, &[], &tracking, &[])?;
+        let row = removed.first().ok_or("removed row missing")?;
+        assert_eq!(row.before_uid, Some("prior-uid"));
+        assert_eq!(row.ownership_change.status, "release-planned");
+        assert!(row.after.is_none());
         Ok(())
     }
 }

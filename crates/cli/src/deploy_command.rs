@@ -240,7 +240,21 @@ async fn reserve_new_transition(
     )
     .await?;
     crate::inventory_connection::require_request(inventory, &request).await?;
-    crate::review::preflight(&deploy::plan_transition(&request)?)?;
+    let previous_review = if request.predecessor()?.is_some() {
+        platform
+            .load_active_review_metadata(
+                &domain.id,
+                &request.registry.registry_uid,
+                &request.registry.revision,
+            )
+            .await?
+    } else {
+        None
+    };
+    crate::review::preflight(
+        &deploy::plan_transition(&request)?,
+        previous_review.as_ref(),
+    )?;
     platform
         .reserve_transition(&request, executor, verified, inventory)
         .await?;
