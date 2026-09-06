@@ -151,8 +151,31 @@ registry, policy, review, trust, and disposable-target checks must remain stable
 
 Pure state tests and compilation do not qualify this check. The two-candidate
 public-method test, immutable marker replacement, live state comparisons, and
-receipt producer remain unfinished. No ownership-collision receipt is emitted by
+receipt verification remain unfinished. No ownership-collision receipt is emitted by
 this API, and it cannot admit a non-colliding second reservation.
+
+`tests/reakt/run_ownership_collision.py` runs that experiment with two signed
+production candidates. The contender is the unchanged subject of the resulting
+receipt; the owner is independently built from tracked source. Both candidates
+must share scope, have distinct domains, and overlap at exactly one canonical
+resource identity. The owner reserves first. The runner then conditionally deletes
+its immutable marker and creates the contender marker before measuring rejection.
+
+```sh
+cuenv exec python3 tests/reakt/run_ownership_collision.py \
+  --artifact "$PWD/work/contender-candidate" \
+  --trust-policy "$PWD/work/contender-trust.json" \
+  --owner-artifact "$PWD/work/owner-candidate" \
+  --owner-trust-policy "$PWD/work/owner-trust.json" \
+  --output "$PWD/work/ownership-collision"
+```
+
+One qualification executor is authorized for both domains. This experiment does
+not prove credential isolation between distinct principals. Candidate payloads,
+raw state, credentials, and trust bodies are excluded from evidence; the owner is
+bound separately by source and payload digests. The same owned-cluster cleanup
+and receipt-last rules as the ceiling runner apply. `cuenv task
+ownershipCollisionTest` checks orchestration contracts without a live cluster.
 
 ## Reproducibility runner
 

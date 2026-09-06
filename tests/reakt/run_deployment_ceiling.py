@@ -30,14 +30,14 @@ FIELDS = {
 }
 
 
-def result_record(stdout, expected):
-    records = [line.removeprefix("APS_CEILING_RESULT=") for line in stdout.splitlines()
-               if line.startswith("APS_CEILING_RESULT=")]
+def result_record(stdout, expected, *, prefix="APS_CEILING_RESULT=", schema=SCHEMA, fields=FIELDS):
+    records = [line.removeprefix(prefix) for line in stdout.splitlines()
+               if line.startswith(prefix)]
     if len(records) != 1 or len(records[0]) > 128 * 1024:
         raise shared.QualificationError("ceiling driver did not emit one bounded result")
     value = json.loads(records[0], object_pairs_hook=shared.unique_object)
-    if (not isinstance(value, dict) or set(value) != FIELDS[expected] | {"schemaVersion", "outcome"}
-            or value["schemaVersion"] != SCHEMA or value["outcome"] != expected):
+    if (not isinstance(value, dict) or set(value) != fields[expected] | {"schemaVersion", "outcome"}
+            or value["schemaVersion"] != schema or value["outcome"] != expected):
         raise shared.QualificationError("ceiling driver result has an unexpected contract")
     for key, item in value.items():
         if key == "creationTargets":
@@ -46,7 +46,7 @@ def result_record(stdout, expected):
             for target in item:
                 if not isinstance(target, dict) or set(target) != {"namespace", "apiGroup", "resource", "name"} or any(not isinstance(v, str) for v in target.values()):
                     raise shared.QualificationError("invalid creation target")
-        elif key in {"nextSequence", "claimCount"}:
+        elif key in {"nextSequence", "claimCount", "overlapCount"}:
             if type(item) is not int or item < 0:
                 raise shared.QualificationError("invalid ceiling result counter")
         elif not isinstance(item, str) or not item or len(item) > 1024:
@@ -121,8 +121,9 @@ class CeilingRunner:
         self.sources = [Path(__file__).resolve(), Path(shared.__file__).resolve(),
                         Path(observations.__file__).resolve(), ROOT / "crates/platform/tests/deployment_ceiling.rs"]
         self.sources += sorted((ROOT / "crates/platform/tests/support").glob("deployment_ceiling*.rs"))
+        self.sources.append(ROOT / "crates/platform/tests/support/qualification_driver.rs")
         self.driver_error_reasons = set(re.findall(r'DriverError\(\s*"([a-zA-Z0-9 -]+)"',
-            (ROOT / "crates/platform/tests/support/deployment_ceiling_driver.rs").read_text()))
+            "\n".join(path.read_text() for path in self.sources if path.suffix == ".rs")))
         self.failure_reasons = set(re.findall(r'(?:QualificationError|RuntimeError)\(\s*"([^"\n]+)"', Path(__file__).read_text()))
         self.source_digests = {path.name: shared.digest_file(path) for path in self.sources}
         if len(self.source_digests) != len(self.sources):
@@ -312,7 +313,11 @@ class CeilingRunner:
         with os.fdopen(descriptor, "w") as stream:
             json.dump(config, stream)
 
-    def permissions(self):
+    def permissions(self, domains=None):
+        domains = [self.domain] if domains is None else domains
+        trust_names = ["reakt-trust-" + domain for domain in domains]
+        identity_names = ["reakt-deploy-identity-" + domain for domain in domains]
+        policy_names = ["reakt-policy-" + domain for domain in domains]
         def rule(resource, verbs, names):
             return {"apiGroups": [""], "resources": [resource], "verbs": verbs, "resourceNames": names}
 
@@ -324,12 +329,11 @@ class CeilingRunner:
                          "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": kind, "name": metadata["name"]},
                          "subjects": [{"kind": "ServiceAccount", "name": account, "namespace": self.control}]})
 
-        role(self.control, "issuer", [rule("configmaps", ["get"], ["reakt-trust-" + self.domain, "reakt-deploy-identity-" + self.domain]),
+        role(self.control, "issuer", [rule("configmaps", ["get"], trust_names + identity_names),
                                       rule("serviceaccounts", ["get"], ["ceiling-deployer"]),
                                       rule("serviceaccounts/token", ["create"], ["ceiling-deployer"]),
                                       rule("secrets", ["get"], ["ceiling-binding"])], "ceiling-issuer")
-        role(self.control, "deployer", [rule("configmaps", ["get"], ["reakt-trust-" + self.domain, "reakt-deploy-identity-" + self.domain,
-                                                                   "reakt-policy-" + self.domain, "reakt-registry-" + self.workload]),
+        role(self.control, "deployer", [rule("configmaps", ["get"], trust_names + identity_names + policy_names + ["reakt-registry-" + self.workload]),
                                         rule("configmaps", ["update"], ["reakt-registry-" + self.workload])], "ceiling-deployer")
         role(self.cluster, "marker", [rule("configmaps", ["get"], [MARKER])], "ceiling-deployer")
         role("reakt-platform", "authority", [rule("configmaps", ["get"], ["reakt-registry-authority." + self.control + "." + self.workload])], "ceiling-deployer")
@@ -374,9 +378,10 @@ class CeilingRunner:
                 "rawObjects": raw_objects, "rawCoordination": raw_coordination, "rawInventory": raw_inventory}
 
     def assert_targets_absent(self, prepared):
-        if prepared["creationTargetsSource"] != "capability-complete-projection":
+        if prepared is not None and prepared["creationTargetsSource"] != "capability-complete-projection":
             raise shared.QualificationError("unknown creation target projection")
-        targets = list(prepared["creationTargets"])
+        # None requests only the candidate's declared resource absence check.
+        targets = [] if prepared is None else list(prepared["creationTargets"])
         kinds = {"ConfigMap": ("", "configmaps"), "Service": ("", "services"), "Deployment": ("apps", "deployments")}
         for resource in self.plan["ir"]["resources"]:
             group, plural = kinds[resource["kind"]]
@@ -527,14 +532,14 @@ def failure_reason(runner, error):
     return str(error) if str(error) in getattr(runner, "failure_reasons", set()) else type(error).__name__
 
 
-def main():
+def main(runner_class=None, extra_arguments=()):
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ["artifact", "trust-policy", "output"]:
+    for name in ["artifact", "trust-policy", "output", *extra_arguments]:
         parser.add_argument("--" + name, type=Path, required=True)
     args = parser.parse_args()
     runner = None
     try:
-        runner = CeilingRunner(args)
+        runner = (runner_class or CeilingRunner)(args)
         try:
             runner.prepare()
             runner.phase = "cluster-create"
