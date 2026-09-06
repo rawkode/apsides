@@ -4,6 +4,25 @@ Reakt implements specification 0.2 in the workspace crates and the `@reakt/kuber
 
 ## Current integration checkpoint
 
+Issued-credential SSA qualification now passes against a fresh disposable kind
+cluster pinned to Kubernetes `v1.34.3`. `cuenv task previewQualification` uses the
+client minted by `IssuedDeployment` for version discovery, named LIST and
+conditional dry-run apply. Existing and absent targets remain unchanged in the
+API server; wrong UID is rejected with HTTP 422 and stale resourceVersion with
+409. The same client receives 403 for Secret reads, unfiltered and unapproved-name
+LISTs, and unapproved-name PATCH. The harness removes its owned cluster and
+transient admin kubeconfig, and rejects a zero-test success. Five mocked harness
+tests cover failures, timeouts, name collisions, result validation and cleanup
+(`cuenv task previewQualificationTest`). Local live evidence is in
+`work/aps-preview-ad862476daf448e2/result.json` and its `test.log`.
+This proves the issued-client transport and RBAC boundary on that server version;
+it does not prove a complete signed-release CLI deployment, pending upgrade,
+Pod/PV recovery, remote Turso operation, or OrbStack SSA qualification.
+The focused preview suite passed 40 tests, strict all-target Clippy passed, and
+the Astro build checked all links across 29 pages. Independent adversarial review
+found no blockers for this qualification harness. Service/Deployment dry-runs,
+force conflicts and multi-target timing remain outside this live test's scope.
+
 Deployment review v5 now integrates the approved fresh and pending live-preview paths. Fresh combined-report budgeting precedes reservation of the same request; output follows selected plan/reference validation. Resumed observations retain exact phase/revision/epoch binding and are labeled current-state. Only closed missing-UID/adoption evidence can produce whole-live-preview unavailable while resume continues; authority and transport failures remain errors. Supplemental preview permissions remain separate from the durable declaration projector. The combined deploy/platform/CLI suite passed 249 tests with three live tests skipped, and the final focused preview suite passed 40 tests after pending precomposition validation (`work/live-review-registry-tests.log`, `work/live-review-preview-tests.log`). Strict all-target Clippy passed (`work/live-review-clippy.log`). CLI fixtures prove live/declaration binding, private-value omission, explicit opt-out and the combined 8 MiB limit; pending wire fixtures prove current Active-claim UID handling, unavailable without PATCH, conditional existing apply, exact binding and replacement/final-drift rejection. These are in-process fixtures, not a real CLI deployment or issued-token API-server qualification. Multi-target ordering, timeout cancellation and pending adoption completion remain further coverage work.
 
 The following paragraphs record prior checkpoints; their statements that CLI preview is disconnected are superseded by the v5 integration above.

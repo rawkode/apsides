@@ -26,6 +26,8 @@ mod evidence_profile;
 mod permissions;
 #[cfg(feature = "deployer")]
 mod preview_adapter;
+#[cfg(all(test, feature = "test-support"))]
+mod preview_issued_live;
 #[cfg(feature = "deployer")]
 mod preview_permissions;
 #[cfg(feature = "deployer")]
