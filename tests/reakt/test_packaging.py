@@ -42,6 +42,17 @@ class PackagingTests(unittest.TestCase):
             (self.repo / f"crates/{crate}/Cargo.toml").write_text('[package]\nname="test"\nversion="0.1.0"\n')
             (self.repo / f"crates/{crate}/src/lib.rs").write_text("// trusted runtime snapshot\n")
         self.calls = []
+        patch_copy = patch.object(packaging.patched_libsql, "copy_generated", self.copy_patch)
+        patch_copy.start()
+        self.addCleanup(patch_copy.stop)
+        patch_verify = patch.object(packaging.patched_libsql, "verify_generated", return_value={"qualification": "synthetic dependency fixture"})
+        patch_verify.start()
+        self.addCleanup(patch_verify.stop)
+
+    def copy_patch(self, source, destination):
+        destination.mkdir(parents=True)
+        (destination / "Cargo.toml").write_text('[package]\nname="libsql"\nversion="0.9.30"\n')
+        return {"qualification": "synthetic dependency fixture"}
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -57,11 +68,16 @@ class PackagingTests(unittest.TestCase):
             return json.dumps([{"Os": "linux", "Architecture": "arm64", "Id": "sha256:" + "b" * 64,
                                 "RepoDigests": [packaging.BUILDER]}])
         if argv[:2] == ["cargo", "vendor"]:
+            self.assertIn('[patch.crates-io]', (cwd / '.cargo/config.toml').read_text())
+            self.assertTrue((cwd / '.generated/libsql-0.9.30/Cargo.toml').is_file())
             self.assertIn("--locked", argv)
             self.assertIn("--offline", argv)
             (cwd / "vendor/example").mkdir(parents=True)
             (cwd / "vendor/example/Cargo.toml").write_text('[package]\nname="example"\n')
             return '[source.crates-io]\nreplace-with="vendored-sources"\n[source.vendored-sources]\ndirectory="vendor"\n'
+        if argv[:2] == ["cargo", "metadata"]:
+            self.assertIn('[patch.crates-io]', (cwd / '.cargo/config.toml').read_text())
+            return json.dumps({"packages": [], "resolve": {"nodes": []}})
         if len(argv) > 1 and argv[1] == "check":
             return json.dumps({"status": "valid", "irDigest": "sha256:" + "a" * 64})
         return "{}"
@@ -85,6 +101,29 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(result["releaseStatus"], "blocked")
         self.assertFalse(any("pull" in argv for argv in self.calls))
         self.assertTrue(any(argv[:2] == ["cargo", "metadata"] for argv in self.calls))
+
+    def test_context_refuses_missing_or_unverified_patch(self):
+        with patch.object(packaging.patched_libsql, "copy_generated", side_effect=ValueError("unverified patch")):
+            with self.assertRaisesRegex(ValueError, "unverified patch"):
+                self.prepare()
+        self.assertFalse(self.output.exists())
+        self.assertFalse(any(argv[:2] == ["cargo", "vendor"] for argv in self.calls))
+
+    def test_prepared_context_rejects_a_patch_that_is_no_longer_current(self):
+        self.prepare()
+        with patch.object(packaging.patched_libsql, "verify_generated", side_effect=ValueError("outdated patch")):
+            with self.assertRaisesRegex(ValueError, "outdated patch"):
+                self.verify()
+
+    def test_context_rejects_registry_libsql_resolution(self):
+        def registry_metadata(argv, cwd=None, timeout=180):
+            if argv[:2] == ["cargo", "metadata"]:
+                return json.dumps({"packages": [{"name": "libsql", "version": "0.9.30", "source": "registry+https://example.invalid"}]})
+            return self.fake_command(argv, cwd, timeout)
+        with patch.object(packaging, "command", registry_metadata):
+            with self.assertRaisesRegex(ValueError, "patched dependency"):
+                packaging.prepare(self.artifact, self.output, repository=self.repo)
+        self.assertFalse(self.output.exists())
 
     def test_context_verification_rejects_extra_and_changed_files(self):
         self.prepare()

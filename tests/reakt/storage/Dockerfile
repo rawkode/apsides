@@ -6,6 +6,7 @@ ARG SOURCE_DATE_EPOCH
 ARG PACKAGE
 ENV CARGO_HOME=/opt/reakt-cargo CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/build/target SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 COPY .cargo .cargo
+COPY .generated .generated
 COPY vendor vendor
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates

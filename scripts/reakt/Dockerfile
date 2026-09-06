@@ -7,6 +7,7 @@ ARG SOURCE_DATE_EPOCH
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 ENV CARGO_HOME=/opt/reakt-cargo CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/build/target
 COPY .cargo .cargo
+COPY .generated .generated
 COPY vendor vendor
 COPY workspace workspace
 COPY controller controller

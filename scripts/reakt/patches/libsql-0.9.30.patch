@@ -1,0 +1,474 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -389,7 +389,10 @@
+ 
+ [dev-dependencies.tokio]
+ version = "1.29.1"
+-features = ["full"]
++features = [
++    "full",
++    "test-util",
++]
+ 
+ [dev-dependencies.tokio-test]
+ version = "0.4"
+--- a/src/hrana/hyper.rs
++++ b/src/hrana/hyper.rs
+@@ -3,24 +3,74 @@
+ use crate::hrana::proto::{Batch, Stmt};
+ use crate::hrana::stream::HranaStream;
+ use crate::hrana::transaction::{HttpTransaction, TxScopeCounter};
+-use crate::hrana::{bind_params, unwrap_err, HranaError, HttpSend, Result};
++use crate::hrana::{bind_params, unwrap_err, HranaError, HttpSend, Result, MAX_RESPONSE_BYTES};
+ use crate::params::Params;
+ use crate::transaction::Tx;
+ use crate::util::ConnectorService;
+ use crate::{Error, Rows, Statement};
+-use bytes::Bytes;
++use bytes::{Bytes, BytesMut};
+ use futures::future::BoxFuture;
+-use futures::{Stream, TryStreamExt};
+-use http::header::AUTHORIZATION;
+-use http::{HeaderValue, StatusCode};
++use futures::Stream;
++use http::header::{AUTHORIZATION, CONTENT_LENGTH};
++use http::{HeaderMap, HeaderValue, StatusCode};
+ use hyper::body::HttpBody;
+-use std::io::ErrorKind;
++use std::future::Future;
+ use std::sync::Arc;
+ use std::time::Duration;
+ 
+ use super::StmtResultRows;
+ 
+ pub type ByteStream = Box<dyn Stream<Item = std::io::Result<Bytes>> + Send + Sync + Unpin>;
++
++const HTTP_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
++
++fn validate_content_length(headers: &HeaderMap, limit: usize) -> Result<()> {
++    let Some(length) = headers.get(CONTENT_LENGTH) else {
++        return Ok(());
++    };
++    let length = length
++        .to_str()
++        .ok()
++        .and_then(|value| value.parse::<u64>().ok())
++        .ok_or_else(|| HranaError::Http("invalid response content length".to_owned()))?;
++    if length > limit as u64 {
++        return Err(HranaError::Http(
++            "response body exceeds limit".to_owned(),
++        ));
++    }
++    Ok(())
++}
++
++async fn collect_response_body(mut body: hyper::Body, limit: usize) -> Result<Bytes> {
++    let mut bytes = BytesMut::new();
++    while let Some(chunk) = body.data().await {
++        let chunk = chunk.map_err(HranaError::from)?;
++        let length = bytes
++            .len()
++            .checked_add(chunk.len())
++            .ok_or_else(|| HranaError::Http("response body exceeds limit".to_owned()))?;
++        if length > limit {
++            return Err(HranaError::Http("response body exceeds limit".to_owned()));
++        }
++        bytes.extend_from_slice(&chunk);
++    }
++    Ok(bytes.freeze())
++}
++
++async fn read_response(response: hyper::Response<hyper::Body>, limit: usize) -> Result<Bytes> {
++    let status = response.status();
++    if status != StatusCode::OK {
++        return Err(HranaError::Api(format!("status={status}")));
++    }
++    validate_content_length(response.headers(), limit)?;
++    collect_response_body(response.into_body(), limit).await
++}
++
++async fn with_request_deadline<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
++    tokio::time::timeout(HTTP_REQUEST_DEADLINE, future)
++        .await
++        .map_err(|_| HranaError::Http("request deadline exceeded".to_owned()))?
++}
+ 
+ #[derive(Clone, Debug)]
+ pub struct HttpSender {
+@@ -79,31 +129,12 @@
+             .body(hyper::Body::from(body))
+             .map_err(|err| HranaError::Http(format!("{:?}", err)))?;
+ 
+-        let resp = self.inner.request(req).await.map_err(HranaError::from)?;
+-
+-        let status = resp.status();
+-        if status != StatusCode::OK {
+-            let body = hyper::body::to_bytes(resp.into_body())
+-                .await
+-                .map_err(HranaError::from)?;
+-            let body = String::from_utf8(body.into()).unwrap();
+-            return Err(HranaError::Api(format!("status={}, body={}", status, body)));
+-        }
+-
+-        let body: super::HttpBody<ByteStream> = if resp.is_end_stream() {
+-            let body = hyper::body::to_bytes(resp.into_body())
+-                .await
+-                .map_err(HranaError::from)?;
+-            super::HttpBody::from(body)
+-        } else {
+-            let stream = resp
+-                .into_body()
+-                .into_stream()
+-                .map_err(|e| std::io::Error::new(ErrorKind::Other, e));
+-            super::HttpBody::Stream(Box::new(stream))
+-        };
+-
+-        Ok(body)
++        with_request_deadline(async move {
++            let response = self.inner.request(req).await.map_err(HranaError::from)?;
++            let body = read_response(response, MAX_RESPONSE_BYTES).await?;
++            Ok(super::HttpBody::from(body))
++        })
++        .await
+     }
+ }
+ 
+@@ -120,7 +151,7 @@
+         if let Ok(rt) = tokio::runtime::Handle::try_current() {
+             rt.spawn(self.send(url, auth, body));
+         } else {
+-            tracing::warn!("tried to send request to `{url}` while no runtime was available");
++            tracing::warn!("tried to send a request while no runtime was available");
+         }
+     }
+ }
+@@ -444,3 +475,116 @@
+         self.reset().await;
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use futures::stream;
++    use std::io;
++
++    fn response(
++        status: StatusCode,
++        content_length: Option<&str>,
++        body: hyper::Body,
++    ) -> std::result::Result<hyper::Response<hyper::Body>, http::Error> {
++        let mut builder = hyper::Response::builder().status(status);
++        if let Some(content_length) = content_length {
++            builder = builder.header(CONTENT_LENGTH, content_length);
++        }
++        builder.body(body)
++    }
++
++    #[tokio::test]
++    async fn response_limit_accepts_exact_body_and_rejects_first_extra_byte(
++    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
++        let exact = response(StatusCode::OK, Some("4"), hyper::Body::from("1234"));
++        assert_eq!(read_response(exact?, 4).await?, "1234");
++
++        let oversized = response(StatusCode::OK, Some("5"), hyper::Body::from("12345"));
++        assert!(matches!(
++            read_response(oversized?, 4).await,
++            Err(HranaError::Http(message)) if message == "response body exceeds limit"
++        ));
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn chunked_response_limit_is_cumulative(
++    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
++        let exact_chunks = stream::iter([
++            Ok::<_, io::Error>(Bytes::from_static(b"12")),
++            Ok(Bytes::from_static(b"34")),
++        ]);
++        let exact = response(
++            StatusCode::OK,
++            None,
++            hyper::Body::wrap_stream(exact_chunks),
++        )?;
++        assert_eq!(read_response(exact, 4).await?, "1234");
++
++        let oversized_chunks = stream::iter([
++            Ok::<_, io::Error>(Bytes::from_static(b"12")),
++            Ok(Bytes::from_static(b"345")),
++        ]);
++        let oversized = response(
++            StatusCode::OK,
++            None,
++            hyper::Body::wrap_stream(oversized_chunks),
++        )?;
++        assert!(matches!(
++            read_response(oversized, 4).await,
++            Err(HranaError::Http(message)) if message == "response body exceeds limit"
++        ));
++        Ok(())
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn malformed_content_length_and_non_ok_body_are_private(
++    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
++        let malformed = response(StatusCode::OK, Some("not-a-size"), hyper::Body::empty())?;
++        assert!(matches!(
++            read_response(malformed, 4).await,
++            Err(HranaError::Http(message)) if message == "invalid response content length"
++        ));
++
++        let (_sender, pending_body) = hyper::Body::channel();
++        let non_ok = response(StatusCode::BAD_GATEWAY, None, pending_body)?;
++        let non_ok = tokio::time::timeout(
++            Duration::from_secs(1),
++            read_response(non_ok, 4),
++        )
++        .await?;
++        assert!(matches!(
++            non_ok,
++            Err(HranaError::Api(message)) if message == "status=502 Bad Gateway"
++        ));
++
++        let invalid_utf8 = response(
++            StatusCode::SERVICE_UNAVAILABLE,
++            None,
++            hyper::Body::from(vec![0xff, b's', b'e', b'c', b'r', b'e', b't']),
++        )?;
++        let error = read_response(invalid_utf8, 4).await;
++        assert!(matches!(
++            &error,
++            Err(HranaError::Api(message)) if message == "status=503 Service Unavailable"
++        ));
++        assert!(!format!("{error:?}").contains("secret"));
++        Ok(())
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn one_deadline_bounds_request_and_complete_body(
++    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
++        let (_sender, pending_body) = hyper::Body::channel();
++        let success = response(StatusCode::OK, None, pending_body)?;
++        let operation = tokio::spawn(with_request_deadline(read_response(success, 4)));
++        tokio::task::yield_now().await;
++        tokio::time::advance(HTTP_REQUEST_DEADLINE).await;
++        assert!(matches!(
++            operation.await?,
++            Err(HranaError::Http(message)) if message == "request deadline exceeded"
++        ));
++        Ok(())
++    }
++}
+--- a/src/hrana/mod.rs
++++ b/src/hrana/mod.rs
+@@ -45,6 +45,8 @@
+     /// Schedule sending a HTTP post request without waiting for the completion.
+     fn oneshot(self, url: Arc<str>, auth: Arc<str>, body: String);
+ }
++
++pub(super) const MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
+ 
+ pub enum HttpBody<S> {
+     Body(Option<Bytes>),
+@@ -326,7 +328,11 @@
+ 
+ impl RowInner for Row {
+     fn column_value(&self, idx: i32) -> crate::Result<crate::Value> {
+-        let v = self.inner.get(idx as usize).cloned().unwrap();
++        let v = self
++            .inner
++            .get(idx as usize)
++            .cloned()
++            .ok_or(crate::Error::ColumnNotFound(idx))?;
+         Ok(into_value2(v))
+     }
+ 
+@@ -468,3 +474,21 @@
+             .and_then(|v| v.parse().map_err(|_| crate::Error::InvalidColumnType))
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn short_row_returns_column_not_found() {
++        let columns = Arc::<[Col]>::from([Col {
++            name: Some("value".to_owned()),
++            decltype: None,
++        }]);
++        let row = Row::new(columns, Vec::new());
++        assert!(matches!(
++            row.column_value(0),
++            Err(crate::Error::ColumnNotFound(0))
++        ));
++    }
++}
+--- a/src/hrana/stream.rs
++++ b/src/hrana/stream.rs
+@@ -79,7 +79,7 @@
+     pub(super) async fn finalize(&mut self, req: StreamRequest) -> Result<bool> {
+         let mut client = self.inner.stream.lock().await;
+         if client.baton.borrow().is_none() {
+-            tracing::trace!("baton not found - skipping finalize for {:?}", req);
++            tracing::trace!("client stream is already closed; skipping finalize");
+             return Ok(false);
+         }
+         let (resp, is_autocommit) = client.finalize(req).await?;
+@@ -339,7 +339,7 @@
+                 self.reset();
+             } // stream has been closed by the server
+             Some(baton) => {
+-                tracing::trace!("client stream has been assigned with baton: `{}`", baton);
++                tracing::trace!("client stream has been assigned a baton");
+                 *self.baton.borrow_mut() = Some(baton)
+             }
+         }
+@@ -350,12 +350,7 @@
+         &mut self,
+         requests: [StreamRequest; N],
+     ) -> Result<[StreamResponse; N]> {
+-        tracing::trace!(
+-            "client stream sending {} requests with baton `{}`: {:?}",
+-            N,
+-            self.baton.borrow().as_deref().unwrap_or_default(),
+-            requests
+-        );
++        tracing::trace!("client stream sending {} requests", N);
+         let msg = PipelineReqBody {
+             baton: self.baton.borrow().clone(),
+             requests: Vec::from(requests),
+@@ -366,7 +361,7 @@
+             .http_send(self.pipeline_url.clone(), self.auth_token.clone(), body)
+             .await?;
+         let body = stream_to_bytes(body).await?;
+-        let mut response: PipelineRespBody = serde_json::from_slice(&body)?;
++        let mut response = decode_pipeline_response(&body)?;
+         if let Some(base_url) = response.base_url.take() {
+             let (pipeline_url, cursor_url) = parse_hrana_urls(&base_url);
+             self.pipeline_url = pipeline_url;
+@@ -378,7 +373,7 @@
+                 self.reset();
+             } // stream has been closed by the server
+             Some(baton) => {
+-                tracing::trace!("client stream has been assigned with baton: `{}`", baton);
++                tracing::trace!("client stream has been assigned a baton");
+                 *self.baton.borrow_mut() = Some(baton)
+             }
+         }
+@@ -429,8 +424,8 @@
+     }
+ 
+     fn reset(&self) {
+-        if let Some(baton) = self.baton.borrow_mut().take() {
+-            tracing::trace!("closing client stream (baton: `{}`)", baton);
++        if self.baton.borrow_mut().take().is_some() {
++            tracing::trace!("closing client stream");
+         }
+         *self.sql_id_generator.borrow_mut() = 0;
+     }
+@@ -442,6 +437,10 @@
+     }
+ }
+ 
++fn decode_pipeline_response(body: &[u8]) -> Result<PipelineRespBody> {
++    serde_json::from_slice(body).map_err(HranaError::Json)
++}
++
+ #[cfg(feature = "remote")]
+ impl<T> Drop for RawStream<T>
+ where
+@@ -451,15 +450,18 @@
+         let baton = self.baton.get_mut().take();
+         if let Some(baton) = baton {
+             // only send a close request if stream was ever used to send the data
+-            tracing::trace!("closing client stream (baton: `{}`)", baton);
+-            let req = serde_json::to_string(&PipelineReqBody {
++            tracing::trace!("closing client stream");
++            let request = serde_json::to_string(&PipelineReqBody {
+                 baton: Some(baton),
+                 requests: vec![StreamRequest::Close(CloseStreamReq {})],
+-            })
+-            .unwrap();
+-            self.client
+-                .clone()
+-                .oneshot(self.pipeline_url.clone(), self.auth_token.clone(), req);
++            });
++            if let Ok(request) = request {
++                self.client.clone().oneshot(
++                    self.pipeline_url.clone(),
++                    self.auth_token.clone(),
++                    request,
++                );
++            }
+             self.reset();
+         }
+     }
+@@ -482,11 +484,26 @@
+ where
+     S: Stream<Item = std::io::Result<Bytes>> + Unpin,
+ {
++    stream_to_bytes_with_limit(&mut stream, super::MAX_RESPONSE_BYTES).await
++}
++
++async fn stream_to_bytes_with_limit<S>(mut stream: S, limit: usize) -> Result<Bytes>
++where
++    S: Stream<Item = std::io::Result<Bytes>> + Unpin,
++{
+     use futures::StreamExt;
+ 
+     let mut buf = BytesMut::new();
+     while let Some(chunk) = stream.next().await {
+-        buf.extend_from_slice(&chunk.map_err(|e| HranaError::Http(e.to_string()))?);
++        let chunk = chunk.map_err(|e| HranaError::Http(e.to_string()))?;
++        let length = buf
++            .len()
++            .checked_add(chunk.len())
++            .ok_or_else(|| HranaError::Http("response body exceeds limit".to_owned()))?;
++        if length > limit {
++            return Err(HranaError::Http("response body exceeds limit".to_owned()));
++        }
++        buf.extend_from_slice(&chunk);
+     }
+     Ok(buf.freeze())
+ }
+@@ -557,3 +574,38 @@
+     /// the scope of current transaction/prepared statement, which sent a store SQL request.
+     SqlId(SqlId),
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use futures::stream;
++    use std::io;
++
++    #[test]
++    fn invalid_utf8_is_a_typed_json_error() {
++        assert!(matches!(
++            decode_pipeline_response(&[0xff]),
++            Err(HranaError::Json(_))
++        ));
++    }
++
++    #[tokio::test]
++    async fn streamed_http_body_uses_the_same_cumulative_limit(
++    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
++        let exact = stream::iter([
++            Ok::<_, io::Error>(Bytes::from_static(b"12")),
++            Ok(Bytes::from_static(b"34")),
++        ]);
++        assert_eq!(stream_to_bytes_with_limit(exact, 4).await?, "1234");
++
++        let oversized = stream::iter([
++            Ok::<_, io::Error>(Bytes::from_static(b"12")),
++            Ok(Bytes::from_static(b"345")),
++        ]);
++        assert!(matches!(
++            stream_to_bytes_with_limit(oversized, 4).await,
++            Err(HranaError::Http(message)) if message == "response body exceeds limit"
++        ));
++        Ok(())
++    }
++}

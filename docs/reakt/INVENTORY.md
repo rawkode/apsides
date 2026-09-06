@@ -32,8 +32,16 @@ query, fragment or non-root path, and fit within 2,048 bytes. Tokens must contai
 Both backends also filter every connection URI before the TLS connector: only
 HTTPS reaches the dialer, including requests directed by a server-returned
 libSQL `base_url`. Native certificate validation remains enabled; failure to load
-any usable native roots returns a closed error. This guard does not establish
-bounded response handling or remote recovery behavior.
+any usable native roots returns a closed error.
+
+The configured remote-primary client limits each encoded HTTP response to
+128 MiB and each request plus complete body transfer to 30 seconds. Non-success
+response bodies are discarded, and malformed short rows return errors. These
+limits cover both pipeline and cursor responses; they do not bound process
+memory, synchronous decoding or the total duration of a multi-request transaction.
+A timeout can follow a server-side commit, so callers must retain the documented
+exact-record retry and inventory reload behavior. libSQL sync and replication
+features are not enabled.
 
 A controlled real-client test completes an authenticated TLS transaction start,
 then rejects the server's HTTP continuation before it reaches a plaintext

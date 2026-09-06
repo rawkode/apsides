@@ -51,6 +51,7 @@ def profile(package):
 
 sys.path.insert(0, str(ROOT / "scripts/reakt"))
 from package_oci import file_manifest, pinned_image, read_regular, sha256  # noqa: E402
+import patched_libsql
 
 
 TARGET_SELECTOR = r'''#!/usr/bin/env python3
@@ -203,6 +204,13 @@ def prepare_context(repository, context, builder, package="inventory"):
     (context / ".dockerignore").write_text("context.json\n")
 
     lock = read_regular(context / "Cargo.lock")
+    dependency_patch = patched_libsql.copy_generated(
+        repository / ".generated/libsql-0.9.30",
+        context / ".generated/libsql-0.9.30",
+    )
+    patch_config = patched_libsql.cargo_patch_config(".generated/libsql-0.9.30")
+    (context / ".cargo").mkdir()
+    (context / ".cargo/config.toml").write_text(patch_config)
     vendor_config = run(
         [
             "cargo",
@@ -219,11 +227,10 @@ def prepare_context(repository, context, builder, package="inventory"):
     parsed = tomllib.loads(vendor_config)
     if parsed.get("source", {}).get("vendored-sources", {}).get("directory") != "vendor":
         raise ValueError("Cargo returned an unexpected vendor configuration")
-    (context / ".cargo").mkdir()
-    (context / ".cargo/config.toml").write_text(vendor_config)
+    (context / ".cargo/config.toml").write_text(vendor_config + "\n" + patch_config)
     if read_regular(context / "Cargo.lock") != lock:
         raise ValueError("offline dependency preparation changed Cargo.lock")
-    run(
+    cargo_metadata = run(
         [
             "cargo",
             "metadata",
@@ -236,12 +243,17 @@ def prepare_context(repository, context, builder, package="inventory"):
         ],
         cwd=context,
     )
+    patched_libsql.validate_cargo_metadata(
+        cargo_metadata, context / ".generated/libsql-0.9.30/Cargo.toml",
+        require_resolved=True,
+    )
     metadata = {
         "schemaVersion": selected["context_schema"],
         "builder": builder,
         "platform": PLATFORM,
         "target": {"package": package, "test": TARGET_NAME},
         "cargoLockDigest": sha256(lock),
+        "dependencyPatch": dependency_patch,
         "files": file_manifest(context),
         "qualification": "test-only; no production or release authority",
     }
@@ -259,6 +271,8 @@ def verify_context(context, expected, package="inventory"):
         raise ValueError("prepared storage build context has an invalid claim")
     if file_manifest(context) != actual.get("files"):
         raise ValueError("prepared storage build context files changed")
+    if patched_libsql.verify_generated(context / ".generated/libsql-0.9.30") != actual.get("dependencyPatch"):
+        raise ValueError("prepared storage build context dependency patch changed")
     return encoded
 
 

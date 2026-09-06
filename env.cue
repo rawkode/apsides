@@ -5,11 +5,13 @@ import "github.com/cuenv/cuenv/schema"
 schema.#Project & {name: "apsides"}
 
 tasks: {
-	releaseTest: {command: "cargo", args: ["test", "--locked", "-p", "release", "--features", "test-support"]}
-	productionEvidenceLive: {command: "cargo", args: ["test", "--locked", "-p", "release", "--lib", "assembled_reproducibility_evidence", "--", "--ignored"]}
-	inputIsolationEvidenceLive: {command: "cargo", args: ["test", "--locked", "-p", "release", "--lib", "assembled_input_isolation_evidence", "--", "--ignored"]}
-	reactorEvidenceLive: {command: "cargo", args: ["test", "--locked", "-p", "release", "--lib", "reactor_evidence_live::assembled_reactor_evidence_matches_production_contract", "--", "--ignored", "--exact"]}
-	releaseCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "release", "--features", "test-support", "--all-targets", "--", "-D", "warnings"]}
+	patchedLibsql: {command: "python3", args: ["scripts/reakt/patched_libsql.py", "--fetch"]}
+	patchedLibsqlTest: {command: "python3", args: ["tests/reakt/test_patched_libsql.py"]}
+	releaseTest: {dependsOn: [patchedLibsql], command: "cargo", args: ["test", "--locked", "-p", "release", "--features", "test-support"]}
+	productionEvidenceLive: {dependsOn: [patchedLibsql], command: "cargo", args: ["test", "--locked", "-p", "release", "--lib", "assembled_reproducibility_evidence", "--", "--ignored"]}
+	inputIsolationEvidenceLive: {dependsOn: [patchedLibsql], command: "cargo", args: ["test", "--locked", "-p", "release", "--lib", "assembled_input_isolation_evidence", "--", "--ignored"]}
+	reactorEvidenceLive: {dependsOn: [patchedLibsql], command: "cargo", args: ["test", "--locked", "-p", "release", "--lib", "reactor_evidence_live::assembled_reactor_evidence_matches_production_contract", "--", "--ignored", "--exact"]}
+	releaseCheck: {dependsOn: [patchedLibsql], command: "cargo", args: ["clippy", "--locked", "-p", "release", "--features", "test-support", "--all-targets", "--", "-D", "warnings"]}
 	reproducibilityTest: {command: "python3", args: ["-m", "unittest", "tests/reakt/test_reproducibility.py"]}
 	inputIsolationTest: {command: "python3", args: ["tests/reakt/test_input_isolation.py"]}
 	inputIsolationProbeTest: {command: "node", args: ["--test", "tests/reakt/isolation_probe.test.mts"]}
@@ -18,31 +20,31 @@ tasks: {
 	lifecycleCleanupTest: {command: "python3", args: ["tests/reakt/test_lifecycle_cleanup.py"]}
 	lifecyclePermissionsTest: {command: "python3", args: ["tests/reakt/test_lifecycle_permissions.py"]}
 	lifecycleInterruptionTest: {command: "python3", args: ["tests/reakt/test_lifecycle_interruption.py"]}
-	storageProbeTest: {command: "cargo", args: ["test", "--locked", "-p", "inventory", "--test", "pvc_restart"]}
+	storageProbeTest: {dependsOn: [patchedLibsql], command: "cargo", args: ["test", "--locked", "-p", "inventory", "--test", "pvc_restart"]}
 	storageBuildTest: {command: "python3", args: ["tests/reakt/storage/test_build.py"]}
 	storageRestartTest: {command: "python3", args: ["tests/reakt/storage/test_restart.py"]}
 	coordinationRestartTest: {command: "python3", args: ["tests/reakt/storage/test_coordination.py"]}
-	coordinationProbeTest: {command: "cargo", args: ["test", "--locked", "-p", "coordination", "--test", "pvc_restart"]}
+	coordinationProbeTest: {dependsOn: [patchedLibsql], command: "cargo", args: ["test", "--locked", "-p", "coordination", "--test", "pvc_restart"]}
 	storageBackupTest: {command: "python3", args: ["tests/reakt/storage/test_backup.py"]}
 	storageBackup: {command: "python3", args: ["tests/reakt/run_storage_backup.py"]}
 	coordinationRestart: {command: "python3", args: ["tests/reakt/run_coordination_restart.py"]}
-	storagePrepare: {command: "python3", args: ["tests/reakt/storage/build.py"]}
+	storagePrepare: {dependsOn: [patchedLibsql], command: "python3", args: ["tests/reakt/storage/build.py"]}
 	storageRestart: {command: "python3", args: ["tests/reakt/run_storage_restart.py"]}
-	coordinationTest: {command: "cargo", args: ["test", "--locked", "-p", "coordination"]}
+	coordinationTest: {dependsOn: [patchedLibsql], command: "cargo", args: ["test", "--locked", "-p", "coordination"]}
 	coordinationCheck: [
-		{command: "cargo", args: ["clippy", "--locked", "-p", "coordination", "--all-targets", "--", "-D", "warnings"]},
-		{command: "cargo", args: ["check", "--locked", "-p", "coordination", "--no-default-features"]},
+		{dependsOn: [patchedLibsql], command: "cargo", args: ["clippy", "--locked", "-p", "coordination", "--all-targets", "--", "-D", "warnings"]},
+		{dependsOn: [patchedLibsql], command: "cargo", args: ["check", "--locked", "-p", "coordination", "--no-default-features"]},
 	]
-	registryRuntimeCheck: {command: "cargo", args: ["check", "--locked", "-p", "platform", "--no-default-features"]}
-	runtimeTest: {command: "cargo", args: ["test", "--locked", "-p", "runtime"]}
-	runtimeCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "runtime", "--all-targets", "--", "-D", "warnings"]}
-	previewTest: {command: "cargo", args: ["test", "--locked", "-p", "platform", "--features", "test-support", "preview_"]}
-	previewIssuedLive: {command: "cargo", args: ["test", "--locked", "-p", "platform", "--features", "test-support", "--lib", "preview_issued_live", "--", "--ignored"]}
+	registryRuntimeCheck: {dependsOn: [patchedLibsql], command: "cargo", args: ["check", "--locked", "-p", "platform", "--no-default-features"]}
+	runtimeTest: {dependsOn: [patchedLibsql], command: "cargo", args: ["test", "--locked", "-p", "runtime"]}
+	runtimeCheck: {dependsOn: [patchedLibsql], command: "cargo", args: ["clippy", "--locked", "-p", "runtime", "--all-targets", "--", "-D", "warnings"]}
+	previewTest: {dependsOn: [patchedLibsql], command: "cargo", args: ["test", "--locked", "-p", "platform", "--features", "test-support", "preview_"]}
+	previewIssuedLive: {dependsOn: [patchedLibsql], command: "cargo", args: ["test", "--locked", "-p", "platform", "--features", "test-support", "--lib", "preview_issued_live", "--", "--ignored"]}
 	previewQualification: {command: "python3", args: ["tests/reakt/run_preview_qualification.py"]}
 	previewQualificationTest: {command: "python3", args: ["-m", "unittest", "tests/reakt/test_preview_qualification.py"]}
-	previewReadOnlyLive: {command: "cargo", args: ["test", "--locked", "-p", "platform", "--features", "test-support", "--test", "preview_readonly", "--", "--ignored"]}
-	registryTest: {command: "cargo", args: ["test", "--locked", "-p", "deploy", "-p", "platform", "-p", "cli", "--features", "platform/test-support"]}
-	registryCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "deploy", "-p", "platform", "-p", "cli", "--features", "platform/test-support", "--all-targets", "--", "-D", "warnings"]}
+	previewReadOnlyLive: {dependsOn: [patchedLibsql], command: "cargo", args: ["test", "--locked", "-p", "platform", "--features", "test-support", "--test", "preview_readonly", "--", "--ignored"]}
+	registryTest: {dependsOn: [patchedLibsql], command: "cargo", args: ["test", "--locked", "-p", "deploy", "-p", "platform", "-p", "cli", "--features", "platform/test-support"]}
+	registryCheck: {dependsOn: [patchedLibsql], command: "cargo", args: ["clippy", "--locked", "-p", "deploy", "-p", "platform", "-p", "cli", "--features", "platform/test-support", "--all-targets", "--", "-D", "warnings"]}
 	authorCompilerTest: {
 		dependsOn: [install]
 		command: "pnpm"
@@ -74,5 +76,5 @@ tasks: {
 		args: ["--prefix", "docs", "run", "dev"]
 	}
 	install: {command: "pnpm", args: ["install", "--frozen-lockfile"], env: {CI: "1"}}
-	build: {command: "cargo", args: ["build", "--locked", "-p", "cli"]}
+	build: {dependsOn: [patchedLibsql], command: "cargo", args: ["build", "--locked", "-p", "cli"]}
 }
