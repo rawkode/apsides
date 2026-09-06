@@ -16,6 +16,12 @@ emits only its measured check. Six mocked producer tests and nine packaging test
 pass; these are not evidence that two real production builds match. See
 `PRODUCTION-EVIDENCE.md` for the contracts and remaining acceptance boundary.
 
+The first real no-cache qualification attempt failed before image assembly because
+the packaging allowlist omitted the runtime's `coordination` dependency. That
+omission is corrected and all ten packaging tests pass, including traversal of
+the current workspace dependency closure. The failed attempt produced no
+production evidence receipt (`work/production-reproducibility-4ecf13d/`).
+
 Issued-credential SSA qualification now passes against a fresh disposable kind
 cluster pinned to Kubernetes `v1.34.3`. `cuenv task previewQualification` uses the
 client minted by `IssuedDeployment` for version discovery, named LIST and

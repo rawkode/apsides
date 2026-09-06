@@ -46,6 +46,11 @@ class PackagingTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def test_current_runtime_dependency_closure_includes_coordination(self):
+        closure = packaging.local_crates(ROOT)
+        self.assertIn("coordination", closure)
+        self.assertEqual(closure, sorted(set(closure)))
+
     def fake_command(self, argv, cwd=None, timeout=180):
         self.calls.append(argv)
         if argv[:3] == ["docker", "image", "inspect"]:

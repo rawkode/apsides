@@ -102,7 +102,7 @@ def local_crates(repository):
         directory = pending.pop().resolve()
         if directory in seen:
             continue
-        if directory.parent != repository / "crates" or directory.name not in {"compiler-core", "runtime", "deploy", "platform", "inventory", "release", "cli"}:
+        if directory.parent != repository / "crates" or directory.name not in {"compiler-core", "runtime", "deploy", "platform", "inventory", "release", "cli", "coordination"}:
             raise ValueError("runtime path dependency escapes the trusted Reakt crate closure")
         seen.add(directory)
         manifest = tomllib.loads(read_regular(directory / "Cargo.toml").decode())
