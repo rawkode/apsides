@@ -240,6 +240,7 @@ async fn reserve_new_transition(
     )
     .await?;
     crate::inventory_connection::require_request(inventory, &request).await?;
+    crate::review::preflight(&deploy::plan_transition(&request)?)?;
     platform
         .reserve_transition(&request, executor, verified, inventory)
         .await?;

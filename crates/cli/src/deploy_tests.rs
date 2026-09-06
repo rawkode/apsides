@@ -1,3 +1,8 @@
+#[path = "review_adoption_tests.rs"]
+mod review_adoption;
+#[path = "review_contract_tests.rs"]
+mod review_contract;
+
 use super::*;
 use deploy::{GenerationHistory, begin, plan_transition};
 use platform::{NamespaceRegistry, RuntimeBinding, StoredTransition};
@@ -220,7 +225,7 @@ fn review_requires_exact_replay_and_predecessor_checkpoint() -> Result<()> {
     original.record = begin(&original_plan, "job-1")?;
     let initial =
         crate::review::transition_review_fixture(&original, &original_plan, TRANSITION_1)?;
-    assert!(initial["reactions"]["before"].is_null());
+    assert_eq!(initial["reactions"]["before"], json!([]));
 
     let mut request = original_plan.request.clone();
     request.transition_id = TRANSITION_2.into();
@@ -246,10 +251,20 @@ fn review_requires_exact_replay_and_predecessor_checkpoint() -> Result<()> {
     let predecessor = plan.request.predecessor()?.ok_or("predecessor missing")?;
     upgrade.previous_writer_checkpoint = Some(review_checkpoint(predecessor)?);
     let review = crate::review::transition_review_fixture(&upgrade, &plan, TRANSITION_2)?;
-    assert_eq!(review["schemaVersion"], "reakt.dev/deployment-review/v2");
+    assert_eq!(review["schemaVersion"], "reakt.dev/deployment-review/v3");
     assert_eq!(review["detailAvailability"], "metadata-only");
-    assert_eq!(review["permissions"]["runtime"]["status"], "unavailable");
-    assert!(review["permissions"]["runtime"].get("added").is_none());
+    assert_eq!(
+        review["permissions"]["runtime"]["after"],
+        serde_json::to_value(&plan.request.next.compiled.capabilities)?
+    );
+    assert_eq!(
+        review["permissions"]["runtime"]["before"]["status"],
+        "unavailable"
+    );
+    assert_eq!(
+        review["permissions"]["runtime"]["added"]["status"],
+        "unavailable"
+    );
     let checkpoint = upgrade
         .previous_writer_checkpoint
         .as_mut()

@@ -1,6 +1,16 @@
 # Deployment review proposal
 
-Status: **proposed and unimplemented**. This document proposes how to satisfy the deployment-report requirements in [specification v0.2, section 25](SPEC-v0.2.md). It does not claim that the current review report satisfies those requirements. Independent architecture review and the acceptance tests below are implementation gates.
+Status: **partially implemented**. Deployment review v3 implements the initial declaration projection described below. Durable historical comparison and live apply impact remain proposed. The current report does not satisfy all deployment-report requirements in [specification v0.2, section 25](SPEC-v0.2.md). Independent architecture review and the acceptance tests below remain implementation gates for the unfinished scope.
+
+## Implemented initial declaration report
+
+The `reakt.dev/deployment-review/v3` report uses an explicit empty declaration baseline for initial installation. It projects compiler-derived resource field paths, reactions, compact dependency rows, source locations, complete input authority and sensitivity, separate runtime/cleanup/deployment permission requirements, and allowlisted compatibility requirements. Arrays retain the compiler's atomic field ownership paths. Desired values and arbitrary compiler review documents are excluded.
+
+Ownership classifications describe planned actions: an approved adoption is linked to its protected intent and observed UID/resourceVersion; another added declaration is `create-if-absent`. Neither proves a live operation completed. The report explicitly labels live SSA impact unavailable. Upgrades retain authenticated inventory comparisons but label unavailable historical graphs, field structures, permissions and compatibility as unavailable, never empty.
+
+The CLI validates the shared typed report projection before reserving a fresh transition. A preallocation guard rejects more than 100,000 counted projection source elements (catalog rows, paths, references, capability names and policy lists). A separate exact byte limit rejects more than 8 MiB of serialized report content before producing output. Repeated change arrays and derived permission, compatibility and source-location rows are covered by the byte limit; the source-element guard is not an output-entry limit. This is a bounded partial implementation, not a claim that every compiler-accepted input fits those limits. Oversized reports fail as incomplete; they are never truncated. Upgrade identity preparation may precede report preflight, but reservation does not.
+
+This slice adds no durable review snapshots, database fields, preview permissions or live API dry-run calls. Deployment API compatibility covers the issued deployer's requirements; invoking-identity bootstrap and token minting remain outside that catalog, as stated in the report. The storage and preview contracts below describe remaining work.
 
 The scope is deployment reporting for the initial supported resource and reaction vocabulary. It does not change lifecycle authority, grant permissions, restore historical compiled plans, or move other coordination state into a database. Controller diagnostics and logging obligations in section 25 remain separate requirements.
 

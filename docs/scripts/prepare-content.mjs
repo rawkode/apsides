@@ -29,6 +29,7 @@ const references = [
   ["reakt/OCI-PACKAGING.md", "reakt/oci-packaging.md", "Native controller OCI packaging"],
   ["reakt/PERFORMANCE.md", "reakt/performance.md", "Performance comparison contract"],
   ["reakt/PLATFORM-CONTRACT.md", "reakt/platform-contract.md", "Platform contract"],
+  ["reakt/REVIEW-CONTRACT.md", "reakt/review-contract.md", "Deployment review contract"],
   ["reakt/SPEC-v0.2.md", "reakt/spec-v0-2.md", "Reakt specification 0.2"],
   ["reakt/STATE-CAPACITY.md", "reakt/state-capacity.md", "State capacity admission"],
   ["reakt/STATE-MIGRATION.md", "reakt/state-migration.md", "State migration contract"],
@@ -39,6 +40,10 @@ const references = [
 function withFrontmatter(source, title) {
   const withoutHeading = source
     .replace(/^# .+\n+/, "")
+    .replace(
+      /\]\(REVIEW-CONTRACT\.md(#[^)]+)?\)/g,
+      (_, fragment = "") => `](../review-contract/${fragment})`,
+    )
     .replace(
       /\]\(STATE-CAPACITY\.md(#[^)]+)?\)/g,
       (_, fragment = "") => `](../state-capacity/${fragment})`,

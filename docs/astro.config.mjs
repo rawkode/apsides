@@ -51,6 +51,7 @@ export default defineConfig({
             { label: "Platform contract", slug: "reakt/platform-contract" },
             { label: "Deployment protocol", slug: "reakt/deployment-contract" },
             { label: "Deployment permissions", slug: "reakt/deployment-permissions" },
+            { label: "Deployment review", slug: "reakt/review-contract" },
             { label: "Artifact resolution", slug: "reakt/artifact-resolution" },
             { label: "OCI packaging", slug: "reakt/oci-packaging" },
             { label: "Resource inventory", slug: "reakt/inventory" },
