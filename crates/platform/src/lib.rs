@@ -84,6 +84,13 @@ pub use writer_checkpoint::WriterCheckpoint;
 mod test_support;
 #[cfg(feature = "test-support")]
 pub use test_support::{DisposableTestCluster, TestClusterTarget};
+#[cfg(feature = "test-support")]
+mod candidate_qualification;
+#[cfg(feature = "test-support")]
+pub use candidate_qualification::{
+    CANDIDATE_QUALIFICATION_MARKER_NAME, CANDIDATE_QUALIFICATION_SCHEMA,
+    CandidateQualificationMarker, CandidateQualificationTarget,
+};
 #[cfg(feature = "deployer")]
 mod activation;
 #[cfg(feature = "deployer")]

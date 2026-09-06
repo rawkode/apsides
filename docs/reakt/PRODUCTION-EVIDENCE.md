@@ -68,6 +68,41 @@ The summary reports missing required checks and cases and always records
 the assembled release through the normal trust policy. A successful merge alone
 cannot satisfy the production release gate.
 
+## Exact-candidate cluster qualification
+
+Production cluster checks must retain the candidate's signed namespace, domain,
+cluster binding and payload. Recompiling with disposable namespace names changes
+the subject and cannot qualify the original production candidate.
+
+The reservation-only qualification capability is compiled under platform's
+`test-support` feature. It checks the candidate against an immutable marker and
+pinned namespace and node identities, then uses the existing authenticated
+reservation path and protected policy. It does not grant staging or activation
+and does not construct a verified release. The ordinary deployment CLI does not
+enable this feature; existing disposable lifecycle guards remain in effect.
+
+The host runner must establish that its random kind cluster name was absent,
+successfully create that cluster with a dedicated kubeconfig, and verify its
+Docker container and pinned node image before creating the marker. A public run
+identifier provides uniqueness, not authorization. Kubernetes observations check
+the current target identities; the marker's node image digest remains a host
+runner attestation. Neither alone proves that the runner created the cluster.
+
+This capability is a prerequisite, not a completed production evidence producer.
+The ceiling check still requires a live denial with an actually required
+capability removed from protected policy, unchanged registry and immutable store
+state, and no writer or RBAC mutation. Restoring the full policy must allow the
+same candidate and allocation to reach `Planned`. No production receipt may be
+emitted before both the owned-cluster bootstrap and those measurements succeed.
+
+`cuenv task candidateQualificationTest` exercises target rejection with a mocked
+Kubernetes API. `cuenv task candidateQualificationArchivedTest` additionally calls
+the public reservation method using a signed production candidate selected by
+absolute `APS_QUALIFICATION_CANDIDATE` and `APS_QUALIFICATION_TRUST_POLICY` paths.
+It verifies the candidate signature before testing against mocked Kubernetes and
+metadata stores. This opt-in archived-candidate integration test establishes
+neither cluster ownership nor production deployment acceptance.
+
 ## Reproducibility runner
 
 `tests/reakt/run_reproducibility.py` runs two fresh CLI builds with

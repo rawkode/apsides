@@ -15,6 +15,8 @@ use std::{
 };
 use tower::service_fn;
 
+#[cfg(feature = "test-support")]
+mod candidate_qualification;
 #[cfg(feature = "deployer")]
 mod capacity_accounting;
 #[cfg(feature = "deployer")]
