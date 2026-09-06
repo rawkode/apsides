@@ -962,12 +962,23 @@ class LifecycleRunner:
     def delete_owned_cluster(self):
         if not self.created:
             return "not-owned"
-        result = self.command(["kind", "delete", "cluster", "--name", self.cluster], check=False)
-        if result.returncode:
-            raise RuntimeError("owned disposable cluster deletion failed")
-        if self.cluster in self.cluster_names():
-            raise RuntimeError("owned disposable cluster remains after deletion")
-        return "deleted"
+        evidence = {"stage": "delete", "deleteExitCode": None, "absenceConfirmed": False}
+        try:
+            result = self.command(["kind", "delete", "cluster", "--name", self.cluster], check=False)
+            evidence["deleteExitCode"] = result.returncode
+            if result.returncode:
+                raise RuntimeError("owned disposable cluster deletion failed")
+            evidence["stage"] = "verify-absence"
+            if self.cluster in self.cluster_names():
+                raise RuntimeError("owned disposable cluster remains after deletion")
+            evidence["absenceConfirmed"] = True
+            evidence["stage"] = "complete"
+            return "deleted"
+        except subprocess.TimeoutExpired:
+            evidence["timedOut"] = True
+            raise
+        finally:
+            (self.output / "cluster-cleanup.json").write_text(json.dumps(evidence, indent=2))
 
     def remove_credentials(self):
         removed = True

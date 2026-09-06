@@ -109,6 +109,8 @@ class LifecycleCleanupTests(unittest.TestCase):
             self.assertTrue(result["passed"])
             self.assertEqual(result["clusterDisposition"], "deleted")
             self.assertTrue(result["credentialsRemoved"])
+            cleanup = json.loads((runner.output / "cluster-cleanup.json").read_text())
+            self.assertEqual(cleanup, {"stage": "complete", "deleteExitCode": 0, "absenceConfirmed": True})
             self.assertEqual(commands[-2:], [
                 ["kind", "delete", "cluster", "--name", runner.cluster],
                 ["kind", "get", "clusters"],
@@ -143,12 +145,33 @@ class LifecycleCleanupTests(unittest.TestCase):
                 self.assertFalse(result["passed"])
                 self.assertEqual(result["clusterDisposition"], "cleanup-failed")
                 self.assertTrue(result["credentialsRemoved"])
+                cleanup = json.loads((runner.output / "cluster-cleanup.json").read_text())
+                self.assertEqual(cleanup["stage"], "delete" if failure == "delete" else "verify-absence")
+                self.assertFalse(cleanup["absenceConfirmed"])
                 self.assertTrue(any(item[:3] == ["kind", "delete", "cluster"] for item in commands))
                 self.assertTrue(all(not path.exists() for path in [
                     runner.issuer,
                     runner.admin,
                     runner.output / "old-generation.kubeconfig",
                 ]))
+
+    def test_delete_timeout_preserves_closed_diagnostic_and_removes_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = cleanup_runner(Path(directory))
+            runner.collect_diagnostics = lambda: True
+
+            def command(arguments, **_):
+                raise subprocess.TimeoutExpired(arguments, 180, output="private output")
+
+            runner.command = command
+            with self.assertRaisesRegex(RuntimeError, "cleanup did not establish"):
+                runner.finish(True)
+            cleanup = json.loads((runner.output / "cluster-cleanup.json").read_text())
+            self.assertEqual(cleanup, {"stage": "delete", "deleteExitCode": None,
+                                       "absenceConfirmed": False, "timedOut": True})
+            result = json.loads((runner.output / "result.json").read_text())
+            self.assertFalse(result["passed"])
+            self.assertTrue(result["credentialsRemoved"])
 
     def test_diagnostic_failure_does_not_suppress_owned_cluster_deletion(self):
         with tempfile.TemporaryDirectory() as directory:
