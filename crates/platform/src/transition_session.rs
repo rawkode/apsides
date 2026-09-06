@@ -5,7 +5,7 @@ use crate::{
 };
 use coordination::{ReviewMetadataV1, ReviewRef};
 use deploy::{
-    DeploymentRequest, GenerationPlan, PreviousGeneration, RegistrySnapshot, TransitionPlan,
+    DeploymentRequest, GenerationPlan, PredecessorGeneration, RegistrySnapshot, TransitionPlan,
 };
 use inventory::InventoryStore;
 use std::{ops::Deref, sync::Arc};
@@ -288,7 +288,7 @@ impl PlatformClient {
         )?;
         crate::completion_envelope::validate_selected(&registry.value, &selection.plan)?;
         match (
-            selection.plan.request.predecessor()?,
+            selection.plan.request.predecessor(),
             &stored.previous_writer_checkpoint,
         ) {
             (Some(previous), Some(checkpoint)) => checkpoint.validate(
@@ -423,7 +423,7 @@ impl PlatformClient {
 async fn read_predecessor(
     inventory: &dyn InventoryStore,
     previous: Option<&crate::FrozenPredecessor>,
-) -> Result<Option<PreviousGeneration>> {
+) -> Result<Option<Box<PredecessorGeneration>>> {
     Ok(match previous {
         None => None,
         Some(previous) => {
@@ -436,17 +436,15 @@ async fn read_predecessor(
             if inventory::snapshot_id(&previous.scope, &snapshot)? != previous.snapshot_id {
                 return Err(invalid("frozen predecessor inventory commitment mismatch"));
             }
-            Some(PreviousGeneration::Metadata(Box::new(
-                deploy::PredecessorGeneration {
-                    allocation: previous.allocation.clone(),
-                    scope: previous.scope.clone(),
-                    control_namespace: previous.control_namespace.clone(),
-                    inventory: snapshot,
-                    retirement_role_binding_namespaces: previous
-                        .retirement_role_binding_namespaces
-                        .clone(),
-                },
-            )))
+            Some(Box::new(deploy::PredecessorGeneration {
+                allocation: previous.allocation.clone(),
+                scope: previous.scope.clone(),
+                control_namespace: previous.control_namespace.clone(),
+                inventory: snapshot,
+                retirement_role_binding_namespaces: previous
+                    .retirement_role_binding_namespaces
+                    .clone(),
+            }))
         }
     })
 }

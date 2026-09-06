@@ -231,7 +231,7 @@ async fn reserve_test_transition(
     executor: &str,
 ) -> platform::Result<Versioned<NamespaceRegistry>> {
     let inventory = MemoryInventoryStore::default();
-    if let Some(previous) = request.predecessor()? {
+    if let Some(previous) = request.predecessor() {
         inventory.seed(&previous.scope, &previous.inventory)?;
     }
     Box::pin(platform.reserve_authenticated(request, executor, &inventory, None)).await
@@ -1574,13 +1574,11 @@ fn staged_upgrade_fixture() -> std::result::Result<LifecycleRegistry, Box<dyn st
     }
     let mut request = previous_plan.request.clone();
     request.transition_id = TRANSITION_B.into();
-    request.previous = Some(deploy::PreviousGeneration::Metadata(Box::new(
-        deploy::predecessor_metadata(
-            &previous_plan.request.next,
-            &previous_plan.generation_reservation,
-            &registry.claims,
-        )?,
-    )));
+    request.previous = Some(Box::new(deploy::predecessor_metadata(
+        &previous_plan.request.next,
+        &previous_plan.generation_reservation,
+        &registry.claims,
+    )?));
     request.next.generation_id = GENERATION_B.into();
     request.registry = RegistrySnapshot {
         registry_uid: REGISTRY_UID.into(),
@@ -1678,7 +1676,7 @@ async fn predecessor_metadata_requires_exact_protected_retirement_authority_befo
             .remove(TRANSITION_B)
             .ok_or("upgrade transition missing")?;
         registry.next_sequence = request.registry.next_sequence;
-        let Some(deploy::PreviousGeneration::Metadata(previous)) = request.previous.as_mut() else {
+        let Some(previous) = request.previous.as_mut() else {
             return Err("fixture must use predecessor metadata".into());
         };
         match alteration {
@@ -2510,7 +2508,7 @@ fn upgrade_ci_permissions_cover_retirement_and_actual_exec_method()
     let registry = staged_upgrade_fixture()?;
     let plan = registry.plan(TRANSITION_B)?;
     let report = deployment_permissions(plan)?;
-    let previous = plan.request.predecessor()?.ok_or("missing predecessor")?;
+    let previous = plan.request.predecessor().ok_or("missing predecessor")?;
     let account = previous.allocation.service_account_name.clone();
     for (resource, verb, name) in [
         ("serviceaccounts", "delete", account.clone()),
@@ -2692,10 +2690,10 @@ async fn captured_uid_publication_rejects_known_uid_change_without_overwrite()
 
 #[cfg(feature = "deployer")]
 #[tokio::test]
-async fn inventory_checkpoint_rejects_tampered_policy_and_legacy_authority_before_capture()
+async fn inventory_checkpoint_rejects_tampered_policy_and_missing_commitment_before_capture()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     use inventory::{InventoryStore, LibsqlInventory};
-    for corruption in ["policy", "legacy", "foreign-allocation"] {
+    for corruption in ["policy", "missing-commitment", "foreign-allocation"] {
         let directory = tempfile::tempdir()?;
         let store = LibsqlInventory::open_local(&directory.path().join("inventory.db")).await?;
         let mut registry = staged_upgrade_fixture()?;
@@ -2720,8 +2718,8 @@ async fn inventory_checkpoint_rejects_tampered_policy_and_legacy_authority_befor
                 .active_allocation
                 .as_mut()
                 .ok_or("allocation missing")?;
-            if corruption == "legacy" {
-                allocation.inventory_metadata_digest = None;
+            if corruption == "missing-commitment" {
+                allocation.inventory_metadata_digest.clear();
             } else {
                 allocation.generation_id = "foreign".into();
             }
@@ -2732,7 +2730,7 @@ async fn inventory_checkpoint_rejects_tampered_policy_and_legacy_authority_befor
             let allocation = state["histories"]["example"]["activeAllocation"]
                 .as_object_mut()
                 .ok_or("active allocation state missing")?;
-            if corruption == "legacy" {
+            if corruption == "missing-commitment" {
                 allocation.remove("inventoryMetadataDigest");
             } else {
                 allocation.insert("generationId".into(), json!("foreign"));
@@ -2753,7 +2751,16 @@ async fn inventory_checkpoint_rejects_tampered_policy_and_legacy_authority_befor
                 .is_err(),
             "{corruption}"
         );
-        assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 2);
+        {
+            let calls = calls.lock().map_err(|_| "request lock poisoned")?;
+            let expected_reads = if corruption == "missing-commitment" {
+                1
+            } else {
+                2
+            };
+            assert_eq!(calls.len(), expected_reads, "{corruption}");
+            assert!(calls.iter().all(|call| call.0 == "GET"));
+        }
         let (client, calls) = wire(vec![control]);
         assert!(
             platform_client(client, "control", "workload", "cluster-a")?
@@ -2762,7 +2769,16 @@ async fn inventory_checkpoint_rejects_tampered_policy_and_legacy_authority_befor
                 .is_err(),
             "{corruption}"
         );
-        assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 2);
+        {
+            let calls = calls.lock().map_err(|_| "request lock poisoned")?;
+            let expected_reads = if corruption == "missing-commitment" {
+                1
+            } else {
+                2
+            };
+            assert_eq!(calls.len(), expected_reads, "{corruption}");
+            assert!(calls.iter().all(|call| call.0 == "GET"));
+        }
         assert_eq!(store.load(&scope).await?, Some(head));
     }
     Ok(())

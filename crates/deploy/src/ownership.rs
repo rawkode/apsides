@@ -283,7 +283,7 @@ fn runtime_fields(target: &GenerationPlan, resource: &Resource) -> Vec<String> {
 pub(crate) fn validate_intents(request: &DeploymentRequest) -> Result<()> {
     let mut names = BTreeSet::new();
     let mut identities = BTreeSet::new();
-    let previous = request.predecessor()?;
+    let previous = request.predecessor();
     if request.ownership_intents.len() > request.next.compiled.ir.resources.len() {
         return Err(Error::Plan("too many ownership intents".into()));
     }

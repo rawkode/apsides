@@ -1,15 +1,10 @@
 {
-  "name": "@oxideloop/workspace",
+  "name": "@apsides/workspace",
   "version": "0.0.0",
   "private": true,
   "packageManager": "pnpm@11.22.0",
   "scripts": {
     "typecheck": "pnpm -r --if-present typecheck",
-    "test": "pnpm -r --if-present test",
-    "fixtures:typecheck": "pnpm --filter @oxideloop/fixtures typecheck",
-    "fixtures:transform": "pnpm --filter @oxideloop/fixtures transform",
-    "fixtures:bundle": "pnpm --filter @oxideloop/fixtures bundle",
-    "fixtures:matrix": "pnpm --filter @oxideloop/fixtures test",
-    "bundle:e2e": "pnpm --filter @oxideloop/bundle-builder bundle:e2e"
+    "test": "pnpm -r --if-present test"
   }
 }

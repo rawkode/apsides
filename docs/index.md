@@ -1,6 +1,6 @@
 ---
 title: Apsides
-description: Documentation for the Reakt compiled Kubernetes controller toolchain.
+description: Documentation for the Apsides compiled Kubernetes controller toolchain.
 template: splash
 hero:
   title: Compiled reactive GitOps for Kubernetes
@@ -18,15 +18,14 @@ hero:
 
 <div class="status-strip">
   <strong>Release status</strong>
-  <p>Reakt is under active implementation. Candidate builds and focused lifecycle runs exist, but the v1 production release gates are not complete. Start with the <a href="/reakt/status/">implementation status</a> before evaluating it for a cluster.</p>
+  <p>Apsides is under active implementation. Candidate builds and focused lifecycle runs exist, but the production release gates are not complete. Start with the <a href="/reakt/status/">implementation status</a> before evaluating it for a cluster.</p>
 </div>
 
-## Repository and tool names
+## Names used by the current implementation
 
-**Apsides** is the repository. The current implementation is named **Reakt**:
-the CLI binary is `reakt`, the TypeScript package is `@reakt/kubernetes`, and
-the generated controller package is `controller`. Commands in this site use
-those names until a separate rename is implemented.
+**Apsides** is the project. The current CLI command is `reakt`; commands in this
+site use that executable name. Existing `reakt.dev` schema and protocol identifiers
+remain active wire names. TypeScript authoring uses `@apsides/compiler`.
 
 ## The working model
 

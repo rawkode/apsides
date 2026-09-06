@@ -71,9 +71,7 @@ pub struct GenerationAllocation {
     pub artifact_digest: String,
     pub ir_digest: String,
     /// Protected commitment to approved identity/lifecycle metadata, never values.
-    /// Missing on legacy allocations; it cannot be inferred as upgrade authority.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inventory_metadata_digest: Option<String>,
+    pub inventory_metadata_digest: String,
 }
 
 /// Metadata used to authenticate predecessor state without retaining its
@@ -86,15 +84,6 @@ pub struct PredecessorGeneration {
     pub control_namespace: String,
     pub inventory: inventory::InventorySnapshot,
     pub retirement_role_binding_namespaces: Vec<String>,
-}
-
-/// Legacy full-generation requests remain decodable for explicit recovery, but
-/// normal planning accepts only the metadata projection.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum PreviousGeneration {
-    Metadata(Box<PredecessorGeneration>),
-    Legacy(Box<GenerationPlan>),
 }
 
 /// Runtime-written information is diagnostic input only. It does not grant
@@ -110,7 +99,7 @@ pub struct RuntimeObservation {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeploymentRequest {
     pub transition_id: String,
-    pub previous: Option<PreviousGeneration>,
+    pub previous: Option<Box<PredecessorGeneration>>,
     pub next: GenerationPlan,
     pub runtime_ceiling: PermissionCeiling,
     pub cleanup_ceiling: PermissionCeiling,
@@ -121,17 +110,10 @@ pub struct DeploymentRequest {
 }
 
 impl DeploymentRequest {
-    /// Return predecessor metadata for validation by the planner or platform.
-    /// # Errors
-    /// Legacy requests require an explicit recovery flow and cannot be replayed.
-    pub fn predecessor(&self) -> crate::Result<Option<&PredecessorGeneration>> {
-        match &self.previous {
-            None => Ok(None),
-            Some(PreviousGeneration::Metadata(previous)) => Ok(Some(previous)),
-            Some(PreviousGeneration::Legacy(_)) => Err(crate::Error::Plan(
-                "legacy predecessor generation requires explicit recovery".into(),
-            )),
-        }
+    /// Return the authenticated predecessor metadata supplied for planning.
+    #[must_use]
+    pub fn predecessor(&self) -> Option<&PredecessorGeneration> {
+        self.previous.as_deref()
     }
 }
 

@@ -29,8 +29,8 @@ class PreparationTests(unittest.TestCase):
             with tarfile.open(output / "bench-0/artifact.tar.gz") as payload:
                 desired = json.load(payload.extractfile("resources.json"))["items"]
             self.assertEqual([obj["kind"] for obj in desired], ["Deployment", "ConfigMap", "ConfigMap", "ConfigMap"])
-            source = (output / "bench-0/program.ts").read_text()
-            self.assertEqual(source.count("new ConfigMap("), 3)
+            source = (output / "bench-0/program.tsx").read_text()
+            self.assertEqual(source.count("<ConfigMap id="), 3)
             self.assertIn('"maxConcurrentRequests": 1', source)
 
     def test_artifacts_are_stable_and_have_no_machine_metadata(self):

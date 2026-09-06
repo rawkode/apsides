@@ -1,4 +1,4 @@
-import * as legacy from "./legacy.ts";
+import * as model from "./model.ts";
 
 declare const elementBrand: unique symbol;
 declare const projectionBrand: unique symbol;
@@ -14,10 +14,10 @@ export interface ResourceRef<K extends ResourceKind = ResourceKind> {
 export interface ObservedReference { readonly data: DataProjection }
 type ResourceKind = "ConfigMap" | "Deployment" | "Service";
 type LifecycleProps = { readonly deletionPolicy?: "orphan" | "delete"; readonly force?: boolean };
-export type ControllerProps = Omit<legacy.DomainOptions, "provenance"> & { readonly children?: ReaktNode };
-export type ConfigMapProps = legacy.ConfigMapDefinition & LifecycleProps & { readonly ref?: ResourceRef<"ConfigMap"> };
-export type ServiceProps = legacy.ServiceDefinition & LifecycleProps & { readonly ref?: ResourceRef<"Service"> };
-export type DeploymentProps = legacy.DeploymentDefinition & LifecycleProps & {
+export type ControllerProps = Omit<model.DomainOptions, "provenance"> & { readonly children?: ReaktNode };
+export type ConfigMapProps = model.ConfigMapDefinition & LifecycleProps & { readonly ref?: ResourceRef<"ConfigMap"> };
+export type ServiceProps = model.ServiceDefinition & LifecycleProps & { readonly ref?: ResourceRef<"Service"> };
+export type DeploymentProps = model.DeploymentDefinition & LifecycleProps & {
   readonly ref?: ResourceRef<"Deployment">;
   readonly rolloutOn?: readonly DataProjection[];
 };
@@ -30,23 +30,23 @@ export function Service(_props: ServiceProps): ReaktElement { return builtin(); 
 export function Deployment(_props: DeploymentProps): ReaktElement { return builtin(); }
 export const Fragment = Symbol("Reakt.Fragment");
 
-interface ElementState { readonly type: unknown; readonly props: Record<string, unknown>; readonly source?: legacy.SourceLocation }
+interface ElementState { readonly type: unknown; readonly props: Record<string, unknown>; readonly source?: model.SourceLocation }
 const elements = new WeakMap<object, ElementState>();
 interface ReferenceState {
   readonly owner: RenderState;
   readonly kind: ResourceKind;
-  managed?: legacy.ManagedResource;
+  managed?: model.ManagedResource;
 }
-interface ProjectionState { readonly owner: RenderState; readonly ref?: ReferenceState; readonly observed?: legacy.ObservedInput }
+interface ProjectionState { readonly owner: RenderState; readonly ref?: ReferenceState; readonly observed?: model.ObservedInput }
 const references = new WeakMap<object, ReferenceState>();
 const projections = new WeakMap<object, ProjectionState>();
 interface RenderState {
-  readonly domain: legacy.Domain;
+  readonly domain: model.Domain;
   readonly namespace: string;
   readonly refs: ReferenceState[];
-  readonly rollouts: { target: legacy.ManagedResource<legacy.Deployment>; inputs: readonly unknown[]; source: legacy.SourceLocation }[];
+  readonly rollouts: { target: model.ManagedResource<model.Deployment>; inputs: readonly unknown[]; source: model.SourceLocation }[];
 }
-interface Frame { readonly state: RenderState; readonly source: legacy.SourceLocation }
+interface Frame { readonly state: RenderState; readonly source: model.SourceLocation }
 let frame: Frame | undefined;
 
 function record(value: unknown, context: string): Record<string, unknown> {
@@ -63,7 +63,7 @@ function record(value: unknown, context: string): Record<string, unknown> {
 export function makeElement(type: unknown, props: unknown, source?: { fileName: string; lineNumber: number; columnNumber: number }): ReaktElement {
   const node = Object.freeze(Object.create(null)) as ReaktElement;
   const values = props == null ? {} : record(props, "JSX props");
-  let location: legacy.SourceLocation | undefined;
+  let location: model.SourceLocation | undefined;
   if (source !== undefined) {
     const raw = record(source, "JSX source");
     if (typeof raw.fileName !== "string" || !raw.fileName.startsWith("reakt:/source/") || !Number.isSafeInteger(raw.lineNumber) || (raw.lineNumber as number) < 1 || !Number.isSafeInteger(raw.columnNumber) || (raw.columnNumber as number) < 1) throw new Error("JSX source must come from the locked compiler transform");
@@ -91,18 +91,18 @@ export function useResourceRef<K extends ResourceKind>(kind: K): ResourceRef<K> 
   state.refs.push(reference);
   return value as ResourceRef<K>;
 }
-function observe(kind: typeof legacy.ConfigMap | typeof legacy.Secret, options: ObserveProps): ObservedReference {
+function observe(kind: typeof model.ConfigMap | typeof model.Secret, options: ObserveProps): ObservedReference {
   const { state, source } = requireFrame();
   const raw = record(options, "observation");
   for (const key of Object.keys(raw)) if (!["id", "name", "namespace"].includes(key)) throw new Error(`unsupported observation field: ${key}`);
-  const supplied = { ...raw, namespace: raw.namespace ?? state.namespace, projection: ["data"], missing: "block-dependent-mutations", source } as unknown as legacy.ObserveOptions;
-  const observed = kind === legacy.Secret ? state.domain.observe(legacy.Secret, supplied) : state.domain.observe(legacy.ConfigMap, supplied);
+  const supplied = { ...raw, namespace: raw.namespace ?? state.namespace, projection: ["data"], missing: "block-dependent-mutations", source } as unknown as model.ObserveOptions;
+  const observed = kind === model.Secret ? state.domain.observe(model.Secret, supplied) : state.domain.observe(model.ConfigMap, supplied);
   return Object.freeze({ data: makeProjection({ owner: state, observed }) });
 }
-export function useConfigMap(options: ObserveProps): ObservedReference { return observe(legacy.ConfigMap, options); }
-export function useSecret(options: ObserveProps): ObservedReference { return observe(legacy.Secret, options); }
+export function useConfigMap(options: ObserveProps): ObservedReference { return observe(model.ConfigMap, options); }
+export function useSecret(options: ObserveProps): ObservedReference { return observe(model.Secret, options); }
 
-function bindReference(ref: unknown, state: RenderState, managed: legacy.ManagedResource, kind: ResourceKind): void {
+function bindReference(ref: unknown, state: RenderState, managed: model.ManagedResource, kind: ResourceKind): void {
   if (ref === undefined) return;
   const value = ref !== null && typeof ref === "object" ? references.get(ref) : undefined;
   if (!value || value.owner !== state) throw new Error("foreign or invalid resource reference");
@@ -124,7 +124,7 @@ function snapshotNativeData(value: unknown, visiting = new Set<object>()): unkno
   try {
     for (const key of Reflect.ownKeys(value)) {
       // A Proxy may change its answers between reads. Consume each descriptor once
-      // and pass only this recursively detached snapshot to the legacy validators.
+      // and pass only this recursively detached snapshot to the model validators.
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
       if (typeof key !== "string" || !descriptor || !("value" in descriptor)) throw new Error("native resource fields require data properties");
       if (!descriptor.enumerable && !(array && key === "length")) throw new Error("native resource fields require enumerable data properties");
@@ -136,12 +136,12 @@ function snapshotNativeData(value: unknown, visiting = new Set<object>()): unkno
 }
 
 /** Compiler-only entry: author code never supplies its own provenance to Controller. */
-export function renderTree(root: unknown, provenance: legacy.DomainOptions["provenance"]): legacy.ReaktIR {
+export function renderTree(root: unknown, provenance: model.DomainOptions["provenance"]): model.ReaktIR {
   if (frame) throw new Error("nested compiler rendering is unsupported");
   let state: RenderState | undefined;
   let count = 0;
   const visiting = new Set<object>();
-  function visit(node: unknown, current?: RenderState, inheritedSource?: legacy.SourceLocation, depth = 0): void {
+  function visit(node: unknown, current?: RenderState, inheritedSource?: model.SourceLocation, depth = 0): void {
     if (++count > 65_536 || depth > 128) throw new Error("component tree budget exceeded");
     if (node == null || typeof node === "boolean") return;
     if (typeof node !== "object") throw new Error("components must return Reakt JSX nodes");
@@ -158,7 +158,7 @@ export function renderTree(root: unknown, provenance: legacy.DomainOptions["prov
         if (state || current) throw new Error("exactly one Controller is supported; nested Controllers are unsupported");
         const { children, ...options } = props;
         if ("provenance" in options) throw new Error("Controller provenance is compiler-owned");
-        const domain = legacy.defineDomain({ ...options, provenance } as legacy.DomainOptions);
+        const domain = model.defineDomain({ ...options, provenance } as model.DomainOptions);
         state = { domain, namespace: (options as unknown as ControllerProps).namespace, refs: [], rollouts: [] };
         visit(children, state, source, depth + 1);
         return;
@@ -167,11 +167,11 @@ export function renderTree(root: unknown, provenance: legacy.DomainOptions["prov
         if (!current) throw new Error("resources require Controller");
         if (!source) throw new Error("resource JSX requires compiler source information");
         const { ref, deletionPolicy, force, rolloutOn, ...definition } = props;
-        const options = { source, ...(deletionPolicy === undefined ? {} : { deletionPolicy }), ...(force === undefined ? {} : { force }) } as legacy.ManageOptions;
+        const options = { source, ...(deletionPolicy === undefined ? {} : { deletionPolicy }), ...(force === undefined ? {} : { force }) } as model.ManageOptions;
         if (type !== Deployment && rolloutOn !== undefined) throw new Error("rolloutOn is supported only on Deployment");
         const desired = snapshotNativeData(definition);
         const kind = type === ConfigMap ? "ConfigMap" : type === Service ? "Service" : "Deployment";
-        const resource = type === ConfigMap ? new legacy.ConfigMap(desired as legacy.ConfigMapDefinition) : type === Service ? new legacy.Service(desired as legacy.ServiceDefinition) : new legacy.Deployment(desired as legacy.DeploymentDefinition);
+        const resource = type === ConfigMap ? new model.ConfigMap(desired as model.ConfigMapDefinition) : type === Service ? new model.Service(desired as model.ServiceDefinition) : new model.Deployment(desired as model.DeploymentDefinition);
         const managed = current.domain.manage(resource, options);
         bindReference(ref, current, managed, kind);
         if (rolloutOn !== undefined) {
@@ -185,7 +185,7 @@ export function renderTree(root: unknown, provenance: legacy.DomainOptions["prov
             if (!descriptor) throw new Error("rolloutOn cannot contain empty entries");
             inputs.push(descriptor.value);
           }
-          current.rollouts.push({ target: managed as legacy.ManagedResource<legacy.Deployment>, inputs, source });
+          current.rollouts.push({ target: managed as model.ManagedResource<model.Deployment>, inputs, source });
         }
         return;
       }
@@ -208,7 +208,7 @@ export function renderTree(root: unknown, provenance: legacy.DomainOptions["prov
       if (!projection || projection.owner !== completed) throw new Error("rolloutOn requires a data projection from this Controller");
       const targetInput = projection.observed ?? projection.ref?.managed;
       if (!targetInput || (projection.ref && projection.ref.kind !== "ConfigMap")) throw new Error("rolloutOn requires ConfigMap or Secret data");
-      legacy.watch(targetInput as legacy.ManagedResource<legacy.ConfigMap> | legacy.ObservedInput).project("data").rollout(rollout.target, { source: rollout.source });
+      model.watch(targetInput as model.ManagedResource<model.ConfigMap> | model.ObservedInput).project("data").rollout(rollout.target, { source: rollout.source });
     }
   }
   return completed.domain.toIR();

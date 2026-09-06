@@ -115,7 +115,7 @@ pub(crate) fn control_object_ceilings(
     )?)?
     .len();
 
-    if let Some(previous) = plan.request.predecessor()? {
+    if let Some(previous) = plan.request.predecessor() {
         let checkpoint = stored
             .previous_writer_checkpoint
             .as_ref()

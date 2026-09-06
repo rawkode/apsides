@@ -1,6 +1,6 @@
 # Protected Kubernetes platform state
 
-`platform` uses an authenticated `kube::Client` supplied by the trusted deployment environment. It never loads a project kubeconfig, runs a project hook, or accepts an artifact's policy as platform authority. Initial platform bootstrap installs the control objects and permissions; routine execution does not require a permanent Reakt administrator.
+`platform` uses an authenticated `kube::Client` supplied by the trusted deployment environment. It never loads a project kubeconfig, runs a project hook, or accepts an artifact's policy as platform authority. Initial platform bootstrap installs the control objects and permissions; routine execution does not require a permanent Apsides administrator.
 
 All JSON uses `schemaVersion: "reakt.dev/platform/v1"`, camelCase fields, strict unknown-field rejection, and a 512 KiB serialized state limit. Every ConfigMap stores exactly one data entry, `state.json`. Kubernetes metadata UID and resourceVersion are read separately and retained across conditional PUTs. Missing, corrupt, deleting or oversized records block. No expiry grants a stale claim or transition to another executor.
 
@@ -14,7 +14,7 @@ All JSON uses `schemaVersion: "reakt.dev/platform/v1"`, camelCase fields, strict
 | `reakt-inventory-{domain}` | runtime updates a preprovisioned object | runtime and deployer; `RuntimeInventory` |
 | Secret `reakt-rollout-key-{domain}` | authorized deployment job | runtime only when sensitive inputs require it; exactly `key` (32 bytes) and `keyId` (UTF-8) |
 
-The namespace registry contains claims, one registry-wide monotonic allocation counter, a committed active allocation and writer checkpoint per domain, and retained deployment plans/transition records. `reserve_transition` reads it, compares the exact supplied snapshot and independently loaded ceilings, invokes `deploy`, then atomically reserves resource identities, generation identity and transition ownership in one ConfigMap replacement. Kubernetes UID/resourceVersion predicates reject concurrent deployers. Allocation authority is never inferred from currently active claims. Counters are canonical decimal strings; snapshots and allocations bind the actual registry UID. Full transition plans remain retained pending the separate compaction migration.
+The namespace registry contains an immutable claim reference, one registry-wide monotonic allocation counter, a committed active allocation and writer checkpoint per domain, and compact transition records. Each transition binds frozen planning inputs, review references, capacity admission and issued-executor identity. The selected plan is reconstructed from the freshly verified release. Reservation compares the exact supplied snapshot and independently loaded ceilings, then atomically reserves resource identities, generation identity and transition ownership in one ConfigMap replacement. Kubernetes UID/resourceVersion predicates reject concurrent deployers. Allocation authority is never inferred from active claims. Counters are canonical decimal strings; snapshots and allocations bind the actual registry UID.
 
 `load_trust_policy` returns the protected policy JSON plus Kubernetes UID/resourceVersion for the separate established signature verifier. `load_policy` similarly returns the typed ceilings. Hashes identify these records; their writers' platform-controlled RBAC establishes trust. The release verifier must reject fixture artifacts and bind approved provenance, compiled plan, controller image and build manifest before deployment proceeds.
 
@@ -32,7 +32,7 @@ Runtime inventory includes the binding, activationUid, activationResourceVersion
 
 Kubelet-reported termination of all containers in retained Pod UIDs can establish process termination in a qualified environment. It does not establish completion of in-flight API writes. A force-deleted or disappeared Pod, an unreachable node, a cooperative drained flag, expired timeout, or deleted RoleBinding is insufficient on its own.
 
-An established credential-injecting API proxy is under evaluation as the request-drain boundary. Runtime must not receive a Kubernetes token. A proxy-only token volume and a proxy-admin Unix socket inaccessible to runtime avoid the shared Pod-network admin exposure. Graceful Envoy listener draining initially continues accepting connections; zero active upstream requests also does not distinguish completed responses from timed-out/reset requests whose Kubernetes outcome is unknown. Qualification must establish that admission of new requests has stopped and that every forwarded mutation has a terminal upstream response, with continuous protected evidence and no ambiguous outcomes. Unsupported environments remain blocked; this crate does not manufacture a proof from caller-provided digest strings.
+The qualified credential-injecting API proxy is the supported request-drain boundary. Runtime must not receive a Kubernetes token. A proxy-only token volume and a proxy-admin Unix socket inaccessible to runtime avoid the shared Pod-network admin exposure. Graceful Envoy listener draining initially continues accepting connections; zero active upstream requests also does not distinguish completed responses from timed-out/reset requests whose Kubernetes outcome is unknown. Qualification must establish that admission of new requests has stopped and that every forwarded mutation has a terminal upstream response, with continuous protected evidence and no ambiguous outcomes. Unsupported environments remain blocked; this crate does not manufacture a proof from caller-provided digest strings.
 
 ## Initial installation executor
 
@@ -55,11 +55,11 @@ the Deployment. Resume uses the same recorded executor, UID and object resource
 versions. `Committed` records deployment transition completion, not workload
 readiness or an end-to-end behavioral pass.
 
-Current initial installations explicitly record
+Initial installations record
 `requestDrainQualification: "unqualifiedDirectApi"`. They use the runtime's
 `inCluster` transport under the admitted API-bound enforcement gaps. This marker
-cannot authorize a later automatic upgrade. Qualified proxy transport and complete
-historical request accounting must be established before an upgrade API exists.
+cannot authorize a later automatic upgrade. An upgrade requires qualified proxy
+transport and complete protected request-ledger evidence.
 
 ## Termination and proxy qualification
 
@@ -168,7 +168,7 @@ evidence.
 Every activation/resume checks the staged service account and exact derived Roles
 and RoleBindings, including their recorded UIDs and current semantic contents.
 It also rereads immutable runtime configuration and generation TLS identities.
-These checks establish that Reakt's own grants have not drifted. Kubernetes RBAC
+These checks establish that Apsides' own grants have not drifted. Kubernetes RBAC
 is additive: independently administered bindings can grant the same service account
 additional authority. Preventing that is a platform authorization/admission trust
 assumption; this adapter does not claim to prove the complete effective ceiling

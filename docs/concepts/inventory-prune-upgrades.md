@@ -75,12 +75,12 @@ mutation authority or prove that an old writer stopped.
 
 ## Current implementation boundary
 
-The trait, libSQL backend, deployment connection and several publication checks
-are implemented and covered by focused tests. Compact registry storage, recovery
-from installations without inventory, and live PVC/Turso upgrade qualification
-remain outstanding. The current registry still serializes complete transition
-plans.
+Registry schema v8 stores compact transition inputs and immutable references;
+selected sessions reconstruct the plan from the freshly verified release. Missing
+inventory, review metadata, claims, audit records or writer checkpoints fail
+closed. Live persistent-volume and remote Turso recovery qualification, explicit
+administrative recovery, and cross-executor takeover remain release work.
 
 For the canonical details, read [Resource inventory](/reakt/inventory/),
-[State migration](/reakt/state-migration/), and the
-[Deployment protocol](/reakt/deployment-contract/).
+[Transition audit history](/reakt/audit/), [State capacity](/reakt/state-capacity/),
+and the [Deployment protocol](/reakt/deployment-contract/).

@@ -84,7 +84,7 @@ impl PlatformClient {
             &plan.generation_reservation,
         )?;
         let previous = active_review_reference(registry, &next.scope.domain_id)?.cloned();
-        match (plan.request.predecessor()?, previous.as_ref()) {
+        match (plan.request.predecessor(), previous.as_ref()) {
             (None, None) => (),
             (Some(predecessor), Some(reference)) => {
                 validate_reference(

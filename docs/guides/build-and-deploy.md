@@ -107,7 +107,7 @@ actual issued-token SSA qualification remains outstanding.
 The deployer creates generation-specific Roles and RoleBindings, deploys the
 new controller image, activates it, and retires the previous writer. The runtime
 controller receives only approved reconciliation capabilities. Kubernetes RBAC
-is additive, so exact checks of Reakt-owned Roles do not prove total effective
+is additive, so exact checks of Apsides-owned Roles do not prove total effective
 authority on a cluster.
 
 ## Current deployment boundary
@@ -115,8 +115,9 @@ authority on a cluster.
 Focused candidate lifecycle runs have exercised install and upgrade behaviour,
 including writer quiescence, adoption, explicit force and finalizer-delayed
 cleanup. They are not final production-artifact acceptance. Persistent
-libSQL/Turso upgrades, compact coordination storage, full failure injection,
-operational recovery and independent final review remain release work.
+libSQL/Turso recovery, the complete six-phase interruption matrix, cross-executor
+recovery, remaining release evidence, and independent final review remain release
+work.
 
 Read the [implementation status](/reakt/status/) before repeating any evidence
 claim. The canonical protocols are [Deployment contract](/reakt/deployment-contract/),

@@ -142,16 +142,16 @@ async fn lost_reservation_cas_does_not_poison_the_unconsumed_review_scope() -> T
 }
 
 #[tokio::test]
-async fn v6_and_missing_v7_review_bindings_require_explicit_recovery() -> TestResult {
+async fn unsupported_schema_and_missing_review_bindings_are_rejected() -> TestResult {
     let (registry, _, _, _, _) = staged_initial_fixture()?;
-    for legacy in [true, false] {
+    for unsupported_schema in [true, false] {
         let mut object = registry_object(&registry, REGISTRY_UID, "42")?;
         let mut state: Value = serde_json::from_str(
             object["data"]["state.json"]
                 .as_str()
                 .ok_or("state missing")?,
         )?;
-        if legacy {
+        if unsupported_schema {
             state["schemaVersion"] = json!("reakt.dev/namespace-registry/v6");
         } else {
             state["transitions"][TRANSITION_A]

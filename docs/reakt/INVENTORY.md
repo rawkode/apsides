@@ -1,51 +1,68 @@
 # Resource inventory
 
-Reakt's database boundary is `inventory::InventoryStore`. The default backend is libSQL: a persistent local file (for example on a PVC), or a remote Turso/libSQL primary. The trait exposes reading a head, reading immutable historical snapshots, and conditionally publishing a new head. SQL connections, transactions, and query syntax remain inside the backend. A future Parquet/S3 backend can implement this contract using immutable objects and conditional head writes.
+`inventory::InventoryStore` is the metadata-only boundary for resource history.
+The default backend is libSQL, using either a persistent local file or a remote
+TLS libSQL/Turso primary. The same configured database hosts separate immutable
+claim, review and audit records; those records do not grant each other authority.
 
-The inventory contains cluster/controller scope, generation, resource group/plural/version/kind/namespace/name, observed UID, and deletion policy. It contains no resource manifests, desired or observed values, labels, annotations, source paths, arbitrary JSON, credentials, or hashes of private resource contents. The projection copies an explicit allowlist of fields; it never serializes an input resource. Resource names themselves are necessary inventory metadata and should not contain secrets.
+## Stored data
 
-During an upgrade, retain the previous inventory until reconciliation and cleanup complete. Compare resource identities to find omissions. Apply the previous resource's deletion policy: orphan releases tracking without changing the live resource; delete requires live UID checks and the existing lifecycle authorization. Missing UIDs do not authorize deleting whatever currently has the same name. Pending deletions retain their inventory until finalizers finish. A restarted pod must reload the existing head; an unavailable or corrupt store must not be interpreted as an empty inventory.
+An immutable inventory snapshot is scoped to the registry incarnation, cluster,
+control and workload namespaces, domain and generation. Each resource records its
+API identity, namespace, name, observed UID and deletion policy. The conditionally
+updated head identifies the current committed snapshot.
 
-Snapshots are immutable and published with an opaque expected head revision. A stale publisher receives a conflict. Retrying the exact current snapshot is idempotent, including after a lost commit response. Snapshot digests cover only inventory metadata. Backend implementations must preserve these semantics; eventual-consistency reads alone are insufficient. History is stored in separate snapshots, rather than one continually growing Kubernetes object.
-
-The local backend uses libSQL's rollback journal and FULL synchronization. Persistent volume attachment, filesystem durability, backup, and single-writer lifecycle fencing remain deployment concerns. A database lock or PVC access mode does not prove that an old pod has stopped making Kubernetes requests. Remote credentials are connection configuration, never inventory records.
-
-The initial backend and contract tests are implemented separately from the current lifecycle registry. Full runtime/registry migration, completed-history retention, and PVC upgrade acceptance remain work in progress. The previous ConfigMap containing complete plans and history is rejected as the production storage design; its existing lifecycle tests do not validate this replacement.
-
-The deployment planner now projects verified generations and matching protected claims through `generation_inventory`. Cleanup items use that metadata projection and include API version and kind, so the cleanup executor does not look up old resource manifests. Transition plans use schema v2; a v1 plan or altered cleanup API identity fails canonical-plan verification. This is an integration step, not a claim that the current registry no longer stores full transition requests. CLI loading and publication are now implemented as described below. Compacting the registry and exercising live restart/upgrade against persistent storage remain outstanding.
-
-`PlatformClient::publish_committed_inventory` now publishes through the trait. It verifies the recorded transition by replay, requires the latest committed generation and complete active claims, reads the current inventory head, rechecks the Kubernetes registry, then conditionally publishes. It checks the registry again before reporting success. A registry change after database commit returns an error; retry can discover the committed snapshot idempotently. The two systems do not share a transaction, and the inventory remains tracking evidence rather than mutation authority.
-
-An upgrade with missing prior inventory requires explicit recovery. Publication rejects unrelated/newer heads and refuses to drop or change an already recorded UID within the same generation. Live UID capture remains an independent step; this API never promotes a runtime-reported UID into a protected claim. The deployment CLI connection and invocation are described below.
+Snapshots exclude manifests, desired and observed values, arbitrary labels and
+annotations, source text, credentials, rollout keys, and private-content hashes.
+Names and source-free identities remain operational metadata and must not contain
+secrets. Canonical encoding, typed scope validation and digest verification apply
+on every read, including results returned by a backend implementation.
 
 ## Deployment connection
 
-`reakt deploy` now requires `REAKT_INVENTORY_DATABASE`. Use an absolute database path on persistent storage, or a TLS `libsql://` / `https://` primary endpoint. The default backend remains libSQL. Remote connections require `REAKT_INVENTORY_TOKEN`, supplied through the trusted job environment; do not put credentials in the endpoint. Endpoint credentials, query strings, fragments and non-root paths are rejected. Local connections reject remote tokens. Connection settings and tokens are never included in deployment reports or inventory snapshots.
+Set `REAKT_INVENTORY_DATABASE` to an absolute persistent local path or to an
+approved `libsql://` or `https://` endpoint. Remote access also requires
+`REAKT_INVENTORY_TOKEN`. URLs, tokens and database paths are deployment
+configuration; they are not serialized into registry, inventory or review data.
 
-The claim-snapshot integration also opens `coordination::ClaimStore` against this database using separate immutable tables. Claim snapshots are selected by the protected registry reference; they do not use the mutable inventory head. These database credentials remain in the deployment process and are not passed to the runtime.
+Writable deployment initialization creates and validates the required tables.
+Read-only audit access performs no DDL or repair. Missing tables, malformed schema,
+corrupt rows, foreign scope and oversized records fail closed.
 
-For GitHub Actions, configure the primary endpoint as a repository/environment variable and the token as a secret; the deployment command remains `reakt deploy`. An ephemeral CI filesystem is not durable inventory storage. For a local database in a deployment pod, mount a persistent volume and configure its absolute database path. This change does not provision that volume or a database server.
+## Publication and recovery
 
-Before reserving an upgrade, the CLI requires the inventory head to identify the protected active generation. It captures active UIDs through the platform and republishes that predecessor before starting cleanup. Resuming an unfinished transition requires its recorded predecessor; unavailable, corrupt, absent or unrelated history is not treated as an empty inventory. The head stays on the predecessor while cleanup is pending. After the Kubernetes transition commits, the CLI conditionally publishes the new inventory before reporting success, including its revision and snapshot identity in the report. A committed retry republishes idempotently, using the recorded transition executor identity; it does not take over an unfinished transition. If publication fails or times out after commit, retry the same transition. Workload activation is not rolled back by a tracking failure.
+The runtime publishes a bounded inventory observation only after rereading the
+protected activation and preserving its UID/resourceVersion. Deployment reads the
+immutable predecessor snapshot referenced by the protected transition and checks
+its exact scope, generation and contents before planning cleanup or ownership.
 
-The CLI now invokes the publication path above. Compact registry storage, recovery migration from older installations without inventory, and live PVC/Turso upgrade qualification remain outstanding.
+Final transition commit and inventory-head publication are separate conditional
+operations. A lost response or database failure therefore retries the same
+committed transition and immutable snapshot. An existing identical snapshot is
+idempotent; a conflicting object under the same reference is an error. Inventory
+does not prove writer termination, authorize mutation, fill a missing protected
+claim UID, or turn missing history into an initial installation.
 
-For a configured GitHub Actions deployment job:
+## Upgrade use
 
-```yaml
-- name: Deploy
-  env:
-    REAKT_INVENTORY_DATABASE: ${{ vars.REAKT_INVENTORY_DATABASE }}
-    REAKT_INVENTORY_TOKEN: ${{ secrets.REAKT_INVENTORY_TOKEN }}
-  run: reakt deploy
-```
+Cleanup uses the predecessor inventory's UID and deletion policy together with
+the protected claim. `delete` requires exact live UID matching and a preconditioned
+delete. `orphan` releases tracking without deleting the object. A missing trusted
+UID permits only an absence check.
 
-The job still needs the approved release artifact, Kubernetes authentication and protected platform policy. The database settings are independent of the Kubernetes provider. A tokenless managed controller does not receive the database token: deployment/cleanup owns publication.
+Registry schema v8 retains compact transition inputs and immutable inventory,
+claim, review and audit references. Selected sessions reconstruct the plan from
+the freshly verified release; no previous manifest, compiled IR or OCI artifact is
+loaded. Current committed records remain available for idempotent retry until a
+successor archives them.
 
-Upgrade preflight also checks the complete persisted snapshot against the approved predecessor and the protected claim snapshot used for planning. Matching generation IDs are insufficient: missing or extra resources, different API identities/types, changed deletion policies and mismatched UIDs reject reservation or resume. The publication path repeats this content check when advancing from the predecessor. Within a committed generation, publication may only complete unknown UIDs from protected claims; it rejects metadata changes, missing records and changes to known UIDs instead of silently replacing the stored history. The database remains tracking evidence and cannot authorize a larger cleanup scope.
+## Current limits
 
-The source-backed [state migration contract](STATE-MIGRATION.md) separates the CI-supplied new release, prune inventory and protected coordination. The current compact transition cutover replaces stored full plans with verified immutable snapshot references and a release-bound in-memory session. Automated combined checks passed; live persistent-backend qualification remains pending. Copying the registry into this database remains explicitly excluded.
+Canonical state and completion-envelope budgets reject oversized records before
+publication. The implementation does not provide snapshot garbage collection,
+cross-executor takeover, automatic recovery for missing authority, or completed
+live qualification of persistent-volume and remote Turso recovery.
 
-Active UID capture accepts the persisted inventory snapshot directly. It validates its scope and active generation, rejects missing protected resources, and uses only API identity/version/kind to read live objects. Known inventory UIDs must match protected claims; live UID completion still requires exact approved Apply ownership and refuses replacements or deleting objects. The CLI loads the inventory before this capture. Capture does not require an old desired manifest or historical transition record.
-
-After capture, `publish_captured_inventory` conditionally fills unknown UIDs in the existing snapshot instead of rebuilding it from an old compiled plan. It reads the protected registry afresh, checks the capture revision and active generation, requires the database head to equal the snapshot used for capture, and preserves every existing metadata field. Claims supplied inside a caller's registry copy are not trusted. Known UIDs cannot change. Registry rechecks bracket the database CAS; a change after publication returns an error and requires retry. Transition/evidence growth, activation and reconstructed-request size limits, and live persistent-backend qualification remain open.
+See [Inventory, prune and upgrades](/concepts/inventory-prune-upgrades/),
+[Transition audit history](/reakt/audit/), [State capacity](/reakt/state-capacity/),
+and the [Deployment protocol](/reakt/deployment-contract/).

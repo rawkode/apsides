@@ -1,9 +1,9 @@
 ---
 title: Architecture
-description: How Reakt separates build-time declarations from runtime Kubernetes authority.
+description: How Apsides separates build-time declarations from runtime Kubernetes authority.
 ---
 
-Reakt separates build-time authoring from runtime authority. TypeScript produces
+Apsides separates build-time authoring from runtime authority. TypeScript produces
 data. Rust validates that data, derives the allowed effects and performs the
 Kubernetes operations.
 
@@ -62,14 +62,15 @@ adoption approval, lifecycle policy, finalizers or old-writer termination.
 
 ## Persistence boundaries
 
-Resource history belongs in metadata-only inventory through the
-`InventoryStore` trait. libSQL is the default backend, using either a persistent
-local file or a remote Turso/libSQL primary. Protected Kubernetes coordination
-holds the smaller generation and writer-transition state that must be evaluated
-against live cluster identity.
+Resource history belongs in immutable metadata-only inventory through the
+`InventoryStore` trait. Review metadata, claims and transition audit records use
+their own typed immutable stores. libSQL is the default backend, using either a
+persistent local file or a remote Turso/libSQL primary. Protected Kubernetes
+coordination stores compact transition inputs, immutable references, capacity
+admission, writer checkpoints and the executor binding needed for conditional
+lifecycle updates.
 
-The migration is not complete: current status documents note that full
-transition requests still exist in the legacy registry shape. See
+See
 [Inventory, prune and upgrades](/concepts/inventory-prune-upgrades/) and the
 [implementation status](/reakt/status/).
 
@@ -85,5 +86,5 @@ transition requests still exist in the legacy registry shape. See
 | `inventory` | metadata-only snapshots and libSQL storage |
 | `cli` | `reakt` build, verification and deployment commands |
 
-Internal packages use role names without product prefixes. The public names that
-already exist remain `reakt` and `@reakt/kubernetes`.
+Internal packages use role names without product prefixes. The current executable
+is `reakt`, and the authoring package is `@reakt/kubernetes`.

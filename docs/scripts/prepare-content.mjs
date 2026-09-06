@@ -14,27 +14,20 @@ const pages = [
 ];
 
 const references = [
-  ["ROADMAP.md", "roadmap.md", "Rust kernel roadmap"],
-  ["m0/BOUNDARY.md", "m0/boundary.md", "Milestone 0 boundary"],
-  ["m0/DECISION.md", "m0/decision.md", "Milestone 0 decision"],
-  ["m0/LIMITS.md", "m0/limits.md", "Milestone 0 limits"],
-  ["v1/CONTROLLER_TSX_V1.md", "v1/controller-tsx-v1.md", "Controller TSX v1"],
   ["reakt/ARTIFACT-RESOLUTION.md", "reakt/artifact-resolution.md", "Optional OCI release retrieval"],
   ["reakt/AUDIT.md", "reakt/audit.md", "Transition audit history"],
   ["reakt/DEPLOYMENT-CONTRACT.md", "reakt/deployment-contract.md", "Provider-neutral deployment protocol"],
   ["reakt/DEPLOYMENT-PERMISSIONS.md", "reakt/deployment-permissions.md", "Deployment permissions"],
   ["reakt/INVENTORY.md", "reakt/inventory.md", "Resource inventory"],
   ["reakt/IR-CONTRACT.md", "reakt/ir-contract.md", "IR contract"],
-  ["reakt/LEGACY-POC.md", "reakt/legacy-poc.md", "Legacy OxideLoop POC"],
   ["reakt/OCI-PACKAGING.md", "reakt/oci-packaging.md", "Native controller OCI packaging"],
   ["reakt/PERFORMANCE.md", "reakt/performance.md", "Performance comparison contract"],
   ["reakt/PRODUCTION-EVIDENCE.md", "reakt/production-evidence.md", "Production acceptance evidence"],
   ["reakt/PLATFORM-CONTRACT.md", "reakt/platform-contract.md", "Platform contract"],
   ["reakt/REVIEW-CONTRACT.md", "reakt/review-contract.md", "Deployment review contract"],
-  ["reakt/SPEC-v0.2.md", "reakt/spec-v0-2.md", "Reakt specification 0.2"],
+  ["reakt/SPEC-v0.2.md", "reakt/spec-v0-2.md", "Apsides specification 0.2"],
   ["reakt/STATE-CAPACITY.md", "reakt/state-capacity.md", "State capacity admission"],
-  ["reakt/STATE-MIGRATION.md", "reakt/state-migration.md", "State migration contract"],
-  ["reakt/STATUS.md", "reakt/status.md", "Reakt implementation status"],
+  ["reakt/STATUS.md", "reakt/status.md", "Apsides implementation status"],
   ["reakt/TOOLCHAIN.md", "reakt/toolchain.md", "Toolchain choices"],
 ];
 
@@ -56,10 +49,6 @@ function withFrontmatter(source, title) {
     .replace(
       /\]\(AUDIT\.md(#[^)]+)?\)/g,
       (_, fragment = "") => `](../audit/${fragment})`,
-    )
-    .replace(
-      /\]\(STATE-MIGRATION\.md(#[^)]+)?\)/g,
-      (_, fragment = "") => `](../state-migration/${fragment})`,
     )
     .replace(
       /\]\(\.\.\/\.\.\/packages\/example-bundle\/src\/controller\.tsx\)/g,

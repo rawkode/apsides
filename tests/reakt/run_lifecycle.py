@@ -634,7 +634,7 @@ class LifecycleRunner:
         next_claims = [claim for claim in claims if claim.get("generationId") == allocation["generation"]]
         if not next_claims or any(claim.get("transitionId") != transition for claim in next_claims):
             raise RuntimeError("protected claims differ from interrupted allocation")
-        expected_state = "Active" if phase in ("Activated", "Cleaning", "Committed") else "Reserved"
+        expected_state = "active" if phase in ("Activated", "Cleaning", "Committed") else "reserved"
         if any(claim.get("state") != expected_state for claim in next_claims):
             raise RuntimeError("protected next-generation claim state differs at interruption boundary")
         successor = self.writer_observation(protected_allocation)

@@ -202,8 +202,8 @@ fn phase_recovery_requires_every_phase_and_safe_activation() {
 }
 
 #[test]
-fn phase_recovery_rejects_legacy_aggregate_and_self_selected_expectations() {
-    let legacy = vec![
+fn phase_recovery_rejects_incomplete_aggregate_and_self_selected_expectations() {
+    let incomplete = vec![
         assertion(
             "all-phase-interruptions-recovered",
             json!(true),
@@ -211,7 +211,7 @@ fn phase_recovery_rejects_legacy_aggregate_and_self_selected_expectations() {
         ),
         assertion("unsafe-activation", json!(false), json!(false)),
     ];
-    assert!(validate_assertions("phase-interruption-recovery", false, None, &legacy).is_err());
+    assert!(validate_assertions("phase-interruption-recovery", false, None, &incomplete).is_err());
     let mut incomplete = phase_recovery_assertions();
     incomplete[0].expected = json!(false);
     incomplete[0].actual = json!(false);

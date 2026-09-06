@@ -79,21 +79,13 @@ fn base36(mut value: u64) -> String {
 /// # Errors
 /// Rejects noncanonical names or invalid digest metadata.
 pub fn validate_allocation(allocation: &GenerationAllocation) -> Result<()> {
-    if allocation.inventory_metadata_digest.is_none() {
-        return Err(Error::Plan(
-            "protected inventory checkpoint is missing; explicit recovery is required".into(),
-        ));
-    }
     let names = allocation_names(&allocation.registry_uid, allocation.sequence)?;
     if allocation.generation_id != names.generation_id
         || allocation.transition_id != names.transition_id
         || allocation.service_account_name != names.service_account_name
         || !valid_digest(&allocation.artifact_digest)
         || !valid_digest(&allocation.ir_digest)
-        || allocation
-            .inventory_metadata_digest
-            .as_ref()
-            .is_none_or(|value| !valid_digest(value))
+        || !valid_digest(&allocation.inventory_metadata_digest)
     {
         return Err(Error::Plan(
             "allocation identity or metadata commitment is invalid".into(),

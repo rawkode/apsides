@@ -168,9 +168,12 @@ fn allocation(generation: &GenerationPlan, sequence: u64) -> GenerationAllocatio
         transition_id,
         artifact_digest: generation.artifact_digest.clone(),
         ir_digest: generation.compiled.ir_digest.clone(),
-        inventory_metadata_digest: generation_inventory(generation, &[])
+        inventory_metadata_digest: match generation_inventory(generation, &[])
             .and_then(|(scope, snapshot)| inventory_metadata_digest(&scope, &snapshot))
-            .ok(),
+        {
+            Ok(digest) => digest,
+            Err(error) => format!("invalid-fixture:{error}"),
+        },
     }
 }
 
@@ -233,11 +236,7 @@ fn request_at_sequence(
     let previous = previous
         .zip(previous_allocation)
         .map(|(generation, allocation)| {
-            PreviousGeneration::Metadata(Box::new(fixture_predecessor(
-                &generation,
-                &allocation,
-                &claims,
-            )))
+            Box::new(fixture_predecessor(&generation, &allocation, &claims))
         });
     DeploymentRequest {
         transition_id,
@@ -305,8 +304,7 @@ fn predecessor_mut(
     request: &mut DeploymentRequest,
 ) -> std::result::Result<&mut PredecessorGeneration, &'static str> {
     match request.previous.as_mut() {
-        Some(PreviousGeneration::Metadata(previous)) => Ok(previous),
-        Some(PreviousGeneration::Legacy(_)) => Err("legacy fixture predecessor"),
+        Some(previous) => Ok(previous),
         None => Err("missing fixture predecessor"),
     }
 }
@@ -316,16 +314,8 @@ fn events(plan: &TransitionPlan) -> Vec<Event> {
         None => Quiescence::InitialInstallation {
             verification_epoch: 0,
         },
-        Some(PreviousGeneration::Metadata(old)) => Quiescence::OldGeneration(TerminationEvidence {
+        Some(old) => Quiescence::OldGeneration(TerminationEvidence {
             generation_id: old.allocation.generation_id.clone(),
-            executor_id: "executor".into(),
-            verification_epoch: 0,
-            environment_qualification_digest: DIGEST.into(),
-            process_termination_receipt_digest: DIGEST.into(),
-            access_revocation_receipt_digest: DIGEST.into(),
-        }),
-        Some(PreviousGeneration::Legacy(old)) => Quiescence::OldGeneration(TerminationEvidence {
-            generation_id: old.generation_id.clone(),
             executor_id: "executor".into(),
             verification_epoch: 0,
             environment_qualification_digest: DIGEST.into(),
@@ -634,7 +624,7 @@ fn rollback_reuses_build_only_with_new_allocation_identity()
     let next = generation("generation-2", &[("config", "orphan")]);
     assert_eq!(previous.artifact_digest, next.artifact_digest);
     let plan = plan_transition(&request(Some(previous), next))?;
-    let predecessor = plan.request.predecessor()?.ok_or("predecessor missing")?;
+    let predecessor = plan.request.predecessor().ok_or("predecessor missing")?;
     assert_ne!(
         predecessor.allocation.generation_id,
         plan.generation_reservation.generation_id
@@ -798,7 +788,7 @@ fn previous_policy_and_protected_uid_govern_removal_not_runtime_inventory() {
         .find(|claim| claim.identity.name == "remove")
         .unwrap()
         .uid = None;
-    if let Some(PreviousGeneration::Metadata(previous)) = request.previous.as_mut() {
+    if let Some(previous) = request.previous.as_mut() {
         for resource in previous
             .inventory
             .resources
@@ -1414,7 +1404,7 @@ fn persisted_inventory_must_match_approved_resource_metadata()
         generation("g2", &[("new", "delete")]),
     );
     let snapshot = upgrade
-        .predecessor()?
+        .predecessor()
         .ok_or("missing fixture predecessor")?
         .inventory
         .clone();
@@ -1455,7 +1445,7 @@ fn persisted_inventory_must_match_approved_resource_metadata()
 }
 
 #[test]
-fn protected_metadata_commitment_excludes_desired_values_and_requires_legacy_recovery()
+fn protected_metadata_commitment_excludes_desired_values_and_rejects_invalid_authority()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let original = generation("g1", &[("config", "delete")]);
     let original_plan = plan_transition(&request(None, original.clone()))?;
@@ -1468,15 +1458,12 @@ fn protected_metadata_commitment_excludes_desired_values_and_requires_legacy_rec
         serde_json::json!({"private-value-canary": "not-part-of-inventory-commitment"});
     let changed = GenerationPlan {
         compiled: compiler_core::validate(&changed_ir)?,
-        ..original.clone()
+        ..original
     };
-    assert_ne!(original.compiled.ir_digest, changed.compiled.ir_digest);
     let changed_plan = plan_transition(&request(None, changed))?;
-    assert!(
-        original_plan
-            .generation_reservation
-            .inventory_metadata_digest
-            .is_some()
+    assert_ne!(
+        original_plan.generation_reservation.ir_digest,
+        changed_plan.generation_reservation.ir_digest
     );
     assert_eq!(
         original_plan
@@ -1486,41 +1473,26 @@ fn protected_metadata_commitment_excludes_desired_values_and_requires_legacy_rec
             .generation_reservation
             .inventory_metadata_digest
     );
-    let mut upgrade = request(Some(original), generation("g2", &[]));
-    upgrade
-        .registry
-        .generation_history
-        .active_allocation
-        .as_mut()
-        .ok_or("allocation missing")?
-        .inventory_metadata_digest = None;
-    predecessor_mut(&mut upgrade)?
-        .allocation
-        .inventory_metadata_digest = None;
-    let error = plan_transition(&upgrade)
-        .err()
-        .ok_or("legacy upgrade unexpectedly accepted")?;
-    assert!(error.to_string().contains("explicit recovery"));
-
     let record = begin(&original_plan, "executor")?;
-    let mut pre_v3_plan = original_plan.clone();
-    pre_v3_plan.schema_version = "reakt.dev/transition-plan/v2".into();
-    for outcome in [
-        begin(&pre_v3_plan, "executor").map(|_| ()),
-        verify_record(&pre_v3_plan, &record),
-    ] {
-        let error = outcome.err().ok_or("pre-v3 transition accepted")?;
-        assert!(error.to_string().contains("explicit recovery"));
+    for malformed in ["schema", "digest"] {
+        let mut plan = original_plan.clone();
+        if malformed == "schema" {
+            plan.schema_version = "unsupported".into();
+        } else {
+            plan.generation_reservation.inventory_metadata_digest = "invalid".into();
+        }
+        assert!(begin(&plan, "executor").is_err());
+        assert!(verify_record(&plan, &record).is_err());
     }
-
-    let mut legacy_plan = original_plan;
-    legacy_plan.generation_reservation.inventory_metadata_digest = None;
-    for outcome in [
-        begin(&legacy_plan, "executor").map(|_| ()),
-        verify_record(&legacy_plan, &record),
-    ] {
-        let error = outcome.err().ok_or("legacy transition accepted")?;
-        assert!(error.to_string().contains("explicit recovery"));
+    for absent in [false, true] {
+        let mut encoded = serde_json::to_value(&original_plan.generation_reservation)?;
+        let object = encoded.as_object_mut().ok_or("allocation object missing")?;
+        if absent {
+            object.remove("inventoryMetadataDigest");
+        } else {
+            object.insert("inventoryMetadataDigest".into(), serde_json::Value::Null);
+        }
+        assert!(serde_json::from_value::<GenerationAllocation>(encoded).is_err());
     }
     Ok(())
 }
@@ -1541,7 +1513,7 @@ fn predecessor_metadata_rejects_forged_allocation_policy_uid_transition_and_memb
     assert_eq!(
         predecessor_metadata(&prior, allocation, &baseline.registry.claims)?,
         baseline
-            .predecessor()?
+            .predecessor()
             .ok_or("missing fixture predecessor")?
             .clone()
     );
@@ -1637,20 +1609,12 @@ fn predecessor_metadata_validates_scope_retirement_namespaces_and_absent_uids()
 }
 
 #[test]
-fn legacy_full_predecessor_decodes_but_requires_explicit_recovery()
+fn full_generation_is_rejected_as_predecessor_metadata()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let predecessor = generation("g1", &[("old", "delete")]);
     let request = request(Some(predecessor.clone()), generation("g2", &[]));
     let mut encoded = serde_json::to_value(request)?;
     encoded["previous"] = serde_json::to_value(predecessor)?;
-    let decoded: DeploymentRequest = serde_json::from_value(encoded)?;
-    assert!(matches!(
-        decoded.previous,
-        Some(PreviousGeneration::Legacy(_))
-    ));
-    let error = plan_transition(&decoded)
-        .err()
-        .ok_or("legacy predecessor replay was accepted")?;
-    assert!(error.to_string().contains("explicit recovery"));
+    assert!(serde_json::from_value::<DeploymentRequest>(encoded).is_err());
     Ok(())
 }

@@ -83,9 +83,6 @@ Resource locations identify JSX declarations. Hook locations currently identify
 the containing component invocation, not the hook expression itself. Source
 locations assist diagnostics; they do not confer authority.
 
-The earlier imperative API remains available at `@reakt/kubernetes/legacy` for
-existing fixtures. New application examples use TSX.
-
 See the [IR contract](/reakt/ir-contract/) and [toolchain](/reakt/toolchain/) for
 the underlying constraints. The [implementation status](/reakt/status/) records
 the remaining production release gates.

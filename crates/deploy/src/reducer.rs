@@ -119,17 +119,9 @@ pub fn require_event_capacity(plan: &TransitionPlan, record: &TransitionRecord) 
 
 fn require_inventory_checkpoint(plan: &TransitionPlan) -> Result<()> {
     if plan.schema_version != "reakt.dev/transition-plan/v4" {
-        return Err(reject("pre-v4 transition plan requires explicit recovery"));
+        return Err(reject("unsupported transition plan schema"));
     }
-    if plan
-        .generation_reservation
-        .inventory_metadata_digest
-        .is_none()
-    {
-        return Err(reject(
-            "legacy transition lacks a protected inventory checkpoint; explicit recovery is required",
-        ));
-    }
+    crate::validate_allocation(&plan.generation_reservation)?;
     Ok(())
 }
 
@@ -260,7 +252,7 @@ fn advance_phase(plan: &TransitionPlan, record: &TransitionRecord, event: &Event
             }
             if plan
                 .request
-                .predecessor()?
+                .predecessor()
                 .is_some_and(|old| old.allocation.service_account_name == *name)
             {
                 return Err(reject(
@@ -316,7 +308,7 @@ fn verify_quiescence(
     record: &TransitionRecord,
     evidence: &Quiescence,
 ) -> Result<()> {
-    match (plan.request.predecessor()?, evidence) {
+    match (plan.request.predecessor(), evidence) {
         (None, Quiescence::InitialInstallation { verification_epoch })
             if *verification_epoch == record.verification_epoch =>
         {

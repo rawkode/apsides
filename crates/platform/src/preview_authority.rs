@@ -130,7 +130,7 @@ pub(super) fn same<T: PartialEq>(left: &Versioned<T>, right: &Versioned<T>) -> b
 }
 
 async fn check_inventory(request: &DeploymentRequest, store: &dyn InventoryStore) -> Result<()> {
-    if let Some(previous) = request.predecessor()? {
+    if let Some(previous) = request.predecessor() {
         let id = inventory::snapshot_id(&previous.scope, &previous.inventory)?;
         let actual = store
             .read_snapshot(&previous.scope, &id)

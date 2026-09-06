@@ -158,7 +158,7 @@ fn classify(
         .find(|item| item.id == metadata.id)
         .ok_or_else(|| invalid("pending resource missing"))?;
     let claim = current_claim(resolved, metadata)?;
-    let previous = request.predecessor()?.and_then(|previous| {
+    let previous = request.predecessor().and_then(|previous| {
         previous.inventory.resources.iter().find(|old| {
             old.identity.api_group == claim.identity.api_group
                 && old.identity.resource == claim.identity.resource

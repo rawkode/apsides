@@ -178,7 +178,7 @@ fn require_target_authority(
         .ownership_intents
         .iter()
         .find(|intent| &intent.approval.identity == identity);
-    let previous = request.predecessor()?.and_then(|previous| {
+    let previous = request.predecessor().and_then(|previous| {
         previous.inventory.resources.iter().find(|old| {
             old.identity.api_group == identity.api_group
                 && old.identity.resource == identity.resource

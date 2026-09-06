@@ -153,7 +153,7 @@ impl PlatformClient {
             .get_mut(&stored.plan.request.next.compiled.ir.domain.id)
             .ok_or_else(|| invalid("domain history missing at commit"))?;
         if history.active_allocation.as_ref()
-            != stored.plan.request.predecessor()?.map(|p| &p.allocation)
+            != stored.plan.request.predecessor().map(|p| &p.allocation)
         {
             return Err(invalid("active allocation changed before commit"));
         }
@@ -227,7 +227,7 @@ impl PlatformClient {
         let previous = stored
             .plan
             .request
-            .predecessor()?
+            .predecessor()
             .ok_or_else(|| invalid("previous generation missing"))?;
         let domain = &stored.plan.request.next.compiled.ir.domain.id;
         let mut next = registry.value.clone();

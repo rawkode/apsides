@@ -380,7 +380,7 @@ impl PlatformClient {
         let metadata = current
             .plan
             .request
-            .predecessor()?
+            .predecessor()
             .ok_or_else(|| invalid("initial generation has no previous writer"))?;
         let checkpoint = current.previous_writer_checkpoint.as_ref().ok_or_else(|| {
             invalid("previous writer checkpoint requires explicit protected backfill")

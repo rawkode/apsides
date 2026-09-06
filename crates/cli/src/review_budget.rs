@@ -19,7 +19,7 @@ pub(super) fn count(
         plan.cleanup.len(),
         plan.request.ownership_intents.len(),
         plan.request
-            .predecessor()?
+            .predecessor()
             .map_or(0, |p| p.inventory.resources.len()),
         plan.warnings.len(),
     ];

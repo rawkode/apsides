@@ -5,7 +5,7 @@ export default defineConfig({
   integrations: [
     starlight({
       title: "Apsides",
-      description: "Documentation for the Reakt compiled Kubernetes controller toolchain",
+      description: "Documentation for the Apsides compiled Kubernetes controller toolchain",
       customCss: ["./src/styles/custom.css"],
       social: [
         {
@@ -57,10 +57,8 @@ export default defineConfig({
             { label: "Resource inventory", slug: "reakt/inventory" },
             { label: "Transition audit history", slug: "reakt/audit" },
             { label: "State capacity", slug: "reakt/state-capacity" },
-            { label: "State migration", slug: "reakt/state-migration" },
             { label: "Toolchain", slug: "reakt/toolchain" },
             { label: "Performance contract", slug: "reakt/performance" },
-            { label: "Legacy POC", slug: "reakt/legacy-poc" },
           ],
         },
       ],

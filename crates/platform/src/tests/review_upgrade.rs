@@ -18,7 +18,7 @@ async fn commit_and_discard_predecessor() -> TestResult<PrunedUpgrade> {
     let plan = registry.plan(TRANSITION_B)?;
     let next = plan.request.next.clone();
     let policy = policy(&next.compiled);
-    let predecessor = plan.request.predecessor()?.ok_or("predecessor missing")?;
+    let predecessor = plan.request.predecessor().ok_or("predecessor missing")?;
     let inventory = MemoryInventoryStore::default();
     inventory.seed(&predecessor.scope, &predecessor.inventory)?;
     let stored = registry.transition(TRANSITION_B)?;

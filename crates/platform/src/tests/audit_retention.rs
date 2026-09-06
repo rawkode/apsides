@@ -669,13 +669,11 @@ fn prepare_pending_third_transition(
     "43".clone_into(&mut history.revision);
     let mut request = predecessor_plan.request.clone();
     request.transition_id.clone_from(&names.transition_id);
-    request.previous = Some(deploy::PreviousGeneration::Metadata(Box::new(
-        deploy::predecessor_metadata(
-            &predecessor_plan.request.next,
-            &predecessor_plan.generation_reservation,
-            &registry.claims,
-        )?,
-    )));
+    request.previous = Some(Box::new(deploy::predecessor_metadata(
+        &predecessor_plan.request.next,
+        &predecessor_plan.generation_reservation,
+        &registry.claims,
+    )?));
     request.next.generation_id.clone_from(&names.generation_id);
     request.registry = deploy::RegistrySnapshot {
         registry_uid: REGISTRY_UID.to_owned(),

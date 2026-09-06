@@ -267,7 +267,7 @@ fn compile_command(options: &BTreeMap<String, String>, command: &str) -> Result<
             .join("../..")
             .canonicalize()?;
         let status = Command::new("node")
-            .arg(root.join("packages/bundle-builder/src/reakt.ts"))
+            .arg(root.join("packages/compiler/src/compiler.ts"))
             .arg(fs::canonicalize(source)?)
             .arg(&stage)
             .env_clear()

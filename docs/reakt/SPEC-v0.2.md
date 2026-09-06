@@ -4,7 +4,7 @@ Version: 0.2
 Status: Proposed architecture and implementation contract
 Date: 5 September 2026
 
-This revision incorporates the design review of the original specification. It defines required behaviour, security limits, implementation scope, and acceptance criteria. Code examples describe a proposed DSL; they are not an existing SDK. Requirements marked as future work do not belong to the initial release.
+This specification defines required behaviour, security limits, implementation scope, and acceptance criteria. Code examples define the required DSL shape; the current implementation boundary is documented separately. Requirements marked as future work do not belong to the initial release.
 
 1. Overview
 

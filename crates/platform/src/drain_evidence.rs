@@ -34,7 +34,7 @@ mod tests {
 
     type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-    fn legacy_drain() -> Value {
+    fn drain_wire_fixture() -> Value {
         json!({
             "previousTransitionId": "transition-a",
             "runtimeWriters": {
@@ -82,23 +82,23 @@ mod tests {
         })
     }
 
-    fn assert_legacy_compatibility(legacy: &Value) -> TestResult {
+    fn assert_roundtrip_and_digest(wire: &Value) -> TestResult {
         fn optional(value: &Value) -> Option<&Value> {
             (!value.is_null()).then_some(value)
         }
 
-        let typed: UpgradeDrainState = serde_json::from_value(legacy.clone())?;
-        assert_eq!(serde_json::to_value(&typed)?, *legacy);
+        let typed: UpgradeDrainState = serde_json::from_value(wire.clone())?;
+        assert_eq!(serde_json::to_value(&typed)?, *wire);
 
-        let runtime = legacy
+        let runtime = wire
             .get("runtimeTermination")
-            .ok_or("legacy runtime termination missing")?;
-        let ledger = legacy
+            .ok_or("wire runtime termination missing")?;
+        let ledger = wire
             .get("finalProxyLedger")
-            .ok_or("legacy proxy ledger missing")?;
-        let proxy = legacy
+            .ok_or("wire proxy ledger missing")?;
+        let proxy = wire
             .get("proxyTermination")
-            .ok_or("legacy proxy termination missing")?;
+            .ok_or("wire proxy termination missing")?;
         assert_eq!(
             compiler_core::digest(&(
                 typed.runtime_termination.as_ref(),
@@ -112,9 +112,9 @@ mod tests {
     }
 
     #[test]
-    fn typed_drain_preserves_legacy_wire_and_evidence_digest() -> TestResult {
-        let legacy = legacy_drain();
-        assert_legacy_compatibility(&legacy)
+    fn typed_drain_roundtrips_current_wire_and_evidence_digest() -> TestResult {
+        let wire = drain_wire_fixture();
+        assert_roundtrip_and_digest(&wire)
     }
 
     #[test]
@@ -124,11 +124,11 @@ mod tests {
             &["finalProxyLedger", "proxyTermination"][..],
             &["proxyTermination"][..],
         ] {
-            let mut legacy = legacy_drain();
+            let mut wire = drain_wire_fixture();
             for field in absent {
-                legacy[*field] = Value::Null;
+                wire[*field] = Value::Null;
             }
-            assert_legacy_compatibility(&legacy)?;
+            assert_roundtrip_and_digest(&wire)?;
         }
         Ok(())
     }
@@ -136,13 +136,12 @@ mod tests {
     #[test]
     fn typed_drain_rejects_unknown_evidence_fields() -> TestResult {
         for field in ["runtimeTermination", "finalProxyLedger", "proxyTermination"] {
-            let mut legacy = legacy_drain();
-            legacy
-                .get_mut(field)
+            let mut wire = drain_wire_fixture();
+            wire.get_mut(field)
                 .and_then(Value::as_object_mut)
-                .ok_or("legacy evidence object missing")?
+                .ok_or("wire evidence object missing")?
                 .insert("privateCanary".to_owned(), json!("must-not-be-retained"));
-            assert!(serde_json::from_value::<UpgradeDrainState>(legacy).is_err());
+            assert!(serde_json::from_value::<UpgradeDrainState>(wire).is_err());
         }
         Ok(())
     }
@@ -155,24 +154,23 @@ mod tests {
             ("finalProxyLedger", "ledgerDigest"),
             ("proxyTermination", "containerIds"),
         ] {
-            let mut legacy = legacy_drain();
-            legacy
-                .get_mut(field)
+            let mut wire = drain_wire_fixture();
+            wire.get_mut(field)
                 .and_then(Value::as_object_mut)
-                .ok_or("legacy evidence object missing")?
+                .ok_or("wire evidence object missing")?
                 .remove(required);
-            cases.push(legacy);
+            cases.push(wire);
         }
         for count in [
             json!(-1),
             serde_json::from_str::<Value>("18446744073709551616")?,
         ] {
-            let mut legacy = legacy_drain();
-            legacy["finalProxyLedger"]["completedRequests"] = count;
-            cases.push(legacy);
+            let mut wire = drain_wire_fixture();
+            wire["finalProxyLedger"]["completedRequests"] = count;
+            cases.push(wire);
         }
-        for legacy in cases {
-            assert!(serde_json::from_value::<UpgradeDrainState>(legacy).is_err());
+        for wire in cases {
+            assert!(serde_json::from_value::<UpgradeDrainState>(wire).is_err());
         }
         Ok(())
     }

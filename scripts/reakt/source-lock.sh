@@ -7,4 +7,4 @@ if [[ $# -lt 1 ]]; then
 fi
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd -P)"
-exec node "$repo_root/packages/bundle-builder/src/reakt-lock.ts" "$@"
+exec node "$repo_root/packages/compiler/src/source-lock.ts" "$@"

@@ -25,4 +25,4 @@ Oxc supplies resource and rollout JSX locations. Hook input locations identify t
 
 The compiler captures and verifies the complete SDK module closure and author source lock, then evaluates twice in a pinned SES Compartment hosted by Deno with denied host permissions. Native validation independently checks the resulting IR. Projection tokens cannot enter native resource fields, and observed Secret values never enter authoring evaluation. Compiler fixture generation supplies separate synthetic inputs and workload images.
 
-The previous imperative API remains available through `@reakt/kubernetes/legacy` for existing source definitions and fixture utilities. The compiler renderer is internal and is not a public package export.
+The compiler renderer and validation model are internal and are not public package exports.

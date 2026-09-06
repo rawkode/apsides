@@ -216,7 +216,7 @@ async fn bootstrap_checks_exact_admission_response() -> Result {
 }
 
 #[tokio::test]
-async fn legacy_registry_requires_explicit_recovery() -> Result {
+async fn unsupported_registry_schema_is_rejected_before_claim_access() -> Result {
     for version in ["v2", "v3", "v4", "v5"] {
         let mut old = state()?;
         old["schemaVersion"] = json!(format!("reakt.dev/namespace-registry/{version}"));
@@ -228,7 +228,7 @@ async fn legacy_registry_requires_explicit_recovery() -> Result {
             .load_registry()
             .await
             .err()
-            .ok_or("legacy registry accepted")?;
+            .ok_or("unsupported registry schema accepted")?;
         assert!(error.to_string().contains("explicit recovery"));
         assert_eq!(methods(&calls)?, ["GET"]);
     }

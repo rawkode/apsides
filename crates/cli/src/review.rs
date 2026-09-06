@@ -130,7 +130,7 @@ fn validate_metadata(
     if platform::project_review_metadata(plan)? != *next {
         return Err("review requires the canonical next declaration metadata".into());
     }
-    match (plan.request.predecessor()?, previous) {
+    match (plan.request.predecessor(), previous) {
         (None, None) => Ok(()),
         (None, Some(_)) => Err("initial review cannot contain predecessor metadata".into()),
         (Some(_), None) => Err("upgrade review requires predecessor declaration metadata".into()),
@@ -159,7 +159,7 @@ fn validate_predecessor_checkpoint(
     current: &platform::StoredTransition,
     plan: &deploy::TransitionPlan,
 ) -> crate::Result<()> {
-    let Some(predecessor) = plan.request.predecessor()? else {
+    let Some(predecessor) = plan.request.predecessor() else {
         if current.previous_writer_checkpoint.is_some() {
             return Err("initial review cannot contain predecessor authority".into());
         }
@@ -281,7 +281,7 @@ fn review_resources<'a>(
     let resources = resources::resources(
         previous,
         next,
-        plan.request.predecessor()?.map(|value| &value.inventory),
+        plan.request.predecessor().map(|value| &value.inventory),
         &plan.request.ownership_intents,
     )?;
     Ok((resources, ownership_intents(plan)))
@@ -389,7 +389,7 @@ fn with_report<T>(
         compatibility,
         expected_interruption: expected_interruption(initial),
         live_impact: live.map_or_else(
-            || live::Impact::Legacy(Unavailable::live()),
+            || live::Impact::Unavailable(Unavailable::live()),
             live::Impact::Current,
         ),
         values_omitted: true,

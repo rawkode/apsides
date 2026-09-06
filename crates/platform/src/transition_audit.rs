@@ -143,7 +143,7 @@ impl PlatformClient {
     ) -> Result<()> {
         let selected = self.selected(previous, successor)?;
         let domain = selected.domain_id();
-        let Some(metadata) = selected.plan.request.predecessor()? else {
+        let Some(metadata) = selected.plan.request.predecessor() else {
             if previous.value.audit_heads.contains_key(domain) {
                 return Err(invalid("initial transition cannot advance an audit chain"));
             }

@@ -119,16 +119,17 @@ async fn reservation_persists_exact_executor_binding_in_its_single_registry_cas(
 }
 
 #[tokio::test]
-async fn v7_or_missing_executor_binding_requires_recovery_without_a_write() -> TestResult {
+async fn unsupported_schema_or_missing_executor_binding_is_rejected_without_a_write() -> TestResult
+{
     let (registry, _, _, _, _) = staged_initial_fixture()?;
-    for legacy in [true, false] {
+    for unsupported_schema in [true, false] {
         let mut control = registry_object(&registry, REGISTRY_UID, "42")?;
         let encoded = control
             .pointer("/data/state.json")
             .and_then(Value::as_str)
             .ok_or("registry state missing")?;
         let mut state: Value = serde_json::from_str(encoded)?;
-        if legacy {
+        if unsupported_schema {
             state["schemaVersion"] = json!("reakt.dev/namespace-registry/v7");
         } else {
             state["transitions"][TRANSITION_A]

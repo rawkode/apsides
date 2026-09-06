@@ -63,13 +63,11 @@ pub(super) fn upgrade_with_ceiling(
             uid: Some(format!("uid-{}", resource.id)),
         })
         .collect();
-    request.previous = Some(deploy::PreviousGeneration::Metadata(Box::new(
-        deploy::predecessor_metadata(
-            &old.request.next,
-            &old.generation_reservation,
-            &request.registry.claims,
-        )?,
-    )));
+    request.previous = Some(Box::new(deploy::predecessor_metadata(
+        &old.request.next,
+        &old.generation_reservation,
+        &request.registry.claims,
+    )?));
     let next = &request.next.compiled;
     request.runtime_ceiling.capabilities = next.capabilities.clone();
     request.runtime_ceiling.accepted_enforcement_gaps = next.enforcement_gaps.clone();
@@ -105,7 +103,7 @@ pub(super) fn upgrade_with_ceiling(
     stored.next_review_metadata = platform::project_review_metadata(&plan)?.reference()?;
     stored.previous_review_metadata = Some(previous.reference()?);
     stored.previous_writer_checkpoint = Some(review_checkpoint(
-        plan.request.predecessor()?.ok_or("missing predecessor")?,
+        plan.request.predecessor().ok_or("missing predecessor")?,
     )?);
     Ok((stored, plan, previous))
 }

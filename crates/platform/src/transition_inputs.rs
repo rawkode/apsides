@@ -68,7 +68,7 @@ impl TransitionInputs {
         }
         let previous = plan
             .request
-            .predecessor()?
+            .predecessor()
             .map(|previous| {
                 Ok::<_, crate::Error>(FrozenPredecessor {
                     allocation: previous.allocation.clone(),

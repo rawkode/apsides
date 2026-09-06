@@ -1,1 +1,10 @@
-{"imports":{"@reakt/kubernetes/legacy":"../../../../packages/reakt/src/legacy.ts"}}
+{
+  "compilerOptions": {
+    "jsx": "react-jsxdev",
+    "jsxImportSource": "@reakt/kubernetes"
+  },
+  "imports": {
+    "@reakt/kubernetes": "../../../../packages/reakt/src/index.ts",
+    "@reakt/kubernetes/jsx-dev-runtime": "../../../../packages/reakt/src/jsx-dev-runtime.ts"
+  }
+}

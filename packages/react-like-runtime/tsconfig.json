@@ -1,1 +1,0 @@
-{ "extends": "../../tsconfig.base.json", "compilerOptions": { "jsxImportSource": "@oxideloop/react-like-runtime" }, "include": ["src/**/*.ts"] }

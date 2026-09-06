@@ -158,7 +158,7 @@ pub fn validate_transition_inventory(
     persisted: Option<&InventorySnapshot>,
 ) -> Result<()> {
     crate::plan_transition(request)?;
-    match (request.predecessor()?, persisted) {
+    match (request.predecessor(), persisted) {
         (None, None) => Ok(()),
         (Some(previous), Some(persisted)) => {
             if &previous.inventory != persisted {
@@ -198,21 +198,14 @@ pub fn inventory_metadata_digest(
 /// Verify metadata against protected allocation authority without any compiled
 /// predecessor, manifest or source. This does not validate live UID ownership.
 /// # Errors
-/// Rejects missing legacy checkpoints and changed generation or metadata.
+/// Rejects invalid commitments and changed generation or metadata.
 pub fn validate_inventory_checkpoint(
     scope: &InventoryScope,
     snapshot: &InventorySnapshot,
     allocation: &crate::GenerationAllocation,
 ) -> Result<()> {
     crate::validate_allocation(allocation)?;
-    let expected = allocation
-        .inventory_metadata_digest
-        .as_ref()
-        .ok_or_else(|| {
-            Error::Plan(
-                "protected inventory checkpoint is missing; explicit recovery is required".into(),
-            )
-        })?;
+    let expected = &allocation.inventory_metadata_digest;
     if snapshot.generation != allocation.generation_id
         || &inventory_metadata_digest(scope, snapshot)? != expected
     {

@@ -7,4 +7,4 @@ if [[ $# -ne 2 ]]; then
 fi
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd -P)"
-exec node "$repo_root/packages/bundle-builder/src/reakt.ts" "$1" "$2"
+exec node "$repo_root/packages/compiler/src/compiler.ts" "$1" "$2"

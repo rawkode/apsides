@@ -299,9 +299,9 @@ async fn reserve(
             .active_writer_checkpoints
             .get(&domain.id)
             .ok_or("active writer checkpoint missing")?;
-        Some(deploy::PreviousGeneration::Metadata(Box::new(
+        Some(Box::new(
             checkpoint.predecessor_metadata(&scope, &captured.snapshot)?,
-        )))
+        ))
     } else {
         None
     };

@@ -44,7 +44,7 @@ fn snapshot() -> InventorySnapshot {
     }
 }
 
-fn allocation(metadata_digest: Option<String>) -> GenerationAllocation {
+fn allocation(metadata_digest: String) -> GenerationAllocation {
     GenerationAllocation {
         registry_uid: REGISTRY_UID.into(),
         sequence: 1,
@@ -62,7 +62,7 @@ fn metadata_only_checkpoint_validates_and_uid_completion_is_inert() -> TestResul
     let scope = scope();
     let snapshot = snapshot();
     let digest = inventory_metadata_digest(&scope, &snapshot)?;
-    let allocation = allocation(Some(digest.clone()));
+    let allocation = allocation(digest.clone());
 
     validate_inventory_checkpoint(&scope, &snapshot, &allocation)?;
 
@@ -101,7 +101,7 @@ fn every_approved_metadata_dimension_changes_the_checkpoint() -> TestResult {
     let scope = scope();
     let snapshot = snapshot();
     let baseline = inventory_metadata_digest(&scope, &snapshot)?;
-    let allocation = allocation(Some(baseline.clone()));
+    let allocation = allocation(baseline.clone());
 
     let mut changed_scope = scope.clone();
     changed_scope.cluster = "cluster-b".into();
@@ -183,7 +183,7 @@ fn invalid_inventory_cannot_be_committed() -> TestResult {
 }
 
 #[test]
-fn legacy_allocation_decodes_but_requires_explicit_recovery() -> TestResult {
+fn allocation_requires_inventory_metadata_commitment() {
     let value = json!({
         "generationId": "gceirceircfardairceirceirce-1",
         "registryUid": REGISTRY_UID,
@@ -193,10 +193,7 @@ fn legacy_allocation_decodes_but_requires_explicit_recovery() -> TestResult {
         "artifactDigest": DIGEST,
         "irDigest": DIGEST
     });
-    let allocation: GenerationAllocation = serde_json::from_value(value)?;
-    assert_eq!(allocation.inventory_metadata_digest, None);
-    assert!(validate_inventory_checkpoint(&scope(), &snapshot(), &allocation).is_err());
-    Ok(())
+    assert!(serde_json::from_value::<GenerationAllocation>(value).is_err());
 }
 
 fn assert_changed(

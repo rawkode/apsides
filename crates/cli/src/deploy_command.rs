@@ -279,7 +279,7 @@ async fn reserve_new_transition(
     )
     .await?;
     crate::inventory_connection::require_request(inventory, &request).await?;
-    let previous_review = if request.predecessor()?.is_some() {
+    let previous_review = if request.predecessor().is_some() {
         platform
             .load_active_review_metadata(
                 &domain.id,
@@ -518,7 +518,7 @@ async fn prepare_predecessor(
     registry: &platform::NamespaceRegistry,
     domain: &compiler_core::Domain,
     history: &deploy::GenerationHistory,
-) -> Result<Option<deploy::PreviousGeneration>> {
+) -> Result<Option<Box<deploy::PredecessorGeneration>>> {
     let Some(allocation) = &history.active_allocation else {
         return Ok(None);
     };
@@ -541,9 +541,7 @@ async fn prepare_predecessor(
         controller: domain.id.clone(),
     };
     let predecessor = checkpoint.predecessor_metadata(&scope, &head.snapshot)?;
-    Ok(Some(deploy::PreviousGeneration::Metadata(Box::new(
-        predecessor,
-    ))))
+    Ok(Some(Box::new(predecessor)))
 }
 
 fn default_transition(

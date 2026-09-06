@@ -48,7 +48,7 @@ impl PlatformClient {
 
     /// Authenticate the protected registry reference before resolving its immutable claims.
     /// # Errors
-    /// Rejects legacy schemas, mismatched authority, missing snapshots and corrupt backend results.
+    /// Rejects unsupported schemas, mismatched authority, missing snapshots and corrupt backend results.
     pub async fn load_registry(&self) -> Result<Versioned<NamespaceRegistry>> {
         self.claims_backend()?;
         self.audit_backend()?;
@@ -61,7 +61,7 @@ impl PlatformClient {
             != Some(crate::REGISTRY_SCHEMA_VERSION)
         {
             return Err(invalid(
-                "registry executor binding schema requires explicit recovery; automatic legacy migration is forbidden",
+                "unsupported registry schema; explicit recovery required",
             ));
         }
         let state: NamespaceRegistryState = serde_json::from_value(raw.value)
@@ -219,7 +219,7 @@ impl PlatformClient {
     }
 
     /// Initialize a truly empty registry after its Kubernetes UID and authority anchor exist.
-    /// No legacy state, claims, allocation history or transitions are adopted.
+    /// No existing state, claims, allocations or transitions are adopted.
     /// # Errors
     /// Rejects existing data, changed UID/RV, absent authority and unavailable claim storage.
     pub async fn bootstrap_registry(

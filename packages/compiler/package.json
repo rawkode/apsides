@@ -1,0 +1,19 @@
+{
+  "name": "@apsides/compiler",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "oxc-transform": "0.58.0",
+    "rolldown": "1.0.0-beta.35",
+    "ses": "2.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.21",
+    "typescript": "5.8.3"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node src/compiler.test.ts && node src/compiler-tsx.test.ts && node src/compiler-cli.test.ts"
+  }
+}

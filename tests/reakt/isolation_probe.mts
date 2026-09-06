@@ -105,7 +105,7 @@ function describe(): void {
 }
 
 async function run(source: string, output: string, probe: Probe): Promise<boolean> {
-  const { compileReakt } = await import("../../packages/bundle-builder/src/reakt.ts");
+  const { compileReakt } = await import("../../packages/compiler/src/compiler.ts");
   try {
     await compileReakt(source, output);
   } catch (error) {

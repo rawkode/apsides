@@ -24,7 +24,6 @@ pub(super) fn project(plan: &TransitionPlan) -> Result<Declarations> {
     let old: BTreeSet<_> = plan
         .request
         .predecessor()
-        .map_err(|_| invalid("review predecessor metadata is invalid"))?
         .into_iter()
         .flat_map(|p| &p.inventory.resources)
         .map(|r| ReviewIdentity {

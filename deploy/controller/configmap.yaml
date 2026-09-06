@@ -1,6 +1,0 @@
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: oxideloop-controller-config
-data:
-  rootName: root

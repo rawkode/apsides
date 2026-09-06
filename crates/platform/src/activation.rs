@@ -250,7 +250,7 @@ impl PlatformClient {
             let predecessor = selected
                 .plan
                 .request
-                .predecessor()?
+                .predecessor()
                 .map(|p| p.allocation.clone());
             let allocation = selected.plan.generation_reservation.clone();
             let checkpoint = crate::writer_checkpoint::project_committed(

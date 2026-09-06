@@ -128,7 +128,7 @@ pub fn deployment_permissions(plan: &TransitionPlan) -> Result<DeploymentPermiss
     let mut requests = Requests::default();
     control_state(plan, &mut requests)?;
     let roles = stage_generation(plan, &mut requests);
-    previous_generation(plan, &mut requests)?;
+    previous_generation(plan, &mut requests);
     for capability in &plan.cleanup_capabilities {
         requests.capability(capability);
     }
@@ -262,9 +262,9 @@ fn stage_generation(plan: &TransitionPlan, requests: &mut Requests) -> Vec<RoleD
     }).collect()
 }
 
-fn previous_generation(plan: &TransitionPlan, requests: &mut Requests) -> Result<()> {
-    let Some(previous) = plan.request.predecessor()? else {
-        return Ok(());
+fn previous_generation(plan: &TransitionPlan, requests: &mut Requests) {
+    let Some(previous) = plan.request.predecessor() else {
+        return;
     };
     let control = &previous.control_namespace;
     let name = &previous.allocation.service_account_name;
@@ -306,5 +306,4 @@ fn previous_generation(plan: &TransitionPlan, requests: &mut Requests) -> Result
             Some(&resource.identity.name),
         );
     }
-    Ok(())
 }

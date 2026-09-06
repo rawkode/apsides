@@ -238,7 +238,7 @@ class LifecycleInterruptionTests(unittest.TestCase):
                         }]
                     return subprocess.CompletedProcess([], 0, stdout=json.dumps({"items": items}), stderr="")
 
-                claim_state = "Active" if phase in ("Activated", "Cleaning", "Committed") else "Reserved"
+                claim_state = "active" if phase in ("Activated", "Cleaning", "Committed") else "reserved"
                 value.get = get
                 value.k = k
                 value.claims = lambda: [{
@@ -276,7 +276,7 @@ class LifecycleInterruptionTests(unittest.TestCase):
                 }
                 value.claims = lambda: [{
                     "generationId": "generation-b", "transitionId": "foreign" if case == "claim" else "transition-b",
-                    "state": "Reserved", "uid": None,
+                    "state": "reserved", "uid": None,
                 }]
 
                 with self.assertRaisesRegex(RuntimeError, "registry version|claims differ|writer started"):

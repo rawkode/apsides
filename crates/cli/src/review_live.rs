@@ -6,7 +6,7 @@ use serde::Serialize;
 #[derive(Serialize)]
 #[serde(untagged)]
 pub(super) enum Impact<'a> {
-    Legacy(Unavailable),
+    Unavailable(Unavailable),
     Current(&'a LiveReview),
 }
 

@@ -261,13 +261,11 @@ fn review_requires_exact_replay_and_predecessor_checkpoint() -> Result<()> {
         .get("example")
         .ok_or("history missing")?
         .clone();
-    request.previous = Some(deploy::PreviousGeneration::Metadata(Box::new(
-        deploy::predecessor_metadata(
-            &original_plan.request.next,
-            &original_plan.generation_reservation,
-            &request.registry.claims,
-        )?,
-    )));
+    request.previous = Some(Box::new(deploy::predecessor_metadata(
+        &original_plan.request.next,
+        &original_plan.generation_reservation,
+        &request.registry.claims,
+    )?));
     let plan = plan_transition(&request)?;
     let previous_review = platform::project_review_metadata(&original_plan)?;
     let mut upgrade = original;
@@ -284,7 +282,7 @@ fn review_requires_exact_replay_and_predecessor_checkpoint() -> Result<()> {
         )
         .is_err()
     );
-    let predecessor = plan.request.predecessor()?.ok_or("predecessor missing")?;
+    let predecessor = plan.request.predecessor().ok_or("predecessor missing")?;
     upgrade.previous_writer_checkpoint = Some(review_checkpoint(predecessor)?);
     let review = crate::review::transition_review_fixture(
         &upgrade,

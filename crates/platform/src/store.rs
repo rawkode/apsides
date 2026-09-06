@@ -263,7 +263,7 @@ impl PlatformClient {
         let metadata = stored
             .plan
             .request
-            .predecessor()?
+            .predecessor()
             .ok_or_else(|| invalid("initial installation has no previous writer"))?;
         if let Some(checkpoint) = &stored.previous_writer_checkpoint {
             checkpoint.validate(
@@ -353,7 +353,7 @@ impl PlatformClient {
             ));
         }
         request
-            .predecessor()?
+            .predecessor()
             .map(|previous| {
                 let checkpoint = crate::writer_checkpoint::active(
                     &current.value,
@@ -418,7 +418,7 @@ impl PlatformClient {
         if !request.observations.is_empty() {
             return Err(invalid("compact transitions require empty observations"));
         }
-        if let Some(previous) = request.predecessor()? {
+        if let Some(previous) = request.predecessor() {
             let id = inventory::snapshot_id(&previous.scope, &previous.inventory)?;
             let snapshot = inventory
                 .read_snapshot(&previous.scope, &id)

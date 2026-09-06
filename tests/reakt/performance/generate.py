@@ -41,19 +41,24 @@ def archive(objects):
 
 def source(name, managed, image):
     desired = deployment(name, image)
-    lines = ['import {ConfigMap, Deployment, defineDomain, watch} from "@reakt/kubernetes/legacy";',
-        'export default function program(context: {readonly sourceDigest: string}) {',
-        'const source = {file:"program.ts", line:1, column:1};',
-        'const domain = defineDomain(' + json.dumps({"id": name, "namespace": NAMESPACE, "controlNamespace": CONTROL,
-        "clusterBinding": "reakt-disposable-benchmark", "policyRef": "platform/" + name, "enforcement": "api-bound",
-        "budgets": {"maxResources": managed + 2, "maxInputs": 1, "maxReactions": 1, "maxObjectBytes": 262144,
-                    "maxQueueDepth": 128, "maxConcurrentRequests": 1}})[:-1] + ', provenance:{inputs:[{path:"program.ts",sha256:context.sourceDigest}]}});',
-        'const input = domain.observe(ConfigMap, ' + json.dumps({"id": "input", "name": name + "-input", "namespace": NAMESPACE,
-        "projection": ["data"], "missing": "block-dependent-mutations"})[:-1] + ', source});',
-        'const target = domain.manage(new Deployment(' + json.dumps({"id": "target", "metadata": desired["metadata"], "spec": desired["spec"]}) + '), {deletionPolicy:"delete",source});']
+    resources = ['<Deployment id="target" metadata={' + json.dumps(desired["metadata"]) +
+                 '} spec={' + json.dumps(desired["spec"]) +
+                 '} deletionPolicy="delete" rolloutOn={[input.data]} />']
     for i in range(managed):
-        lines.append('domain.manage(new ConfigMap(' + json.dumps({"id": "managed-" + str(i), "metadata": {"name": f"{name}-managed-{i}", "namespace": NAMESPACE}, "data": {"value": "stable"}}) + '), {deletionPolicy:"delete",source});')
-    lines += ['watch(input).project("data").rollout(target,{id:"rollout",source});', 'return {productionIR:domain.toIR()};', '}']
+        resources.append('<ConfigMap id="managed-' + str(i) + '" metadata={' +
+                         json.dumps({"name": f"{name}-managed-{i}", "namespace": NAMESPACE}) +
+                         '} data={{value:"stable"}} deletionPolicy="delete" />')
+    options = {"id": name, "namespace": NAMESPACE, "controlNamespace": CONTROL,
+               "clusterBinding": "reakt-disposable-benchmark", "policyRef": "platform/" + name,
+               "enforcement": "api-bound", "budgets": {"maxResources": managed + 2, "maxInputs": 1,
+               "maxReactions": 1, "maxObjectBytes": 262144, "maxQueueDepth": 128,
+               "maxConcurrentRequests": 1}}
+    lines = ['import {ConfigMap, Controller, Deployment, useConfigMap} from "@reakt/kubernetes";',
+             'function Workload() {',
+             'const input = useConfigMap(' + json.dumps({"id": "input", "name": name + "-input", "namespace": NAMESPACE}) + ');',
+             'return <>' + ''.join(resources) + '</>;',
+             '}',
+             'export default <Controller {...' + json.dumps(options) + '}><Workload /></Controller>;']
     return "\n".join(lines) + "\n"
 
 
@@ -70,7 +75,7 @@ def prepare(output, domains, managed, image, server_image, interval):
         name = f"bench-{index}"
         root = output / name
         root.mkdir()
-        (root / "program.ts").write_text(source(name, managed, image))
+        (root / "program.tsx").write_text(source(name, managed, image))
         input_object = obj("ConfigMap", name + "-input", {"data": {"revision": "initial"}})
         input_object["metadata"]["labels"] = {"reconcile.fluxcd.io/watch": "Enabled"}
         common.append(input_object)

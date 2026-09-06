@@ -10,4 +10,4 @@ export type {
 export type {
   ConfigMapDefinition, DeploymentDefinition, ServiceDefinition, ContainerDefinition,
   ObjectMetadata, DomainBudgets, DomainOptions, ReaktIR,
-} from "./legacy.ts";
+} from "./model.ts";

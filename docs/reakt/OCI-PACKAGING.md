@@ -4,13 +4,13 @@ This path prepares dependencies with Cargo and delegates image creation to Docke
 
 ```sh
 bash scripts/reakt/package-oci.sh prepare \
-  --artifact work/reakt-native-final-v3 \
+  --artifact work/reakt-native \
   --output work/reakt-oci-context
 
 bash scripts/reakt/package-oci.sh verify --context work/reakt-oci-context
 ```
 
-Preparation first invokes the existing Reakt artifact verifier. It requires the artifact's recorded `controller/Cargo.lock`, preserves its exact bytes, snapshots the current trusted `compiler-core` and `runtime` sources, and relocates the generated manifest's single runtime path into the context. It copies no kubeconfig, credential store, JavaScript source evaluator, legacy renderer, Cargo cache, or unrelated workspace source.
+Preparation first invokes the existing artifact verifier. It requires the artifact's recorded `controller/Cargo.lock`, preserves its exact bytes, snapshots the current trusted `compiler-core` and `runtime` sources, and relocates the generated manifest's single runtime path into the context. It copies no kubeconfig, credential store, JavaScript source evaluator, Cargo cache, or unrelated workspace source.
 
 `cargo vendor --locked --offline --versioned-dirs` prepares the registry dependency closure from the existing local Cargo cache. Cargo validates checksums and writes its own source-replacement configuration. A subsequent locked offline `cargo metadata` verifies resolution from the prepared context. Missing cached dependencies or an outdated artifact lock fail preparation; there is no automatic fetch, lock update, or network fallback. Rebuild the native artifact after runtime dependency changes before preparing it again.
 
@@ -39,18 +39,6 @@ The runtime image must already be cached, match the builder's platform, and supp
 The two-stage Dockerfile runs `cargo build --frozen --release` with vendored dependencies and `RUN --network=none`. The final image receives only the generated native binary from the build stage, uses UID/GID 65532, and embeds the validated IR in that binary. Runtime fixture configuration must be provided separately at the explicitly configured file path. The script requests BuildKit's standard OCI archive exporter and metadata output; it never pushes an image. The selected BuildKit driver must support that exporter and already have access to the pinned base-image contents.
 
 Both the build invocation and its Cargo RUN steps disable build-step networking. These flags do not by themselves prove that BuildKit's source/metadata resolver made no external requests. Whole-process egress isolation and production deployment authorization require separate evidence. Reproducible image builds, candidate provenance verification, and containerized reconciliation have separate receipts; consult STATUS.md for their current verification boundaries. A prepared context or successful image export must not be reported as satisfying them.
-
-## Historical packaging integration
-
-Eight packaging regression tests pass, including embedded-IR relabeling, changed build inputs, and receipt binding to the initial snapshot. Bash syntax passes.
-
-After a separate `cargo fetch --locked` dependency-preparation step, `prepare` succeeded offline for `work/reakt-native-final-v3`. The final context is `work/reakt-oci-context-v3`. Cargo vendoring and locked metadata resolution completed; both pre-build and post-build context/IR verification passed.
-
-BuildKit compiled the Linux arm64 release binary using `--frozen` and disabled build-step networking, then exported `work/reakt-oci-image-v3/controller.oci.tar` (13 MB). The loaded image identity is `sha256:02979aa498f9ef64979b2eb9ac2094227717779f58fd528464e10252799bbb3d`; it runs as UID/GID 65532 and retains the blocked-release label.
-
-The image started with `--network none --read-only --cap-drop ALL --security-opt no-new-privileges`, then exited with the expected `REAKT_RUNTIME_CONFIG_PATH is required` error. This verifies the Linux executable and runtime loader. The 14-case Kubernetes smoke suite separately exercised the host-native build, not this container image. Neither result authorizes production deployment.
-
-Evidence logs are under `work/reakt-migration/oci-prepare-v3.log`, `oci-build-v3.log`, and `oci-startup-v3.log`; packaging receipts are alongside the OCI archive. BuildKit emitted warnings for required base-image arguments having no Dockerfile defaults; the wrapper supplied both digest-pinned images explicitly.
 
 ## Complete CLI build
 

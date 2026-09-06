@@ -84,7 +84,7 @@ impl PlatformClient {
             stored
                 .plan
                 .request
-                .predecessor()?
+                .predecessor()
                 .map(|generation| generation.allocation.generation_id.as_str()),
             &snapshot,
             previous.as_ref(),

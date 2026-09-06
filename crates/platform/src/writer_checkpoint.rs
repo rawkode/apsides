@@ -206,10 +206,7 @@ impl WriterCheckpoint {
         ]
         .iter()
         .all(|value| valid_digest(value))
-            || allocation
-                .inventory_metadata_digest
-                .as_ref()
-                .is_none_or(|value| !valid_digest(value))
+            || !valid_digest(&allocation.inventory_metadata_digest)
             || binding.controller_image.len() > 4096
             || !binding
                 .controller_image

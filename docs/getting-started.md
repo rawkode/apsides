@@ -1,6 +1,6 @@
 ---
 title: Getting started
-description: Compile and inspect the checked-in Reakt example locally.
+description: Compile and inspect the checked-in Apsides example locally.
 ---
 
 This path compiles and inspects the checked-in TypeScript example. It does not

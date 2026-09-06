@@ -96,7 +96,6 @@ async fn row_count(path: &std::path::Path, table: &str) -> TestResult<i64> {
     let database = libsql::Builder::new_local(path).build().await?;
     let connection = database.connect()?;
     let query = match table {
-        "reakt_coordination_reviews" => "SELECT count(*) FROM reakt_coordination_reviews",
         "reakt_coordination_review_objects" => {
             "SELECT count(*) FROM reakt_coordination_review_objects"
         }
@@ -108,54 +107,6 @@ async fn row_count(path: &std::path::Path, table: &str) -> TestResult<i64> {
         .await?
         .ok_or("review count row missing")?
         .get::<i64>(0)?)
-}
-
-async fn create_legacy_database(
-    path: &std::path::Path,
-    metadata: Option<&ReviewMetadataV1>,
-) -> TestResult {
-    let database = libsql::Builder::new_local(path).build().await?;
-    let connection = database.connect()?;
-    connection
-        .execute_batch(
-            "CREATE TABLE reakt_coordination_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);\
-             INSERT INTO reakt_coordination_schema VALUES (1,1);\
-             CREATE TABLE reakt_coordination_claims (digest TEXT PRIMARY KEY, metadata BLOB NOT NULL);\
-             CREATE TABLE reakt_coordination_audits (digest TEXT PRIMARY KEY, metadata BLOB NOT NULL);\
-             CREATE TABLE reakt_coordination_reviews (\
-             registry_uid TEXT NOT NULL,cluster_binding TEXT NOT NULL,\
-             control_namespace TEXT NOT NULL,workload_namespace TEXT NOT NULL,\
-             domain_id TEXT NOT NULL,transition_id TEXT NOT NULL,\
-             sequence TEXT NOT NULL,digest TEXT NOT NULL,metadata BLOB NOT NULL,\
-             PRIMARY KEY (registry_uid,cluster_binding,control_namespace,\
-             workload_namespace,domain_id,transition_id));",
-        )
-        .await?;
-    if let Some(metadata) = metadata {
-        let reference = metadata.reference()?;
-        let scope = &reference.scope;
-        let claims = &scope.claim_scope;
-        connection
-            .execute(
-                "INSERT INTO reakt_coordination_reviews(\
-                 registry_uid,cluster_binding,control_namespace,workload_namespace,\
-                 domain_id,transition_id,sequence,digest,metadata) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                libsql::params![
-                    claims.registry_uid.clone(),
-                    claims.cluster_binding.clone(),
-                    claims.control_namespace.clone(),
-                    claims.workload_namespace.clone(),
-                    scope.domain_id.clone(),
-                    scope.transition_id.clone(),
-                    scope.sequence.to_string(),
-                    reference.digest,
-                    compiler_core::canonical_bytes(metadata)?,
-                ],
-            )
-            .await?;
-    }
-    Ok(())
 }
 
 #[tokio::test]
@@ -417,110 +368,9 @@ async fn local_read_only_store_reads_without_creating_or_mutating_reviews() -> T
 }
 
 #[tokio::test]
-async fn read_only_legacy_review_is_compatible_without_creating_the_object_table() -> TestResult {
+async fn read_only_database_without_review_table_is_rejected_without_repair() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("legacy-coordination.db");
-    let metadata = review("policy-a")?;
-    let reference = metadata.reference()?;
-    create_legacy_database(&path, Some(&metadata)).await?;
-
-    let read_only = LibsqlCoordination::open_local_read_only(&path).await?;
-    assert_eq!(read_only.read_review(&reference).await?, Some(metadata));
-    assert!(matches!(
-        read_only.put_review(&review("policy-b")?).await,
-        Err(Error::Invalid("read-only coordination store"))
-    ));
-    assert_eq!(row_count(&path, "reakt_coordination_reviews").await?, 1);
-    let database = libsql::Builder::new_local(&path).build().await?;
-    let mut rows = database
-        .connect()?
-        .query(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' \
-             AND name='reakt_coordination_review_objects'",
-            (),
-        )
-        .await?;
-    let count = rows
-        .next()
-        .await?
-        .ok_or("object table count row missing")?
-        .get::<i64>(0)?;
-    assert_eq!(count, 0);
-    Ok(())
-}
-
-#[tokio::test]
-async fn legacy_and_new_reviews_for_one_scope_coexist_and_remain_readable() -> TestResult {
-    let directory = tempfile::tempdir()?;
-    let path = directory.path().join("coordination.db");
-    let legacy = review("policy-a")?;
-    let legacy_reference = legacy.reference()?;
-    create_legacy_database(&path, Some(&legacy)).await?;
-
-    let store = LibsqlCoordination::open_local(&path).await?;
-    assert_eq!(store.read_review(&legacy_reference).await?, Some(legacy));
-    assert_eq!(
-        store.put_review(&review("policy-a")?).await?,
-        legacy_reference
-    );
-    let current = review("policy-b")?;
-    let current_reference = store.put_review(&current).await?;
-    assert_ne!(current_reference, legacy_reference);
-    assert_eq!(store.read_review(&current_reference).await?, Some(current));
-    assert_eq!(row_count(&path, "reakt_coordination_reviews").await?, 1);
-    assert_eq!(
-        row_count(&path, "reakt_coordination_review_objects").await?,
-        2
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn corrupt_exact_legacy_review_cannot_be_shadowed_but_another_digest_is_allowed() -> TestResult
-{
-    let directory = tempfile::tempdir()?;
-    let path = directory.path().join("coordination.db");
-    let legacy = review("policy-a")?;
-    let legacy_reference = legacy.reference()?;
-    create_legacy_database(&path, Some(&legacy)).await?;
-    let database = libsql::Builder::new_local(&path).build().await?;
-    database
-        .connect()?
-        .execute(
-            "UPDATE reakt_coordination_reviews SET metadata=?1",
-            [format!("{{\"private\":\"{PRIVATE_CANARY}\"}}").into_bytes()],
-        )
-        .await?;
-
-    let store = LibsqlCoordination::open_local(&path).await?;
-    let Err(read_error) = store.read_review(&legacy_reference).await else {
-        return Err("corrupt exact legacy review was accepted".into());
-    };
-    private(&read_error);
-    let Err(write_error) = store.put_review(&legacy).await else {
-        return Err("corrupt exact legacy review was shadowed".into());
-    };
-    private(&write_error);
-    assert_eq!(
-        row_count(&path, "reakt_coordination_review_objects").await?,
-        0
-    );
-
-    let current = review("policy-b")?;
-    let current_reference = store.put_review(&current).await?;
-    assert_eq!(store.read_review(&current_reference).await?, Some(current));
-    assert_eq!(row_count(&path, "reakt_coordination_reviews").await?, 1);
-    assert_eq!(
-        row_count(&path, "reakt_coordination_review_objects").await?,
-        1
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn read_only_old_database_reports_no_review_tables_without_repair() -> TestResult {
-    let directory = tempfile::tempdir()?;
-    let path = directory.path().join("old-coordination.db");
+    let path = directory.path().join("missing-review-table.db");
     let database = libsql::Builder::new_local(&path).build().await?;
     database
         .connect()?
@@ -546,7 +396,7 @@ async fn read_only_old_database_reports_no_review_tables_without_repair() -> Tes
         .connect()?
         .query(
             "SELECT count(*) FROM sqlite_master WHERE type='table' \
-             AND name IN ('reakt_coordination_reviews','reakt_coordination_review_objects')",
+             AND name='reakt_coordination_review_objects'",
             (),
         )
         .await?;

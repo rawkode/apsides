@@ -89,7 +89,7 @@ fn valid_request(request: &DeploymentRequest) -> Result<()> {
     validate_generation_history(request)?;
     validate_ceiling(&request.next.compiled, &request.runtime_ceiling)?;
     let next = &request.next.compiled.ir.domain;
-    if let Some(previous) = request.predecessor()? {
+    if let Some(previous) = request.predecessor() {
         if previous.allocation.generation_id == request.next.generation_id {
             return Err(Error::Plan(
                 "activation must allocate a new generation even for rollback".into(),
@@ -131,14 +131,14 @@ fn allocation(request: &DeploymentRequest) -> Result<GenerationAllocation> {
         transition_id: transition_id.clone(),
         artifact_digest: generation.artifact_digest.clone(),
         ir_digest: generation.compiled.ir_digest.clone(),
-        inventory_metadata_digest: Some(crate::inventory_metadata_digest(&scope, &snapshot)?),
+        inventory_metadata_digest: crate::inventory_metadata_digest(&scope, &snapshot)?,
     })
 }
 
 fn validate_generation_history(request: &DeploymentRequest) -> Result<()> {
     let history = &request.registry.generation_history;
     let domain = &request.next.compiled.ir.domain;
-    let previous = request.predecessor()?;
+    let previous = request.predecessor();
     request
         .registry
         .next_sequence
@@ -207,7 +207,7 @@ fn claims<'a>(
     request: &'a DeploymentRequest,
     previous: &BTreeMap<ResourceIdentity, &inventory::TrackedResource>,
 ) -> Result<BTreeMap<ResourceIdentity, &'a ProtectedClaim>> {
-    let predecessor = request.predecessor()?;
+    let predecessor = request.predecessor();
     let mut claims = BTreeMap::new();
     for claim in &request.registry.claims {
         if !bounded_identity(&claim.identity) {
@@ -331,7 +331,7 @@ fn cleanup_allowed(capabilities: &[Capability], ceiling: &PermissionCeiling) -> 
 /// migrations, or permissions outside independently supplied platform ceilings.
 pub fn plan_transition(request: &DeploymentRequest) -> Result<TransitionPlan> {
     valid_request(request)?;
-    let predecessor = request.predecessor()?;
+    let predecessor = request.predecessor();
     let previous = predecessor
         .map(|previous| inventory_resources(&previous.inventory))
         .unwrap_or_default();

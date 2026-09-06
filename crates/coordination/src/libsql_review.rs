@@ -1,4 +1,4 @@
-//! Content-addressed review publication with read-only legacy receipt fallback.
+//! Strict content-addressed review publication and lookup.
 use super::LibsqlCoordination;
 use crate::{Error, MAX_REVIEW_METADATA_BYTES, Result, ReviewMetadataV1, ReviewRef, ReviewStore};
 use async_trait::async_trait;
@@ -18,65 +18,28 @@ CREATE TABLE IF NOT EXISTS reakt_coordination_review_objects (
  PRIMARY KEY (registry_uid,cluster_binding,control_namespace,workload_namespace,domain_id,transition_id,digest));
 ";
 
-#[derive(Clone, Copy)]
-enum ReviewTable {
-    Objects,
-    Legacy,
-}
+const TABLE: &str = "reakt_coordination_review_objects";
+const READ_QUERY: &str = "SELECT \
+ CASE WHEN typeof(sequence)='text' AND length(sequence)<=20 THEN sequence ELSE NULL END,\
+ CASE WHEN typeof(digest)='text' AND length(digest)=71 THEN digest ELSE NULL END,\
+ CASE WHEN typeof(metadata)='blob' AND length(metadata)<=?7 THEN metadata ELSE NULL END \
+ FROM reakt_coordination_review_objects \
+ WHERE registry_uid=?1 AND cluster_binding=?2 AND control_namespace=?3 \
+ AND workload_namespace=?4 AND domain_id=?5 AND transition_id=?6 AND digest=?8";
 
-impl ReviewTable {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Objects => "reakt_coordination_review_objects",
-            Self::Legacy => "reakt_coordination_reviews",
-        }
-    }
-
-    const fn schema_query(self) -> &'static str {
-        match self {
-            Self::Objects => "PRAGMA table_info(reakt_coordination_review_objects)",
-            Self::Legacy => "PRAGMA table_info(reakt_coordination_reviews)",
-        }
-    }
-
-    const fn read_query(self) -> &'static str {
-        match self {
-            Self::Objects => {
-                "SELECT \
-                CASE WHEN typeof(sequence)='text' AND length(sequence)<=20 THEN sequence ELSE NULL END,\
-                CASE WHEN typeof(digest)='text' AND length(digest)=71 THEN digest ELSE NULL END,\
-                CASE WHEN typeof(metadata)='blob' AND length(metadata)<=?7 THEN metadata ELSE NULL END \
-                FROM reakt_coordination_review_objects \
-                WHERE registry_uid=?1 AND cluster_binding=?2 AND control_namespace=?3 \
-                AND workload_namespace=?4 AND domain_id=?5 AND transition_id=?6 AND digest=?8"
-            }
-            Self::Legacy => {
-                "SELECT \
-                CASE WHEN typeof(sequence)='text' AND length(sequence)<=20 THEN sequence ELSE NULL END,\
-                CASE WHEN typeof(digest)='text' AND length(digest)=71 THEN digest ELSE NULL END,\
-                CASE WHEN typeof(metadata)='blob' AND length(metadata)<=?7 THEN metadata ELSE NULL END \
-                FROM reakt_coordination_reviews \
-                WHERE registry_uid=?1 AND cluster_binding=?2 AND control_namespace=?3 \
-                AND workload_namespace=?4 AND domain_id=?5 AND transition_id=?6 AND digest=?8"
-            }
-        }
-    }
-}
-
-/// Initialization requires the new object table but never creates a legacy table.
+/// Require the complete immutable object-table schema.
 pub(super) async fn validate_schema(connection: &Connection) -> Result<()> {
-    if !validate_if_present(connection, ReviewTable::Objects).await? {
+    if !validate_if_present(connection).await? {
         return Err(Error::Invalid("missing immutable review table"));
     }
-    validate_if_present(connection, ReviewTable::Legacy).await?;
     Ok(())
 }
 
-async fn validate_if_present(connection: &Connection, table: ReviewTable) -> Result<bool> {
+async fn validate_if_present(connection: &Connection) -> Result<bool> {
     let mut rows = connection
         .query(
             "SELECT type FROM sqlite_master WHERE name=:table_name",
-            named_params! { ":table_name": table.name() },
+            named_params! { ":table_name": TABLE },
         )
         .await
         .map_err(|_| Error::Backend("read review table presence"))?;
@@ -99,15 +62,11 @@ async fn validate_if_present(connection: &Connection, table: ReviewTable) -> Res
     {
         return Err(Error::Invalid("review table schema"));
     }
-    validate_table_schema(connection, table).await?;
+    validate_table_schema(connection).await?;
     Ok(true)
 }
 
-async fn validate_table_schema(connection: &Connection, table: ReviewTable) -> Result<()> {
-    let digest_key = match table {
-        ReviewTable::Objects => 7,
-        ReviewTable::Legacy => 0,
-    };
+async fn validate_table_schema(connection: &Connection) -> Result<()> {
     let expected = [
         ("registry_uid", "TEXT", 1),
         ("cluster_binding", "TEXT", 2),
@@ -116,11 +75,11 @@ async fn validate_table_schema(connection: &Connection, table: ReviewTable) -> R
         ("domain_id", "TEXT", 5),
         ("transition_id", "TEXT", 6),
         ("sequence", "TEXT", 0),
-        ("digest", "TEXT", digest_key),
+        ("digest", "TEXT", 7),
         ("metadata", "BLOB", 0),
     ];
     let mut rows = connection
-        .query(table.schema_query(), ())
+        .query("PRAGMA table_info(reakt_coordination_review_objects)", ())
         .await
         .map_err(|_| Error::Invalid("review table schema"))?;
     for (name, sql_type, primary_key) in expected {
@@ -246,28 +205,14 @@ async fn read_bytes(
     connection: &Connection,
     reference: &ReviewRef,
 ) -> Result<Option<(String, Vec<u8>)>> {
-    // Detect on every read: a read-only client can predate table provisioning.
-    // Validate both present schemas before accepting data from either one.
-    let objects = validate_if_present(connection, ReviewTable::Objects).await?;
-    let legacy = validate_if_present(connection, ReviewTable::Legacy).await?;
-    if !objects && !legacy {
-        return Err(Error::Invalid("missing immutable review table"));
-    }
-    if objects
-        && let Some(bytes) = read_table_bytes(connection, reference, ReviewTable::Objects).await?
-    {
-        return Ok(Some(bytes));
-    }
-    if legacy {
-        return read_table_bytes(connection, reference, ReviewTable::Legacy).await;
-    }
-    Ok(None)
+    // A read-only connection may predate provisioning; every read validates it.
+    validate_schema(connection).await?;
+    read_table_bytes(connection, reference).await
 }
 
 async fn read_table_bytes(
     connection: &Connection,
     reference: &ReviewRef,
-    table: ReviewTable,
 ) -> Result<Option<(String, Vec<u8>)>> {
     let limit = i64::try_from(MAX_REVIEW_METADATA_BYTES)
         .map_err(|_| Error::Invalid("review metadata bound"))?;
@@ -275,7 +220,7 @@ async fn read_table_bytes(
     let claims = &scope.claim_scope;
     let mut rows = connection
         .query(
-            table.read_query(),
+            READ_QUERY,
             params![
                 claims.registry_uid.clone(),
                 claims.cluster_binding.clone(),
