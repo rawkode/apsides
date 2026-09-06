@@ -4,6 +4,44 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
+#[test]
+fn cnpg_review_preserves_the_imported_api_mapping() -> TestResult {
+    let mut request = reservation_fixture()?.request;
+    let mut ir = serde_json::to_value(&request.next.compiled.ir)?;
+    let source = ir["resources"][0]["source"].clone();
+    ir["resources"] = json!([{
+        "id":"database", "apiVersion":"postgresql.cnpg.io/v1", "kind":"Cluster",
+        "apiResource":{"plural":"clusters", "scope":"Namespaced",
+            "schemaSha256":format!("sha256:{}", "a".repeat(64))},
+        "name":"database", "namespace":"workload",
+        "desired":{"apiVersion":"postgresql.cnpg.io/v1", "kind":"Cluster",
+            "metadata":{"name":"database", "namespace":"workload"},
+            "spec":{"instances":1, "storage":{"size":"1Gi"}}},
+        "lifecycle":{"deletionPolicy":"orphan"}, "source":source
+    }]);
+    ir["reactions"] = json!([]);
+    request.next.compiled = parse_and_validate(&ir.to_string())?;
+    let accepted = policy(&request.next.compiled);
+    request.runtime_ceiling = accepted.runtime_ceiling;
+    request.cleanup_ceiling = accepted.cleanup_ceiling;
+    let review = crate::project_review_metadata(&deploy::plan_transition(&request)?)?;
+    let resource = review.resources.first().ok_or("missing CNPG review")?;
+    let mapping = resource
+        .api_resource
+        .as_ref()
+        .ok_or("missing CRD mapping")?;
+    assert_eq!(resource.identity.api_group, "postgresql.cnpg.io");
+    assert_eq!(resource.identity.resource, "clusters");
+    assert_eq!(mapping.plural, "clusters");
+    assert_eq!(mapping.schema_sha256, format!("sha256:{}", "a".repeat(64)));
+    assert_eq!(
+        mapping.scope,
+        coordination::ReviewApiResourceScope::Namespaced
+    );
+    review.validate()?;
+    Ok(())
+}
+
 #[derive(Default)]
 struct CountingClaims {
     puts: AtomicUsize,

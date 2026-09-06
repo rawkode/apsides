@@ -88,6 +88,7 @@ fn risk(value: &str) -> bool {
             | "external-input-writers-influence-rollout"
             | "secret-read-authority"
             | "rollout-key-read-authority"
+            | "opaque-custom-resource-effects"
     ) {
         return true;
     }

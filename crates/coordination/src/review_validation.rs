@@ -1,6 +1,7 @@
 use super::{
-    MAX_REVIEW_DECLARATIONS, REVIEW_METADATA_SCHEMA, REVIEW_ROLLOUT_FIELD, ReviewMetadataV1,
-    ReviewOwnershipPlan,
+    MAX_REVIEW_DECLARATIONS, REVIEW_METADATA_SCHEMA, REVIEW_ROLLOUT_FIELD,
+    ReviewApiResourceMapping, ReviewApiResourceScope, ReviewMetadataV1, ReviewOwnershipPlan,
+    ReviewResource,
 };
 use super::{ReviewInputMode, ReviewSource};
 use crate::{Error, Result};
@@ -72,6 +73,40 @@ fn pointer(value: &str) -> bool {
     true
 }
 
+fn resource_api(resource: &ReviewResource) -> Result<compiler_core::ResolvedApiResource> {
+    if resource.kind == "Secret" {
+        return Err(Error::Invalid("review resource API"));
+    }
+    let builtin = match resource.kind.as_str() {
+        "ConfigMap" => Some(("v1", "", "configmaps")),
+        "Service" => Some(("v1", "", "services")),
+        "Deployment" => Some(("apps/v1", "apps", "deployments")),
+        _ => None,
+    };
+    let (api_group, plural) = match (builtin, &resource.api_resource) {
+        (Some((api_version, api_group, plural)), None) if resource.api_version == api_version => {
+            (api_group, plural)
+        }
+        (
+            None,
+            Some(ReviewApiResourceMapping {
+                plural,
+                scope: ReviewApiResourceScope::Namespaced,
+                schema_sha256,
+            }),
+        ) if super::encoding::valid_digest(schema_sha256) => {
+            let api_group = resource
+                .api_version
+                .split_once('/')
+                .map_or("", |(group, _)| group);
+            (api_group, plural.as_str())
+        }
+        _ => return Err(Error::Invalid("review resource API")),
+    };
+    compiler_core::resolve_namespaced_api(&resource.api_version, &resource.kind, api_group, plural)
+        .map_err(|_| Error::Invalid("review resource API"))
+}
+
 pub(super) fn validate(value: &ReviewMetadataV1) -> Result<()> {
     require(
         value.schema_version == REVIEW_METADATA_SCHEMA
@@ -86,18 +121,13 @@ pub(super) fn validate(value: &ReviewMetadataV1) -> Result<()> {
     let mut approval_names = BTreeSet::new();
     for resource in &value.resources {
         let identity = &resource.identity;
-        let mapping = match (resource.api_version.as_str(), resource.kind.as_str()) {
-            ("v1", "ConfigMap") => ("", "configmaps"),
-            ("v1", "Service") => ("", "services"),
-            ("apps/v1", "Deployment") => ("apps", "deployments"),
-            _ => return Err(Error::Invalid("review resource API")),
-        };
+        let mapping = resource_api(resource)?;
         require(
             namespace(&resource.id)
                 && ids.insert(&resource.id, resource).is_none()
                 && previous_identity.is_none_or(|old| old < identity)
-                && identity.api_group == mapping.0
-                && identity.resource == mapping.1
+                && identity.api_group == mapping.api_group
+                && identity.resource == mapping.plural
                 && identity.namespace == scope.workload_namespace
                 && name(&identity.name)
                 && source(&resource.source)

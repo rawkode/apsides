@@ -226,6 +226,7 @@ fn same_declaration(before: &ReviewResource, after: &ReviewResource) -> bool {
         && before.identity == after.identity
         && before.api_version == after.api_version
         && before.kind == after.kind
+        && before.api_resource == after.api_resource
         && before.apply_fields == after.apply_fields
         && before.lifecycle == after.lifecycle
         && before.force == after.force
@@ -342,6 +343,26 @@ fn identity(identity: &ResourceIdentity) -> ReviewIdentity {
 mod tests {
     use super::*;
 
+    #[test]
+    fn imported_schema_change_is_a_declaration_change() {
+        let mut before = declaration("database", "database");
+        before.api_version = "postgresql.cnpg.io/v1".into();
+        before.kind = "Cluster".into();
+        before.identity.api_group = "postgresql.cnpg.io".into();
+        before.identity.resource = "clusters".into();
+        before.api_resource = Some(coordination::ReviewApiResourceMapping {
+            plural: "clusters".into(),
+            scope: coordination::ReviewApiResourceScope::Namespaced,
+            schema_sha256: format!("sha256:{}", "a".repeat(64)),
+        });
+        let mut after = before.clone();
+        assert!(same_declaration(&before, &after));
+        if let Some(mapping) = &mut after.api_resource {
+            mapping.schema_sha256 = format!("sha256:{}", "b".repeat(64));
+        }
+        assert!(!same_declaration(&before, &after));
+    }
+
     fn declaration(name: &str, id: &str) -> ReviewResource {
         ReviewResource {
             id: id.into(),
@@ -352,6 +373,7 @@ mod tests {
                 name: name.into(),
             },
             api_version: "v1".into(),
+            api_resource: None,
             kind: "ConfigMap".into(),
             apply_fields: vec!["/data/shared".into()],
             lifecycle: ReviewLifecycle {

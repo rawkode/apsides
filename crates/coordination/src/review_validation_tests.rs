@@ -1,5 +1,20 @@
 use super::*;
 
+#[test]
+fn custom_resource_risk_requires_explicit_ceiling_acceptance() -> Result<()> {
+    let mut value = metadata()?;
+    let risk = "opaque-custom-resource-effects".to_string();
+    value.enforcement.indirect_risks = vec![risk.clone()];
+    assert!(value.validate().is_err());
+    value.enforcement.runtime_ceiling.accepted_indirect_risks = vec![risk];
+    value.validate()?;
+    value.enforcement.indirect_risks = vec!["unknown-custom-resource-risk".into()];
+    value.enforcement.runtime_ceiling.accepted_indirect_risks =
+        value.enforcement.indirect_risks.clone();
+    assert!(value.validate().is_err());
+    Ok(())
+}
+
 fn metadata() -> Result<ReviewMetadataV1> {
     let claim_scope = ClaimScope {
         registry_uid: "11111111-1111-4111-8111-111111111111".into(),
@@ -64,6 +79,7 @@ fn resource(name: &str) -> ReviewResource {
         },
         api_version: "v1".into(),
         kind: "ConfigMap".into(),
+        api_resource: None,
         apply_fields: vec!["/data/key".into()],
         lifecycle: ReviewLifecycle {
             deletion_policy: ReviewDeletionPolicy::Orphan,
@@ -76,6 +92,95 @@ fn resource(name: &str) -> ReviewResource {
         },
         ownership_plan: ReviewOwnershipPlan::CreateIfAbsent,
     }
+}
+
+fn custom_resource() -> ReviewResource {
+    let mut value = resource("database");
+    value.identity.api_group = "postgresql.cnpg.io".into();
+    value.identity.resource = "clusters".into();
+    value.api_version = "postgresql.cnpg.io/v1".into();
+    value.kind = "Cluster".into();
+    value.api_resource = Some(ReviewApiResourceMapping {
+        plural: "clusters".into(),
+        scope: ReviewApiResourceScope::Namespaced,
+        schema_sha256: format!("sha256:{}", "a".repeat(64)),
+    });
+    value.apply_fields = vec!["/spec/instances".into()];
+    value
+}
+
+#[test]
+fn custom_resource_mapping_is_explicit_and_exact() -> Result<()> {
+    let mut value = metadata()?;
+    value.resources = vec![custom_resource()];
+    value.validate()?;
+
+    let mut invalid = value.clone();
+    invalid.resources[0].kind = "Secret".into();
+    assert!(invalid.validate().is_err());
+
+    invalid = value.clone();
+    invalid.resources[0].api_resource = None;
+    assert!(invalid.validate().is_err());
+
+    invalid = value.clone();
+    invalid.resources[0]
+        .api_resource
+        .as_mut()
+        .ok_or(Error::Invalid("test custom mapping"))?
+        .plural = "databases".into();
+    assert!(invalid.validate().is_err());
+
+    invalid = value.clone();
+    invalid.resources[0]
+        .api_resource
+        .as_mut()
+        .ok_or(Error::Invalid("test custom mapping"))?
+        .plural = "Clusters".into();
+    invalid.resources[0].identity.resource = "Clusters".into();
+    assert!(invalid.validate().is_err());
+
+    invalid = value.clone();
+    invalid.resources[0]
+        .api_resource
+        .as_mut()
+        .ok_or(Error::Invalid("test custom mapping"))?
+        .schema_sha256 = format!("sha256:{}", "A".repeat(64));
+    assert!(invalid.validate().is_err());
+
+    invalid = value.clone();
+    invalid.resources[0].api_version = "other.example/v1".into();
+    assert!(invalid.validate().is_err());
+
+    invalid = value.clone();
+    invalid.resources[0].identity.api_group = "other.example".into();
+    assert!(invalid.validate().is_err());
+
+    invalid = value.clone();
+    invalid.resources[0].api_version = "v1".into();
+    invalid.resources[0].identity.api_group.clear();
+    assert!(invalid.validate().is_err());
+
+    invalid = value.clone();
+    invalid.resources[0].api_resource = Some(ReviewApiResourceMapping {
+        plural: "configmaps".into(),
+        scope: ReviewApiResourceScope::Namespaced,
+        schema_sha256: format!("sha256:{}", "a".repeat(64)),
+    });
+    invalid.resources[0].api_version = "v1".into();
+    invalid.resources[0].kind = "ConfigMap".into();
+    invalid.resources[0].identity.api_group.clear();
+    invalid.resources[0].identity.resource = "configmaps".into();
+    assert!(invalid.validate().is_err());
+
+    let mut encoded =
+        serde_json::to_value(custom_resource()).map_err(|_| Error::Invalid("test encoding"))?;
+    encoded["apiResource"]["scope"] = serde_json::json!("Cluster");
+    assert!(serde_json::from_value::<ReviewResource>(encoded).is_err());
+    let encoded =
+        serde_json::to_value(resource("builtin")).map_err(|_| Error::Invalid("test encoding"))?;
+    assert!(encoded.get("apiResource").is_none());
+    Ok(())
 }
 
 #[test]

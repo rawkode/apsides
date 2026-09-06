@@ -55,6 +55,17 @@ pub enum ReviewOwnershipPlan {
         observed_resource_version: String,
     },
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewApiResourceScope {
+    Namespaced,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewApiResourceMapping {
+    pub plural: String,
+    pub scope: ReviewApiResourceScope,
+    pub schema_sha256: String,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReviewResource {
@@ -62,6 +73,8 @@ pub struct ReviewResource {
     pub identity: ReviewIdentity,
     pub api_version: String,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_resource: Option<ReviewApiResourceMapping>,
     pub apply_fields: Vec<String>,
     pub lifecycle: ReviewLifecycle,
     pub force: bool,

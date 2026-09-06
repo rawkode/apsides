@@ -68,6 +68,17 @@ pub(super) fn project(plan: &TransitionPlan) -> Result<Declarations> {
             identity,
             api_version: resource.api_version.clone(),
             kind: resource.kind.clone(),
+            api_resource: resource.api_resource.as_ref().map(|mapping| {
+                coordination::ReviewApiResourceMapping {
+                    plural: mapping.plural.clone(),
+                    scope: match mapping.scope {
+                        compiler_core::ApiResourceScope::Namespaced => {
+                            coordination::ReviewApiResourceScope::Namespaced
+                        }
+                    },
+                    schema_sha256: mapping.schema_sha256.clone(),
+                }
+            }),
             apply_fields: effects
                 .apply
                 .get(resource.id.as_str())

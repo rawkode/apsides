@@ -66,6 +66,7 @@ fn resource(name: &str) -> ReviewResource {
             name: name.into(),
         },
         api_version: "v1".into(),
+        api_resource: None,
         kind: "ConfigMap".into(),
         apply_fields: vec!["/data/key".into()],
         lifecycle: ReviewLifecycle {
