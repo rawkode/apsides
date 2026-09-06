@@ -4,6 +4,28 @@ Reakt implements specification 0.2 in the workspace crates and the `@reakt/kuber
 
 ## Current integration checkpoint
 
+Declared-input isolation now has a real production-subject qualification from
+commit `026ad98`. The normal CLI baseline before and after the probes matched the
+previously measured production IR and authoring compiler closure. All seven
+probes passed: a declared dependency compiled; the same physical dependency
+omitted from the lock rejected; clock/random access rejected; environment,
+filesystem and network guest capabilities were absent. The initial run exposed
+incorrect compact source-lock serialization in the producer; the runner now
+writes the compiler's required canonical indented format. Five orchestration
+tests pass, including the corrected encoding check.
+
+Evidence is under `work/input-isolation-canonical/`. The real CLI assembled it
+together with reproducibility evidence in
+`work/input-isolation-assembly-026ad98/release`, rejecting differing duplicate
+evidence files during staging. Both explicitly invoked Rust consumers passed
+one test each (`work/input-isolation-consumer.log` and
+`work/input-isolation-repro-consumer.log`). This establishes producer, package and
+consumer interoperability for these two checks. Capability absence probes do
+not independently test host syscalls or network enforcement. Fourteen other
+required checks, reactor coverage and production release promotion remain open.
+Independent review checked the real probe outcomes, baseline IR, source locks,
+payload subjects and every packaged evidence digest and found no blockers.
+
 The corrected producer passed a fresh two-build run from commit `3a45749`, and
 the real CLI assembled its flat evidence directory into a release. The Rust
 consumer then validated the assembled payload and reproducibility receipt
