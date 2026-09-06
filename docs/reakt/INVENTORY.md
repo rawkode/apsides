@@ -75,6 +75,16 @@ A fresh read-only handle verifies absence, then removing the injected failure
 permits an exact, idempotent retry. This covers returned statement errors, not
 process termination, failed commits, remote storage or cross-store atomicity.
 
+Separate Unix process-crash tests kill and reap an owned child for each local
+claim, review and audit table. Before SIGKILL, the child verifies exact candidate
+bytes inside a raw immediate transaction and a populated rollback journal under
+DELETE/FULL durability settings. It also deletes committed synthetic filler rows
+to exercise cache spill. Writable recovery followed by public read-only access
+verifies prior records, candidate absence and restored row counts. Two exact
+public retries and readback then succeed. These tests qualify local rollback of
+the test-owned transaction; they do not interrupt the public publication method
+or qualify uncertain commits, persistent volumes, node loss or remote storage.
+
 ## Upgrade use
 
 Cleanup uses the predecessor inventory's UID and deletion policy together with

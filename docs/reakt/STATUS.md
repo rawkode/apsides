@@ -140,7 +140,7 @@ Pod. Competing coordination writers also passed: identical claims were idempoten
 distinct reviews coexisted, and one immutable audit candidate won while the other
 received the exact conflict error. A fresh read-only Pod verified seed and race
 records. This does not prove transaction overlap or cross-store atomicity;
-interrupted coordination writes remain unqualified.
+interrupted coordination writes on persistent volumes remain unqualified.
 
 Local statement-failure tests exercise all three public coordination write methods.
 An injected failure after insertion must return a static error, leave the new
@@ -148,6 +148,12 @@ record absent on reopen, preserve existing references and allow an exact retry.
 A raw SQL control verifies that the fault leaves the inserted row inside its
 transaction until rollback. These tests cover returned insert errors and cleanup;
 they do not qualify process interruption or an uncertain commit outcome.
+Separate Unix tests passed SIGKILL and reaping of a raw transaction for each
+coordination table with an observed populated rollback journal. Writable recovery
+followed by public read-only checks preserved prior records, removed the candidate
+and restored deleted synthetic row counts; exact public retries succeeded. This
+is local SQLite transaction recovery, not interruption inside the public write
+method, persistent-volume failure, remote recovery or cross-store atomicity.
 
 Local filesystem tests cover one libSQL `VACUUM INTO` backup containing all four
 stores, exact read-only verification, retained inventory history, exclusion of
