@@ -168,11 +168,16 @@ impl PlatformClient {
         }
         let hydrated = written.value.hydrate(&snapshot)?;
         self.validate_registry_allocations(&hydrated)?;
-        Ok(Versioned {
+        let written = Versioned {
             value: hydrated,
             uid: written.uid,
             resource_version: written.resource_version,
-        })
+        };
+        #[cfg(all(test, feature = "test-support"))]
+        if let Some(pause) = &self.phase_pause {
+            pause.after_persistence(previous, &written).await;
+        }
+        Ok(written)
     }
 
     #[cfg(feature = "deployer")]

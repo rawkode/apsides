@@ -26,6 +26,10 @@ mod evidence_profile;
 mod executor_binding;
 pub use executor_binding::{EXECUTOR_BINDING_SCHEMA, ExecutorBinding};
 mod permissions;
+#[cfg(all(test, feature = "test-support"))]
+mod phase_interruption;
+#[cfg(all(test, feature = "test-support"))]
+mod phase_interruption_live;
 #[cfg(feature = "deployer")]
 mod preview_adapter;
 #[cfg(all(test, feature = "test-support"))]

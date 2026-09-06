@@ -22,6 +22,8 @@ mod capacity_topology;
 mod event_capacity;
 #[cfg(feature = "deployer")]
 mod executor_binding;
+#[cfg(feature = "test-support")]
+mod phase_interruption;
 
 const REGISTRY_UID: &str = "11111111-1111-4111-8111-111111111111";
 const GENERATION_A: &str = "gceirceircfardairceirceirce-1";

@@ -9,6 +9,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import selectors
+import signal
 import subprocess
 import shutil
 import time
@@ -18,6 +20,15 @@ ROOT = Path(__file__).resolve().parents[2]
 NODE = "kindest/node:v1.34.3@sha256:08497ee19eace7b4b5348db5c6a1591d7752b164530a36f855cb0f2bdcbadd48"
 CONTROL, WORKLOAD, DOMAIN = "reakt-test-control", "reakt-test-workload", "lifecycle"
 BINDING = "reakt-disposable-test"
+INTERRUPTION_PHASES = ("Planned", "Staged", "Quiesced", "Activated", "Cleaning", "Committed")
+PHASE_ACTIONS = {
+    "Planned": "reserve",
+    "Staged": "stage",
+    "Quiesced": "quiesce",
+    "Activated": "activate",
+    "Cleaning": "activate",
+    "Committed": "commit",
+}
 
 
 def runtime_ceiling(plan):
@@ -43,6 +54,44 @@ def digest(value):
     return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def parse_checkpoint(line):
+    prefix = "REAKT_TEST_CHECKPOINT="
+    if not line.startswith(prefix):
+        return None
+    if len(line) > 8192:
+        raise RuntimeError("phase-interruption checkpoint exceeds its bound")
+    try:
+        checkpoint = json.loads(line[len(prefix):])
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("phase-interruption checkpoint is malformed") from error
+    if (not isinstance(checkpoint, dict)
+            or set(checkpoint) != {"registryUid", "registryResourceVersion", "transition", "phase"}
+            or checkpoint.get("phase") not in INTERRUPTION_PHASES
+            or any(not isinstance(value, str) or not value or len(value) > 1024
+                   or any(character.isprintable() is False for character in value)
+                   for value in checkpoint.values())):
+        raise RuntimeError("phase-interruption checkpoint is invalid")
+    return checkpoint
+
+
+def parse_checkpoint_error(line):
+    prefix = "REAKT_TEST_ERROR="
+    if not line.startswith(prefix):
+        return None
+    if len(line) > 1024:
+        raise RuntimeError("phase-interruption error record exceeds its bound")
+    try:
+        record = json.loads(line[len(prefix):])
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("phase-interruption error record is malformed") from error
+    if (not isinstance(record, dict) or set(record) != {"pending", "kind"}
+            or not isinstance(record.get("pending"), bool)
+            or record.get("kind") not in ("platform-pending", "other")
+            or (record["pending"] is True) != (record["kind"] == "platform-pending")):
+        raise RuntimeError("phase-interruption error record is invalid")
+    return record
+
+
 class LifecycleRunner:
     def __init__(self, args):
         self.args = args
@@ -56,6 +105,7 @@ class LifecycleRunner:
         self.allocations = {}
         self.created = False
         self.adopted_uid = None
+        self.interrupt_after_phase = getattr(args, "interrupt_after_phase", None)
         self.candidates = [args.first.resolve(), args.second.resolve()]
         self.manifests = [json.loads((p / "release.json").read_text()) for p in self.candidates]
         scopes = [json.loads((p / "ir.json").read_text())["domain"] for p in self.candidates]
@@ -103,6 +153,24 @@ class LifecycleRunner:
         shutil.copy2(executables[0], self.driver)
         (self.output / "driver.json").write_text(json.dumps({"sha256": "sha256:" + hashlib.sha256(self.driver.read_bytes()).hexdigest(),
                                                            "scope": "frozen test-support executable; not a production release"}, indent=2))
+        if self.interrupt_after_phase:
+            self.prepare_checkpoint_driver()
+
+    def prepare_checkpoint_driver(self):
+        result = self.command(["cargo", "test", "-p", "platform", "--features", "test-support", "--lib",
+                               "--locked", "--offline", "--no-run", "--message-format=json"], timeout=240)
+        executables = [row["executable"] for line in result.stdout.splitlines()
+                       if (row := json.loads(line)).get("reason") == "compiler-artifact"
+                       and row.get("target", {}).get("name") == "platform"
+                       and "lib" in row.get("target", {}).get("kind", []) and row.get("executable")]
+        if len(executables) != 1:
+            raise RuntimeError("Cargo did not identify exactly one phase-interruption driver")
+        self.checkpoint_driver = self.output / "platform-phase-checkpoint-runner"
+        shutil.copy2(executables[0], self.checkpoint_driver)
+        (self.output / "checkpoint-driver.json").write_text(json.dumps({
+            "sha256": "sha256:" + hashlib.sha256(self.checkpoint_driver.read_bytes()).hexdigest(),
+            "scope": "frozen private test-support phase-boundary executable; not production code",
+        }, indent=2))
 
     def cluster_names(self):
         result = self.command(["kind", "get", "clusters"], check=False)
@@ -188,6 +256,7 @@ class LifecycleRunner:
             "apiVersion": "v1", "kind": "ConfigMap",
             "metadata": {"name": registry_name, "namespace": self.control},
         })).stdout)
+        self.registry_uid = registry["metadata"]["uid"]
         self.apply({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "reakt-platform"}})
         authority_name = "reakt-registry-authority." + self.control + "." + self.workload
         if self.get("configmap", authority_name, "reakt-platform"):
@@ -316,6 +385,19 @@ class LifecycleRunner:
             raise RuntimeError("failed to read authenticated claim snapshot")
         return records[0]
 
+    def committed_inventory(self, candidate, transition):
+        path = self.output / "inventory.json"
+        path.write_text(json.dumps({
+            "artifact": str(candidate), "transition": transition,
+            "action": "inventory", "target": self.target,
+        }))
+        result = self.cargo("candidate_transition_step", env=self.driver_environment(path, self.issuer))
+        records = [json.loads(line.split("=", 1)[1]) for line in result.stdout.splitlines()
+                   if line.startswith("REAKT_TEST_INVENTORY=")]
+        if result.returncode or len(records) != 1 or set(records[0]) != {"generation", "snapshotId"}:
+            raise RuntimeError("failed to read authenticated committed inventory")
+        return records[0]
+
     def allocation(self, candidate, alias):
         if alias not in self.allocations:
             path = self.output / "allocation.json"
@@ -373,6 +455,291 @@ class LifecycleRunner:
             if not records or not records[-1].get("pending") or time.monotonic() >= deadline:
                 raise RuntimeError(result.stdout[-3500:] + result.stderr[-1500:])
             time.sleep(1)
+
+    def checkpoint_step(self, candidate, transition, phase, timeout=120):
+        if phase not in INTERRUPTION_PHASES:
+            raise RuntimeError("unsupported lifecycle interruption phase")
+        allocation = self.allocation(candidate, transition)
+        path = self.output / "checkpoint-step.json"
+        path.write_text(json.dumps({
+            "artifact": str(candidate), "transition": allocation["transition"],
+            "action": PHASE_ACTIONS[phase], "target": self.target,
+            "ownershipIntents": [],
+            "pauseAfterPhase": {"registryUid": self.registry_uid, "phase": phase},
+        }))
+        environment = self.driver_environment(path, self.issuer)
+        deadline = time.monotonic() + timeout
+        pending_attempts = 0
+        while True:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("phase-interruption pending retries exceeded deadline")
+            process = subprocess.Popen(
+                [str(self.checkpoint_driver), "--ignored", "--exact",
+                 "phase_interruption_live::candidate_transition_checkpoint", "--nocapture"],
+                cwd=ROOT, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                bufsize=0,
+            )
+            try:
+                outcome, record = self.await_checkpoint(process, max(0, deadline - time.monotonic()))
+                if outcome == "error":
+                    self.reap_checkpoint_error(process, max(0, deadline - time.monotonic()))
+                    if record != {"pending": True, "kind": "platform-pending"}:
+                        raise RuntimeError("phase-interruption driver failed before checkpoint")
+                    pending_attempts += 1
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("phase-interruption pending retries exceeded deadline")
+                    time.sleep(1)
+                    continue
+                evidence = self.validate_checkpoint(record, allocation, phase)
+                returncode = self.kill_and_reap_checkpoint(process)
+                break
+            except Exception:
+                if process.poll() is None:
+                    self.kill_and_reap_checkpoint(process)
+                raise
+        self.results.append({
+            "transition": transition, "action": PHASE_ACTIONS[phase],
+            "phaseInterruption": evidence, "exitCode": returncode,
+            "terminationSignal": "SIGKILL", "reaped": True,
+            "pendingAttempts": pending_attempts,
+        })
+        (self.output / "steps.json").write_text(json.dumps(self.results, indent=2))
+
+    @staticmethod
+    def interruption_action(phase):
+        try:
+            return PHASE_ACTIONS[phase]
+        except KeyError as error:
+            raise RuntimeError("unsupported lifecycle interruption phase") from error
+
+    @staticmethod
+    def await_checkpoint(process, timeout):
+        if process.stdout is None:
+            raise RuntimeError("phase-interruption driver output unavailable")
+        deadline = time.monotonic() + timeout
+        buffer = bytearray()
+        discarding = False
+        prefix = b"REAKT_TEST_CHECKPOINT="
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while time.monotonic() < deadline:
+                for key, _ in selector.select(min(1, max(0, deadline - time.monotonic()))):
+                    chunk = os.read(key.fileobj.fileno(), 4096)
+                    if not chunk:
+                        continue
+                    if discarding:
+                        newline = chunk.find(b"\n")
+                        if newline < 0:
+                            continue
+                        chunk = chunk[newline + 1:]
+                        discarding = False
+                    buffer.extend(chunk)
+                    while b"\n" in buffer:
+                        line, _, remaining = buffer.partition(b"\n")
+                        buffer = bytearray(remaining)
+                        if line.startswith(prefix) or line.startswith(b"REAKT_TEST_ERROR="):
+                            try:
+                                decoded = line.decode("utf-8")
+                            except UnicodeDecodeError as error:
+                                raise RuntimeError("phase-interruption checkpoint is malformed") from error
+                            checkpoint = parse_checkpoint(decoded)
+                            if checkpoint is not None:
+                                return "checkpoint", checkpoint
+                            error = parse_checkpoint_error(decoded)
+                            if error is not None:
+                                return "error", error
+                    if len(buffer) > 8192:
+                        if buffer.startswith(prefix):
+                            raise RuntimeError("phase-interruption checkpoint exceeds its bound")
+                        buffer.clear()
+                        discarding = True
+                if process.poll() is not None:
+                    raise RuntimeError("phase-interruption driver exited without a complete record")
+        raise RuntimeError("phase-interruption driver timed out before checkpoint")
+
+    @staticmethod
+    def reap_checkpoint_error(process, timeout):
+        try:
+            returncode = process.wait(timeout=min(10, timeout))
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("phase-interruption error attempt did not exit") from error
+        if returncode <= 0:
+            raise RuntimeError("phase-interruption error attempt did not exit with failure")
+        return returncode
+
+    @staticmethod
+    def kill_and_reap_checkpoint(process):
+        if process.poll() is not None:
+            raise RuntimeError("phase-interruption driver exited before owned SIGKILL")
+        process.kill()
+        try:
+            returncode = process.wait(timeout=10)
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("owned phase-interruption driver could not be reaped") from error
+        if returncode != -signal.SIGKILL:
+            raise RuntimeError("phase-interruption driver did not terminate by owned SIGKILL")
+        return returncode
+
+    def validate_checkpoint(self, checkpoint, allocation, phase):
+        transition = allocation["transition"]
+        expected = {
+            "registryUid": self.registry_uid,
+            "transition": transition,
+            "phase": phase,
+        }
+        if any(checkpoint.get(key) != value for key, value in expected.items()):
+            raise RuntimeError("phase-interruption checkpoint differs from requested boundary")
+        registry = self.get("configmap", "reakt-registry-" + self.workload, self.control)
+        if registry is None:
+            raise RuntimeError("protected registry missing at phase-interruption checkpoint")
+        metadata = registry.get("metadata", {})
+        if (metadata.get("uid") != checkpoint["registryUid"]
+                or metadata.get("resourceVersion") != checkpoint["registryResourceVersion"]):
+            raise RuntimeError("protected registry version differs from phase-interruption checkpoint")
+        try:
+            state = json.loads(registry["data"]["state.json"])
+            stored = state["transitions"][transition]
+            protected_allocation = stored["inputs"]["allocation"]
+            binding = stored["executorBinding"]
+            active = state["histories"][self.domain]["activeAllocation"]
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError("protected phase-interruption state is incomplete") from error
+        if (stored["record"]["phase"] != phase
+                or protected_allocation["transitionId"] != transition
+                or protected_allocation["generationId"] != allocation["generation"]
+                or protected_allocation["registryUid"] != self.registry_uid):
+            raise RuntimeError("protected transition allocation differs at interruption boundary")
+        scope = binding.get("scope", {})
+        if (binding.get("executorId") != "disposable-lifecycle-test"
+                or binding.get("transitionId") != transition
+                or binding.get("domainId") != self.domain
+                or binding.get("sequence") != protected_allocation.get("sequence")
+                or scope.get("registryUid") != self.registry_uid
+                or scope.get("clusterBinding") != self.binding
+                or scope.get("controlNamespace") != self.control
+                or scope.get("workloadNamespace") != self.workload):
+            raise RuntimeError("protected executor binding differs at interruption boundary")
+        previous = stored["inputs"].get("previous")
+        expected_active = protected_allocation if phase == "Committed" else previous["allocation"]
+        if active != expected_active:
+            raise RuntimeError("active allocation advanced at an invalid interruption phase")
+        staged_uids = stored.get("stagedIdentityUids")
+        if not isinstance(staged_uids, dict) or any(not value for value in staged_uids.values()):
+            raise RuntimeError("staged identity metadata is malformed at interruption boundary")
+        if phase == "Planned" and staged_uids:
+            raise RuntimeError("planned transition already contains staged identities")
+        if phase != "Planned" and not staged_uids:
+            raise RuntimeError("advanced transition lacks staged identity metadata")
+        claims = self.claims()
+        next_claims = [claim for claim in claims if claim.get("generationId") == allocation["generation"]]
+        if not next_claims or any(claim.get("transitionId") != transition for claim in next_claims):
+            raise RuntimeError("protected claims differ from interrupted allocation")
+        expected_state = "Active" if phase in ("Activated", "Cleaning", "Committed") else "Reserved"
+        if any(claim.get("state") != expected_state for claim in next_claims):
+            raise RuntimeError("protected next-generation claim state differs at interruption boundary")
+        successor = self.writer_observation(protected_allocation)
+        replicas = successor["replicas"]
+        if phase == "Planned" and successor["deploymentPresent"]:
+            raise RuntimeError("planned interruption unexpectedly has a staged writer")
+        if phase in ("Staged", "Quiesced", "Activated") and (replicas != 0 or successor["runningPods"]):
+            raise RuntimeError("new writer started before the cleaning phase")
+        if phase in ("Cleaning", "Committed") and (not isinstance(replicas, int) or replicas < 1):
+            raise RuntimeError("new writer did not start before the cleaning phase")
+        predecessor = self.writer_observation(previous["allocation"])
+        if phase in ("Planned", "Staged"):
+            if predecessor["replicas"] != 1 or predecessor["runningPods"] < 1:
+                raise RuntimeError("active predecessor writer disappeared before quiescence")
+        else:
+            expected_writers = stored.get("upgradeDrain", {}).get("runtimeWriters", {})
+            expected_uids = sorted(pod.get("uid") for pod in expected_writers.get("pods", []))
+            if (predecessor["replicas"] != 0 or predecessor["runningPods"]
+                    or not expected_uids or predecessor["podUids"] != expected_uids
+                    or predecessor["terminalPods"] != len(expected_uids)):
+                raise RuntimeError("predecessor writer termination differs from protected evidence")
+        self.interrupted_executor_binding = binding
+        self.interrupted_registry_resource_version = checkpoint["registryResourceVersion"]
+        return {
+            "phase": phase, "transition": transition,
+            "registryUid": checkpoint["registryUid"],
+            "registryResourceVersion": checkpoint["registryResourceVersion"],
+            "executor": "disposable-lifecycle-test", "sameExecutorResume": True,
+            "nextGenerationClaims": len(next_claims), "claimsWithUid": sum(claim.get("uid") is not None for claim in next_claims),
+            "stagedIdentityCount": len(staged_uids), "successorWriterReplicas": replicas,
+            "successorRunningPods": successor["runningPods"],
+            "predecessorWriterReplicas": predecessor["replicas"],
+            "predecessorRunningPods": predecessor["runningPods"],
+            "predecessorTerminalPods": predecessor["terminalPods"],
+            "scope": "verified post-CAS phase boundary followed by a fresh-token ordinary driver; not within-phase crash coverage",
+        }
+
+    def writer_observation(self, allocation):
+        deployment = self.get("deployment", allocation["serviceAccountName"], self.control)
+        response = json.loads(self.k(
+            "get", "pods", "-n", self.control,
+            "--field-selector", "spec.serviceAccountName=" + allocation["serviceAccountName"] + "-process",
+            "-o", "json",
+        ).stdout)
+        items = response.get("items")
+        if not isinstance(items, list) or len(items) > 64:
+            raise RuntimeError("writer Pod observation is malformed or unbounded")
+        uids, running, terminal = [], 0, 0
+        for pod in items:
+            metadata = pod.get("metadata", {})
+            uid = metadata.get("uid")
+            phase = pod.get("status", {}).get("phase")
+            if not isinstance(uid, str) or not uid:
+                raise RuntimeError("writer Pod observation lacks UID")
+            uids.append(uid)
+            running += phase == "Running"
+            if phase in ("Succeeded", "Failed"):
+                statuses = []
+                status = pod.get("status", {})
+                for key in ("containerStatuses", "initContainerStatuses", "ephemeralContainerStatuses"):
+                    statuses.extend(status.get(key, []))
+                if not statuses or any("terminated" not in item.get("state", {}) for item in statuses):
+                    raise RuntimeError("terminal writer Pod lacks terminated container evidence")
+                terminal += 1
+        if len(uids) != len(set(uids)):
+            raise RuntimeError("writer Pod observation contains duplicate UIDs")
+        return {
+            "deploymentPresent": deployment is not None,
+            "replicas": None if deployment is None else deployment.get("spec", {}).get("replicas"),
+            "podUids": sorted(uids), "runningPods": running, "terminalPods": terminal,
+        }
+
+    def verify_interrupted_completion(self, candidate, allocation):
+        registry = self.get("configmap", "reakt-registry-" + self.workload, self.control)
+        if registry is None:
+            raise RuntimeError("protected registry missing after interrupted transition recovery")
+        state = json.loads(registry["data"]["state.json"])
+        transition = state["transitions"][allocation["transition"]]
+        active = state["histories"][self.domain]["activeAllocation"]
+        audit = state.get("auditHeads", {}).get(self.domain)
+        previous_allocation = transition["inputs"]["previous"]["allocation"]
+        inventory = self.committed_inventory(candidate, allocation["transition"])
+        if (transition["record"]["phase"] != "Committed"
+                or active != transition["inputs"]["allocation"]
+                or transition["executorBinding"] != self.interrupted_executor_binding
+                or inventory.get("generation") != allocation["generation"]
+                or not isinstance(inventory.get("snapshotId"), str)
+                or not inventory["snapshotId"].startswith("sha256:")
+                or not isinstance(audit, dict)
+                or audit.get("scope", {}).get("domainId") != self.domain
+                or audit.get("scope", {}).get("transitionId") != previous_allocation["transitionId"]
+                or audit.get("scope", {}).get("sequence") != previous_allocation["sequence"]
+                or audit.get("scope", {}).get("claimScope", {}).get("registryUid") != self.registry_uid):
+            raise RuntimeError("ordinary recovery did not durably publish the committed generation")
+        if (self.interrupt_after_phase == "Committed"
+                and registry.get("metadata", {}).get("resourceVersion") != self.interrupted_registry_resource_version):
+            raise RuntimeError("committed retry unexpectedly rewrote protected registry state")
+        self.results.append({
+            "check": "phase-interruption-ordinary-recovery", "passed": True,
+            "phase": self.interrupt_after_phase, "transition": allocation["transition"],
+            "sameExecutor": "disposable-lifecycle-test", "committedInventoryPublished": True,
+            "inventorySnapshotId": inventory["snapshotId"], "auditHeadProtected": True,
+            "scope": "one post-CAS boundary in one fresh cluster; full matrix requires six isolated runs",
+        })
+        (self.output / "steps.json").write_text(json.dumps(self.results, indent=2))
 
     def wait_value(self, value):
         deadline = time.monotonic() + 90
@@ -508,14 +875,23 @@ class LifecycleRunner:
                 time.sleep(1)
             self.reject_unapproved_upgrade()
             self.approve_runtime(1)
-            self.step(self.candidates[1], "upgrade", "reserve")
+            if self.interrupt_after_phase == "Planned":
+                self.checkpoint_step(self.candidates[1], "upgrade", "Planned")
+            else:
+                self.step(self.candidates[1], "upgrade", "reserve")
             obsolete = self.get("service", "obsolete-service")
             obsolete_uid = obsolete["metadata"]["uid"]
             self.k("patch", "service", "obsolete-service", "-n", self.workload, "--type=merge", "-p",
                    json.dumps({"metadata": {"finalizers": ["reakt.test/hold-cleanup"]}}))
-            self.step(self.candidates[1], "upgrade", "stage")
+            if self.interrupt_after_phase == "Staged":
+                self.checkpoint_step(self.candidates[1], "upgrade", "Staged")
+            else:
+                self.step(self.candidates[1], "upgrade", "stage")
             old_credential, issued_at = self.old_credential()
-            self.step(self.candidates[1], "upgrade", "quiesce")
+            if self.interrupt_after_phase == "Quiesced":
+                self.checkpoint_step(self.candidates[1], "upgrade", "Quiesced")
+            else:
+                self.step(self.candidates[1], "upgrade", "quiesce")
             self.verify_retired_credential(old_credential, issued_at)
             if self.args.force_retained:
                 target = next(r for r in json.loads((self.candidates[1] / "ir.json").read_text())["resources"] if r["name"] == "retained")
@@ -523,7 +899,12 @@ class LifecycleRunner:
                     raise RuntimeError("force test requires explicit force in the approved candidate")
                 foreign = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "retained", "namespace": self.workload}, "data": {"value": "foreign"}}
                 self.k("apply", "--server-side", "--force-conflicts", "--field-manager=fixture-foreign", "-f", "-", data=json.dumps(foreign))
-            self.step(self.candidates[1], "upgrade", "activate")
+            if self.interrupt_after_phase in ("Activated", "Cleaning"):
+                self.checkpoint_step(self.candidates[1], "upgrade", self.interrupt_after_phase)
+                if self.interrupt_after_phase == "Activated":
+                    self.step(self.candidates[1], "upgrade", "activate")
+            else:
+                self.step(self.candidates[1], "upgrade", "activate")
             new = self.wait_value("version-2")
             if old["metadata"]["uid"] != new["metadata"]["uid"]:
                 raise RuntimeError("upgrade replaced retained resource UID")
@@ -541,8 +922,14 @@ class LifecycleRunner:
                 raise RuntimeError("cleanup released claim before finalizer completion")
             self.k("patch", "service", "obsolete-service", "-n", self.workload, "--type=merge", "-p",
                    json.dumps({"metadata": {"finalizers": []}}))
+            if self.interrupt_after_phase == "Committed":
+                self.checkpoint_step(self.candidates[1], "upgrade", "Committed")
             self.step(self.candidates[1], "upgrade", "commit")
             self.step(self.candidates[1], "upgrade", "commit")
+            if self.interrupt_after_phase:
+                self.verify_interrupted_completion(
+                    self.candidates[1], self.allocation(self.candidates[1], "upgrade"),
+                )
             if self.get("service", "obsolete-service") is not None or self.get("configmap", "orphan") is None:
                 raise RuntimeError("prior deletion/orphan policy was not preserved")
             passed = True
@@ -627,4 +1014,6 @@ if __name__ == "__main__":
     parser.add_argument("--adopt-retained", action="store_true", help="exercise explicit operator-approved adoption before upgrade")
     parser.add_argument("--replace-cleanup-target", action="store_true", help="verify real cleanup rejects a replacement UID and retains its claim")
     parser.add_argument("--force-retained", action="store_true", help="verify policy-approved force repairs a foreign SSA field after writer retirement")
+    parser.add_argument("--interrupt-after-phase", choices=INTERRUPTION_PHASES,
+                        help="kill one owned test driver after an exact upgrade phase CAS, then resume through the ordinary driver")
     LifecycleRunner(parser.parse_args()).run()

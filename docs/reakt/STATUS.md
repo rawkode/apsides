@@ -75,6 +75,17 @@ or continue mutating the metadata store before transfer can be authorized.
 Current candidate tests do not prove this. Activation also crosses intermediate
 durable phases inside one call; interruption at each such phase remains untested.
 
+A private test-only checkpoint now pauses after a verified registry CAS at a
+selected phase. The disposable lifecycle harness accepts
+`--interrupt-after-phase` with one of Planned, Staged, Quiesced, Activated,
+Cleaning or Committed. Each phase requires its own fresh run. The parent checks
+the protected boundary, kills and reaps its owned child, and resumes the recorded
+transition through the ordinary issued-client driver. This instrumentation is
+absent from production builds. It targets same-executor process recovery after
+durable publication; it does not establish fresh-CI takeover, arbitrary
+within-phase crash recovery or production-release acceptance. The live matrix
+has not yet passed.
+
 The unreleased phase-recovery assertion contract now requires individual
 Planned, Staged, Quiesced, Activated, Cleaning and Committed recovery results,
 plus `unsafe-activation: false`. Earlier aggregate-only evidence is rejected;

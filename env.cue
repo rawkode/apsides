@@ -17,6 +17,7 @@ tasks: {
 	lifecycleCeilingTest: {command: "python3", args: ["tests/reakt/test_lifecycle_ceiling.py"]}
 	lifecycleCleanupTest: {command: "python3", args: ["tests/reakt/test_lifecycle_cleanup.py"]}
 	lifecyclePermissionsTest: {command: "python3", args: ["tests/reakt/test_lifecycle_permissions.py"]}
+	lifecycleInterruptionTest: {command: "python3", args: ["tests/reakt/test_lifecycle_interruption.py"]}
 	coordinationTest: {command: "cargo", args: ["test", "--locked", "-p", "coordination"]}
 	coordinationCheck: [
 		{command: "cargo", args: ["clippy", "--locked", "-p", "coordination", "--all-targets", "--", "-D", "warnings"]},
