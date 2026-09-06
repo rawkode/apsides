@@ -289,3 +289,26 @@ three fixture checks through the actual evidence validator. It accepts no extra
 case or check keys. This opt-in consumer grants no `VerifiedRelease`, does not
 verify signatures or the remaining production checks, and does not separately
 accept each supplemental `fixtureCases` entry.
+
+## Fixture promotion verification
+
+`cuenv task fixturePromotionLive` exercises the real release verifier against an
+exact signed production candidate and a separately built fixture release. Set
+`APS_FIXTURE_PRODUCTION_ARTIFACT`, `APS_FIXTURE_ARTIFACT`, and
+`APS_FIXTURE_TRUST_POLICY` to absolute paths. Build the fixture with
+`reakt build --source ... --mode fixture` and assemble it with `reakt release`.
+Its coverage remains pending; the driver does not manufacture passing coverage.
+
+The driver verifies the production signature, validates fixture native binary
+and OCI integrity, binds every reread document to its manifest, and proves the
+exact compiler projection and unchanged reactor contracts. It requires the
+specific fixture-promotion rejection and rechecks both subjects. The fixture
+rejection precedes signature verification, so this does not establish that the
+fixture has a valid signature.
+
+The source build at commit `0a3b58b` passed this check with a real Linux/arm64
+fixture image and the archived production candidate. Its local result is
+`work/fixture-promotion-0a3b58b/result.json`. This is a measured driver result,
+not a packaged `ProductionEvidence` receipt. Source-closure packaging and merge
+verification remain necessary before counting `fixture-promotion-rejection`
+in production coverage, which remains seven of sixteen checks.
