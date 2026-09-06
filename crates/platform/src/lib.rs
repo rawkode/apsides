@@ -20,6 +20,8 @@ pub use transition_inputs::{FrozenPredecessor, FrozenRegistrySnapshot, Transitio
 mod transition_session;
 #[cfg(feature = "deployer")]
 pub use transition_session::{ResolvedTransition, TransitionSession};
+mod drain_evidence;
+pub use drain_evidence::{ProcessTerminationObservation, ProxyDrainObservation};
 #[cfg(all(test, feature = "deployer"))]
 mod tests;
 mod writer_checkpoint;
@@ -62,9 +64,7 @@ pub use crypto::install_rustls_ring_provider;
 pub use model::*;
 pub use runtime::RuntimeAuthority;
 pub use store::PlatformClient;
-pub use termination::{
-    ExpectedPod, ExpectedWriters, ProcessTerminationObservation, TERMINATION_FINALIZER,
-};
+pub use termination::{ExpectedPod, ExpectedWriters, TERMINATION_FINALIZER};
 
 /// Return the fixed, bounded name of the separately provisioned incarnation anchor.
 /// # Errors
@@ -155,7 +155,7 @@ fn valid_name(value: &str) -> bool {
 #[cfg(feature = "deployer")]
 mod proxy;
 #[cfg(feature = "deployer")]
-pub use proxy::{ADMIN_IMAGE, ENVOY_IMAGE, MAX_PROXY_LEDGER_BYTES, ProxyDrainObservation};
+pub use proxy::{ADMIN_IMAGE, ENVOY_IMAGE, MAX_PROXY_LEDGER_BYTES};
 
 #[cfg(feature = "deployer")]
 mod proxy_config;

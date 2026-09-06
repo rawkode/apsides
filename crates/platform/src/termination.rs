@@ -1,4 +1,4 @@
-use crate::{PlatformClient, Result, invalid, valid_name};
+use crate::{PlatformClient, ProcessTerminationObservation, Result, invalid, valid_name};
 use k8s_openapi::api::{
     apps::v1::Deployment,
     core::v1::{ContainerStatus, Node, Pod},
@@ -27,17 +27,6 @@ pub struct ExpectedWriters {
     /// Complete platform-recorded Pod identities. A missing record is not
     /// inferred from an empty live list or runtime-written inventory.
     pub pods: Vec<ExpectedPod>,
-}
-
-/// Produced from live UID-bound objects, never caller-supplied receipt strings.
-/// This proves only the checked process observations; API drain is separate.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProcessTerminationObservation {
-    pub(crate) deployment_uid: String,
-    pub(crate) deployment_resource_version: String,
-    pub(crate) pod_resource_versions: Vec<(String, String)>,
-    pub(crate) container_ids: Vec<String>,
 }
 
 impl PlatformClient {

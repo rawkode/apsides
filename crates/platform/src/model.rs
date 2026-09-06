@@ -251,9 +251,9 @@ pub struct UpgradeDrainState {
     /// is not a claim to enumerate all historical tokenless runtime processes.
     pub runtime_writers: crate::ExpectedWriters,
     pub proxy_writers: crate::ExpectedWriters,
-    pub runtime_termination: Option<serde_json::Value>,
-    pub final_proxy_ledger: Option<serde_json::Value>,
-    pub proxy_termination: Option<serde_json::Value>,
+    pub runtime_termination: Option<crate::ProcessTerminationObservation>,
+    pub final_proxy_ledger: Option<crate::ProxyDrainObservation>,
+    pub proxy_termination: Option<crate::ProcessTerminationObservation>,
     pub retired_identity_uids: BTreeMap<String, String>,
 }
 

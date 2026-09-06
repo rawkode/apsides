@@ -467,8 +467,14 @@ pub(crate) fn state_object(
     namespace: &str,
     state: &impl serde::Serialize,
 ) -> Result<Value> {
+    let encoded = canonical_bytes(state)?;
+    if encoded.len() > crate::MAX_STATE_BYTES {
+        return Err(invalid(
+            "initial control state exceeds 512 KiB; split or reduce the domain before staging",
+        ));
+    }
     Ok(
-        json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":namespace},"data":{"state.json":String::from_utf8(canonical_bytes(state)?).map_err(|_|invalid("invalid state encoding"))?}}),
+        json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":namespace},"data":{"state.json":String::from_utf8(encoded).map_err(|_|invalid("invalid state encoding"))?}}),
     )
 }
 
@@ -499,6 +505,34 @@ fn controller_deployment(
 mod stage_metadata_tests {
     use super::stage_annotations_match;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn initial_state_budget_matches_the_reader_at_the_encoded_boundary()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let state = "x".repeat(crate::MAX_STATE_BYTES - 2);
+        let object = super::state_object("activation", "control", &state)?;
+        let mut object: k8s_openapi::api::core::v1::ConfigMap = serde_json::from_value(object)?;
+        object.metadata.uid = Some("control-uid".into());
+        object.metadata.resource_version = Some("42".into());
+        assert_eq!(crate::store::decode_state::<String>(&object)?.value, state);
+        assert!(super::state_object("activation", "control", &format!("{state}x")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn initial_state_budget_counts_escaped_bytes_without_printing_values() {
+        let state = "\u{0001}".repeat(crate::MAX_STATE_BYTES / 6 + 1);
+        assert!(state.len() < crate::MAX_STATE_BYTES);
+        let error = super::state_object("activation", "control", &state)
+            .err()
+            .map(|error| error.to_string());
+        assert_eq!(
+            error.as_deref(),
+            Some(
+                "platform state rejected: initial control state exceeds 512 KiB; split or reduce the domain before staging"
+            )
+        );
+    }
 
     #[test]
     fn live_v4_deployment_revision_is_not_staged_content_drift() {

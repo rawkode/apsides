@@ -1,10 +1,10 @@
 //! Live inspection of a separately protected Envoy proxy. This module does not
 //! turn caller-provided hashes into upgrade authorization.
-use crate::{PlatformClient, ProxyIdentity, Result, invalid, valid_digest};
+use crate::{PlatformClient, ProxyDrainObservation, ProxyIdentity, Result, invalid, valid_digest};
 use compiler_core::{digest, parse_strict};
 use k8s_openapi::api::core::v1::{ConfigMap, Pod};
 use kube::{Api, api::AttachParams};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
 // Envoy's unfiltered JSON includes fractional histogram quantiles. Ask the
@@ -19,22 +19,6 @@ pub const ENVOY_IMAGE: &str =
 pub const ADMIN_IMAGE: &str =
     "curlimages/curl@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b";
 pub const MAX_PROXY_LEDGER_BYTES: usize = 16 * 1024 * 1024;
-
-/// Produced by actual UID-bound Kubernetes reads and isolated helper execution.
-/// This is a proxy observation. It is not sufficient to activate another writer:
-/// runtime/proxy termination, credential retirement and policy qualification are
-/// separate mandatory checks.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProxyDrainObservation {
-    pod_uid: String,
-    pod_resource_version: String,
-    container_id: String,
-    qualification_digest: String,
-    ledger_digest: String,
-    completed_requests: u64,
-    rejected_after_freeze: u64,
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

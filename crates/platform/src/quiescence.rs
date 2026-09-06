@@ -85,10 +85,8 @@ impl PlatformClient {
             let terminated = self
                 .observe_writer_termination(&drain.runtime_writers)
                 .await?;
-            drain.runtime_termination = Some(serde_json::to_value(terminated)?);
-            drain.final_proxy_ledger = Some(serde_json::to_value(
-                self.freeze_and_inspect_proxy(proxy).await?,
-            )?);
+            drain.runtime_termination = Some(terminated);
+            drain.final_proxy_ledger = Some(self.freeze_and_inspect_proxy(proxy).await?);
             registry = self
                 .persist_drain(&registry, transition, drain.clone())
                 .await?;
@@ -100,7 +98,7 @@ impl PlatformClient {
                 .observe_writer_termination(&drain.proxy_writers)
                 .await?;
             self.verify_proxy_stop_epoch(proxy, true).await?;
-            drain.proxy_termination = Some(serde_json::to_value(terminated)?);
+            drain.proxy_termination = Some(terminated);
             registry = self
                 .persist_drain(&registry, transition, drain.clone())
                 .await?;
