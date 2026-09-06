@@ -52,14 +52,11 @@ def runtime_closure(archive, reference, platform):
 
 
 PACKAGING_SOURCES = [
-    ".cargo/config.toml",
     "scripts/reakt/Dockerfile",
     "scripts/reakt/build.py",
     "scripts/reakt/extract_binary.py",
     "scripts/reakt/finalize_inputs.py",
     "scripts/reakt/package_oci.py",
-    "scripts/reakt/patched_libsql.py",
-    "scripts/reakt/patches/libsql-0.9.30.patch",
     "scripts/reakt/sbom.py",
     "scripts/reakt/toolchain_snapshot.py",
 ]

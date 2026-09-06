@@ -8,13 +8,10 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import patched_libsql
 BUILDER = "rust@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922"
 CONTEXT_SCHEMA = "reakt.dev/oci-context/v1"
 
@@ -147,31 +144,20 @@ def prepare(artifact, output, repository=ROOT, builder_image=BUILDER, source_dat
             copy_source(repository / f"crates/{crate}/src", staging / f"workspace/crates/{crate}/src")
         copy_file(ROOT / "scripts/reakt/Dockerfile", staging / "Dockerfile")
         (staging / ".dockerignore").write_text("context.json\n")
-        dependency_patch = patched_libsql.copy_generated(
-            repository / ".generated/libsql-0.9.30",
-            staging / ".generated/libsql-0.9.30",
-        )
-        patch_config = patched_libsql.cargo_patch_config(".generated/libsql-0.9.30")
-        (staging / ".cargo").mkdir()
-        (staging / ".cargo/config.toml").write_text(patch_config)
         cargo_config = command(["cargo", "vendor", "--locked", "--offline", "--versioned-dirs", "--manifest-path", "controller/Cargo.toml", "vendor"], cwd=staging)
         parsed_config = tomllib.loads(cargo_config)
         if parsed_config.get("source", {}).get("vendored-sources", {}).get("directory") != "vendor":
             raise ValueError("cargo vendor returned an unexpected source directory")
-        (staging / ".cargo/config.toml").write_text(cargo_config + "\n" + patch_config)
+        (staging / ".cargo").mkdir()
+        (staging / ".cargo/config.toml").write_text(cargo_config)
         if (staging / "controller/Cargo.lock").read_bytes() != lock:
             raise ValueError("locked dependency preparation changed Cargo.lock")
-        cargo_metadata = command(["cargo", "metadata", "--locked", "--offline", "--format-version", "1", "--manifest-path", "controller/Cargo.toml"], cwd=staging)
-        patched_libsql.validate_cargo_metadata(
-            cargo_metadata, staging / ".generated/libsql-0.9.30/Cargo.toml",
-            require_resolved=False,
-        )
+        command(["cargo", "metadata", "--locked", "--offline", "--format-version", "1", "--manifest-path", "controller/Cargo.toml"], cwd=staging)
         metadata = {
             "schemaVersion": CONTEXT_SCHEMA,
             "irDigest": manifest["irDigest"],
             "sourceArtifactManifestDigest": sha256(manifest_bytes),
             "controllerLockDigest": sha256(lock),
-            "dependencyPatch": dependency_patch,
             "sourceDateEpoch": source_date_epoch,
             "builder": builder,
             "runtimeImage": None,
@@ -194,8 +180,6 @@ def verify_context(context):
         raise ValueError("unsupported context or false release claim")
     if file_manifest(context) != metadata["files"]:
         raise ValueError("prepared context file set or contents changed")
-    if patched_libsql.verify_generated(context / ".generated/libsql-0.9.30") != metadata.get("dependencyPatch"):
-        raise ValueError("prepared context dependency patch changed")
     if sha256(read_regular(context / "controller/Cargo.lock")) != metadata["controllerLockDigest"]:
         raise ValueError("controller lock identity changed")
     checked_ir = json.loads(command([os.environ.get("REAKT_CLI", str(ROOT / "target/debug/reakt")), "check", "--ir", str(context / "controller/src/ir.json")]))

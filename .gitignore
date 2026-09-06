@@ -1,5 +1,4 @@
 /target/
-/.generated/
 /node_modules/
 /packages/*/node_modules/
 /work/

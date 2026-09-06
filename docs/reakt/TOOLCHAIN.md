@@ -14,16 +14,6 @@ Apsides reuses established tooling for language processing, Kubernetes transport
 | Native dependency preparation | Cargo lockfiles and Cargo vendor |
 | OCI build and export | Docker BuildKit |
 
-`cuenv task patchedLibsql` prepares the pinned libSQL dependency from its
-checksum-verified crate archive and a handwritten patch. It may fetch that exact
-archive when it is missing; subsequent verification and image preparation are
-offline. Cargo tasks depend on this preparation. Direct Cargo commands fail if
-the ignored `.generated/libsql-0.9.30` tree is absent. Generated source is never
-committed. CLI lock preparation and image-context verification reconstruct the
-expected tree from the archive and current patch, rejecting stale or modified
-output. Offline contexts retain the override and generated source; their file
-manifests and packaging inputs bind the patch and generator.
-
 The compiler uses Node to host Oxc and Rolldown. A canonical `reakt.lock.json` declares every author module and digest; package imports are limited to the explicit `@reakt/kubernetes` public entrypoints (main and JSX runtimes), relative imports must resolve to that lock, and all bytes are snapshotted before either build. Deno type-checks a staged copy with remote and npm resolution disabled. The compiler snapshots and hashes all six SDK modules, including its private rendering entrypoint, and rechecks them before publishing output. Authors cannot import that entrypoint. Oxc lowers TSX through the automatic development JSX transform, supplying virtual-file source coordinates. A compiler-owned wrapper traverses inert component trees and supplies provenance. Oxc/Rolldown then build the same memory snapshot twice with virtual `reakt:/source` and `reakt:/sdk` identities and source maps.
 
 Deno evaluates the closed IIFE bundle twice in fresh processes using the fixed `file:///$deno$stdin.mts` entry identity, a fixed `TZ`/locale environment, seeded host randomness, and denied permissions. Each process loads the digest-recorded SES 2.3.0 bundle, calls `lockdown` with safe error, locale, domain, and regular-expression taming, and evaluates the program in a `Compartment` with no module hooks. The only custom endowment is the recursively hardened declared build input. SES supplies frozen language intrinsics, disables clock and random observations, removes host APIs such as Deno, WebAssembly, streams and workers from the compartment, prevents constructor escapes, and rejects intrinsic prototype mutation. The compiler does not maintain an ambient-global denylist. The generated controller contains Rust and embedded IR, with no TypeScript evaluator or reconciliation-time package loading.

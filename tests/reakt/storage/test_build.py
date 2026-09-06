@@ -83,17 +83,6 @@ class StorageBuildTests(unittest.TestCase):
         (self.repository / ".cargo").mkdir()
         (self.repository / ".cargo/credentials.toml").write_text("private-canary\n")
         self.calls = []
-        patch_copy = patch.object(storage_build.patched_libsql, "copy_generated", self.copy_patch)
-        patch_copy.start()
-        self.addCleanup(patch_copy.stop)
-        patch_verify = patch.object(storage_build.patched_libsql, "verify_generated", return_value={"qualification": "synthetic dependency fixture"})
-        patch_verify.start()
-        self.addCleanup(patch_verify.stop)
-
-    def copy_patch(self, source, destination):
-        destination.mkdir(parents=True)
-        (destination / "Cargo.toml").write_text('[package]\nname="libsql"\nversion="0.9.30"\n')
-        return {"qualification": "synthetic dependency fixture"}
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -101,20 +90,12 @@ class StorageBuildTests(unittest.TestCase):
     def command(self, argv, *, cwd=None, timeout=300):
         self.calls.append([str(value) for value in argv])
         if argv[:2] == ["cargo", "vendor"]:
-            self.assertIn('[patch.crates-io]', (cwd / '.cargo/config.toml').read_text())
-            self.assertTrue((cwd / '.generated/libsql-0.9.30/Cargo.toml').is_file())
             (cwd / "vendor/example-1.0.0").mkdir(parents=True)
             (cwd / "vendor/example-1.0.0/Cargo.toml").write_text('[package]\nname="example"\n')
             return (
                 '[source.crates-io]\nreplace-with="vendored-sources"\n'
                 '[source.vendored-sources]\ndirectory="vendor"\n'
             )
-        if argv[:2] == ["cargo", "metadata"]:
-            self.assertIn('[patch.crates-io]', (cwd / '.cargo/config.toml').read_text())
-            manifest = cwd / '.generated/libsql-0.9.30/Cargo.toml'
-            return json.dumps({"packages": [{"name": "libsql", "version": "0.9.30", "source": None,
-                "manifest_path": str(manifest), "id": "patched-libsql"}],
-                "resolve": {"nodes": [{"id": "patched-libsql"}]}})
         return "{}"
 
     def builder(self):
@@ -331,23 +312,6 @@ class StorageBuildTests(unittest.TestCase):
         self.assertIn("FROM runtime AS coordination", source)
         self.assertIn("/usr/local/bin/storage-crash", source)
         self.assertIn("USER 65532:65532", source)
-
-    def test_prepared_context_rejects_a_patch_that_is_no_longer_current(self):
-        context = self.repository / "prepared-context"
-        with patch.object(storage_build, "run", self.command):
-            metadata = storage_build.prepare_context(self.repository, context, self.builder())
-        with patch.object(storage_build.patched_libsql, "verify_generated", side_effect=ValueError("outdated patch")):
-            with self.assertRaisesRegex(ValueError, "outdated patch"):
-                storage_build.verify_context(context, metadata)
-
-    def test_context_rejects_registry_libsql_resolution(self):
-        def registry_metadata(argv, *, cwd=None, timeout=300):
-            if argv[:2] == ["cargo", "metadata"]:
-                return json.dumps({"packages": [{"name": "libsql", "version": "0.9.30", "source": "registry+https://example.invalid"}]})
-            return self.command(argv, cwd=cwd, timeout=timeout)
-        with patch.object(storage_build, "run", registry_metadata):
-            with self.assertRaisesRegex(ValueError, "patched dependency"):
-                storage_build.prepare_context(self.repository, self.repository / "bad-context", self.builder())
 
     def test_oci_identity_rejects_wrong_platform_and_tampered_metadata(self):
         archive = self.repository / "valid.oci.tar"

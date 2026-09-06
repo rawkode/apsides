@@ -1,2 +1,0 @@
-[patch.crates-io]
-libsql = { path = ".generated/libsql-0.9.30" }

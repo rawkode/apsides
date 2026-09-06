@@ -203,27 +203,12 @@ pub fn verify(root: &Path) -> Result<Value> {
 }
 
 pub fn prepare_lock(root: &Path) -> Result<()> {
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()?;
-    let workspace_lock = repository.join("Cargo.lock");
-    let verified = std::process::Command::new("python3")
-        .arg(repository.join("scripts/reakt/patched_libsql.py"))
-        .arg("verify")
-        .output()?;
-    if !verified.status.success() {
-        return Err("prepared libsql dependency is missing, stale or modified".into());
-    }
-    let patched_manifest = repository
-        .join(".generated/libsql-0.9.30/Cargo.toml")
-        .canonicalize()?;
+    let workspace_lock = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
     fs::copy(workspace_lock, root.join("controller/Cargo.lock"))?;
     // Start from the compiler's own lock. Cargo adds the generated root package
     // without upgrading versions already selected in that lock; resolution is
     // preparation, and all subsequent native builds require --locked.
     let output = std::process::Command::new("cargo")
-        .arg("--config")
-        .arg(repository.join(".cargo/config.toml"))
         .args([
             "metadata",
             "--offline",
@@ -236,7 +221,6 @@ pub fn prepare_lock(root: &Path) -> Result<()> {
     if !output.status.success() {
         return Err("prepared native dependencies are incomplete; Cargo metadata could not lock the generated controller offline".into());
     }
-    validate_patched_dependency(&output.stdout, &patched_manifest)?;
     let mut manifest: Manifest = serde_json::from_value(compiler_core::parse_strict(
         &fs::read_to_string(root.join("manifest.json"))?,
     )?)?;
@@ -248,33 +232,6 @@ pub fn prepare_lock(root: &Path) -> Result<()> {
         root.join("manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
     )?;
-    Ok(())
-}
-
-fn validate_patched_dependency(metadata: &[u8], expected_manifest: &Path) -> Result<()> {
-    let metadata: Value = serde_json::from_slice(metadata)?;
-    let packages = metadata["packages"]
-        .as_array()
-        .ok_or("Cargo metadata lacks packages")?;
-    let mut found = false;
-    for package in packages
-        .iter()
-        .filter(|package| package["name"] == "libsql")
-    {
-        let manifest = package["manifest_path"]
-            .as_str()
-            .ok_or("Cargo metadata lacks libsql manifest path")?;
-        if found
-            || package["version"] != "0.9.30"
-            || !package["source"].is_null()
-            || Path::new(manifest).canonicalize()? != expected_manifest
-        {
-            return Err("Cargo did not select the prepared libsql dependency".into());
-        }
-        found = true;
-    }
-    // The generated runtime uses storage traits without enabling libsql-backend.
-    // An absent libsql package is valid; a registry-backed package is not.
     Ok(())
 }
 

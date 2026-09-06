@@ -153,10 +153,9 @@ recovery, or production restore authority.
 - Complete claim, review and audit persistent-volume interrupted-write
   qualification, and qualify remote Turso/libSQL restart,
   unavailable-storage, conflict and recovery behavior.
-- Complete live remote-response qualification. The configured client enforces
-  HTTPS, a 128 MiB encoded-response limit and a 30-second request/body deadline.
-  Focused tests cover the patched response paths; they do not prove complete
-  upstream panic elimination, transaction deadlines or remote recovery behavior.
+- Qualify byte and time bounds and non-panicking handling of remote responses.
+  The store connectors reject non-HTTPS connection URIs, including server-directed libSQL
+  requests, but this does not bound response bodies in the pinned upstream client.
 - Complete production API authorization and admission qualification for the
   supported Kubernetes versions, including the declared preview permissions and
   request-drain profile.
