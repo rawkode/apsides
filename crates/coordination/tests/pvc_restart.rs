@@ -15,6 +15,9 @@ const LIVE_RACE_BARRIER: &str = "/store/coordination-race-go";
 const REGISTRY_UID: &str = "11111111-1111-4111-8111-111111111111";
 const TEST_NONCE: &str = "0123456789abcdef0123456789abcdef";
 
+#[path = "support/backup.rs"]
+mod backup;
+
 #[derive(Clone, Copy)]
 enum Phase {
     Seed,

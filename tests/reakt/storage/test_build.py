@@ -75,6 +75,7 @@ class StorageBuildTests(unittest.TestCase):
         (coordination / "Cargo.toml").write_text(
             '[package]\nname="coordination"\nversion="0.1.0"\nedition.workspace=true\n'
             '[dependencies]\ncompiler-core={path="../compiler-core"}\ndeploy={path="../deploy"}\n'
+            '[dev-dependencies]\ninventory={path="../inventory"}\n'
         )
         (coordination / "src/lib.rs").write_text("// coordination stores\n")
         (coordination / "tests/pvc_restart.rs").write_text("mod support;\n")
@@ -171,9 +172,9 @@ class StorageBuildTests(unittest.TestCase):
         )
         self.assertFalse((context / "crates/inventory/tests").exists())
 
-    def test_coordination_profile_rejects_an_additional_inventory_dependency(self):
+    def test_coordination_profile_rejects_inventory_as_a_build_dependency(self):
         manifest = self.repository / "crates/coordination/Cargo.toml"
-        manifest.write_text(manifest.read_text() + 'inventory={path="../inventory"}\n')
+        manifest.write_text(manifest.read_text() + '[build-dependencies]\ninventory={path="../inventory"}\n')
         with self.assertRaisesRegex(ValueError, "local dependency closure changed"):
             storage_build.validate_repository(self.repository, "coordination")
 

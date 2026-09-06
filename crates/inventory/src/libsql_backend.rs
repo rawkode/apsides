@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS reakt_inventory_heads (
 pub struct LibsqlInventory {
     database: Database,
     local: bool,
+    read_only: bool,
 }
 
 impl LibsqlInventory {
@@ -40,6 +41,7 @@ impl LibsqlInventory {
         let store = Self {
             database,
             local: true,
+            read_only: false,
         };
         store.initialize().await?;
         Ok(store)
@@ -59,8 +61,30 @@ impl LibsqlInventory {
         let store = Self {
             database,
             local: false,
+            read_only: false,
         };
         store.initialize().await?;
+        Ok(store)
+    }
+
+    /// Open an existing local database without creating or mutating it.
+    /// # Errors
+    /// Rejects relative or missing paths and databases without the supported schema and columns.
+    pub async fn open_local_read_only(path: &Path) -> Result<Self> {
+        if !path.is_absolute() {
+            return Err(Error::Invalid("database path must be absolute"));
+        }
+        let database = Builder::new_local(path)
+            .flags(libsql::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .build()
+            .await
+            .map_err(|_| Error::Backend("open local read-only database"))?;
+        let store = Self {
+            database,
+            local: true,
+            read_only: true,
+        };
+        validate_existing(&store.connection()?).await?;
         Ok(store)
     }
 
@@ -94,23 +118,7 @@ impl LibsqlInventory {
                 .execute_batch(SCHEMA)
                 .await
                 .map_err(|_| Error::Backend("initialize schema"))?;
-            let mut rows = transaction
-                .query("SELECT version FROM reakt_inventory_schema WHERE id=1", ())
-                .await
-                .map_err(|_| Error::Backend("read schema"))?;
-            let row = rows
-                .next()
-                .await
-                .map_err(|_| Error::Backend("read schema row"))?
-                .ok_or(Error::Invalid("missing inventory schema"))?;
-            if row
-                .get::<i64>(0)
-                .map_err(|_| Error::Invalid("schema version"))?
-                != 1
-            {
-                return Err(Error::Invalid("unsupported inventory schema"));
-            }
-            Ok(())
+            validate_existing(&transaction).await
         }
         .await;
         if let Err(error) = result {
@@ -123,6 +131,45 @@ impl LibsqlInventory {
             .map_err(|_| Error::Backend("commit schema"))?;
         Ok(())
     }
+}
+
+async fn validate_existing(connection: &Connection) -> Result<()> {
+    let mut rows = connection
+        .query("SELECT version FROM reakt_inventory_schema WHERE id=1", ())
+        .await
+        .map_err(|_| Error::Invalid("missing inventory schema"))?;
+    let row = rows
+        .next()
+        .await
+        .map_err(|_| Error::Backend("read schema row"))?
+        .ok_or(Error::Invalid("missing inventory schema"))?;
+    if row
+        .get::<i64>(0)
+        .map_err(|_| Error::Invalid("schema version"))?
+        != 1
+        || rows
+            .next()
+            .await
+            .map_err(|_| Error::Backend("read schema row"))?
+            .is_some()
+    {
+        return Err(Error::Invalid("unsupported inventory schema"));
+    }
+    connection
+        .query(
+            "SELECT scope,digest,metadata FROM reakt_inventory_snapshots LIMIT 0",
+            (),
+        )
+        .await
+        .map_err(|_| Error::Invalid("missing immutable inventory snapshot table"))?;
+    connection
+        .query(
+            "SELECT scope,revision,digest FROM reakt_inventory_heads LIMIT 0",
+            (),
+        )
+        .await
+        .map_err(|_| Error::Invalid("missing inventory head table"))?;
+    Ok(())
 }
 
 async fn head(connection: &Connection, scope: &str) -> Result<Option<(i64, String)>> {
@@ -206,6 +253,9 @@ impl InventoryStore for LibsqlInventory {
         expected: Option<&str>,
         snapshot: &InventorySnapshot,
     ) -> Result<VersionedInventory> {
+        if self.read_only {
+            return Err(Error::Invalid("read-only inventory store"));
+        }
         let key = scope.key()?;
         let bytes = snapshot.encode(scope)?;
         let id = snapshot_id(scope, snapshot)?;

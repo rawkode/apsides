@@ -21,6 +21,7 @@ thiserror = "2"
 url = { version = "2", optional = true }
 
 [dev-dependencies]
+inventory = { path = "../inventory" }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 

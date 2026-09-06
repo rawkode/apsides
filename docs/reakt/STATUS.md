@@ -126,7 +126,14 @@ Pod. Competing coordination writers also passed: identical claims were idempoten
 distinct reviews coexisted, and one immutable audit candidate won while the other
 received the exact conflict error. A fresh read-only Pod verified seed and race
 records. This does not prove transaction overlap or cross-store atomicity;
-interrupted coordination writes and backup remain unqualified.
+interrupted coordination writes and PVC backup restoration remain unqualified.
+
+Local filesystem tests cover one libSQL `VACUUM INTO` backup containing all four
+stores, exact read-only verification, retained inventory history, exclusion of
+later source writes, refusal to overwrite existing destinations, and rejection
+of malformed backups without repair.
+Inventory now supports local read-only access without initialization or repair.
+These tests do not establish live PVC restore or production recovery authority.
 
 ## Remaining production work
 

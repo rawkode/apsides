@@ -373,6 +373,7 @@ dependencies = [
  "async-trait",
  "compiler-core",
  "deploy",
+ "inventory",
  "libsql",
  "serde",
  "serde_json",

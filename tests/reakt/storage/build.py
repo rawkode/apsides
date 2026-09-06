@@ -38,6 +38,7 @@ PROFILES = {
             "compiler-core": {"path": "../compiler-core"},
             "deploy": {"path": "../deploy"},
         },
+        "dev-dependencies": {"inventory": {"path": "../inventory"}},
     },
 }
 
@@ -161,6 +162,10 @@ def validate_repository(repository, package="inventory"):
         ("root", "dependencies", name): value
         for name, value in selected["dependencies"].items()
     }
+    expected_dependencies.update({
+        ("root", "dev-dependencies", name): value
+        for name, value in selected.get("dev-dependencies", {}).items()
+    })
     if local_dependencies != expected_dependencies:
         raise ValueError("storage local dependency closure changed")
     member_directories = {(repository / member).resolve() for member in members}

@@ -29,6 +29,13 @@ Writable deployment initialization creates and validates the required tables.
 Read-only audit access performs no DDL or repair. Missing tables, malformed schema,
 corrupt rows, foreign scope and oversized records fail closed.
 
+`LibsqlInventory::open_local_read_only` opens an existing local database with
+SQLite read-only flags. It checks the supported version and required columns
+without initialization or repair; reads still validate each requested record.
+Publication through that handle rejects before serialization or SQL. Missing
+files are not created. This does not eagerly validate every row or certify the
+complete SQL table layout.
+
 ## Publication and recovery
 
 The runtime publishes a bounded inventory observation only after rereading the
@@ -96,6 +103,14 @@ does not prove transaction overlap, cross-store atomicity, crash recovery or bac
 cuenv exec python3 tests/reakt/storage/build.py --package coordination --output work/coordination-image
 cuenv exec python3 tests/reakt/run_coordination_restart.py --image-directory work/coordination-image --output work/coordination-results
 ```
+
+Local backup tests (`cuenv task coordinationProbeTest`) seed all four stores in
+one database and use parameterized libSQL `VACUUM INTO` to create one standalone
+backup. They synchronize the completed file and its parent directory, reopen it
+through both read-only backends, verify exact records and inventory history, and
+check that later source writes are absent. Existing destinations are refused;
+missing or truncated backups fail without repair. This is local filesystem test
+evidence, not PVC restore, power-loss durability, or authority to resume a deploy.
 
 Canonical state and completion-envelope budgets reject oversized records before
 publication. The implementation does not provide snapshot garbage collection,
