@@ -110,13 +110,25 @@ backup. They synchronize the completed file and its parent directory, reopen it
 through both read-only backends, verify exact records and inventory history, and
 check that later source writes are absent. Existing destinations are refused;
 missing or truncated backups fail without repair. This is local filesystem test
-evidence, not PVC restore, power-loss durability, or authority to resume a deploy.
+evidence, not power-loss durability or authority to resume a deploy.
+
+The live backup qualification also passed on two distinct local PVCs. A backup
+Pod mounted the source read-only and the destination writable; a later Pod
+changed all four source stores. The verifier mounted only the backup PVC,
+read-only, and recovered the original records and inventory revision 2 while
+excluding the later source revision 3 and its metadata. The two volumes share
+one node, so this does not establish independent failure domains, node-loss
+recovery, or a production restore procedure.
+
+```sh
+cuenv exec python3 tests/reakt/run_storage_backup.py --image-directory work/coordination-image --output work/backup-results
+```
 
 Canonical state and completion-envelope budgets reject oversized records before
 publication. The implementation does not provide snapshot garbage collection,
 cross-executor takeover, automatic recovery for missing authority, or completed
 live qualification of remote Turso recovery or persistent-volume recovery for
-claim, review and audit stores after interrupted writes or backup restoration.
+claim, review and audit stores after interrupted writes.
 
 See [Inventory, prune and upgrades](/concepts/inventory-prune-upgrades/),
 [Transition audit history](/reakt/audit/), [State capacity](/reakt/state-capacity/),

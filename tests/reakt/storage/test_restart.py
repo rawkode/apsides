@@ -42,6 +42,19 @@ def completed(arguments, returncode=0, stdout=""):
 
 
 class StorageRestartTests(unittest.TestCase):
+    def test_storage_contract_rejects_mount_redirection_and_extra_sources(self):
+        pod = {"spec": {"volumes": [{"name": "store", "persistentVolumeClaim": {
+            "claimName": "fixed"}}], "containers": [{"volumeMounts": [
+                {"name": "store", "mountPath": "/store"}]}]}}
+        for field in ["subPath", "subPathExpr", "mountPropagation"]:
+            mutated = json.loads(json.dumps(pod))
+            mutated["spec"]["containers"][0]["volumeMounts"][0][field] = "redirect"
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                WRAPPER.pod_storage_contract(mutated)
+        pod["spec"]["volumes"][0]["hostPath"] = {"path": "/alternate"}
+        with self.assertRaises(RuntimeError):
+            WRAPPER.pod_storage_contract(pod)
+
     def test_event_parser_is_closed_nonce_bound_and_private_safe(self):
         value = event("seed", "published")
         parsed = WRAPPER.parse_event(line("APS_STORAGE_RESULT=", value),
@@ -120,9 +133,10 @@ class StorageRestartTests(unittest.TestCase):
                          ["/usr/local/bin/storage-crash"])
         pod["metadata"]["uid"] = "pod-uid"
         runner.expected_pods["readonly"] = {
-            "uid": "pod-uid", "readOnly": True, "command": None,
+            "uid": "pod-uid", "command": None,
             "args": WRAPPER.PROBE_TEST,
             "env": {item["name"]: item["value"] for item in container["env"]},
+            "storage": WRAPPER.pod_storage_contract(pod),
         }
         pod["status"] = {"containerStatuses": [{
             "name": "probe", "containerID": "containerd://runtime-id",
@@ -132,10 +146,61 @@ class StorageRestartTests(unittest.TestCase):
                                       "finishedAt": "2026-01-01T00:00:01Z"}},
         }]}
         runner.validate_pod(pod, "readonly", True)
-        mutated = json.loads(json.dumps(pod))
-        mutated["spec"]["containers"][0]["volumeMounts"][0]["readOnly"] = False
-        with self.assertRaisesRegex(RuntimeError, "admitted contract changed"):
-            runner.validate_pod(mutated, "readonly", False)
+        mutations = []
+        extra = json.loads(json.dumps(pod))
+        extra["spec"]["volumes"].append({"name": "extra", "persistentVolumeClaim": {
+            "claimName": "extra", "readOnly": True}})
+        extra["spec"]["containers"][0]["volumeMounts"].append({
+            "name": "extra", "mountPath": "/extra", "readOnly": True})
+        mutations.append(extra)
+        wrong_claim = json.loads(json.dumps(pod))
+        wrong_claim["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"] = "wrong"
+        mutations.append(wrong_claim)
+        wrong_mount = json.loads(json.dumps(pod))
+        wrong_mount["spec"]["containers"][0]["volumeMounts"][0]["mountPath"] = "/wrong"
+        mutations.append(wrong_mount)
+        wrong_read_only = json.loads(json.dumps(pod))
+        wrong_read_only["spec"]["containers"][0]["volumeMounts"][0]["readOnly"] = False
+        mutations.append(wrong_read_only)
+        for mutated in mutations:
+            with self.subTest(storage=mutated["spec"]), self.assertRaisesRegex(
+                    RuntimeError, "admitted contract changed"):
+                runner.validate_pod(mutated, "readonly", False)
+
+    def test_create_pod_captures_exact_two_volume_contract(self):
+        runner = WRAPPER.StorageRunner.__new__(WRAPPER.StorageRunner)
+        runner.image = {"reference": "localhost/probe@" + DIGEST_A,
+                        "platformManifestDigest": DIGEST_A}
+        runner.node = "owned-control-plane"
+        runner.nonce = NONCE
+        runner.expected_pods = {}
+        original = runner.pod_object
+
+        def two_volume_pod(name, phase, **options):
+            value = original(name, phase, **options)
+            value["spec"]["volumes"].append({
+                "name": "backup", "persistentVolumeClaim": {"claimName": "backup-pvc"}})
+            value["spec"]["containers"][0]["volumeMounts"].append({
+                "name": "backup", "mountPath": "/backup"})
+            return value
+
+        runner.pod_object = two_volume_pod
+        runner.k = lambda *_args, data=None, **_kwargs: completed(
+            [], stdout=json.dumps(dict(json.loads(data), metadata={
+                "name": "backup", "namespace": WRAPPER.NAMESPACE, "uid": "pod-uid"})))
+        created = runner.create_pod("backup", "verify")
+        expected = {
+            "volumes": [
+                {"name": "backup", "claimName": "backup-pvc", "readOnly": False},
+                {"name": "store", "claimName": WRAPPER.PVC_NAME, "readOnly": False},
+            ],
+            "mounts": [
+                {"name": "backup", "mountPath": "/backup", "readOnly": False},
+                {"name": "store", "mountPath": WRAPPER.MOUNT_PATH, "readOnly": False},
+            ],
+        }
+        self.assertEqual(runner.expected_pods["backup"]["storage"], expected)
+        self.assertEqual(WRAPPER.pod_storage_contract(created), expected)
 
     def test_pv_omitted_empty_storage_class_is_canonical_and_diagnostics_name_only_fields(self):
         runner = WRAPPER.StorageRunner.__new__(WRAPPER.StorageRunner)

@@ -92,6 +92,62 @@ def file_digest(path):
     return "sha256:" + digest.hexdigest()
 
 
+def normalized_read_only(value):
+    if value is None or value is False:
+        return False
+    if value is True:
+        return True
+    raise RuntimeError("probe Pod storage contract is invalid")
+
+
+def pod_storage_contract(value):
+    if not isinstance(value, dict) or not isinstance(value.get("spec"), dict):
+        raise RuntimeError("probe Pod storage contract is invalid")
+    spec = value["spec"]
+    containers = spec.get("containers", [])
+    volumes = spec.get("volumes", [])
+    if (not isinstance(containers, list) or len(containers) != 1
+            or not isinstance(containers[0], dict)
+            or not isinstance(volumes, list) or not 1 <= len(volumes) <= 8
+            or not all(isinstance(item, dict) for item in volumes)):
+        raise RuntimeError("probe Pod storage contract is invalid")
+    mounts = containers[0].get("volumeMounts", [])
+    if (not isinstance(mounts, list) or len(mounts) != len(volumes)
+            or not all(isinstance(item, dict) for item in mounts)):
+        raise RuntimeError("probe Pod storage contract is invalid")
+    volume_contract = []
+    for volume in volumes:
+        name = volume.get("name")
+        claim = volume.get("persistentVolumeClaim")
+        claim_name = claim.get("claimName") if isinstance(claim, dict) else None
+        if (set(volume) != {"name", "persistentVolumeClaim"}
+                or not isinstance(claim, dict) or set(claim) - {"claimName", "readOnly"}
+                or not isinstance(name, str) or not name or len(name) > 63
+                or not isinstance(claim_name, str) or not claim_name
+                or len(claim_name) > 253):
+            raise RuntimeError("probe Pod storage contract is invalid")
+        volume_contract.append({"name": name, "claimName": claim_name,
+                                "readOnly": normalized_read_only(claim.get("readOnly"))})
+    mount_contract = []
+    for mount in mounts:
+        name = mount.get("name")
+        path = mount.get("mountPath")
+        if (set(mount) - {"name", "mountPath", "readOnly"}
+                or not isinstance(name, str) or not name or len(name) > 63
+                or not isinstance(path, str) or not path.startswith("/")
+                or len(path) > 1024 or any(character.isspace() for character in path)):
+            raise RuntimeError("probe Pod storage contract is invalid")
+        mount_contract.append({"name": name, "mountPath": path,
+                               "readOnly": normalized_read_only(mount.get("readOnly"))})
+    volume_contract.sort(key=lambda item: item["name"])
+    mount_contract.sort(key=lambda item: item["name"])
+    names = [item["name"] for item in volume_contract]
+    mount_names = [item["name"] for item in mount_contract]
+    if len(names) != len(set(names)) or len(mount_names) != len(set(mount_names)) or names != mount_names:
+        raise RuntimeError("probe Pod storage contract is invalid")
+    return {"volumes": volume_contract, "mounts": mount_contract}
+
+
 class StorageRunner:
     PACKAGE = "inventory"
     RESULT_SCHEMA = "apsides.dev/storage-restart-qualification/v1"
@@ -306,14 +362,14 @@ class StorageRunner:
         expected = self.expected_pods.get(name)
         spec = value.get("spec", {})
         containers = spec.get("containers", [])
-        volumes = spec.get("volumes", [])
-        if expected is None or len(containers) != 1 or len(volumes) != 1:
+        if expected is None or len(containers) != 1:
             raise RuntimeError("probe Pod expectation is missing")
         container = containers[0]
-        volume = volumes[0]
-        mounts = container.get("volumeMounts", [])
         env = {item.get("name"): item.get("value") for item in container.get("env", [])}
-        claim = volume.get("persistentVolumeClaim", {})
+        try:
+            storage = pod_storage_contract(value)
+        except RuntimeError as error:
+            raise RuntimeError("probe Pod identity or admitted contract changed") from error
         if (value.get("metadata", {}).get("uid") != expected["uid"]
                 or value.get("metadata", {}).get("name") != name
                 or spec.get("nodeName") != self.node
@@ -324,11 +380,7 @@ class StorageRunner:
                 or container.get("command") != expected["command"]
                 or container.get("args", []) != expected["args"]
                 or env != expected["env"]
-                or volume.get("name") != "store" or claim.get("claimName") != PVC_NAME
-                or bool(claim.get("readOnly", False)) != expected["readOnly"]
-                or len(mounts) != 1 or mounts[0].get("name") != "store"
-                or mounts[0].get("mountPath") != MOUNT_PATH
-                or bool(mounts[0].get("readOnly", False)) != expected["readOnly"]):
+                or storage != expected["storage"]):
             raise RuntimeError("probe Pod identity or admitted contract changed")
         if not terminal:
             return
@@ -351,7 +403,7 @@ class StorageRunner:
         elif self.runtime_image_id != image_id:
             raise RuntimeError("probe runtime image identity changed")
         self.mounts.append({"pod": name, "podUid": expected["uid"], "node": self.node,
-                            "readOnly": expected["readOnly"]})
+                            "storage": expected["storage"]})
         self.pod_runs.append({"pod": name, "podUid": expected["uid"],
                               "containerId": container_id, "imageId": image_id,
                               "exitCode": 0, "startedAt": terminated["startedAt"],
@@ -398,11 +450,12 @@ class StorageRunner:
         if created.get("metadata", {}).get("name") != name:
             raise RuntimeError("created Pod identity differs")
         container = value["spec"]["containers"][0]
+        storage = pod_storage_contract(value)
         self.expected_pods[name] = {
             "uid": created.get("metadata", {}).get("uid"),
-            "readOnly": bool(options.get("read_only", False)),
             "command": container.get("command"), "args": container.get("args", []),
             "env": {item["name"]: item["value"] for item in container.get("env", [])},
+            "storage": storage,
         }
         self.validate_pod(created, name, False)
         return created

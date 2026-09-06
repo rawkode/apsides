@@ -126,14 +126,18 @@ Pod. Competing coordination writers also passed: identical claims were idempoten
 distinct reviews coexisted, and one immutable audit candidate won while the other
 received the exact conflict error. A fresh read-only Pod verified seed and race
 records. This does not prove transaction overlap or cross-store atomicity;
-interrupted coordination writes and PVC backup restoration remain unqualified.
+interrupted coordination writes remain unqualified.
 
 Local filesystem tests cover one libSQL `VACUUM INTO` backup containing all four
 stores, exact read-only verification, retained inventory history, exclusion of
 later source writes, refusal to overwrite existing destinations, and rejection
 of malformed backups without repair.
 Inventory now supports local read-only access without initialization or repair.
-These tests do not establish live PVC restore or production recovery authority.
+A live two-PVC qualification also passed: the backup-only read-only verifier
+recovered original records after all four source stores were changed. Exact Pod
+mount sets exclude access to the source during verification. Both local volumes
+share one node; this does not establish independent failure domains, node-loss
+recovery, or production restore authority.
 
 ## Remaining production work
 
@@ -147,7 +151,7 @@ These tests do not establish live PVC restore or production recovery authority.
   executor cannot mint credentials, complete admitted requests, or write the
   metadata store.
 - Complete claim, review and audit persistent-volume interrupted-write
-  qualification, and qualify backup and remote Turso/libSQL restart,
+  qualification, and qualify remote Turso/libSQL restart,
   unavailable-storage, conflict and recovery behavior.
 - Complete production API authorization and admission qualification for the
   supported Kubernetes versions, including the declared preview permissions and

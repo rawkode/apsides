@@ -25,6 +25,10 @@ enum Phase {
     RaceLeft,
     RaceRight,
     VerifyRace,
+    BackupSeed,
+    BackupCreate,
+    BackupMutate,
+    BackupVerify,
 }
 
 impl Phase {
@@ -35,6 +39,10 @@ impl Phase {
             "race-left" => Ok(Self::RaceLeft),
             "race-right" => Ok(Self::RaceRight),
             "verify-race" => Ok(Self::VerifyRace),
+            "backup-seed" => Ok(Self::BackupSeed),
+            "backup-create" => Ok(Self::BackupCreate),
+            "backup-mutate" => Ok(Self::BackupMutate),
+            "backup-verify" => Ok(Self::BackupVerify),
             _ => Err("unsupported coordination PVC probe phase".into()),
         }
     }
@@ -46,6 +54,10 @@ impl Phase {
             Self::RaceLeft => "race-left",
             Self::RaceRight => "race-right",
             Self::VerifyRace => "verify-race",
+            Self::BackupSeed => "backup-seed",
+            Self::BackupCreate => "backup-create",
+            Self::BackupMutate => "backup-mutate",
+            Self::BackupVerify => "backup-verify",
         }
     }
 }
@@ -390,7 +402,7 @@ fn emit(phase: Phase, outcome: &'static str, nonce: &str, fixture: &Fixture) -> 
 fn write_report<T: Serialize>(prefix: &[u8], report: &T) -> TestResult {
     let bytes = serde_json::to_vec(report)?;
     if bytes.len() > 4096 {
-        return Err("coordination PVC race report exceeds its bound".into());
+        return Err("coordination PVC report exceeds its bound".into());
     }
     let mut output = std::io::stdout().lock();
     output.write_all(prefix)?;
@@ -639,7 +651,13 @@ async fn execute(path: &Path, phase: Phase, nonce: &str) -> TestResult {
             verify_read_only(path, &fixture).await?;
             "verified"
         }
-        Phase::RaceLeft | Phase::RaceRight | Phase::VerifyRace => {
+        Phase::RaceLeft
+        | Phase::RaceRight
+        | Phase::VerifyRace
+        | Phase::BackupSeed
+        | Phase::BackupCreate
+        | Phase::BackupMutate
+        | Phase::BackupVerify => {
             return Err("coordination PVC race phase requires its dedicated protocol".into());
         }
     };
@@ -665,7 +683,12 @@ async fn execute_race(path: &Path, phase: Phase, nonce: &str, live: bool) -> Tes
             let winner_left = verify_race_read_only(path).await?;
             emit_race_result(phase, "verified", nonce, &race, winner_left)
         }
-        Phase::Seed | Phase::Verify => {
+        Phase::Seed
+        | Phase::Verify
+        | Phase::BackupSeed
+        | Phase::BackupCreate
+        | Phase::BackupMutate
+        | Phase::BackupVerify => {
             Err("coordination PVC non-race phase used with race protocol".into())
         }
     }
@@ -689,10 +712,14 @@ async fn pvc_coordination_phase() -> TestResult {
     let nonce = std::env::var("APS_COORDINATION_TEST_NONCE")
         .map_err(|_| "coordination PVC nonce is required")?;
     let phase = live_configuration(&phase, &path, &nonce)?;
-    if matches!(phase, Phase::Seed | Phase::Verify) {
-        execute(Path::new(&path), phase, &nonce).await
-    } else {
-        execute_race(Path::new(&path), phase, &nonce, true).await
+    match phase {
+        Phase::Seed | Phase::Verify => execute(Path::new(&path), phase, &nonce).await,
+        Phase::RaceLeft | Phase::RaceRight | Phase::VerifyRace => {
+            execute_race(Path::new(&path), phase, &nonce, true).await
+        }
+        Phase::BackupSeed | Phase::BackupCreate | Phase::BackupMutate | Phase::BackupVerify => {
+            backup::execute_live(phase, &nonce).await
+        }
     }
     .map_err(|_| "coordination PVC probe failed".into())
 }
@@ -743,6 +770,10 @@ fn live_protocol_is_exact_and_bounded() {
     assert!(live_configuration("race-left", LIVE_PATH, TEST_NONCE).is_ok());
     assert!(live_configuration("race-right", LIVE_PATH, TEST_NONCE).is_ok());
     assert!(live_configuration("verify-race", LIVE_PATH, TEST_NONCE).is_ok());
+    assert!(live_configuration("backup-seed", LIVE_PATH, TEST_NONCE).is_ok());
+    assert!(live_configuration("backup-create", LIVE_PATH, TEST_NONCE).is_ok());
+    assert!(live_configuration("backup-mutate", LIVE_PATH, TEST_NONCE).is_ok());
+    assert!(live_configuration("backup-verify", LIVE_PATH, TEST_NONCE).is_ok());
     for phase in ["", "write", "recover", "race"] {
         assert!(live_configuration(phase, LIVE_PATH, TEST_NONCE).is_err());
     }

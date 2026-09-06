@@ -23,6 +23,8 @@ tasks: {
 	storageRestartTest: {command: "python3", args: ["tests/reakt/storage/test_restart.py"]}
 	coordinationRestartTest: {command: "python3", args: ["tests/reakt/storage/test_coordination.py"]}
 	coordinationProbeTest: {command: "cargo", args: ["test", "--locked", "-p", "coordination", "--test", "pvc_restart"]}
+	storageBackupTest: {command: "python3", args: ["tests/reakt/storage/test_backup.py"]}
+	storageBackup: {command: "python3", args: ["tests/reakt/run_storage_backup.py"]}
 	coordinationRestart: {command: "python3", args: ["tests/reakt/run_coordination_restart.py"]}
 	storagePrepare: {command: "python3", args: ["tests/reakt/storage/build.py"]}
 	storageRestart: {command: "python3", args: ["tests/reakt/run_storage_restart.py"]}
