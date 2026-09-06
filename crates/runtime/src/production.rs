@@ -37,6 +37,7 @@ use crate::{
     normalized_object, validate_exact_apply_owner,
 };
 
+const MAX_DIAGNOSTIC_CONDITIONS: usize = 256;
 const MAX_POLL_MILLIS: u64 = 30_000;
 const MAX_BACKOFF_MILLIS: u64 = 60_000;
 const MAX_MUTATION_INTERVAL_MILLIS: u64 = 60_000;
@@ -77,6 +78,8 @@ struct DiagnosticSnapshot {
     phase: DiagnosticPhase,
     cache: CacheState,
     blocked_targets: usize,
+    conditions: Vec<DiagnosticCondition>,
+    field_or_version_conflicts: usize,
     last_reason_code: Option<String>,
     reconciliations: u64,
     watch_recoveries: u64,
@@ -88,6 +91,13 @@ struct DiagnosticSnapshot {
     trigger_to_cycle_micros_count: u64,
     trigger_to_cycle_micros_sum: u64,
     trigger_to_cycle_micros_max: u64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticCondition {
+    reason_code: String,
+    resource_id: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
@@ -132,6 +142,8 @@ impl Diagnostics {
                 phase: DiagnosticPhase::Starting,
                 cache: CacheState::Pending,
                 blocked_targets: 0,
+                conditions: Vec::new(),
+                field_or_version_conflicts: 0,
                 last_reason_code: None,
                 reconciliations: 0,
                 watch_recoveries: 0,
@@ -161,17 +173,30 @@ impl Diagnostics {
         &self,
         phase: DiagnosticPhase,
         cache: CacheState,
-        blocked: usize,
+        conditions: &[RuntimeCondition],
         reason: Option<&str>,
     ) {
         let mut snapshot = self.snapshot.write().await;
-        snapshot.phase = if blocked == 0 {
+        snapshot.phase = if conditions.is_empty() {
             phase
         } else {
             DiagnosticPhase::Degraded
         };
         snapshot.cache = cache;
-        snapshot.blocked_targets = blocked;
+        snapshot.conditions = conditions
+            .iter()
+            .take(MAX_DIAGNOSTIC_CONDITIONS)
+            .map(|condition| DiagnosticCondition {
+                reason_code: condition.reason_code.clone(),
+                resource_id: condition.resource_name.clone(),
+            })
+            .collect();
+        snapshot.blocked_targets = snapshot.conditions.len();
+        snapshot.field_or_version_conflicts = snapshot
+            .conditions
+            .iter()
+            .filter(|condition| condition.reason_code == "field-or-version-conflict")
+            .count();
         snapshot.last_reason_code = reason.map(str::to_owned);
         self.copy_counters(&mut snapshot);
     }
@@ -398,7 +423,7 @@ impl ProductionController {
                     .update(
                         DiagnosticPhase::Draining,
                         CacheState::Pending,
-                        0,
+                        &[],
                         Some("termination-requested"),
                     )
                     .await;
@@ -425,7 +450,7 @@ impl ProductionController {
                         .update(
                             DiagnosticPhase::Inactive,
                             CacheState::Pending,
-                            0,
+                            &[],
                             Some("activation-inactive"),
                         )
                         .await;
@@ -524,7 +549,7 @@ impl ProductionController {
             .update(
                 DiagnosticPhase::Ready,
                 CacheState::Synchronized,
-                conditions.len(),
+                conditions,
                 reason.as_deref(),
             )
             .await;
@@ -554,7 +579,7 @@ impl ProductionController {
             .update(
                 DiagnosticPhase::Degraded,
                 CacheState::Pending,
-                0,
+                &[],
                 Some(reason),
             )
             .await;
@@ -673,7 +698,7 @@ impl ProductionController {
                 Err(error) => conditions.push(condition_for(resource, &error)),
             }
         }
-        conditions.truncate(256);
+        conditions.truncate(MAX_DIAGNOSTIC_CONDITIONS);
         Ok(CycleResult {
             observations: observations.into_values().collect(),
             conditions,
@@ -826,7 +851,7 @@ impl ProductionController {
             .update(
                 DiagnosticPhase::Draining,
                 CacheState::Pending,
-                0,
+                &[],
                 Some("activation-draining"),
             )
             .await;
@@ -1626,7 +1651,10 @@ mod tests {
             .update(
                 DiagnosticPhase::Ready,
                 CacheState::Synchronized,
-                1,
+                &[RuntimeCondition {
+                    reason_code: "input-unavailable".into(),
+                    resource_name: Some("target".into()),
+                }],
                 Some("input-unavailable"),
             )
             .await;
@@ -1644,7 +1672,10 @@ mod tests {
             .update(
                 DiagnosticPhase::Ready,
                 CacheState::Synchronized,
-                1,
+                &[RuntimeCondition {
+                    reason_code: "input-unavailable".into(),
+                    resource_name: Some("target".into()),
+                }],
                 Some("input-unavailable"),
             )
             .await;
@@ -1718,6 +1749,12 @@ mod tests {
                 || body["cache"] != "synchronized"
                 || body["blockedTargets"] != 2
                 || body["lastReasonCode"] != reason
+                || body["conditions"]
+                    != json!([
+                        {"reasonCode": reason, "resourceId": "target-a"},
+                        {"reasonCode": "input-unavailable", "resourceId": "target-b"},
+                    ])
+                || body["fieldOrVersionConflicts"] != json!(index)
                 || body["errors"] != json!(index + 1)
             {
                 return Err("retry wait erased completed cycle diagnostics".into());
@@ -1736,6 +1773,8 @@ mod tests {
         if body["phase"] != "ready"
             || body["cache"] != "synchronized"
             || body["blockedTargets"] != 0
+            || body["conditions"] != json!([])
+            || body["fieldOrVersionConflicts"] != 0
             || !body["lastReasonCode"].is_null()
             || diagnostic_json(&runtime.diagnostics, "/readyz").await?.0 != StatusCode::OK
         {
@@ -1774,6 +1813,8 @@ mod tests {
         if body["phase"] != "degraded"
             || body["cache"] != "pending"
             || body["blockedTargets"] != 0
+            || body["conditions"] != json!([])
+            || body["fieldOrVersionConflicts"] != 0
             || body["lastReasonCode"] != "activation-unavailable"
             || body["errors"] != 1
             || diagnostic_json(&runtime.diagnostics, "/readyz").await?.0
@@ -1783,6 +1824,56 @@ mod tests {
         }
         shutdown.send(true)?;
         waiting.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn diagnostic_conditions_are_bounded_and_exclude_api_values()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let plan = plan();
+        let policy = policy(&plan);
+        let activation = activation(&plan, &policy, None);
+        let runtime = controller(&plan, &activation, wire(vec![]).0);
+        let resource = plan.ir.resources.first().ok_or("test resource missing")?;
+        let api_error = kube::Error::Api(
+            kube::core::Status::failure("private-api-value", "private-api-value")
+                .with_code(409)
+                .boxed(),
+        );
+        let error = write_api_error("conditional-apply", resource, &api_error);
+        let mut conditions = vec![condition_for(resource, &error); MAX_DIAGNOSTIC_CONDITIONS + 1];
+        let first = conditions.first_mut().ok_or("test condition missing")?;
+        first.reason_code = "input-missing".into();
+        runtime.record_cycle(&conditions, &mut None).await;
+        let (_, body) = diagnostic_json(&runtime.diagnostics, "/status").await?;
+        let retained = body["conditions"].as_array().ok_or("conditions missing")?;
+        if retained.len() != MAX_DIAGNOSTIC_CONDITIONS
+            || body["blockedTargets"] != MAX_DIAGNOSTIC_CONDITIONS
+            || body["fieldOrVersionConflicts"] != MAX_DIAGNOSTIC_CONDITIONS - 1
+            || retained
+                .first()
+                .and_then(|entry| entry["reasonCode"].as_str())
+                != Some("input-missing")
+            || retained
+                .iter()
+                .any(|entry| entry["resourceId"] != resource.id)
+            || body.to_string().contains("private-api-value")
+        {
+            return Err("diagnostic conditions lost bounds or disclosed API values".into());
+        }
+        for phase in [DiagnosticPhase::Draining, DiagnosticPhase::Inactive] {
+            runtime
+                .diagnostics
+                .update(phase, CacheState::Pending, &[], Some("activation-inactive"))
+                .await;
+            let (_, body) = diagnostic_json(&runtime.diagnostics, "/status").await?;
+            if body["conditions"] != json!([])
+                || body["blockedTargets"] != 0
+                || body["fieldOrVersionConflicts"] != 0
+            {
+                return Err("inactive diagnostic state retained old conditions".into());
+            }
+        }
         Ok(())
     }
 

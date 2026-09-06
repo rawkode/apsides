@@ -20,8 +20,11 @@ establish narrower properties.
   Server-Side Apply. It has no JavaScript evaluator and cannot expand its
   approved scope.
 - Runtime diagnostics retain completed-cycle blocked counts and specific reasons
-  throughout reconciliation backoff. Operational failures replace those with a
-  pending cache state and their own reason. `/readyz` stays unavailable while
+  throughout reconciliation backoff. `/status` includes up to 256 `conditions`
+  containing only `resourceId` and `reasonCode`, plus a `fieldOrVersionConflicts`
+  count. A Kubernetes 409 is not classified more narrowly as an SSA ownership
+  conflict. Operational failures replace those with a pending cache state and
+  their own reason, clearing the per-target list and conflict count. `/readyz` stays unavailable while
   degraded; a clean cycle restores readiness. These probes describe the
   controller, not application workload health.
 
