@@ -173,7 +173,12 @@ const PERMISSION_UPGRADE: &[Requirement] = &[
     r("unapproved-writer-started", Expected::Bool(false)),
 ];
 const PHASE_RECOVERY: &[Requirement] = &[
-    r("all-phase-interruptions-recovered", Expected::Bool(true)),
+    r("planned-interruption-recovered", Expected::Bool(true)),
+    r("staged-interruption-recovered", Expected::Bool(true)),
+    r("quiesced-interruption-recovered", Expected::Bool(true)),
+    r("activated-interruption-recovered", Expected::Bool(true)),
+    r("cleaning-interruption-recovered", Expected::Bool(true)),
+    r("committed-interruption-recovered", Expected::Bool(true)),
     r("unsafe-activation", Expected::Bool(false)),
 ];
 const LAST_TYPE: &[Requirement] = &[

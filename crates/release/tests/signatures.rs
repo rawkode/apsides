@@ -117,7 +117,12 @@ fn check_assertions(check: &str) -> Vec<Value> {
             boolean("unapproved-writer-started", false),
         ],
         "phase-interruption-recovery" => vec![
-            boolean("all-phase-interruptions-recovered", true),
+            boolean("planned-interruption-recovered", true),
+            boolean("staged-interruption-recovered", true),
+            boolean("quiesced-interruption-recovered", true),
+            boolean("activated-interruption-recovered", true),
+            boolean("cleaning-interruption-recovered", true),
+            boolean("committed-interruption-recovered", true),
             boolean("unsafe-activation", false),
         ],
         "last-api-type-cleanup" => vec![

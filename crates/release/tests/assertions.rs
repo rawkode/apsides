@@ -156,3 +156,64 @@ fn rejects_generic_status_equalities() {
         .is_err()
     );
 }
+
+fn phase_recovery_assertions() -> Vec<Assertion> {
+    let mut assertions: Vec<_> = [
+        "planned",
+        "staged",
+        "quiesced",
+        "activated",
+        "cleaning",
+        "committed",
+    ]
+    .into_iter()
+    .map(|phase| {
+        assertion(
+            &format!("{phase}-interruption-recovered"),
+            json!(true),
+            json!(true),
+        )
+    })
+    .collect();
+    assertions.push(assertion("unsafe-activation", json!(false), json!(false)));
+    assertions
+}
+
+#[test]
+fn phase_recovery_requires_every_phase_and_safe_activation() {
+    let complete = phase_recovery_assertions();
+    let validate = |values: &[Assertion]| {
+        validate_assertions("phase-interruption-recovery", false, None, values)
+    };
+    assert!(validate(&complete).is_ok());
+    for index in 0..complete.len() {
+        let mut missing = complete.clone();
+        missing.remove(index);
+        assert!(validate(&missing).is_err());
+
+        let mut failed = complete.clone();
+        failed[index].actual = json!(index == complete.len() - 1);
+        assert!(validate(&failed).is_err());
+
+        let mut duplicate = complete.clone();
+        duplicate[index] = complete[(index + 1) % complete.len()].clone();
+        assert!(validate(&duplicate).is_err());
+    }
+}
+
+#[test]
+fn phase_recovery_rejects_legacy_aggregate_and_self_selected_expectations() {
+    let legacy = vec![
+        assertion(
+            "all-phase-interruptions-recovered",
+            json!(true),
+            json!(true),
+        ),
+        assertion("unsafe-activation", json!(false), json!(false)),
+    ];
+    assert!(validate_assertions("phase-interruption-recovery", false, None, &legacy).is_err());
+    let mut incomplete = phase_recovery_assertions();
+    incomplete[0].expected = json!(false);
+    incomplete[0].actual = json!(false);
+    assert!(validate_assertions("phase-interruption-recovery", false, None, &incomplete).is_err());
+}

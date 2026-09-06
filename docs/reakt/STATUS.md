@@ -75,6 +75,15 @@ or continue mutating the metadata store before transfer can be authorized.
 Current candidate tests do not prove this. Activation also crosses intermediate
 durable phases inside one call; interruption at each such phase remains untested.
 
+The unreleased phase-recovery assertion contract now requires individual
+Planned, Staged, Quiesced, Activated, Cleaning and Committed recovery results,
+plus `unsafe-activation: false`. Earlier aggregate-only evidence is rejected;
+old signed receipts must not be rewritten or presented as compatible. This is
+an assertion-contract cutover, not a change to the evidence envelope version.
+The validator checks authenticated assertion structure, not the underlying
+per-phase execution transcript. Production-payload evidence from a bound
+producer remains required before closing the release check.
+
 The fresh lifecycle run at `283d493` passed using the signed disposable A/B
 candidates and current test driver (`work/lifecycle-283d493-results/`). Initial
 allocation, reservation, staging and activation succeeded. B was rejected with
