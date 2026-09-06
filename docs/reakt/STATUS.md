@@ -4,6 +4,33 @@ Reakt implements specification 0.2 in the workspace crates and the `@reakt/kuber
 
 ## Current integration checkpoint
 
+The fresh UID-replacement lifecycle run at `b6a103b` passed
+(`work/lifecycle-b6a103b-uid-results/`). After verified old-writer retirement and
+successor activation, the harness deleted the obsolete Service and recreated it
+with the same name and SSA manager but a different UID. Actual cleanup rejected
+the replacement, preserved it without a deletion timestamp, and retained the
+original UID claim. The run intentionally ends with cleanup uncommitted after
+that safety refusal. Its report confirms owned-cluster deletion, credential-file
+removal and complete diagnostics. This remains signed disposable-candidate
+evidence, not production `VerifiedRelease` acceptance. The refusal is matched by
+static diagnostic text; no byte-for-byte unchanged-registry claim is made.
+Independent review found no blockers and confirmed the frozen runner matches
+source, the final registry remains at the pre-refusal revision, and cleanup
+completed. Service preservation and original-claim retention are established by
+the runner's successful live assertions; diagnostics do not retain those object
+bodies for independent re-evaluation. Astro build and internal links pass
+(`work/lifecycle-b6a103b-uid-docs.log`).
+
+The next recovery gap is distinct from same-executor process restart. A fresh
+GitHub Actions attempt has a different executor identity, and the CLI correctly
+rejects takeover, but no qualified executor-transfer command exists yet. The
+issued deployment credential's binding and expiry are not retained on the
+transition. Independent architecture review requires durable binding plus proof
+that the old executor cannot remint credentials, leave admitted writes unresolved,
+or continue mutating the metadata store before transfer can be authorized.
+Current candidate tests do not prove this. Activation also crosses intermediate
+durable phases inside one call; interruption at each such phase remains untested.
+
 The fresh lifecycle run at `283d493` passed using the signed disposable A/B
 candidates and current test driver (`work/lifecycle-283d493-results/`). Initial
 allocation, reservation, staging and activation succeeded. B was rejected with
