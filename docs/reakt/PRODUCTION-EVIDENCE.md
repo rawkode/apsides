@@ -71,3 +71,39 @@ a separate mandatory release check.
 `cuenv task reproducibilityTest` exercises runner failure handling with synthetic
 build processes. `cuenv task releaseTest` exercises signature and evidence
 verification. Neither command establishes production build or cluster acceptance.
+
+## Declared-input isolation
+
+`tests/reakt/run_input_isolation.py` measures the authoring boundary against an
+already measured production build. It brackets controlled probes with normal CLI
+compilations, requiring the same production IR and authoring compiler closure.
+The declared-module control and omitted-module probe contain the same physical
+dependency; only inclusion in the lock changes. Other probes check SES rejection
+of clock/random access and absence of guest environment, filesystem and network
+capabilities. Those absence checks do not issue operating-system or network calls.
+
+The probe helper calls the existing compiler API because the public CLI deliberately
+hides detailed errors. It classifies only specific errors, rejects unrelated
+failures and emits closed result tags. The producer authenticates its Python
+source, shared measurement helpers and TypeScript probe source through the flat
+evidence directory. The resulting receipt attests only `declared-input-isolation`.
+
+```sh
+cuenv exec python3 tests/reakt/run_input_isolation.py \
+  --source examples/reakt/program.tsx \
+  --artifact work/reproducibility/build-1 \
+  --production-evidence work/reproducibility/evidence/production-evidence.json \
+  --cli "$PWD/target/debug/reakt" \
+  --output work/input-isolation
+```
+
+Pass the output's flat `evidence/` directory to release assembly. Coverage must
+reference `evidence/isolation-evidence.json`. Combining this with another evidence
+directory requires preserving every referenced file and rejecting conflicting
+copies; copying a receipt alone is insufficient.
+
+`cuenv task inputIsolationTest` checks orchestration with mocked compiler outcomes.
+`cuenv task inputIsolationEvidenceLive` reads an actual assembled release selected
+by `APS_PRODUCTION_EVIDENCE_RELEASE` and validates this receipt. Release validation
+checks the fixed assertion contract and signed file bindings; it does not replay
+the probes or independently establish host-level isolation from their result tags.
