@@ -11,6 +11,7 @@
 )]
 mod artifact;
 mod artifact_input;
+mod audit_command;
 mod deploy_command;
 mod inventory_connection;
 mod release_command;
@@ -50,7 +51,7 @@ fn run() -> Result<()> {
     if matches!(command.as_str(), "help" | "--help" | "-h") {
         writeln!(
             std::io::stdout().lock(),
-            "Reakt — compiled reactive GitOps for Kubernetes\n\n  reakt check --ir FILE\n  reakt plan --ir FILE --ceiling FILE\n  reakt compile (--source FILE | --ir FILE) --output DIR\n  reakt build --source FILE --output DIR [--profile FILE]\n  reakt test --ir FILE --output DIR\n  reakt verify --artifact DIR\n  reakt verify-release --artifact DIR --trust-policy FILE\n  reakt deploy [--artifact DIR | --artifact-reference FILE]\n\ncompile emits validated plans and a Rust controller project.\nbuild produces a pinned Linux OCI image, native binary, SBOM and compiler closure.\ndeploy reads dist/reakt by default and uses protected Kubernetes policy and short-lived identity."
+            "Reakt — compiled reactive GitOps for Kubernetes\n\n  reakt check --ir FILE\n  reakt plan --ir FILE --ceiling FILE\n  reakt compile (--source FILE | --ir FILE) --output DIR\n  reakt build --source FILE --output DIR [--profile FILE]\n  reakt test --ir FILE --output DIR\n  reakt verify --artifact DIR\n  reakt verify-release --artifact DIR --trust-policy FILE\n  reakt deploy [--artifact DIR | --artifact-reference FILE]\n  reakt audit --domain NAME --transition ID --cluster-binding NAME --namespace NAME --control-namespace NAME\n\ncompile emits validated plans and a Rust controller project.\nbuild produces a pinned Linux OCI image, native binary, SBOM and compiler closure.\ndeploy reads dist/reakt by default and uses protected Kubernetes policy and short-lived identity."
         )?;
         return Ok(());
     }
@@ -127,6 +128,7 @@ fn run() -> Result<()> {
         }
         "verify-release" => verify_release_command(&options)?,
         "deploy" => deploy_command::command(&options)?,
+        "audit" => audit_command::command(&options)?,
         "release" => release_command::command(&options)?,
         _ => return Err(format!("unknown command {command}; run reakt --help").into()),
     }

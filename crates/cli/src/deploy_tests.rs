@@ -93,6 +93,7 @@ fn registry() -> Result<(NamespaceRegistry, deploy::TransitionPlan)> {
         claims: vec![],
     };
     let registry = platform::NamespaceRegistryState {
+        audit_heads: BTreeMap::new(),
         active_writer_checkpoints: BTreeMap::new(),
         schema_version: platform::REGISTRY_SCHEMA_VERSION.into(),
         registry_uid: REGISTRY_UID.into(),

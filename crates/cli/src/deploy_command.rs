@@ -252,13 +252,15 @@ async fn connect(root: &Path, expected_digest: Option<&str>) -> Result<Deploymen
     };
     config.headers.clear();
     let client = Client::try_from(config)?;
+    let coordination = crate::inventory_connection::connect_coordination().await?;
     let platform = PlatformClient::new(
         client,
         &domain.control_namespace,
         &domain.namespace,
         &domain.cluster_binding,
     )?
-    .with_claim_store(crate::inventory_connection::connect_claims().await?);
+    .with_claim_store(coordination.clone())
+    .with_audit_store(coordination);
     Ok(DeploymentContext {
         platform,
         verified,
@@ -521,13 +523,13 @@ async fn drive_transition(
             }
             Phase::Staged if upgrade => platform.quiesce_previous(transition, executor).await,
             Phase::Staged | Phase::Quiesced | Phase::Activated if !upgrade => {
-                platform.activate_initial(transition, executor).await
+                Box::pin(platform.activate_initial(transition, executor)).await
             }
             Phase::Quiesced | Phase::Activated => {
                 platform.activate_upgrade(transition, executor).await
             }
             Phase::Cleaning if upgrade => platform.commit_upgrade(transition, executor).await,
-            Phase::Cleaning => platform.activate_initial(transition, executor).await,
+            Phase::Cleaning => Box::pin(platform.activate_initial(transition, executor)).await,
             Phase::Staged => return Err("unsupported protected transition phase".into()),
         };
         match result {

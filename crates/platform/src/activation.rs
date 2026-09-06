@@ -266,6 +266,8 @@ impl PlatformClient {
             }
             history.active_allocation = Some(allocation);
             next.active_writer_checkpoints.insert(domain, checkpoint);
+            self.archive_predecessor(registry, &mut next, transition_id)
+                .await?;
         }
         self.persist_registry(registry, &next).await
     }

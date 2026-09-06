@@ -50,6 +50,7 @@ mod model;
 mod ownership;
 mod registry;
 mod registry_model;
+mod transition_audit;
 pub use ownership::OWNERSHIP_INTENT_NAMESPACE;
 mod runtime;
 #[cfg(feature = "deployer")]
@@ -86,7 +87,7 @@ pub fn registry_authority_name(
 }
 
 pub const REGISTRY_AUTHORITY_NAMESPACE: &str = "reakt-platform";
-pub const REGISTRY_SCHEMA_VERSION: &str = "reakt.dev/namespace-registry/v4";
+pub const REGISTRY_SCHEMA_VERSION: &str = "reakt.dev/namespace-registry/v5";
 pub const REGISTRY_AUTHORITY_SCHEMA_VERSION: &str = "reakt.dev/registry-authority/v1";
 pub const SCHEMA_VERSION: &str = "reakt.dev/platform/v1";
 pub const MAX_STATE_BYTES: usize = 512 * 1024;

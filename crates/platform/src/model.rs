@@ -161,6 +161,7 @@ pub struct NamespaceRegistry {
     pub claims: Vec<ProtectedClaim>,
     pub histories: BTreeMap<String, GenerationHistory>,
     pub active_writer_checkpoints: BTreeMap<String, crate::WriterCheckpoint>,
+    pub audit_heads: BTreeMap<String, coordination::AuditRef>,
     pub transitions: BTreeMap<String, StoredTransition>,
     pub(crate) captured_claim_scope: coordination::ClaimScope,
 }
@@ -179,6 +180,7 @@ pub struct NamespaceRegistryState {
     pub histories: BTreeMap<String, GenerationHistory>,
     #[serde(default)]
     pub active_writer_checkpoints: BTreeMap<String, crate::WriterCheckpoint>,
+    pub audit_heads: BTreeMap<String, coordination::AuditRef>,
     pub transitions: BTreeMap<String, StoredTransition>,
 }
 

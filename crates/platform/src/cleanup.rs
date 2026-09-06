@@ -409,6 +409,29 @@ mod tests {
         }
     }
 
+    struct EmptyAuditStore;
+
+    #[async_trait::async_trait]
+    impl coordination::AuditStore for EmptyAuditStore {
+        async fn put_audit(
+            &self,
+            _: &coordination::TransitionAuditV1,
+        ) -> coordination::Result<coordination::AuditRef> {
+            Err(coordination::Error::Invalid(
+                "unexpected cleanup audit publication",
+            ))
+        }
+
+        async fn read_audit(
+            &self,
+            _: &coordination::AuditRef,
+        ) -> coordination::Result<Option<coordination::TransitionAuditV1>> {
+            Err(coordination::Error::Invalid(
+                "unexpected cleanup audit read",
+            ))
+        }
+    }
+
     fn cleanup_registry_fixture() -> crate::Versioned<NamespaceRegistry> {
         crate::Versioned {
             value: NamespaceRegistry {
@@ -419,6 +442,7 @@ mod tests {
                     workload_namespace: "workload".into(),
                 },
                 active_writer_checkpoints: std::collections::BTreeMap::default(),
+                audit_heads: std::collections::BTreeMap::default(),
                 registry_uid: "11111111-1111-4111-8111-111111111111".into(),
                 next_sequence: 1,
                 schema_version: crate::REGISTRY_SCHEMA_VERSION.into(),
@@ -504,7 +528,8 @@ mod tests {
         assert!(metadata_api(&client, &identity, "apps/v1", "ConfigMap").is_err());
         assert!(metadata_api(&client, &identity, "v1", "Secret").is_err());
         let platform = PlatformClient::new(client.clone(), "control", "workload", "cluster-a")?
-            .with_claim_store(Arc::new(FixtureClaims(snapshot)));
+            .with_claim_store(Arc::new(FixtureClaims(snapshot)))
+            .with_audit_store(Arc::new(EmptyAuditStore));
         let ar = ApiResource::from_gvk_with_plural(
             &GroupVersionKind::gvk("", "v1", "ConfigMap"),
             "configmaps",

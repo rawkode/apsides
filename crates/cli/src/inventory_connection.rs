@@ -11,21 +11,41 @@ pub async fn connect() -> Result<Box<dyn InventoryStore>> {
     open(&database, token).await
 }
 
-/// Claim coordination shares the configured persistent metadata database, using
+/// Claim and audit coordination share the configured persistent metadata database, using
 /// separate immutable tables. These credentials are never passed to the runtime.
-pub async fn connect_claims() -> Result<Arc<dyn coordination::ClaimStore>> {
+pub async fn connect_coordination() -> Result<Arc<coordination::LibsqlCoordination>> {
+    open_coordination(false).await
+}
+
+pub async fn connect_audit_reader() -> Result<Arc<coordination::LibsqlCoordination>> {
+    open_coordination(true).await
+}
+
+async fn open_coordination(read_only: bool) -> Result<Arc<coordination::LibsqlCoordination>> {
     let (database, token) = configuration()?;
     let store = tokio::time::timeout(TIMEOUT, async {
         if Path::new(&database).is_absolute() {
             if token.is_some() {
                 return Err("local coordination does not accept a remote token".into());
             }
-            Ok(coordination::LibsqlCoordination::open_local(Path::new(&database)).await?)
+            if read_only {
+                Ok(
+                    coordination::LibsqlCoordination::open_local_read_only(Path::new(&database))
+                        .await?,
+                )
+            } else {
+                Ok(coordination::LibsqlCoordination::open_local(Path::new(&database)).await?)
+            }
         } else {
             let token = token.ok_or("remote coordination requires REAKT_INVENTORY_TOKEN")?;
-            Ok::<_, Box<dyn std::error::Error>>(
-                coordination::LibsqlCoordination::open_remote(database, token).await?,
-            )
+            if read_only {
+                Ok::<_, Box<dyn std::error::Error>>(
+                    coordination::LibsqlCoordination::open_remote_read_only(database, token)
+                        .await?,
+                )
+            } else {
+                Ok(coordination::LibsqlCoordination::open_remote(database, token).await?)
+            }
         }
     })
     .await

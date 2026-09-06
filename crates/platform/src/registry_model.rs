@@ -24,6 +24,7 @@ impl NamespaceRegistryState {
             claims: snapshot.claims.clone(),
             histories: self.histories.clone(),
             active_writer_checkpoints: self.active_writer_checkpoints.clone(),
+            audit_heads: self.audit_heads.clone(),
             transitions: self.transitions.clone(),
             captured_claim_scope: snapshot.scope.clone(),
         })
@@ -69,6 +70,7 @@ impl NamespaceRegistry {
             claim_snapshot: reference.clone(),
             histories: self.histories.clone(),
             active_writer_checkpoints: self.active_writer_checkpoints.clone(),
+            audit_heads: self.audit_heads.clone(),
             transitions: self.transitions.clone(),
         };
         validate_scope(&state, &self.captured_claim_scope)?;

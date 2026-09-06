@@ -51,6 +51,7 @@ impl PlatformClient {
     /// Rejects legacy schemas, mismatched authority, missing snapshots and corrupt backend results.
     pub async fn load_registry(&self) -> Result<Versioned<NamespaceRegistry>> {
         self.claims_backend()?;
+        self.audit_backend()?;
         let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.control_namespace);
         let object = api
             .get(&format!("reakt-registry-{}", self.workload_namespace))
@@ -127,6 +128,7 @@ impl PlatformClient {
         next: &NamespaceRegistry,
     ) -> Result<Versioned<NamespaceRegistry>> {
         self.claims_backend()?;
+        self.audit_backend()?;
         let scope = self.claim_scope(&previous.uid);
         if previous.value.captured_claim_scope != scope
             || next.captured_claim_scope != scope
@@ -184,6 +186,7 @@ impl PlatformClient {
         domain_ids: &[String],
     ) -> Result<Versioned<NamespaceRegistry>> {
         self.claims_backend()?;
+        self.audit_backend()?;
         let scope = self.claim_scope(expected_uid);
         scope.validate()?;
         let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.control_namespace);
@@ -238,6 +241,7 @@ impl PlatformClient {
             claim_snapshot: snapshot.reference()?,
             histories,
             active_writer_checkpoints: BTreeMap::new(),
+            audit_heads: BTreeMap::new(),
             transitions: BTreeMap::new(),
         };
         validate_state_size(&state)?;
@@ -286,6 +290,7 @@ impl PlatformClient {
         for domain in registry.active_writer_checkpoints.keys() {
             crate::writer_checkpoint::active(registry, domain, &self.control_namespace)?;
         }
+        self.validate_registry_retention(registry)?;
         let mut sequences = BTreeSet::new();
         for (transition_id, stored) in &registry.transitions {
             let allocation = stored.allocation();

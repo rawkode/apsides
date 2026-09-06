@@ -162,6 +162,8 @@ impl PlatformClient {
             stored.plan.request.next.compiled.ir.domain.id.clone(),
             checkpoint,
         );
+        self.archive_predecessor(&registry, &mut next, transition)
+            .await?;
         self.persist_registry(&registry, &next).await
     }
 

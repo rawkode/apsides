@@ -20,6 +20,7 @@ const references = [
   ["m0/LIMITS.md", "m0/limits.md", "Milestone 0 limits"],
   ["v1/CONTROLLER_TSX_V1.md", "v1/controller-tsx-v1.md", "Controller TSX v1"],
   ["reakt/ARTIFACT-RESOLUTION.md", "reakt/artifact-resolution.md", "Optional OCI release retrieval"],
+  ["reakt/AUDIT.md", "reakt/audit.md", "Transition audit history"],
   ["reakt/DEPLOYMENT-CONTRACT.md", "reakt/deployment-contract.md", "Provider-neutral deployment protocol"],
   ["reakt/DEPLOYMENT-PERMISSIONS.md", "reakt/deployment-permissions.md", "Deployment permissions"],
   ["reakt/INVENTORY.md", "reakt/inventory.md", "Resource inventory"],
@@ -37,6 +38,10 @@ const references = [
 function withFrontmatter(source, title) {
   const withoutHeading = source
     .replace(/^# .+\n+/, "")
+    .replace(
+      /\]\(AUDIT\.md(#[^)]+)?\)/g,
+      (_, fragment = "") => `](../audit/${fragment})`,
+    )
     .replace(
       /\]\(STATE-MIGRATION\.md(#[^)]+)?\)/g,
       (_, fragment = "") => `](../state-migration/${fragment})`,

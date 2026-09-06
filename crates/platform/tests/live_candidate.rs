@@ -51,7 +51,8 @@ async fn transition_step() -> Result<()> {
         &domain.namespace,
         &domain.cluster_binding,
     )?
-    .with_claim_store(claim_store.clone());
+    .with_claim_store(claim_store.clone())
+    .with_audit_store(claim_store.clone());
     let trust = serde_json::from_value(bootstrap.load_trust_policy(&domain.id).await?.value)?;
     let candidate = release::verify_candidate(Path::new(artifact), &trust).await?;
     let authorization = candidate.authorize_test_staging(TestStagingScope {
@@ -91,7 +92,8 @@ async fn transition_step() -> Result<()> {
         &domain.namespace,
         &domain.cluster_binding,
     )?
-    .with_claim_store(claim_store);
+    .with_claim_store(claim_store.clone())
+    .with_audit_store(claim_store);
     Box::pin(run_action(
         action,
         &settings,
@@ -169,7 +171,7 @@ async fn run_action(
                 {
                     session.activate_upgrade(transition, executor).await?;
                 } else {
-                    session.activate_initial(transition, executor).await?;
+                    Box::pin(session.activate_initial(transition, executor)).await?;
                     session
                         .publish_committed_inventory(&inventory, transition, executor)
                         .await?;
@@ -193,7 +195,7 @@ async fn run_action(
     Ok(())
 }
 
-async fn claim_store() -> Result<Arc<dyn coordination::ClaimStore>> {
+async fn claim_store() -> Result<Arc<coordination::LibsqlCoordination>> {
     let database = env::var("REAKT_INVENTORY_DATABASE")?;
     let path = Path::new(&database);
     if !path.is_absolute() || env::var_os("REAKT_INVENTORY_TOKEN").is_some() {

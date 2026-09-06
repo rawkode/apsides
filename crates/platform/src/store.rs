@@ -126,6 +126,7 @@ pub struct PlatformClient {
     #[cfg(feature = "deployer")]
     pub(crate) selection: Option<std::sync::Arc<crate::transition_session::Selection>>,
     pub(crate) claim_store: Option<std::sync::Arc<dyn coordination::ClaimStore>>,
+    pub(crate) audit_store: Option<std::sync::Arc<dyn coordination::AuditStore>>,
     pub(crate) client: Client,
     pub(crate) control_namespace: String,
     pub(crate) workload_namespace: String,
@@ -159,6 +160,7 @@ impl PlatformClient {
             #[cfg(feature = "deployer")]
             selection: None,
             claim_store: None,
+            audit_store: None,
             client,
             control_namespace: control_namespace.into(),
             workload_namespace: workload_namespace.into(),
@@ -170,6 +172,13 @@ impl PlatformClient {
     #[must_use]
     pub fn with_claim_store(mut self, store: std::sync::Arc<dyn coordination::ClaimStore>) -> Self {
         self.claim_store = Some(store);
+        self
+    }
+
+    /// Attach immutable transition audit storage used by registry operations.
+    #[must_use]
+    pub fn with_audit_store(mut self, store: std::sync::Arc<dyn coordination::AuditStore>) -> Self {
+        self.audit_store = Some(store);
         self
     }
 

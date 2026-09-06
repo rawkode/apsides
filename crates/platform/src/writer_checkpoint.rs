@@ -297,9 +297,7 @@ pub(crate) fn active<'a>(
     let checkpoint = registry
         .active_writer_checkpoints
         .get(domain)
-        .ok_or_else(|| {
-            invalid("active writer checkpoint missing; authenticated backfill required")
-        })?;
+        .ok_or_else(|| invalid("active writer checkpoint missing; explicit recovery required"))?;
     checkpoint.validate_authority(
         allocation,
         &inventory::InventoryScope {

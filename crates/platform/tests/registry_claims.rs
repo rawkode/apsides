@@ -120,6 +120,7 @@ fn client(initial: Option<Value>, mutate_response: bool) -> (Client, Calls) {
 
 fn state() -> Result<Value> {
     Ok(serde_json::to_value(NamespaceRegistryState {
+        audit_heads: BTreeMap::new(),
         registry_uid: UID.into(),
         next_sequence: 1,
         schema_version: platform::REGISTRY_SCHEMA_VERSION.into(),
@@ -137,11 +138,25 @@ fn methods(calls: &Calls) -> Result<Vec<String>> {
 
 #[tokio::test]
 async fn missing_store_fails_before_kubernetes_io() -> Result {
-    let (client, calls) = client(Some(state()?), false);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
-    assert!(platform.load_registry().await.is_err());
-    assert!(platform.bootstrap_registry(UID, "1", &[]).await.is_err());
-    assert!(methods(&calls)?.is_empty());
+    for claims_configured in [false, true] {
+        let (client, calls) = client(Some(state()?), false);
+        let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+        let platform = if claims_configured {
+            platform.with_claim_store(Arc::new(Store(Fault::None)))
+        } else {
+            platform
+        };
+        let error = platform
+            .load_registry()
+            .await
+            .err()
+            .ok_or("missing store accepted")?;
+        if claims_configured {
+            assert!(error.to_string().contains("audit store"));
+        }
+        assert!(platform.bootstrap_registry(UID, "1", &[]).await.is_err());
+        assert!(methods(&calls)?.is_empty());
+    }
     Ok(())
 }
 
@@ -150,7 +165,8 @@ async fn selected_missing_corrupt_and_failed_storage_never_become_empty_claims()
     for fault in [Fault::Missing, Fault::WrongSnapshot, Fault::Backend] {
         let (client, calls) = client(Some(state()?), false);
         let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?
-            .with_claim_store(Arc::new(Store(fault)));
+            .with_claim_store(Arc::new(Store(fault)))
+            .with_audit_store(Arc::new(audit_support::MemoryAuditStore::default()));
         assert!(platform.load_registry().await.is_err());
         assert_eq!(methods(&calls)?, ["GET", "GET"]);
     }
@@ -167,7 +183,8 @@ async fn bootstrap_rejects_lying_store_before_any_kubernetes_write() -> Result {
     ] {
         let (client, calls) = client(None, false);
         let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?
-            .with_claim_store(Arc::new(Store(fault)));
+            .with_claim_store(Arc::new(Store(fault)))
+            .with_audit_store(Arc::new(audit_support::MemoryAuditStore::default()));
         assert!(
             platform
                 .bootstrap_registry(UID, "1", &["example".into()])
@@ -184,7 +201,8 @@ async fn bootstrap_checks_exact_admission_response() -> Result {
     for mutate in [false, true] {
         let (client, calls) = client(None, mutate);
         let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?
-            .with_claim_store(Arc::new(Store(Fault::None)));
+            .with_claim_store(Arc::new(Store(Fault::None)))
+            .with_audit_store(Arc::new(audit_support::MemoryAuditStore::default()));
         let result = platform
             .bootstrap_registry(UID, "1", &["example".into()])
             .await;
@@ -199,12 +217,13 @@ async fn bootstrap_checks_exact_admission_response() -> Result {
 
 #[tokio::test]
 async fn legacy_registry_requires_explicit_recovery() -> Result {
-    for version in ["v2", "v3"] {
+    for version in ["v2", "v3", "v4"] {
         let mut old = state()?;
         old["schemaVersion"] = json!(format!("reakt.dev/namespace-registry/{version}"));
         let (client, calls) = client(Some(old), false);
         let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?
-            .with_claim_store(Arc::new(Store(Fault::None)));
+            .with_claim_store(Arc::new(Store(Fault::None)))
+            .with_audit_store(Arc::new(audit_support::MemoryAuditStore::default()));
         let error = platform
             .load_registry()
             .await
@@ -232,10 +251,13 @@ async fn protected_reference_survives_real_local_database_reopen() -> Result {
         let store = coordination::LibsqlCoordination::open_local(&path).await?;
         let (client, calls) = client(Some(state()?), false);
         let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?
-            .with_claim_store(Arc::new(store));
+            .with_claim_store(Arc::new(store))
+            .with_audit_store(Arc::new(audit_support::MemoryAuditStore::default()));
         let loaded = platform.load_registry().await?;
         assert_eq!(loaded.value.claim_snapshot()?, snapshot());
         assert_eq!(methods(&calls)?, ["GET", "GET"]);
     }
     Ok(())
 }
+#[path = "support/audit.rs"]
+mod audit_support;

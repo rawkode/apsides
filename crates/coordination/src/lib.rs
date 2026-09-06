@@ -7,7 +7,7 @@
     clippy::unimplemented
 )]
 #![forbid(unsafe_code)]
-//! Immutable claim metadata, without a mutable authority pointer.
+//! Immutable coordination metadata, without a mutable authority pointer.
 //!
 //! A snapshot asserts a complete registry view; this library cannot prove that
 //! completeness or grant authority. A future protected registry pointer must bind
@@ -15,6 +15,8 @@
 //! continues to accept `ProtectedClaim` values and never depends on this crate.
 mod model;
 pub use model::*;
+mod audit;
+pub use audit::*;
 
 #[cfg(feature = "libsql-backend")]
 mod libsql_backend;
@@ -27,7 +29,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("invalid claim snapshot: {0}")]
+    #[error("invalid coordination metadata: {0}")]
     Invalid(&'static str),
     #[error("coordination backend operation failed: {0}")]
     Backend(&'static str),
@@ -46,4 +48,20 @@ pub trait ClaimStore: Send + Sync {
     /// Returns errors for invalid references, corrupt data and backend failures;
     /// `None` means only that the referenced digest has no row.
     async fn read_claims(&self, reference: &ClaimRef) -> Result<Option<ClaimSnapshotV1>>;
+}
+
+/// A typed immutable transition-audit store. There is no mutable head, update,
+/// delete or arbitrary payload API.
+#[async_trait]
+pub trait AuditStore: Send + Sync {
+    /// Store a validated audit immutably and return its scope-bound reference.
+    /// # Errors
+    /// Rejects malformed metadata, conflicting/corrupt existing rows, and storage failures.
+    async fn put_audit(&self, audit: &TransitionAuditV1) -> Result<AuditRef>;
+
+    /// Read and verify exactly the referenced immutable audit.
+    /// # Errors
+    /// Returns errors for invalid references, corrupt data and backend failures;
+    /// `None` means only that the referenced transition scope has no row.
+    async fn read_audit(&self, reference: &AuditRef) -> Result<Option<TransitionAuditV1>>;
 }
