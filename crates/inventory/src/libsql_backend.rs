@@ -76,6 +76,31 @@ impl LibsqlInventory {
         Ok(store)
     }
 
+    /// Open an existing remote primary through a client that exposes reads only.
+    /// The supplied remote credential must also be restricted to database reads.
+    /// # Errors
+    /// Rejects invalid endpoints, connection failures or databases without the
+    /// supported schema and columns.
+    pub async fn open_remote_read_only(url: String, token: String) -> Result<Self> {
+        validate_remote_configuration(&url, &token)?;
+        let database = Builder::new_remote(url, token)
+            .connector(remote_connector()?)
+            .build()
+            .await
+            .map_err(|_| Error::Backend("connect remote read-only database"))?;
+        Self::from_remote_read_only_database(database).await
+    }
+
+    async fn from_remote_read_only_database(database: Database) -> Result<Self> {
+        let store = Self {
+            database,
+            local: false,
+            read_only: true,
+        };
+        validate_existing(&store.connection()?).await?;
+        Ok(store)
+    }
+
     /// Open an existing local database without creating or mutating it.
     /// # Errors
     /// Rejects relative or missing paths and databases without the supported schema and columns.

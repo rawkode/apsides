@@ -5,15 +5,22 @@ type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Sen
 const PRIVATE: &str = "private-remote-canary";
 
 async fn rejected(url: String, token: String, expected: &'static str) -> TestResult {
-    let Err(error) = LibsqlInventory::open_remote(url, token).await else {
-        return Err("invalid remote inventory configuration was accepted".into());
-    };
-    if !matches!(error, Error::Invalid(actual) if actual == expected) {
-        return Err("remote inventory configuration returned a different error".into());
-    }
-    let diagnostic = error.to_string();
-    if diagnostic.contains(PRIVATE) {
-        return Err("remote inventory diagnostic disclosed configuration content".into());
+    for read_only in [false, true] {
+        let result = if read_only {
+            LibsqlInventory::open_remote_read_only(url.clone(), token.clone()).await
+        } else {
+            LibsqlInventory::open_remote(url.clone(), token.clone()).await
+        };
+        let Err(error) = result else {
+            return Err("invalid remote inventory configuration was accepted".into());
+        };
+        if !matches!(error, Error::Invalid(actual) if actual == expected) {
+            return Err("remote inventory configuration returned a different error".into());
+        }
+        let diagnostic = error.to_string();
+        if diagnostic.contains(PRIVATE) {
+            return Err("remote inventory diagnostic disclosed configuration content".into());
+        }
     }
     Ok(())
 }

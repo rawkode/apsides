@@ -41,7 +41,9 @@ listener. Its unguarded control reaches that listener. The fixture uses its own
 test certificate; it does not qualify a live Turso deployment or host trust store.
 
 Writable deployment initialization creates and validates the required tables.
-Read-only audit access performs no DDL or repair. Missing tables, malformed schema,
+Inventory and coordination expose local and remote read-only openers without DDL
+or repair. These client guards do not replace server-side credential restrictions.
+Missing tables, malformed schema,
 corrupt rows, foreign scope and oversized records fail closed.
 
 `LibsqlInventory::open_local_read_only` opens an existing local database with

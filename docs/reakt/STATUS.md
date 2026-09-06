@@ -132,7 +132,7 @@ Local filesystem tests cover one libSQL `VACUUM INTO` backup containing all four
 stores, exact read-only verification, retained inventory history, exclusion of
 later source writes, refusal to overwrite existing destinations, and rejection
 of malformed backups without repair.
-Inventory now supports local read-only access without initialization or repair.
+Inventory supports local and remote read-only access without initialization or repair.
 A live two-PVC qualification also passed: the backup-only read-only verifier
 recovered original records after all four source stores were changed. Exact Pod
 mount sets exclude access to the source during verification. Both local volumes
