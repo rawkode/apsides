@@ -315,7 +315,7 @@ fn fixture_review_store() -> &'static Arc<review_support::MemoryReviewStore> {
     STORE.get_or_init(|| Arc::new(review_support::MemoryReviewStore::default()))
 }
 
-fn platform_client(
+pub(crate) fn platform_client(
     client: Client,
     control_namespace: &str,
     workload_namespace: &str,
@@ -336,7 +336,7 @@ fn claim_snapshot(registry: &NamespaceRegistry) -> platform::Result<ClaimSnapsho
     registry.claim_snapshot()
 }
 
-fn registry_object(
+pub(crate) fn registry_object(
     registry: &NamespaceRegistry,
     uid: &str,
     resource_version: &str,
@@ -431,7 +431,7 @@ fn registry_authority() -> Value {
     authority
 }
 
-fn wire(responses: Vec<Value>) -> (Client, Calls) {
+pub(crate) fn wire(responses: Vec<Value>) -> (Client, Calls) {
     wire_with_authority(responses, registry_authority())
 }
 
@@ -3297,4 +3297,29 @@ async fn unqualified_initial_writer_rejects_before_activation_mutations()
             .all(|(method, _, _)| method == "GET")
     );
     Ok(())
+}
+
+// Canonical request/registry fixture shared with the sealed preview kernel tests.
+pub(crate) fn preview_fresh_fixture() -> std::result::Result<
+    (
+        deploy::DeploymentRequest,
+        NamespaceRegistry,
+        PolicyState,
+        Value,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let (staged, _, policy, trust, _) = staged_initial_fixture()?;
+    let request = staged.plan(TRANSITION_A)?.request.clone();
+    let registry = hydrated_registry(
+        1,
+        Vec::new(),
+        BTreeMap::from([(
+            request.next.compiled.ir.domain.id.clone(),
+            request.registry.generation_history.clone(),
+        )]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    )?;
+    Ok((request, registry, policy, trust))
 }

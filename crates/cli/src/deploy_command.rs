@@ -3,8 +3,8 @@ use crate::{Result, only};
 mod capacity;
 use compiler_core::CompiledPlan;
 use deploy::{DeploymentRequest, GenerationPlan, Phase, RegistrySnapshot};
-use kube::{Client, Config, config::AuthInfo};
-use platform::PlatformClient;
+use kube::{Client, Config};
+use platform::{IssuedDeployment, PlatformClient};
 use serde_json::{Value, json};
 use std::io::Write as _;
 use std::{
@@ -41,11 +41,11 @@ async fn deploy(options: &BTreeMap<String, String>, resize_capacity: bool) -> Re
     let inventory = crate::inventory_connection::connect().await?;
     let artifact = crate::artifact_input::open(options).await?;
     let DeploymentContext {
-        platform,
+        issued,
         verified,
         compatibility,
-        expires_at,
     } = connect(artifact.path(), artifact.expected_digest()).await?;
+    let platform = issued.platform().clone();
     let domain = &verified.compiled().ir.domain;
     let executor = executor_id(options)?;
     let registry = platform.load_registry().await?;
@@ -132,7 +132,7 @@ async fn deploy(options: &BTreeMap<String, String>, resize_capacity: bool) -> Re
         &session.resolve().await?,
         &verified,
         &compatibility,
-        &expires_at,
+        issued.expires_at(),
         &tracking,
     )
 }
@@ -262,10 +262,9 @@ async fn reserve_new_transition(
 }
 
 struct DeploymentContext {
-    platform: PlatformClient,
+    issued: IssuedDeployment,
     verified: release::VerifiedRelease,
     compatibility: Value,
-    expires_at: String,
 }
 
 async fn connect(root: &Path, expected_digest: Option<&str>) -> Result<DeploymentContext> {
@@ -298,31 +297,20 @@ async fn connect(root: &Path, expected_digest: Option<&str>) -> Result<Deploymen
     )?;
     let domain = &verified.compiled().ir.domain;
     let compatibility = compatibility(&bootstrap, verified.compiled()).await?;
-    let credential = platform.approved_deployment_credential(&domain.id).await?;
-    let expires_at = credential.expires_at.clone();
-    // Discard all inherited client keys, exec/auth providers, token paths and
-    // impersonation settings. Only this short-lived, UID-bound bearer remains.
-    config.auth_info = AuthInfo {
-        token: Some(credential.token),
-        ..AuthInfo::default()
-    };
-    config.headers.clear();
-    let client = Client::try_from(config)?;
     let coordination = crate::inventory_connection::connect_coordination().await?;
-    let platform = PlatformClient::new(
-        client,
+    let issued = IssuedDeployment::connect(
+        config,
         &domain.control_namespace,
         &domain.namespace,
         &domain.cluster_binding,
-    )?
-    .with_claim_store(coordination.clone())
-    .with_audit_store(coordination.clone())
-    .with_review_store(coordination);
+        &domain.id,
+    )
+    .await?
+    .with_stores(coordination.clone(), coordination.clone(), coordination);
     Ok(DeploymentContext {
-        platform,
+        issued,
         verified,
         compatibility,
-        expires_at,
     })
 }
 

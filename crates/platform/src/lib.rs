@@ -25,6 +25,12 @@ mod envelope_writer;
 mod evidence_profile;
 mod permissions;
 #[cfg(feature = "deployer")]
+mod preview_adapter;
+#[cfg(feature = "deployer")]
+pub use preview_adapter::{LivePreviewReport, PreviewCondition, PreviewInterval};
+#[cfg(feature = "deployer")]
+pub mod preview_composition;
+#[cfg(feature = "deployer")]
 pub mod preview_fields;
 #[cfg(feature = "deployer")]
 mod preview_limits;
@@ -70,7 +76,11 @@ mod inventory_capture;
 #[cfg(feature = "deployer")]
 mod inventory_store;
 #[cfg(feature = "deployer")]
+mod issued_deployment;
+#[cfg(feature = "deployer")]
 pub use cleanup::CleanupProgress;
+#[cfg(feature = "deployer")]
+pub use issued_deployment::IssuedDeployment;
 #[cfg(feature = "deployer")]
 mod controller;
 mod credentials;
@@ -86,7 +96,10 @@ mod runtime;
 mod staging;
 mod store;
 mod termination;
-pub use credentials::DeploymentIdentity;
+pub use credentials::{
+    DEPLOYMENT_IDENTITY_SCHEMA_V2, DeploymentIdentity, DeploymentPreviewApproval,
+    DeploymentPreviewProfile,
+};
 pub use crypto::install_rustls_ring_provider;
 pub use model::*;
 pub use runtime::RuntimeAuthority;

@@ -315,7 +315,7 @@ impl PlatformClient {
     }
 
     #[cfg(feature = "deployer")]
-    fn validate_reservation_snapshot(
+    pub(crate) fn validate_reservation_snapshot(
         &self,
         current: &Versioned<NamespaceRegistry>,
         request: &DeploymentRequest,

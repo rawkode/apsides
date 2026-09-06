@@ -114,6 +114,18 @@ Report the exact named LIST and PATCH requirements for managed targets, plus CRE
 
 Before returning a preview, reobserve target UID/resourceVersion or exact absence and revalidate the exact registry snapshot, trust, policy and identity approval. Reject races, incomplete reports and oversized responses. Reservation and execution retain their independent checks. A future typed live-impact report must label the issued-deployer admission context, observation interval and runtime-conditional targets, and must remain ephemeral. Real API and credential tests still gate claims about absent SSA, admission, field ownership and non-persistence.
 
+### Implemented fresh-request adapter
+
+`IssuedDeployment::connect` now mints the approved credential and privately constructs the stock client from the same verified TLS configuration. It replaces inherited authentication and impersonation settings, clears custom headers and disables retries. A caller cannot supply an arbitrary client or bearer to this wrapper. The CLI uses this factory for deployment authentication.
+
+`IssuedDeployment::preview_fresh` accepts a verified release, a fresh planning request and the inventory store. It requires the exact protected identity approval, registry snapshot, current trust and policy, immutable predecessor inventory and review metadata, and ownership approvals. All managed targets must be covered before workload requests begin. It rechecks authority around target previews and reobserves every target before returning a bounded, ephemeral report. The report describes an observation interval, not an atomic snapshot or execution authorization. The whole operation has a 120-second deadline.
+
+Preview opt-in uses `reakt.dev/deployment-identity/v2` with the exact profile `static-ssa-issued-deployer/v1`. Its target list is sorted, unique and restricted to named ConfigMaps, Services and Deployments in the workload namespace. Approved supersets are allowed. An empty list authorizes zero targets; it is never a wildcard. Existing v1 documents and v2 documents without `preview` remain opted out. RBAC is independently provisioned: the profile itself grants no access, and Kubernetes has no dry-run-only grant.
+
+Static composition preserves a current rollout contribution only with exact stable-manager Apply evidence. Missing contributions remain missing and future reaction output stays conditional. Removed final reactions omit the old contribution. Adoption uses the approved non-force payload. No observed input, Secret value or rollout key is read to invent future runtime state.
+
+The CLI does not yet invoke this adapter or include its result in deployment review. Pending-session preview, permission-report integration and actual issued-credential SSA qualification remain required. The fresh adapter rejects server versions other than v1.34.3, matching the existing CLI absent-only SSA qualification. No server version is yet live-qualified for the adapter itself; the OrbStack read-only probe does not establish that qualification.
+
 ## Shared request construction
 
 The runtime's existing-object and absent-object apply paths now use the shared `platform::conditional_apply_request` builder. It preserves strict validation, the stable field manager and declared force, and installs an explicit UID/resourceVersion or absent-list resourceVersion precondition on a cloned desired object. Supplied concurrency metadata replaces any such metadata in the desired value. The builder performs no requests and establishes neither ownership nor absence; callers retain their authenticated claim checks, version qualification, dry-run interpretation and pre-write authority checks. The request type deliberately has no debug representation because it carries desired values.
@@ -134,7 +146,7 @@ The implementation labels field-set inequality as `serializedFieldSetChanged`, n
 
 Requests use the Kubernetes library's request builder and raw client transport. Every PATCH fixes `dryRun=All`; error bodies are discarded unread and failures use static text. Request JSON is structurally checked and capped at 1 MiB before serialization; successful response collection is capped at 4 MiB and one request/body read has a 15-second deadline. Strict decoding rejects duplicate keys. List responses must match the exact collection type, contain at most one matching object, have no continuation or nonzero remaining count, and carry bounded UID/resourceVersion evidence. List items may omit both type fields and inherit the exact list type; partial or conflicting item types reject. PATCH responses must supply the exact object type.
 
-These mechanisms remain disconnected from `reakt deploy` until protected opt-in, the authenticated planning/session adapters, rollout composition, complete report budgeting and race revalidation are implemented. Read-only live list decoding does not qualify SSA non-persistence, absent-only creation, runtime admission or actual credential scope.
+The fresh adapter connects these mechanisms under protected opt-in and authenticated planning, composition, budgeting and race checks. Invoking it from `reakt deploy`, reporting its required permissions, and supporting pending sessions remain outstanding. Read-only live list decoding does not qualify SSA non-persistence, absent-only creation, runtime admission or actual credential scope.
 
 ## Runtime-derived fields
 
