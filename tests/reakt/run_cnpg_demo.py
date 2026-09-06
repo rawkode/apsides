@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 import run_deployment_ceiling as base
@@ -24,6 +25,8 @@ PAIR_MARKER = "reakt-candidate-pair-qualification"
 PAIR_SCHEMA = "reakt.dev/candidate-pair-qualification/v1"
 MAX_OPERATOR_BYTES = 8 * 1024 * 1024
 MAX_HTTP_BYTES = 64 * 1024
+MEASUREMENT_SCHEMA = "reakt.dev/permission-upgrade-measurement/v1"
+TARGET_FIELDS = {"apiGroup", "resource", "namespace", "name"}
 EXPECTED_SCOPE = {
     "domainId": "database-demo",
     "clusterBinding": "local-demo",
@@ -41,7 +44,8 @@ PAIR_DIGESTS = {
 }
 PREPARED = {
     "generation", "transition", "registryUid", "registryResourceVersion",
-    "requestDigest", "policyRole",
+    "requestDigest", "policyRole", "serviceAccountName", "creationTargets",
+    "creationTargetsSource", "managedTargets",
 }
 REGISTRY = {
     "transition", "generation", "phase", "registryUid",
@@ -102,7 +106,9 @@ def result_record(output, expected):
     for key, item in value.items():
         if key in {"schemaVersion", "outcome", "candidates"}:
             continue
-        if key in {"initialCapabilityCount", "successorCapabilityCount"}:
+        if key in {"creationTargets", "managedTargets"}:
+            validate_targets(item)
+        elif key in {"initialCapabilityCount", "successorCapabilityCount"}:
             if type(item) is not int or item < 1:
                 raise shared.QualificationError("permission upgrade result has an invalid capability count")
         elif not isinstance(item, str) or len(item) > 1024 or (not item and key != "requestDigest"):
@@ -110,7 +116,102 @@ def result_record(output, expected):
     for key in {"requestDigest", "missingCapabilityDigest"} & set(value):
         if value[key] and not shared.valid_digest(value[key]):
             raise shared.QualificationError("permission upgrade result has an invalid digest")
+    if outcome in {"initial-prepared", "rejection-prepared", "successor-prepared"} and (
+            value["creationTargetsSource"] != "authorized-candidate-policy-projection"):
+        raise shared.QualificationError("permission upgrade target projection source is invalid")
     return value
+
+
+def validate_targets(value):
+    if not isinstance(value, list) or not value or len(value) > 1024:
+        raise shared.QualificationError("permission upgrade target projection is invalid")
+    orders = []
+    for target in value:
+        if (not isinstance(target, dict) or set(target) != TARGET_FIELDS
+                or any(not isinstance(item, str) or len(item) > 253 for item in target.values())
+                or not target["resource"] or not target["namespace"] or not target["name"]):
+            raise shared.QualificationError("permission upgrade target projection is invalid")
+        orders.append(target_order(target))
+    if orders != sorted(set(orders)):
+        raise shared.QualificationError("permission upgrade target projection is not canonical")
+    return value
+
+
+def target_key(target):
+    return tuple(target[name] for name in ["apiGroup", "resource", "namespace", "name"])
+
+
+def target_order(target):
+    return tuple(target[name] for name in ["namespace", "apiGroup", "resource", "name"])
+
+
+def managed_target(resource):
+    builtins = {
+        ("v1", "ConfigMap"): ("", "configmaps"),
+        ("v1", "Service"): ("", "services"),
+        ("apps/v1", "Deployment"): ("apps", "deployments"),
+    }
+    mapping = builtins.get((resource.get("apiVersion"), resource.get("kind")))
+    if mapping is None:
+        api = resource.get("apiResource")
+        version = resource.get("apiVersion")
+        if (not isinstance(api, dict) or api.get("scope") != "Namespaced"
+                or not isinstance(version, str) or version.count("/") != 1):
+            raise shared.QualificationError("signed managed resource has no namespaced API mapping")
+        mapping = (version.split("/", 1)[0], api.get("plural"))
+    group, plural = mapping
+    target = {
+        "apiGroup": group,
+        "resource": plural,
+        "namespace": resource.get("namespace"),
+        "name": resource.get("name"),
+    }
+    validate_targets([target])
+    return target
+
+
+def release_files(root, manifest, role):
+    files = manifest.get("files") if isinstance(manifest, dict) else None
+    if not isinstance(files, dict) or not files:
+        raise shared.QualificationError("permission upgrade release manifest is invalid")
+    result = {role + "/release.json": root / "release.json"}
+    for name, expected in files.items():
+        path = root / name
+        if (not isinstance(name, str) or not shared.valid_digest(expected)
+                or path.is_symlink() or not path.is_file()
+                or not path.resolve().is_relative_to(root.resolve())):
+            raise shared.QualificationError("permission upgrade release payload is invalid")
+        result[role + "/" + name] = path
+    for name in ["provenance.json", "provenance.sig", "provenance.sigstore.json"]:
+        path = root / name
+        if path.exists():
+            if path.is_symlink() or not path.is_file():
+                raise shared.QualificationError("permission upgrade release signature is invalid")
+            result[role + "/" + name] = path
+    return result
+
+
+def snapshot_files(files):
+    snapshot = {}
+    for role, path in files.items():
+        if not isinstance(role, str) or not role or path.is_symlink() or not path.is_file():
+            raise shared.QualificationError("permission upgrade snapshot input is invalid")
+        snapshot[role] = shared.digest_file(path)
+    return snapshot
+
+
+def reject_ignored_driver_sources(repository):
+    roots = [
+        ".cargo",
+        "crates/platform/src", "crates/platform/tests",
+        "crates/release/src", "crates/compiler-core/src", "crates/coordination/src",
+        "crates/deploy/src", "crates/inventory/src",
+    ]
+    ignored = shared.git(
+        repository, "ls-files", "--others", "--ignored", "--exclude-standard", "--", *roots,
+    )
+    if ignored:
+        raise shared.QualificationError("permission upgrade source closure contains ignored files")
 
 
 def full_policy(plan):
@@ -188,6 +289,57 @@ class CnpgDemoRunner(base.CeilingRunner):
             *sorted((ROOT / "crates/platform/tests/support/permission_upgrade").glob("*.rs")),
             ROOT / "crates/platform/tests/support/qualification_driver.rs",
         ]
+        canary = ROOT / "crates/platform/tests/envoy/canary.py"
+        source_names = {
+            Path(__file__).resolve(): "permission-upgrade-runner.py",
+            Path(base.__file__).resolve(): "permission-upgrade-cluster-base.py",
+            Path(shared.__file__).resolve(): "permission-upgrade-shared.py",
+            Path(base.observations.__file__).resolve(): "permission-upgrade-observations.py",
+            canary: "permission-upgrade-proxy-canary.py",
+            ROOT / "crates/platform/tests/permission_upgrade.rs": "permission-upgrade-entry.rs",
+            ROOT / "crates/platform/tests/support/permission_upgrade_driver.rs":
+                "permission-upgrade-driver.rs",
+            ROOT / "crates/platform/tests/support/qualification_driver.rs":
+                "permission-upgrade-qualification-support.rs",
+        }
+        for path in sorted((ROOT / "crates/platform/tests/support/permission_upgrade").glob("*.rs")):
+            source_names[path] = "permission-upgrade-" + path.name
+        if set(source_names) != set(self.pair_sources) | {
+                Path(base.__file__).resolve(), Path(shared.__file__).resolve(),
+                Path(base.observations.__file__).resolve(), canary}:
+            raise shared.QualificationError("permission upgrade source closure is incomplete")
+        if len(set(source_names.values())) != len(source_names):
+            raise shared.QualificationError("permission upgrade source archive names collide")
+        self.sources = list(source_names)
+        self.source_archives = source_names
+        self.source_digests = {path: shared.digest_file(path) for path in self.sources}
+        self.initial_input_manifest = shared.read_json(self.initial_artifact / "release.json")
+        self.successor_input_manifest = shared.read_json(self.successor_artifact / "release.json")
+        reject_ignored_driver_sources(self.repository)
+        self.source_archive = self.output / "permission-upgrade-source.tar"
+        archived = subprocess.run(
+            ["git", "-C", str(self.repository), "archive", "--format=tar",
+             "--output", str(self.source_archive), self.commit],
+            capture_output=True, check=False, timeout=60,
+        )
+        if (archived.returncode or not self.source_archive.is_file()
+                or self.source_archive.stat().st_size <= 0
+                or self.source_archive.stat().st_size > shared.MAX_EVIDENCE_BYTES):
+            raise shared.QualificationError("permission upgrade source archive failed")
+        self.files = {}
+        self.files.update(release_files(
+            self.initial_artifact, self.initial_input_manifest, "initial"))
+        self.files.update(release_files(
+            self.successor_artifact, self.successor_input_manifest, "successor"))
+        self.files.update({
+            "trust/policy": self.trust,
+            "operator/source": self.operator_manifest,
+            "operator/snapshot": self.operator_snapshot,
+            "producer/source-archive": self.source_archive,
+        })
+        for path, archive_name in self.source_archives.items():
+            self.files["producer/" + archive_name] = path
+        self.snapshot = snapshot_files(self.files)
         self.driver_error_reasons = set(re.findall(
             r'DriverError\(\s*"([a-zA-Z0-9 -]+)"',
             "\n".join(path.read_text() for path in self.pair_sources),
@@ -197,8 +349,25 @@ class CnpgDemoRunner(base.CeilingRunner):
         ))
         self.checks = []
         self.disposition = "not-created"
+        self.denial_observation = None
+
+    def freeze_file(self, role, path):
+        if role in self.files:
+            raise shared.QualificationError("permission upgrade snapshot role already exists")
+        self.files[role] = path
+        self.snapshot[role] = snapshot_files({role: path})[role]
+
+    def require_inputs_unchanged(self):
+        reject_ignored_driver_sources(self.repository)
+        if (shared.source_state(Path(__file__).resolve()) != (self.repository, self.commit)
+                or snapshot_files(self.files) != self.snapshot
+                or shared.read_json(self.initial_artifact / "release.json") != self.initial_input_manifest
+                or shared.read_json(self.successor_artifact / "release.json")
+                != self.successor_input_manifest):
+            raise shared.QualificationError("permission upgrade inputs changed")
 
     def prepare(self):
+        self.require_inputs_unchanged()
         output = self.command([
             "cargo", "test", "--locked", "--offline", "-p", "platform", "--features", "test-support",
             "--test", "permission_upgrade", "--test", "live_candidate", "--no-run", "--message-format=json",
@@ -214,10 +383,15 @@ class CnpgDemoRunner(base.CeilingRunner):
                 executables.setdefault(name, []).append(row["executable"])
         if any(len(executables.get(name, [])) != 1 for name in ["permission_upgrade", "live_candidate"]):
             raise shared.QualificationError("Cargo did not identify the CNPG demo drivers")
+        self.require_inputs_unchanged()
         self.driver = self.output / "permission-upgrade-driver"
         self.profile_driver = self.output / "proxy-profile-driver"
         shutil.copy2(executables["permission_upgrade"][0], self.driver)
         shutil.copy2(executables["live_candidate"][0], self.profile_driver)
+        self.driver_digest = shared.digest_file(self.driver)
+        self.profile_driver_digest = shared.digest_file(self.profile_driver)
+        self.freeze_file("executable/permission-upgrade-driver", self.driver)
+        self.freeze_file("executable/proxy-profile-driver", self.profile_driver)
         self.pair = self.step("verify", "verified-pair")
         if any(self.pair[key] != value for key, value in EXPECTED_SCOPE.items()):
             raise shared.QualificationError("verified pair does not use the local CNPG demo scope")
@@ -267,6 +441,7 @@ class CnpgDemoRunner(base.CeilingRunner):
         if len(containers) != 1 or "@sha256:" not in containers[0].get("image", ""):
             raise shared.QualificationError("signed successor does not pin one PostgREST image")
         self.workload_image = containers[0]["image"]
+        self.require_inputs_unchanged()
 
     def run_proxy_canary(self):
         source = ROOT / "crates/platform/tests/envoy/canary.py"
@@ -319,6 +494,8 @@ class CnpgDemoRunner(base.CeilingRunner):
             "checks": sorted(checks),
             "qualification": result["qualification"],
         }
+        self.freeze_file("canary/source-snapshot", archive)
+        self.freeze_file("canary/result", result_path)
         result_path.chmod(0o600)
 
     def k(self, *args, data=None):
@@ -491,7 +668,9 @@ class CnpgDemoRunner(base.CeilingRunner):
             self.command(["docker", "pull", reference], timeout=300)
             archive = self.output / f"proxy-{index}.tar"
             self.command(["docker", "image", "save", "--output", archive, reference], timeout=300)
+            self.freeze_file(f"proxy/archive-{index}", archive)
             self.import_archive(archive, reference)
+        self.require_inputs_unchanged()
 
     def _role(self, namespace, name, rules, account, cluster=False):
         kind = "ClusterRole" if cluster else "Role"
@@ -689,6 +868,128 @@ class CnpgDemoRunner(base.CeilingRunner):
                 raise shared.QualificationError("CNPG demo lifecycle step remained pending")
             time.sleep(2)
 
+    def prepared_projection(self, prepared, plan):
+        account = prepared["serviceAccountName"]
+        if (len(account) > 63
+                or re.fullmatch(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?", account) is None):
+            raise shared.QualificationError("prepared generation service account is invalid")
+        creation = validate_targets(prepared["creationTargets"])
+        managed = validate_targets(prepared["managedTargets"])
+        expected_managed = sorted(
+            (managed_target(resource) for resource in plan["ir"]["resources"]),
+            key=target_order,
+        )
+        if managed != expected_managed:
+            raise shared.QualificationError("prepared managed targets differ from the signed candidate")
+        if any(target["namespace"] not in {self.control, self.workload} for target in creation):
+            raise shared.QualificationError("prepared creation target escaped the signed scope")
+        keys = {target_key(target) for target in creation}
+        for group, resource in [("", "serviceaccounts"), ("apps", "deployments")]:
+            if (group, resource, self.control, account) not in keys:
+                raise shared.QualificationError("prepared targets omit the generation writer")
+        return creation, managed
+
+    def denied_targets(self, initial_managed, rejection):
+        creation, successor_managed = self.prepared_projection(rejection, self.successor_plan)
+        previous = {target_key(target) for target in initial_managed}
+        added = [target for target in successor_managed if target_key(target) not in previous]
+        expected = sorted(
+            (managed_target(resource) for resource in self.successor_plan["ir"]["resources"]
+             if (resource["kind"], resource["name"])
+             in {("Deployment", "database-api"), ("Service", "database-api")}),
+            key=target_order,
+        )
+        if added != expected:
+            raise shared.QualificationError("permission upgrade managed target delta is unexpected")
+        targets = sorted(
+            {shared.canonical(target): target for target in [*creation, *added]}.values(),
+            key=target_order,
+        )
+        return targets
+
+    def assert_targets_absent(self, targets):
+        for target in targets:
+            resource = target["resource"]
+            if target["apiGroup"]:
+                resource += "." + target["apiGroup"]
+            present = self.k(
+                "get", resource, target["name"], "-n", target["namespace"],
+                "--ignore-not-found", "-o", "name",
+            ).strip()
+            if present:
+                raise shared.QualificationError("unapproved successor object exists")
+
+    def writer_identity(self, prepared):
+        creation, _ = self.prepared_projection(prepared, self.initial_plan)
+        names = sorted(
+            target["name"] for target in creation
+            if (target["apiGroup"], target["resource"], target["namespace"])
+            == ("apps", "deployments", self.control)
+        )
+        if len(names) != 2 or prepared["serviceAccountName"] not in names:
+            raise shared.QualificationError("initial writer deployment projection is invalid")
+        deployments = json.loads(self.k("get", "deployments", "-n", self.control, "-o", "json"))["items"]
+        replicasets = json.loads(self.k("get", "replicasets", "-n", self.control, "-o", "json"))["items"]
+        pods = json.loads(self.k("get", "pods", "-n", self.control, "-o", "json"))["items"]
+        result = []
+        for name in names:
+            matching = [item for item in deployments if item["metadata"].get("name") == name]
+            if len(matching) != 1:
+                raise shared.QualificationError("initial writer Deployment is absent or ambiguous")
+            deployment = matching[0]
+            metadata = deployment["metadata"]
+            deployment_uid = metadata.get("uid")
+            if (not deployment_uid or metadata.get("deletionTimestamp")
+                    or deployment.get("spec", {}).get("replicas") != 1
+                    or deployment.get("status", {}).get("readyReplicas") != 1):
+                raise shared.QualificationError("initial writer Deployment is not active")
+            owned_sets = {
+                item["metadata"].get("uid")
+                for item in replicasets
+                if any(owner.get("kind") == "Deployment" and owner.get("uid") == deployment_uid
+                       and owner.get("controller") is True
+                       for owner in item["metadata"].get("ownerReferences", []))
+            }
+            if len(owned_sets) != 1 or None in owned_sets:
+                raise shared.QualificationError("initial writer ReplicaSet identity is ambiguous")
+            writer_pods = []
+            for pod in pods:
+                owners = pod["metadata"].get("ownerReferences", [])
+                if not any(owner.get("kind") == "ReplicaSet" and owner.get("uid") in owned_sets
+                           and owner.get("controller") is True for owner in owners):
+                    continue
+                status = pod.get("status", {})
+                containers = status.get("containerStatuses", [])
+                if (pod["metadata"].get("deletionTimestamp") or status.get("phase") != "Running"
+                        or not containers or any(item.get("ready") is not True
+                                                 or not item.get("containerID") for item in containers)
+                        or not any(condition.get("type") == "Ready" and condition.get("status") == "True"
+                                   for condition in status.get("conditions", []))):
+                    raise shared.QualificationError("initial writer Pod is not active")
+                writer_pods.append({
+                    "name": pod["metadata"]["name"],
+                    "uid": pod["metadata"]["uid"],
+                    "nodeName": pod["spec"]["nodeName"],
+                    "replicaSetUid": next(
+                        owner["uid"] for owner in owners
+                        if owner.get("kind") == "ReplicaSet" and owner.get("uid") in owned_sets
+                        and owner.get("controller") is True
+                    ),
+                    "containers": sorted(({
+                        "name": item["name"], "containerId": item["containerID"],
+                        "restartCount": item.get("restartCount", 0),
+                    } for item in containers), key=lambda item: item["name"]),
+                })
+            if len(writer_pods) != 1:
+                raise shared.QualificationError("initial writer Pod set is not singular")
+            result.append({
+                "name": name,
+                "uid": deployment_uid,
+                "replicaSetUids": sorted(owned_sets),
+                "pods": writer_pods,
+            })
+        return result
+
     def wait_object(self, resource, name, namespace, timeout):
         deadline = time.monotonic() + timeout
         while True:
@@ -847,12 +1148,28 @@ class CnpgDemoRunner(base.CeilingRunner):
         return {"status": response.status, "rowCount": len(value), "bodyDigest": shared.digest_bytes(body)}
 
     def replace_policy(self):
+        before = self.policy_object["metadata"]
         replacement = json.loads(json.dumps(self.policy_object))
         replacement["data"]["state.json"] = shared.canonical(self.successor_policy).decode()
-        self.policy_object = json.loads(self.k("replace", "-f", "-", "-o", "json", data=json.dumps(replacement)))
+        written = json.loads(self.k("replace", "-f", "-", "-o", "json", data=json.dumps(replacement)))
+        metadata = written.get("metadata", {})
+        if (metadata.get("uid") != before.get("uid")
+                or metadata.get("resourceVersion") == before.get("resourceVersion")
+                or metadata.get("deletionTimestamp") is not None
+                or written.get("data", {}).get("state.json")
+                != shared.canonical(self.successor_policy).decode()):
+            raise shared.QualificationError("successor policy replacement was not exact")
+        self.policy_object = written
+        return {
+            "uid": metadata["uid"],
+            "beforeResourceVersion": before["resourceVersion"],
+            "afterResourceVersion": metadata["resourceVersion"],
+            "policyDigest": self.successor_policy_digest,
+        }
 
     def measure(self):
         prepared = self.step("prepare-initial", "initial-prepared", self.issuer)
+        _, initial_managed = self.prepared_projection(prepared, self.initial_plan)
         reserved = self.step(
             "reserve-initial", "initial-reserved", self.issuer,
             expectedRequestDigest=prepared["requestDigest"],
@@ -885,6 +1202,9 @@ class CnpgDemoRunner(base.CeilingRunner):
             "data": {"PGRST_DB_MAX_ROWS": "100"},
         })
         rejection = self.step("prepare-rejection", "rejection-prepared", self.issuer)
+        denied_targets = self.denied_targets(initial_managed, rejection)
+        self.assert_targets_absent(denied_targets)
+        writer_before = self.writer_identity(prepared)
         denied = self.step(
             "reject-upgrade", "upgrade-rejected", self.issuer,
             expectedRequestDigest=rejection["requestDigest"], expectedMissingCapability=self.missing,
@@ -893,8 +1213,25 @@ class CnpgDemoRunner(base.CeilingRunner):
                 or denied["registryUid"] != rejection["registryUid"]
                 or denied["registryResourceVersion"] != rejection["registryResourceVersion"]):
             raise shared.QualificationError("permission rejection differs from its frozen request")
-        self.replace_policy()
+        self.assert_targets_absent(denied_targets)
+        writer_after = self.writer_identity(prepared)
+        if writer_after != writer_before:
+            raise shared.QualificationError("permission rejection changed the active initial writer")
+        self.denial_observation = {
+            "prepared": rejection,
+            "denied": denied,
+            "absentTargets": denied_targets,
+            "initialWriterBefore": writer_before,
+            "initialWriterAfter": writer_after,
+        }
+        self.policy_change = self.replace_policy()
         successor = self.step("prepare-successor", "successor-prepared", self.issuer)
+        self.prepared_projection(successor, self.successor_plan)
+        if any(successor[key] != rejection[key] for key in [
+                "generation", "transition", "registryUid", "registryResourceVersion",
+                "serviceAccountName", "creationTargets", "managedTargets",
+        ]):
+            raise shared.QualificationError("approved successor changed the denied candidate allocation")
         reserved = self.step(
             "reserve-successor", "successor-reserved", self.issuer,
             expectedRequestDigest=successor["requestDigest"],
@@ -961,6 +1298,120 @@ class CnpgDemoRunner(base.CeilingRunner):
             raise shared.QualificationError("owned CNPG demo cluster deletion was not confirmed")
         self.disposition = "deleted" if deleted else "not-created"
 
+    def final_check(self):
+        if (self.disposition != "deleted" or not self.cleanup_confirmed
+                or self.admin.exists() or self.issuer.exists() or self.denial_observation is None):
+            raise shared.QualificationError("permission upgrade evidence requires completed cleanup")
+        self.verify_docker()
+        self.require_inputs_unchanged()
+        verified = self.step("verify", "verified-pair")
+        if (verified != self.pair
+                or shared.digest_file(self.driver) != self.driver_digest
+                or shared.digest_file(self.profile_driver) != self.profile_driver_digest):
+            raise shared.QualificationError("permission upgrade subject or executable changed")
+        self.require_inputs_unchanged()
+
+    def publish(self):
+        self.final_check()
+        manifest = self.successor_manifest
+        measurement = {
+            "schemaVersion": MEASUREMENT_SCHEMA,
+            "scope": "exact-signed-permission-changing-upgrade-on-owned-kind-cluster",
+            "runnerSourceCommit": self.commit,
+            "successorSubject": {
+                "releaseDigest": self.pair["candidates"]["successorReleaseDigest"],
+                "irDigest": manifest["irDigest"],
+                "compilerDigest": manifest["compilerDigest"],
+                "binaryDigest": manifest["binaryDigest"],
+                "image": manifest["image"],
+            },
+            "initialSubject": {
+                "releaseDigest": self.pair["candidates"]["initialReleaseDigest"],
+                "irDigest": self.initial_manifest["irDigest"],
+                "compilerDigest": self.initial_manifest["compilerDigest"],
+                "binaryDigest": self.initial_manifest["binaryDigest"],
+                "image": self.initial_manifest["image"],
+            },
+            "candidatePair": self.pair["candidates"],
+            "initialPolicyDigest": self.initial_policy_digest,
+            "successorPolicyDigest": self.successor_policy_digest,
+            "successorPolicyReplacement": self.policy_change,
+            "denial": self.denial_observation,
+            "lifecycleSteps": self.steps,
+            "workloadChecks": self.checks,
+            "hostIdentity": self.host_identity,
+            "dockerIdentity": self.docker_binding,
+            "operator": self.operator_identity,
+            "proxyEnvironmentCanary": self.proxy_canary,
+            "driverBinaryDigest": self.driver_digest,
+            "profileDriverBinaryDigest": self.profile_driver_digest,
+            "sourceArchiveDigest": self.snapshot["producer/source-archive"],
+            "runnerSourceDigest": self.source_digests[Path(__file__).resolve()],
+            "operatorManifestDigest": self.operator_sha256,
+            "frozenInputDigests": self.snapshot,
+            "clusterDeleted": True,
+            "credentialsRemoved": True,
+            "releaseVerified": False,
+            "limitation": "one owned local kind execution; this receipt covers only permission-changing-upgrade",
+        }
+        measurement_bytes = shared.canonical(measurement)
+        receipt = {
+            "schemaVersion": shared.SCHEMA,
+            "irDigest": manifest["irDigest"],
+            "compilerDigest": manifest["compilerDigest"],
+            "binaryDigest": manifest["binaryDigest"],
+            "image": manifest["image"],
+            "sourceInputsDigest": manifest["source"]["inputsDigest"],
+            "payloadFiles": {
+                name: manifest["files"][name]
+                for name in ["build-inputs.json", "controller.oci.tar", "reakt-controller"]
+            },
+            "runnerSourceFile": "evidence/permission-upgrade-runner.py",
+            "runnerSourceDigest": self.source_digests[Path(__file__).resolve()],
+            "checks": {
+                "permission-changing-upgrade": {
+                    "status": "passed",
+                    "assertions": [
+                        {"checkId": "permission-change-reviewed", "expected": True,
+                         "actual": True, "passed": True},
+                        {"checkId": "unapproved-writer-started", "expected": False,
+                         "actual": False, "passed": True},
+                    ],
+                    "evidenceFiles": [
+                        "evidence/permission-upgrade-measurement.json",
+                        "evidence/permission-upgrade-runner.py",
+                        "evidence/permission-upgrade-source.tar",
+                        "evidence/permission-upgrade-cnpg-operator.yaml",
+                    ],
+                },
+            },
+        }
+        receipt_bytes = shared.canonical(receipt)
+        if (max(len(measurement_bytes), len(receipt_bytes)) > shared.MAX_EVIDENCE_BYTES
+                or self.source_archive.stat().st_size > shared.MAX_EVIDENCE_BYTES
+                or len(self.operator_bytes) > shared.MAX_EVIDENCE_BYTES):
+            raise shared.QualificationError("permission upgrade evidence exceeds its size limit")
+        evidence = self.output / "evidence"
+        if evidence.exists():
+            raise shared.QualificationError("permission upgrade evidence path exists")
+        with tempfile.TemporaryDirectory(prefix=".permission-upgrade-evidence-",
+                                         dir=self.output) as temporary:
+            staging = Path(temporary)
+            staged = {
+                "permission-upgrade-runner.py": Path(__file__).resolve(),
+                "permission-upgrade-source.tar": self.source_archive,
+                "permission-upgrade-cnpg-operator.yaml": self.operator_manifest,
+            }
+            for name, source in staged.items():
+                shutil.copyfile(source, staging / name)
+                if shared.digest_file(staging / name) != shared.digest_file(source):
+                    raise shared.QualificationError("permission upgrade evidence staging changed a file")
+            (staging / "permission-upgrade-measurement.json").write_bytes(measurement_bytes)
+            (staging / "permission-upgrade-evidence.json").write_bytes(receipt_bytes)
+            self.require_inputs_unchanged()
+            staging.rename(evidence)
+        return evidence / "permission-upgrade-evidence.json"
+
     def run(self):
         passed = False
         try:
@@ -978,6 +1429,10 @@ class CnpgDemoRunner(base.CeilingRunner):
         finally:
             self.phase = "cleanup"
             self.finish(passed)
+        evidence = None
+        if self.disposition == "deleted":
+            self.phase = "publication"
+            evidence = self.publish()
         result = {
             "passed": True,
             "candidateIntegrityVerified": True,
@@ -987,6 +1442,8 @@ class CnpgDemoRunner(base.CeilingRunner):
             "clusterDisposition": self.disposition,
             "issuerCredentialsRemoved": not self.issuer.exists(),
             "adminKubeconfig": str(self.admin) if self.disposition == "retained" else None,
+            "productionEvidence": str(evidence) if evidence else None,
+            "productionEvidenceStatus": "published" if evidence else "ineligible-retained-cluster",
             "operator": self.operator_identity,
             "proxyEnvironmentCanary": self.proxy_canary,
             "candidates": self.pair["candidates"],

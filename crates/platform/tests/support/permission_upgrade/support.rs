@@ -55,6 +55,63 @@ async fn prepare_request(
     })
 }
 
+fn prepared_targets(
+    request: &DeploymentRequest,
+    target: &CandidatePairQualificationTarget,
+    role: CandidatePairRole,
+) -> Result<(Vec<platform_api::CreationTarget>, Vec<platform_api::CreationTarget>)> {
+    let compiled = &request.next.compiled;
+    let domain = &compiled.ir.domain;
+    let ceiling = compiler_core::PermissionCeiling {
+        policy_ref: domain.policy_ref.clone(),
+        domain_id: domain.id.clone(),
+        cluster_binding: domain.cluster_binding.clone(),
+        workload_namespace: domain.namespace.clone(),
+        control_namespace: domain.control_namespace.clone(),
+        capabilities: compiled.capabilities.clone(),
+        accepted_enforcement_gaps: compiled.enforcement_gaps.clone(),
+        accepted_indirect_risks: compiled.indirect_risks.clone(),
+    };
+    let policy = platform_api::PolicyState {
+        schema_version: platform_api::SCHEMA_VERSION.into(),
+        runtime_ceiling: ceiling.clone(),
+        cleanup_ceiling: ceiling,
+    };
+    let expected = match role {
+        CandidatePairRole::Initial => &target.initial_policy_digest,
+        CandidatePairRole::Successor => &target.successor_policy_digest,
+    };
+    if compiler_core::digest(&policy)
+        .map_err(|_| DriverError("candidate target policy digest failed"))? != *expected
+    {
+        return Err(DriverError("candidate target projection differs from approved policy"));
+    }
+    // Project names under the marker-bound candidate policy without changing the
+    // actual request: rejection still runs against the current initial policy.
+    let mut projected = request.clone();
+    projected.runtime_ceiling = policy.runtime_ceiling;
+    projected.cleanup_ceiling = policy.cleanup_ceiling;
+    let plan = deploy::plan_transition(&projected)
+        .map_err(|_| DriverError("candidate target plan projection failed"))?;
+    let creates = platform_api::deployment_permissions(&plan)
+        .map_err(|_| DriverError("candidate target permission projection failed"))?
+        .creation_targets;
+    let mut managed = Vec::with_capacity(compiled.ir.resources.len());
+    for resource in &compiled.ir.resources {
+        let identity = deploy::resource_identity(resource)
+            .map_err(|_| DriverError("candidate managed target projection failed"))?;
+        managed.push(platform_api::CreationTarget {
+            namespace: identity.namespace,
+            api_group: identity.api_group,
+            resource: identity.resource,
+            name: identity.name,
+        });
+    }
+    managed.sort();
+    managed.dedup();
+    Ok((creates, managed))
+}
+
 async fn prepare_predecessor(
     platform: &PlatformClient,
     domain: &compiler_core::Domain,

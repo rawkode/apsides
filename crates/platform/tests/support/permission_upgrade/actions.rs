@@ -62,6 +62,11 @@ async fn prepare(
         prepared.registry.value.next_sequence,
     )
     .map_err(|_| DriverError("canonical allocation derivation failed"))?;
+    let (creation_targets, managed_targets) = prepared_targets(
+        &prepared.request,
+        required_target(settings)?,
+        request_role,
+    )?;
     emit(
         match settings.action {
             Action::PrepareInitial => "initial-prepared",
@@ -72,6 +77,10 @@ async fn prepare(
         pair,
         json!({
             "generation":names.generation_id,
+            "serviceAccountName":names.service_account_name,
+            "creationTargetsSource":"authorized-candidate-policy-projection",
+            "creationTargets":creation_targets,
+            "managedTargets":managed_targets,
             "transition":names.transition_id,
             "registryUid":prepared.registry.uid,
             "registryResourceVersion":prepared.registry.resource_version,
