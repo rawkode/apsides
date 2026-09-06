@@ -24,6 +24,12 @@ mod envelope_record;
 mod envelope_writer;
 mod evidence_profile;
 mod permissions;
+#[cfg(feature = "deployer")]
+pub mod preview_fields;
+#[cfg(feature = "deployer")]
+mod preview_limits;
+#[cfg(feature = "deployer")]
+pub mod preview_transport;
 mod review_metadata;
 mod review_projection;
 mod ssa_request;
