@@ -85,8 +85,12 @@ inventory store on the tested local PV, not the other durable stores.
 Current-format claim, review and audit records separately passed a writable
 seed followed by exact reference/body verification in a second Pod on the same
 local PV. The second Pod mounted the volume read-only, and all three store write
-methods rejected writes. This uses a small synthetic fixture; it does not prove
-coordination-store concurrency, retained history, crash recovery or backup.
+methods rejected writes. Competing writer Pods also passed: identical claims
+were idempotent, distinct reviews at one scope both persisted, and two audit
+candidates for one immutable transition produced one winner and one exact
+conflict. A fresh read-only Pod verified both seed and race records, including
+rejection of the losing audit reference. This uses small synthetic fixtures and
+does not prove transaction overlap, cross-store atomicity, crash recovery or backup.
 
 ```sh
 cuenv exec python3 tests/reakt/storage/build.py --package coordination --output work/coordination-image

@@ -122,7 +122,11 @@ This covers inventory process termination on the tested local PV; it does not
 qualify CSI storage, node failure, or remote Turso. A separate small-fixture
 qualification verified current claim, review and audit bodies across two Pods,
 with a read-only mount and rejection of all three write methods in the second
-Pod. Coordination concurrency, interrupted writes and backup remain unqualified.
+Pod. Competing coordination writers also passed: identical claims were idempotent,
+distinct reviews coexisted, and one immutable audit candidate won while the other
+received the exact conflict error. A fresh read-only Pod verified seed and race
+records. This does not prove transaction overlap or cross-store atomicity;
+interrupted coordination writes and backup remain unqualified.
 
 ## Remaining production work
 
@@ -135,8 +139,8 @@ Pod. Coordination concurrency, interrupted writes and backup remain unqualified.
   executor label and recorded credential expiry do not prove that an earlier
   executor cannot mint credentials, complete admitted requests, or write the
   metadata store.
-- Complete claim, review and audit persistent-volume concurrency and interrupted
-  write qualification, and qualify backup and remote Turso/libSQL restart,
+- Complete claim, review and audit persistent-volume interrupted-write
+  qualification, and qualify backup and remote Turso/libSQL restart,
   unavailable-storage, conflict and recovery behavior.
 - Complete production API authorization and admission qualification for the
   supported Kubernetes versions, including the declared preview permissions and
