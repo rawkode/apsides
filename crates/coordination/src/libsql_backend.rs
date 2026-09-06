@@ -6,6 +6,9 @@ use async_trait::async_trait;
 use libsql::{Builder, Connection, Database, TransactionBehavior, params};
 use std::{path::Path, time::Duration};
 
+#[path = "libsql_review.rs"]
+mod review;
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS reakt_coordination_schema (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL);
 INSERT OR IGNORE INTO reakt_coordination_schema VALUES (1,1);
@@ -146,6 +149,11 @@ impl LibsqlCoordination {
                 .execute_batch(SCHEMA)
                 .await
                 .map_err(|_| Error::Backend("initialize schema"))?;
+            transaction
+                .execute_batch(review::SCHEMA)
+                .await
+                .map_err(|_| Error::Backend("initialize review schema"))?;
+            review::validate_schema(&transaction).await?;
             let mut rows = transaction
                 .query(
                     "SELECT version FROM reakt_coordination_schema WHERE id=1",

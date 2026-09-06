@@ -1,6 +1,6 @@
 # Deployment review proposal
 
-Status: **partially implemented**. Deployment review v3 implements the initial declaration projection described below. Durable historical comparison and live apply impact remain proposed. The current report does not satisfy all deployment-report requirements in [specification v0.2, section 25](SPEC-v0.2.md). Independent architecture review and the acceptance tests below remain implementation gates for the unfinished scope.
+Status: **partially implemented**. Deployment review v3 implements the initial declaration projection described below. The typed immutable storage foundation is implemented, but its trusted platform projection and protected registry bindings are not integrated. Durable historical comparison and live apply impact remain proposed. The current report does not satisfy all deployment-report requirements in [specification v0.2, section 25](SPEC-v0.2.md). Independent architecture review and the acceptance tests below remain implementation gates for the unfinished scope.
 
 ## Implemented initial declaration report
 
@@ -44,6 +44,18 @@ This interpretation satisfies the literal section 25 report categories without p
 An initial installation has an explicit empty declaration baseline. Existing objects still require the normal adoption checks; they do not become managed merely because the declaration baseline is empty.
 
 ## Typed review metadata and storage
+
+### Storage foundation and integration boundary
+
+The selected storage design adds `ReviewStore` to `coordination`, with immutable typed `ReviewMetadataV1` bodies and `ReviewRef` references. The scope identifies the registry incarnation, cluster, control/workload namespaces, domain, allocation sequence and canonical transition. Generation and ServiceAccount names derive from that allocation. The reference digest is domain-separated over this metadata; artifact, plan and IR commitments stay outside the database body.
+
+The v1 body owns its serialized types rather than embedding evolving compiler records. It retains resource identities and declared field paths, lifecycle/force and planned ownership metadata, complete input and reaction declarations with source locations, separate runtime/cleanup/deployment permissions, compatibility and runtime budgets, and both policy ceilings. Graph edges and source catalogs derive from those entries without duplicate storage. Unknown fields, malformed links, duplicate or unsorted entries and unsupported vocabulary are rejected. Limits are 256 resources, inputs and reactions each, 100,000 aggregate source elements and 8 MiB of canonical metadata. Validation counts serialized bytes before constructing the canonical value or buffer; exceeding a limit is an error, never truncation.
+
+The libSQL implementation uses the existing durable primary connection. Each scoped transition has one immutable database slot. An exact repeated publication is idempotent; different metadata for that slot is an error. Publication verifies the committed body through a fresh read. Corrupt rows are errors and are never silently repaired. Writable initialization adds the review table transactionally without changing existing claim or audit tables. A read-only client performs no DDL: an older database can still supply claims and audits, but attempting to read a missing review table fails rather than returning an absent snapshot.
+
+The planned registry v7 binding is `StoredTransition.reviewBindings { next, previous }`. The existing active allocation and retained committed transition identify the active review reference, so no second mutable active pointer is required. A pending successor must preserve the exact prior committed `next` reference as its `previous`. Verified sessions must pin both bindings. Snapshot publication and exact read-back must finish before claim publication and reservation; commit promotes the allocation and transition in the existing registry CAS. Capacity admission must include the bounded references. These lifecycle changes are a separate integration gate; a working database trait alone does not implement durable upgrade reporting.
+
+Registry v6 has no complete review baseline. The v7 cutover must reject that missing baseline explicitly; it cannot infer an empty history or reconstruct old reactions from live objects. The no-old-artifact acceptance scenario is an A-to-B upgrade where A was committed with protected review metadata. This contract covers active and pending comparisons, not indefinite lookup of every archived deployment report.
 
 Introduce a bounded, versioned `ReviewMetadataV1` projection derived by trusted code from a verified release and its canonical transition plan. It contains only the fields needed for the declaration comparisons above: resource identities and field-path catalogs, lifecycle/force settings, source locations, inputs, reactions, dependency edges, capability sets, enforcement metadata and compatibility requirements.
 

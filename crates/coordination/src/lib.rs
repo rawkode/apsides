@@ -17,6 +17,8 @@ mod model;
 pub use model::*;
 mod audit;
 pub use audit::*;
+mod review;
+pub use review::*;
 
 #[cfg(feature = "libsql-backend")]
 mod libsql_backend;
@@ -64,4 +66,18 @@ pub trait AuditStore: Send + Sync {
     /// Returns errors for invalid references, corrupt data and backend failures;
     /// `None` means only that the referenced transition scope has no row.
     async fn read_audit(&self, reference: &AuditRef) -> Result<Option<TransitionAuditV1>>;
+}
+
+/// Immutable typed declaration metadata. It has no mutable head or authority.
+#[async_trait]
+pub trait ReviewStore: Send + Sync {
+    /// Publish one exact review body into its immutable scoped transition slot.
+    /// # Errors
+    /// Rejects invalid metadata, conflicting or corrupt rows and backend failures.
+    async fn put_review(&self, metadata: &ReviewMetadataV1) -> Result<ReviewRef>;
+
+    /// Read the exact validated scope-bound metadata. Only absent rows return `None`.
+    /// # Errors
+    /// Rejects invalid references, substituted or corrupt data and backend failures.
+    async fn read_review(&self, reference: &ReviewRef) -> Result<Option<ReviewMetadataV1>>;
 }
