@@ -66,7 +66,8 @@ def stage(source, snapshot, destination, probe, definition):
     lock = {"schemaVersion": "reakt.dev/source-lock/v1", "entry": source.name,
             "inputs": [{"path": name, "sha256": shared.digest_file(destination / name)[7:]}
                        for name in sorted(names)]}
-    (destination / "reakt.lock.json").write_bytes(shared.canonical(lock))
+    (destination / "reakt.lock.json").write_text(
+        json.dumps(lock, sort_keys=True, indent=2, ensure_ascii=False) + "\n")
     return entry
 
 

@@ -194,6 +194,10 @@ class InputIsolationTests(unittest.TestCase):
                 dependency = destination / "aps-isolation-dependency.ts"
                 self.assertTrue(dependency.is_file())
                 locks[probe] = json.loads((destination / "reakt.lock.json").read_text())
+                self.assertEqual(
+                    (destination / "reakt.lock.json").read_text(),
+                    json.dumps(locks[probe], sort_keys=True, indent=2, ensure_ascii=False) + "\n",
+                )
                 for item in locks[probe]["inputs"]:
                     self.assertEqual(item["sha256"], producer.shared.digest_file(destination / item["path"])[7:])
             self.assertIn("aps-isolation-dependency.ts", [item["path"] for item in locks["declared"]["inputs"]])
