@@ -4,6 +4,32 @@ Reakt implements specification 0.2 in the workspace crates and the `@reakt/kuber
 
 ## Current integration checkpoint
 
+The fresh lifecycle run at `283d493` passed using the signed disposable A/B
+candidates and current test driver (`work/lifecycle-283d493-results/`). Initial
+allocation, reservation, staging and activation succeeded. B was rejected with
+the typed permission-ceiling result before protected registry, claims, object
+identity or RBAC changes; after explicit A+B ceiling approval, the same allocation
+reserved and staged. Old-writer quiescence completed and its actual credential
+received HTTP 401 before expiry. The new generation retained the managed UID;
+cleanup remained pending under the test finalizer, preserved its claim, then
+completed after explicit fixture removal. Orphan retention and repeated commit
+also passed. Separate driver processes reopened the same persistent local libSQL
+metadata file. This does not qualify a remote Turso backend or PV deployment.
+
+The final report records `passed: true`, verified cluster deletion, credential-file
+removal and complete diagnostics. Only the two pre-existing kind clusters remain.
+These are signed-candidate test-adapter lifecycle results, not `VerifiedRelease`
+or full production CLI acceptance. Compiler-policy refusal is distinct from
+API-server authorization denial. The eleven remaining required production
+release checks are not closed by relabeling this candidate evidence.
+
+Independent review of the actual run found no blockers. It confirmed the frozen
+runner matches the current source, successful state reconstruction across driver
+processes, credential rejection before expiry, and cleanup. The unchanged-state
+comparison is asserted by the runner; diagnostics do not retain before/after
+Role bodies for independent re-evaluation. The Astro documentation build and
+link validation passed after this checkpoint update.
+
 The first fresh lifecycle run stopped before reservation while reading its test
 allocation. Verified cleanup deleted the owned cluster and removed all three
 kubeconfigs (`work/lifecycle-99becfd-results/result.json`). Source review found
