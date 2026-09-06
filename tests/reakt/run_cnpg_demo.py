@@ -384,6 +384,7 @@ class CnpgDemoRunner(base.CeilingRunner):
             raise shared.QualificationError("CNPG demo cluster identity is ambiguous")
         self.container_id = containers[0]["Id"]
         node = json.loads(self.k("get", "node", self.cluster + "-control-plane", "-o", "json"))
+        self.node_platform = "/".join(node["status"]["nodeInfo"][key] for key in ["operatingSystem", "architecture"])
         self.host_identity = base.observations.validate_kind_target(
             node, containers[0], self.cluster, base.NODE, self.node_image_id,
         )
@@ -454,13 +455,16 @@ class CnpgDemoRunner(base.CeilingRunner):
 
     def import_archive(self, archive, reference):
         repository = reference.split("@", 1)[0]
+        registry = repository.split("/")[0]
+        if "." not in registry and ":" not in registry and registry != "localhost":
+            repository = "docker.io/" + repository
         environment = dict(os.environ, DOCKER_CONTEXT=self.docker_context, KIND_EXPERIMENTAL_PROVIDER="docker")
         for name in ["DOCKER_HOST", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"]:
             environment.pop(name, None)
         command = [
             "docker", "--context", self.docker_context, "exec", "-i",
             self.cluster + "-control-plane", "ctr", "-n", "k8s.io", "images", "import",
-            "--digests", "--base-name", repository, "-",
+            "--digests", "--platform", self.node_platform, "--base-name", repository, "-",
         ]
         with archive.open("rb") as payload:
             result = subprocess.run(
@@ -473,18 +477,21 @@ class CnpgDemoRunner(base.CeilingRunner):
         ])
 
     def load_images(self):
+        self.phase = "load-candidate-images"
         for artifact, manifest in [
             (self.initial_artifact, self.initial_manifest),
             (self.successor_artifact, self.successor_manifest),
         ]:
+            if manifest["image"]["platform"] != self.node_platform:
+                raise shared.QualificationError("candidate image platform differs from the demo node")
             archive = artifact / "controller.oci.tar"
             self.import_archive(archive, manifest["image"]["reference"])
-        for reference in [self.profile["envoyImage"], self.profile["adminImage"]]:
+        self.phase = "load-proxy-images"
+        for index, reference in enumerate([self.profile["envoyImage"], self.profile["adminImage"]]):
             self.command(["docker", "pull", reference], timeout=300)
-            self.command(["kind", "load", "docker-image", reference, "--name", self.cluster], timeout=300)
-            self.command([
-                "docker", "exec", self.cluster + "-control-plane", "crictl", "inspecti", reference,
-            ])
+            archive = self.output / f"proxy-{index}.tar"
+            self.command(["docker", "image", "save", "--output", archive, reference], timeout=300)
+            self.import_archive(archive, reference)
 
     def _role(self, namespace, name, rules, account, cluster=False):
         kind = "ClusterRole" if cluster else "Role"
@@ -582,6 +589,7 @@ class CnpgDemoRunner(base.CeilingRunner):
     def bootstrap(self):
         self.install_operator()
         self.load_images()
+        self.phase = "bootstrap-policy"
         self.state("reakt-trust-" + self.domain, shared.read_json(self.trust))
         self.policy_object = self.state("reakt-policy-" + self.domain, self.initial_policy)
         self.state("reakt-proxy-policy-" + self.domain, {
