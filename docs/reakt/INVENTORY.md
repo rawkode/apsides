@@ -25,6 +25,13 @@ approved `libsql://` or `https://` endpoint. Remote access also requires
 `REAKT_INVENTORY_TOKEN`. URLs, tokens and database paths are deployment
 configuration; they are not serialized into registry, inventory or review data.
 
+Both store backends validate remote configuration before creating a client:
+endpoints must use `https` or `libsql`, contain a host and no embedded credentials,
+query, fragment or non-root path, and fit within 2,048 bytes. Tokens must contain
+1–8,192 bytes. Control characters are rejected, and errors omit supplied values.
+This validates connection inputs; end-to-end remote transport qualification is
+still incomplete.
+
 Writable deployment initialization creates and validates the required tables.
 Read-only audit access performs no DDL or repair. Missing tables, malformed schema,
 corrupt rows, foreign scope and oversized records fail closed.

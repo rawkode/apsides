@@ -8,7 +8,7 @@ publish = false
 
 [features]
 default = ["libsql-backend"]
-libsql-backend = ["dep:libsql"]
+libsql-backend = ["dep:libsql", "dep:url"]
 
 [dependencies]
 async-trait = "0.1"
@@ -17,6 +17,7 @@ compiler-core = { path = "../compiler-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+url = { version = "2", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

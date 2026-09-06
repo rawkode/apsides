@@ -51,9 +51,7 @@ impl LibsqlInventory {
     /// # Errors
     /// Rejects insecure endpoints, connection failures or unsupported schemas.
     pub async fn open_remote(url: String, token: String) -> Result<Self> {
-        if !(url.starts_with("https://") || url.starts_with("libsql://")) {
-            return Err(Error::Invalid("remote inventory requires TLS"));
-        }
+        validate_remote_configuration(&url, &token)?;
         let database = Builder::new_remote(url, token)
             .build()
             .await
@@ -131,6 +129,29 @@ impl LibsqlInventory {
             .map_err(|_| Error::Backend("commit schema"))?;
         Ok(())
     }
+}
+
+fn validate_remote_configuration(url: &str, token: &str) -> Result<()> {
+    if url.len() > 2048 || url.chars().any(char::is_control) {
+        return Err(Error::Invalid("remote endpoint"));
+    }
+    let endpoint = url::Url::parse(url).map_err(|_| Error::Invalid("remote endpoint"))?;
+    if !matches!(endpoint.scheme(), "https" | "libsql")
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+        || !matches!(endpoint.path(), "" | "/")
+    {
+        return Err(Error::Invalid(
+            "remote endpoint must use TLS without embedded credentials, query or path",
+        ));
+    }
+    if token.is_empty() || token.len() > 8192 || token.chars().any(char::is_control) {
+        return Err(Error::Invalid("remote authentication token"));
+    }
+    Ok(())
 }
 
 async fn validate_existing(connection: &Connection) -> Result<()> {
