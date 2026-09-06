@@ -105,15 +105,22 @@ promoted as a complete release.
 A test-only interruption hook can pause after an exact validated registry CAS,
 allow the parent harness to inspect the protected phase, and remain parked until
 the owned child is killed and reaped. It is excluded from production builds.
-The six-phase live recovery matrix has not yet completed and therefore does not
-satisfy the phase-recovery release check.
+The six-phase live recovery matrix has passed for signed test candidates. Each
+isolated run kills and reaps the parked deploy process, then uses a fresh issued
+client under the same executor binding to complete the recorded transition,
+publish inventory, verify repeated commit, and remove its cluster and credentials.
+This covers the validated post-CAS boundary of each phase. It does not prove
+within-phase interruption, transfer to a different CI executor, or recovery of a
+matching production release payload, and does not satisfy the production
+phase-recovery release check.
 
 ## Remaining production work
 
 - Produce one signed production release containing every required reactor case
   and all sixteen authenticated release checks.
-- Complete and package isolated Planned, Staged, Quiesced, Activated, Cleaning,
-  and Committed interruption recovery with `unsafe-activation: false`.
+- Qualify and package Planned, Staged, Quiesced, Activated, Cleaning, and Committed
+  interruption recovery against the exact production payload, including safe
+  recovery by a different CI executor and `unsafe-activation: false`.
 - Define and qualify executor transfer for a different CI run. The current
   executor label and recorded credential expiry do not prove that an earlier
   executor cannot mint credentials, complete admitted requests, or write the
