@@ -393,6 +393,9 @@ fn derive_resources(
 ) -> Result<()> {
     for resource in &ir.resources {
         let api = resolve_resource_api(resource)?;
+        if resource.api_resource.is_some() {
+            risks.insert("opaque-custom-resource-effects".to_owned());
+        }
         if resource.force {
             risks.insert(format!(
                 "force-apply:{}/{}/{}",

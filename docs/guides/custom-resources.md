@@ -63,6 +63,12 @@ The factory owns `apiVersion`, `kind` and REST routing metadata; application JSX
 cannot replace them. A later Kubernetes server-side apply validates the object
 against the CRD actually installed in the target cluster.
 
+The compiler reports `opaque-custom-resource-effects` for imported resources.
+The platform policy must explicitly accept this risk: a schema describes the
+object, but cannot bound the actions its operator performs. For this example,
+CloudNativePG must be installed separately with its own permissions; it creates
+the PostgreSQL workloads, storage and connection Secret.
+
 ## Lock and compile
 
 For the complete working example, replace the scaffold program with the checked

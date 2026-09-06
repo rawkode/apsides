@@ -213,6 +213,17 @@ fn custom_resource_mapping_drives_exact_capabilities_and_base_validation() -> Re
             && capability.verb == "patch"
             && matches!(capability.names.as_slice(), [name] if name == "database")
     }));
+    assert!(
+        plan.indirect_risks
+            .contains(&"opaque-custom-resource-effects".into())
+    );
+    let accepted = ceiling(&plan);
+    validate_ceiling(&plan, &accepted)?;
+    let mut missing = accepted;
+    missing
+        .accepted_indirect_risks
+        .retain(|risk| risk != "opaque-custom-resource-effects");
+    assert!(validate_ceiling(&plan, &missing).is_err());
 
     let mut remapped_builtin = fixture();
     remapped_builtin["resources"][0]["apiResource"] = value["resources"][0]["apiResource"].clone();
