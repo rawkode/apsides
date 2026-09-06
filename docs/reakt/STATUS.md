@@ -19,8 +19,25 @@ is historical evidence rather than proof of executor retirement. Old registries
 require explicit recovery; there is no inferred binding or automatic migration.
 Changed-executor transfer remains rejected, and archived audits retain only the
 executor label. The live candidate driver now uses `IssuedDeployment::connect`
-instead of constructing a client from a manually installed token, but a fresh
-live run of this v8 path is still required.
+instead of constructing a client from a manually installed token.
+
+The fresh v8 lifecycle run at `c609871` passed
+(`work/lifecycle-c609871-results/`). Separate driver processes reconnected using
+actual issued credentials for installation and an approved permission-changing
+upgrade. Unapproved reservation left protected state unchanged; old-writer
+retirement produced HTTP 401 before credential expiry. Finalizer-held cleanup
+retained claims, completed after fixture removal, and repeated commit preserved
+registry resourceVersion `1156`. The report confirms owned-cluster deletion,
+credential-file removal and complete diagnostics. The driver was built from
+`c609871`; candidate runtime images remain the signed disposable fixtures built
+at `9559fd1`. This is not a rebuild of the current production runtime, final
+`VerifiedRelease` acceptance, or fresh-CI-executor takeover evidence.
+Independent review verified the protected v8 binding against the identity
+approval's UID, resourceVersion and canonical digest, and confirmed the frozen
+runner and driver digests. It found no blockers. This run finishes before the
+original deployment credential expires, so post-expiry renewal remains unproven.
+Astro built 30 pages with all internal links resolving
+(`work/lifecycle-c609871-docs.log`).
 
 The final combined deploy/platform/CLI suite passed 257 tests with four opt-in
 checks ignored (`work/executor-binding-final-tests.log`). Six focused tests cover
@@ -51,8 +68,8 @@ bodies for independent re-evaluation. Astro build and internal links pass
 The next recovery gap is distinct from same-executor process restart. A fresh
 GitHub Actions attempt has a different executor identity, and the CLI correctly
 rejects takeover, but no qualified executor-transfer command exists yet. The
-issued deployment credential's binding and expiry are not retained on the
-transition. Independent architecture review requires durable binding plus proof
+issued deployment credential's binding and original expiry are now retained on
+the transition. Independent architecture review additionally requires proof
 that the old executor cannot remint credentials, leave admitted writes unresolved,
 or continue mutating the metadata store before transfer can be authorized.
 Current candidate tests do not prove this. Activation also crosses intermediate
