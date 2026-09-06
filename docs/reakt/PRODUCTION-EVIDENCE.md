@@ -103,6 +103,42 @@ It verifies the candidate signature before testing against mocked Kubernetes and
 metadata stores. This opt-in archived-candidate integration test establishes
 neither cluster ownership nor production deployment acceptance.
 
+`tests/reakt/run_deployment_ceiling.py` runs the live reservation experiment. It
+requires an existing pinned kind node image, a clean source checkout, and an
+independently approved trust policy. It verifies the signed candidate before
+creating a new cluster and leaves the candidate's payload and scope unchanged.
+
+```sh
+cuenv exec python3 tests/reakt/run_deployment_ceiling.py \
+  --artifact "$PWD/work/signed-candidate" \
+  --trust-policy "$PWD/work/approved-trust.json" \
+  --output "$PWD/work/deployment-ceiling"
+```
+
+The runner pins its Docker context and daemon, provisions short-lived deployment
+identity, and freezes the protected request before each attempt. A separate
+capability-complete projection supplies the list of objects that must remain
+absent; it does not authorize the deficient request. The negative control must
+return the exact typed capability-ceiling error without changing Kubernetes or
+metadata state. Restoring only the protected policy must allow the same candidate
+and allocation to reach `Planned`, followed by an exact public-store readback.
+
+Python snapshots and packaged diagnostics never retain Secret bodies. The runner
+uses kubectl's metadata-only output, although kubectl itself fetches the object.
+SQLite rows are compared in memory as canonical typed values; evidence includes
+only hashes and counts. Candidate and runner source commits are recorded
+separately. This checks reservation with the recorded runner, not execution of
+the candidate's controller binary.
+
+The receipt is written only after cluster/container deletion, preservation of
+pre-existing inventories, credential removal, and source revalidation. A failed
+run records its cluster name and whether cleanup was confirmed. Changed or
+unverifiable container ownership requires manual cleanup and cannot produce a
+passing receipt. `cuenv task deploymentCeilingTest` exercises orchestration and
+snapshot failures with mocks; it does not qualify a live cluster. Feed successful
+receipts through `merge-evidence` and the existing release validators before
+counting this check toward production coverage.
+
 ## Reproducibility runner
 
 `tests/reakt/run_reproducibility.py` runs two fresh CLI builds with
