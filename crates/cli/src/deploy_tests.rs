@@ -11,7 +11,7 @@ const TRANSITION_1: &str = "tceirceircfardairceirceirce-1";
 const TRANSITION_2: &str = "tceirceircfardairceirceirce-2";
 const SERVICE_ACCOUNT_1: &str = "rceirceircfardairceirceirce-1";
 
-fn registry() -> NamespaceRegistry {
+fn registry() -> Result<NamespaceRegistry> {
     let compiled = compiler_core::parse_and_validate(&json!({
         "testOnly":false,"schemaVersion":"reakt.dev/ir/v1",
         "domain":{"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound",
@@ -82,22 +82,34 @@ fn registry() -> NamespaceRegistry {
         upgrade_drain: None,
         previous_writer_checkpoint: None,
     };
-    NamespaceRegistry {
+    let snapshot = coordination::ClaimSnapshotV1 {
+        schema_version: coordination::CLAIM_SNAPSHOT_SCHEMA.into(),
+        scope: coordination::ClaimScope {
+            registry_uid: REGISTRY_UID.into(),
+            cluster_binding: "cluster-a".into(),
+            control_namespace: "control".into(),
+            workload_namespace: "workload".into(),
+        },
+        claims: vec![],
+    };
+    platform::NamespaceRegistryState {
         active_writer_checkpoints: BTreeMap::new(),
         schema_version: platform::REGISTRY_SCHEMA_VERSION.into(),
         registry_uid: REGISTRY_UID.into(),
         next_sequence: 2,
         cluster_binding: "cluster-a".into(),
         workload_namespace: "workload".into(),
-        claims: vec![],
+        claim_snapshot: snapshot.reference()?,
         histories: BTreeMap::from([("example".into(), history)]),
         transitions: BTreeMap::from([(TRANSITION_1.into(), stored)]),
     }
+    .hydrate(&snapshot)
+    .map_err(Into::into)
 }
 
 #[test]
 fn active_release_is_idempotent_but_changed_policy_allocates_a_generation() -> Result<()> {
-    let registry = registry();
+    let registry = registry()?;
     assert_eq!(
         default_transition(&registry, "example", BUILD, "policy-1")?,
         TRANSITION_1
@@ -111,7 +123,7 @@ fn active_release_is_idempotent_but_changed_policy_allocates_a_generation() -> R
 
 #[test]
 fn pending_same_build_precedes_old_active_transition_and_rollback_is_fresh() -> Result<()> {
-    let mut registry = registry();
+    let mut registry = registry()?;
     let mut next = registry.transitions[TRANSITION_1].clone();
     next.plan.request.transition_id = TRANSITION_2.into();
     next.plan.request.next.generation_id = GENERATION_2.into();
@@ -151,7 +163,7 @@ fn pending_same_build_precedes_old_active_transition_and_rollback_is_fresh() -> 
 
 #[test]
 fn review_uses_metadata_predecessor_but_rejects_unverified_historical_details() -> Result<()> {
-    let mut registry = registry();
+    let mut registry = registry()?;
     let original = registry.transition(TRANSITION_1)?.clone();
     let initial = crate::review::transition_review(&registry, TRANSITION_1)?;
     assert!(initial["reactions"]["before"].is_null());

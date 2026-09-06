@@ -2,11 +2,38 @@
 use crate::Result;
 use inventory::{InventoryScope, InventoryStore, LibsqlInventory, VersionedInventory};
 use platform::{NamespaceRegistry, PlatformClient};
-use std::{path::Path, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn connect() -> Result<Box<dyn InventoryStore>> {
+    let (database, token) = configuration()?;
+    open(&database, token).await
+}
+
+/// Claim coordination shares the configured persistent metadata database, using
+/// separate immutable tables. These credentials are never passed to the runtime.
+pub async fn connect_claims() -> Result<Arc<dyn coordination::ClaimStore>> {
+    let (database, token) = configuration()?;
+    let store = tokio::time::timeout(TIMEOUT, async {
+        if Path::new(&database).is_absolute() {
+            if token.is_some() {
+                return Err("local coordination does not accept a remote token".into());
+            }
+            Ok(coordination::LibsqlCoordination::open_local(Path::new(&database)).await?)
+        } else {
+            let token = token.ok_or("remote coordination requires REAKT_INVENTORY_TOKEN")?;
+            Ok::<_, Box<dyn std::error::Error>>(
+                coordination::LibsqlCoordination::open_remote(database, token).await?,
+            )
+        }
+    })
+    .await
+    .map_err(|_| "coordination connection timed out")??;
+    Ok(Arc::new(store))
+}
+
+fn configuration() -> Result<(String, Option<String>)> {
     let database = std::env::var("REAKT_INVENTORY_DATABASE").map_err(
         |_| "set REAKT_INVENTORY_DATABASE to a persistent absolute path or TLS libSQL endpoint",
     )?;
@@ -15,7 +42,7 @@ pub async fn connect() -> Result<Box<dyn InventoryStore>> {
         Err(std::env::VarError::NotPresent) => None,
         Err(_) => return Err("inventory token must be valid UTF-8".into()),
     };
-    open(&database, token).await
+    Ok((database, token))
 }
 
 async fn open(database: &str, token: Option<String>) -> Result<Box<dyn InventoryStore>> {

@@ -1,4 +1,5 @@
 use compiler_core::{CompiledPlan, PermissionCeiling, digest, parse_and_validate};
+use coordination::{ClaimRef, ClaimSnapshotV1, ClaimStore};
 use deploy::{ClaimState, ProtectedClaim, ResourceIdentity};
 use http::{Request, Response};
 use http_body_util::BodyExt;
@@ -8,7 +9,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
     convert::Infallible,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 use tower::service_fn;
 
@@ -23,6 +24,180 @@ const TRANSITION_B: &str = "tceirceircfardairceirceirce-2";
 mod qualified_writer;
 
 type Calls = Arc<Mutex<Vec<(String, String, Value)>>>;
+
+#[derive(Default)]
+struct MemoryClaimStore {
+    rows: Mutex<BTreeMap<String, ClaimSnapshotV1>>,
+}
+
+struct LyingClaimStore {
+    snapshot: ClaimSnapshotV1,
+}
+
+struct CorruptClaimStore {
+    snapshot: ClaimSnapshotV1,
+}
+
+impl MemoryClaimStore {
+    fn seed(&self, snapshot: ClaimSnapshotV1) -> coordination::Result<ClaimRef> {
+        let reference = snapshot.reference()?;
+        let mut rows = self
+            .rows
+            .lock()
+            .map_err(|_| coordination::Error::Backend("test claim store lock"))?;
+        if let Some(existing) = rows.get(&reference.digest)
+            && existing != &snapshot
+        {
+            return Err(coordination::Error::Invalid("test claim digest collision"));
+        }
+        rows.insert(reference.digest.clone(), snapshot);
+        Ok(reference)
+    }
+}
+
+#[async_trait::async_trait]
+impl ClaimStore for MemoryClaimStore {
+    async fn put_claims(&self, snapshot: &ClaimSnapshotV1) -> coordination::Result<ClaimRef> {
+        self.seed(snapshot.clone())
+    }
+
+    async fn read_claims(
+        &self,
+        reference: &ClaimRef,
+    ) -> coordination::Result<Option<ClaimSnapshotV1>> {
+        reference.validate()?;
+        let rows = self
+            .rows
+            .lock()
+            .map_err(|_| coordination::Error::Backend("test claim store lock"))?;
+        let Some(snapshot) = rows.get(&reference.digest) else {
+            return Ok(None);
+        };
+        if snapshot.reference()? != *reference {
+            return Err(coordination::Error::Invalid(
+                "test claim reference mismatch",
+            ));
+        }
+        Ok(Some(snapshot.clone()))
+    }
+}
+
+#[async_trait::async_trait]
+impl ClaimStore for LyingClaimStore {
+    async fn put_claims(&self, snapshot: &ClaimSnapshotV1) -> coordination::Result<ClaimRef> {
+        let mut reference = snapshot.reference()?;
+        reference.digest = format!("sha256:{}", "0".repeat(64));
+        Ok(reference)
+    }
+
+    async fn read_claims(
+        &self,
+        reference: &ClaimRef,
+    ) -> coordination::Result<Option<ClaimSnapshotV1>> {
+        if self.snapshot.reference()? == *reference {
+            Ok(Some(self.snapshot.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ClaimStore for CorruptClaimStore {
+    async fn put_claims(&self, snapshot: &ClaimSnapshotV1) -> coordination::Result<ClaimRef> {
+        snapshot.reference()
+    }
+
+    async fn read_claims(&self, _: &ClaimRef) -> coordination::Result<Option<ClaimSnapshotV1>> {
+        Ok(Some(self.snapshot.clone()))
+    }
+}
+
+fn fixture_claim_store() -> &'static Arc<MemoryClaimStore> {
+    static STORE: OnceLock<Arc<MemoryClaimStore>> = OnceLock::new();
+    STORE.get_or_init(|| Arc::new(MemoryClaimStore::default()))
+}
+
+fn platform_client(
+    client: Client,
+    control_namespace: &str,
+    workload_namespace: &str,
+    cluster_binding: &str,
+) -> platform::Result<PlatformClient> {
+    Ok(PlatformClient::new(
+        client,
+        control_namespace,
+        workload_namespace,
+        cluster_binding,
+    )?
+    .with_claim_store(fixture_claim_store().clone()))
+}
+
+fn claim_snapshot(registry: &NamespaceRegistry) -> platform::Result<ClaimSnapshotV1> {
+    registry.claim_snapshot()
+}
+
+fn registry_object(
+    registry: &NamespaceRegistry,
+    uid: &str,
+    resource_version: &str,
+) -> std::result::Result<Value, Box<dyn std::error::Error>> {
+    let snapshot = claim_snapshot(registry)?;
+    let reference = fixture_claim_store().seed(snapshot)?;
+    let state = registry.state(&reference)?;
+    Ok(object(
+        "reakt-registry-workload",
+        &state,
+        uid,
+        resource_version,
+    ))
+}
+
+fn hydrate_registry(
+    encoded: &str,
+) -> std::result::Result<NamespaceRegistry, Box<dyn std::error::Error>> {
+    let state: NamespaceRegistryState = serde_json::from_str(encoded)?;
+    let snapshot = fixture_claim_store()
+        .rows
+        .lock()
+        .map_err(|_| "test claim store lock poisoned")?
+        .get(&state.claim_snapshot.digest)
+        .cloned()
+        .ok_or("test claim snapshot missing")?;
+    Ok(state.hydrate(&snapshot)?)
+}
+
+fn hydrated_registry(
+    next_sequence: u64,
+    claims: Vec<ProtectedClaim>,
+    histories: BTreeMap<String, deploy::GenerationHistory>,
+    active_writer_checkpoints: BTreeMap<String, WriterCheckpoint>,
+    transitions: BTreeMap<String, StoredTransition>,
+) -> std::result::Result<NamespaceRegistry, Box<dyn std::error::Error>> {
+    let snapshot = ClaimSnapshotV1 {
+        schema_version: coordination::CLAIM_SNAPSHOT_SCHEMA.to_owned(),
+        scope: coordination::ClaimScope {
+            registry_uid: REGISTRY_UID.to_owned(),
+            cluster_binding: "cluster-a".to_owned(),
+            control_namespace: "control".to_owned(),
+            workload_namespace: "workload".to_owned(),
+        },
+        claims,
+    };
+    let reference = fixture_claim_store().seed(snapshot.clone())?;
+    Ok(NamespaceRegistryState {
+        registry_uid: REGISTRY_UID.to_owned(),
+        next_sequence,
+        schema_version: REGISTRY_SCHEMA_VERSION.to_owned(),
+        cluster_binding: "cluster-a".to_owned(),
+        workload_namespace: "workload".to_owned(),
+        claim_snapshot: reference,
+        histories,
+        active_writer_checkpoints,
+        transitions,
+    }
+    .hydrate(&snapshot)?)
+}
 fn registry_authority() -> Value {
     let mut authority = object(
         "reakt-registry-authority.control.workload",
@@ -87,6 +262,17 @@ fn wire_with_authority(responses: Vec<Value>, authority: Value) -> (Client, Call
                 };
                 if reply == json!("echo-put") {
                     reply = data;
+                    reply["metadata"]["resourceVersion"] = json!("43");
+                } else if reply == json!("echo-mutated-registry-put") {
+                    reply = data;
+                    let encoded = reply["data"]["state.json"]
+                        .as_str()
+                        .ok_or_else(|| std::io::Error::other("registry state missing"))?;
+                    let mut state: Value =
+                        serde_json::from_str(encoded).map_err(std::io::Error::other)?;
+                    state["nextSequence"] = json!("3");
+                    reply["data"]["state.json"] =
+                        json!(serde_json::to_string(&state).map_err(std::io::Error::other)?);
                     reply["metadata"]["resourceVersion"] = json!("43");
                 }
                 Response::builder()
@@ -299,11 +485,11 @@ async fn malformed_oversized_and_duplicate_control_records_fail_closed() {
     for value in [json!({"x":1}), json!("x".repeat(MAX_STATE_BYTES + 1))] {
         let mut record = object("registry", &value, REGISTRY_UID, "42");
         if value.is_object() {
-            record["data"]["state.json"] = json!("{\"x\":1,\"x\":2}");
+            record["data"]["state.json"] = json!(r#"{"x":1,"x":2}"#);
         }
         let (client, _) = wire(vec![record]);
         assert!(
-            PlatformClient::new(client, "control", "workload", "cluster-a")
+            platform_client(client, "control", "workload", "cluster-a")
                 .unwrap()
                 .load_registry()
                 .await
@@ -312,8 +498,13 @@ async fn malformed_oversized_and_duplicate_control_records_fail_closed() {
     }
 }
 
-#[tokio::test]
-async fn namespace_claim_reservation_is_one_conditional_update_and_rejects_stale_snapshot() {
+struct ReservationFixture {
+    registry: NamespaceRegistry,
+    policy: PolicyState,
+    request: deploy::DeploymentRequest,
+}
+
+fn reservation_fixture() -> std::result::Result<ReservationFixture, Box<dyn std::error::Error>> {
     let compiled = plan();
     let policy = policy(&compiled);
     let history = deploy::GenerationHistory {
@@ -322,17 +513,13 @@ async fn namespace_claim_reservation_is_one_conditional_update_and_rejects_stale
         revision: "42".into(),
         active_allocation: None,
     };
-    let registry = NamespaceRegistry {
-        active_writer_checkpoints: BTreeMap::new(),
-        registry_uid: REGISTRY_UID.into(),
-        next_sequence: 1,
-        schema_version: REGISTRY_SCHEMA_VERSION.into(),
-        cluster_binding: "cluster-a".into(),
-        workload_namespace: "workload".into(),
-        claims: vec![],
-        histories: BTreeMap::from([("example".into(), history.clone())]),
-        transitions: BTreeMap::new(),
-    };
+    let registry = hydrated_registry(
+        1,
+        vec![],
+        BTreeMap::from([("example".into(), history.clone())]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    )?;
     let request = deploy::DeploymentRequest {
         transition_id: TRANSITION_A.into(),
         previous: None,
@@ -353,18 +540,30 @@ async fn namespace_claim_reservation_is_one_conditional_update_and_rejects_stale
         observations: vec![],
         ownership_intents: vec![],
     };
-    let registry_object = object("registry", &registry, REGISTRY_UID, "42");
+    Ok(ReservationFixture {
+        registry,
+        policy,
+        request,
+    })
+}
+
+#[tokio::test]
+async fn namespace_claim_reservation_is_one_conditional_update_and_rejects_stale_snapshot()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let ReservationFixture {
+        registry,
+        policy,
+        request,
+    } = reservation_fixture()?;
+    let registry_response = registry_object(&registry, REGISTRY_UID, "42")?;
     let (client, calls) = wire(vec![
-        registry_object.clone(),
+        registry_response.clone(),
         object("policy", &policy, "policy-uid", "40"),
-        registry_object,
+        registry_response,
         json!("echo-put"),
     ]);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a").unwrap();
-    let changed = platform
-        .reserve_transition(&request, "executor-a")
-        .await
-        .unwrap();
+    let platform = platform_client(client, "control", "workload", "cluster-a")?;
+    let changed = platform.reserve_transition(&request, "executor-a").await?;
     assert_eq!(changed.value.claims.len(), 1);
     assert_eq!(changed.value.claims[0].state, ClaimState::Reserved);
     assert_eq!(changed.value.next_sequence, 2);
@@ -386,17 +585,65 @@ async fn namespace_claim_reservation_is_one_conditional_update_and_rejects_stale
             .count(),
         1
     );
-    let mut stale = request;
+    let mut stale = request.clone();
     stale.registry.revision = "41".into();
-    let (client, calls) = wire(vec![object("registry", &registry, REGISTRY_UID, "42")]);
+    let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
     assert!(
-        PlatformClient::new(client, "control", "workload", "cluster-a")
+        platform_client(client, "control", "workload", "cluster-a")
             .unwrap()
             .reserve_transition(&stale, "executor-b")
             .await
             .is_err()
     );
     assert_eq!(calls.lock().unwrap().len(), 2);
+
+    let registry_response = registry_object(&registry, REGISTRY_UID, "42")?;
+    let (client, calls) = wire(vec![
+        registry_response.clone(),
+        object("policy", &policy, "policy-uid", "40"),
+        registry_response.clone(),
+    ]);
+    let lying_store = LyingClaimStore {
+        snapshot: registry.claim_snapshot()?,
+    };
+    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?
+        .with_claim_store(Arc::new(lying_store));
+    assert!(
+        platform
+            .reserve_transition(&request, "executor-b")
+            .await
+            .is_err()
+    );
+    assert!(
+        calls
+            .lock()
+            .map_err(|_| "request lock poisoned")?
+            .iter()
+            .all(|(method, _, _)| method == "GET")
+    );
+
+    let (client, calls) = wire(vec![
+        registry_response.clone(),
+        object("policy", &policy, "policy-uid", "40"),
+        registry_response,
+        json!("echo-mutated-registry-put"),
+    ]);
+    assert!(
+        platform_client(client, "control", "workload", "cluster-a")?
+            .reserve_transition(&request, "executor-b")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        calls
+            .lock()
+            .map_err(|_| "request lock poisoned")?
+            .iter()
+            .filter(|(method, _, _)| method == "PUT")
+            .count(),
+        1
+    );
+    Ok(())
 }
 
 fn expected_writers() -> ExpectedWriters {
@@ -432,7 +679,7 @@ async fn termination_requires_observed_zero_and_known_terminal_containers() {
         ready_node(),
         deployment.clone(),
     ]);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a").unwrap();
+    let platform = platform_client(client, "control", "workload", "cluster-a").unwrap();
     platform
         .observe_writer_termination(&expected_writers())
         .await
@@ -446,7 +693,7 @@ async fn termination_requires_observed_zero_and_known_terminal_containers() {
             .remove(field);
         let (client, calls) = wire(vec![invalid_deployment]);
         assert!(
-            PlatformClient::new(client, "control", "workload", "cluster-a")
+            platform_client(client, "control", "workload", "cluster-a")
                 .unwrap()
                 .observe_writer_termination(&expected_writers())
                 .await
@@ -465,7 +712,7 @@ async fn termination_requires_observed_zero_and_known_terminal_containers() {
         ready_node(),
         omitted_zero,
     ]);
-    PlatformClient::new(client, "control", "workload", "cluster-a")
+    platform_client(client, "control", "workload", "cluster-a")
         .unwrap()
         .observe_writer_termination(&expected_writers())
         .await
@@ -479,7 +726,7 @@ async fn termination_requires_observed_zero_and_known_terminal_containers() {
         ready_node(),
     ]);
     assert!(
-        PlatformClient::new(client, "control", "workload", "cluster-a")
+        platform_client(client, "control", "workload", "cluster-a")
             .unwrap()
             .observe_writer_termination(&expected_writers())
             .await
@@ -494,7 +741,7 @@ async fn missing_pod_or_changed_node_never_proves_termination() {
         json!({"apiVersion":"v1","kind":"PodList","items":[]}),
     ]);
     assert!(
-        PlatformClient::new(client, "control", "workload", "cluster-a")
+        platform_client(client, "control", "workload", "cluster-a")
             .unwrap()
             .observe_writer_termination(&expected_writers())
             .await
@@ -509,7 +756,7 @@ async fn missing_pod_or_changed_node_never_proves_termination() {
         node,
     ]);
     assert!(
-        PlatformClient::new(client, "control", "workload", "cluster-a")
+        platform_client(client, "control", "workload", "cluster-a")
             .unwrap()
             .observe_writer_termination(&expected_writers())
             .await
@@ -519,13 +766,17 @@ async fn missing_pod_or_changed_node_never_proves_termination() {
 }
 
 #[cfg(feature = "deployer")]
-fn staged_initial_fixture() -> (
+type StagedInitialFixture = (
     NamespaceRegistry,
     ActivationState,
     PolicyState,
     Value,
     Value,
-) {
+);
+
+#[cfg(feature = "deployer")]
+fn staged_initial_fixture() -> std::result::Result<StagedInitialFixture, Box<dyn std::error::Error>>
+{
     use deploy::{
         DeploymentRequest, Event, GenerationHistory, GenerationPlan, RegistrySnapshot, advance,
         begin, plan_transition,
@@ -612,18 +863,14 @@ fn staged_initial_fixture() -> (
     };
     let mut claim = activation.approved_claims[0].claim.clone();
     claim.state = ClaimState::Reserved;
-    let registry = NamespaceRegistry {
-        active_writer_checkpoints: BTreeMap::new(),
-        registry_uid: REGISTRY_UID.into(),
-        next_sequence: 2,
-        schema_version: REGISTRY_SCHEMA_VERSION.into(),
-        cluster_binding: "cluster-a".into(),
-        workload_namespace: "workload".into(),
-        claims: vec![claim],
-        histories: [("example".into(), history)].into(),
-        transitions: [(TRANSITION_A.into(), entry)].into(),
-    };
-    (registry, activation, policy, trust, deployment)
+    let registry = hydrated_registry(
+        2,
+        vec![claim],
+        [("example".into(), history)].into(),
+        BTreeMap::new(),
+        [(TRANSITION_A.into(), entry)].into(),
+    )?;
+    Ok((registry, activation, policy, trust, deployment))
 }
 
 #[cfg(feature = "deployer")]
@@ -732,11 +979,11 @@ fn stateful_wire_with_drift(
 #[tokio::test]
 async fn initial_activation_starts_only_after_protected_authority_and_resumes_committed()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let (mut registry, activation, policy, trust, deployment) = staged_initial_fixture();
+    let (mut registry, activation, policy, trust, deployment) = staged_initial_fixture()?;
     let mut objects = initial_support_fixture(&mut registry);
     objects.extend(qualified_writer::qualify(&mut registry, TRANSITION_A)?);
     objects.extend(vec![
-        object("reakt-registry-workload", &registry, REGISTRY_UID, "42"),
+        registry_object(&registry, REGISTRY_UID, "42")?,
         object(
             "reakt-activation-example",
             &activation,
@@ -748,7 +995,7 @@ async fn initial_activation_starts_only_after_protected_authority_and_resumes_co
         deployment,
     ]);
     let (client, calls) = stateful_wire(objects);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a").unwrap();
+    let platform = platform_client(client, "control", "workload", "cluster-a").unwrap();
     let committed = platform
         .activate_initial(TRANSITION_A, "executor-a")
         .await
@@ -765,7 +1012,7 @@ async fn initial_activation_starts_only_after_protected_authority_and_resumes_co
         let encoded = payload["data"]["state.json"]
             .as_str()
             .ok_or("registry state missing")?;
-        let state: NamespaceRegistry = serde_json::from_str(encoded)?;
+        let state = hydrate_registry(encoded)?;
         let record = state.transition(TRANSITION_A)?;
         let history = state
             .histories
@@ -810,10 +1057,10 @@ async fn initial_activation_starts_only_after_protected_authority_and_resumes_co
 #[tokio::test]
 async fn initial_activation_rejects_changed_trust_without_writes()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let (mut registry, _, _, _, _) = staged_initial_fixture();
+    let (mut registry, _, _, _, _) = staged_initial_fixture()?;
     qualified_writer::qualify(&mut registry, TRANSITION_A)?;
     let (client, calls) = wire(vec![
-        object("reakt-registry-workload", &registry, REGISTRY_UID, "42"),
+        registry_object(&registry, REGISTRY_UID, "42")?,
         object(
             "reakt-trust-example",
             &json!({"platform":"changed"}),
@@ -822,7 +1069,7 @@ async fn initial_activation_rejects_changed_trust_without_writes()
         ),
     ]);
     assert!(
-        PlatformClient::new(client, "control", "workload", "cluster-a")
+        platform_client(client, "control", "workload", "cluster-a")
             .unwrap()
             .activate_initial(TRANSITION_A, "executor-a")
             .await
@@ -835,7 +1082,7 @@ async fn initial_activation_rejects_changed_trust_without_writes()
 #[cfg(feature = "deployer")]
 fn staged_upgrade_fixture() -> std::result::Result<NamespaceRegistry, Box<dyn std::error::Error>> {
     use deploy::{Event, Phase, Quiescence, RegistrySnapshot, advance, begin, plan_transition};
-    let (mut registry, _, _, _, _) = staged_initial_fixture();
+    let (mut registry, _, _, _, _) = staged_initial_fixture()?;
     let previous = registry
         .transitions
         .get_mut(TRANSITION_A)
@@ -976,8 +1223,8 @@ async fn predecessor_metadata_requires_exact_protected_retirement_authority_befo
             }
             _ => return Err("unknown fixture alteration".into()),
         }
-        let (client, calls) = wire(vec![object("registry", &registry, REGISTRY_UID, "42")]);
-        let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+        let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
+        let platform = platform_client(client, "control", "workload", "cluster-a")?;
         assert!(
             platform
                 .reserve_transition(&request, "executor-b")
@@ -1011,12 +1258,12 @@ async fn authenticated_metadata_predecessor_reserves_without_embedding_old_plan(
     registry.next_sequence = request.registry.next_sequence;
     let policy = policy(&request.next.compiled);
     let (client, calls) = wire(vec![
-        object("registry", &registry, REGISTRY_UID, "42"),
+        registry_object(&registry, REGISTRY_UID, "42")?,
         object("policy", &policy, "policy-uid", "40"),
-        object("registry", &registry, REGISTRY_UID, "42"),
+        registry_object(&registry, REGISTRY_UID, "42")?,
         json!("echo-put"),
     ]);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let platform = platform_client(client, "control", "workload", "cluster-a")?;
     let reserved = platform.reserve_transition(&request, "executor-b").await?;
     assert!(
         reserved
@@ -1055,13 +1302,13 @@ async fn direct_api_predecessor_is_durably_blocked_and_forged_phase_never_writes
     let mut registry = staged_upgrade_fixture()?;
     qualified_writer::qualify(&mut registry, TRANSITION_B)?;
     let (client, calls) = wire(vec![
-        object("reakt-registry-workload", &registry, REGISTRY_UID, "42"),
-        object("reakt-registry-workload", &registry, REGISTRY_UID, "42"),
-        object("reakt-registry-workload", &registry, REGISTRY_UID, "42"),
-        object("reakt-registry-workload", &registry, REGISTRY_UID, "42"),
+        registry_object(&registry, REGISTRY_UID, "42")?,
+        registry_object(&registry, REGISTRY_UID, "42")?,
+        registry_object(&registry, REGISTRY_UID, "42")?,
+        registry_object(&registry, REGISTRY_UID, "42")?,
         json!("echo-put"),
     ]);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a").unwrap();
+    let platform = platform_client(client, "control", "workload", "cluster-a").unwrap();
     assert!(
         platform
             .quiesce_previous(TRANSITION_B, "executor-b")
@@ -1070,12 +1317,11 @@ async fn direct_api_predecessor_is_durably_blocked_and_forged_phase_never_writes
     );
     assert_eq!(calls.lock().unwrap().len(), 8);
     assert_eq!(calls.lock().unwrap()[7].0, "PUT");
-    let blocked: NamespaceRegistry = serde_json::from_str(
+    let blocked = hydrate_registry(
         calls.lock().unwrap()[7].2["data"]["state.json"]
             .as_str()
             .unwrap(),
-    )
-    .unwrap();
+    )?;
     assert_eq!(
         blocked.transitions[TRANSITION_B].record.phase,
         Phase::Blocked
@@ -1090,13 +1336,8 @@ async fn direct_api_predecessor_is_durably_blocked_and_forged_phase_never_writes
             .unwrap()
             .record
             .phase = phase;
-        let (client, calls) = wire(vec![object(
-            "reakt-registry-workload",
-            &forged,
-            REGISTRY_UID,
-            "42",
-        )]);
-        let platform = PlatformClient::new(client, "control", "workload", "cluster-a").unwrap();
+        let (client, calls) = wire(vec![registry_object(&forged, REGISTRY_UID, "42")?]);
+        let platform = platform_client(client, "control", "workload", "cluster-a").unwrap();
         assert!(
             platform
                 .activate_upgrade(TRANSITION_B, "executor-b")
@@ -1169,7 +1410,7 @@ fn initial_support_fixture(registry: &mut NamespaceRegistry) -> Vec<Value> {
 async fn broadened_staged_role_and_recreated_config_block_before_activation()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     for changed_kind in ["Role", "ConfigMap"] {
-        let (mut registry, activation, policy, trust, deployment) = staged_initial_fixture();
+        let (mut registry, activation, policy, trust, deployment) = staged_initial_fixture()?;
         let mut objects = initial_support_fixture(&mut registry);
         objects.extend(qualified_writer::qualify(&mut registry, TRANSITION_A)?);
         let changed = objects
@@ -1182,7 +1423,7 @@ async fn broadened_staged_role_and_recreated_config_block_before_activation()
             changed["metadata"]["uid"] = json!("replaced-config-uid");
         }
         objects.extend(vec![
-            object("reakt-registry-workload", &registry, REGISTRY_UID, "42"),
+            registry_object(&registry, REGISTRY_UID, "42")?,
             object("reakt-policy-example", &policy, "policy-uid", "44"),
             object("reakt-trust-example", &trust, "trust-uid", "43"),
             object(
@@ -1194,7 +1435,7 @@ async fn broadened_staged_role_and_recreated_config_block_before_activation()
             deployment,
         ]);
         let (client, calls) = stateful_wire(objects);
-        let platform = PlatformClient::new(client, "control", "workload", "cluster-a").unwrap();
+        let platform = platform_client(client, "control", "workload", "cluster-a").unwrap();
         assert!(
             platform
                 .activate_initial(TRANSITION_A, "executor-a")
@@ -1211,7 +1452,7 @@ async fn broadened_staged_role_and_recreated_config_block_before_activation()
 async fn crash_after_start_resume_rechecks_authority_before_replica_one_fast_path()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     use deploy::{Event, Quiescence, advance};
-    let (mut registry, activation, policy, trust, mut deployment) = staged_initial_fixture();
+    let (mut registry, activation, policy, trust, mut deployment) = staged_initial_fixture()?;
     let entry = registry.transitions.get_mut(TRANSITION_A).unwrap();
     for event in [
         Event::Quiesced {
@@ -1240,7 +1481,7 @@ async fn crash_after_start_resume_rechecks_authority_before_replica_one_fast_pat
     let mut objects = initial_support_fixture(&mut registry);
     objects.extend(qualified_writer::qualify(&mut registry, TRANSITION_A)?);
     objects.extend(vec![
-        object("reakt-registry-workload", &registry, REGISTRY_UID, "42"),
+        registry_object(&registry, REGISTRY_UID, "42")?,
         object("reakt-policy-example", &policy, "policy-uid", "44"),
         object("reakt-trust-example", &trust, "trust-uid", "43"),
         object(
@@ -1252,7 +1493,7 @@ async fn crash_after_start_resume_rechecks_authority_before_replica_one_fast_pat
         deployment,
     ]);
     let (client, calls) = stateful_wire_with_drift(objects, true);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a").unwrap();
+    let platform = platform_client(client, "control", "workload", "cluster-a").unwrap();
     assert!(
         platform
             .activate_initial(TRANSITION_A, "executor-a")
@@ -1273,7 +1514,10 @@ async fn crash_after_start_resume_rechecks_authority_before_replica_one_fast_pat
     Ok(())
 }
 
-fn adoption_request() -> (NamespaceRegistry, PolicyState, deploy::DeploymentRequest) {
+fn adoption_request() -> std::result::Result<
+    (NamespaceRegistry, PolicyState, deploy::DeploymentRequest),
+    Box<dyn std::error::Error>,
+> {
     let compiled = plan();
     let policy = policy(&compiled);
     let history = deploy::GenerationHistory {
@@ -1282,17 +1526,13 @@ fn adoption_request() -> (NamespaceRegistry, PolicyState, deploy::DeploymentRequ
         revision: "42".into(),
         active_allocation: None,
     };
-    let registry = NamespaceRegistry {
-        active_writer_checkpoints: BTreeMap::new(),
-        registry_uid: REGISTRY_UID.into(),
-        next_sequence: 1,
-        schema_version: REGISTRY_SCHEMA_VERSION.into(),
-        cluster_binding: "cluster-a".into(),
-        workload_namespace: "workload".into(),
-        claims: vec![],
-        histories: BTreeMap::from([("example".into(), history.clone())]),
-        transitions: BTreeMap::new(),
-    };
+    let registry = hydrated_registry(
+        1,
+        vec![],
+        BTreeMap::from([("example".into(), history.clone())]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    )?;
     let next = deploy::GenerationPlan {
         generation_id: GENERATION_A.into(),
         artifact_digest: format!("sha256:{}", "a".repeat(64)),
@@ -1331,12 +1571,13 @@ fn adoption_request() -> (NamespaceRegistry, PolicyState, deploy::DeploymentRequ
         observations: vec![],
         ownership_intents: vec![intent],
     };
-    (registry, policy, request)
+    Ok((registry, policy, request))
 }
 
 #[tokio::test]
-async fn adoption_reservation_rechecks_operator_approval_and_uses_non_force_uid_bound_dry_run() {
-    let (registry, policy, request) = adoption_request();
+async fn adoption_reservation_rechecks_operator_approval_and_uses_non_force_uid_bound_dry_run()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let (registry, policy, request) = adoption_request()?;
     let approval = &request.ownership_intents[0].approval;
     for corruption in [
         "none",
@@ -1346,7 +1587,7 @@ async fn adoption_reservation_rechecks_operator_approval_and_uses_non_force_uid_
         "managed-fields",
         "dry-run-uid",
     ] {
-        let registry_object = object("registry", &registry, REGISTRY_UID, "42");
+        let registry_object = registry_object(&registry, REGISTRY_UID, "42")?;
         let mut approval_object = object("approve-config", &approval, "approval-uid", "12");
         approval_object["metadata"]["namespace"] = json!(OWNERSHIP_INTENT_NAMESPACE);
         let mut live = json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{
@@ -1370,7 +1611,7 @@ async fn adoption_reservation_rechecks_operator_approval_and_uses_non_force_uid_
             registry_object,
             json!("echo-put"),
         ]);
-        let result = PlatformClient::new(client, "control", "workload", "cluster-a")
+        let result = platform_client(client, "control", "workload", "cluster-a")
             .unwrap()
             .reserve_transition(&request, "executor-a")
             .await;
@@ -1398,12 +1639,14 @@ async fn adoption_reservation_rechecks_operator_approval_and_uses_non_force_uid_
             assert!(calls.iter().all(|call| call.0 != "PUT"));
         }
     }
+    Ok(())
 }
 
 #[cfg(feature = "deployer")]
-fn committed_inventory_fixture() -> NamespaceRegistry {
+fn committed_inventory_fixture()
+-> std::result::Result<NamespaceRegistry, Box<dyn std::error::Error>> {
     use deploy::{Event, Quiescence, advance};
-    let (mut registry, _, _, _, _) = staged_initial_fixture();
+    let (mut registry, _, _, _, _) = staged_initial_fixture()?;
     let stored = registry.transitions.get_mut(TRANSITION_A).unwrap();
     for event in [
         Event::Quiesced {
@@ -1443,17 +1686,18 @@ fn committed_inventory_fixture() -> NamespaceRegistry {
         .active_allocation = Some(stored.plan.generation_reservation.clone());
     registry.claims[0].state = ClaimState::Active;
     registry.claims[0].uid = Some("observed-uid".into());
-    registry
+    Ok(registry)
 }
 
 #[cfg(feature = "deployer")]
 #[tokio::test]
-async fn committed_inventory_persists_metadata_and_retries_after_reopen() {
+async fn committed_inventory_persists_metadata_and_retries_after_reopen()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     use inventory::{InventoryStore, LibsqlInventory};
-    let registry = committed_inventory_fixture();
-    let response = object("reakt-registry-workload", &registry, REGISTRY_UID, "42");
+    let registry = committed_inventory_fixture()?;
+    let response = registry_object(&registry, REGISTRY_UID, "42")?;
     let (client, calls) = wire(vec![response; 6]);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a").unwrap();
+    let platform = platform_client(client, "control", "workload", "cluster-a").unwrap();
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("inventory.db");
     let stored = {
@@ -1500,21 +1744,23 @@ async fn committed_inventory_persists_metadata_and_retries_after_reopen() {
                     .1
                     .ends_with("/configmaps/reakt-registry-authority.control.workload"))
     }));
+    Ok(())
 }
 
 #[cfg(feature = "deployer")]
 #[tokio::test]
-async fn registry_races_do_not_report_inventory_completion() {
+async fn registry_races_do_not_report_inventory_completion()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
     use inventory::{InventoryStore, LibsqlInventory};
-    let registry = committed_inventory_fixture();
+    let registry = committed_inventory_fixture()?;
     let scope = deploy::generation_inventory(
         &registry.transitions[TRANSITION_A].plan.request.next,
         &registry.claims,
     )
     .unwrap()
     .0;
-    let stable = object("reakt-registry-workload", &registry, REGISTRY_UID, "42");
-    let changed = object("reakt-registry-workload", &registry, REGISTRY_UID, "43");
+    let stable = registry_object(&registry, REGISTRY_UID, "42")?;
+    let changed = registry_object(&registry, REGISTRY_UID, "43")?;
     for after_commit in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let store = LibsqlInventory::open_local(&directory.path().join("inventory.db"))
@@ -1526,7 +1772,7 @@ async fn registry_races_do_not_report_inventory_completion() {
             vec![stable.clone(), changed.clone()]
         };
         let (client, _) = wire(replies);
-        let platform = PlatformClient::new(client, "control", "workload", "cluster-a").unwrap();
+        let platform = platform_client(client, "control", "workload", "cluster-a").unwrap();
         assert!(
             platform
                 .publish_committed_inventory(&store, TRANSITION_A, "executor-a")
@@ -1537,7 +1783,7 @@ async fn registry_races_do_not_report_inventory_completion() {
         );
         assert_eq!(store.load(&scope).await.unwrap().is_some(), after_commit);
         let (client, _) = wire(vec![changed.clone(); 3]);
-        let platform = PlatformClient::new(client, "control", "workload", "cluster-a").unwrap();
+        let platform = platform_client(client, "control", "workload", "cluster-a").unwrap();
         assert!(
             platform
                 .publish_committed_inventory(&store, TRANSITION_A, "executor-a")
@@ -1545,6 +1791,7 @@ async fn registry_races_do_not_report_inventory_completion() {
                 .is_ok()
         );
     }
+    Ok(())
 }
 
 #[cfg(feature = "deployer")]
@@ -1563,7 +1810,7 @@ async fn inventory_refuses_forged_commits_wrong_claims_and_uid_regression()
         "policy",
         "api-type",
     ] {
-        let mut registry = committed_inventory_fixture();
+        let mut registry = committed_inventory_fixture()?;
         let (scope, mut snapshot) = deploy::generation_inventory(
             &registry
                 .transitions
@@ -1620,13 +1867,8 @@ async fn inventory_refuses_forged_commits_wrong_claims_and_uid_regression()
             "head" | "missing-resource" | "policy" | "api-type" => {}
             _ => return Err("unknown fixture corruption".into()),
         }
-        let (client, calls) = wire(vec![object(
-            "reakt-registry-workload",
-            &registry,
-            REGISTRY_UID,
-            "42",
-        )]);
-        let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+        let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
+        let platform = platform_client(client, "control", "workload", "cluster-a")?;
         assert!(
             platform
                 .publish_committed_inventory(&store, TRANSITION_A, "executor-a")
@@ -1644,7 +1886,7 @@ async fn inventory_refuses_forged_commits_wrong_claims_and_uid_regression()
 #[test]
 fn ci_permission_report_distinguishes_creation_scope_and_runtime_authority()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let (registry, _, _, _, _) = staged_initial_fixture();
+    let (registry, _, _, _, _) = staged_initial_fixture()?;
     let plan = &registry.transition(TRANSITION_A)?.plan;
     let report = deployment_permissions(plan)?;
     let authority_access: Vec<_> = report
@@ -1780,7 +2022,7 @@ async fn active_uid_capture_uses_inventory_and_rejects_missing_records()
         "resources":[{"identity":{"apiGroup":"","resource":"configmaps","namespace":"workload","name":"config"},
             "apiVersion":"v1","kind":"ConfigMap","uid":null,"deletionPolicy":"orphan"}]
     }))?;
-    let control = object("reakt-registry-workload", &registry, REGISTRY_UID, "42");
+    let control = registry_object(&registry, REGISTRY_UID, "42")?;
     let live = json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{
         "name":"config","namespace":"workload","uid":"captured-uid","resourceVersion":"9",
         "managedFields":[{"manager":"reakt-example","operation":"Apply","apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{}}]
@@ -1791,7 +2033,7 @@ async fn active_uid_capture_uses_inventory_and_rejects_missing_records()
         control.clone(),
         json!("echo-put"),
     ]);
-    let captured = PlatformClient::new(client, "control", "workload", "cluster-a")?
+    let captured = platform_client(client, "control", "workload", "cluster-a")?
         .capture_active_claim_uids("example", &snapshot)
         .await?;
     assert_eq!(
@@ -1807,7 +2049,7 @@ async fn active_uid_capture_uses_inventory_and_rejects_missing_records()
     missing.resources.clear();
     let (client, calls) = wire(vec![control]);
     assert!(
-        PlatformClient::new(client, "control", "workload", "cluster-a")?
+        platform_client(client, "control", "workload", "cluster-a")?
             .capture_active_claim_uids("example", &missing)
             .await
             .is_err()
@@ -1843,9 +2085,9 @@ async fn captured_uid_publication_preserves_metadata_and_uses_authoritative_clai
         .first_mut()
         .ok_or("claim missing")?
         .uid = Some("forged-caller-uid".into());
-    let state = object("reakt-registry-workload", &registry, REGISTRY_UID, "42");
+    let state = registry_object(&registry, REGISTRY_UID, "42")?;
     let (client, calls) = wire(vec![state.clone(), state.clone(), state.clone()]);
-    let published = PlatformClient::new(client, "control", "workload", "cluster-a")?
+    let published = platform_client(client, "control", "workload", "cluster-a")?
         .publish_captured_inventory(&store, "example", &captured, &head)
         .await?;
     let mut expected = snapshot;
@@ -1866,7 +2108,7 @@ async fn captured_uid_publication_preserves_metadata_and_uses_authoritative_clai
     assert_eq!(reopened.load(&scope).await?, Some(published.clone()));
     let (client, _) = wire(vec![state]);
     assert!(
-        PlatformClient::new(client, "control", "workload", "cluster-a")?
+        platform_client(client, "control", "workload", "cluster-a")?
             .publish_captured_inventory(&reopened, "example", &captured, &head)
             .await
             .is_err()
@@ -1896,14 +2138,9 @@ async fn captured_uid_publication_rejects_known_uid_change_without_overwrite()
         uid: REGISTRY_UID.into(),
         resource_version: "42".into(),
     };
-    let (client, calls) = wire(vec![object(
-        "reakt-registry-workload",
-        &registry,
-        REGISTRY_UID,
-        "42",
-    )]);
+    let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
     assert!(
-        PlatformClient::new(client, "control", "workload", "cluster-a")?
+        platform_client(client, "control", "workload", "cluster-a")?
             .publish_captured_inventory(&store, "example", &captured, &head)
             .await
             .is_err()
@@ -1923,6 +2160,7 @@ async fn inventory_checkpoint_rejects_tampered_policy_and_legacy_authority_befor
         let store = LibsqlInventory::open_local(&directory.path().join("inventory.db")).await?;
         let mut registry = staged_upgrade_fixture()?;
         registry.transitions.remove(TRANSITION_B);
+        let mut control = registry_object(&registry, REGISTRY_UID, "42")?;
         let (scope, mut snapshot) = deploy::generation_inventory(
             &registry.transition(TRANSITION_A)?.plan.request.next,
             &registry.claims,
@@ -1947,6 +2185,19 @@ async fn inventory_checkpoint_rejects_tampered_policy_and_legacy_authority_befor
             } else {
                 allocation.generation_id = "foreign".into();
             }
+            let encoded = control["data"]["state.json"]
+                .as_str()
+                .ok_or("registry state missing")?;
+            let mut state: Value = serde_json::from_str(encoded)?;
+            let allocation = state["histories"]["example"]["activeAllocation"]
+                .as_object_mut()
+                .ok_or("active allocation state missing")?;
+            if corruption == "legacy" {
+                allocation.remove("inventoryMetadataDigest");
+            } else {
+                allocation.insert("generationId".into(), json!("foreign"));
+            }
+            control["data"]["state.json"] = json!(serde_json::to_string(&state)?);
         }
         let head = store.publish(&scope, None, &snapshot).await?;
         let captured = Versioned {
@@ -1954,10 +2205,9 @@ async fn inventory_checkpoint_rejects_tampered_policy_and_legacy_authority_befor
             uid: REGISTRY_UID.into(),
             resource_version: "42".into(),
         };
-        let control = object("reakt-registry-workload", &registry, REGISTRY_UID, "42");
         let (client, calls) = wire(vec![control.clone()]);
         assert!(
-            PlatformClient::new(client, "control", "workload", "cluster-a")?
+            platform_client(client, "control", "workload", "cluster-a")?
                 .capture_active_claim_uids("example", &snapshot)
                 .await
                 .is_err(),
@@ -1966,7 +2216,7 @@ async fn inventory_checkpoint_rejects_tampered_policy_and_legacy_authority_befor
         assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 2);
         let (client, calls) = wire(vec![control]);
         assert!(
-            PlatformClient::new(client, "control", "workload", "cluster-a")?
+            platform_client(client, "control", "workload", "cluster-a")?
                 .publish_captured_inventory(&store, "example", &captured, &head)
                 .await
                 .is_err(),
@@ -1975,11 +2225,20 @@ async fn inventory_checkpoint_rejects_tampered_policy_and_legacy_authority_befor
         assert_eq!(calls.lock().map_err(|_| "request lock poisoned")?.len(), 2);
         assert_eq!(store.load(&scope).await?, Some(head));
     }
+    Ok(())
+}
 
+#[cfg(feature = "deployer")]
+#[tokio::test]
+async fn inventory_checkpoint_rejects_wrong_transition_claim_snapshot_before_capture()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    use inventory::{InventoryStore, LibsqlInventory};
     let directory = tempfile::tempdir()?;
     let store = LibsqlInventory::open_local(&directory.path().join("inventory.db")).await?;
     let mut registry = staged_upgrade_fixture()?;
     registry.transitions.remove(TRANSITION_B);
+    let control = registry_object(&registry, REGISTRY_UID, "42")?;
+    let mut corrupt_snapshot = registry.claim_snapshot()?;
     let (scope, snapshot) = deploy::generation_inventory(
         &registry.transition(TRANSITION_A)?.plan.request.next,
         &registry.claims,
@@ -1990,19 +2249,19 @@ async fn inventory_checkpoint_rejects_tampered_policy_and_legacy_authority_befor
         .first_mut()
         .ok_or("claim missing")?
         .transition_id = "wrong-transition".into();
+    corrupt_snapshot.claims.clone_from(&registry.claims);
     let captured = Versioned {
         value: registry.clone(),
         uid: REGISTRY_UID.into(),
         resource_version: "42".into(),
     };
-    let (client, calls) = wire(vec![object(
-        "reakt-registry-workload",
-        &registry,
-        REGISTRY_UID,
-        "42",
-    )]);
+    let (client, calls) = wire(vec![control]);
+    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?
+        .with_claim_store(Arc::new(CorruptClaimStore {
+            snapshot: corrupt_snapshot,
+        }));
     assert!(
-        PlatformClient::new(client, "control", "workload", "cluster-a")?
+        platform
             .publish_captured_inventory(&store, "example", &captured, &head)
             .await
             .is_err(),
@@ -2100,13 +2359,8 @@ async fn writer_checkpoint_backfill_is_atomic_private_and_independent_of_old_his
     previous
         .staged_content_digests
         .insert(unrelated.into(), "public-digest-canary".into());
-    let (client, calls) = stateful_wire(vec![object(
-        "reakt-registry-workload",
-        &registry,
-        REGISTRY_UID,
-        "42",
-    )]);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let (client, calls) = stateful_wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
+    let platform = platform_client(client, "control", "workload", "cluster-a")?;
     let captured = platform
         .ensure_previous_writer_checkpoint(TRANSITION_B, "executor-b")
         .await?;
@@ -2158,13 +2412,8 @@ async fn writer_checkpoint_backfill_is_atomic_private_and_independent_of_old_his
 
     let mut compacted = captured.value;
     compacted.transitions.remove(TRANSITION_A);
-    let (client, calls) = wire(vec![object(
-        "reakt-registry-workload",
-        &compacted,
-        REGISTRY_UID,
-        "43",
-    )]);
-    let restored = PlatformClient::new(client, "control", "workload", "cluster-a")?
+    let (client, calls) = wire(vec![registry_object(&compacted, REGISTRY_UID, "43")?]);
+    let restored = platform_client(client, "control", "workload", "cluster-a")?
         .ensure_previous_writer_checkpoint(TRANSITION_B, "executor-b")
         .await?;
     assert_eq!(restored.value, compacted);
@@ -2178,11 +2427,11 @@ async fn writer_checkpoint_backfill_rejects_registry_races_without_writes()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let registry = qualified_upgrade_fixture()?;
     let (client, calls) = wire(vec![
-        object("reakt-registry-workload", &registry, REGISTRY_UID, "42"),
-        object("reakt-registry-workload", &registry, REGISTRY_UID, "43"),
+        registry_object(&registry, REGISTRY_UID, "42")?,
+        registry_object(&registry, REGISTRY_UID, "43")?,
     ]);
     assert!(
-        PlatformClient::new(client, "control", "workload", "cluster-a")?
+        platform_client(client, "control", "workload", "cluster-a")?
             .ensure_previous_writer_checkpoint(TRANSITION_B, "executor-b")
             .await
             .is_err()
@@ -2208,13 +2457,8 @@ async fn writer_checkpoint_backfill_rejects_registry_races_without_writes()
 async fn writer_checkpoint_substitution_never_overwrites_recorded_authority()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let registry = qualified_upgrade_fixture()?;
-    let (client, _) = stateful_wire(vec![object(
-        "reakt-registry-workload",
-        &registry,
-        REGISTRY_UID,
-        "42",
-    )]);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let (client, _) = stateful_wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
+    let platform = platform_client(client, "control", "workload", "cluster-a")?;
     let captured = platform
         .ensure_previous_writer_checkpoint(TRANSITION_B, "executor-b")
         .await?;
@@ -2252,14 +2496,9 @@ async fn writer_checkpoint_substitution_never_overwrites_recorded_authority()
             }
             _ => return Err("unknown fixture alteration".into()),
         }
-        let (client, calls) = wire(vec![object(
-            "reakt-registry-workload",
-            &changed,
-            REGISTRY_UID,
-            "43",
-        )]);
+        let (client, calls) = wire(vec![registry_object(&changed, REGISTRY_UID, "43")?]);
         assert!(
-            PlatformClient::new(client, "control", "workload", "cluster-a")?
+            platform_client(client, "control", "workload", "cluster-a")?
                 .ensure_previous_writer_checkpoint(TRANSITION_B, "executor-b")
                 .await
                 .is_err(),
@@ -2281,14 +2520,9 @@ async fn writer_checkpoint_backfill_rejects_unapproved_capability_commitment()
         .and_then(|stored| stored.runtime_binding.as_mut())
         .ok_or("binding missing")?
         .capability_digest = digest(&"unapproved-capabilities")?;
-    let (client, calls) = wire(vec![object(
-        "reakt-registry-workload",
-        &registry,
-        REGISTRY_UID,
-        "42",
-    )]);
+    let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
     assert!(
-        PlatformClient::new(client, "control", "workload", "cluster-a")?
+        platform_client(client, "control", "workload", "cluster-a")?
             .ensure_previous_writer_checkpoint(TRANSITION_B, "executor-b")
             .await
             .is_err()
@@ -2300,14 +2534,13 @@ async fn writer_checkpoint_backfill_rejects_unapproved_capability_commitment()
 #[tokio::test]
 async fn recreated_registry_cannot_resume_copied_coordination_state()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let (registry, _, _, _, _) = staged_initial_fixture();
-    let (client, calls) = wire(vec![object(
-        "reakt-registry-workload",
+    let (registry, _, _, _, _) = staged_initial_fixture()?;
+    let (client, calls) = wire(vec![registry_object(
         &registry,
         "22222222-2222-4222-8222-222222222222",
         "42",
-    )]);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    )?]);
+    let platform = platform_client(client, "control", "workload", "cluster-a")?;
     assert!(platform.load_registry().await.is_err());
     let recorded = calls.lock().map_err(|_| "wire calls lock poisoned")?;
     assert_eq!(recorded.len(), 1);
@@ -2332,19 +2565,14 @@ fn wire_fixture_identities_match_the_production_allocator()
 #[tokio::test]
 async fn exhausted_allocator_rejects_reservation_without_writes()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let (mut registry, _, _, _, _) = staged_initial_fixture();
+    let (mut registry, _, _, _, _) = staged_initial_fixture()?;
     let mut request = registry.transition(TRANSITION_A)?.plan.request.clone();
     registry.next_sequence = u64::MAX;
     registry.claims.clear();
     registry.transitions.clear();
     request.registry.next_sequence = u64::MAX;
-    let (client, calls) = wire(vec![object(
-        "reakt-registry-workload",
-        &registry,
-        REGISTRY_UID,
-        "42",
-    )]);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
+    let platform = platform_client(client, "control", "workload", "cluster-a")?;
     let error = platform
         .reserve_transition(&request, "executor-a")
         .await
@@ -2362,7 +2590,7 @@ async fn exhausted_allocator_rejects_reservation_without_writes()
 #[tokio::test]
 async fn registry_authority_rejects_wrong_incarnation_scope_and_deletion()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let (registry, _, _, _, _) = staged_initial_fixture();
+    let (registry, _, _, _, _) = staged_initial_fixture()?;
     for corruption in [
         "registryUid",
         "controlNamespace",
@@ -2382,15 +2610,10 @@ async fn registry_authority_rejects_wrong_incarnation_scope_and_deletion()
             authority["data"]["state.json"] = json!(serde_json::to_string(&state)?);
         }
         let (client, calls) = wire_with_authority(
-            vec![object(
-                "reakt-registry-workload",
-                &registry,
-                REGISTRY_UID,
-                "42",
-            )],
+            vec![registry_object(&registry, REGISTRY_UID, "42")?],
             authority,
         );
-        let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+        let platform = platform_client(client, "control", "workload", "cluster-a")?;
         assert!(platform.load_registry().await.is_err(), "{corruption}");
         let recorded = calls.lock().map_err(|_| "wire calls lock poisoned")?;
         assert_eq!(recorded.len(), 2);
@@ -2407,18 +2630,18 @@ async fn registry_authority_rejects_wrong_incarnation_scope_and_deletion()
 #[tokio::test]
 async fn competing_reservation_cannot_overwrite_the_winning_allocation()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let (winner, _, policy, _, _) = staged_initial_fixture();
+    let (winner, _, policy, _, _) = staged_initial_fixture()?;
     let request = winner.transition(TRANSITION_A)?.plan.request.clone();
     let mut initial = winner.clone();
     initial.next_sequence = 1;
     initial.claims.clear();
     initial.transitions.clear();
     let (client, calls) = wire(vec![
-        object("reakt-registry-workload", &initial, REGISTRY_UID, "42"),
+        registry_object(&initial, REGISTRY_UID, "42")?,
         object("policy", &policy, "policy-uid", "40"),
-        object("reakt-registry-workload", &winner, REGISTRY_UID, "43"),
+        registry_object(&winner, REGISTRY_UID, "43")?,
     ]);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let platform = platform_client(client, "control", "workload", "cluster-a")?;
     let error = platform
         .reserve_transition(&request, "executor-b")
         .await
@@ -2436,7 +2659,7 @@ async fn competing_reservation_cannot_overwrite_the_winning_allocation()
 #[tokio::test]
 async fn another_domain_uses_the_registry_counter_after_domain_entry_removal()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let (mut registry, _, _, _, _) = staged_initial_fixture();
+    let (mut registry, _, _, _, _) = staged_initial_fixture()?;
     let mut request = registry.transition(TRANSITION_A)?.plan.request.clone();
     registry.histories.remove("example");
     let history = deploy::GenerationHistory {
@@ -2466,12 +2689,12 @@ async fn another_domain_uses_the_registry_counter_after_domain_entry_removal()
         generation_history: history,
     };
     let (client, calls) = wire(vec![
-        object("reakt-registry-workload", &registry, REGISTRY_UID, "42"),
+        registry_object(&registry, REGISTRY_UID, "42")?,
         object("policy", &policy, "policy-uid", "40"),
-        object("reakt-registry-workload", &registry, REGISTRY_UID, "42"),
+        registry_object(&registry, REGISTRY_UID, "42")?,
         json!("echo-put"),
     ]);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let platform = platform_client(client, "control", "workload", "cluster-a")?;
     let reserved = platform.reserve_transition(&request, "executor-b").await?;
     assert_eq!(reserved.value.next_sequence, 3);
     assert_eq!(
@@ -2508,13 +2731,8 @@ async fn active_writer_backfill_survives_historical_plan_removal()
         &registry.transition(TRANSITION_A)?.plan.request.next,
         &registry.claims,
     )?;
-    let (client, calls) = stateful_wire(vec![object(
-        "reakt-registry-workload",
-        &registry,
-        REGISTRY_UID,
-        "42",
-    )]);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let (client, calls) = stateful_wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
+    let platform = platform_client(client, "control", "workload", "cluster-a")?;
     let captured = platform.ensure_active_writer_checkpoint("example").await?;
     let checkpoint = captured
         .value
@@ -2544,13 +2762,8 @@ async fn active_writer_backfill_survives_historical_plan_removal()
     }
     let mut compacted = captured.value;
     compacted.transitions.clear();
-    let (client, calls) = wire(vec![object(
-        "reakt-registry-workload",
-        &compacted,
-        REGISTRY_UID,
-        "43",
-    )]);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let (client, calls) = wire(vec![registry_object(&compacted, REGISTRY_UID, "43")?]);
+    let platform = platform_client(client, "control", "workload", "cluster-a")?;
     let retained = platform.ensure_active_writer_checkpoint("example").await?;
     assert_eq!(
         retained.value.active_writer_checkpoints.get("example"),
@@ -2567,13 +2780,8 @@ async fn with_active_checkpoint(
 ) -> std::result::Result<NamespaceRegistry, Box<dyn std::error::Error>> {
     let mut committed = registry.clone();
     committed.transitions.remove(TRANSITION_B);
-    let (client, _) = stateful_wire(vec![object(
-        "reakt-registry-workload",
-        &committed,
-        REGISTRY_UID,
-        "42",
-    )]);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let (client, _) = stateful_wire(vec![registry_object(&committed, REGISTRY_UID, "42")?]);
+    let platform = platform_client(client, "control", "workload", "cluster-a")?;
     registry.active_writer_checkpoints = platform
         .ensure_active_writer_checkpoint("example")
         .await?
@@ -2586,13 +2794,8 @@ async fn with_active_checkpoint(
 async fn active_writer_backfill_rejects_pending_claim_changes_and_registry_races()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let registry = qualified_upgrade_fixture()?;
-    let (client, calls) = wire(vec![object(
-        "reakt-registry-workload",
-        &registry,
-        REGISTRY_UID,
-        "42",
-    )]);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
+    let platform = platform_client(client, "control", "workload", "cluster-a")?;
     let error = platform
         .ensure_active_writer_checkpoint("example")
         .await
@@ -2612,10 +2815,10 @@ async fn active_writer_backfill_rejects_pending_claim_changes_and_registry_races
     let mut committed = registry;
     committed.transitions.remove(TRANSITION_B);
     let (client, calls) = wire(vec![
-        object("reakt-registry-workload", &committed, REGISTRY_UID, "42"),
-        object("reakt-registry-workload", &committed, REGISTRY_UID, "43"),
+        registry_object(&committed, REGISTRY_UID, "42")?,
+        registry_object(&committed, REGISTRY_UID, "43")?,
     ]);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let platform = platform_client(client, "control", "workload", "cluster-a")?;
     let error = platform
         .ensure_active_writer_checkpoint("example")
         .await
@@ -2638,14 +2841,9 @@ async fn active_writer_backfill_rejects_pending_claim_changes_and_registry_races
 #[tokio::test]
 async fn unqualified_initial_writer_rejects_before_activation_mutations()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let (registry, _, _, _, _) = staged_initial_fixture();
-    let (client, calls) = wire(vec![object(
-        "reakt-registry-workload",
-        &registry,
-        REGISTRY_UID,
-        "42",
-    )]);
-    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    let (registry, _, _, _, _) = staged_initial_fixture()?;
+    let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
+    let platform = platform_client(client, "control", "workload", "cluster-a")?;
     let error = platform
         .activate_initial(TRANSITION_A, "executor-a")
         .await

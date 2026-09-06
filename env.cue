@@ -10,6 +10,8 @@ tasks: {
 		{command: "cargo", args: ["clippy", "--locked", "-p", "coordination", "--all-targets", "--", "-D", "warnings"]},
 		{command: "cargo", args: ["check", "--locked", "-p", "coordination", "--no-default-features"]},
 	]
+	registryTest: {command: "cargo", args: ["test", "--locked", "-p", "deploy", "-p", "platform", "-p", "cli", "--features", "platform/test-support"]}
+	registryCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "deploy", "-p", "platform", "-p", "cli", "--features", "platform/test-support", "--all-targets", "--", "-D", "warnings"]}
 	generate: [
 		{command: "cargo", args: ["run", "--locked", "-p", "controller-api", "--bin", "generate-controller-api"]},
 		{command: "cargo", args: ["run", "--locked", "-p", "renderer-abi", "--bin", "generate", "--", "."]},

@@ -155,24 +155,12 @@ class LifecycleRunner:
         self.state("reakt-proxy-policy-" + self.domain, {"schemaVersion": "reakt.dev/platform/v1", "domainId": self.domain, "clusterBinding": self.binding,
                     **self.profile, "environmentQualificationDigest": digest(qualification), "nodeImageDigest": NODE.split("@")[1], "certificateLifetimeSeconds": 86400})
         registry_name = "reakt-registry-" + self.workload
-        registry = self.get("configmap", registry_name, self.control)
-        state = json.loads(registry["data"]["state.json"]) if registry else {"schemaVersion": "reakt.dev/namespace-registry/v2", "clusterBinding": self.binding,
-                 "workloadNamespace": self.workload, "nextSequence": "1", "activeWriterCheckpoints": {}, "claims": [], "transitions": {}, "histories": {}}
-        if state["clusterBinding"] != self.binding or state["workloadNamespace"] != self.workload or self.domain in state["histories"]:
-            raise RuntimeError("test bootstrap refuses to replace existing domain history or scope")
-        state["histories"][self.domain] = {"domainId": self.domain, "clusterBinding": self.binding, "revision": "bootstrap", "activeAllocation": None}
-        if registry and state.get("registryUid") != registry["metadata"]["uid"]:
-            raise RuntimeError("test bootstrap refuses a registry with an unbound incarnation")
-        if not registry:
-            registry = json.loads(self.k("create", "-f", "-", "-o", "json", data=json.dumps({
-                "apiVersion": "v1", "kind": "ConfigMap",
-                "metadata": {"name": registry_name, "namespace": self.control},
-            })).stdout)
-            state["registryUid"] = registry["metadata"]["uid"]
-        if registry:
-            registry["data"] = registry.get("data", {})
-            registry["data"]["state.json"] = json.dumps(state, sort_keys=True, separators=(",", ":"))
-            self.k("replace", "-f", "-", data=json.dumps(registry))
+        if self.get("configmap", registry_name, self.control):
+            raise RuntimeError("test bootstrap refuses an existing registry")
+        registry = json.loads(self.k("create", "-f", "-", "-o", "json", data=json.dumps({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": registry_name, "namespace": self.control},
+        })).stdout)
         self.apply({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "reakt-platform"}})
         authority_name = "reakt-registry-authority." + self.control + "." + self.workload
         if self.get("configmap", authority_name, "reakt-platform"):
@@ -181,11 +169,19 @@ class LifecycleRunner:
             "apiVersion": "v1", "kind": "ConfigMap",
             "metadata": {"name": authority_name, "namespace": "reakt-platform"},
             "data": {"state.json": json.dumps({
-                "schemaVersion": "reakt.dev/registry-authority/v1", "registryUid": state["registryUid"],
+                "schemaVersion": "reakt.dev/registry-authority/v1", "registryUid": registry["metadata"]["uid"],
                 "clusterBinding": self.binding, "controlNamespace": self.control,
                 "workloadNamespace": self.workload,
             }, sort_keys=True, separators=(",", ":"))},
         }))
+        path = self.output / "bootstrap.json"
+        path.write_text(json.dumps({"artifact": str(self.candidates[0]), "transition": "bootstrap",
+                                    "action": "bootstrap", "target": self.target,
+                                    "registryUid": registry["metadata"]["uid"],
+                                    "registryResourceVersion": registry["metadata"]["resourceVersion"]}))
+        result = self.cargo("candidate_transition_step", env=self.driver_environment(path, self.admin))
+        if result.returncode:
+            raise RuntimeError("production registry bootstrap failed: " + result.stdout[-2000:] + result.stderr[-1000:])
         for account in ["test-deployer", "test-issuer"]:
             self.apply({"apiVersion": "v1", "kind": "ServiceAccount", "metadata": {"name": account, "namespace": self.control}, "automountServiceAccountToken": False})
         secret = self.apply({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "deployment-binding", "namespace": self.control}, "immutable": True, "type": "Opaque"})
@@ -228,12 +224,29 @@ class LifecycleRunner:
                     "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": name},
                     "subjects": [{"kind": "ServiceAccount", "name": "test-deployer", "namespace": self.control}]})
 
+    def driver_environment(self, path, kubeconfig):
+        environment = dict(os.environ, KUBECONFIG=str(kubeconfig), REAKT_TEST_STEP=str(path),
+                           REAKT_INVENTORY_DATABASE=str(self.output / "metadata.db"))
+        environment.pop("REAKT_INVENTORY_TOKEN", None)
+        return environment
+
+    def claims(self):
+        path = self.output / "claims.json"
+        path.write_text(json.dumps({"artifact": str(self.candidates[0]), "transition": "claims-query",
+                                    "action": "claims", "target": self.target}))
+        result = self.cargo("candidate_transition_step", env=self.driver_environment(path, self.issuer))
+        records = [json.loads(line.split("=", 1)[1]) for line in result.stdout.splitlines()
+                   if line.startswith("REAKT_TEST_CLAIMS=")]
+        if result.returncode or len(records) != 1:
+            raise RuntimeError("failed to read authenticated claim snapshot")
+        return records[0]
+
     def allocation(self, candidate, alias):
         if alias not in self.allocations:
             path = self.output / "allocation.json"
             path.write_text(json.dumps({"artifact": str(candidate), "transition": "allocation-query",
                                         "action": "allocation", "target": self.target}))
-            environment = dict(os.environ, KUBECONFIG=str(self.issuer), REAKT_TEST_STEP=str(path))
+            environment = self.driver_environment(path, self.issuer)
             result = self.cargo("candidate_transition_step", env=environment)
             records = [json.loads(line.split("=", 1)[1]) for line in result.stdout.splitlines()
                        if line.startswith("REAKT_TEST_ALLOCATION=")]
@@ -246,7 +259,7 @@ class LifecycleRunner:
         path = self.output / "step.json"
         path.write_text(json.dumps({"artifact": str(candidate), "transition": self.allocation(candidate, transition)["transition"], "action": action, "target": self.target,
                                    "ownershipIntents": ["adopt-retained"] if self.adopted_uid and transition == "install" else []}))
-        environment = dict(os.environ, KUBECONFIG=str(self.issuer), REAKT_TEST_STEP=str(path))
+        environment = self.driver_environment(path, self.issuer)
         deadline = time.monotonic() + timeout
         while True:
             result = self.cargo("candidate_transition_step", env=environment)
@@ -363,8 +376,7 @@ class LifecycleRunner:
         preserved = self.get("service", "obsolete-service")
         if not preserved or preserved["metadata"]["uid"] != new_uid or preserved["metadata"].get("deletionTimestamp"):
             raise RuntimeError("cleanup mutated or deleted the replacement object")
-        registry = json.loads(self.get("configmap", "reakt-registry-" + self.workload, self.control)["data"]["state.json"])
-        claims = [c for c in registry["claims"] if c["identity"]["name"] == "obsolete-service"]
+        claims = [c for c in self.claims() if c["identity"]["name"] == "obsolete-service"]
         if len(claims) != 1 or claims[0]["uid"] != old_uid:
             raise RuntimeError("cleanup changed or released the protected original UID claim")
         self.results.append({"check": "replacement-uid-cleanup-rejected-and-claim-retained", "passed": True,
@@ -429,8 +441,7 @@ class LifecycleRunner:
             held = self.get("service", "obsolete-service")
             if not held or held["metadata"]["uid"] != obsolete_uid or not held["metadata"].get("deletionTimestamp") or held["metadata"].get("finalizers") != ["reakt.test/hold-cleanup"]:
                 raise RuntimeError("cleanup bypassed the real finalizer or replaced the target")
-            registry = json.loads(self.get("configmap", "reakt-registry-" + self.workload, self.control)["data"]["state.json"])
-            if not any(c["identity"]["name"] == "obsolete-service" for c in registry["claims"]):
+            if not any(c["identity"]["name"] == "obsolete-service" for c in self.claims()):
                 raise RuntimeError("cleanup released claim before finalizer completion")
             self.k("patch", "service", "obsolete-service", "-n", self.workload, "--type=merge", "-p",
                    json.dumps({"metadata": {"finalizers": []}}))

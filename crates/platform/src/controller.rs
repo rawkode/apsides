@@ -1,4 +1,4 @@
-use crate::store::{decode_state, replace_state};
+use crate::store::decode_state;
 use crate::tls_integrity::{TlsSecretExpectation, validate_tls_secret};
 use crate::{
     ActivationState, ActivationStatus, ApprovedClaim, NamespaceRegistry, PlatformClient, Result,
@@ -324,21 +324,6 @@ impl PlatformClient {
             return Err(invalid("platform rollout key invalid"));
         }
         Ok(id.map(str::to_owned))
-    }
-
-    pub(crate) async fn persist_registry(
-        &self,
-        previous: &Versioned<NamespaceRegistry>,
-        next: &NamespaceRegistry,
-    ) -> Result<Versioned<NamespaceRegistry>> {
-        replace_state(
-            &self.client,
-            &self.control_namespace,
-            &format!("reakt-registry-{}", self.workload_namespace),
-            previous,
-            next,
-        )
-        .await
     }
 
     pub(crate) async fn stage_object(

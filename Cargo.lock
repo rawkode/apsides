@@ -494,6 +494,7 @@ name = "cli"
 version = "0.1.0"
 dependencies = [
  "compiler-core",
+ "coordination",
  "deploy",
  "inventory 0.1.0",
  "kube",
@@ -3356,7 +3357,9 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 name = "platform"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "compiler-core",
+ "coordination",
  "deploy",
  "http 1.5.0",
  "http-body-util",

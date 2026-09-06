@@ -249,7 +249,8 @@ async fn connect(root: &Path, expected_digest: Option<&str>) -> Result<Deploymen
         &domain.control_namespace,
         &domain.namespace,
         &domain.cluster_binding,
-    )?;
+    )?
+    .with_claim_store(crate::inventory_connection::connect_claims().await?);
     Ok(DeploymentContext {
         platform,
         verified,

@@ -5,7 +5,7 @@ use kube::{Client, Config, config::AuthInfo};
 use platform::{PlatformClient, TestClusterTarget};
 use release::TestStagingScope;
 use serde_json::json;
-use std::{env, fs, path::Path};
+use std::{env, fs, path::Path, sync::Arc};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -43,14 +43,41 @@ async fn transition_step() -> Result<()> {
     config.default_retry = false;
     let (_, plan, _) = release::read_release(Path::new(artifact))?;
     let domain = &plan.ir.domain;
+    let claim_store = claim_store().await?;
     let bootstrap = PlatformClient::new(
         Client::try_from(config.clone())?,
         &domain.control_namespace,
         &domain.namespace,
         &domain.cluster_binding,
-    )?;
+    )?
+    .with_claim_store(claim_store.clone());
     let trust = serde_json::from_value(bootstrap.load_trust_policy(&domain.id).await?.value)?;
     let candidate = release::verify_candidate(Path::new(artifact), &trust).await?;
+    let authorization = candidate.authorize_test_staging(TestStagingScope {
+        cluster_binding: domain.cluster_binding.clone(),
+        control_namespace: domain.control_namespace.clone(),
+        workload_namespace: domain.namespace.clone(),
+    })?;
+    let target: TestClusterTarget = serde_json::from_value(settings["target"].clone())?;
+    bootstrap
+        .verify_test_cluster_target(&authorization, &target)
+        .await?;
+    if action == "bootstrap" {
+        let registry_uid = settings["registryUid"]
+            .as_str()
+            .ok_or("registry UID missing")?;
+        let registry_resource_version = settings["registryResourceVersion"]
+            .as_str()
+            .ok_or("registry resourceVersion missing")?;
+        bootstrap
+            .bootstrap_registry(
+                registry_uid,
+                registry_resource_version,
+                std::slice::from_ref(&domain.id),
+            )
+            .await?;
+        return Ok(());
+    }
     let credential = bootstrap.approved_deployment_credential(&domain.id).await?;
     config.auth_info = AuthInfo {
         token: Some(credential.token),
@@ -62,16 +89,29 @@ async fn transition_step() -> Result<()> {
         &domain.control_namespace,
         &domain.namespace,
         &domain.cluster_binding,
-    )?;
-    let authorization = candidate.authorize_test_staging(TestStagingScope {
-        cluster_binding: domain.cluster_binding.clone(),
-        control_namespace: domain.control_namespace.clone(),
-        workload_namespace: domain.namespace.clone(),
-    })?;
-    let target: TestClusterTarget = serde_json::from_value(settings["target"].clone())?;
-    platform
-        .verify_test_cluster_target(&authorization, &target)
-        .await?;
+    )?
+    .with_claim_store(claim_store);
+    run_action(
+        action,
+        &settings,
+        &platform,
+        &authorization,
+        &target,
+        transition,
+        executor,
+    )
+    .await
+}
+
+async fn run_action(
+    action: &str,
+    settings: &serde_json::Value,
+    platform: &PlatformClient,
+    authorization: &release::TestStagingAuthorization,
+    target: &TestClusterTarget,
+    transition: &str,
+    executor: &str,
+) -> Result<()> {
     if action == "allocation" {
         let registry = platform.load_registry().await?;
         let names = deploy::allocation_names(&registry.uid, registry.value.next_sequence)?;
@@ -79,6 +119,11 @@ async fn transition_step() -> Result<()> {
             "REAKT_TEST_ALLOCATION={}",
             json!({"generation":names.generation_id,"transition":names.transition_id})
         );
+        return Ok(());
+    }
+    if action == "claims" {
+        let registry = platform.load_registry().await?;
+        println!("REAKT_TEST_CLAIMS={}", json!(registry.value.claims));
         return Ok(());
     }
     match action {
@@ -89,11 +134,11 @@ async fn transition_step() -> Result<()> {
                     .cloned()
                     .unwrap_or_else(|| json!([])),
             )?;
-            reserve(&platform, &authorization, transition, executor, &names).await?;
+            reserve(platform, authorization, transition, executor, &names).await?;
         }
         "stage" => {
             platform
-                .stage_test_candidate(transition, executor, &authorization, &target)
+                .stage_test_candidate(transition, executor, authorization, target)
                 .await?;
         }
         "quiesce" => {
@@ -124,6 +169,19 @@ async fn transition_step() -> Result<()> {
         json!({"candidateIntegrityVerified":true,"releaseVerified":false,"transition":transition,"phase":state.record.phase,"generation":state.plan.request.next.generation_id,"registryResourceVersion":registry.resource_version})
     );
     Ok(())
+}
+
+async fn claim_store() -> Result<Arc<dyn coordination::ClaimStore>> {
+    let database = env::var("REAKT_INVENTORY_DATABASE")?;
+    let path = Path::new(&database);
+    if !path.is_absolute() || env::var_os("REAKT_INVENTORY_TOKEN").is_some() {
+        return Err(
+            "disposable lifecycle claim store requires an absolute local database path".into(),
+        );
+    }
+    Ok(Arc::new(
+        coordination::LibsqlCoordination::open_local(path).await?,
+    ))
 }
 
 async fn reserve(

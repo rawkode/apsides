@@ -70,6 +70,25 @@ pub(crate) async fn replace_state<T: Serialize + DeserializeOwned>(
     previous: &Versioned<T>,
     next: &T,
 ) -> Result<Versioned<T>> {
+    replace_state_at(
+        client,
+        namespace,
+        name,
+        &previous.uid,
+        &previous.resource_version,
+        next,
+    )
+    .await
+}
+
+pub(crate) async fn replace_state_at<T: Serialize + DeserializeOwned>(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    expected_uid: &str,
+    expected_revision: &str,
+    next: &T,
+) -> Result<Versioned<T>> {
     let encoded = canonical_bytes(next)?;
     if encoded.len() > MAX_STATE_BYTES {
         return Err(invalid(
@@ -78,8 +97,8 @@ pub(crate) async fn replace_state<T: Serialize + DeserializeOwned>(
     }
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
     let mut object = api.get(name).await?;
-    if object.metadata.uid.as_deref() != Some(&previous.uid)
-        || object.metadata.resource_version.as_deref() != Some(&previous.resource_version)
+    if object.metadata.uid.as_deref() != Some(expected_uid)
+        || object.metadata.resource_version.as_deref() != Some(expected_revision)
         || object.metadata.deletion_timestamp.is_some()
     {
         return Err(invalid(
@@ -93,7 +112,7 @@ pub(crate) async fn replace_state<T: Serialize + DeserializeOwned>(
     // Preserve all platform metadata; UID and resourceVersion remain attached to
     // the PUT. Concurrent writes are rejected by the API server's atomic CAS.
     let updated = api.replace(name, &PostParams::default(), &object).await?;
-    if updated.metadata.uid.as_deref() != Some(&previous.uid) {
+    if updated.metadata.uid.as_deref() != Some(expected_uid) {
         return Err(invalid("replacement changed control-object UID"));
     }
     decode_state(&updated)
@@ -101,6 +120,7 @@ pub(crate) async fn replace_state<T: Serialize + DeserializeOwned>(
 
 #[derive(Clone)]
 pub struct PlatformClient {
+    pub(crate) claim_store: Option<std::sync::Arc<dyn coordination::ClaimStore>>,
     pub(crate) client: Client,
     pub(crate) control_namespace: String,
     pub(crate) workload_namespace: String,
@@ -131,6 +151,7 @@ impl PlatformClient {
             ));
         }
         Ok(Self {
+            claim_store: None,
             client,
             control_namespace: control_namespace.into(),
             workload_namespace: workload_namespace.into(),
@@ -138,97 +159,11 @@ impl PlatformClient {
         })
     }
 
-    /// # Errors
-    /// Rejects unavailable, corrupt, oversized or differently scoped registry.
-    pub async fn load_registry(&self) -> Result<Versioned<NamespaceRegistry>> {
-        let mut registry: Versioned<NamespaceRegistry> = read_state(
-            &self.client,
-            &self.control_namespace,
-            &format!("reakt-registry-{}", self.workload_namespace),
-        )
-        .await?;
-        if registry.value.schema_version != crate::REGISTRY_SCHEMA_VERSION
-            || registry.value.registry_uid != registry.uid
-            || registry.value.next_sequence == 0
-            || registry.value.cluster_binding != self.cluster_binding
-            || registry.value.workload_namespace != self.workload_namespace
-        {
-            return Err(invalid("protected registry scope mismatch"));
-        }
-        // This anchor is independently provisioned and is never writable by the deployer.
-        let authority: Versioned<crate::RegistryAuthority> = read_state(
-            &self.client,
-            crate::REGISTRY_AUTHORITY_NAMESPACE,
-            &crate::registry_authority_name(&self.control_namespace, &self.workload_namespace)?,
-        )
-        .await?;
-        if authority.value.schema_version != crate::REGISTRY_AUTHORITY_SCHEMA_VERSION
-            || authority.value.registry_uid != registry.uid
-            || authority.value.control_namespace != self.control_namespace
-            || authority.value.cluster_binding != self.cluster_binding
-            || authority.value.workload_namespace != self.workload_namespace
-        {
-            return Err(invalid(
-                "registry incarnation authority mismatch; explicit platform recovery required",
-            ));
-        }
-        // UUID validation is independent of the exhausted-counter sentinel.
-        deploy::allocation_names(&registry.uid, 1)?;
-        for (domain_id, history) in &registry.value.histories {
-            if &history.domain_id != domain_id
-                || history.cluster_binding != registry.value.cluster_binding
-            {
-                return Err(invalid("active allocation history scope mismatch"));
-            }
-            if let Some(allocation) = &history.active_allocation {
-                deploy::validate_allocation(allocation)?;
-                if allocation.registry_uid != registry.uid
-                    || allocation.sequence >= registry.value.next_sequence
-                {
-                    return Err(invalid(
-                        "active allocation is outside protected registry sequence",
-                    ));
-                }
-            }
-        }
-        for domain in registry.value.active_writer_checkpoints.keys() {
-            crate::writer_checkpoint::active(&registry.value, domain, &self.control_namespace)?;
-        }
-        let mut sequences = std::collections::BTreeSet::new();
-        for (transition_id, stored) in &registry.value.transitions {
-            let allocation = &stored.plan.generation_reservation;
-            deploy::validate_allocation(allocation)?;
-            if allocation.registry_uid != registry.uid
-                || allocation.sequence >= registry.value.next_sequence
-                || !sequences.insert(allocation.sequence)
-                || transition_id != &allocation.transition_id
-                || stored.plan.request.registry.registry_uid != registry.uid
-                || stored.plan.request.registry.next_sequence != allocation.sequence
-            {
-                return Err(invalid(
-                    "stored reservation is outside protected registry allocation authority",
-                ));
-            }
-        }
-        // Older stage records kept a digest of generated private TLS material.
-        // UID-bound immutable Secrets no longer need that value. Do not carry it
-        // into any subsequent registry write; leave unrelated commitments intact.
-        for stored in registry.value.transitions.values_mut() {
-            let key = format!(
-                "v1/Secret/{}/{}-tls",
-                stored
-                    .plan
-                    .request
-                    .next
-                    .compiled
-                    .ir
-                    .domain
-                    .control_namespace,
-                stored.plan.generation_reservation.service_account_name,
-            );
-            stored.staged_content_digests.remove(&key);
-        }
-        Ok(registry)
+    /// Attach the immutable claim store used only by registry operations.
+    #[must_use]
+    pub fn with_claim_store(mut self, store: std::sync::Arc<dyn coordination::ClaimStore>) -> Self {
+        self.claim_store = Some(store);
+        self
     }
 
     /// Capture the currently committed writer authority for pre-checkpoint v4 state.
@@ -338,14 +273,7 @@ impl PlatformClient {
             .get_mut(transition)
             .ok_or_else(|| invalid("transition disappeared"))?
             .previous_writer_checkpoint = Some(checkpoint);
-        let written = replace_state(
-            &self.client,
-            &self.control_namespace,
-            &format!("reakt-registry-{}", self.workload_namespace),
-            &current,
-            &next,
-        )
-        .await?;
+        let written = self.persist_registry(&current, &next).await?;
         let reloaded = self.load_registry().await?;
         if reloaded.uid != written.uid || reloaded.resource_version != written.resource_version {
             return Err(invalid(
@@ -513,14 +441,7 @@ impl PlatformClient {
         stored.previous_writer_checkpoint = previous_writer_checkpoint;
         next.transitions
             .insert(request.transition_id.clone(), stored);
-        replace_state(
-            &self.client,
-            &self.control_namespace,
-            &format!("reakt-registry-{}", self.workload_namespace),
-            &current,
-            &next,
-        )
-        .await
+        self.persist_registry(&current, &next).await
     }
 
     /// Mint a bounded token for a preprovisioned deployment `ServiceAccount`,

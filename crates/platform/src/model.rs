@@ -138,18 +138,33 @@ impl StoredTransition {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Hydrated registry state. Its claims cannot be serialized into a control object.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NamespaceRegistry {
     pub registry_uid: String,
-    #[serde(with = "deploy::allocation_counter")]
     pub next_sequence: u64,
     pub schema_version: String,
     pub cluster_binding: String,
     pub workload_namespace: String,
     pub claims: Vec<ProtectedClaim>,
     pub histories: BTreeMap<String, GenerationHistory>,
-    /// Missing only on pre-checkpoint v4 registries; requires authenticated backfill.
+    pub active_writer_checkpoints: BTreeMap<String, crate::WriterCheckpoint>,
+    pub transitions: BTreeMap<String, StoredTransition>,
+    pub(crate) captured_claim_scope: coordination::ClaimScope,
+}
+
+/// Protected wire format. Only this DTO may be serialized into registry state.json.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NamespaceRegistryState {
+    pub registry_uid: String,
+    #[serde(with = "deploy::allocation_counter")]
+    pub next_sequence: u64,
+    pub schema_version: String,
+    pub cluster_binding: String,
+    pub workload_namespace: String,
+    pub claim_snapshot: coordination::ClaimRef,
+    pub histories: BTreeMap<String, GenerationHistory>,
     #[serde(default)]
     pub active_writer_checkpoints: BTreeMap<String, crate::WriterCheckpoint>,
     pub transitions: BTreeMap<String, StoredTransition>,

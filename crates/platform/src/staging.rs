@@ -1,4 +1,3 @@
-use crate::store::replace_state;
 use crate::{NamespaceRegistry, PlatformClient, Result, Versioned, invalid};
 use compiler_core::Capability;
 use deploy::{Phase, plan_transition};
@@ -122,14 +121,7 @@ impl PlatformClient {
                 .ok_or_else(|| invalid("transition disappeared"))?
                 .staged_identity_uids
                 .insert(key, uid);
-            registry = replace_state(
-                &self.client,
-                &self.control_namespace,
-                &format!("reakt-registry-{}", self.workload_namespace),
-                &registry,
-                &next,
-            )
-            .await?;
+            registry = self.persist_registry(&registry, &next).await?;
         }
         Ok(registry)
     }

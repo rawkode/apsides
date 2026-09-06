@@ -68,7 +68,7 @@ Review schema v2 distinguishes known resource membership and deletion policy fro
 
 Active-checkpoint backfill requires undisturbed committed state and refuses an unfinished transition in the domain. It verifies the source, writes with UID/resourceVersion preconditions and reloads the captured revision. A present checkpoint is scope-validated and returned unchanged. Existing v4 pending transitions continue to use their transition-local predecessor checkpoint; no new authority is inferred from runtime observations. Unqualified new writers now reject before activation or old-writer shutdown mutations, so they cannot activate and then fail to produce a committed checkpoint.
 
-## Immutable claim storage boundary (library verified; integration pending)
+## Immutable claim storage boundary
 
 The claim-store prerequisite uses a separate typed `ClaimStore` trait with immutable `put_claims` and `read_claims` operations. A snapshot contains only its registry incarnation, cluster/control/workload scope and sorted resource-claim identities, states and UIDs. It has no mutable database head and no API for storing arbitrary manifests, source or desired values. The default implementation uses libSQL/Turso. A database row by itself grants no Kubernetes authority.
 
@@ -79,3 +79,15 @@ This library does not yet remove the planner's 1 MiB request limit, the embedded
 The `coordination` crate now implements this boundary. Snapshots are bounded to 32 MiB and 100,000 claims; strict decoding checks canonical encoding, scope, lifecycle identities and the domain-separated digest. The local backend uses durable libSQL transactions and verifies the committed row after insertion. Remote configuration accepts TLS primary endpoints with authentication supplied separately; remote durability and availability remain provider requirements, not established by local tests.
 
 `cuenv task coordinationTest` passed nine tests, including a snapshot larger than one MiB surviving a local database reopen, competing identical inserts, malformed/corrupt rows, scope mismatch, private diagnostic canaries and bounds. `cuenv task coordinationCheck` passed strict all-target Clippy and a build without the default backend. Independent source review found no blocking issues. These checks do not establish live PV attachment, Turso connectivity, registry integration or end-to-end upgrade behavior.
+
+## Registry snapshot integration (automated checks passed; live qualification pending)
+
+Registry schema v3 replaces the top-level claim vector with a required `claimSnapshot` reference. The hydrated registry is a separate, non-serializable type. Readers authenticate the Kubernetes UID, scope and independent authority anchor before fetching metadata, then independently verify the returned snapshot against the selected reference. A missing database row cannot mean an empty registry.
+
+Every registry mutation must publish and read-verify its candidate snapshot before the existing UID/resourceVersion-conditional Kubernetes update selects it. This applies even when only transition evidence changes. A database write failure prevents that update; a lost Kubernetes response requires reload. Unselected snapshots left by competing or interrupted deployers grant no authority.
+
+Fresh bootstrap requires an empty ConfigMap with its actual UID/resourceVersion and an independently provisioned matching authority anchor. It publishes an empty scoped snapshot before initializing the registry. Existing v2 registries require explicit administrative migration; ordinary load cannot silently upgrade them or synthesize an empty snapshot. The first integration does not implement that migration.
+
+The CLI uses `REAKT_INVENTORY_DATABASE` and `REAKT_INVENTORY_TOKEN` for both typed stores, with separate database tables. Runtime credentials and activation readers are unchanged by this integration. Stored transition plans still embed claim inputs, so moving the top-level vector alone does not complete bounded-state acceptance.
+
+`cuenv task registryTest` passed 112 tests with two explicitly skipped live-cluster tests. Coverage includes normal reservation, stale revisions, backend-provided corrupt snapshots, false publication references, admission-mutated responses, empty-registry bootstrap, existing lifecycle regressions and authenticated loads after real local libSQL reopen. `cuenv task registryCheck` passed strict all-target Clippy for deploy, platform and CLI with test support. Formatting and lifecycle harness parsing passed. Independent production, harness and test-diff reviews found no remaining source blockers. These checks do not establish live pod upgrade, persistent-volume attachment or Turso connectivity.

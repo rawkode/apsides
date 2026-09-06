@@ -1,4 +1,3 @@
-use crate::store::replace_state;
 use crate::{NamespaceRegistry, PlatformClient, Result, Versioned, invalid};
 #[cfg(test)]
 use compiler_core::Resource;
@@ -109,14 +108,7 @@ impl PlatformClient {
                 claim.uid = Some(uid);
             }
         }
-        replace_state(
-            &self.client,
-            &self.control_namespace,
-            &format!("reakt-registry-{}", self.workload_namespace),
-            &current,
-            &next,
-        )
-        .await
+        self.persist_registry(&current, &next).await
     }
 }
 
@@ -407,11 +399,37 @@ impl PlatformClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coordination::{ClaimRef, ClaimSnapshotV1, ClaimStore};
     use serde_json::json;
+
+    struct FixtureClaims(ClaimSnapshotV1);
+
+    #[async_trait::async_trait]
+    impl ClaimStore for FixtureClaims {
+        async fn put_claims(&self, snapshot: &ClaimSnapshotV1) -> coordination::Result<ClaimRef> {
+            if snapshot != &self.0 {
+                return Err(coordination::Error::Invalid("unexpected fixture write"));
+            }
+            snapshot.reference()
+        }
+
+        async fn read_claims(
+            &self,
+            reference: &ClaimRef,
+        ) -> coordination::Result<Option<ClaimSnapshotV1>> {
+            Ok((self.0.reference()? == *reference).then(|| self.0.clone()))
+        }
+    }
 
     fn cleanup_registry_fixture() -> crate::Versioned<NamespaceRegistry> {
         crate::Versioned {
             value: NamespaceRegistry {
+                captured_claim_scope: coordination::ClaimScope {
+                    registry_uid: "11111111-1111-4111-8111-111111111111".into(),
+                    cluster_binding: "cluster-a".into(),
+                    control_namespace: "control".into(),
+                    workload_namespace: "workload".into(),
+                },
                 active_writer_checkpoints: std::collections::BTreeMap::default(),
                 registry_uid: "11111111-1111-4111-8111-111111111111".into(),
                 next_sequence: 1,
@@ -439,6 +457,8 @@ mod tests {
             sync::{Arc, Mutex},
         };
         let registry = cleanup_registry_fixture();
+        let snapshot = registry.value.claim_snapshot()?;
+        let state = registry.value.state(&snapshot.reference()?)?;
         let ceiling: compiler_core::PermissionCeiling = serde_json::from_value(json!({"policyRef":"platform","domainId":"example","clusterBinding":"cluster-a","workloadNamespace":"workload","controlNamespace":"control","capabilities":[],"acceptedEnforcementGaps":[],"acceptedIndirectRisks":[]})).unwrap();
         let policy = crate::Versioned {
             value: crate::PolicyState {
@@ -451,7 +471,7 @@ mod tests {
         };
         let live: DynamicObject = serde_json::from_value(json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"settings","namespace":"workload","uid":"target-uid","resourceVersion":"42","finalizers":["example.test/hold"]}})).unwrap();
         let replies = Arc::new(Mutex::new(VecDeque::from([
-            json!({"metadata":{"uid":registry.uid,"resourceVersion":registry.resource_version},"data":{"state.json":serde_json::to_string(&registry.value).unwrap()}}),
+            json!({"metadata":{"uid":registry.uid,"resourceVersion":registry.resource_version},"data":{"state.json":serde_json::to_string(&state)?}}),
             json!({"metadata":{"uid":"authority-uid","resourceVersion":"1"},"data":{"state.json":json!({
                 "schemaVersion":crate::REGISTRY_AUTHORITY_SCHEMA_VERSION,
                 "registryUid":registry.uid,"clusterBinding":"cluster-a",
@@ -495,8 +515,8 @@ mod tests {
         };
         assert!(metadata_api(&client, &identity, "apps/v1", "ConfigMap").is_err());
         assert!(metadata_api(&client, &identity, "v1", "Secret").is_err());
-        let platform =
-            PlatformClient::new(client.clone(), "control", "workload", "cluster-a").unwrap();
+        let platform = PlatformClient::new(client.clone(), "control", "workload", "cluster-a")?
+            .with_claim_store(Arc::new(FixtureClaims(snapshot)));
         let ar = ApiResource::from_gvk_with_plural(
             &GroupVersionKind::gvk("", "v1", "ConfigMap"),
             "configmaps",
