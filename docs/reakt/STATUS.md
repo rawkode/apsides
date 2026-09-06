@@ -4,6 +4,18 @@ Reakt implements specification 0.2 in the workspace crates and the `@reakt/kuber
 
 ## Current integration checkpoint
 
+Reactor evidence packaging now stages only successful runs into a flat release
+evidence directory, fixes all receipt references to the release namespace, and
+binds the coverage fragment to the production IR. Raw controller logs and cluster
+diagnostics remain local; only a typed, explicitly scoped synthetic-canary scan
+summary is published. The release verifier now requires the exact runner source
+as a signed file and rejects missing or substituted source identities. Independent
+source review found no blockers. Seven packaging tests and 30 release tests pass
+(four opt-in tests skipped), along with strict release Clippy and docs build/link
+checks. Logs are `work/reactor-packaging-*.log`. A fresh cluster run,
+complete coverage assembly and actual reactor-consumer qualification are still
+required before this change establishes release acceptance.
+
 Declared-input isolation now has a real production-subject qualification from
 commit `026ad98`. The normal CLI baseline before and after the probes matched the
 previously measured production IR and authoring compiler closure. All seven

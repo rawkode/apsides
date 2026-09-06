@@ -124,6 +124,7 @@ pub(crate) fn validate_record(
             return reject("runner evidence has invalid identity digests");
         }
     }
+    validate_runner_source(root, release, &evidence.runner_identity.source_sha256)?;
     if !evidence
         .runner_identity
         .node_image
@@ -176,6 +177,18 @@ pub(crate) fn validate_record(
     })?;
     record(result, release)?;
     crate::validate_assertions(key, case, scenario, &result.assertions)
+}
+
+fn validate_runner_source(root: &Path, release: &ReleaseManifest, claimed: &str) -> Result<()> {
+    const SOURCE: &str = "evidence/run_cluster.py";
+    if release.files.get(SOURCE).map(String::as_str) != Some(claimed) {
+        return reject("reactor runner source is not authenticated by the release");
+    }
+    let bytes = bounded_read(&contained(root, SOURCE)?, MAX_DOCUMENT)?;
+    if raw_digest(&bytes) != claimed {
+        return reject("reactor runner source differs from its claimed digest");
+    }
+    Ok(())
 }
 
 fn validate_fixture_substitution(production: &Value, fixture: &Value) -> Result<()> {

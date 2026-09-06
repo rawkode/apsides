@@ -7,6 +7,7 @@ an explicit loopback TCP proxy. An unimplemented or unobserved case fails.
 """
 
 import argparse
+import copy
 import base64
 import hashlib
 import hmac
@@ -29,6 +30,50 @@ ROLLOUT_KEY_ID = "fixture-v1"
 ROLLOUT_KEY = b"synthetic-fixture-key-never-production-0123456789"
 CONTROLLER_TAG = "reakt-controller-fixture:local"
 WORKLOAD_TAG = "reakt-fixture:local"
+
+
+def stage_release_evidence(output, receipt, coverage, result):
+    """Publish only successful, bounded diagnostics using release-relative paths."""
+    if result.get("status") != "passed":
+        return
+    receipt = copy.deepcopy(receipt)
+    coverage = copy.deepcopy(coverage)
+    allowed = {"tested-artifact-manifest.json", "cluster-transcript.json",
+               "semantic-results.json", "canary-scan.json"}
+    required = {receipt["artifactManifestFile"]}
+    for catalogue in ["cases", "fixtureCases", "checks"]:
+        for record in receipt[catalogue].values():
+            if record["status"] != "passed":
+                raise RuntimeError("failed reactor record cannot be packaged")
+            required.update(record["evidenceFiles"])
+            record["evidenceFiles"] = ["evidence/" + name for name in record["evidenceFiles"]]
+    if not required <= allowed:
+        raise RuntimeError("reactor evidence references an unapproved diagnostic")
+    receipt["artifactManifestFile"] = "evidence/" + receipt["artifactManifestFile"]
+    coverage["irDigest"] = receipt["productionIrDigest"]
+    for record in [*coverage["cases"], *coverage["checks"].values()]:
+        if record["evidenceFiles"] != ["reactor-evidence.json"]:
+            raise RuntimeError("reactor coverage has an unexpected evidence reference")
+        record["evidenceFiles"] = ["evidence/reactor-evidence.json"]
+    files = {}
+    for name in sorted(required):
+        path = output / name
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 4 * 1024 * 1024:
+            raise RuntimeError("reactor diagnostic is missing, nonregular or oversized")
+        files[name] = path.read_bytes()
+    runner = Path(__file__).resolve()
+    source = runner.read_bytes()
+    if "sha256:" + hashlib.sha256(source).hexdigest() != receipt["runnerIdentity"]["sourceSha256"]:
+        raise RuntimeError("reactor runner changed during measurement")
+    files["run_cluster.py"] = source
+    files["reactor-evidence.json"] = canonical(receipt)
+    if any(len(value) > 4 * 1024 * 1024 for value in files.values()):
+        raise RuntimeError("reactor evidence exceeds the release document limit")
+    destination = output / "evidence"
+    destination.mkdir()
+    for name, value in files.items():
+        (destination / name).write_bytes(value)
+    (output / "release-coverage-fragment.json").write_bytes(canonical(coverage))
 
 
 def canonical(value):
@@ -1077,6 +1122,13 @@ echo REAKT_INIT_EGRESS_DENIED
         mutation_rows = [row for row in fixture_ordered if row["case"]["scenario"] == "reaction-contribution-removed"]
         failed_required = sum(row["status"] != "passed" for row in [*ordered, *fixture_ordered])
         canary_occurrences = logs.count(ROLLOUT_KEY.decode()) + logs.count("rotated-synthetic-value")
+        (self.output / "canary-scan.json").write_bytes(canonical({
+            "schemaVersion": "reakt.dev/reactor-canary-scan/v1",
+            "scope": "controller-log-synthetic-rollout-key-and-secret-canaries",
+            "filesScanned": 1, "canaryOccurrences": canary_occurrences,
+            "controllerStarted": self.controller_started, "nonemptyLog": bool(logs),
+            "passed": scan_ok,
+        }))
         checks = {
             "offline-reactor-suite": {"status": "passed" if self.network_canary_passed and self.local_images_verified and failed_required == 0 else "failed",
                                       "assertions": [assertion("external-network-disabled", True, self.network_canary_passed),
@@ -1086,7 +1138,7 @@ echo REAKT_INIT_EGRESS_DENIED
             "secret-canary-scan": {"status": "passed" if scan_ok else "failed",
                                    "assertions": [assertion("canary-occurrences", 0, canary_occurrences),
                                                   assertion("files-scanned", ">=1", 1)],
-                                   "evidenceFiles": ["controller.log"]},
+                                   "evidenceFiles": ["canary-scan.json"]},
             "reaction-mutation-check": {"status": "passed" if len(mutation_rows) == len(self.ir["reactions"]) and all(row["status"] == "passed" for row in mutation_rows) else "failed",
                                         "assertions": [assertion("removed-reaction-contribution-detected", True,
                                                                  len(mutation_rows) == len(self.ir["reactions"]) and all(row["status"] == "passed" for row in mutation_rows))],
@@ -1123,6 +1175,7 @@ echo REAKT_INIT_EGRESS_DENIED
             if row["status"] != "passed":
                 ET.SubElement(item, "failure", message=row.get("message", "failed"))
         ET.ElementTree(suite).write(self.output / "junit.xml", encoding="utf-8", xml_declaration=True)
+        stage_release_evidence(self.output, reactor_evidence, coverage, result)
         return result
 
     def run(self):

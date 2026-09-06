@@ -107,3 +107,24 @@ copies; copying a receipt alone is insufficient.
 by `APS_PRODUCTION_EVIDENCE_RELEASE` and validates this receipt. Release validation
 checks the fixed assertion contract and signed file bindings; it does not replay
 the probes or independently establish host-level isolation from their result tags.
+
+## Reactor evidence packaging
+
+Successful fresh runs of `tests/reakt/run_cluster.py` stage a flat `OUTPUT/evidence/`
+directory for `reakt release --evidence`. Packaged receipts use release-relative
+`evidence/` references for the tested artifact manifest and case/check diagnostics.
+`OUTPUT/release-coverage-fragment.json` carries matching receipt references; it
+selects the production IR and remains a reactor fragment to merge into the
+complete release coverage report.
+The raw local reports retain their original local references.
+
+Staging includes only referenced diagnostics from a fixed allowlist. Missing,
+symlinked, oversized or unapproved files reject before the staging directory is
+created. Failed runs retain diagnostics but publish no release evidence directory.
+Kubeconfigs, runtime configuration and other cluster diagnostics are never copied
+wholesale into release evidence. Raw controller logs remain local; the packaged
+canary scan contains only counts and its explicit synthetic-canary scope. This
+scan does not establish the absence of all possible secret material. The release
+verifier binds `evidence/run_cluster.py` to the runner source digest, and staging
+rejects source drift during measurement. `cuenv task reactorPackagingTest` verifies this
+boundary using synthetic records; it does not establish fresh cluster acceptance.

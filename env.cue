@@ -12,6 +12,7 @@ tasks: {
 	reproducibilityTest: {command: "python3", args: ["-m", "unittest", "tests/reakt/test_reproducibility.py"]}
 	inputIsolationTest: {command: "python3", args: ["tests/reakt/test_input_isolation.py"]}
 	inputIsolationProbeTest: {command: "node", args: ["--test", "tests/reakt/isolation_probe.test.mts"]}
+	reactorPackagingTest: {command: "python3", args: ["tests/reakt/test_reactor_packaging.py"]}
 	coordinationTest: {command: "cargo", args: ["test", "--locked", "-p", "coordination"]}
 	coordinationCheck: [
 		{command: "cargo", args: ["clippy", "--locked", "-p", "coordination", "--all-targets", "--", "-D", "warnings"]},

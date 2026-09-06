@@ -204,6 +204,10 @@ fn command(args: &[&str]) {
     );
 }
 fn release(root: &Path) -> TrustPolicy {
+    assert!(
+        fs::create_dir(root.join("evidence")).is_ok(),
+        "test evidence directory creation failed"
+    );
     let ir = json!({
         "schemaVersion":"reakt.dev/ir/v1","testOnly":false,
         "domain":{"id":"example","namespace":"workload","controlNamespace":"reakt-system","clusterBinding":"test-cluster","policyRef":"platform/example","enforcement":"api-bound","budgets":{"maxResources":64,"maxInputs":64,"maxReactions":64,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},
@@ -593,9 +597,15 @@ fn add_evidence(
             )
         })
         .collect();
+    let runner_bytes = write_json(
+        root,
+        "evidence/run_cluster.py",
+        &json!("synthetic reactor verifier fixture; not executed acceptance evidence"),
+    );
+    files.insert("evidence/run_cluster.py".into(), hash(&runner_bytes));
     let evidence = json!({"schemaVersion":"reakt.dev/reactor-evidence/v1","productionIrDigest":plan.ir_digest,
         "fixtureIrDigest":fixture_digest,"testedArtifactDigest":hash(&artifact_bytes),"artifactManifestFile":"tested-artifact-manifest.json",
-        "overlayDigest":digest(&overlay).unwrap(),"runnerIdentity":{"sourceSha256":hash(b"test runner"),"controllerManifestDigest":hash(b"test controller"),"controllerArchiveDigest":hash(b"test archive"),"fixtureArchiveDigest":hash(b"test fixture"),"nodeImage":format!("example.invalid/node@{}",hash(b"node"))},
+        "overlayDigest":digest(&overlay).unwrap(),"runnerIdentity":{"sourceSha256":hash(&runner_bytes),"controllerManifestDigest":hash(b"test controller"),"controllerArchiveDigest":hash(b"test archive"),"fixtureArchiveDigest":hash(b"test fixture"),"nodeImage":format!("example.invalid/node@{}",hash(b"node"))},
         "cases":records,"checks":check_records});
     files.insert(
         "test-evidence.json".into(),
@@ -858,6 +868,50 @@ async fn signed_production_assertions_must_satisfy_the_exact_contract() -> TestR
         }
         replace_signed_document(root.path(), "production-evidence.json", &evidence)?;
         require_evidence_rejection(root.path(), &policy, expected).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn signed_reactor_evidence_requires_authenticated_fixed_runner_source() -> TestResult {
+    for mutation in ["missing-entry", "swapped-claim", "changed-signed-source"] {
+        let root = tempfile::tempdir()?;
+        let policy = release(root.path());
+        verify_release(root.path(), &policy).await?;
+        match mutation {
+            "missing-entry" => {
+                let mut manifest = read_fixture(root.path(), "release.json")?;
+                manifest["files"]
+                    .as_object_mut()
+                    .ok_or("manifest files missing")?
+                    .remove("evidence/run_cluster.py")
+                    .ok_or("runner source fixture missing")?;
+                fs::write(
+                    root.path().join("release.json"),
+                    canonical_bytes(&manifest)?,
+                )?;
+                resign(root.path());
+            }
+            "swapped-claim" => {
+                let mut evidence = read_fixture(root.path(), "test-evidence.json")?;
+                evidence["runnerIdentity"]["sourceSha256"] =
+                    json!(hash(b"unrelated runner source"));
+                replace_signed_document(root.path(), "test-evidence.json", &evidence)?;
+            }
+            _ => {
+                replace_signed_document(
+                    root.path(),
+                    "evidence/run_cluster.py",
+                    &json!("changed signed runner source"),
+                )?;
+            }
+        }
+        require_evidence_rejection(
+            root.path(),
+            &policy,
+            "reactor runner source is not authenticated by the release",
+        )
+        .await?;
     }
     Ok(())
 }
