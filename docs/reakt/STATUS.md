@@ -4,6 +4,25 @@ Reakt implements specification 0.2 in the workspace crates and the `@reakt/kuber
 
 ## Current integration checkpoint
 
+The corrected reactor producer at `72f761a` passed a fresh run: all 43 core cases
+and 46 compiler fixture cases passed, network denials were observed, and the owned
+Kubernetes v1.34.3 cluster was deleted. Its six-file evidence directory staged
+successfully (`work/reactor-72f761a-results/`). Real CLI assembly merged it with
+the measured reproducibility and declared-input isolation receipts into
+`work/reactor-72f761a-assembly/release`. The actual reactor consumer passed,
+validating production/fixture plan equality, all 43 required core cases and the
+three fixture checks (`work/reactor-72f761a-consumer.log`). Supplemental fixture
+cases are reported by the runner and are not individually accepted by this
+consumer. All compiled runtime crate sources and vendored dependencies match the
+measured production context; the fixture controller remains a different artifact.
+This is five-check partial coverage, not trusted production release promotion.
+Eleven required production checks remain open.
+Both production-evidence consumers also passed on the merged bundle
+(`work/reactor-72f761a-repro-consumer.log` and
+`work/reactor-72f761a-isolation-consumer.log`). Independent review rehashed all
+14 packaged evidence files, verified subjects, counts and cleanup, and found no
+blockers. Docs build and links passed (`work/reactor-72f761a-docs.log`).
+
 A fresh current-runtime reactor run passed all 43 required core cases and 46
 compiler fixture cases in its owned Kubernetes v1.34.3 cluster, then deleted the
 cluster (`work/reactor-b986698-results/result.json`). The fixture contract binds
