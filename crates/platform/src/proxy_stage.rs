@@ -67,6 +67,7 @@ impl PlatformClient {
                 "proxy staging requires an owning Planned transition",
             ));
         }
+        deploy::require_event_capacity(&stored.plan, &stored.record)?;
         let binding = self.release_binding(&stored, release).await?;
         let policy = self.load_proxy_policy(&binding.domain_id).await?;
         let mut registry = self

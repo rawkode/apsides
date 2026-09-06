@@ -123,6 +123,7 @@ impl PlatformClient {
                 "controller upgrade staging requires a qualified proxy transport",
             ));
         }
+        deploy::require_event_capacity(&stored.plan, &stored.record)?;
         let binding = self.release_binding(&stored, &artifact).await?;
         let mut registry = self
             .stage_runtime_identity(transition_id, executor_id)

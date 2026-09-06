@@ -31,7 +31,7 @@ pub use ownership::{
     validate_frozen_ownership_intents, validate_ownership_intent,
 };
 pub use planner::{cleanup_decision, plan_inventory_cleanup, plan_transition};
-pub use reducer::{advance, begin, service_account_name, verify_record};
+pub use reducer::{advance, begin, require_event_capacity, service_account_name, verify_record};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Error {

@@ -45,7 +45,7 @@ impl PlatformClient {
     /// # Errors
     /// Any identity change, restart, incomplete ledger, reset, timeout, retry or
     /// unqualified upstream status fails closed. No timeout establishes success.
-    pub async fn freeze_and_inspect_proxy(
+    pub(crate) async fn freeze_and_inspect_proxy(
         &self,
         expected: &ProxyIdentity,
     ) -> Result<ProxyDrainObservation> {

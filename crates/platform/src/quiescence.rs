@@ -203,6 +203,7 @@ impl PlatformClient {
             return Err(invalid("operation requires owning validated upgrade phase"));
         }
         verify_record(&stored)?;
+        deploy::require_event_capacity(&stored.plan, &stored.record)?;
         Ok(stored)
     }
 

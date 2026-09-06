@@ -260,6 +260,7 @@ impl PlatformClient {
         if stored.plan.request.previous.is_none() {
             return Err(invalid("cleanup requires an approved previous generation"));
         }
+        deploy::require_event_capacity(&stored.plan, &stored.record)?;
         let domain_id = &stored.plan.request.next.compiled.ir.domain.id;
         let policy = self.load_policy(domain_id).await?;
         if policy.value.cleanup_ceiling != stored.plan.request.cleanup_ceiling {

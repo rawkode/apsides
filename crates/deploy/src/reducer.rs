@@ -5,6 +5,8 @@ use crate::{
 use compiler_core::{DeletionPolicy, digest};
 use std::collections::BTreeSet;
 
+const MAX_EVENT_RECEIPTS: usize = 256;
+
 fn reject(message: &str) -> Error {
     Error::Transition(message.into())
 }
@@ -56,7 +58,7 @@ pub fn verify_record(plan: &TransitionPlan, record: &TransitionRecord) -> Result
     }
     if plan_transition(&plan.request)? != *plan
         || !valid_id(&record.executor_id)
-        || record.receipts.len() > 256
+        || record.receipts.len() > MAX_EVENT_RECEIPTS
     {
         return Err(reject("invalid plan or oversized transition record"));
     }
@@ -72,6 +74,44 @@ pub fn verify_record(plan: &TransitionPlan, record: &TransitionRecord) -> Result
     if reconstructed != *record {
         return Err(reject(
             "record phase/revision does not match its durable event history",
+        ));
+    }
+    Ok(())
+}
+
+/// Verify a transition and reserve enough durable receipt slots to finish the
+/// remaining transition and record one failure as `Blocked` before any external work.
+///
+/// A committed transition needs no further slots. A blocked transition cannot
+/// authorize lifecycle side effects until a separate recovery decision resumes
+/// it.
+/// # Errors
+/// Rejects malformed records, blocked transitions, arithmetic overflow, or a
+/// record whose bounded receipt history cannot represent the remaining path.
+pub fn require_event_capacity(plan: &TransitionPlan, record: &TransitionRecord) -> Result<()> {
+    verify_record(plan, record)?;
+    let (remaining, blocked_reserve) = match record.phase {
+        Phase::Planned => (5, 1),
+        Phase::Staged => (4, 1),
+        Phase::Quiesced => (3, 1),
+        Phase::Activated => (2, 1),
+        Phase::Cleaning => (1, 1),
+        Phase::Committed => (0, 0),
+        Phase::Blocked => {
+            return Err(reject(
+                "blocked transition cannot authorize lifecycle side effects",
+            ));
+        }
+    };
+    let required = record
+        .receipts
+        .len()
+        .checked_add(remaining)
+        .and_then(|count| count.checked_add(blocked_reserve))
+        .ok_or_else(|| reject("transition event capacity arithmetic overflow"))?;
+    if required > MAX_EVENT_RECEIPTS {
+        return Err(reject(
+            "transition lacks receipt capacity for completion or failure",
         ));
     }
     Ok(())
@@ -133,7 +173,7 @@ fn apply(
     event: Event,
 ) -> Result<TransitionRecord> {
     if !valid_id(event.id())
-        || record.receipts.len() >= 256
+        || record.receipts.len() >= MAX_EVENT_RECEIPTS
         || record
             .receipts
             .iter()

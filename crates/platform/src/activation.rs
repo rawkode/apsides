@@ -42,7 +42,7 @@ impl PlatformClient {
                 "initial activation requires the owning staged initial transition",
             ));
         }
-        deploy::verify_record(&stored.plan, &stored.record)?;
+        deploy::require_event_capacity(&stored.plan, &stored.record)?;
         if stored.record.phase != Phase::Committed {
             crate::writer_checkpoint::require_qualified(&stored)?;
         }

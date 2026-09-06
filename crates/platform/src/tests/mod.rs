@@ -15,6 +15,8 @@ use std::{
 };
 use tower::service_fn;
 
+mod event_capacity;
+
 const REGISTRY_UID: &str = "11111111-1111-4111-8111-111111111111";
 const GENERATION_A: &str = "gceirceircfardairceirceirce-1";
 const GENERATION_B: &str = "gceirceircfardairceirceirce-2";

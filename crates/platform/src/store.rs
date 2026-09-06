@@ -429,6 +429,7 @@ impl PlatformClient {
         let plan = plan_transition(request)?;
         self.verify_ownership_intents(request).await?;
         let record = begin(&plan, executor_id)?;
+        deploy::require_event_capacity(&plan, &record)?;
         let mut next = current.value.clone();
         if next.transitions.values().any(|entry| {
             entry.domain_id() == domain.id && entry.record.phase != deploy::Phase::Committed

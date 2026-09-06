@@ -375,6 +375,226 @@ fn events(plan: &TransitionPlan) -> Vec<Event> {
     ]
 }
 
+fn planned_recovery_cycles(
+    plan: &TransitionPlan,
+    cycles: usize,
+) -> std::result::Result<TransitionRecord, Box<dyn std::error::Error>> {
+    let mut record = begin(plan, "executor")?;
+    for cycle in 0..cycles {
+        record = advance(
+            plan,
+            &record,
+            record.revision,
+            "executor",
+            Event::Blocked {
+                event_id: format!("capacity-block-{cycle}"),
+                reason: "bounded test failure".into(),
+            },
+        )?;
+        record = advance(
+            plan,
+            &record,
+            record.revision,
+            "executor",
+            Event::Resume {
+                event_id: format!("capacity-resume-{cycle}"),
+                recovery_receipt_digest: DIGEST.into(),
+            },
+        )?;
+    }
+    Ok(record)
+}
+
+fn stage_for_capacity(
+    plan: &TransitionPlan,
+    record: &TransitionRecord,
+    event_id: &str,
+) -> std::result::Result<TransitionRecord, Box<dyn std::error::Error>> {
+    Ok(advance(
+        plan,
+        record,
+        record.revision,
+        "executor",
+        Event::Staged {
+            event_id: event_id.into(),
+            generation_id: plan.request.next.generation_id.clone(),
+            service_account_name: plan.generation_reservation.service_account_name.clone(),
+            registry_cas_receipt_digest: compiler_core::digest(&event_id)?,
+            verification_epoch: record.verification_epoch,
+        },
+    )?)
+}
+
+fn completion_after_staging(
+    plan: &TransitionPlan,
+    record: &TransitionRecord,
+) -> std::result::Result<(TransitionRecord, Event), Box<dyn std::error::Error>> {
+    let mut current = record.clone();
+    let mut events = capacity_completion_events(plan, record.verification_epoch).into_iter();
+    for event in events.by_ref().take(3) {
+        current = advance(plan, &current, current.revision, "executor", event)?;
+    }
+    let committed = events.next().ok_or("capacity commit event missing")?;
+    current = advance(
+        plan,
+        &current,
+        current.revision,
+        "executor",
+        committed.clone(),
+    )?;
+    Ok((current, committed))
+}
+
+fn capacity_completion_events(plan: &TransitionPlan, epoch: u64) -> [Event; 4] {
+    [
+        Event::Quiesced {
+            event_id: "capacity-quiesced".into(),
+            evidence: Quiescence::InitialInstallation {
+                verification_epoch: epoch,
+            },
+        },
+        Event::Activated {
+            event_id: "capacity-activated".into(),
+            generation_id: plan.request.next.generation_id.clone(),
+            activation_receipt_digest: DIGEST.into(),
+            verification_epoch: epoch,
+        },
+        Event::Cleaning {
+            event_id: "capacity-cleaning".into(),
+        },
+        Event::Committed {
+            event_id: "capacity-committed".into(),
+            cleanup_receipts: vec![],
+            obsolete_identity_retirement_digest: DIGEST.into(),
+        },
+    ]
+}
+
+fn insufficient_staged(
+    plan: &TransitionPlan,
+) -> std::result::Result<TransitionRecord, Box<dyn std::error::Error>> {
+    let mut record = planned_recovery_cycles(plan, 124)?;
+    record = stage_for_capacity(plan, &record, "capacity-stage-before-retry")?;
+    for event in [
+        Event::Blocked {
+            event_id: "capacity-retry-block".into(),
+            reason: "retry fixture".into(),
+        },
+        Event::Resume {
+            event_id: "capacity-retry-resume".into(),
+            recovery_receipt_digest: DIGEST.into(),
+        },
+    ] {
+        record = advance(plan, &record, record.revision, "executor", event)?;
+    }
+    stage_for_capacity(plan, &record, "capacity-stage-insufficient")
+}
+
+fn assert_capacity(
+    plan: &TransitionPlan,
+    record: &TransitionRecord,
+    expected: bool,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    if require_event_capacity(plan, record).is_ok() == expected {
+        Ok(())
+    } else {
+        Err("event capacity result differed from boundary expectation".into())
+    }
+}
+
+#[test]
+fn event_capacity_reserves_completion_and_failure_at_canonical_boundary()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let plan = plan_transition(&request(
+        None,
+        generation("capacity", &[("config", "orphan")]),
+    ))?;
+    let mut exact = planned_recovery_cycles(&plan, 125)?;
+    assert_eq!(exact.receipts.len(), 250);
+    assert_capacity(&plan, &exact, true)?;
+    exact = stage_for_capacity(&plan, &exact, "capacity-stage-exact")?;
+    assert_eq!(exact.receipts.len(), 251);
+    assert_capacity(&plan, &exact, true)?;
+    for event in capacity_completion_events(&plan, exact.verification_epoch) {
+        exact = advance(&plan, &exact, exact.revision, "executor", event)?;
+        assert_capacity(&plan, &exact, true)?;
+    }
+    assert_eq!(exact.receipts.len(), 255);
+    assert_eq!(exact.phase, Phase::Committed);
+
+    let planned = planned_recovery_cycles(&plan, 125)?;
+    let blocked = advance(
+        &plan,
+        &planned,
+        planned.revision,
+        "executor",
+        Event::Blocked {
+            event_id: "capacity-final-block".into(),
+            reason: "last reserved failure receipt".into(),
+        },
+    )?;
+    assert_eq!(blocked.receipts.len(), 251);
+    assert_capacity(&plan, &blocked, false)?;
+    let resumed = advance(
+        &plan,
+        &blocked,
+        blocked.revision,
+        "executor",
+        Event::Resume {
+            event_id: "capacity-final-resume".into(),
+            recovery_receipt_digest: DIGEST.into(),
+        },
+    )?;
+    assert_eq!(resumed.phase, Phase::Planned);
+    assert_eq!(resumed.receipts.len(), 252);
+    assert_capacity(&plan, &resumed, false)?;
+
+    let mut insufficient = insufficient_staged(&plan)?;
+    for event in capacity_completion_events(&plan, insufficient.verification_epoch) {
+        assert_capacity(&plan, &insufficient, false)?;
+        insufficient = advance(
+            &plan,
+            &insufficient,
+            insufficient.revision,
+            "executor",
+            event,
+        )?;
+    }
+    assert_eq!(insufficient.receipts.len(), 256);
+    assert_eq!(insufficient.phase, Phase::Committed);
+    assert_capacity(&plan, &insufficient, true)?;
+
+    let mut corrupted = planned;
+    corrupted
+        .receipts
+        .last_mut()
+        .ok_or("capacity receipt missing")?
+        .event_id
+        .push_str("-corrupt");
+    assert_capacity(&plan, &corrupted, false)?;
+    Ok(())
+}
+
+#[test]
+fn full_committed_history_remains_valid_and_idempotent()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let plan = plan_transition(&request(
+        None,
+        generation("capacity", &[("config", "orphan")]),
+    ))?;
+    let staged = insufficient_staged(&plan)?;
+    assert_eq!(staged.receipts.len(), 252);
+    let (committed, event) = completion_after_staging(&plan, &staged)?;
+    assert_eq!(committed.receipts.len(), 256);
+    assert_eq!(committed.phase, Phase::Committed);
+    require_event_capacity(&plan, &committed)?;
+    assert_eq!(
+        advance(&plan, &committed, 255, "executor", event)?,
+        committed
+    );
+    Ok(())
+}
+
 #[test]
 fn interruption_after_every_phase_resumes_from_serialized_durable_state() {
     let request = request(

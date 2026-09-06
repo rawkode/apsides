@@ -61,6 +61,7 @@ impl PlatformClient {
                 "identity staging requires the owning Planned transition",
             ));
         }
+        deploy::require_event_capacity(&stored.plan, &stored.record)?;
         let domain = &stored.plan.request.next.compiled.ir.domain;
         let policy = self.load_policy(&domain.id).await?;
         if policy.value.runtime_ceiling != stored.plan.request.runtime_ceiling

@@ -40,6 +40,23 @@ persisting termination observations; `upgrade.rs` obtains cleanup receipts befor
 publishing Committed. The current size check safely refuses the oversized write,
 but refusal can leave the transition requiring recovery.
 
+## Implemented receipt-slot admission
+
+Lifecycle entrypoints now verify the canonical transition record and require
+space under the existing 256-receipt limit for the remaining successful path
+plus one Blocked receipt. Planned/Staged/Quiesced/Activated/Cleaning require
+5/4/3/2/1 completion receipts; Committed requires none. Staging, quiescence,
+activation and cleanup check this before their external mutations. Exact event
+retries retain the reducer's existing idempotence behavior.
+
+This is receipt-count admission only. It does not reserve serialized bytes,
+admit a complete evidence profile, impose the proposed finite recovery allowance,
+or account for another domain's completion capacity. A refusal does not itself
+persist a Blocked record. Pre-existing v5 records already at the limit can be
+read and safely refused, but require explicit recovery if no failure receipt
+can fit. Committed records remain readable and idempotently retryable at the
+full limit.
+
 ## Proposed implementation: reserve completion capacity
 
 Add `crates/platform/src/state_capacity.rs` with a versioned, typed
@@ -106,6 +123,41 @@ regular, init, and ephemeral containers without a total container count or
 container-ID length bound. Likewise, a bounded Blocked reason may expand when
 escaped and every distinct Blocked/Resume cycle appends receipts. Existing raw
 length and 256-receipt checks are safety ceilings, not an admitted profile.
+
+## Reviewed profile and capture direction
+
+Reserve a bounded evidence profile, not exact volatile Pod names, container IDs
+or resourceVersions in immutable transition inputs. Capture exact live identities
+in `initialize_drain` immediately before quiescence, validate them against the
+admitted profile, and persist them before freezing admission or stopping writers.
+Authenticate each Pod through its ReplicaSet UID to the protected Deployment UID;
+a same-service-account match alone is insufficient. Reject empty, paginated or
+foreign writer sets. ResourceVersions legitimately change during shutdown and
+receive separate terminal-observation allowances.
+
+The proposed initial profile retains the 64-controller-Pod ceiling and fixed
+one-Pod/two-container proxy, with separately bounded regular/init/ephemeral
+container totals. Select scalar encoded-size tiers during authenticated preflight
+rather than reserving every identity at the largest possible size. The candidate
+UID/resourceVersion tiers are 128, 512 and 2050 bytes per complete JSON string;
+container-ID tiers are 256, 1024 and 2050 bytes. The proposed absolute string
+profile is 1024 ASCII-graphic bytes. A complete drain-evidence ceiling of 128 KiB
+must include captured topology, terminal observations, proxy summary and retired
+identities. These are proposed admission constraints, not current validators or
+a proof that every allowed combination fits.
+
+The candidate recovery profile is eight Resume events and 40 receipts. It still
+needs exhaustive state-machine sizing and the full canonical phase proofs below;
+the implemented 256-slot guard does not establish these smaller allowances.
+
+Prefer monotonic pre-quiescence capacity expansion if later topology outgrows the
+reserved profile. An owning Planned/Staged upgrade may resize only while no drain
+checkpoint exists and the exact previous activation remains Active. Recheck
+trust, policy, topology and all global/per-object budgets; CAS only the expanded
+capacity metadata and require session rebinding. Do not resize or recapture after
+drain capture. If expansion cannot fit, leave the writer untouched and require
+explicit platform recovery. Automatic cancellation and unconditional progress
+under arbitrary topology drift are not promised by this design.
 
 ## Evidence and side-effect gates
 
