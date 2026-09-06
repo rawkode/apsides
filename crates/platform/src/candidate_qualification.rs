@@ -1,5 +1,4 @@
-//! Reservation-only qualification for an exact production candidate on one
-//! runner-owned disposable kind cluster.
+//! Exact-candidate qualification on a runner-owned disposable kind cluster.
 use crate::{NamespaceRegistry, PlatformClient, Result, Versioned, invalid};
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Node};
 use kube::Api;
@@ -8,6 +7,13 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 
 mod collision;
+mod pair;
+pub use pair::{
+    CANDIDATE_PAIR_QUALIFICATION_MARKER_NAME, CANDIDATE_PAIR_QUALIFICATION_SCHEMA,
+    CandidatePairLifecycleOperation, CandidatePairQualificationMarker,
+    CandidatePairQualificationTarget, CandidatePairRole, CandidateQualificationPair,
+    candidate_pair_qualification_executor,
+};
 
 pub const CANDIDATE_QUALIFICATION_SCHEMA: &str = "reakt.dev/candidate-qualification/v1";
 pub const CANDIDATE_QUALIFICATION_MARKER_NAME: &str = "reakt-candidate-qualification";
@@ -18,7 +24,7 @@ const MAX_IDENTITY_BYTES: usize = 256;
 /// API identities observed after a host runner created one disposable kind
 /// cluster. The node-image digest is a runner attestation bound into the
 /// immutable marker; Kubernetes Node data does not establish that image digest.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CandidateQualificationTarget {
     pub run_id: String,
@@ -108,6 +114,54 @@ fn collision_owner_plan(
     Ok(plan)
 }
 
+fn validate_fresh_qualification_request(request: &deploy::DeploymentRequest) -> Result<()> {
+    if request.previous.is_some()
+        || !request.observations.is_empty()
+        || !request.ownership_intents.is_empty()
+        || request.registry.next_sequence != 1
+        || !request.registry.claims.is_empty()
+        || request
+            .registry
+            .generation_history
+            .active_allocation
+            .is_some()
+    {
+        return Err(invalid(
+            "candidate qualification requires an unobserved initial installation",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_fresh_qualification_registry(
+    current: &Versioned<NamespaceRegistry>,
+    candidate: &IntegrityVerifiedCandidate,
+) -> Result<()> {
+    let domain = &candidate.compiled().ir.domain;
+    let history =
+        current.value.histories.get(&domain.id).ok_or_else(|| {
+            invalid("candidate qualification domain allocation authority is absent")
+        })?;
+    if current.value.next_sequence != 1
+        || !current.value.claims.is_empty()
+        || !current.value.transitions.is_empty()
+        || !current.value.audit_heads.is_empty()
+        || !current.value.active_writer_checkpoints.is_empty()
+        || current
+            .value
+            .histories
+            .values()
+            .any(|entry| entry.active_allocation.is_some())
+        || history.domain_id != domain.id
+        || history.cluster_binding != domain.cluster_binding
+    {
+        return Err(invalid(
+            "candidate qualification requires fresh protected allocation state",
+        ));
+    }
+    Ok(())
+}
+
 impl PlatformClient {
     /// Reserve an initial transition for one exact signed production candidate
     /// after reobserving its runner-owned disposable kind target.
@@ -129,43 +183,9 @@ impl PlatformClient {
     ) -> Result<Versioned<NamespaceRegistry>> {
         let binding = self.candidate_binding(request, candidate)?;
         let domain = &candidate.compiled().ir.domain;
-        if request.previous.is_some()
-            || !request.observations.is_empty()
-            || !request.ownership_intents.is_empty()
-            || request.registry.next_sequence != 1
-            || !request.registry.claims.is_empty()
-            || request
-                .registry
-                .generation_history
-                .active_allocation
-                .is_some()
-        {
-            return Err(invalid(
-                "candidate qualification requires an unobserved initial installation",
-            ));
-        }
-
+        validate_fresh_qualification_request(request)?;
         let current = self.load_registry().await?;
-        let history = current.value.histories.get(&domain.id).ok_or_else(|| {
-            invalid("candidate qualification domain allocation authority is absent")
-        })?;
-        if current.value.next_sequence != 1
-            || !current.value.claims.is_empty()
-            || !current.value.transitions.is_empty()
-            || !current.value.audit_heads.is_empty()
-            || !current.value.active_writer_checkpoints.is_empty()
-            || current
-                .value
-                .histories
-                .values()
-                .any(|entry| entry.active_allocation.is_some())
-            || history.domain_id != domain.id
-            || history.cluster_binding != domain.cluster_binding
-        {
-            return Err(invalid(
-                "candidate qualification requires fresh protected allocation state",
-            ));
-        }
+        validate_fresh_qualification_registry(&current, candidate)?;
         self.verify_release_trust(&domain.id, candidate.trust_policy_digest())
             .await?;
         self.after_candidate_qualification(&binding, target, || {
@@ -296,10 +316,23 @@ impl PlatformClient {
         request: &deploy::DeploymentRequest,
         candidate: &'a IntegrityVerifiedCandidate,
     ) -> Result<CandidateBinding<'a>> {
-        let domain = &candidate.compiled().ir.domain;
+        let binding = self.candidate_binding_for(candidate)?;
         if request.next.compiled != *candidate.compiled()
             || request.next.artifact_digest != candidate.release_digest()
-            || candidate.manifest().image.reference.len() > 4096
+        {
+            return Err(invalid(
+                "qualification reservation differs from the exact signed candidate scope",
+            ));
+        }
+        Ok(binding)
+    }
+
+    fn candidate_binding_for<'a>(
+        &self,
+        candidate: &'a IntegrityVerifiedCandidate,
+    ) -> Result<CandidateBinding<'a>> {
+        let domain = &candidate.compiled().ir.domain;
+        if candidate.manifest().image.reference.len() > 4096
             || domain.cluster_binding != self.cluster_binding
             || domain.control_namespace != self.control_namespace
             || domain.namespace != self.workload_namespace
@@ -332,7 +365,7 @@ impl PlatformClient {
         continue_with().await
     }
 
-    async fn verify_candidate_qualification_target(
+    async fn verify_qualification_topology(
         &self,
         binding: &CandidateBinding<'_>,
         target: &CandidateQualificationTarget,
@@ -382,9 +415,18 @@ impl PlatformClient {
 
         verify_node(&Api::all(self.client.clone()), target).await?;
 
+        Ok(())
+    }
+
+    async fn read_qualification_marker<T: serde::de::DeserializeOwned>(
+        &self,
+        target: &CandidateQualificationTarget,
+        name: &str,
+    ) -> Result<Versioned<T>> {
+        let cluster = qualification_cluster_name(&target.run_id)?;
         let markers: Api<ConfigMap> = Api::namespaced(self.client.clone(), &cluster);
-        let object = markers.get(CANDIDATE_QUALIFICATION_MARKER_NAME).await?;
-        if object.metadata.name.as_deref() != Some(CANDIDATE_QUALIFICATION_MARKER_NAME)
+        let object = markers.get(name).await?;
+        if object.metadata.name.as_deref() != Some(name)
             || object.metadata.namespace.as_deref() != Some(cluster.as_str())
             || object.metadata.uid.as_deref() != Some(target.marker_uid.as_str())
             || object.metadata.resource_version.as_deref()
@@ -396,7 +438,19 @@ impl PlatformClient {
                 "candidate qualification marker identity or immutability changed",
             ));
         }
-        let marker: Versioned<CandidateQualificationMarker> = crate::store::decode_state(&object)?;
+        crate::store::decode_state(&object)
+    }
+
+    async fn verify_candidate_qualification_target(
+        &self,
+        binding: &CandidateBinding<'_>,
+        target: &CandidateQualificationTarget,
+    ) -> Result<()> {
+        self.verify_qualification_topology(binding, target).await?;
+        let cluster = qualification_cluster_name(&target.run_id)?;
+        let marker: Versioned<CandidateQualificationMarker> = self
+            .read_qualification_marker(target, CANDIDATE_QUALIFICATION_MARKER_NAME)
+            .await?;
         let expected = CandidateQualificationMarker {
             schema_version: CANDIDATE_QUALIFICATION_SCHEMA.into(),
             run_id: target.run_id.clone(),
