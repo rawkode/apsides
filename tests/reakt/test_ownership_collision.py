@@ -81,6 +81,9 @@ class CollisionContractTests(unittest.TestCase):
                 runner = collision.CollisionRunner(args)
             self.assertTrue({"run_ownership_collision.py", "run_deployment_ceiling.py", "qualification_driver.rs", "ownership_collision_driver.rs"}.issubset(runner.source_digests))
             self.assertEqual(len(runner.source_digests), len(runner.sources))
+            self.assertEqual(len(set(runner.archives.values())), len(runner.sources))
+            self.assertTrue(all(name.startswith("ownership-collision-") and len(name) <= 128 for name in runner.archives.values()))
+            self.assertTrue(set(runner.source_digests).isdisjoint(runner.archives.values()))
 
     def test_invalid_owner_inputs_do_not_create_output(self):
         with tempfile.TemporaryDirectory() as directory:

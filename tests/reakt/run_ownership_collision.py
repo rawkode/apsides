@@ -79,6 +79,9 @@ class CollisionRunner(base.CeilingRunner):
         self.source_digests = {path.name: shared.digest_file(path) for path in self.sources}
         if len(self.sources) != len(self.source_digests):
             raise shared.QualificationError("collision source filenames collide")
+        self.archives = {path: "ownership-collision-" + path.name for path in self.sources}
+        if len(set(self.archives.values())) != len(self.sources) or any(len(name) > 128 for name in self.archives.values()):
+            raise shared.QualificationError("collision archive names are ambiguous or oversized")
         self.driver_error_reasons = set(re.findall(r'DriverError\(\s*"([a-zA-Z0-9 -]+)"', "\n".join(path.read_text() for path in self.sources if path.suffix == ".rs")))
         self.failure_reasons |= set(re.findall(r'(?:QualificationError|RuntimeError)\(\s*"([^"\n]+)"', Path(__file__).read_text()))
 
@@ -245,7 +248,9 @@ class CollisionRunner(base.CeilingRunner):
                             "hostIdentity": self.host_identity, "dockerIdentity": self.docker_binding, "steps": self.steps,
                             "beforeOwner": base.public_snapshot(before_owner), "afterOwner": base.public_snapshot(after_owner),
                             "beforeDenial": base.public_snapshot(before_denial), "afterDenial": base.public_snapshot(after_denial),
-                            "runnerSources": self.source_digests, "driverDigest": self.driver_digest, "releaseVerified": False}
+                            "runnerSources": {self.archives[path]: self.source_digests[path.name] for path in self.sources},
+                            "sourceArchiveFiles": {path.relative_to(ROOT).as_posix(): self.archives[path] for path in self.sources},
+                            "driverDigest": self.driver_digest, "releaseVerified": False}
 
     def publish(self):
         self.verify_docker()
@@ -259,19 +264,19 @@ class CollisionRunner(base.CeilingRunner):
         evidence = self.output / "evidence"
         evidence.mkdir()
         for path in self.sources:
-            shutil.copyfile(path, evidence / path.name)
-            if shared.digest_file(evidence / path.name) != self.source_digests[path.name]:
+            shutil.copyfile(path, evidence / self.archives[path])
+            if shared.digest_file(evidence / self.archives[path]) != self.source_digests[path.name]:
                 raise shared.QualificationError("staged collision source differs from measured source")
         (evidence / "ownership-collision-measurement.json").write_bytes(payload)
         receipt = {"schemaVersion": shared.SCHEMA, "irDigest": self.manifest["irDigest"], "compilerDigest": self.manifest["compilerDigest"],
                    "binaryDigest": self.manifest["binaryDigest"], "image": self.manifest["image"],
                    "sourceInputsDigest": shared.digest_bytes(shared.canonical(shared.read_json(self.artifact / "build-inputs.json"))),
                    "payloadFiles": {name: self.manifest["files"][name] for name in ["build-inputs.json", "controller.oci.tar", "reakt-controller"]},
-                   "runnerSourceFile": "evidence/" + Path(__file__).name, "runnerSourceDigest": self.source_digests[Path(__file__).name],
+                   "runnerSourceFile": "evidence/" + self.archives[Path(__file__).resolve()], "runnerSourceDigest": self.source_digests[Path(__file__).name],
                    "checks": {"ownership-collision": {"status": "passed", "assertions": [
                        {"checkId": key, "expected": value, "actual": value, "passed": True}
                        for key, value in [("claim-collision-rejected", True), ("next-writer-started", False)]],
-                       "evidenceFiles": ["evidence/ownership-collision-measurement.json", *["evidence/" + path.name for path in self.sources]]}}}
+                       "evidenceFiles": ["evidence/ownership-collision-measurement.json", *["evidence/" + self.archives[path] for path in self.sources]]}}}
         (evidence / "ownership-collision-evidence.json").write_bytes(shared.canonical(receipt))
         return evidence
 
