@@ -1,0 +1,301 @@
+async fn bootstrap(settings: &Settings, pair: &CandidatePair) -> Result<()> {
+    require_fields(settings, FieldSet::Bootstrap)?;
+    let target = required_target(settings)?;
+    let uid = qualification_driver::required(
+        settings.registry_uid.as_deref(),
+        "bootstrap registry UID is missing",
+    )?;
+    let revision = qualification_driver::required(
+        settings.registry_resource_version.as_deref(),
+        "bootstrap registry resourceVersion is missing",
+    )?;
+    let coordination = coordination_store().await?;
+    let _inventory = inventory_store().await?;
+    let platform = bootstrap_platform(&pair.initial, coordination).await?;
+    platform
+        .authorize_candidate_qualification_pair(
+            CandidatePairRole::Initial,
+            &pair.initial,
+            &pair.successor,
+            target,
+        )
+        .await
+        .map_err(|_| DriverError("candidate pair target authorization failed"))?;
+    let domain = &pair.initial.compiled().ir.domain.id;
+    let written = platform
+        .bootstrap_registry(uid, revision, std::slice::from_ref(domain))
+        .await
+        .map_err(|_| DriverError("protected registry bootstrap failed"))?;
+    qualification_driver::bounded_metadata(&written.uid, &written.resource_version)?;
+    emit(
+        "bootstrapped",
+        pair,
+        json!({"registryUid":written.uid,"registryResourceVersion":written.resource_version}),
+    )
+}
+
+async fn prepare(
+    settings: &Settings,
+    pair: &CandidatePair,
+    policy_role: CandidatePairRole,
+) -> Result<()> {
+    require_fields(settings, FieldSet::TargetOnly)?;
+    let coordination = coordination_store().await?;
+    let inventory = inventory_store().await?;
+    let issued = issued_deployment(&pair.initial, coordination).await?;
+    let platform = issued.platform();
+    let _authorized = authorize(platform, policy_role, pair, required_target(settings)?).await?;
+    let request_role = match settings.action {
+        Action::PrepareInitial => CandidatePairRole::Initial,
+        Action::PrepareRejection | Action::PrepareSuccessor => CandidatePairRole::Successor,
+        _ => return Err(DriverError("prepare action is invalid")),
+    };
+    let prepared = prepare_request(
+        platform,
+        candidate(pair, request_role),
+        &inventory,
+        RequestPreparation::CapturePredecessor,
+    )
+    .await?;
+    let names = deploy::allocation_names(
+        &prepared.registry.uid,
+        prepared.registry.value.next_sequence,
+    )
+    .map_err(|_| DriverError("canonical allocation derivation failed"))?;
+    emit(
+        match settings.action {
+            Action::PrepareInitial => "initial-prepared",
+            Action::PrepareRejection => "rejection-prepared",
+            Action::PrepareSuccessor => "successor-prepared",
+            _ => return Err(DriverError("prepare action is invalid")),
+        },
+        pair,
+        json!({
+            "generation":names.generation_id,
+            "transition":names.transition_id,
+            "registryUid":prepared.registry.uid,
+            "registryResourceVersion":prepared.registry.resource_version,
+            "requestDigest":prepared.request_digest,
+            "policyRole":role_name(policy_role),
+        }),
+    )
+}
+
+async fn reserve_initial(settings: &Settings, pair: &CandidatePair) -> Result<()> {
+    require_fields(settings, FieldSet::RequestMutation)?;
+    let platform = issued_platform(&pair.initial).await?;
+    let inventory = inventory_store().await?;
+    let authorized = authorize(
+        &platform,
+        CandidatePairRole::Initial,
+        pair,
+        required_target(settings)?,
+    )
+    .await?;
+    let prepared = prepare_request(
+        &platform,
+        &pair.initial,
+        &inventory,
+        RequestPreparation::ReadOnly,
+    )
+    .await?;
+    require_request_digest(settings, &prepared.request_digest)?;
+    let written = platform
+        .reserve_pair_initial_candidate(&prepared.request, &authorized, &inventory)
+        .await
+        .map_err(|_| DriverError("initial candidate reservation failed"))?;
+    report_registry(
+        "initial-reserved",
+        pair,
+        &written,
+        &prepared.request.transition_id,
+        &prepared.request_digest,
+    )
+}
+
+async fn reject_upgrade(settings: &Settings, pair: &CandidatePair) -> Result<()> {
+    require_fields(settings, FieldSet::Rejection)?;
+    let missing = settings
+        .expected_missing_capability
+        .as_ref()
+        .ok_or(DriverError("expected missing capability is absent"))?;
+    let platform = issued_platform(&pair.initial).await?;
+    let inventory = inventory_store().await?;
+    let authorized = authorize(
+        &platform,
+        CandidatePairRole::Initial,
+        pair,
+        required_target(settings)?,
+    )
+    .await?;
+    let prepared = prepare_request(
+        &platform,
+        &pair.successor,
+        &inventory,
+        RequestPreparation::ReadOnly,
+    )
+    .await?;
+    require_request_digest(settings, &prepared.request_digest)?;
+    platform
+        .reject_pair_upgrade_candidate(&prepared.request, &authorized, &inventory, missing)
+        .await
+        .map_err(|_| DriverError("typed permission upgrade rejection failed"))?;
+    let durable = platform
+        .load_registry()
+        .await
+        .map_err(|_| DriverError("rejection durable readback failed"))?;
+    if durable.uid != prepared.registry.uid
+        || durable.resource_version != prepared.registry.resource_version
+        || durable.value != prepared.registry.value
+    {
+        return Err(DriverError("rejection changed protected registry state"));
+    }
+    let missing_digest = compiler_core::digest(missing)
+        .map_err(|_| DriverError("missing capability digest failed"))?;
+    emit(
+        "upgrade-rejected",
+        pair,
+        json!({
+            "registryUid":durable.uid,
+            "registryResourceVersion":durable.resource_version,
+            "requestDigest":prepared.request_digest,
+            "missingCapabilityDigest":missing_digest,
+        }),
+    )
+}
+
+async fn reserve_successor(settings: &Settings, pair: &CandidatePair) -> Result<()> {
+    require_fields(settings, FieldSet::RequestMutation)?;
+    let platform = issued_platform(&pair.successor).await?;
+    let inventory = inventory_store().await?;
+    let authorized = authorize(
+        &platform,
+        CandidatePairRole::Successor,
+        pair,
+        required_target(settings)?,
+    )
+    .await?;
+    let prepared = prepare_request(
+        &platform,
+        &pair.successor,
+        &inventory,
+        RequestPreparation::ReadOnly,
+    )
+    .await?;
+    require_request_digest(settings, &prepared.request_digest)?;
+    let written = platform
+        .reserve_pair_upgrade_candidate(&prepared.request, &authorized, &inventory)
+        .await
+        .map_err(|_| DriverError("successor candidate reservation failed"))?;
+    report_registry(
+        "successor-reserved",
+        pair,
+        &written,
+        &prepared.request.transition_id,
+        &prepared.request_digest,
+    )
+}
+
+async fn lifecycle(
+    settings: &Settings,
+    pair: &CandidatePair,
+    operation: CandidatePairLifecycleOperation,
+) -> Result<()> {
+    require_fields(settings, FieldSet::Transition)?;
+    let role = operation_role(operation);
+    let platform = issued_platform(candidate(pair, role)).await?;
+    let inventory = inventory_store().await?;
+    let authorized = authorize(&platform, role, pair, required_target(settings)?).await?;
+    let transition = required_transition(settings)?;
+    let written = platform
+        .run_pair_lifecycle_operation(operation, &authorized, &inventory, transition)
+        .await;
+    match written {
+        Ok(written) => report_registry(operation_name(operation), pair, &written, transition, ""),
+        Err(platform_api::Error::Pending(_)) => {
+            let registry = platform
+                .load_registry()
+                .await
+                .map_err(|_| DriverError("pending lifecycle state readback failed"))?;
+            report_registry(
+                operation_pending_name(operation),
+                pair,
+                &registry,
+                transition,
+                "",
+            )
+        }
+        Err(_) => Err(DriverError("pair lifecycle operation failed")),
+    }
+}
+
+async fn publish(settings: &Settings, pair: &CandidatePair, role: CandidatePairRole) -> Result<()> {
+    require_fields(settings, FieldSet::Transition)?;
+    let platform = issued_platform(candidate(pair, role)).await?;
+    let inventory = inventory_store().await?;
+    let authorized = authorize(&platform, role, pair, required_target(settings)?).await?;
+    let transition = required_transition(settings)?;
+    let published = platform
+        .publish_pair_inventory(role, &authorized, &inventory, transition)
+        .await
+        .map_err(|_| DriverError("committed pair inventory publication failed"))?;
+    qualification_driver::bounded_metadata(&published.snapshot_id, &published.revision)?;
+    emit(
+        if role == CandidatePairRole::Initial {
+            "initial-inventory-published"
+        } else {
+            "successor-inventory-published"
+        },
+        pair,
+        json!({
+            "transition":transition,
+            "inventoryGeneration":published.snapshot.generation,
+            "inventorySnapshotId":published.snapshot_id,
+            "inventoryRevision":published.revision,
+        }),
+    )
+}
+
+async fn resolve(settings: &Settings, pair: &CandidatePair, role: CandidatePairRole) -> Result<()> {
+    require_fields(settings, FieldSet::Transition)?;
+    let platform = issued_platform(candidate(pair, role)).await?;
+    let inventory = inventory_store().await?;
+    let authorized = authorize(&platform, role, pair, required_target(settings)?).await?;
+    let transition = required_transition(settings)?;
+    let resolved = platform
+        .resolve_pair_transition(role, &authorized, &inventory, transition)
+        .await
+        .map_err(|_| DriverError("pair transition resolution failed"))?;
+    let stored = resolved.stored();
+    qualification_driver::bounded_metadata(
+        &resolved.registry().uid,
+        &resolved.registry().resource_version,
+    )?;
+    emit(
+        if role == CandidatePairRole::Initial {
+            "initial-resolved"
+        } else {
+            "successor-resolved"
+        },
+        pair,
+        json!({
+            "transition":transition,
+            "generation":stored.allocation().generation_id,
+            "phase":phase_name(stored.record.phase),
+            "registryUid":resolved.registry().uid,
+            "registryResourceVersion":resolved.registry().resource_version,
+        }),
+    )
+}
+
+async fn authorize<'a>(
+    platform: &PlatformClient,
+    role: CandidatePairRole,
+    pair: &'a CandidatePair,
+    target: &'a CandidatePairQualificationTarget,
+) -> Result<platform_api::CandidateQualificationPair<'a>> {
+    platform
+        .authorize_candidate_qualification_pair(role, &pair.initial, &pair.successor, target)
+        .await
+        .map_err(|_| DriverError("candidate pair target authorization failed"))
+}

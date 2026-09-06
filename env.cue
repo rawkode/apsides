@@ -12,6 +12,7 @@ tasks: {
 	fixturePromotionTest: {command: "python3", args: ["tests/reakt/test_fixture_promotion.py"]}
 	fixturePromotionEvidence: {command: "python3", args: ["tests/reakt/run_fixture_promotion.py"]}
 	fixturePromotionLive: {command: "cargo", args: ["test", "--locked", "-p", "release", "--test", "fixture_promotion", "fixture_promotion_step", "--", "--ignored", "--exact", "--nocapture"]}
+	permissionUpgradeStep: {command: "cargo", args: ["test", "--locked", "-p", "platform", "--features", "test-support", "--test", "permission_upgrade", "permission_upgrade_step", "--", "--ignored", "--exact", "--nocapture"]}
 	releaseCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "release", "--features", "test-support", "--all-targets", "--", "-D", "warnings"]}
 	reproducibilityTest: {command: "python3", args: ["-m", "unittest", "tests/reakt/test_reproducibility.py"]}
 	inputIsolationTest: {command: "python3", args: ["tests/reakt/test_input_isolation.py"]}
