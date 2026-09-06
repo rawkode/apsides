@@ -43,6 +43,10 @@ fn error_kind(error: &(dyn std::error::Error + 'static)) -> &'static str {
     );
     if ceiling {
         "permission-ceiling"
+    } else if matches!(error.downcast_ref::<kube::Error>(), Some(kube::Error::Api(status)) if status.code == 403)
+        || matches!(error.downcast_ref::<platform::Error>(), Some(platform::Error::Kubernetes(kube::Error::Api(status))) if status.code == 403)
+    {
+        "kubernetes-forbidden"
     } else {
         "other"
     }
@@ -76,6 +80,39 @@ fn ceiling_error_kind_requires_a_typed_ceiling_variant() {
     for error in unrelated {
         assert_eq!(error_kind(error.as_ref()), "other");
     }
+}
+
+#[test]
+fn kubernetes_forbidden_kind_requires_a_typed_api_403() {
+    let api_error = |code| {
+        kube::Error::Api(Box::new(kube::core::Status {
+            code,
+            message: "forbidden 403 permission-ceiling".into(),
+            reason: "Forbidden".into(),
+            ..kube::core::Status::default()
+        }))
+    };
+    for code in [0, 401, 403, 404, 409, 500] {
+        let direct = api_error(code);
+        let nested = platform::Error::Kubernetes(api_error(code));
+        let expected = if code == 403 {
+            "kubernetes-forbidden"
+        } else {
+            "other"
+        };
+        assert_eq!(error_kind(&direct), expected);
+        assert_eq!(error_kind(&nested), expected);
+    }
+    for error in [
+        platform::Error::Invalid("ApiError: Forbidden 403".into()),
+        platform::Error::Pending("kubernetes-forbidden".into()),
+    ] {
+        assert_eq!(error_kind(&error), "other");
+    }
+    assert_eq!(
+        error_kind(&std::io::Error::other("ApiError: Forbidden 403")),
+        "other"
+    );
 }
 
 async fn transition_step() -> Result<()> {

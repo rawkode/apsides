@@ -241,7 +241,7 @@ class LifecycleRunner:
         self.role(self.control, "test-deployer", rules, "test-deployer")
         self.role(self.workload, "test-deployer", [rule("", ["configmaps", "services"], ["get", "list", "watch", "create", "patch", "delete"]),
                   rule("rbac.authorization.k8s.io", ["roles", "rolebindings"], ["get", "create"]), rule("rbac.authorization.k8s.io", ["rolebindings"], ["delete"])], "test-deployer")
-        self.role(self.control, "test-issuer", [rule("", ["configmaps"], ["get"], ["reakt-trust-"+self.domain, "reakt-deploy-identity-"+self.domain]),
+        self.role(self.control, "test-issuer", [rule("", ["configmaps"], ["get"], ["reakt-trust-"+self.domain, "reakt-deploy-identity-"+self.domain, "reakt-test-support"]),
                   rule("", ["serviceaccounts"], ["get"], ["test-deployer"]), rule("", ["serviceaccounts/token"], ["create"], ["test-deployer"]),
                   rule("", ["secrets"], ["get"], ["deployment-binding"])], "test-issuer")
         name = "reakt-disposable-" + self.cluster
@@ -250,6 +250,12 @@ class LifecycleRunner:
         self.apply({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRoleBinding", "metadata": {"name": name},
                     "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": name},
                     "subjects": [{"kind": "ServiceAccount", "name": "test-deployer", "namespace": self.control}]})
+        issuer_role = name + "-issuer"
+        self.apply({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole", "metadata": {"name": issuer_role},
+                    "rules": [rule("", ["namespaces"], ["get"], ["kube-system"])]})
+        self.apply({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRoleBinding", "metadata": {"name": issuer_role},
+                    "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": issuer_role},
+                    "subjects": [{"kind": "ServiceAccount", "name": "test-issuer", "namespace": self.control}]})
 
     def approve_runtime(self, index):
         self.state("reakt-policy-" + self.domain, {
@@ -320,6 +326,21 @@ class LifecycleRunner:
             records = [json.loads(line.split("=", 1)[1]) for line in result.stdout.splitlines()
                        if line.startswith("REAKT_TEST_ALLOCATION=")]
             if result.returncode or len(records) != 1:
+                errors = []
+                for line in result.stdout.splitlines():
+                    if line.startswith("REAKT_TEST_ERROR=") and len(line) <= 4096:
+                        try:
+                            record = json.loads(line.split("=", 1)[1])
+                        except ValueError:
+                            continue
+                        if isinstance(record, dict):
+                            kind = record.get("kind")
+                            errors.append({"kind": kind if kind in ["permission-ceiling", "kubernetes-forbidden"] else "other",
+                                           "pending": record.get("pending") is True})
+                            break
+                (self.output / "allocation-error.json").write_text(json.dumps({
+                    "exitCode": result.returncode, "errors": errors[:1],
+                    "scope": "static driver classification; raw diagnostics omitted"}))
                 raise RuntimeError("failed to read canonical test allocation")
             self.allocations[alias] = records[0]
         return self.allocations[alias]

@@ -4,6 +4,22 @@ Reakt implements specification 0.2 in the workspace crates and the `@reakt/kuber
 
 ## Current integration checkpoint
 
+The first fresh lifecycle run stopped before reservation while reading its test
+allocation. Verified cleanup deleted the owned cluster and removed all three
+kubeconfigs (`work/lifecycle-99becfd-results/result.json`). Source review found
+that issuer credentials lacked the two reads performed by disposable-target
+verification before deployment credential minting: the named `kube-system`
+Namespace and control-namespace `reakt-test-support` ConfigMap. The provisioner
+now grants exactly those reads through a separate namespace-only cluster role;
+it does not grant the issuer node access. Because the original driver error was
+discarded, this diagnosis is source-derived and awaits a fresh live rerun.
+Allocation failures now retain a bounded static classification, excluding raw
+library diagnostics and response bodies.
+Three permission/diagnostic tests, seven cleanup tests, six ceiling tests and two
+typed-error tests pass. Strict deploy/platform/CLI Clippy, docs build/link checks
+and independent source review pass (`work/lifecycle-issuer-*.log`). These checks
+do not establish live issuer authorization or successful lifecycle progression.
+
 Fresh A/B lifecycle images and signed unpromoted candidates were built from
 `9559fd1` (`work/lifecycle-9559fd1-*-build` and `*-candidate`). Their source
 identities are explicitly synthetic and coverage remains pending. The temporary
