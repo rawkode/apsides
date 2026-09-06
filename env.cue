@@ -15,6 +15,7 @@ tasks: {
 	inputIsolationProbeTest: {command: "node", args: ["--test", "tests/reakt/isolation_probe.test.mts"]}
 	reactorPackagingTest: {command: "python3", args: ["tests/reakt/test_reactor_packaging.py"]}
 	lifecycleCeilingTest: {command: "python3", args: ["tests/reakt/test_lifecycle_ceiling.py"]}
+	lifecycleCleanupTest: {command: "python3", args: ["tests/reakt/test_lifecycle_cleanup.py"]}
 	coordinationTest: {command: "cargo", args: ["test", "--locked", "-p", "coordination"]}
 	coordinationCheck: [
 		{command: "cargo", args: ["clippy", "--locked", "-p", "coordination", "--all-targets", "--", "-D", "warnings"]},

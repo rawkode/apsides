@@ -104,11 +104,21 @@ class LifecycleRunner:
         (self.output / "driver.json").write_text(json.dumps({"sha256": "sha256:" + hashlib.sha256(self.driver.read_bytes()).hexdigest(),
                                                            "scope": "frozen test-support executable; not a production release"}, indent=2))
 
+    def cluster_names(self):
+        result = self.command(["kind", "get", "clusters"], check=False)
+        if result.returncode:
+            raise RuntimeError("could not establish the exact kind cluster inventory")
+        return {name.strip() for name in result.stdout.splitlines() if name.strip()}
+
     def create(self):
+        if self.cluster in self.cluster_names():
+            raise RuntimeError("disposable cluster name already exists; ownership not established")
         self.command(["docker", "image", "inspect", NODE])
+        creation = self.command(["kind", "create", "cluster", "--name", self.cluster, "--image", NODE,
+                                 "--kubeconfig", self.admin, "--wait", "120s"], check=False)
+        if creation.returncode:
+            raise RuntimeError("disposable cluster creation failed; ownership not established")
         self.created = True
-        self.command(["kind", "create", "cluster", "--name", self.cluster, "--image", NODE,
-                      "--kubeconfig", self.admin, "--wait", "120s"])
         for namespace in [self.control, self.workload]:
             self.apply({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": namespace}})
         profile_result = self.cargo("proxy_profile")
@@ -516,22 +526,77 @@ class LifecycleRunner:
                 raise RuntimeError("prior deletion/orphan policy was not preserved")
             passed = True
         finally:
-            (self.output / "result.json").write_text(json.dumps({"passed": passed, "releaseVerified": False, "cluster": self.cluster,
-                "scope": "signed candidate deployment through actual short-lived credentials; not final release acceptance", "steps": self.results}, indent=2))
+            self.finish(passed)
+
+    def collect_diagnostics(self):
+        complete = True
+        for namespace in [self.control, self.workload]:
+            try:
+                result = self.k("get", "pods,deployments,configmaps,events", "-n", namespace,
+                                "-o", "json", check=False)
+                (self.output / (namespace + ".json")).write_text(result.stdout)
+                complete = complete and result.returncode == 0
+                pods = self.k("get", "pods", "-n", namespace, "-o", "json", check=False)
+                if pods.returncode:
+                    complete = False
+                    continue
+                for pod in json.loads(pods.stdout).get("items", []):
+                    name = pod["metadata"]["name"]
+                    logs = self.k("logs", name, "-n", namespace, "--all-containers", "--prefix",
+                                  "--tail=200", check=False)
+                    (self.output / (namespace + "-" + name + ".log")).write_text(logs.stdout + logs.stderr)
+                    complete = complete and logs.returncode == 0
+            except Exception:
+                # Diagnostic collection must never prevent owned-resource cleanup.
+                complete = False
+        return complete
+
+    def delete_owned_cluster(self):
+        if not self.created:
+            return "not-owned"
+        result = self.command(["kind", "delete", "cluster", "--name", self.cluster], check=False)
+        if result.returncode:
+            raise RuntimeError("owned disposable cluster deletion failed")
+        if self.cluster in self.cluster_names():
+            raise RuntimeError("owned disposable cluster remains after deletion")
+        return "deleted"
+
+    def remove_credentials(self):
+        removed = True
+        for path in [self.issuer, self.admin, self.output / "old-generation.kubeconfig"]:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                removed = False
+        return removed
+
+    def finish(self, work_passed):
+        disposition = "cleanup-failed" if self.created else "not-owned"
+        diagnostics_complete = False
+        cleanup_failed = False
+        try:
             if self.created:
-                for namespace in [self.control, self.workload]:
-                    result = self.k("get", "pods,deployments,configmaps,events", "-n", namespace, "-o", "json", check=False)
-                    (self.output / (namespace + ".json")).write_text(result.stdout)
-                    pods = self.k("get", "pods", "-n", namespace, "-o", "json", check=False)
-                    if pods.returncode == 0:
-                        for pod in json.loads(pods.stdout).get("items", []):
-                            name = pod["metadata"]["name"]
-                            logs = self.k("logs", name, "-n", namespace, "--all-containers", "--prefix", "--tail=200", check=False)
-                            (self.output / (namespace + "-" + name + ".log")).write_text(logs.stdout + logs.stderr)
-                self.command(["kind", "delete", "cluster", "--name", self.cluster], check=False)
-            self.issuer.unlink(missing_ok=True)
-            self.admin.unlink(missing_ok=True)
-            (self.output / "old-generation.kubeconfig").unlink(missing_ok=True)
+                try:
+                    diagnostics_complete = self.collect_diagnostics()
+                except Exception:
+                    diagnostics_complete = False
+        finally:
+            try:
+                disposition = self.delete_owned_cluster()
+            except Exception:
+                cleanup_failed = True
+            finally:
+                credentials_removed = self.remove_credentials()
+                passed = work_passed and disposition == "deleted" and credentials_removed
+                (self.output / "result.json").write_text(json.dumps({
+                    "passed": passed, "releaseVerified": False, "cluster": self.cluster,
+                    "clusterDisposition": disposition, "credentialsRemoved": credentials_removed,
+                    "diagnosticsComplete": diagnostics_complete,
+                    "scope": "signed candidate deployment through actual short-lived credentials; not final release acceptance",
+                    "steps": self.results,
+                }, indent=2))
+        if cleanup_failed or not credentials_removed or (work_passed and disposition != "deleted"):
+            raise RuntimeError("lifecycle cleanup did not establish cluster deletion and credential removal")
 
 
 if __name__ == "__main__":

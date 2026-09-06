@@ -4,6 +4,21 @@ Reakt implements specification 0.2 in the workspace crates and the `@reakt/kuber
 
 ## Current integration checkpoint
 
+Fresh A/B lifecycle images and signed unpromoted candidates were built from
+`9559fd1` (`work/lifecycle-9559fd1-*-build` and `*-candidate`). Their source
+identities are explicitly synthetic and coverage remains pending. The temporary
+private signing key was deleted. The actual CLI rejected B under A's ceiling and
+accepted the A+B handoff ceiling (`work/lifecycle-9559fd1-ceiling-preflight/`).
+Preflight review found a harness ownership bug before cluster creation: ownership
+was recorded before `kind create` succeeded. The runner now refuses name collisions,
+marks ownership only on success, and reports results after verified deletion and
+credential removal. Diagnostic failures cannot bypass cleanup. These changes
+still require the fresh lifecycle run; no additional release check is closed.
+Seven cleanup tests and six ceiling tests pass, alongside docs build/link checks
+(`work/lifecycle-cleanup-*.log`). Independent cleanup review found no blockers.
+Failed creation remains explicitly unowned and failed; it does not authorize
+deletion based on a non-atomic earlier absence check.
+
 The disposable lifecycle harness now starts with only the first candidate's
 runtime ceiling. Before approving the successor it requires a typed ceiling
 rejection and unchanged registry UID/resourceVersion/data, authenticated claims,
