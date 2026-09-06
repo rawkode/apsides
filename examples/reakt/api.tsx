@@ -37,11 +37,15 @@ export function Api({ name, namespace, image }: ApiProps) {
           template: {
             metadata: { labels },
             spec: {
-              serviceAccountName: "api-workload",
+              automountServiceAccountToken: false,
               containers: [{
                 name,
                 image,
                 ports: [{ containerPort: 8080 }],
+                resources: {
+                  requests: { cpu: "10m", memory: "16Mi" },
+                  limits: { memory: "64Mi" },
+                },
                 envFrom: [
                   { configMapRef: { name: `${name}-config` } },
                   { configMapRef: { name: "external-settings" } },

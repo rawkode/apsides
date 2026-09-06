@@ -105,12 +105,12 @@ impl PlatformClient {
                     .is_ok_and(|identity| identity == approval.identity)
             })
             .ok_or_else(|| invalid("adoption resource missing"))?;
-        let (group, version) = resource
-            .api_version
-            .split_once('/')
-            .unwrap_or(("", resource.api_version.as_str()));
-        let api_resource =
-            ApiResource::from_gvk(&GroupVersionKind::gvk(group, version, &resource.kind));
+        let resolved = compiler_core::resolve_resource_api(resource)
+            .map_err(|_| invalid("adoption resource API is unsupported"))?;
+        let api_resource = ApiResource::from_gvk_with_plural(
+            &GroupVersionKind::gvk(&resolved.api_group, &resolved.version, &resolved.kind),
+            &resolved.plural,
+        );
         let api: Api<DynamicObject> =
             Api::namespaced_with(self.client.clone(), &resource.namespace, &api_resource);
         let current = api.get(&resource.name).await?;

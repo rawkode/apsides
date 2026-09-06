@@ -44,7 +44,7 @@ Create a JSON list of receipt paths relative to the list file, for example:
 ```
 
 ```sh
-cuenv exec -- target/debug/reakt merge-evidence \
+cuenv exec -- target/debug/aps merge-evidence \
   --artifact work/candidate \
   --fragments work/fragments.json \
   --output work/merged-evidence
@@ -196,7 +196,7 @@ Run the producer through the configured environment:
 cuenv exec python3 tests/reakt/run_reproducibility.py \
   --source examples/reakt/program.tsx \
   --profile work/build-profile.json \
-  --cli "$PWD/target/debug/reakt" \
+  --cli "$PWD/target/debug/aps" \
   --image-repository ghcr.io/rawkode/apsides-controller \
   --output work/reproducibility
 ```
@@ -246,7 +246,7 @@ cuenv exec python3 tests/reakt/run_input_isolation.py \
   --source examples/reakt/program.tsx \
   --artifact work/reproducibility/build-1 \
   --production-evidence work/reproducibility/evidence/production-evidence.json \
-  --cli "$PWD/target/debug/reakt" \
+  --cli "$PWD/target/debug/aps" \
   --output work/input-isolation
 ```
 

@@ -48,6 +48,19 @@ pub struct Lifecycle {
     pub deletion_policy: DeletionPolicy,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ApiResourceScope {
+    Namespaced,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApiResourceMapping {
+    pub plural: String,
+    pub scope: ApiResourceScope,
+    pub schema_sha256: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Resource {
@@ -56,6 +69,8 @@ pub struct Resource {
     pub id: String,
     pub api_version: String,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_resource: Option<ApiResourceMapping>,
     pub name: String,
     pub namespace: String,
     pub desired: Value,

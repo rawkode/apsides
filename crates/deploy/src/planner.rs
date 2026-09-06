@@ -14,15 +14,11 @@ use std::collections::{BTreeMap, BTreeSet};
 /// # Errors
 /// Rejects resource types outside the supported lifecycle set.
 pub fn resource_identity(resource: &Resource) -> Result<ResourceIdentity> {
-    let (api_group, plural) = match (resource.api_version.as_str(), resource.kind.as_str()) {
-        ("v1", "ConfigMap") => ("", "configmaps"),
-        ("v1", "Service") => ("", "services"),
-        ("apps/v1", "Deployment") => ("apps", "deployments"),
-        _ => return Err(Error::Plan("unsupported lifecycle resource".into())),
-    };
+    let api = compiler_core::resolve_resource_api(resource)
+        .map_err(|_| Error::Plan("unsupported lifecycle resource".into()))?;
     Ok(ResourceIdentity {
-        api_group: api_group.into(),
-        resource: plural.into(),
+        api_group: api.api_group,
+        resource: api.plural,
         namespace: resource.namespace.clone(),
         name: resource.name.clone(),
     })

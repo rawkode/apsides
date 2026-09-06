@@ -161,17 +161,13 @@ fn approval_identity(intent: &OwnershipIntent) -> ReviewIdentity {
     }
 }
 fn resource_identity(resource: &compiler_core::Resource) -> Result<ReviewIdentity> {
-    let (group, plural) = match (resource.api_version.as_str(), resource.kind.as_str()) {
-        ("v1", "ConfigMap") => ("", "configmaps"),
-        ("v1", "Service") => ("", "services"),
-        ("apps/v1", "Deployment") => ("apps", "deployments"),
-        _ => return Err(invalid("review managed API is unsupported")),
-    };
+    let identity = deploy::resource_identity(resource)
+        .map_err(|_| invalid("review managed API is unsupported"))?;
     Ok(ReviewIdentity {
-        api_group: group.into(),
-        resource: plural.into(),
-        namespace: resource.namespace.clone(),
-        name: resource.name.clone(),
+        api_group: identity.api_group,
+        resource: identity.resource,
+        namespace: identity.namespace,
+        name: identity.name,
     })
 }
 fn effects(compiled: &CompiledPlan) -> Result<Effects<'_>> {

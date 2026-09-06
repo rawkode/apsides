@@ -6,6 +6,7 @@ fn resource() -> Resource {
         id: "owned".into(),
         api_version: "v1".into(),
         kind: "ConfigMap".into(),
+        api_resource: None,
         name: "owned".into(),
         namespace: "workload".into(),
         force: false,

@@ -601,6 +601,23 @@ impl KubeRuntimeClient {
             &resource,
         ))
     }
+
+    pub(crate) fn resource_api(
+        &self,
+        resource: &Resource,
+    ) -> Result<Api<DynamicObject>, RuntimeError> {
+        let api = compiler_core::resolve_resource_api(resource)
+            .map_err(|error| RuntimeError::Plan(error.to_string()))?;
+        let resource_type = ApiResource::from_gvk_with_plural(
+            &GroupVersionKind::gvk(&api.api_group, &api.version, &api.kind),
+            &api.plural,
+        );
+        Ok(Api::namespaced_with(
+            self.client.clone(),
+            &resource.namespace,
+            &resource_type,
+        ))
+    }
 }
 
 fn validate_fixture_kubeconfig(
@@ -707,7 +724,7 @@ fn validate_fixture_kubeconfig(
 #[async_trait]
 impl RuntimeClient for KubeRuntimeClient {
     async fn apply_ssa(&self, resource: &Resource, desired: &Value) -> Result<(), RuntimeError> {
-        let api = self.api(&resource.api_version, &resource.kind, &resource.namespace)?;
+        let api = self.resource_api(resource)?;
         let selector = format!("metadata.name={}", resource.name);
         let mut listed = api
             .list(&ListParams::default().fields(&selector))
@@ -1075,7 +1092,9 @@ fn observation_from_object(object: &DynamicObject) -> Result<Observation, Runtim
 #[cfg(test)]
 mod tests {
     use super::*;
-    use compiler_core::{DeletionPolicy, Lifecycle, SourceLocation};
+    use compiler_core::{
+        ApiResourceMapping, ApiResourceScope, DeletionPolicy, Lifecycle, SourceLocation,
+    };
     use http::{Method, Request, Response, StatusCode, header::CONTENT_TYPE};
     use http_body_util::BodyExt;
     use kube::client::Body;
@@ -1100,6 +1119,7 @@ mod tests {
             id: "config".into(),
             api_version: "v1".into(),
             kind: "ConfigMap".into(),
+            api_resource: None,
             name: "config".into(),
             namespace: "workload".into(),
             desired,
@@ -1462,6 +1482,39 @@ mod tests {
             assert!(error.to_string().contains("nonzero resourceVersion"));
             assert_eq!(calls.lock().unwrap().len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn custom_resource_uses_declared_namespaced_plural() {
+        let desired = serde_json::json!({
+            "apiVersion":"postgresql.cnpg.io/v1","kind":"Cluster",
+            "metadata":{"name":"config","namespace":"workload"},
+            "spec":{"instances":1}
+        });
+        let mut declared = resource(desired.clone());
+        declared.api_version = "postgresql.cnpg.io/v1".into();
+        declared.kind = "Cluster".into();
+        declared.api_resource = Some(ApiResourceMapping {
+            plural: "clusters".into(),
+            scope: ApiResourceScope::Namespaced,
+            schema_sha256: format!("sha256:{}", "a".repeat(64)),
+        });
+        let list = serde_json::json!({
+            "apiVersion":"postgresql.cnpg.io/v1","kind":"ClusterList",
+            "metadata":{"resourceVersion":"0"},"items":[]
+        });
+        let (client, calls) = wire_client(vec![list]);
+        assert!(client.apply_ssa(&declared, &desired).await.is_err());
+        let calls = match calls.lock() {
+            Ok(calls) => calls,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0]
+                .uri
+                .starts_with("/apis/postgresql.cnpg.io/v1/namespaces/workload/clusters?")
+        );
     }
 
     #[test]

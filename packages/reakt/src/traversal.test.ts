@@ -1,4 +1,4 @@
-import { ConfigMap, Controller, Deployment, Fragment, useConfigMap, useResourceRef, useSecret, type DataProjection, type DomainOptions, type ReaktIR } from "./index.ts";
+import { ConfigMap, Controller, Deployment, Fragment, defineNamespacedResource, useConfigMap, useResourceRef, useSecret, type DataProjection, type DomainOptions, type ReaktIR } from "./index.ts";
 import { jsxDEV } from "./jsx-dev-runtime.ts";
 import { renderExport } from "./compiler.ts";
 
@@ -45,6 +45,38 @@ assert(ir.reactions.every(value => value.source.line === 20), "rollout source is
 assert(ir.inputs.find(value => value.id === "credentials")?.sensitive, "Secret sensitivity preserved");
 assert(JSON.stringify(ir) === JSON.stringify(compile(root)), "independent renders have stable IR");
 assert(!JSON.stringify(ir).includes("function"), "IR includes no callbacks");
+
+interface ClusterSpec { readonly instances: number; readonly storage: { readonly size: string } }
+const Cluster = defineNamespacedResource<ClusterSpec>({
+  apiVersion: "postgresql.cnpg.io/v1",
+  kind: "Cluster",
+  apiResource: { plural: "clusters", scope: "Namespaced", schemaSha256: `sha256:${"b".repeat(64)}` },
+});
+const customIR = compile(controller(element(Cluster, {
+  id: "database",
+  metadata: { name: "database", namespace: "workload" },
+  spec: { instances: 2, storage: { size: "1Gi" } },
+  deletionPolicy: "delete",
+}, 40)));
+const custom = customIR.resources[0]!;
+assert(custom.apiVersion === "postgresql.cnpg.io/v1" && custom.kind === "Cluster", "custom resource identity is factory-owned");
+assert(custom.apiResource?.plural === "clusters" && custom.apiResource.scope === "Namespaced", "custom discovery descriptor is carried into IR");
+assert((custom.desired as unknown as { spec: { instances: number } }).spec.instances === 2, "typed custom spec lowers to plain JSON");
+assert(custom.source.line === 40 && custom.lifecycle.deletionPolicy === "delete", "custom JSX preserves source and lifecycle controls");
+throws(() => defineNamespacedResource({
+  apiVersion: "postgresql.cnpg.io/v1",
+  kind: "Cluster",
+  apiResource: { plural: "clusters", scope: "Namespaced", schemaSha256: "sha256:bad" },
+}), "lowercase sha256 digest");
+throws(() => compile(controller(element(Cluster, {
+  metadata: { name: "database", namespace: "workload" },
+  apiVersion: "forged/v1",
+  spec: { instances: 2, storage: { size: "1Gi" } },
+}))), "unsupported field apiVersion");
+throws(() => compile(controller(element(Cluster, {
+  metadata: { name: "database", namespace: "workload" },
+  spec: new Date(),
+}))), "plain data");
 
 throws(() => useSecret({ name: "no-frame" }), "synchronous component");
 throws(() => compile(controller(element(async () => null, {}))), "promises are unsupported");

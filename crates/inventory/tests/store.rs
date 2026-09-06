@@ -112,6 +112,7 @@ async fn corruption_rejects_reads_and_idempotent_publication() {
 #[test]
 fn projection_excludes_private_values_and_rejects_unknown_fields() {
     let resource = compiler_core::Resource {
+        api_resource: None,
         force: false,
         id: "private-id-canary".into(),
         api_version: "v1".into(),

@@ -717,9 +717,7 @@ impl ProductionController {
         let initial = self.authority.verify(&self.plan).await?;
         validated_inventory_observations(inventory, &initial)?;
         let approved = approved_claim(&initial, resource)?.clone();
-        let api = self
-            .kube
-            .api(&resource.api_version, &resource.kind, &resource.namespace)?;
+        let api = self.kube.resource_api(resource)?;
         let selector = format!("metadata.name={}", resource.name);
         let listed = api
             .list(&ListParams::default().fields(&selector))
@@ -1128,23 +1126,7 @@ fn ensure_same_claim(
 }
 
 fn identity(resource: &Resource) -> Result<ResourceIdentity, RuntimeError> {
-    let (api_group, plural) = match (resource.api_version.as_str(), resource.kind.as_str()) {
-        ("v1", "ConfigMap") => ("", "configmaps"),
-        ("v1", "Service") => ("", "services"),
-        ("apps/v1", "Deployment") => ("apps", "deployments"),
-        _ => {
-            return Err(RuntimeError::Plan(format!(
-                "unsupported Kubernetes type {}/{}",
-                resource.api_version, resource.kind
-            )));
-        }
-    };
-    Ok(ResourceIdentity {
-        api_group: api_group.into(),
-        resource: plural.into(),
-        namespace: resource.namespace.clone(),
-        name: resource.name.clone(),
-    })
+    deploy::resource_identity(resource).map_err(|error| RuntimeError::Plan(error.to_string()))
 }
 
 fn snapshots(

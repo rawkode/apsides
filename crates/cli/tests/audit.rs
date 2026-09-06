@@ -18,7 +18,7 @@ fn audit_does_not_create_a_missing_database() -> Result<(), Box<dyn std::error::
             "current-context":"test"
         }))?,
     )?;
-    let output = Command::new(env!("CARGO_BIN_EXE_reakt"))
+    let output = Command::new(env!("CARGO_BIN_EXE_aps"))
         .args([
             "audit",
             "--domain",
@@ -39,7 +39,7 @@ fn audit_does_not_create_a_missing_database() -> Result<(), Box<dyn std::error::
     assert_eq!(output.status.code(), Some(1));
     let error = std::str::from_utf8(&output.stderr)?;
     assert!(
-        error.starts_with("reakt: coordination backend operation failed:"),
+        error.starts_with("aps: coordination backend operation failed:"),
         "{error}"
     );
     assert!(!error.contains(token));

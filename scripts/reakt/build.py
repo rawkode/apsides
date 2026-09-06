@@ -28,7 +28,7 @@ def assemble(artifact, source, profile_path, *, no_cache=False):
     tool = Path(profile["sbomTool"])
     if not tool.is_absolute():
         tool = profile_path.parent / tool
-    cli = Path(os.environ.get("REAKT_CLI", str(Path(__file__).resolve().parents[2] / "target/debug/reakt")))
+    cli = Path(os.environ.get("REAKT_CLI", str(Path(__file__).resolve().parents[2] / "target/debug/aps")))
     tools = capture_tools(tool, cli)
     context, image = artifact.with_name(artifact.name + ".oci-context"), artifact / "image"
     metadata = prepare(artifact, context, builder_image=profile["builderImage"], source_date_epoch=profile["sourceDateEpoch"])

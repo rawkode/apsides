@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 mod json;
 mod model;
+mod resource_api;
 mod review;
 mod rollout;
 mod schema;
@@ -21,6 +22,7 @@ mod validate;
 
 pub use json::{canonical_bytes, digest, parse_strict};
 pub use model::*;
+pub use resource_api::{ResolvedApiResource, resolve_namespaced_api, resolve_resource_api};
 pub use review::review_documents;
 pub use rollout::*;
 pub use semantic::*;

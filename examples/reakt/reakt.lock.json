@@ -3,11 +3,11 @@
   "inputs": [
     {
       "path": "api.tsx",
-      "sha256": "e0f0096dd36528837fff5d6e1f4a77598e313f3fa98cb23ed09590d5a28afae3"
+      "sha256": "703f984f5c67c496ba8c2f0a9e2f04994bcef2358a5c78b1fdf9216616aca2f6"
     },
     {
       "path": "program.tsx",
-      "sha256": "02e63e39115921e4f0cfeea454aa6d1aecaf6da107de84553cfed3b60da8fa24"
+      "sha256": "ffa277a14172f921e46286efefa703b3871291c19c762d2617fc1830887aa795"
     }
   ],
   "schemaVersion": "reakt.dev/source-lock/v1"

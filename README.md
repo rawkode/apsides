@@ -34,10 +34,10 @@ resource subset; unsupported operations fail validation.
 
 ```sh
 cargo build -p cli
-target/debug/reakt compile --source examples/reakt/program.tsx --output work/reakt-compiled
-target/debug/reakt check --ir work/reakt-compiled/ir.json
-target/debug/reakt build --source examples/reakt/program.tsx --output work/reakt-native --profile reakt.build.json
-target/debug/reakt verify --artifact work/reakt-native
+target/debug/aps compile --source examples/reakt/program.tsx --output work/reakt-compiled
+target/debug/aps check --ir work/reakt-compiled/ir.json
+target/debug/aps build --source examples/reakt/program.tsx --output work/reakt-native --profile reakt.build.json
+target/debug/aps verify --artifact work/reakt-native
 ```
 
 Use a fresh output directory for each build. The source path uses Oxc and Rolldown for compilation and Deno with denied filesystem, network, environment, subprocess, and remote-import permissions for evaluation. SES compartments constrain ambient JavaScript capabilities, and the compiler compares independent bundle and evaluation runs. Final release reproducibility requires the separate native/image checks. Local compilation emits the validated IR, recomputed effects and capabilities, generated scenario plan, Rust controller source, and an integrity manifest. The complete build uses a pinned [build profile](docs/reakt/OCI-PACKAGING.md#complete-cli-build), the prepared Cargo cache, Docker BuildKit, and cargo-cyclonedx to produce a Linux image, binary, SBOM, and compiler closure. `verify` checks local integrity and recomputes the plan; it does not establish approved provenance or production readiness.

@@ -140,18 +140,7 @@ fn validate_active_inventory(
 
 #[cfg(test)]
 fn resource_identity(resource: &Resource) -> Result<ResourceIdentity> {
-    let (group, plural) = match (resource.api_version.as_str(), resource.kind.as_str()) {
-        ("v1", "ConfigMap") => ("", "configmaps"),
-        ("v1", "Service") => ("", "services"),
-        ("apps/v1", "Deployment") => ("apps", "deployments"),
-        _ => return Err(invalid("unsupported cleanup resource")),
-    };
-    Ok(ResourceIdentity {
-        api_group: group.into(),
-        resource: plural.into(),
-        namespace: resource.namespace.clone(),
-        name: resource.name.clone(),
-    })
+    deploy::resource_identity(resource).map_err(|_| invalid("unsupported cleanup resource"))
 }
 
 fn metadata_api(
@@ -160,20 +149,16 @@ fn metadata_api(
     api_version: &str,
     kind: &str,
 ) -> Result<Api<DynamicObject>> {
-    let (group, version) = api_version.split_once('/').unwrap_or(("", api_version));
-    if group != identity.api_group
-        || !matches!(
-            (api_version, kind, identity.resource.as_str()),
-            ("v1", "ConfigMap", "configmaps")
-                | ("v1", "Service", "services")
-                | ("apps/v1", "Deployment", "deployments")
-        )
-    {
-        return Err(invalid("unsupported cleanup API identity"));
-    }
-    let ar = ApiResource::from_gvk_with_plural(
-        &GroupVersionKind::gvk(group, version, kind),
+    let resolved = compiler_core::resolve_namespaced_api(
+        api_version,
+        kind,
+        &identity.api_group,
         &identity.resource,
+    )
+    .map_err(|_| invalid("unsupported cleanup API identity"))?;
+    let ar = ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk(&resolved.api_group, &resolved.version, &resolved.kind),
+        &resolved.plural,
     );
     Ok(Api::namespaced_with(
         client.clone(),

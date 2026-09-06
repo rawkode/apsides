@@ -22,17 +22,17 @@ running the deployment protocol.
 ```sh
 cargo build -p cli
 
-target/debug/reakt compile \
+target/debug/aps compile \
   --source examples/reakt/program.tsx \
   --output work/reakt-compiled
 
 # First prepare a build profile using the contract below, then:
-target/debug/reakt build \
+target/debug/aps build \
   --source examples/reakt/program.tsx \
   --output work/reakt-native \
   --profile /path/to/reakt.build.json
 
-target/debug/reakt verify --artifact work/reakt-native
+target/debug/aps verify --artifact work/reakt-native
 ```
 
 Every output directory must be fresh. A build profile is not checked in: prepare

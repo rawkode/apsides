@@ -626,7 +626,7 @@ async fn drive_transition(
                 return Err(capacity::required_error(transition));
             }
             Err(platform::Error::Pending(reason)) if tokio::time::Instant::now() < deadline => {
-                let _ = writeln!(std::io::stderr().lock(), "reakt: {reason}");
+                let _ = writeln!(std::io::stderr().lock(), "aps: {reason}");
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             Err(error) => return Err(error.into()),

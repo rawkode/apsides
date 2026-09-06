@@ -45,6 +45,24 @@ export interface ObjectMetadata {
   readonly annotations?: Readonly<Record<string, string>>;
 }
 
+export interface NamespacedApiResourceDescriptor {
+  readonly plural: string;
+  readonly scope: "Namespaced";
+  readonly schemaSha256: string;
+}
+
+export interface NamespacedResourceDescriptor {
+  readonly apiVersion: string;
+  readonly kind: string;
+  readonly apiResource: NamespacedApiResourceDescriptor;
+}
+
+export interface NamespacedResourceDefinition<Spec> {
+  readonly id?: string;
+  readonly metadata: ObjectMetadata;
+  readonly spec: Spec;
+}
+
 export interface ConfigMapDefinition {
   readonly id?: string;
   readonly metadata: ObjectMetadata;
@@ -81,6 +99,10 @@ export interface ContainerDefinition {
     | { readonly configMapRef: { readonly name: string } }
     | { readonly secretRef: { readonly name: string } }
   )[];
+  readonly env?: readonly (
+    | { readonly name: string; readonly value: string }
+    | { readonly name: string; readonly valueFrom: { readonly secretKeyRef: { readonly name: string; readonly key: string } } }
+  )[];
   readonly resources?: {
     readonly requests?: Readonly<Partial<Record<"cpu" | "memory", string>>>;
     readonly limits?: Readonly<Partial<Record<"cpu" | "memory", string>>>;
@@ -102,6 +124,7 @@ export interface DeploymentDefinition {
       };
       readonly spec: {
         readonly serviceAccountName?: string;
+        readonly automountServiceAccountToken?: boolean;
         readonly containers: readonly ContainerDefinition[];
       };
     };
@@ -129,6 +152,15 @@ type DeploymentDesired = {
   readonly spec: DeploymentDefinition["spec"];
 };
 
+type NamespacedResourceDesired = {
+  readonly apiVersion: string;
+  readonly kind: string;
+  readonly metadata: ObjectMetadata;
+  readonly spec: Json;
+};
+
+type ResourceDesired = ConfigMapDesired | ServiceDesired | DeploymentDesired | NamespacedResourceDesired;
+
 const resourceState = Symbol("reakt.resource");
 const managedState = Symbol("reakt.managed");
 const inputState = Symbol("reakt.input");
@@ -137,9 +169,10 @@ const declareRollout = Symbol("reakt.declare-rollout");
 
 interface ResourceState {
   readonly id?: string;
-  readonly apiVersion: "v1" | "apps/v1";
-  readonly kind: "ConfigMap" | "Service" | "Deployment";
-  readonly desired: ConfigMapDesired | ServiceDesired | DeploymentDesired;
+  readonly apiVersion: string;
+  readonly kind: string;
+  readonly apiResource?: NamespacedApiResourceDescriptor;
+  readonly desired: ResourceDesired;
 }
 
 export class ConfigMap {
@@ -213,7 +246,29 @@ export class Deployment {
   }
 }
 
-export type ManageableResource = ConfigMap | Service | Deployment;
+/** Compiler-facing resource value created by defineNamespacedResource(). */
+export class NamespacedResource<Spec> {
+  readonly [resourceState]: ResourceState;
+
+  constructor(descriptor: NamespacedResourceDescriptor, definition: NamespacedResourceDefinition<Spec>) {
+    const resource = validateNamespacedResourceDescriptor(descriptor);
+    const value = record(definition, resource.kind);
+    exact(value, ["id", "metadata", "spec"], resource.kind);
+    const id = optionalId(value.id, `${resource.kind}.id`);
+    const metadata = validateMetadata(value.metadata, `${resource.kind}.metadata`);
+    const spec = canonical(record(value.spec, `${resource.kind}.spec`));
+    this[resourceState] = freeze({
+      ...(id === undefined ? {} : { id }),
+      apiVersion: resource.apiVersion,
+      kind: resource.kind,
+      apiResource: resource.apiResource,
+      desired: { apiVersion: resource.apiVersion, kind: resource.kind, metadata, spec },
+    });
+    Object.freeze(this);
+  }
+}
+
+export type ManageableResource = ConfigMap | Service | Deployment | NamespacedResource<unknown>;
 
 export interface ManageOptions {
   readonly force?: boolean;
@@ -239,11 +294,12 @@ export interface RolloutOptions {
 interface ResourceDeclaration {
   readonly force?: boolean;
   readonly id: string;
-  readonly apiVersion: "v1" | "apps/v1";
-  readonly kind: "ConfigMap" | "Service" | "Deployment";
+  readonly apiVersion: string;
+  readonly kind: string;
+  readonly apiResource?: NamespacedApiResourceDescriptor;
   readonly name: string;
   readonly namespace: string;
-  readonly desired: ConfigMapDesired | ServiceDesired | DeploymentDesired;
+  readonly desired: ResourceDesired;
   readonly lifecycle: { readonly deletionPolicy: "orphan" | "delete" };
   readonly source: SourceLocation;
 }
@@ -361,8 +417,8 @@ export class Domain {
   }
 
   manage<R extends ManageableResource>(resource: R, options: ManageOptions): ManagedResource<R> {
-    if (!(resource instanceof ConfigMap || resource instanceof Service || resource instanceof Deployment)) {
-      throw new Error("manage() accepts only Reakt ConfigMap, Service, or Deployment values");
+    if (!(resource instanceof ConfigMap || resource instanceof Service || resource instanceof Deployment || resource instanceof NamespacedResource)) {
+      throw new Error("manage() accepts only Reakt resource values");
     }
     const rawOptions = record(options, "manage options");
     exact(rawOptions, ["id", "deletionPolicy", "force", "source"], "manage options");
@@ -375,7 +431,9 @@ export class Domain {
     const deletionPolicy = rawOptions.deletionPolicy === undefined ? (this.#state.options.prune ? "delete" : "orphan") : enumValue(rawOptions.deletionPolicy, ["orphan", "delete"] as const, "manage.deletionPolicy");
     const force = optionalBoolean(rawOptions.force, "manage.force") ?? this.#state.options.force ?? false;
     if (this.#state.resources.has(id)) throw new Error(`duplicate managed resource id: ${id}`);
-    const identity = `${definition.apiVersion}/${definition.kind}/${namespace}/${name}`;
+    const identity = definition.apiResource === undefined
+      ? `${definition.apiVersion}/${definition.kind}/${namespace}/${name}`
+      : `${definition.apiVersion.split("/")[0]}/${definition.apiResource.plural}/${namespace}/${name}`;
     const identityOwner = this.#state.identities.get(identity);
     if (identityOwner !== undefined) throw new Error(`managed resource ${identity} is already declared as ${identityOwner}`);
     const observedOwner = this.#state.inputIdentities.get(`v1/${definition.kind}/${namespace}/${name}`);
@@ -386,7 +444,18 @@ export class Domain {
     }
     if (this.#state.resources.size >= this.#state.options.budgets.maxResources) throw new Error("domain maxResources budget exceeded");
     if (this.#state.resources.size >= this.#state.options.budgets.maxQueueDepth) throw new Error("domain maxQueueDepth cannot hold every managed resource");
-    const declaration = freeze({ id, apiVersion: definition.apiVersion, kind: definition.kind, name, namespace, desired, ...(force ? { force: true } : {}), lifecycle: { deletionPolicy }, source });
+    const declaration = freeze({
+      id,
+      apiVersion: definition.apiVersion,
+      kind: definition.kind,
+      ...(definition.apiResource === undefined ? {} : { apiResource: definition.apiResource }),
+      name,
+      namespace,
+      desired,
+      ...(force ? { force: true } : {}),
+      lifecycle: { deletionPolicy },
+      source,
+    });
     this.#state.resources.set(id, declaration);
     this.#state.identities.set(identity, id);
     return ManagedResource.create(this, declaration, resource);
@@ -502,6 +571,33 @@ export class Domain {
 
 export function defineDomain(options: DomainOptions): Domain {
   return new Domain(options);
+}
+
+export function validateNamespacedResourceDescriptor(value: unknown): NamespacedResourceDescriptor {
+  const descriptor = record(value, "namespaced resource descriptor");
+  exact(descriptor, ["apiVersion", "kind", "apiResource"], "namespaced resource descriptor");
+  const apiVersion = boundedText(descriptor.apiVersion, 253, "namespaced resource descriptor.apiVersion");
+  const apiVersionParts = apiVersion.split("/");
+  const [group, version] = apiVersionParts;
+  if (apiVersionParts.length !== 2 || group === undefined || version === undefined) throw new Error("namespaced resource descriptor.apiVersion must contain a custom resource group and version");
+  for (const groupPart of group.split(".")) {
+    dnsLabel(groupPart, 63, "namespaced resource descriptor.apiVersion group");
+  }
+  dnsLabel(version, 63, "namespaced resource descriptor.apiVersion version");
+  const kind = boundedText(descriptor.kind, 63, "namespaced resource descriptor.kind");
+  if (!/^[A-Z][A-Za-z0-9]*$/.test(kind)) throw new Error("namespaced resource descriptor.kind must be an upper camel case Kubernetes kind");
+  if (["ConfigMap", "Secret", "Service", "Deployment"].includes(kind)) {
+    throw new Error(`namespaced resource descriptor.kind cannot replace built-in ${kind}`);
+  }
+  const rawApiResource = record(descriptor.apiResource, "namespaced resource descriptor.apiResource");
+  exact(rawApiResource, ["plural", "scope", "schemaSha256"], "namespaced resource descriptor.apiResource");
+  const plural = dnsLabel(rawApiResource.plural, 63, "namespaced resource descriptor.apiResource.plural");
+  const scope = enumValue(rawApiResource.scope, ["Namespaced"] as const, "namespaced resource descriptor.apiResource.scope");
+  const schemaSha256 = text(rawApiResource.schemaSha256, "namespaced resource descriptor.apiResource.schemaSha256");
+  if (!/^sha256:[0-9a-f]{64}$/.test(schemaSha256)) {
+    throw new Error("namespaced resource descriptor.apiResource.schemaSha256 must be a lowercase sha256 digest");
+  }
+  return freeze({ apiVersion, kind, apiResource: { plural, scope, schemaSha256 } });
 }
 
 type Watchable = ManagedResource<ConfigMap> | ObservedInput;
@@ -766,7 +862,8 @@ function validateDeploymentSpec(value: unknown): DeploymentDefinition["spec"] {
     throw new Error("reakt.dev/revision is reserved for the rollout primitive");
   }
   const podSpec = record(template.spec, "Deployment.spec.template.spec");
-  exact(podSpec, ["serviceAccountName", "containers"], "Deployment.spec.template.spec");
+  exact(podSpec, ["serviceAccountName", "automountServiceAccountToken", "containers"], "Deployment.spec.template.spec");
+  const automount = optionalBoolean(podSpec.automountServiceAccountToken, "Deployment.spec.template.spec.automountServiceAccountToken");
   const containers = array(podSpec.containers, "Deployment containers").map(validateContainer);
   const names = new Set<string>();
   for (const container of containers) {
@@ -789,6 +886,7 @@ function validateDeploymentSpec(value: unknown): DeploymentDefinition["spec"] {
       },
       spec: {
         ...(podSpec.serviceAccountName === undefined ? {} : { serviceAccountName: text(podSpec.serviceAccountName, "Deployment.spec.template.spec.serviceAccountName") }),
+        ...(automount === undefined ? {} : { automountServiceAccountToken: automount }),
         containers,
       },
     },
@@ -798,7 +896,7 @@ function validateDeploymentSpec(value: unknown): DeploymentDefinition["spec"] {
 function validateContainer(value: unknown, index: number): ContainerDefinition {
   const context = `Deployment containers[${index}]`;
   const container = record(value, context);
-  exact(container, ["name", "image", "imagePullPolicy", "ports", "envFrom", "resources"], context);
+  exact(container, ["name", "image", "imagePullPolicy", "ports", "env", "envFrom", "resources"], context);
   const ports = container.ports === undefined ? undefined : array(container.ports, `${context}.ports`).map((entry, portIndex) => {
     const item = record(entry, `${context}.ports[${portIndex}]`);
     exact(item, ["name", "containerPort", "protocol"], `${context}.ports[${portIndex}]`);
@@ -818,6 +916,35 @@ function validateContainer(value: unknown, index: number): ContainerDefinition {
     const name = text(reference.name, `${context}.envFrom[${envIndex}].${key}.name`);
     return key === "configMapRef" ? freeze({ configMapRef: { name } }) : freeze({ secretRef: { name } });
   });
+  const envNames = new Set<string>();
+  const env = container.env === undefined ? undefined : array(container.env, `${context}.env`).map((entry, envIndex) => {
+    const envContext = `${context}.env[${envIndex}]`;
+    const item = record(entry, envContext);
+    exact(item, ["name", "value", "valueFrom"], envContext);
+    const name = text(item.name, `${envContext}.name`);
+    if (envNames.has(name)) throw new Error(`duplicate Deployment environment variable name: ${name}`);
+    envNames.add(name);
+    const hasValue = Object.prototype.hasOwnProperty.call(item, "value");
+    const hasValueFrom = Object.prototype.hasOwnProperty.call(item, "valueFrom");
+    if (hasValue === hasValueFrom) throw new Error(`${envContext} requires exactly one of value or valueFrom`);
+    if (hasValue) {
+      if (typeof item.value !== "string") throw new Error(`${envContext}.value must be a string`);
+      return freeze({ name, value: item.value });
+    }
+    const valueFrom = record(item.valueFrom, `${envContext}.valueFrom`);
+    exact(valueFrom, ["secretKeyRef"], `${envContext}.valueFrom`);
+    const secretKeyRef = record(valueFrom.secretKeyRef, `${envContext}.valueFrom.secretKeyRef`);
+    exact(secretKeyRef, ["name", "key"], `${envContext}.valueFrom.secretKeyRef`);
+    return freeze({
+      name,
+      valueFrom: {
+        secretKeyRef: {
+          name: text(secretKeyRef.name, `${envContext}.valueFrom.secretKeyRef.name`),
+          key: text(secretKeyRef.key, `${envContext}.valueFrom.secretKeyRef.key`),
+        },
+      },
+    });
+  });
   let resources: ContainerDefinition["resources"];
   if (container.resources !== undefined) {
     const item = record(container.resources, `${context}.resources`);
@@ -836,6 +963,7 @@ function validateContainer(value: unknown, index: number): ContainerDefinition {
     image: text(container.image, `${context}.image`),
     ...(container.imagePullPolicy === undefined ? {} : { imagePullPolicy: enumValue(container.imagePullPolicy, ["Always", "IfNotPresent", "Never"] as const, `${context}.imagePullPolicy`) }),
     ...(ports === undefined ? {} : { ports }),
+    ...(env === undefined ? {} : { env }),
     ...(envFrom === undefined ? {} : { envFrom }),
     ...(resources === undefined ? {} : { resources }),
   });

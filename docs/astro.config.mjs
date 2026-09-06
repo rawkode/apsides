@@ -40,6 +40,7 @@ export default defineConfig({
           items: [
             { label: "TypeScript authoring", slug: "guides/typescript-authoring" },
             { label: "Build and deploy", slug: "guides/build-and-deploy" },
+            { label: "Custom resources", slug: "guides/custom-resources" },
           ],
         },
         {

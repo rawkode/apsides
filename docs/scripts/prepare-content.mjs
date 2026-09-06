@@ -10,6 +10,7 @@ const pages = [
   ["concepts/inventory-prune-upgrades.md", "concepts/inventory-prune-upgrades.md"],
   ["guides/typescript-authoring.md", "guides/typescript-authoring.md"],
   ["guides/build-and-deploy.md", "guides/build-and-deploy.md"],
+  ["guides/custom-resources.md", "guides/custom-resources.md"],
   ["reference/index.md", "reference/index.md"],
 ];
 

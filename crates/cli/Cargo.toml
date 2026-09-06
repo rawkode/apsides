@@ -7,7 +7,7 @@ license.workspace = true
 publish = false
 
 [[bin]]
-name = "reakt"
+name = "aps"
 path = "src/main.rs"
 
 [dependencies]

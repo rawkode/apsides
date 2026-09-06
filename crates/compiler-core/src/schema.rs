@@ -95,7 +95,9 @@ fn allowed_fields(path: &str, kind: &str) -> Option<&'static [&'static str]> {
         }
         "/spec/template/spec/containers/*/envFrom/*/configMapRef"
         | "/spec/template/spec/containers/*/envFrom/*/secretRef" => Some(&["name"]),
-        "/spec/template/spec/containers/*/env/*" => Some(&["name", "value"]),
+        "/spec/template/spec/containers/*/env/*" => Some(&["name", "value", "valueFrom"]),
+        "/spec/template/spec/containers/*/env/*/valueFrom" => Some(&["secretKeyRef"]),
+        "/spec/template/spec/containers/*/env/*/valueFrom/secretKeyRef" => Some(&["name", "key"]),
         "/spec/template/spec/containers/*/resources" => Some(&["requests", "limits"]),
         "/spec/template/spec/containers/*/resources/requests"
         | "/spec/template/spec/containers/*/resources/limits" => Some(&["cpu", "memory"]),
@@ -142,6 +144,52 @@ fn effect_vocabulary(value: &Value, path: &str, kind: &str, source: &str) -> Res
     Ok(())
 }
 
+fn custom_effect_vocabulary(value: &Value, path: &str, source: &str) -> Result<()> {
+    match value {
+        Value::Object(map) => {
+            let allowed = match path {
+                "" => Some(&["apiVersion", "kind", "metadata", "spec"][..]),
+                "/metadata" => Some(&["name", "namespace", "labels", "annotations"][..]),
+                _ => None,
+            };
+            if allowed.is_some_and(|fields| map.keys().any(|key| !fields.contains(&key.as_str()))) {
+                return Err(invalid(
+                    source,
+                    &format!("unsupported custom resource field at {path}"),
+                ));
+            }
+            if path.ends_with("/annotations") && map.contains_key(REVISION_ANNOTATION) {
+                return Err(invalid(
+                    source,
+                    "reserved rollout annotation has a compiled writer",
+                ));
+            }
+            if map.len() > 1024 || map.keys().any(|key| key.is_empty() || key.len() > 253) {
+                return Err(invalid(source, "custom resource object is oversized"));
+            }
+            for (key, child) in map {
+                custom_effect_vocabulary(child, &format!("{path}/{key}"), source)?;
+            }
+        }
+        Value::Array(values) => {
+            if values.len() > 128 {
+                return Err(invalid(source, "array exceeds supported cardinality"));
+            }
+            for child in values {
+                custom_effect_vocabulary(child, &format!("{path}/*"), source)?;
+            }
+        }
+        Value::Null => {
+            return Err(invalid(
+                source,
+                "null custom resource fields are unsupported",
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_resource(resource: &Resource) -> Result<()> {
     let source = format!(
         "{}:{}:{} resource {}",
@@ -158,13 +206,32 @@ pub(crate) fn validate_resource(resource: &Resource) -> Result<()> {
             "desired identity differs from declared fixed identity",
         ));
     }
-    match resource.kind.as_str() {
-        "ConfigMap" => upstream_shape::<ConfigMap>(value, &source)?,
-        "Service" => upstream_shape::<Service>(value, &source)?,
-        "Deployment" => upstream_shape::<Deployment>(value, &source)?,
+    match (resource.kind.as_str(), resource.api_resource.is_some()) {
+        ("ConfigMap", false) => upstream_shape::<ConfigMap>(value, &source)?,
+        ("Service", false) => upstream_shape::<Service>(value, &source)?,
+        ("Deployment", false) => upstream_shape::<Deployment>(value, &source)?,
+        (_, true) => {
+            if !value.is_object()
+                || !value.get("spec").is_some_and(Value::is_object)
+                || !value.get("metadata").is_some_and(Value::is_object)
+            {
+                return Err(invalid(
+                    &source,
+                    "custom managed resource requires object metadata and spec",
+                ));
+            }
+            for field in ["labels", "annotations"] {
+                if let Some(map) = value.pointer(&format!("/metadata/{field}")) {
+                    string_map(map, &format!("{source} metadata.{field}"))?;
+                }
+            }
+            custom_effect_vocabulary(value, "", &source)?;
+        }
         _ => return Err(invalid(&source, "unsupported managed type")),
     }
-    effect_vocabulary(value, "", &resource.kind, &source)?;
+    if resource.api_resource.is_none() {
+        effect_vocabulary(value, "", &resource.kind, &source)?;
+    }
     if resource.kind == "Service"
         && value["spec"]
             .get("type")
@@ -207,6 +274,7 @@ fn deployment_contract(value: &Value, source: &str) -> Result<()> {
     {
         return Err(invalid(source, "replicas exceeds supported range"));
     }
+    deployment_env_contract(value, source)?;
     let containers = value
         .pointer("/spec/template/spec/containers")
         .and_then(Value::as_array)
@@ -241,6 +309,40 @@ fn deployment_contract(value: &Value, source: &str) -> Result<()> {
         .is_some_and(|value| value != true)
     {
         return Err(invalid(source, "runAsNonRoot must be true when declared"));
+    }
+    Ok(())
+}
+
+fn deployment_env_contract(value: &Value, source: &str) -> Result<()> {
+    let containers = value
+        .pointer("/spec/template/spec/containers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid(source, "Deployment containers are required"))?;
+    for container in containers {
+        let Some(env) = container.get("env").and_then(Value::as_array) else {
+            continue;
+        };
+        for variable in env {
+            let direct = variable.get("value").and_then(Value::as_str);
+            let secret = variable.pointer("/valueFrom/secretKeyRef");
+            if direct.is_some() == secret.is_some() {
+                return Err(invalid(
+                    source,
+                    "Deployment env requires exactly one value or secretKeyRef",
+                ));
+            }
+            if let Some(secret) = secret {
+                let name = secret.get("name").and_then(Value::as_str);
+                let key = secret.get("key").and_then(Value::as_str);
+                if name.is_none_or(str::is_empty)
+                    || key.is_none_or(str::is_empty)
+                    || name.is_some_and(|value| value.len() > 253)
+                    || key.is_some_and(|value| value.len() > 253)
+                {
+                    return Err(invalid(source, "Deployment secretKeyRef is invalid"));
+                }
+            }
+        }
     }
     Ok(())
 }

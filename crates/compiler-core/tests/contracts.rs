@@ -170,6 +170,60 @@ fn capabilities_follow_requests_and_do_not_sneak_in_cleanup() {
 }
 
 #[test]
+fn deployment_secret_key_reference_is_validated_and_reported_as_risk() -> Result<()> {
+    let mut value = fixture();
+    value["resources"][0]["desired"]["spec"]["template"]["spec"]["containers"][0]["env"] = json!([{"name":"PGRST_DB_URI","valueFrom":{"secretKeyRef":{
+        "name":"database-app","key":"uri"
+    }}}]);
+    let plan = parse_and_validate(&value.to_string())?;
+    assert!(
+        plan.indirect_risks
+            .contains(&"workload-secret-reference".into())
+    );
+
+    let mut ambiguous = value.clone();
+    ambiguous["resources"][0]["desired"]["spec"]["template"]["spec"]["containers"][0]["env"][0]["value"] =
+        json!("private");
+    assert!(parse_and_validate(&ambiguous.to_string()).is_err());
+
+    value["resources"][0]["desired"]["spec"]["template"]["spec"]["containers"][0]["env"][0]["valueFrom"]
+        ["secretKeyRef"]["optional"] = json!(true);
+    assert!(parse_and_validate(&value.to_string()).is_err());
+    Ok(())
+}
+
+#[test]
+fn custom_resource_mapping_drives_exact_capabilities_and_base_validation() -> Result<()> {
+    let mut value = fixture();
+    value["resources"] = json!([{
+        "id":"database","apiVersion":"postgresql.cnpg.io/v1","kind":"Cluster",
+        "apiResource":{"plural":"clusters","scope":"Namespaced",
+            "schemaSha256":format!("sha256:{}", "a".repeat(64))},
+        "name":"database","namespace":"workload",
+        "desired":{"apiVersion":"postgresql.cnpg.io/v1","kind":"Cluster",
+            "metadata":{"name":"database","namespace":"workload"},
+            "spec":{"instances":1,"storage":{"size":"1Gi"}}},
+        "lifecycle":{"deletionPolicy":"orphan"},"source":source()
+    }]);
+    value["reactions"] = json!([]);
+    let plan = parse_and_validate(&value.to_string())?;
+    assert!(plan.capabilities.iter().any(|capability| {
+        capability.api_group == "postgresql.cnpg.io"
+            && capability.resource == "clusters"
+            && capability.verb == "patch"
+            && matches!(capability.names.as_slice(), [name] if name == "database")
+    }));
+
+    let mut remapped_builtin = fixture();
+    remapped_builtin["resources"][0]["apiResource"] = value["resources"][0]["apiResource"].clone();
+    assert!(parse_and_validate(&remapped_builtin.to_string()).is_err());
+
+    value["resources"][0]["desired"]["status"] = json!({});
+    assert!(parse_and_validate(&value.to_string()).is_err());
+    Ok(())
+}
+
+#[test]
 fn independent_ceiling_requires_scope_gaps_risks_and_unmodified_derivation() {
     let plan = plan(&fixture());
     let policy = ceiling(&plan);

@@ -187,7 +187,7 @@ class ReactorRunner:
         raise RuntimeError(f"deadline exceeded: {label}")
 
     def validate_inputs(self):
-        verifier = self.root / "target/debug/reakt"
+        verifier = self.root / "target/debug/aps"
         self.command([str(verifier), "verify", "--artifact", str(self.artifact)])
         if self.ir.get("testOnly") is not True:
             raise RuntimeError("cluster runner accepts only compiler-marked testOnly IR")
@@ -620,7 +620,7 @@ echo REAKT_INIT_EGRESS_DENIED
 
     def semantic_results(self):
         destination = self.output / "semantic"
-        result = self.command([str(self.root / "target/debug/reakt"), "test", "--ir", str(self.artifact / "controller/src/ir.json"),
+        result = self.command([str(self.root / "target/debug/aps"), "test", "--ir", str(self.artifact / "controller/src/ir.json"),
                                "--output", str(destination)], check=False)
         if not (destination / "results.json").is_file():
             raise RuntimeError(f"semantic runner produced no results: {result.stderr[-1000:]}")

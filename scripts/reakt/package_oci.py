@@ -125,7 +125,7 @@ def prepare(artifact, output, repository=ROOT, builder_image=BUILDER, source_dat
     if output == artifact or artifact in output.parents:
         raise ValueError("build context must be outside the input artifact")
     # Reuse the trusted IR/artifact validator. Packaging adds no approval semantics.
-    command([os.environ.get("REAKT_CLI", str(repository / "target/debug/reakt")), "verify", "--artifact", str(artifact)])
+    command([os.environ.get("REAKT_CLI", str(repository / "target/debug/aps")), "verify", "--artifact", str(artifact)])
     manifest_bytes = read_regular(artifact / "manifest.json")
     manifest = json.loads(manifest_bytes)
     lock = read_regular(artifact / "controller/Cargo.lock")
@@ -182,7 +182,7 @@ def verify_context(context):
         raise ValueError("prepared context file set or contents changed")
     if sha256(read_regular(context / "controller/Cargo.lock")) != metadata["controllerLockDigest"]:
         raise ValueError("controller lock identity changed")
-    checked_ir = json.loads(command([os.environ.get("REAKT_CLI", str(ROOT / "target/debug/reakt")), "check", "--ir", str(context / "controller/src/ir.json")]))
+    checked_ir = json.loads(command([os.environ.get("REAKT_CLI", str(ROOT / "target/debug/aps")), "check", "--ir", str(context / "controller/src/ir.json")]))
     if checked_ir.get("status") != "valid" or checked_ir.get("irDigest") != metadata["irDigest"]:
         raise ValueError("context IR digest differs from the validated embedded IR")
     return metadata

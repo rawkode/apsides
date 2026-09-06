@@ -298,18 +298,7 @@ pub(crate) fn validate_binding(binding: &RuntimeBinding) -> Result<()> {
 }
 
 pub(crate) fn resource_identity(resource: &compiler_core::Resource) -> Result<ResourceIdentity> {
-    let (api_group, plural) = match (resource.api_version.as_str(), resource.kind.as_str()) {
-        ("v1", "ConfigMap") => ("", "configmaps"),
-        ("v1", "Service") => ("", "services"),
-        ("apps/v1", "Deployment") => ("apps", "deployments"),
-        _ => return Err(invalid("unsupported resource identity")),
-    };
-    Ok(ResourceIdentity {
-        api_group: api_group.into(),
-        resource: plural.into(),
-        namespace: resource.namespace.clone(),
-        name: resource.name.clone(),
-    })
+    deploy::resource_identity(resource).map_err(|_| invalid("unsupported resource identity"))
 }
 
 fn verify_claims(plan: &CompiledPlan, activation: &ActivationState) -> Result<()> {

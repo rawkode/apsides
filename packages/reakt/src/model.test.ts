@@ -1,12 +1,14 @@
 import {
   ConfigMap,
   Deployment,
+  NamespacedResource,
   Secret,
   Service,
   defineDomain,
   generateFixtureBundle,
   materializeFixtureIR,
   watch,
+  type ContainerDefinition,
   type DomainBudgets,
   type SourceLocation,
 } from "./model.ts";
@@ -50,6 +52,19 @@ function deployment(id = "api", containers = [{ name: "api", image: "example.tes
   });
 }
 
+function deploymentWithEnv(env: NonNullable<ContainerDefinition["env"]>) {
+  return new Deployment({
+    metadata: { name: "postgrest", namespace: "workload" },
+    spec: {
+      selector: { matchLabels: { app: "postgrest" } },
+      template: {
+        metadata: { labels: { app: "postgrest" } },
+        spec: { containers: [{ name: "postgrest", image: "example.test/postgrest@sha256:abc", env }] },
+      },
+    },
+  });
+}
+
 function build(order: "service-first" | "service-last") {
   const value = domain();
   const service = () => value.manage(new Service({
@@ -82,6 +97,49 @@ assert(!("requestPlan" in ir) && !("testPlan" in ir) && !("capabilities" in ir),
 assert(!containsFunction(ir), "IR must contain no runtime callbacks");
 assert(Object.isFrozen(ir) && Object.isFrozen(ir.resources), "IR snapshots must be immutable");
 
+const clusterDescriptor = {
+  apiVersion: "postgresql.cnpg.io/v1",
+  kind: "Cluster",
+  apiResource: {
+    plural: "clusters",
+    scope: "Namespaced" as const,
+    schemaSha256: `sha256:${sha256}`,
+  },
+};
+const custom = domain("custom");
+custom.manage(new NamespacedResource(clusterDescriptor, {
+  id: "database",
+  metadata: { name: "database", namespace: "workload" },
+  spec: { instances: 2, storage: { size: "1Gi" } },
+}), { deletionPolicy: "delete", source });
+const customDeclaration = custom.toIR().resources[0]!;
+equal(customDeclaration.apiVersion, "postgresql.cnpg.io/v1", "custom apiVersion is descriptor-owned");
+equal(customDeclaration.kind, "Cluster", "custom kind is descriptor-owned");
+equal(customDeclaration.apiResource?.plural, "clusters", "custom discovery metadata is carried into IR");
+equal(customDeclaration.apiResource?.schemaSha256, `sha256:${sha256}`, "custom schema digest is carried into IR");
+equal((customDeclaration.desired as unknown as { spec: { instances: number } }).spec.instances, 2, "custom spec is preserved as JSON");
+assert(ir.resources.every((resource) => resource.apiResource === undefined), "built-in resources omit custom discovery metadata");
+throws(() => new NamespacedResource(clusterDescriptor, {
+  metadata: { name: "bad", namespace: "workload" },
+  spec: new Date(),
+}), "plain data object");
+throws(() => new NamespacedResource({
+  ...clusterDescriptor,
+  apiResource: { ...clusterDescriptor.apiResource, schemaSha256: `sha256:${sha256.toUpperCase()}` },
+}, { metadata: { name: "bad", namespace: "workload" }, spec: {} }), "lowercase sha256 digest");
+throws(() => new NamespacedResource({
+  ...clusterDescriptor,
+  kind: "Deployment",
+}, { metadata: { name: "bad", namespace: "workload" }, spec: {} }), "cannot replace built-in");
+throws(() => custom.manage(new NamespacedResource({
+  ...clusterDescriptor,
+  apiVersion: "postgresql.cnpg.io/v1beta1",
+  kind: "DatabaseCluster",
+}, {
+  metadata: { name: "database", namespace: "workload" },
+  spec: {},
+}), { source }), "already declared");
+
 const generated = generateFixtureBundle(ir, { workloadImage: "reakt-fixture:local" });
 equal(generated.inputs.length, 1, "observed input fixture generated from IR");
 equal(generated.workloadSubstitutions.length, 1, "Deployment fixture generated from IR");
@@ -107,6 +165,66 @@ throws(() => new Deployment({
   metadata: { name: "bad", namespace: "workload" },
   spec: { selector: { matchLabels: { app: "bad" } }, template: { metadata: { labels: { app: "bad" }, annotations: { "reakt.dev/revision": "forged" } }, spec: { containers: [{ name: "bad", image: "bad" }] } } },
 }), "reserved");
+
+const tokenless = domain("tokenless");
+tokenless.manage(new Deployment({
+  metadata: { name: "api", namespace: "workload" },
+  spec: {
+    selector: { matchLabels: { app: "api" } },
+    template: {
+      metadata: { labels: { app: "api" } },
+      spec: {
+        automountServiceAccountToken: false,
+        containers: [{ name: "api", image: "example.test/api@sha256:abc" }],
+      },
+    },
+  },
+}), { source });
+const tokenlessDesired = tokenless.toIR().resources[0]?.desired as unknown as {
+  spec: { template: { spec: { automountServiceAccountToken?: boolean } } };
+};
+equal(tokenlessDesired.spec.template.spec.automountServiceAccountToken, false, "disabled ServiceAccount token automount is preserved");
+throws(() => new Deployment({
+  metadata: { name: "bad", namespace: "workload" },
+  spec: {
+    selector: { matchLabels: { app: "bad" } },
+    template: {
+      metadata: { labels: { app: "bad" } },
+      spec: {
+        automountServiceAccountToken: "false",
+        containers: [{ name: "bad", image: "bad" }],
+      },
+    },
+  },
+} as never), "must be a boolean");
+
+const environment = domain("environment");
+environment.manage(deploymentWithEnv([
+  { name: "PGRST_DB_SCHEMAS", value: "public" },
+  { name: "EMPTY_ALLOWED", value: "" },
+  { name: "PGRST_DB_URI", valueFrom: { secretKeyRef: { name: "database-app", key: "uri" } } },
+]), { source });
+const normalizedEnv = (environment.toIR().resources[0]?.desired as unknown as {
+  spec: { template: { spec: { containers: readonly ContainerDefinition[] } } };
+}).spec.template.spec.containers[0]?.env;
+equal(normalizedEnv?.[0]?.name, "PGRST_DB_SCHEMAS", "literal environment name is preserved");
+equal("value" in normalizedEnv![1]! ? normalizedEnv![1]!.value : undefined, "", "empty literal environment values are supported");
+equal("valueFrom" in normalizedEnv![2]! ? normalizedEnv![2]!.valueFrom.secretKeyRef.key : undefined, "uri", "Secret key reference is normalized");
+assert(Object.isFrozen(normalizedEnv) && Object.isFrozen(normalizedEnv?.[2]), "environment snapshot is immutable");
+throws(() => deploymentWithEnv([
+  { name: "DUPLICATE", value: "one" },
+  { name: "DUPLICATE", value: "two" },
+]), "duplicate Deployment environment variable name");
+throws(() => deploymentWithEnv([{
+  name: "AMBIGUOUS",
+  value: "plain",
+  valueFrom: { secretKeyRef: { name: "database-app", key: "uri" } },
+} as never]), "exactly one of value or valueFrom");
+throws(() => deploymentWithEnv([{ name: "MISSING" } as never]), "exactly one of value or valueFrom");
+throws(() => deploymentWithEnv([{
+  name: "PGRST_DB_URI",
+  valueFrom: { secretKeyRef: { name: "database-app", key: "" } },
+}]), "must be a nonempty string");
 
 const crossA = domain("a");
 const crossB = domain("b");

@@ -1,4 +1,6 @@
-use compiler_core::{DeletionPolicy, Lifecycle, Resource, SourceLocation};
+use compiler_core::{
+    ApiResourceMapping, ApiResourceScope, DeletionPolicy, Lifecycle, Resource, SourceLocation,
+};
 use deploy::{Error, ResourceIdentity, resource_identity};
 use serde_json::json;
 
@@ -8,6 +10,7 @@ fn resource(api_version: &str, kind: &str) -> Resource {
         id: "fixture".into(),
         api_version: api_version.into(),
         kind: kind.into(),
+        api_resource: None,
         name: "fixture".into(),
         namespace: "workload".into(),
         desired: json!({}),
@@ -48,4 +51,28 @@ fn rejects_unsupported_lifecycle_resource_identity() {
         resource_identity(&resource("v1", "Secret")),
         Err(Error::Plan("unsupported lifecycle resource".into()))
     );
+}
+
+#[test]
+fn projects_custom_resource_identity_and_rejects_builtin_remapping() -> Result<(), Error> {
+    let mut cluster = resource("postgresql.cnpg.io/v1", "Cluster");
+    cluster.api_resource = Some(ApiResourceMapping {
+        plural: "clusters".into(),
+        scope: ApiResourceScope::Namespaced,
+        schema_sha256: format!("sha256:{}", "a".repeat(64)),
+    });
+    assert_eq!(
+        resource_identity(&cluster)?,
+        ResourceIdentity {
+            api_group: "postgresql.cnpg.io".into(),
+            resource: "clusters".into(),
+            namespace: "workload".into(),
+            name: "fixture".into(),
+        }
+    );
+
+    let mut config_map = resource("v1", "ConfigMap");
+    config_map.api_resource = cluster.api_resource;
+    assert!(resource_identity(&config_map).is_err());
+    Ok(())
 }

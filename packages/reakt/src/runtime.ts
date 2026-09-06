@@ -21,6 +21,8 @@ export type DeploymentProps = model.DeploymentDefinition & LifecycleProps & {
   readonly ref?: ResourceRef<"Deployment">;
   readonly rolloutOn?: readonly DataProjection[];
 };
+export type NamespacedResourceProps<Spec> = model.NamespacedResourceDefinition<Spec> & LifecycleProps;
+export type NamespacedResourceComponent<Spec> = Component<NamespacedResourceProps<Spec>>;
 export interface ObserveProps { readonly id?: string; readonly name: string; readonly namespace?: string }
 
 function builtin(): never { throw new Error("Reakt components must be rendered as JSX by the compiler"); }
@@ -29,6 +31,16 @@ export function ConfigMap(_props: ConfigMapProps): ReaktElement { return builtin
 export function Service(_props: ServiceProps): ReaktElement { return builtin(); }
 export function Deployment(_props: DeploymentProps): ReaktElement { return builtin(); }
 export const Fragment = Symbol("Reakt.Fragment");
+
+const namespacedResources = new WeakMap<Function, model.NamespacedResourceDescriptor>();
+
+/** Defines a typed JSX component for one namespaced Kubernetes custom resource. */
+export function defineNamespacedResource<Spec>(descriptor: model.NamespacedResourceDescriptor): NamespacedResourceComponent<Spec> {
+  const resource = model.validateNamespacedResourceDescriptor(snapshotNativeData(descriptor));
+  const component = function NamespacedResourceComponent(_props: NamespacedResourceProps<Spec>): ReaktElement { return builtin(); };
+  namespacedResources.set(component, resource);
+  return component;
+}
 
 interface ElementState { readonly type: unknown; readonly props: Record<string, unknown>; readonly source?: model.SourceLocation }
 const elements = new WeakMap<object, ElementState>();
@@ -161,6 +173,16 @@ export function renderTree(root: unknown, provenance: model.DomainOptions["prove
         const domain = model.defineDomain({ ...options, provenance } as model.DomainOptions);
         state = { domain, namespace: (options as unknown as ControllerProps).namespace, refs: [], rollouts: [] };
         visit(children, state, source, depth + 1);
+        return;
+      }
+      const customResource = typeof type === "function" ? namespacedResources.get(type) : undefined;
+      if (customResource !== undefined) {
+        if (!current) throw new Error("resources require Controller");
+        if (!source) throw new Error("resource JSX requires compiler source information");
+        const { deletionPolicy, force, ...definition } = props;
+        const options = { source, ...(deletionPolicy === undefined ? {} : { deletionPolicy }), ...(force === undefined ? {} : { force }) } as model.ManageOptions;
+        const resource = new model.NamespacedResource(customResource, snapshotNativeData(definition) as model.NamespacedResourceDefinition<unknown>);
+        current.domain.manage(resource, options);
         return;
       }
       if (type === ConfigMap || type === Service || type === Deployment) {

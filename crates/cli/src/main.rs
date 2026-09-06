@@ -12,12 +12,15 @@
 mod artifact;
 mod artifact_input;
 mod audit_command;
+mod crds_command;
 mod deploy_command;
 mod evidence_command;
+mod init_command;
 mod inventory_connection;
 mod release_command;
 mod review;
 mod source_build;
+mod source_lock_command;
 
 use compiler_core::{PermissionCeiling, parse_and_validate, validate_ceiling};
 use serde_json::json;
@@ -35,12 +38,12 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn main() {
     if let Err(error) = run() {
-        let _ = writeln!(std::io::stderr().lock(), "reakt: {error}");
+        let _ = writeln!(std::io::stderr().lock(), "aps: {error}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<()> {
+fn arguments() -> Result<Vec<String>> {
     let arguments = env::args_os()
         .skip(1)
         .map(|argument| {
@@ -49,25 +52,41 @@ fn run() -> Result<()> {
                 .map_err(|_| "arguments must be valid UTF-8")
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(arguments)
+}
+
+fn run() -> Result<()> {
+    let arguments = arguments()?;
     let mut args = arguments.into_iter();
     let command = args.next().unwrap_or_else(|| "help".to_owned());
     if matches!(command.as_str(), "help" | "--help" | "-h") {
         writeln!(
             std::io::stdout().lock(),
-            "Reakt — compiled reactive GitOps for Kubernetes\n\n  reakt check --ir FILE\n  reakt plan --ir FILE --ceiling FILE\n  reakt compile (--source FILE | --ir FILE) --output DIR\n  reakt build --source FILE --output DIR [--profile FILE] [--mode production|fixture]\n  reakt test --ir FILE --output DIR\n  reakt verify --artifact DIR\n  reakt verify-release --artifact DIR --trust-policy FILE\n  reakt merge-evidence --artifact DIR --fragments FILE --output DIR\n  reakt deploy [--artifact DIR | --artifact-reference FILE] [--transition ID --capacity resize]\n  reakt audit --domain NAME --transition ID --cluster-binding NAME --namespace NAME --control-namespace NAME\n\ncompile emits validated plans and a Rust controller project.\nbuild produces a pinned Linux OCI image, native binary, SBOM and compiler closure.\ndeploy reads dist/reakt by default and uses protected Kubernetes policy and short-lived identity.\n--capacity resize expands an existing untouched upgrade, then reviews and resumes it with a fresh session."
+            "Apsides — compiled reactive GitOps for Kubernetes\n\n  aps init [--directory DIR]\n  aps lock [--source FILE] [--modules FILE,FILE]\n  aps crds fetch --url URL --kind KIND --output FILE [--version VERSION]\n  aps check --ir FILE\n  aps plan --ir FILE --ceiling FILE\n  aps compile (--source FILE | --ir FILE) --output DIR\n  aps build --source FILE --output DIR [--profile FILE] [--mode production|fixture]\n  aps test --ir FILE --output DIR\n  aps verify --artifact DIR\n  aps verify-release --artifact DIR --trust-policy FILE\n  aps merge-evidence --artifact DIR --fragments FILE --output DIR\n  aps deploy [--artifact DIR | --artifact-reference FILE] [--transition ID --capacity resize]\n  aps audit --domain NAME --transition ID --cluster-binding NAME --namespace NAME --control-namespace NAME\n\ncompile emits validated plans and a Rust controller project.\nbuild produces a pinned Linux OCI image, native binary, SBOM and compiler closure.\ndeploy reads dist/reakt by default and uses protected Kubernetes policy and short-lived identity.\n--capacity resize expands an existing untouched upgrade, then reviews and resumes it with a fresh session."
         )?;
         return Ok(());
     }
     if matches!(command.as_str(), "--version" | "version") {
         writeln!(
             std::io::stdout().lock(),
-            "reakt {}",
+            "aps {}",
             env!("CARGO_PKG_VERSION")
         )?;
         return Ok(());
     }
+    let command = if command == "crds" {
+        if args.next().as_deref() != Some("fetch") {
+            return Err("expected aps crds fetch".into());
+        }
+        "crds-fetch".to_owned()
+    } else {
+        command
+    };
     let options = parse_options(&args.collect::<Vec<_>>())?;
     match command.as_str() {
+        "init" => init_command::command(&options)?,
+        "lock" => source_lock_command::command(&options)?,
+        "crds-fetch" => crds_command::fetch(&options)?,
         "test" => {
             only(&options, &["--ir", "--output"])?;
             let plan = read_plan(required(&options, "--ir")?)?;
@@ -134,7 +153,7 @@ fn run() -> Result<()> {
         "audit" => audit_command::command(&options)?,
         "release" => release_command::command(&options)?,
         "merge-evidence" => evidence_command::command(&options)?,
-        _ => return Err(format!("unknown command {command}; run reakt --help").into()),
+        _ => return Err(format!("unknown command {command}; run aps --help").into()),
     }
     Ok(())
 }

@@ -1,9 +1,11 @@
-# Reakt TSX example
+# Apsides TSX example
 
 `program.tsx` declares the controller boundary and composes the reusable `Api`
 component from `api.tsx`. The component declares Kubernetes resources with JSX
 and observations with `useConfigMap` and `useSecret`. `rolloutOn` connects opaque
 input projections to a Deployment; it never reads live values during the build.
+The workload is a pinned, unprivileged NGINX image serving HTTP on port 8080.
+Its Pods do not mount Kubernetes API credentials.
 
 Compile the digest-locked example from the repository root:
 
@@ -31,6 +33,37 @@ Resource locations identify their JSX declarations. Observation hooks currently
 identify the containing component's JSX invocation, rather than the hook's
 individual line. These locations are diagnostics, not authorization.
 
-The workload image digest is illustrative. The `api-workload` ServiceAccount
-and external ConfigMap/Secret are platform prerequisites. Compilation does not
-establish deployment or production release readiness.
+In a dedicated demo cluster, create the two external inputs in the workload
+namespace before installing the controller. These values are demo data:
+
+```sh
+kubectl -n production create configmap external-settings --from-literal=THEME=blue
+kubectl -n production create secret generic database-credentials --from-literal=PASSWORD=demo-only
+```
+
+After installation, check the workload and forward its HTTP service:
+
+```sh
+kubectl -n production rollout status deployment/api --timeout=120s
+kubectl -n production port-forward service/api 8080:80
+# In another terminal:
+curl --fail http://localhost:8080/
+```
+
+Watch Pods while changing the observed ConfigMap:
+
+```sh
+kubectl -n production get pods -l app=api --watch
+# In another terminal:
+kubectl -n production patch configmap external-settings --type=merge \
+  -p '{"data":{"THEME":"green"}}'
+```
+
+The controller changes the Deployment's Pod template revision, causing a rollout.
+The page remains the NGINX welcome page: this example demonstrates reconciliation
+and rollout on input changes, rather than an application that renders those inputs.
+Secret changes drive the same behavior without printing their values.
+
+Compilation and workload-image checks do not establish a deployed controller or
+a production-qualified release. The live demo must also rehearse controller
+installation and the observed rollout.

@@ -1,7 +1,7 @@
 use crate::{
     Capability, CompiledPlan, Effect, Error, IR_SCHEMA, Input, InputMode, Ir, PermissionCeiling,
     Provenance, Request, Resource, Result, SourceLocation, TestCase, canonical_bytes, digest,
-    parse_strict,
+    parse_strict, resolve_resource_api,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,8 +43,8 @@ fn source_valid(source: &SourceLocation, provenance: &Provenance) -> bool {
             .any(|input| input.path == source.file)
 }
 
-fn identity(kind: &str, name: &str, namespace: &str) -> String {
-    format!("{kind}/{namespace}/{name}")
+fn identity(api_group: &str, plural: &str, name: &str, namespace: &str) -> String {
+    format!("{api_group}/{plural}/{namespace}/{name}")
 }
 
 fn api(kind: &str) -> Result<(&'static str, &'static str)> {
@@ -66,6 +66,21 @@ fn request(
     verb: &str,
 ) -> Result<()> {
     let (api_group, resource) = api(kind)?;
+    resolved_request(
+        requests, purpose, api_group, resource, namespace, name, verb,
+    );
+    Ok(())
+}
+
+fn resolved_request(
+    requests: &mut Vec<Request>,
+    purpose: &str,
+    api_group: &str,
+    resource: &str,
+    namespace: &str,
+    name: &str,
+    verb: &str,
+) {
     requests.push(Request {
         purpose: purpose.into(),
         dry_run: purpose == "managed-target-dry-run-apply",
@@ -83,7 +98,6 @@ fn request(
         },
         field_selector: matches!(verb, "list" | "watch").then(|| format!("metadata.name={name}")),
     });
-    Ok(())
 }
 
 fn field_paths(value: &Value, path: &str, result: &mut Vec<String>) {
@@ -219,16 +233,11 @@ fn validate_resources(ir: &Ir) -> Result<BTreeMap<String, &Resource>> {
             object_name(&resource.name) && resource.namespace == ir.domain.namespace,
             "resource identity is outside the fixed workload scope",
         )?;
-        require(
-            matches!(
-                (resource.kind.as_str(), resource.api_version.as_str()),
-                ("ConfigMap" | "Service", "v1") | ("Deployment", "apps/v1")
-            ),
-            "unsupported managed API type",
-        )?;
+        let api = resolve_resource_api(resource)?;
         require(
             identities.insert(identity(
-                &resource.kind,
+                &api.api_group,
+                &api.plural,
                 &resource.name,
                 &resource.namespace,
             )),
@@ -257,8 +266,17 @@ fn validate_inputs<'a>(
     let identities: BTreeSet<_> = ir
         .resources
         .iter()
-        .map(|r| identity(&r.kind, &r.name, &r.namespace))
-        .collect();
+        .map(|resource| {
+            resolve_resource_api(resource).map(|api| {
+                identity(
+                    &api.api_group,
+                    &api.plural,
+                    &resource.name,
+                    &resource.namespace,
+                )
+            })
+        })
+        .collect::<Result<_>>()?;
     let mut inputs = BTreeMap::new();
     for input in &ir.inputs {
         require(
@@ -309,8 +327,14 @@ fn validate_inputs<'a>(
                     input.managed_resource_id.is_none(),
                     "observed input cannot have managedResourceId",
                 )?;
+                let (api_group, plural) = api(&input.kind)?;
                 require(
-                    !identities.contains(&identity(&input.kind, &input.name, &input.namespace)),
+                    !identities.contains(&identity(
+                        api_group,
+                        plural,
+                        &input.name,
+                        &input.namespace,
+                    )),
                     "observed input aliases a managed resource; use managed mode",
                 )?;
             }
@@ -368,6 +392,7 @@ fn derive_resources(
     risks: &mut BTreeSet<String>,
 ) -> Result<()> {
     for resource in &ir.resources {
+        let api = resolve_resource_api(resource)?;
         if resource.force {
             risks.insert(format!(
                 "force-apply:{}/{}/{}",
@@ -384,47 +409,52 @@ fn derive_resources(
             source: resource.source.clone(),
         });
         for verb in ["list", "patch"] {
-            request(
+            resolved_request(
                 requests,
                 "managed-target",
-                &resource.kind,
+                &api.api_group,
+                &api.plural,
                 &resource.namespace,
                 &resource.name,
                 verb,
-            )?;
+            );
         }
-        request(
+        resolved_request(
             requests,
             "managed-target-dry-run-apply",
-            &resource.kind,
+            &api.api_group,
+            &api.plural,
             &resource.namespace,
             &resource.name,
             "patch",
-        )?;
-        request(
+        );
+        resolved_request(
             requests,
             "managed-target-apply-create-authorization",
-            &resource.kind,
+            &api.api_group,
+            &api.plural,
             &resource.namespace,
             &resource.name,
             "create",
-        )?;
-        request(
+        );
+        resolved_request(
             requests,
             "managed-target-create-preflight",
-            &resource.kind,
+            &api.api_group,
+            &api.plural,
             &resource.namespace,
             &resource.name,
             "list",
-        )?;
-        request(
+        );
+        resolved_request(
             requests,
             "managed-target-create-apply",
-            &resource.kind,
+            &api.api_group,
+            &api.plural,
             &resource.namespace,
             &resource.name,
             "patch",
-        )?;
+        );
         gaps.insert("rbac-create-not-name-restricted".to_owned());
         gaps.insert("rbac-patch-not-field-restricted".to_owned());
         if resource.kind == "Deployment" {
@@ -442,13 +472,7 @@ fn derive_resources(
                     {
                         risks.insert("mutable-workload-image".to_owned());
                     }
-                    if container
-                        .get("envFrom")
-                        .and_then(Value::as_array)
-                        .is_some_and(|refs| {
-                            refs.iter().any(|value| value.get("secretRef").is_some())
-                        })
-                    {
+                    if container_uses_secret(container) {
                         risks.insert("workload-secret-reference".to_owned());
                     }
                 }
@@ -456,6 +480,25 @@ fn derive_resources(
         }
     }
     Ok(())
+}
+
+fn container_uses_secret(container: &Value) -> bool {
+    container
+        .get("envFrom")
+        .and_then(Value::as_array)
+        .is_some_and(|references| {
+            references
+                .iter()
+                .any(|value| value.get("secretRef").is_some())
+        })
+        || container
+            .get("env")
+            .and_then(Value::as_array)
+            .is_some_and(|environment| {
+                environment
+                    .iter()
+                    .any(|value| value.pointer("/valueFrom/secretKeyRef").is_some())
+            })
 }
 
 fn derive_plan(ir: &Ir, inputs: &BTreeMap<String, &Input>) -> Result<CompiledPlan> {

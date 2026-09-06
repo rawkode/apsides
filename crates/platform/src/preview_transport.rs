@@ -41,23 +41,22 @@ impl PreviewTarget {
         namespace: &str,
         name: &str,
     ) -> Result<Self> {
-        let (version, expected_group, expected_resource) = match (api_version, kind) {
-            ("v1", "ConfigMap") => ("v1", "", "configmaps"),
-            ("v1", "Service") => ("v1", "", "services"),
-            ("apps/v1", "Deployment") => ("v1", "apps", "deployments"),
-            _ => return Err(invalid("preview target API is unsupported")),
-        };
-        if api_group != expected_group
-            || resource != expected_resource
-            || !super::valid_namespace(namespace)
-            || !super::valid_name(name)
-        {
+        let resolved =
+            compiler_core::resolve_namespaced_api(api_version, kind, api_group, resource)
+                .map_err(|_| invalid("preview target API is unsupported"))?;
+        if !super::valid_namespace(namespace) || !super::valid_name(name) {
             return Err(invalid("preview target identity is invalid"));
         }
         let path = if api_group.is_empty() {
-            format!("/api/{version}/namespaces/{namespace}/{resource}")
+            format!(
+                "/api/{}/namespaces/{namespace}/{resource}",
+                resolved.version
+            )
         } else {
-            format!("/apis/{api_group}/{version}/namespaces/{namespace}/{resource}")
+            format!(
+                "/apis/{api_group}/{}/namespaces/{namespace}/{resource}",
+                resolved.version
+            )
         };
         Ok(Self {
             api_version: api_version.into(),

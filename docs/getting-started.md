@@ -23,10 +23,10 @@ From the repository root:
 
 ```sh
 cargo build -p cli
-target/debug/reakt --help
+target/debug/aps --help
 ```
 
-The Cargo package is `cli`; its binary is `reakt`.
+The Cargo package is `cli`; its binary is `aps`.
 
 ## Compile the example
 
@@ -34,7 +34,7 @@ Choose a fresh output directory. The compiler refuses to reuse an existing
 source staging directory.
 
 ```sh
-target/debug/reakt compile \
+target/debug/aps compile \
   --source examples/reakt/program.tsx \
   --output work/reakt-compiled
 ```
@@ -46,8 +46,8 @@ metadata. Compilation alone does not create a deployable release.
 ## Inspect and check the plan
 
 ```sh
-target/debug/reakt check --ir work/reakt-compiled/ir.json
-target/debug/reakt test \
+target/debug/aps check --ir work/reakt-compiled/ir.json
+target/debug/aps test \
   --ir work/reakt-compiled/ir.json \
   --output work/reakt-semantic-tests
 ```
@@ -65,5 +65,6 @@ example in the current environment. It does not establish release signatures,
 image reproducibility, Kubernetes authorization, controller activation,
 workload readiness or upgrade recovery.
 
-Continue with [TypeScript authoring](/guides/typescript-authoring/), then read the
+Continue with [TypeScript authoring](/guides/typescript-authoring/), generate a
+[typed custom resource from a CRD](/guides/custom-resources/), then read the
 [build and deployment boundaries](/guides/build-and-deploy/).

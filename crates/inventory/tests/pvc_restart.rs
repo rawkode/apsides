@@ -82,6 +82,7 @@ fn snapshot(generation: &str, count: usize) -> InventorySnapshot {
     let resources = (0..count).map(|index| {
         let name = format!("resource-{index:06}");
         let resource = Resource {
+            api_resource: None,
             id: name.clone(), api_version: "v1".into(), kind: "ConfigMap".into(),
             name: name.clone(), namespace: scope().namespace,
             desired: serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":"storage-test"},"data":{"value":PRIVATE}}),
