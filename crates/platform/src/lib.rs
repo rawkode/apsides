@@ -24,6 +24,7 @@ mod envelope_record;
 mod envelope_writer;
 mod evidence_profile;
 mod permissions;
+mod review_projection;
 mod state_capacity;
 #[cfg(feature = "deployer")]
 mod topology_capture;
@@ -44,6 +45,7 @@ mod writer_checkpoint;
 pub use permissions::{
     CreationTarget, DeploymentPermissions, ResourceAccess, RoleDelegation, deployment_permissions,
 };
+pub use review_projection::project_review_metadata;
 pub use writer_checkpoint::WriterCheckpoint;
 
 #[cfg(feature = "test-support")]

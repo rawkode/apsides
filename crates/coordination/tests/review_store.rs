@@ -92,17 +92,70 @@ fn private(error: &coordination::Error) {
     assert!(!error.to_string().contains(PRIVATE_CANARY));
 }
 
-async fn row_count(path: &std::path::Path) -> TestResult<i64> {
+async fn row_count(path: &std::path::Path, table: &str) -> TestResult<i64> {
     let database = libsql::Builder::new_local(path).build().await?;
     let connection = database.connect()?;
-    let mut rows = connection
-        .query("SELECT count(*) FROM reakt_coordination_reviews", ())
-        .await?;
+    let query = match table {
+        "reakt_coordination_reviews" => "SELECT count(*) FROM reakt_coordination_reviews",
+        "reakt_coordination_review_objects" => {
+            "SELECT count(*) FROM reakt_coordination_review_objects"
+        }
+        _ => return Err("unsupported review table fixture".into()),
+    };
+    let mut rows = connection.query(query, ()).await?;
     Ok(rows
         .next()
         .await?
         .ok_or("review count row missing")?
         .get::<i64>(0)?)
+}
+
+async fn create_legacy_database(
+    path: &std::path::Path,
+    metadata: Option<&ReviewMetadataV1>,
+) -> TestResult {
+    let database = libsql::Builder::new_local(path).build().await?;
+    let connection = database.connect()?;
+    connection
+        .execute_batch(
+            "CREATE TABLE reakt_coordination_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);\
+             INSERT INTO reakt_coordination_schema VALUES (1,1);\
+             CREATE TABLE reakt_coordination_claims (digest TEXT PRIMARY KEY, metadata BLOB NOT NULL);\
+             CREATE TABLE reakt_coordination_audits (digest TEXT PRIMARY KEY, metadata BLOB NOT NULL);\
+             CREATE TABLE reakt_coordination_reviews (\
+             registry_uid TEXT NOT NULL,cluster_binding TEXT NOT NULL,\
+             control_namespace TEXT NOT NULL,workload_namespace TEXT NOT NULL,\
+             domain_id TEXT NOT NULL,transition_id TEXT NOT NULL,\
+             sequence TEXT NOT NULL,digest TEXT NOT NULL,metadata BLOB NOT NULL,\
+             PRIMARY KEY (registry_uid,cluster_binding,control_namespace,\
+             workload_namespace,domain_id,transition_id));",
+        )
+        .await?;
+    if let Some(metadata) = metadata {
+        let reference = metadata.reference()?;
+        let scope = &reference.scope;
+        let claims = &scope.claim_scope;
+        connection
+            .execute(
+                "INSERT INTO reakt_coordination_reviews(\
+                 registry_uid,cluster_binding,control_namespace,workload_namespace,\
+                 domain_id,transition_id,sequence,digest,metadata) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                libsql::params![
+                    claims.registry_uid.clone(),
+                    claims.cluster_binding.clone(),
+                    claims.control_namespace.clone(),
+                    claims.workload_namespace.clone(),
+                    scope.domain_id.clone(),
+                    scope.transition_id.clone(),
+                    scope.sequence.to_string(),
+                    reference.digest,
+                    compiler_core::canonical_bytes(metadata)?,
+                ],
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -122,69 +175,67 @@ async fn exact_review_write_is_idempotent_and_survives_local_reopen() -> TestRes
     let mut missing = reference;
     missing.scope.domain_id = "other-domain".to_owned();
     assert_eq!(reopened.read_review(&missing).await?, None);
-    assert_eq!(row_count(&path).await?, 1);
+    assert_eq!(
+        row_count(&path, "reakt_coordination_review_objects").await?,
+        1
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn same_transition_slot_rejects_a_different_valid_review() -> TestResult {
+async fn same_transition_scope_retains_distinct_content_addressed_reviews() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("coordination.db");
     let store = LibsqlCoordination::open_local(&path).await?;
     let original = review("policy-a")?;
     let original_reference = store.put_review(&original).await?;
-    let conflicting = review("policy-b")?;
-    conflicting.validate()?;
-    assert_ne!(conflicting.reference()?, original_reference);
+    let subsequent = review("policy-b")?;
+    let subsequent_reference = store.put_review(&subsequent).await?;
+    assert_ne!(subsequent_reference, original_reference);
 
-    assert!(matches!(
-        store.put_review(&conflicting).await,
-        Err(Error::Invalid("immutable review mismatch"))
-    ));
     assert_eq!(
         store.read_review(&original_reference).await?,
         Some(original)
     );
-    assert_eq!(row_count(&path).await?, 1);
+    assert_eq!(
+        store.read_review(&subsequent_reference).await?,
+        Some(subsequent)
+    );
+    assert_eq!(
+        row_count(&path, "reakt_coordination_review_objects").await?,
+        2
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn concurrent_conflicting_review_writes_have_one_winner() -> TestResult {
+async fn concurrent_distinct_reviews_for_one_scope_both_succeed() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("coordination.db");
     let first_store = LibsqlCoordination::open_local(&path).await?;
     let second_store = LibsqlCoordination::open_local(&path).await?;
     let first = review("policy-a")?;
     let second = review("policy-b")?;
-    let (first_result, second_result) = tokio::join!(
+    let (first_reference, second_reference) = tokio::join!(
         first_store.put_review(&first),
         second_store.put_review(&second)
     );
-
-    let (winner, winner_reference, loser_reference) = match (first_result, second_result) {
-        (Ok(reference), Err(Error::Invalid("immutable review mismatch"))) => {
-            (first, reference, second.reference()?)
-        }
-        (Err(Error::Invalid("immutable review mismatch")), Ok(reference)) => {
-            (second, reference, first.reference()?)
-        }
-        _ => return Err("conflicting review writers did not produce exactly one winner".into()),
-    };
+    let first_reference = first_reference?;
+    let second_reference = second_reference?;
+    assert_ne!(first_reference, second_reference);
     let reopened = LibsqlCoordination::open_local(&path).await?;
-    assert_eq!(reopened.read_review(&winner_reference).await?, Some(winner));
-    assert!(matches!(
-        reopened.read_review(&loser_reference).await,
-        Err(Error::Invalid("review reference mismatch"))
-    ));
-    assert_eq!(row_count(&path).await?, 1);
+    assert_eq!(reopened.read_review(&first_reference).await?, Some(first));
+    assert_eq!(reopened.read_review(&second_reference).await?, Some(second));
+    assert_eq!(
+        row_count(&path, "reakt_coordination_review_objects").await?,
+        2
+    );
     Ok(())
 }
 
 enum Corruption {
     Blob(Vec<u8>),
     Text(String),
-    Digest(String),
     Sequence(String),
 }
 
@@ -194,22 +245,26 @@ async fn corrupt_review_row(path: &std::path::Path, corruption: Corruption) -> T
     match corruption {
         Corruption::Blob(bytes) => {
             connection
-                .execute("UPDATE reakt_coordination_reviews SET metadata=?1", [bytes])
+                .execute(
+                    "UPDATE reakt_coordination_review_objects SET metadata=?1",
+                    [bytes],
+                )
                 .await?;
         }
         Corruption::Text(value) => {
             connection
-                .execute("UPDATE reakt_coordination_reviews SET metadata=?1", [value])
-                .await?;
-        }
-        Corruption::Digest(value) => {
-            connection
-                .execute("UPDATE reakt_coordination_reviews SET digest=?1", [value])
+                .execute(
+                    "UPDATE reakt_coordination_review_objects SET metadata=?1",
+                    [value],
+                )
                 .await?;
         }
         Corruption::Sequence(value) => {
             connection
-                .execute("UPDATE reakt_coordination_reviews SET sequence=?1", [value])
+                .execute(
+                    "UPDATE reakt_coordination_review_objects SET sequence=?1",
+                    [value],
+                )
                 .await?;
         }
     }
@@ -235,23 +290,57 @@ async fn assert_corruption_rejected(corruption: Corruption) -> TestResult {
         return Err("immutable review publication repaired a corrupt row".into());
     };
     private(&write_error);
-    assert_eq!(row_count(&path).await?, 1);
+    assert_eq!(
+        row_count(&path, "reakt_coordination_review_objects").await?,
+        1
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn corrupt_review_blob_type_size_digest_and_sequence_are_static_errors() -> TestResult {
+async fn corrupt_exact_review_blob_type_size_and_sequence_are_static_errors() -> TestResult {
     for corruption in [
         Corruption::Blob(format!("{{\"private\":\"{PRIVATE_CANARY}\"}}").into_bytes()),
         Corruption::Text(PRIVATE_CANARY.to_owned()),
         Corruption::Blob(vec![b'x'; MAX_REVIEW_METADATA_BYTES + 1]),
-        Corruption::Digest(format!("sha256:{}", "f".repeat(64))),
-        Corruption::Digest(format!("sha256:{}", "f".repeat(65))),
         Corruption::Sequence("2".to_owned()),
         Corruption::Sequence("9".repeat(21)),
     ] {
         assert_corruption_rejected(corruption).await?;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn changed_digest_is_a_missing_exact_key_and_does_not_block_republication() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("coordination.db");
+    let metadata = review("policy-a")?;
+    let store = LibsqlCoordination::open_local(&path).await?;
+    let reference = store.put_review(&metadata).await?;
+    let changed_digest = format!("sha256:{}", "f".repeat(64));
+    let database = libsql::Builder::new_local(&path).build().await?;
+    database
+        .connect()?
+        .execute(
+            "UPDATE reakt_coordination_review_objects SET digest=?1 WHERE digest=?2",
+            libsql::params![changed_digest.clone(), reference.digest.clone()],
+        )
+        .await?;
+
+    assert_eq!(store.read_review(&reference).await?, None);
+    let mut changed_reference = reference.clone();
+    changed_reference.digest = changed_digest;
+    assert!(matches!(
+        store.read_review(&changed_reference).await,
+        Err(Error::Invalid("review metadata integrity"))
+    ));
+    assert_eq!(store.put_review(&metadata).await?, reference);
+    assert_eq!(store.read_review(&reference).await?, Some(metadata));
+    assert_eq!(
+        row_count(&path, "reakt_coordination_review_objects").await?,
+        2
+    );
     Ok(())
 }
 
@@ -265,10 +354,7 @@ async fn scope_and_digest_substitution_are_rejected() -> TestResult {
 
     let mut forged_digest = reference.clone();
     forged_digest.digest = format!("sha256:{}", "f".repeat(64));
-    assert!(matches!(
-        store.read_review(&forged_digest).await,
-        Err(Error::Invalid("review reference mismatch"))
-    ));
+    assert_eq!(store.read_review(&forged_digest).await?, None);
 
     let mut forged_scope = reference.clone();
     forged_scope.scope.domain_id = "other-domain".to_owned();
@@ -276,11 +362,11 @@ async fn scope_and_digest_substitution_are_rejected() -> TestResult {
     let connection = database.connect()?;
     connection
         .execute(
-            "INSERT INTO reakt_coordination_reviews(\
+            "INSERT INTO reakt_coordination_review_objects(\
              registry_uid,cluster_binding,control_namespace,workload_namespace,\
              domain_id,transition_id,sequence,digest,metadata) \
              SELECT registry_uid,cluster_binding,control_namespace,workload_namespace,\
-             ?1,transition_id,sequence,digest,metadata FROM reakt_coordination_reviews \
+             ?1,transition_id,sequence,digest,metadata FROM reakt_coordination_review_objects \
              WHERE domain_id=?2",
             libsql::params![
                 forged_scope.scope.domain_id.clone(),
@@ -323,12 +409,116 @@ async fn local_read_only_store_reads_without_creating_or_mutating_reviews() -> T
         read_only.put_review(&invalid).await,
         Err(Error::Invalid("read-only coordination store"))
     ));
-    assert_eq!(row_count(&path).await?, 1);
+    assert_eq!(
+        row_count(&path, "reakt_coordination_review_objects").await?,
+        1
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn read_only_old_schema_reports_a_missing_review_table_without_repair() -> TestResult {
+async fn read_only_legacy_review_is_compatible_without_creating_the_object_table() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("legacy-coordination.db");
+    let metadata = review("policy-a")?;
+    let reference = metadata.reference()?;
+    create_legacy_database(&path, Some(&metadata)).await?;
+
+    let read_only = LibsqlCoordination::open_local_read_only(&path).await?;
+    assert_eq!(read_only.read_review(&reference).await?, Some(metadata));
+    assert!(matches!(
+        read_only.put_review(&review("policy-b")?).await,
+        Err(Error::Invalid("read-only coordination store"))
+    ));
+    assert_eq!(row_count(&path, "reakt_coordination_reviews").await?, 1);
+    let database = libsql::Builder::new_local(&path).build().await?;
+    let mut rows = database
+        .connect()?
+        .query(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' \
+             AND name='reakt_coordination_review_objects'",
+            (),
+        )
+        .await?;
+    let count = rows
+        .next()
+        .await?
+        .ok_or("object table count row missing")?
+        .get::<i64>(0)?;
+    assert_eq!(count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_and_new_reviews_for_one_scope_coexist_and_remain_readable() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("coordination.db");
+    let legacy = review("policy-a")?;
+    let legacy_reference = legacy.reference()?;
+    create_legacy_database(&path, Some(&legacy)).await?;
+
+    let store = LibsqlCoordination::open_local(&path).await?;
+    assert_eq!(store.read_review(&legacy_reference).await?, Some(legacy));
+    assert_eq!(
+        store.put_review(&review("policy-a")?).await?,
+        legacy_reference
+    );
+    let current = review("policy-b")?;
+    let current_reference = store.put_review(&current).await?;
+    assert_ne!(current_reference, legacy_reference);
+    assert_eq!(store.read_review(&current_reference).await?, Some(current));
+    assert_eq!(row_count(&path, "reakt_coordination_reviews").await?, 1);
+    assert_eq!(
+        row_count(&path, "reakt_coordination_review_objects").await?,
+        2
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn corrupt_exact_legacy_review_cannot_be_shadowed_but_another_digest_is_allowed() -> TestResult
+{
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("coordination.db");
+    let legacy = review("policy-a")?;
+    let legacy_reference = legacy.reference()?;
+    create_legacy_database(&path, Some(&legacy)).await?;
+    let database = libsql::Builder::new_local(&path).build().await?;
+    database
+        .connect()?
+        .execute(
+            "UPDATE reakt_coordination_reviews SET metadata=?1",
+            [format!("{{\"private\":\"{PRIVATE_CANARY}\"}}").into_bytes()],
+        )
+        .await?;
+
+    let store = LibsqlCoordination::open_local(&path).await?;
+    let Err(read_error) = store.read_review(&legacy_reference).await else {
+        return Err("corrupt exact legacy review was accepted".into());
+    };
+    private(&read_error);
+    let Err(write_error) = store.put_review(&legacy).await else {
+        return Err("corrupt exact legacy review was shadowed".into());
+    };
+    private(&write_error);
+    assert_eq!(
+        row_count(&path, "reakt_coordination_review_objects").await?,
+        0
+    );
+
+    let current = review("policy-b")?;
+    let current_reference = store.put_review(&current).await?;
+    assert_eq!(store.read_review(&current_reference).await?, Some(current));
+    assert_eq!(row_count(&path, "reakt_coordination_reviews").await?, 1);
+    assert_eq!(
+        row_count(&path, "reakt_coordination_review_objects").await?,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_only_old_database_reports_no_review_tables_without_repair() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("old-coordination.db");
     let database = libsql::Builder::new_local(&path).build().await?;
@@ -346,7 +536,7 @@ async fn read_only_old_schema_reports_a_missing_review_table_without_repair() ->
     let reference = review("policy-a")?.reference()?;
     assert!(matches!(
         read_only.read_review(&reference).await,
-        Err(Error::Backend("read immutable review"))
+        Err(Error::Invalid("missing immutable review table"))
     ));
     assert!(matches!(
         read_only.put_review(&review("policy-a")?).await,
@@ -355,7 +545,8 @@ async fn read_only_old_schema_reports_a_missing_review_table_without_repair() ->
     let mut rows = database
         .connect()?
         .query(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='reakt_coordination_reviews'",
+            "SELECT count(*) FROM sqlite_master WHERE type='table' \
+             AND name IN ('reakt_coordination_reviews','reakt_coordination_review_objects')",
             (),
         )
         .await?;
@@ -374,7 +565,7 @@ async fn writable_open_rejects_malformed_review_tables_without_repair() -> TestR
     let cases = [
         (
             "missing-column.db",
-            "CREATE TABLE reakt_coordination_reviews (\
+            "CREATE TABLE reakt_coordination_review_objects (\
              registry_uid TEXT NOT NULL,cluster_binding TEXT NOT NULL,\
              control_namespace TEXT NOT NULL,workload_namespace TEXT NOT NULL,\
              domain_id TEXT NOT NULL,transition_id TEXT NOT NULL,\
@@ -385,7 +576,7 @@ async fn writable_open_rejects_malformed_review_tables_without_repair() -> TestR
         ),
         (
             "missing-primary-key.db",
-            "CREATE TABLE reakt_coordination_reviews (\
+            "CREATE TABLE reakt_coordination_review_objects (\
              registry_uid TEXT NOT NULL,cluster_binding TEXT NOT NULL,\
              control_namespace TEXT NOT NULL,workload_namespace TEXT NOT NULL,\
              domain_id TEXT NOT NULL,transition_id TEXT NOT NULL,\
@@ -404,7 +595,7 @@ async fn writable_open_rejects_malformed_review_tables_without_repair() -> TestR
         let mut rows = database
             .connect()?
             .query(
-                "SELECT count(*) FROM pragma_table_info('reakt_coordination_reviews')",
+                "SELECT count(*) FROM pragma_table_info('reakt_coordination_review_objects')",
                 (),
             )
             .await?;

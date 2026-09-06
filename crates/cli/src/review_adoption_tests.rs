@@ -53,7 +53,7 @@ fn adoption_compiled() -> Result<CompiledPlan> {
     )?)
 }
 
-fn adoption_fixture() -> Result<(platform::StoredTransition, deploy::TransitionPlan)> {
+pub(super) fn adoption_fixture() -> Result<(platform::StoredTransition, deploy::TransitionPlan)> {
     let (registry, base) = registry()?;
     let compiled = adoption_compiled()?;
     let domain = compiled.ir.domain.clone();

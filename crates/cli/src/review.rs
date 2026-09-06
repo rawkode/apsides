@@ -55,9 +55,7 @@ fn render_review(
 
 fn validate_plan(plan: &deploy::TransitionPlan) -> crate::Result<()> {
     budget::count(plan)?;
-    if deploy::plan_transition(&plan.request)? != *plan {
-        return Err("review requires the exact resolved transition plan".into());
-    }
+    platform::project_review_metadata(plan)?;
     Ok(())
 }
 

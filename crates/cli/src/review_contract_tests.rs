@@ -1,6 +1,9 @@
 use super::*;
 use compiler_core::canonical_bytes;
 
+#[path = "review_projection_tests.rs"]
+mod projection;
+
 fn source(line: u32) -> Value {
     json!({"file":"program.tsx","line":line,"column":3})
 }

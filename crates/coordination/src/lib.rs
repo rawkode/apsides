@@ -71,9 +71,9 @@ pub trait AuditStore: Send + Sync {
 /// Immutable typed declaration metadata. It has no mutable head or authority.
 #[async_trait]
 pub trait ReviewStore: Send + Sync {
-    /// Publish one exact review body into its immutable scoped transition slot.
+    /// Publish an immutable body addressed by its scope and metadata digest.
     /// # Errors
-    /// Rejects invalid metadata, conflicting or corrupt rows and backend failures.
+    /// Rejects invalid metadata, corrupt exact-reference rows and backend failures.
     async fn put_review(&self, metadata: &ReviewMetadataV1) -> Result<ReviewRef>;
 
     /// Read the exact validated scope-bound metadata. Only absent rows return `None`.
