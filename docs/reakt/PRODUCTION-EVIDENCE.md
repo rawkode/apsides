@@ -306,13 +306,6 @@ specific fixture-promotion rejection and rechecks both subjects. The fixture
 rejection precedes signature verification, so this does not establish that the
 fixture has a valid signature.
 
-The source build at commit `0a3b58b` passed this check with a real Linux/arm64
-fixture image and the archived production candidate. Its local result is
-`work/fixture-promotion-0a3b58b/result.json`. This is a measured driver result,
-not a packaged `ProductionEvidence` receipt. Source-closure packaging and merge
-verification remain necessary before counting `fixture-promotion-rejection`
-in production coverage, which remains seven of sixteen checks.
-
 `tests/reakt/run_fixture_promotion.py` packages a fresh driver execution as a
 single production evidence check. It accepts existing candidates and the fixture
 compiler stage; it does not rebuild or modify them:
@@ -334,3 +327,13 @@ The fixture identity is supplemental; the receipt belongs to the production
 candidate. Namespaced source archives and the measurement accompany the receipt
 for the normal `reakt merge-evidence` consumer. `cuenv task fixturePromotionTest`
 checks orchestration contracts without substituting for the real verifier run.
+
+The producer at commit `d8677cd` passed against the real Linux/arm64 fixture and
+signed production candidate shown above. The receipt is in
+`work/fixture-promotion-evidence-d8677cd/evidence/fixture-promotion-evidence.json`.
+The standard merger accepted it with the existing receipts:
+`work/production-eight-merged/summary.json` reports eight covered checks, no
+missing reactor cases (43 covered), and `releaseVerified: false`. The remaining
+checks are scope-matched benchmark, permission-changing upgrade, phase
+interruption recovery, last API type cleanup, UID replacement rejection,
+finalizer preservation, uncertain-writer refusal, and API-bound gap conformance.
