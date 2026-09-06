@@ -114,7 +114,7 @@ impl Context {
     }
 }
 
-fn require_qualified_server(version: &str) -> Result<()> {
+pub(super) fn require_qualified_server(version: &str) -> Result<()> {
     if version != "v1.34.3" {
         return Err(invalid(
             "live preview requires the qualified v1.34.3 conditional SSA server",
@@ -123,7 +123,7 @@ fn require_qualified_server(version: &str) -> Result<()> {
     Ok(())
 }
 
-fn same<T: PartialEq>(left: &Versioned<T>, right: &Versioned<T>) -> bool {
+pub(super) fn same<T: PartialEq>(left: &Versioned<T>, right: &Versioned<T>) -> bool {
     left.uid == right.uid
         && left.resource_version == right.resource_version
         && left.value == right.value
@@ -143,7 +143,10 @@ async fn check_inventory(request: &DeploymentRequest, store: &dyn InventoryStore
     Ok(())
 }
 
-async fn check_approvals(issued: &IssuedDeployment, request: &DeploymentRequest) -> Result<()> {
+pub(super) async fn check_approvals(
+    issued: &IssuedDeployment,
+    request: &DeploymentRequest,
+) -> Result<()> {
     let names = request
         .ownership_intents
         .iter()
@@ -159,7 +162,7 @@ async fn check_approvals(issued: &IssuedDeployment, request: &DeploymentRequest)
     Ok(())
 }
 
-fn require_targets(
+pub(super) fn require_targets(
     approval: &crate::DeploymentPreviewApproval,
     resources: &[coordination::ReviewResource],
 ) -> Result<()> {

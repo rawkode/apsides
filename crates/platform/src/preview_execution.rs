@@ -14,7 +14,21 @@ pub(super) struct Observation {
     resource_version: Option<String>,
 }
 impl Observation {
-    pub async fn recheck(self, transport: &PreviewTransport) -> Result<()> {
+    pub fn capture(target: PreviewTarget, listed: &NamedPreview) -> Self {
+        Self {
+            target,
+            uid: listed
+                .object()
+                .and_then(|object| object.metadata.uid.clone()),
+            resource_version: listed
+                .object()
+                .and_then(|object| object.metadata.resource_version.clone()),
+        }
+    }
+    pub fn target(&self) -> &PreviewTarget {
+        &self.target
+    }
+    pub async fn read_unchanged(&self, transport: &PreviewTransport) -> Result<NamedPreview> {
         let current = transport.list_named(&self.target).await?;
         let uid = current
             .object()
@@ -27,8 +41,17 @@ impl Observation {
                 "preview target changed during the observation interval",
             ));
         }
-        Ok(())
+        Ok(current)
     }
+    pub async fn recheck(&self, transport: &PreviewTransport) -> Result<()> {
+        self.read_unchanged(transport).await.map(|_| ())
+    }
+}
+
+pub(super) struct Declarations<'a> {
+    pub request: &'a DeploymentRequest,
+    pub next: &'a coordination::ReviewMetadataV1,
+    pub previous: Option<&'a coordination::ReviewMetadataV1>,
 }
 
 pub(super) async fn preview_target(
@@ -61,6 +84,33 @@ pub(super) async fn preview_target(
     )?;
     let listed = transport.list_named(&target).await?;
     let force = require_target_authority(request, resource, &identity, &listed)?;
+    let declarations = Declarations {
+        request,
+        next: &context.next,
+        previous: context.previous.as_ref(),
+    };
+    let impact =
+        apply_observed(transport, &declarations, metadata, &target, &listed, force).await?;
+    Ok((impact, Observation::capture(target, &listed)))
+}
+
+pub(super) async fn apply_observed(
+    transport: &PreviewTransport,
+    context: &Declarations<'_>,
+    metadata: &ReviewResource,
+    target: &PreviewTarget,
+    listed: &NamedPreview,
+    force: bool,
+) -> Result<PreviewFieldImpact> {
+    let request = context.request;
+    let resource = request
+        .next
+        .compiled
+        .ir
+        .resources
+        .iter()
+        .find(|item| item.id == metadata.id)
+        .ok_or_else(|| invalid("preview canonical resource missing"))?;
     let before = listed.object().map(object_value).transpose()?;
     let uid = listed
         .object()
@@ -72,7 +122,7 @@ pub(super) async fn preview_target(
             object,
             expected_uid,
         });
-    let composition = compose_preview(&context.next, &metadata.identity, &resource.desired, live)?;
+    let composition = compose_preview(context.next, &metadata.identity, &resource.desired, live)?;
     let precondition = match listed.object() {
         Some(object) => ApplyPrecondition::Existing {
             uid: object
@@ -98,7 +148,7 @@ pub(super) async fn preview_target(
         force,
         precondition,
     )?;
-    let projected = transport.dry_run_apply(&target, &apply).await?;
+    let projected = transport.dry_run_apply(target, &apply).await?;
     require_apply_owner(
         projected.object(),
         resource,
@@ -107,24 +157,15 @@ pub(super) async fn preview_target(
     let projected_value = object_value(projected.object())?;
     composition.verify_projected(&projected_value)?;
     let impact = classify_preview_fields(
-        context.previous.as_ref(),
-        &context.next,
+        context.previous,
+        context.next,
         &metadata.identity,
         PreviewObjects {
             before: before.as_ref(),
             projected: &projected_value,
         },
     )?;
-    Ok((
-        impact,
-        Observation {
-            target,
-            uid: uid.map(str::to_owned),
-            resource_version: listed
-                .object()
-                .and_then(|object| object.metadata.resource_version.clone()),
-        },
-    ))
+    Ok(impact)
 }
 
 fn require_target_authority(
@@ -206,7 +247,11 @@ fn require_target_authority(
     Ok(resource.force)
 }
 
-fn require_apply_owner(object: &DynamicObject, resource: &Resource, domain: &str) -> Result<()> {
+pub(super) fn require_apply_owner(
+    object: &DynamicObject,
+    resource: &Resource,
+    domain: &str,
+) -> Result<()> {
     let manager = format!("reakt-{domain}");
     let mut apply = 0;
     for entry in object
@@ -238,7 +283,7 @@ fn require_apply_owner(object: &DynamicObject, resource: &Resource, domain: &str
     Ok(())
 }
 
-fn object_value(object: &DynamicObject) -> Result<serde_json::Value> {
+pub(super) fn object_value(object: &DynamicObject) -> Result<serde_json::Value> {
     crate::preview_limits::validate_serialized(object, 4 * 1024 * 1024)?;
     serde_json::to_value(object).map_err(|_| invalid("preview object projection failed"))
 }

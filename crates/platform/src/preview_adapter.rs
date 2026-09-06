@@ -12,6 +12,12 @@ mod authority;
 #[path = "preview_execution.rs"]
 mod execution;
 
+#[path = "preview_pending.rs"]
+mod pending;
+pub use pending::{
+    PendingPreview, PendingPreviewBinding, PendingPreviewOutcome, PendingPreviewUnavailable,
+};
+
 const DEADLINE: Duration = Duration::from_secs(120);
 const MAX_REPORT_BYTES: usize = 8 * 1024 * 1024;
 

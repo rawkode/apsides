@@ -1,7 +1,7 @@
 use super::*;
 use coordination::ReviewMetadataV1;
 
-fn upgrade(
+pub(super) fn upgrade(
     before: &Value,
     after: &Value,
 ) -> Result<(StoredTransition, deploy::TransitionPlan, ReviewMetadataV1)> {
@@ -28,7 +28,7 @@ fn add_ceiling_names(request: &mut deploy::DeploymentRequest, count: usize) {
     request.cleanup_ceiling.capabilities.push(capability);
 }
 
-fn upgrade_with_ceiling(
+pub(super) fn upgrade_with_ceiling(
     before: &Value,
     after: &Value,
     count: usize,

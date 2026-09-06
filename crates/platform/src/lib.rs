@@ -27,7 +27,16 @@ mod permissions;
 #[cfg(feature = "deployer")]
 mod preview_adapter;
 #[cfg(feature = "deployer")]
-pub use preview_adapter::{LivePreviewReport, PreviewCondition, PreviewInterval};
+mod preview_permissions;
+#[cfg(feature = "deployer")]
+pub use preview_adapter::{
+    LivePreviewReport, PendingPreview, PendingPreviewBinding, PendingPreviewOutcome,
+    PendingPreviewUnavailable, PreviewCondition, PreviewInterval,
+};
+#[cfg(feature = "deployer")]
+pub use preview_permissions::{
+    PreviewPermissionLimitation, PreviewPermissions, PreviewTargetRequest, preview_permissions,
+};
 #[cfg(feature = "deployer")]
 pub mod preview_composition;
 #[cfg(feature = "deployer")]

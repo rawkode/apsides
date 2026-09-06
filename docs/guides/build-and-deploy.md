@@ -88,6 +88,20 @@ reakt deploy --artifact path/to/verified-release
 Do not use an ephemeral CI filesystem as durable inventory. Connection values
 are deployment configuration and never enter inventory snapshots or reports.
 
+The command returns a v5 deployment review. If the platform-owned deployment
+identity explicitly enables preview, the same command captures conditional SSA
+live impact; no extra CI flag is needed. Fresh observations precede reservation,
+while resumed observations are labeled current-state. Missing protected UID or
+adoption evidence can make a pending live preview unavailable without granting
+any new execution authority. Identity, policy, transport and permission failures
+remain errors. Without opt-in, the report explicitly says preview was not approved.
+
+The review lists supplemental preview permissions separately and keeps observed
+values out of its output. The final result retains the captured review, and an
+already-committed retry performs no live preview. See the
+[deployment review contract](/reakt/review-contract/) for evidence limits;
+actual issued-token SSA qualification remains outstanding.
+
 ## What privileged CI owns
 
 The deployer creates generation-specific Roles and RoleBindings, deploys the

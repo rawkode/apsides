@@ -1,3 +1,6 @@
+#[path = "review_live_tests.rs"]
+mod live;
+
 use super::*;
 use compiler_core::canonical_bytes;
 

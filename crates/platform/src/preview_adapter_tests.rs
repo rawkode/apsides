@@ -14,7 +14,7 @@ struct Fixture {
     calls: Calls,
 }
 
-struct NoInventory;
+pub(super) struct NoInventory;
 #[async_trait::async_trait]
 impl InventoryStore for NoInventory {
     async fn load(
@@ -44,17 +44,22 @@ impl InventoryStore for NoInventory {
     }
 }
 
-fn state(name: &str, value: &impl serde::Serialize, uid: &str, rv: &str) -> TestResult<Value> {
+pub(super) fn state(
+    name: &str,
+    value: &impl serde::Serialize,
+    uid: &str,
+    rv: &str,
+) -> TestResult<Value> {
     Ok(
         json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":"control","uid":uid,"resourceVersion":rv},
         "data":{"state.json":serde_json::to_string(value)?}}),
     )
 }
-fn version() -> Value {
+pub(super) fn version() -> Value {
     json!({"major":"1","minor":"34","gitVersion":"v1.34.3","gitCommit":"test","gitTreeState":"clean",
         "buildDate":"2026-01-01T00:00:00Z","goVersion":"go1.24","compiler":"gc","platform":"linux/amd64"})
 }
-fn identity(targets: Vec<coordination::ReviewIdentity>) -> DeploymentIdentity {
+pub(super) fn identity(targets: Vec<coordination::ReviewIdentity>) -> DeploymentIdentity {
     DeploymentIdentity {
         schema_version: crate::DEPLOYMENT_IDENTITY_SCHEMA_V2.into(),
         domain_id: "example".into(),
@@ -159,7 +164,7 @@ fn fixture(scenario: Scenario) -> TestResult<Fixture> {
         calls,
     })
 }
-fn empty_list() -> Value {
+pub(super) fn empty_list() -> Value {
     json!({"apiVersion":"v1","kind":"ConfigMapList","metadata":{"resourceVersion":"77"},"items":[]})
 }
 fn dry_run(request: &DeploymentRequest) -> Value {

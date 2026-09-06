@@ -73,7 +73,8 @@ async fn deploy(options: &BTreeMap<String, String>, resize_capacity: bool) -> Re
     if resize_capacity {
         capacity::require_target(&existing, registry.value.transitions.get(&transition_id))?;
     }
-    match existing {
+    let resumed = matches!(&existing, ExistingTransition::Resume);
+    let mut live = match existing {
         ExistingTransition::Committed => {
             return already_committed_report(
                 &platform,
@@ -83,10 +84,12 @@ async fn deploy(options: &BTreeMap<String, String>, resize_capacity: bool) -> Re
             )
             .await;
         }
-        ExistingTransition::Resume => {}
+        ExistingTransition::Resume => crate::review::LiveReview::Unavailable {
+            reason: "deployment-identity-preview-not-approved",
+        },
         ExistingTransition::Absent => {
             reserve_new_transition(
-                &platform,
+                &issued,
                 inventory.as_ref(),
                 registry,
                 &verified,
@@ -94,61 +97,91 @@ async fn deploy(options: &BTreeMap<String, String>, resize_capacity: bool) -> Re
                 &executor,
                 options,
             )
-            .await?;
+            .await?
         }
-    }
-    let session = platform
-        .transition_session(&verified, inventory.as_ref(), &transition_id)
-        .await?;
-    let session = if resize_capacity {
-        Box::pin(capacity::resize_and_rebind(
-            &platform,
-            session,
-            &verified,
-            inventory.as_ref(),
-            &transition_id,
-            &executor,
-        ))
-        .await?
-    } else {
-        session
     };
-    review_transition(&session, inventory.as_ref()).await?;
-    let committed = Box::pin(drive_transition(
-        &session,
+    let mut session = selected_session(
+        &platform,
         &verified,
+        inventory.as_ref(),
         &transition_id,
         &executor,
-    ))
-    .await?;
-    let tracking = crate::inventory_connection::publish(
-        &session,
-        inventory.as_ref(),
-        &committed.value,
-        &transition_id,
+        resize_capacity,
     )
     .await?;
-    deployment_report(
+    if resumed && issued.identity().preview.is_some() {
+        let pending = issued
+            .preview_transition(&verified, inventory.as_ref(), &transition_id)
+            .await?;
+        let resolved = pending.session.resolve().await?;
+        live = crate::review::LiveReview::pending(&resolved, pending.outcome, pending.binding)?;
+        session = pending.session;
+    }
+    let review = review_transition(&session, inventory.as_ref(), &live).await?;
+    let tracking = complete_transition(
+        &session,
+        &verified,
+        inventory.as_ref(),
+        &transition_id,
+        &executor,
+    )
+    .await?;
+    Ok(deployment_report(
         &session.resolve().await?,
         &verified,
         &compatibility,
         issued.expires_at(),
         &tracking,
-    )
+        &review,
+    ))
+}
+
+async fn complete_transition(
+    session: &platform::TransitionSession,
+    verified: &release::VerifiedRelease,
+    inventory: &dyn inventory::InventoryStore,
+    transition: &str,
+    executor: &str,
+) -> Result<inventory::VersionedInventory> {
+    let committed = Box::pin(drive_transition(session, verified, transition, executor)).await?;
+    crate::inventory_connection::publish(session, inventory, &committed.value, transition).await
+}
+
+async fn selected_session(
+    platform: &PlatformClient,
+    verified: &release::VerifiedRelease,
+    inventory: &dyn inventory::InventoryStore,
+    transition: &str,
+    executor: &str,
+    resize_capacity: bool,
+) -> Result<platform::TransitionSession> {
+    let session = platform
+        .transition_session(verified, inventory, transition)
+        .await?;
+    if resize_capacity {
+        Box::pin(capacity::resize_and_rebind(
+            platform, session, verified, inventory, transition, executor,
+        ))
+        .await
+    } else {
+        Ok(session)
+    }
 }
 
 async fn review_transition(
     session: &platform::TransitionSession,
     inventory: &dyn inventory::InventoryStore,
-) -> Result<()> {
+    live: &crate::review::LiveReview,
+) -> Result<Value> {
     let resolved = session.resolve().await?;
     crate::inventory_connection::require_request(inventory, &resolved.plan().request).await?;
+    let review = crate::review::transition_review_with_live(&resolved, live)?;
     writeln!(
         std::io::stderr().lock(),
         "{}",
-        serde_json::to_string_pretty(&crate::review::transition_review(&resolved)?)?
+        serde_json::to_string_pretty(&review)?
     )?;
-    Ok(())
+    Ok(review)
 }
 
 async fn already_committed_report(
@@ -164,9 +197,14 @@ async fn already_committed_report(
     let tracking =
         crate::inventory_connection::publish(&session, inventory, &selected.value, transition)
             .await?;
+    let live = crate::review::LiveReview::Unavailable {
+        reason: "committed-current-state-preview-not-run",
+    };
+    let review = crate::review::transition_review_with_live(&session.resolve().await?, &live)?;
     Ok(json!({
         "status": "already-committed", "transition": transition,
         "releaseDigest": verified.release_digest(),
+        "review": review,
         "inventory": {"revision": tracking.revision, "snapshotId": tracking.snapshot_id},
     }))
 }
@@ -191,14 +229,15 @@ fn verify_resumed_intents(
 }
 
 async fn reserve_new_transition(
-    platform: &PlatformClient,
+    issued: &IssuedDeployment,
     inventory: &dyn inventory::InventoryStore,
     mut registry: platform::Versioned<platform::NamespaceRegistry>,
     verified: &release::VerifiedRelease,
     transition_id: &str,
     executor: &str,
     options: &BTreeMap<String, String>,
-) -> Result<()> {
+) -> Result<crate::review::LiveReview> {
+    let platform = issued.platform();
     registry
         .value
         .next_sequence
@@ -251,14 +290,21 @@ async fn reserve_new_transition(
     } else {
         None
     };
-    crate::review::preflight(
-        &deploy::plan_transition(&request)?,
-        previous_review.as_ref(),
-    )?;
+    let plan = deploy::plan_transition(&request)?;
+    crate::review::preflight(&plan, previous_review.as_ref())?;
+    let live = if issued.identity().preview.is_some() {
+        let report = issued.preview_fresh(&request, verified, inventory).await?;
+        crate::review::LiveReview::fresh(&plan, previous_review.as_ref(), report)?
+    } else {
+        crate::review::LiveReview::Unavailable {
+            reason: "deployment-identity-preview-not-approved",
+        }
+    };
+    crate::review::preflight_with_live(&plan, previous_review.as_ref(), &live)?;
     platform
         .reserve_transition(&request, executor, verified, inventory)
         .await?;
-    Ok(())
+    Ok(live)
 }
 
 struct DeploymentContext {
@@ -336,17 +382,16 @@ fn deployment_report(
     compatibility: &Value,
     expires_at: &str,
     tracking: &inventory::VersionedInventory,
-) -> Result<Value> {
+    review: &Value,
+) -> Value {
     let stored = resolved.stored();
     let transition_id = resolved.transition_id();
-    Ok(
-        json!({"status":"committed","transition":transition_id,"generation":stored.allocation().generation_id,
+    json!({"status":"committed","transition":transition_id,"generation":stored.allocation().generation_id,
         "releaseDigest":verified.release_digest(),"irDigest":verified.compiled().ir_digest,"compatibility":compatibility,
         "inventory":{"revision":tracking.revision,"snapshotId":tracking.snapshot_id},
         "credentialExpiresAt":expires_at,"requestDrainQualification":stored.request_drain_qualification,
-        "review":crate::review::transition_review(resolved)?,
-        "workloadReadiness":"not-established-by-deployment-commit"}),
-    )
+        "review":review,
+        "workloadReadiness":"not-established-by-deployment-commit"})
 }
 
 fn executor_id(options: &BTreeMap<String, String>) -> Result<String> {

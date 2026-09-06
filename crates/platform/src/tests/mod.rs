@@ -3323,3 +3323,13 @@ pub(crate) fn preview_fresh_fixture() -> std::result::Result<
     )?;
     Ok((request, registry, policy, trust))
 }
+
+// Protected pending-state fixture for the sealed preview adapter tests.
+pub(crate) fn preview_pending_fixture() -> std::result::Result<
+    (NamespaceRegistry, deploy::TransitionPlan, PolicyState, Value),
+    Box<dyn std::error::Error>,
+> {
+    let (staged, _, policy, trust, _) = staged_initial_fixture()?;
+    let plan = staged.plan(TRANSITION_A)?.clone();
+    Ok((staged.registry, plan, policy, trust))
+}
