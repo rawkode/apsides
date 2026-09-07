@@ -137,13 +137,13 @@ establish narrower properties.
 
 The current signed CNPG candidate is `work/cnpg-signed-candidate-9b5097a`,
 which includes the observed-input watch correction. The fresh merger at
-`work/cnpg-fourteen-merged-5e63857` accepts **fourteen of sixteen checks and all 43
+`work/cnpg-fifteen-merged-b4f0238` accepts **fifteen of sixteen checks and all 43
 required reactor cases**. These are the three reactor checks, signed
 permission-changing upgrade, reproducible payload, declared-input isolation,
 fixture-promotion rejection, deployment-ceiling rejection, ownership
 collision, last-type cleanup, finalizer preservation, UID-replacement rejection,
-API-bound gap conformance, and uncertain-writer blocking. `releaseVerified`
-remains false. Scope-matched benchmark and phase interruption recovery still need
+API-bound gap conformance, uncertain-writer blocking, and phase interruption
+recovery. `releaseVerified` remains false. Scope-matched benchmark still needs
 matching evidence. Local qualification signers do not
 establish GitHub Actions identity or production release trust.
 
@@ -221,6 +221,20 @@ The receipt passed the normal merger for the corrected successor. The run
 removed its cluster and credentials and restored prior host inventories. This
 qualifies lost termination evidence, not a real network partition or uncertain
 stalled-executor takeover.
+
+The fresh six-phase recovery matrix at producer `b4f0238` passed for Planned,
+Staged, Quiesced, Activated, Cleaning, and Committed. Each run interrupted after
+an exact persisted phase change, killed and reaped its owned deploy process,
+and used a fresh issued session under the same logical owner to recover.
+Planned, Staged, and Quiesced used authenticated checkpoint resolution; the later
+phases replayed their applicable operation. All six reached Committed, preserved
+inventory under repeated publication and commit, passed five workload checks,
+and confirmed old active writers were absent. Independent review verified each
+run's 16 sources and 69 frozen inputs. Every run removed its cluster and
+credentials and restored prior host inventories. The aggregate at
+`work/cnpg-phase-recovery-receipt-b4f0238` passed the normal merger against the
+corrected successor. This qualifies post-CAS interruption at those boundaries,
+not within-phase interruption or takeover of an uncertain stalled executor.
 
 The following qualification results belong to the **previous candidate**,
 `work/cnpg-signed-candidate-c6d67e0`. Its merger at
