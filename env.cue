@@ -5,6 +5,8 @@ import "github.com/cuenv/cuenv/schema"
 schema.#Project & {name: "apsides"}
 
 tasks: {
+	performanceTest: {command: "python3", args: ["tests/reakt/performance/test_performance.py"]}
+	cnpgBaselineTest: {command: "python3", args: ["tests/reakt/performance/test_cnpg_baseline.py"]}
 	authoringEditorCheck: {
 		dependsOn: [build, install]
 		command: "python3"

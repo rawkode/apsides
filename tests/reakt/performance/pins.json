@@ -5,6 +5,12 @@
     "image": "ghcr.io/fluxcd/kustomize-controller@sha256:2b8bec54ffb6caf421bd2a6c005d27f567d5dd4db7feb55794fb51fcabd69b8f",
     "arm64Manifest": "sha256:6ee39b81d5cf08e5ad1e66aa287c314d7e485ba23dfc96e336754839c685bf76"
   },
+  "reloader": {
+    "version": "v1.4.21",
+    "sourceCommit": "392be733e05b8e52c94199263abfd0f7632faab1",
+    "image": "ghcr.io/stakater/reloader@sha256:b253579350a835082cdad8d8736671cedaa0f8309437c894bd1bf1c2f0e0d45e",
+    "arm64Manifest": "sha256:b83b4a6eac57eff8a88a44eca0d06a8acd246b910ccbdb658586a3c6ba71c49c"
+  },
   "crds": [
     {"url": "https://github.com/fluxcd/kustomize-controller/releases/download/v1.9.4/kustomize-controller.crds.yaml", "sha256": "b9e74622f9f3d87950f59641651fe0ea0220367c1d6f34a72c9591552afda292"},
     {"url": "https://github.com/fluxcd/source-controller/releases/download/v1.9.0/source-controller.crds.yaml", "sha256": "672d2cf855a31197240c2923e46a787df3f6ff5a7348b1bf7101f4a6908ebc4f"}

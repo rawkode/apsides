@@ -30,8 +30,9 @@ the intended effect is one template change per changed input value. Equal-value
 replays must produce no template change. Input-to-template timing includes API
 and observation overhead and is not queue latency.
 
-Flux watches only its runtime namespace, with ConfigMap/Secret watchers limited
-by the input label selector. Apsides watches exact names. These are equivalent
+Flux watches only its runtime namespace. Its ConfigMap/Secret label predicate
+filters delivered events; the metadata informer cache may also retain unlabeled
+objects in that namespace. Apsides watches exact names. These are equivalent
 declared object populations, not identical watch implementations or equivalent
 RBAC strength. Measure the additional watch connections and control resources
 instead of removing them. Flux's namespace permissions are broader than Apsides's
@@ -60,6 +61,44 @@ An end-to-end Git distribution comparison requires a separate source-controller
 profile with its costs included.
 
 ## Preparation and operation
+
+### CNPG production workload
+
+`cnpg_baseline.py` prepares a single-domain Flux and Reloader comparison from
+the production CNPG plan, preserving its four desired objects, replicas and
+application images. It adds only static named ConfigMap/Secret reload annotations
+to the Deployment. Reloader is pinned to v1.4.21, source commit
+`392be733e05b8e52c94199263abfd0f7632faab1`, and an immutable OCI image in
+`pins.json`. This does not authenticate the upstream image publisher.
+
+```sh
+cuenv task cnpgBaselineTest
+cuenv exec -- python3 tests/reakt/performance/cnpg_baseline.py \
+  --plan "$CNPG_RELEASE/plan.json" --plan-sha256 "$CNPG_PLAN_SHA256" \
+  --output work/cnpg-baseline --artifact-server-image "$PYTHON_IMAGE"
+```
+
+Use the plan hash from the verified release's file manifest and a digest-pinned
+Python image. Output must be fresh and Git-ignored. The profile records source,
+IR and archive digests and fixes reconciliation to one second, matching current
+platform staging. Runtime configuration must be checked before measurement.
+Flux applies resources sequentially; its concurrency setting does not imply
+the same global request budget as Apsides's named watches.
+
+The output is preparation only: it does not install controllers, validate
+readiness, verify signatures, or produce release evidence. The fixture installer
+below is not a CNPG installer. CNPG and Flux CRDs, the operator, named inputs and
+healthy workloads must be established before the steady-state comparison.
+Startup and missing-input equivalence remain outside this prepared profile.
+
+Reloader publishes an unkeyed Secret hash in its runtime rollout annotation;
+Apsides uses an aggregate keyed revision. Do not retain that annotation, live
+Deployment templates, Secret values or Secret hashes in benchmark artifacts.
+ConfigMap `binaryData` must remain empty on both sides, and input changes must
+target `data`. These differences and the namespace-wide baseline read authority
+are explicit comparison boundaries, not security-equivalence claims.
+
+### Generic fixture profile
 
 Preparation takes immutable fixture and Python server image references. It does
 not pull images, build Apsides controllers, or create clusters:
