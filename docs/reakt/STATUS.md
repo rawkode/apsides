@@ -209,6 +209,13 @@ started. Cleanup removed its cluster and credentials and preserved the two
 existing clusters. `work/cnpg-seven-merged-fcf3e45` covers seven checks and all 43
 cases; nine checks remain missing and `releaseVerified` is false.
 
+Ownership-collision qualification passed at `4662270` against a separately signed
+owner with exactly one shared ConfigMap identity. The owner reserved its claim;
+the contender was rejected without changing measured state or starting a writer.
+Cluster and credential cleanup passed. `work/cnpg-eight-merged-4662270` now covers
+eight checks and all 43 cases, with eight checks missing and `releaseVerified:
+false`. The temporary local signer does not establish GitHub Actions trust.
+
 Automated suites cover strict schema and canonical replay, claim and metadata
 store immutability, registry concurrency, capacity accounting, review privacy,
 issued-client binding, preview request shape, UID-safe cleanup, finalizer retry,

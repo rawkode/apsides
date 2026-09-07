@@ -92,6 +92,21 @@ restored. The normal merger at `work/cnpg-seven-merged-fcf3e45/summary.json` acc
 seven checks and all 43 cases, with nine checks missing and `releaseVerified:
 false`. This is reservation qualification, not a CNPG operator deployment.
 
+Ownership-collision qualification passed at `4662270` using a separately built
+and locally signed `tests/reakt/fixtures/cnpg-owner` candidate. The owner and CNPG
+candidate have distinct domains with matching scope and exactly one shared
+identity: `v1 ConfigMap default/api-config`. The owner successfully reserved that
+claim; the contender's typed collision rejection left the measured registry and
+coordination state unchanged. No writer or managed resource was started.
+The receipt is in `work/cnpg-ownership-collision-4662270/evidence`. The isolated
+cluster and credentials were removed, preserving the two pre-existing clusters.
+Independent review verified both payload bindings, ten archived sources, driver,
+CRD and complete evidence file closure, and checked the reservation/state deltas.
+The temporary owner signing key was removed after signing. The normal merger at
+`work/cnpg-eight-merged-4662270/summary.json` accepts eight checks and all 43 cases;
+eight checks remain missing and `releaseVerified` is false. This measures
+reservation ownership, not runtime execution or GitHub Actions identity.
+
 ## Combining measured evidence
 
 `reakt merge-evidence` combines explicit receipts against one structurally valid
