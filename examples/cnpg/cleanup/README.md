@@ -36,3 +36,26 @@ Two independent live scenarios remain required: preserving a test-owned
 finalizer until its owner removes it, then completing cleanup; and refusing a
 replacement UID while retaining the original protected claim. Compilation and
 driver checks alone do not satisfy either live release check.
+
+The local runner accepts this signed predecessor and the signed parent
+successor, verified together under one external trust policy:
+
+```sh
+cuenv exec -- python3 tests/reakt/run_cnpg_cleanup.py \
+  --initial-artifact "$CLEANUP_PREDECESSOR" \
+  --successor-artifact "$SUCCESSOR_CANDIDATE" \
+  --trust-policy "$JOINT_TRUST_POLICY" \
+  --operator-manifest "$PINNED_OPERATOR_MANIFEST" \
+  --operator-sha256 "$OPERATOR_MANIFEST_DIGEST" \
+  --scenario finalizer \
+  --output "$PWD/work/cnpg-finalizer"
+```
+
+Use absolute input paths, a clean committed checkout, and a fresh ignored output
+directory. Run again with `--scenario replacement` and a separate fresh output
+directory. Each run creates and deletes its own kind cluster through the
+existing Docker context; existing clusters remain untouched.
+
+The runner emits a non-release measurement only after cluster and credential
+cleanup and repeated input verification. It does not produce a production
+cleanup receipt yet. Offline runner checks use `cuenv task cnpgCleanupTest`.

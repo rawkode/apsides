@@ -252,6 +252,30 @@ async fn lifecycle(
             )
         }
         Err(platform_api::Error::Pending(_)) => {
+            if operation == CandidatePairLifecycleOperation::CommitUpgrade
+                && matches!(
+                    settings.purpose,
+                    platform_api::CandidatePairPurpose::LastTypeCleanup { .. }
+                )
+            {
+                let resolved = platform
+                    .resolve_pair_transition(
+                        CandidatePairRole::Successor,
+                        &authorized,
+                        &inventory,
+                        transition,
+                    )
+                    .await
+                    .map_err(|_| DriverError("pending cleanup state readback failed"))?;
+                require_retained_cleanup_claim(&resolved, &settings.purpose)?;
+                return report_registry(
+                    operation_pending_name(operation),
+                    pair,
+                    resolved.registry(),
+                    transition,
+                    "",
+                );
+            }
             let registry = platform
                 .load_registry()
                 .await

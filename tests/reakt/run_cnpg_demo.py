@@ -253,6 +253,12 @@ def missing_capability(initial, successor):
 
 
 class CnpgDemoRunner(base.CeilingRunner):
+    purpose = {"kind": "permission-expansion"}
+
+    @staticmethod
+    def parse_result(output, expected):
+        return result_record(output, expected)
+
     def __init__(self, args):
         args.artifact = args.successor_artifact
         self.initial_artifact = args.initial_artifact
@@ -411,14 +417,7 @@ class CnpgDemoRunner(base.CeilingRunner):
             if (manifest.get("mode") != "production" or plan["ir"].get("testOnly") is not False
                     or shared.digest_file(artifact / "release.json") != self.pair["candidates"][digest_key]):
                 raise shared.QualificationError("CNPG demo subject differs from its verified production candidate")
-        validate_demo_pair(self.initial_plan, self.successor_plan)
-        self.initial_policy = full_policy(self.initial_plan)
-        self.successor_policy = full_policy(self.successor_plan)
-        self.initial_policy_digest = shared.digest_bytes(shared.canonical(self.initial_policy))
-        self.successor_policy_digest = shared.digest_bytes(shared.canonical(self.successor_policy))
-        if self.initial_policy_digest == self.successor_policy_digest:
-            raise shared.QualificationError("CNPG demo policies do not identify an upgrade")
-        self.missing = missing_capability(self.initial_plan, self.successor_plan)
+        self.configure_pair()
         profile_output = self.command([
             self.profile_driver, "proxy_profile", "--exact", "--ignored", "--nocapture",
         ])
@@ -442,6 +441,16 @@ class CnpgDemoRunner(base.CeilingRunner):
             raise shared.QualificationError("signed successor does not pin one PostgREST image")
         self.workload_image = containers[0]["image"]
         self.require_inputs_unchanged()
+
+    def configure_pair(self):
+        validate_demo_pair(self.initial_plan, self.successor_plan)
+        self.initial_policy = full_policy(self.initial_plan)
+        self.successor_policy = full_policy(self.successor_plan)
+        self.initial_policy_digest = shared.digest_bytes(shared.canonical(self.initial_policy))
+        self.successor_policy_digest = shared.digest_bytes(shared.canonical(self.successor_policy))
+        if self.initial_policy_digest == self.successor_policy_digest:
+            raise shared.QualificationError("CNPG demo policies do not identify an upgrade")
+        self.missing = missing_capability(self.initial_plan, self.successor_plan)
 
     def run_proxy_canary(self):
         source = ROOT / "crates/platform/tests/envoy/canary.py"
@@ -506,7 +515,7 @@ class CnpgDemoRunner(base.CeilingRunner):
             self.refresh_issuer()
         settings = {
             "action": action,
-            "purpose": {"kind": "permission-expansion"},
+            "purpose": self.purpose,
             "initialArtifact": str(self.initial_artifact),
             "successorArtifact": str(self.successor_artifact),
             "trustPolicy": str(self.trust),
@@ -529,7 +538,7 @@ class CnpgDemoRunner(base.CeilingRunner):
         output = self.command([
             self.driver, "permission_upgrade_step", "--exact", "--ignored", "--nocapture",
         ], environment=environment, timeout=180)
-        result = result_record(output, expected)
+        result = self.parse_result(output, expected)
         if hasattr(self, "pair") and result["candidates"] != self.pair["candidates"]:
             raise shared.QualificationError("permission upgrade step changed the verified pair")
         self.steps.append(result)
@@ -584,7 +593,7 @@ class CnpgDemoRunner(base.CeilingRunner):
         pair = self.pair["candidates"]
         marker = {
             "schemaVersion": PAIR_SCHEMA,
-            "purpose": {"kind": "permission-expansion"},
+            "purpose": self.purpose,
             "runId": cluster_target["runId"],
             "clusterName": self.cluster,
             "sentinelNamespace": self.cluster,
@@ -600,7 +609,7 @@ class CnpgDemoRunner(base.CeilingRunner):
             markerResourceVersion=created["metadata"]["resourceVersion"],
         )
         self.target = {
-            "purpose": {"kind": "permission-expansion"},
+            "purpose": self.purpose,
             "cluster": cluster_target,
             "initialPolicyDigest": self.initial_policy_digest,
             "successorPolicyDigest": self.successor_policy_digest,

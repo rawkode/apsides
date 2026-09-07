@@ -374,6 +374,18 @@ after authorized readback confirms the transition remains in Cleaning with
 the exact original UID claim retained. These are producer prerequisites, not
 live cleanup receipts.
 
+The cleanup predecessor was built for Linux/arm64 at source revision `aa04c76`
+and assembled as release
+`sha256:c890f42c4624bba3aca59c1bbb1f04a3fb4cb9cb151de97540db1712e6a36a4f`.
+Its native binary digest is
+`sha256:27f0929c7f1f37b83ffad6aa51ff0127b2bb281769389386b8ddaa7318c98c47`.
+The public signed-pair verifier accepted it with the unchanged CNPG successor
+under joint trust digest
+`sha256:0f1ede6a85f0fd14e1081cd3940898783b01f9dd20a61557109d884e24819ead`.
+The temporary private signing key was deleted. This verifies signed candidate
+integrity and the exact compiled cleanup relation; it does not qualify either
+live cleanup scenario or full release acceptance.
+
 The test-support pair marker requires an explicit purpose. Permission-expansion
 qualification retains its strict capability addition and distinct approved policy
 identities. Last-type cleanup qualification instead binds one selected resource
