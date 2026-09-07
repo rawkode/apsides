@@ -156,8 +156,14 @@ the original claim, then completed after removing only the test-owned finalizer.
 A separate replacement-UID run refused deletion and retained the original claim
 in Cleaning. Both preserved an unclaimed Backup, checked the successor workload
 Role omitted Backup access, and deleted their owned cluster and credentials.
-They currently produce non-release measurements; production receipt integration
-is pending, so the accepted check count remains one of sixteen.
+Their archived measurements have now been packaged with the original producer
+source and accepted by the normal evidence merger. Together with the permission
+receipt, `work/cnpg-cleanup-merged/summary.json` covers four of sixteen checks for
+this exact successor: permission-changing upgrade, last-API-type cleanup,
+finalizer preservation and UID-replacement rejection. Twelve checks and all 43
+reactor cases remain missing; `releaseVerified` remains false. Packaging performs
+no new cluster execution. Altered binary and runner digests were both rejected
+without publishing output.
 
 Automated suites cover strict schema and canonical replay, claim and metadata
 store immutability, registry concurrency, capacity accounting, review privacy,

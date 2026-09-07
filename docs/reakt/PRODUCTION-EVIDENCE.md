@@ -422,6 +422,42 @@ This Role check is not a cluster-wide effective-authorization proof. Both
 runners removed their cluster and credentials, restored the previous inventories,
 and reverified the frozen inputs and signed pair before publication.
 
-These are non-release measurements, not production evidence receipts. The
-production receipt adapter and normal evidence-consumer verification remain
-outstanding; the accepted production check count has not increased.
+The original measurement files remain unchanged. Their production receipts are
+in `work/cnpg-finalizer-receipt` and `work/cnpg-replacement-receipt`.
+The normal `aps merge-evidence` consumer accepted both alongside the existing
+permission-upgrade receipt in `work/cnpg-cleanup-merged`. This covers four of
+sixteen checks for the same successor; twelve checks and 43 reactor cases remain
+missing, and `releaseVerified` is false. Negative consumer checks rejected altered
+binary and runner digests without publishing output.
+Independent read-only review passed the adapter and its ten tests, rechecked
+unchanged measurement bytes and runner hashes, and confirmed that both packaged
+closures exactly match the merged evidence. That review used archived records;
+it did not rerun the cluster experiments.
+
+Packaging these archived measurements must preserve the original measurement
+bytes and measured producer source. The adapter must check an explicitly supplied
+measurement digest, the frozen candidate and producer files, and the scenario's
+lifecycle observations before deriving release assertions. The finalizer run can
+support `finalizer-preservation` and `last-api-type-cleanup`; the replacement run
+can support `uid-replacement-rejection`. Neither can satisfy reactor fixture cases.
+The source archive explains the guarded Kubernetes readbacks behind those
+observations; packaging does not repeat them or independently authenticate their
+execution. Receipt filenames must distinguish both scenarios from the existing
+permission-upgrade receipt so the normal merger can retain each source closure.
+
+The bounded archival adapter is `tests/reakt/package_cnpg_cleanup.py`:
+
+```sh
+cuenv exec -- python3 tests/reakt/package_cnpg_cleanup.py \
+  --measurement work/cnpg-finalizer-first \
+  --measurement-sha256 sha256:d8d9898e67f7e5ea9acc45d83e50521f7526f2353138199b01df9ad97be96114 \
+  --initial-artifact work/cnpg-cleanup-pair-aa04c76/initial \
+  --successor-artifact work/cnpg-pair-5ed7b25/successor \
+  --trust-policy work/cnpg-cleanup-pair-aa04c76/trust.json \
+  --output work/cnpg-finalizer-receipt
+```
+
+The destination must not exist. Publication creates it exclusively and writes
+the receipt last; a directory without a valid receipt is incomplete and must not
+be selected for merging. `cuenv task cnpgCleanupEvidenceTest` checks incomplete
+observations, changed bindings and source archives, and output protection.

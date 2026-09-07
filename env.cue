@@ -14,6 +14,7 @@ tasks: {
 	packageCliTest: {command: "python3", args: ["tests/reakt/test_package_cli.py"]}
 	cnpgDemoTest: {command: "python3", args: ["tests/reakt/test_cnpg_demo.py"]}
 	cnpgCleanupTest: {command: "python3", args: ["tests/reakt/test_cnpg_cleanup.py"]}
+	cnpgCleanupEvidenceTest: {command: "python3", args: ["tests/reakt/test_cnpg_cleanup_evidence.py"]}
 	cnpgCleanupTypes: [
 		{
 			dependsOn: [install]
