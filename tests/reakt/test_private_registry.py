@@ -45,6 +45,8 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(value.publishedrefs[reference], {'manifestDigest': digest, 'configDigest': config})
         args = run.call_args_list[0].args[0]
         self.assertIn('--to-registry-config', args)
+        self.assertIn('--to-plain-http=false', args)
+        self.assertIn('--plain-http=false', run.call_args_list[1].args[0])
         self.assertNotIn(value.password, ' '.join(str(arg) for arg in args))
 
     def test_publication_does_not_accept_changed_manifest(self):

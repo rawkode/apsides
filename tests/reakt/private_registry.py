@@ -147,10 +147,10 @@ class PrivateRegistry:
                 or not re.fullmatch(r"sha256:[a-f0-9]{64}", expected_digest)):
             raise RegistryError("registry publication target invalid")
         local_ref = self.local_host + "/" + repository
-        command([self.oras, "cp", "--from-oci-layout", "--to-ca-file", self.ca_path,
+        command([self.oras, "cp", "--from-oci-layout", "--to-plain-http=false", "--to-ca-file", self.ca_path,
                  "--to-registry-config", self.client_config, str(Path(archive).resolve()) + "@" + expected_digest,
                  local_ref + ":qualification"], timeout=180)
-        raw = command([self.oras, "manifest", "fetch", "--ca-file", self.ca_path,
+        raw = command([self.oras, "manifest", "fetch", "--plain-http=false", "--ca-file", self.ca_path,
                        "--registry-config", self.client_config, local_ref + "@" + expected_digest])
         if "sha256:" + hashlib.sha256(raw).hexdigest() != expected_digest:
             raise RegistryError("published manifest digest differs from archive")
