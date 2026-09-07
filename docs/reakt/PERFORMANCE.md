@@ -288,6 +288,33 @@ control-plane images are outside this population. Both analyzers retain
 `completeSection26: false`; cache occupancy, relist recovery, increasing-domain
 costs, build/deploy timing and comparison equivalence still need qualification.
 
+### Recorded native cache and scheduling observations
+
+The same native idle and active windows contain thirteen runtime samples each.
+Recomputing their diagnostics from all twenty-six saved samples reproduced both
+stored summaries. Every sample identifies the corrected `ae8f43a0` release and
+the same generation, Pod and container, with no restart or counter reset. All
+samples report ready, synchronized state with no blocked targets or errors.
+The local report at `work/cnpg-runtime-analysis-b764e79/report.json` binds the
+collector, summaries and sample projections by SHA-256.
+
+| Native window | Sampled peak apply-cache entries | Sampled peak serialized bytes | Scheduling observations | Mean trigger-to-cycle time (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Idle | 4 | 861 | 57 | 14.275 |
+| Active | 4 | 861 | 58 | 20.671 |
+
+Scheduling count and sum are differences between the first and last sample.
+The maximum counter is process-lifetime cumulative: its final values of 54.392 ms
+and 58.692 ms are not interval maxima or percentiles. Pending coalesced triggers
+were zero at every sample; this does not establish that none were pending between
+samples. The measurements cover trigger observation to cycle start, not complete
+reconciliation or application rollout latency.
+
+Cache bytes describe retained serialized apply payloads, excluding allocator
+overhead, other caches and transient allocations. These observations do not
+supply baseline informer-cache occupancy or establish equivalence with Flux's
+workqueue timing. The full benchmark gate remains open.
+
 ### Generic fixture profile
 
 Preparation takes immutable fixture and Python server image references. It does
