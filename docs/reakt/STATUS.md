@@ -11,8 +11,9 @@ establish narrower properties.
 
 - `aps init` creates a starter project with Deno and TypeScript configuration.
   `aps crds fetch` generates ignored, importable types from a pinned CRD source.
-  A generated CloudNativePG import was checked through the TypeScript language
-  service with zero diagnostics and 55 property completions.
+  `cuenv task authoringEditorCheck` verifies a fresh CloudNativePG import through
+  Deno's language server: nested type and JSX completions, hover documentation,
+  zero valid-document diagnostics, and rejection of invalid fields and types.
 - `cuenv task packageCli` builds a relocatable macOS/Linux CLI prefix with
   compiler dependencies and the native build source closure. Distribution builds
   verify the exact asset tree against a manifest digest embedded in the executable.
@@ -38,7 +39,16 @@ establish narrower properties.
 - Protected platform policy can supply registry Secret references for controller
   and proxy image pulls, without granting runtime Secret access. References bind
   to the policy and staged Pod templates; credentials remain platform-owned.
-  A fresh-node private-registry pull is not yet qualified.
+  `work/private-pull-live-9e6896d` qualified an uncached controller pull on a fresh
+  kind node: a missing credential rejection, a fresh HTTP 401 while invalid
+  credentials existed, then readiness after a guarded update to valid credentials.
+  The Pod UID, Deployment template and protected policy stayed unchanged.
+  The same run passed CNPG deployment, permission-change rejection, approved
+  upgrade, Secret consumption and a ConfigMap-triggered rollout. Cluster,
+  container and registry-volume inventories were restored. This is local
+  qualification of the native `5afce8a` pair, not a production release receipt;
+  the invalid-phase event does not establish precisely when kubelet consumed
+  the changed Secret bytes.
 - Runtime diagnostics retain completed-cycle blocked counts and specific reasons
   throughout reconciliation backoff. `/status` includes up to 256 `conditions`
   containing only `resourceId` and `reasonCode`, plus a `fieldOrVersionConflicts`
@@ -372,6 +382,11 @@ recovery, or production restore authority.
 
 ## Remaining production work
 
+- The GitHub Actions checks workflow runs existing cuenv build, authoring,
+  editor, Rust, harness and documentation tasks with read-only repository
+  permissions. Actionlint and independent review passed; hosted Linux execution
+  remains unverified. Release signing and external OIDC-to-Kubernetes identity
+  configuration and claim qualification remain separate unfinished work.
 - Complete release qualification for the corrected native candidate. The runtime
   watches only observed inputs, matching compiled permissions; managed inputs
   retain periodic reconciliation. `work/cnpg-input-reactions-89ceec4` passed the

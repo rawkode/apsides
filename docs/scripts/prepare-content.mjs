@@ -17,6 +17,7 @@ const pages = [
 const references = [
   ["reakt/ARTIFACT-RESOLUTION.md", "reakt/artifact-resolution.md", "Optional OCI release retrieval"],
   ["reakt/AUDIT.md", "reakt/audit.md", "Transition audit history"],
+  ["reakt/CLI-DISTRIBUTION.md", "reakt/cli-distribution.md", "CLI distribution"],
   ["reakt/DEPLOYMENT-CONTRACT.md", "reakt/deployment-contract.md", "Provider-neutral deployment protocol"],
   ["reakt/DEPLOYMENT-PERMISSIONS.md", "reakt/deployment-permissions.md", "Deployment permissions"],
   ["reakt/INVENTORY.md", "reakt/inventory.md", "Resource inventory"],
@@ -50,6 +51,18 @@ function withFrontmatter(source, title) {
     .replace(
       /\]\(AUDIT\.md(#[^)]+)?\)/g,
       (_, fragment = "") => `](../audit/${fragment})`,
+    )
+    .replace(
+      /\]\(CLI-DISTRIBUTION\.md(#[^)]+)?\)/g,
+      (_, fragment = "") => `](../cli-distribution/${fragment})`,
+    )
+    .replace(
+      /\]\(STATUS\.md(#[^)]+)?\)/g,
+      (_, fragment = "") => `](../status/${fragment})`,
+    )
+    .replace(
+      /\]\(\.\.\/\.\.\/examples\/cnpg\/cleanup\/README\.md\)/g,
+      "](https://github.com/rawkode/apsides/blob/main/examples/cnpg/cleanup/README.md)",
     )
     .replace(
       /\]\(\.\.\/\.\.\/packages\/example-bundle\/src\/controller\.tsx\)/g,
