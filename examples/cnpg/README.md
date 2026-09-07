@@ -113,7 +113,9 @@ Presentation checkpoints:
 The rehearsal also inserts a public row in a separate `aps_demo_persistence`
 table before upgrading, then requires that row and the same CNPG resource and
 PVC identities afterward. This leaves the visible `messages` demo unchanged.
-That check has passed unit tests; its live rehearsal is still pending.
+The live rehearsal in `work/demo-preservation-7f30cce` passed this checkpoint,
+both input reactions and cleanup. It used the signed-candidate test driver;
+the public CLI deployment checkpoint above remains pending.
 
 The example uses `deletionPolicy="orphan"` for its resources. That protects the
 intended resource lifecycle; it is not a database backup. The rehearsal deletes
