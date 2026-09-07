@@ -268,6 +268,12 @@ recovery, or production restore authority.
 
 ## Remaining production work
 
+- Rebuild and requalify the native candidate after correcting input watch scope.
+  The runtime now watches only observed inputs, matching compiled permissions;
+  managed inputs retain periodic reconciliation. The prior signed CNPG candidate
+  attempted managed-input watches without a matching watch grant. Live runs
+  completed the upgrade but failed readiness before or after idle sampling;
+  those runs do not prove the cause or qualify the corrected binary.
 - Produce one signed production release containing every required reactor case
   and all sixteen authenticated release checks.
 - Preserve the current payload binding when assembling the final release. Its

@@ -792,6 +792,12 @@ impl RuntimeClient for KubeRuntimeClient {
         inputs: &[Input],
         timeout: Duration,
     ) -> Result<(), RuntimeError> {
+        // Managed inputs come from this controller's desired/applied state and
+        // have no external watch capability. Periodic reconciliation still runs.
+        let inputs = inputs
+            .iter()
+            .filter(|input| input.mode == InputMode::Observed)
+            .collect::<Vec<_>>();
         if inputs.is_empty() {
             tokio::time::sleep(timeout).await;
             return Ok(());
@@ -1242,6 +1248,79 @@ mod tests {
             },
             calls,
         )
+    }
+
+    fn watch_input(name: &str, mode: InputMode) -> Input {
+        Input {
+            id: name.into(),
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            name: name.into(),
+            namespace: "workload".into(),
+            mode,
+            managed_resource_id: (mode == InputMode::Managed).then(|| name.into()),
+            projection: vec!["data".into()],
+            sensitive: false,
+            missing: "block-dependent-mutations".into(),
+            source: SourceLocation {
+                file: "program.tsx".into(),
+                line: 1,
+                column: 1,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn named_watch_scopes_list_and_watch_to_observed_inputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut changed = object("changed", "11", "external");
+        changed["metadata"]["name"] = Value::String("observed".into());
+        let (client, calls) = wire_client(vec![
+            object_list(&[], "10"),
+            serde_json::json!({"type":"ADDED","object":changed}),
+        ]);
+        client
+            .wait_for_named_change(
+                &[
+                    watch_input("managed", InputMode::Managed),
+                    watch_input("observed", InputMode::Observed),
+                ],
+                Duration::from_secs(1),
+            )
+            .await?;
+        let calls = calls.lock().map_err(|_| "wire calls lock poisoned")?;
+        assert_eq!(calls.len(), 2);
+        for call in calls.iter() {
+            assert_eq!(call.method, Method::GET);
+            assert!(call.uri.contains("fieldSelector=metadata.name%3Dobserved"));
+            assert!(!call.uri.contains("managed"));
+        }
+        assert!(!calls[0].uri.contains("watch=true"));
+        assert!(calls[1].uri.contains("watch=true"));
+        assert!(calls[1].uri.contains("resourceVersion=10"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn named_watch_managed_only_waits_without_api_requests()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (client, calls) = wire_client(Vec::new());
+        let inputs = [watch_input("managed", InputMode::Managed)];
+        let wait = client.wait_for_named_change(&inputs, Duration::from_millis(25));
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), &mut wait)
+                .await
+                .is_err()
+        );
+        wait.await?;
+        assert!(
+            calls
+                .lock()
+                .map_err(|_| "wire calls lock poisoned")?
+                .is_empty()
+        );
+        Ok(())
     }
 
     fn conflict() -> Value {
