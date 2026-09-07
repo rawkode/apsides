@@ -39,7 +39,7 @@ def require(ok, reason):
         raise shared.QualificationError(reason)
 
 
-def authentication_failure(pod, events, previous):
+def authentication_failure(pod, events, previous, *, allow_missing=False):
     statuses = pod.get('status', {}).get('containerStatuses', [])
     require(not any(s.get('state', {}).get('running') for s in statuses), 'private image unexpectedly started without valid credentials')
     waiting = any(s.get('name') == 'controller' and s.get('state', {}).get('waiting', {}).get('reason') in {'ErrImagePull', 'ImagePullBackOff'} for s in statuses)
@@ -47,10 +47,15 @@ def authentication_failure(pod, events, previous):
         metadata = event.get('metadata', {})
         count = event.get('count', 1)
         message = event.get('message', '').lower()
+        rejection = None
+        if any(text in message for text in ['401 unauthorized', '401 (unauthorized)', 'unexpected status: 401']):
+            rejection = 'registry-authentication-rejected'
+        elif allow_missing and 'no basic auth credentials' in message:
+            rejection = 'registry-credentials-missing'
         if (waiting and event.get('involvedObject', {}).get('uid') == pod['metadata']['uid']
                 and event.get('reason') == 'Failed' and type(count) is int and count > previous.get(metadata.get('uid'), 0)
-                and any(text in message for text in ['401 unauthorized', '401 (unauthorized)', 'unexpected status: 401'])):
-            return {'eventUid': metadata['uid'], 'count': count, 'podUid': pod['metadata']['uid'], 'reason': 'registry-authentication-rejected'}
+                and rejection is not None):
+            return {'eventUid': metadata['uid'], 'count': count, 'podUid': pod['metadata']['uid'], 'reason': rejection}
     return None
 
 
@@ -128,14 +133,14 @@ class PrivatePullRunner(demo.CnpgDemoRunner):
             require(pods[0]['spec'].get('imagePullSecrets') == spec['imagePullSecrets'], 'private Pod pull references differ')
         return binding, pods[0] if pods else None
 
-    def wait_auth_failure(self, name, binding, previous):
+    def wait_auth_failure(self, name, binding, previous, *, allow_missing=False):
         deadline = time.monotonic()+180
         while True:
             _, pod = self.pinned_workload(name, binding)
             events = []
             if pod:
                 events = json.loads(self.k('get', 'events', '-n', self.control, '-o', 'json'))['items']
-                result = authentication_failure(pod, events, previous)
+                result = authentication_failure(pod, events, previous, allow_missing=allow_missing)
                 if result:
                     return result
             if time.monotonic() >= deadline:
@@ -181,7 +186,7 @@ class PrivatePullRunner(demo.CnpgDemoRunner):
         require(stored['runtimeBinding']['generationId'] == generation and stored['inputs']['allocation']['artifactDigest'] == self.pair['candidates']['initialReleaseDigest'], 'private runtime binding differs from initial candidate')
         self.private_deployment_uid = stored['stagedIdentityUids']['apps/v1/Deployment/'+self.control+'/'+name]
         binding, _ = self.pinned_workload(name)
-        missing = self.wait_auth_failure(name, binding, {})
+        missing = self.wait_auth_failure(name, binding, {}, allow_missing=True)
         self.phase = 'private-pull-invalid-auth'
         invalid = self.install_credentials(False)
         events = json.loads(self.k("get", "events", "-n", self.control, "-o", "json"))["items"]

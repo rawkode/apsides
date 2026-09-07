@@ -8,6 +8,20 @@ import run_private_pull as p
 
 
 class PrivatePullTests(unittest.TestCase):
+    def test_missing_credentials_requires_explicit_phase_opt_in(self):
+        pod = {'metadata': {'uid': 'pod'}, 'status': {'containerStatuses': [
+            {'name': 'controller', 'state': {'waiting': {'reason': 'ErrImagePull'}}}
+        ]}}
+        event = {'metadata': {'uid': 'event'}, 'involvedObject': {'uid': 'pod'},
+                 'count': 2, 'reason': 'Failed', 'message': 'no basic auth credentials'}
+        self.assertIsNone(p.authentication_failure(pod, [event], {}))
+        result = p.authentication_failure(pod, [event], {}, allow_missing=True)
+        self.assertEqual(result['reason'], 'registry-credentials-missing')
+        self.assertIsNone(p.authentication_failure(pod, [event], {'event': 2}, allow_missing=True))
+        for message in ['failed to authorize', 'x509: certificate unknown authority']:
+            event['message'] = message
+            self.assertIsNone(p.authentication_failure(pod, [event], {}, allow_missing=True))
+
     def test_diagnostic_does_not_copy_private_messages(self):
         pod = {'metadata': {'uid': 'pod'}, 'status': {'containerStatuses': [
             {'state': {'waiting': {'reason': 'ImagePullBackOff', 'message': 'private'}}}
