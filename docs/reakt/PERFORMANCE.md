@@ -227,6 +227,67 @@ ConfigMap `binaryData` must remain empty on both sides, and input changes must
 target `data`. These differences and the namespace-wide baseline read authority
 are explicit comparison boundaries, not security-equivalence claims.
 
+### Recorded CNPG resource and image costs
+
+`analyze_resources.py` reads the saved sample projections and their raw kubelet
+summaries. It validates every container identity and counter, rejects unknown or
+ambiguous groups, and hashes all inputs. CPU uses each container's own kubelet
+timestamps: repeated snapshots are accepted only when the cumulative CPU counter
+is unchanged. Group CPU is the sum of those per-container means; their endpoint
+times can differ. RSS and working set are simultaneous sampled group totals,
+not allocator/cache sizes or peaks between samples. The full population means
+the selected namespace/container set for one domain, excluding the Kubernetes
+control plane.
+
+```sh
+cuenv task performanceResourcesTest
+cuenv exec -- python3 tests/reakt/performance/analyze_resources.py \
+  --window work/cnpg-input-reactions-89ceec4/performance-idle \
+  --profile native --output work/native-resource-analysis.json
+```
+
+Use `--profile baseline` for the recorded baseline windows. The four reports at
+`work/cnpg-resource-analysis-a0f9aa4-final` cover thirteen samples per window,
+about sixty seconds, from native producer `89ceec4` and baseline producer
+`1c9563c`. Controller/support includes native controller, Envoy and admin on one
+side, and Flux manager, Reloader and HTTP artifact server on the other. CNPG and
+PostgreSQL are reported separately as shared infrastructure; the API application
+has its own group.
+
+| Recorded controller/support window | Sum of container mean CPU cores | Sample mean RSS (MiB) | Sample mean working set (MiB) |
+| --- | ---: | ---: | ---: |
+| Native idle | 0.0218 | 17.45 | 44.24 |
+| Native active | 0.0226 | 17.55 | 43.57 |
+| Baseline idle | 0.0534 | 82.11 | 144.54 |
+| Baseline active | 0.0616 | 83.33 | 126.30 |
+
+Both active windows replace the application Pod. Application and full-population
+CPU therefore remain unavailable: the final counter from the removed container
+was not captured. Idle population CPU and all sampled memory groups are
+available. These are single-run observations with different observer overhead,
+not a complete scope-equivalent benchmark or a general performance benefit claim.
+
+The pinned image reports at `work/cnpg-image-sizes-a0f9aa4` include the corrected
+native image, Envoy/admin, Flux/Reloader/artifact server, and shared CNPG operator,
+PostgreSQL and PostgREST images. `bindings.json` records source/input/report
+hashes. The existing collector verified immutable descriptors and local Docker
+identity. Python explicitly selects `linux/arm64/v8`; the other images select
+`linux/arm64`.
+
+| Image population | Deduplicated declared compressed layer bytes |
+| --- | ---: |
+| Native controller/support | 94,306,862 |
+| Baseline controller/support | 101,231,021 |
+| Native plus shared workload images | 388,381,152 |
+| Baseline plus shared workload images | 395,792,820 |
+
+Deduplication includes layers shared across components; the combined totals are
+not simple sums of the two populations. These are descriptor-declared compressed
+bytes, not network transfer, disk allocation or unpacked size. Kubernetes node and
+control-plane images are outside this population. Both analyzers retain
+`completeSection26: false`; cache occupancy, relist recovery, increasing-domain
+costs, build/deploy timing and comparison equivalence still need qualification.
+
 ### Generic fixture profile
 
 Preparation takes immutable fixture and Python server image references. It does
@@ -318,13 +379,13 @@ analysis without dropping either from the full total.
 
 | Required measurement | Evidence and current boundary |
 | --- | --- |
-| Controller CPU and memory | Kubelet summary CPU cumulative counters, RSS, working set for every container. Means use collection wall time; retain raw kubelet sample timestamps for precision analysis. Restart, UID change, missing samples, and counter reset invalidate the interval. |
+| Controller CPU and memory | Kubelet summary CPU cumulative counters, RSS, working set for every container. The raw collector summary uses collection wall time; the offline resource analyzer uses each container's kubelet timestamp interval and labels differing endpoints. Restart, UID change, missing samples, and counter reset invalidate the interval. |
 | Total cluster watch connections | Raw API server `apiserver_longrunning_requests` series with watch verb, before/steady/during/after. Preserve total cluster count and idle-cluster baseline; do not count watch-start requests as concurrent connections. |
 | API request rate | Raw API server request counter deltas divided by measured duration; report cluster total and idle baseline. Kubelet/API scraping itself has observer overhead and must be identical for both runs. |
 | Cache size | Apsides exports apply-cache entry count and serialized bytes. Label that representation; it is not allocator heap size or total cache memory. The collector accepts pinned runtime status routes through `--runtime-status`; the paired live measurement remains pending. Flux cache occupancy needs an actual exported measure or separately instrumented profile; RSS is not cache size. |
 | Queue latency | Preserve Flux workqueue histogram series. Apsides exports pending coalesced triggers and trigger-to-cycle scheduling count, sum and maximum. Report their different semantics explicitly; count/sum/maximum cannot establish percentiles. The collector records these runtime counters with identity and reset checks; paired live collection remains pending. |
 | Relist-storm recovery | Requires synchronized real watch disruption/recovery for every domain, verified relists, convergence time, request spikes and memory peaks. Process startup alone is not proof of a relist storm. Not yet automated here. |
-| Image size | `image_sizes.py` verifies OCI descriptors and reports compressed layer bytes per image and deduplicated across images. Docker-reported size is labeled by storage semantics; descriptor-based stores report packed resources, not unpacked filesystem size. Unpacked aggregate remains unknown. Apsides totals must include Envoy/admin; Flux totals must include Reloader and the artifact server. Full-profile collection remains pending. |
+| Image size | `image_sizes.py` verifies OCI descriptors and reports compressed layer bytes per image and deduplicated across images. Docker-reported size is labeled by storage semantics; descriptor-based stores report packed resources, not unpacked filesystem size. Unpacked aggregate remains unknown. Apsides totals must include Envoy/admin; Flux totals must include Reloader and the artifact server. The recorded CNPG profile now includes both controller/support stacks and shared workload images; control-plane images and unpacked allocation are excluded. |
 | Build/deployment latency | Time source build, native build, image packaging/import, platform staging/activation, and initial convergence separately. Flux artifact assembly is not a native compilation. Distinguish warm and cold caches; pre-pulled images are not network distribution measurements. Not yet integrated. |
 
 `summary.json` deliberately reports `completeSection26: false` while these
