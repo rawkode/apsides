@@ -79,16 +79,25 @@ def pinned_history(registry, transition, initial):
                 replicaSetUid=initial["pods"][0]["replicaSetUid"])
 
 
-def stopped_successor(deployment, pods, account):
+def stopped_successor(deployment, pods, account, runtime_uid, proxy, proxy_deployment):
     metadata = deployment.get("metadata", {})
     process_account = deployment.get("spec", {}).get("template", {}).get("spec", {}).get("serviceAccountName")
-    require(metadata.get("name") == account and metadata.get("uid")
+    require(metadata.get("name") == account and runtime_uid and metadata.get("uid") == runtime_uid
             and not metadata.get("deletionTimestamp") and deployment.get("spec", {}).get("replicas") == 0
-            and process_account == account + "-process"
-            and not any(pod.get("spec", {}).get("serviceAccountName") in {account, process_account} for pod in pods),
-            "uncertain writer experiment started a successor runtime")
+            and process_account == account + "-process", "successor runtime Deployment differs from stopped staged identity")
+    require(not any(pod.get("spec", {}).get("serviceAccountName") == process_account for pod in pods),
+            "uncertain writer experiment started a successor runtime Pod")
+    proxy_metadata = proxy_deployment.get("metadata", {})
+    require(proxy_metadata.get("name") == proxy["deploymentName"]
+            and proxy_metadata.get("uid") == proxy["deploymentUid"] and not proxy_metadata.get("deletionTimestamp"),
+            "successor proxy Deployment differs from protected identity")
+    base_pods = [pod for pod in pods if pod.get("spec", {}).get("serviceAccountName") == account]
+    require(len(base_pods) == 1 and base_pods[0].get("metadata", {}).get("name") == proxy["podName"]
+            and base_pods[0].get("metadata", {}).get("uid") == proxy["podUid"]
+            and not base_pods[0]["metadata"].get("deletionTimestamp"),
+            "successor base account Pod differs from protected staged proxy")
     return {"name": account, "uid": metadata["uid"], "processServiceAccountName": process_account,
-            "replicas": 0, "runtimePodUids": []}
+            "replicas": 0, "runtimePodUids": [], "proxyDeploymentUid": proxy["deploymentUid"], "proxyPodUid": proxy["podUid"]}
 
 
 def draining_activation(activation, registry, initial, successor, domain):
@@ -147,10 +156,14 @@ class UncertainWriterRunner(demo.CnpgDemoRunner):
         inventory, _ = demo.base.observations.capture(self.inventory)
         return {"objects": objects, "coordination": coordination, "inventory": inventory}, registry
 
-    def successor_state(self, prepared):
+    def successor_state(self, prepared, registry):
+        stored = registry["transitions"][prepared["transition"]]
+        proxy = stored["proxyIdentity"]
+        runtime_uid = stored["stagedIdentityUids"]["apps/v1/Deployment/" + self.control + "/" + prepared["serviceAccountName"]]
         deployment = json.loads(self.k("get", "deployment", prepared["serviceAccountName"], "-n", self.control, "-o", "json"))
+        proxy_deployment = json.loads(self.k("get", "deployment", proxy["deploymentName"], "-n", self.control, "-o", "json"))
         pods = json.loads(self.k("get", "pods", "-n", self.control, "-o", "json"))["items"]
-        return stopped_successor(deployment, pods, prepared["serviceAccountName"])
+        return stopped_successor(deployment, pods, prepared["serviceAccountName"], runtime_uid, proxy, proxy_deployment)
 
     def get_pod(self, name):
         raw = self.k("get", "pod", name, "-n", self.control, "--ignore-not-found", "-o", "json")
@@ -215,20 +228,20 @@ class UncertainWriterRunner(demo.CnpgDemoRunner):
         self.checkpoint("protected-history-pin")
         expected = pinned_history(registry, transition, runtime[0])
         self.checkpoint("successor-stopped")
-        stopped = self.successor_state(successor)
+        stopped = self.successor_state(successor, registry)
         self.checkpoint("fault-removal")
         fault = self.lose_pod_record(expected)
         self.checkpoint("after-fault-protected-state")
         injected, registry = self.protected_state()
         require(before == injected and pinned_history(registry, transition, runtime[0]) == expected,
                 "writer evidence fault changed protected state")
-        require(self.successor_state(successor) == stopped, "writer fault changed successor identity")
+        require(self.successor_state(successor, registry) == stopped, "writer fault changed successor identity")
         self.checkpoint("activation-refusal")
         rejected = self.step("reject-uncertain-writer", OUTCOME, self.issuer, transition=transition)
         self.checkpoint("after-refusal-protected-state")
         after, registry = self.protected_state()
         require(before == after and pinned_history(registry, transition, runtime[0]) == expected
-                and self.successor_state(successor) == stopped and self.get_pod(expected["name"]) is None
+                and self.successor_state(successor, registry) == stopped and self.get_pod(expected["name"]) is None
                 and rejected["transition"] == transition and rejected["generation"] == successor["generation"],
                 "uncertain writer refusal changed protected state or started successor")
         self.observation = {"fault": fault, "before": before, "afterInjection": injected, "afterRefusal": after,

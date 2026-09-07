@@ -104,15 +104,51 @@ other(False, "not an approved reason")
         with self.assertRaises(writer.shared.QualificationError):
             writer.result_record(line(value) + "\n" + line(value), writer.OUTCOME)
 
+    def successor_fixture(self):
+        deployment = {"metadata": {"name": "successor", "uid": "deployment-uid"},
+                      "spec": {"replicas": 0, "template": {"spec": {"serviceAccountName": "successor-process"}}}}
+        proxy = {"deploymentName": "proxy", "deploymentUid": "proxy-deployment-uid",
+                 "podName": "proxy-pod", "podUid": "proxy-pod-uid"}
+        proxy_deployment = {"metadata": {"name": "proxy", "uid": "proxy-deployment-uid"}}
+        pods = [{"metadata": {"name": "proxy-pod", "uid": "proxy-pod-uid"}, "spec": {"serviceAccountName": "successor"}}]
+        return [deployment, pods, "successor", "deployment-uid", proxy, proxy_deployment]
+
+    def test_successor_allows_only_recorded_staged_proxy(self):
+        args = self.successor_fixture()
+        result = writer.stopped_successor(*args)
+        self.assertEqual(result["replicas"], 0)
+        self.assertEqual(result["runtimePodUids"], [])
+        self.assertEqual(result["proxyPodUid"], "proxy-pod-uid")
+        for mutation in ["missing", "replacement", "extra", "renamed", "proxy-deployment", "runtime-deployment"]:
+            args = self.successor_fixture()
+            if mutation == "missing":
+                args[1].clear()
+            elif mutation == "replacement":
+                args[1][0]["metadata"]["uid"] = "other"
+            elif mutation == "extra":
+                args[1].append({"metadata": {"name": "unknown", "uid": "unknown"}, "spec": {"serviceAccountName": "successor"}})
+            elif mutation == "renamed":
+                args[1][0]["metadata"]["name"] = "other"
+            elif mutation == "proxy-deployment":
+                args[5]["metadata"]["uid"] = "other"
+            else:
+                args[0]["metadata"]["uid"] = "other"
+            with self.subTest(mutation=mutation), self.assertRaises(writer.shared.QualificationError):
+                writer.stopped_successor(*args)
+
     def test_successor_zero_requires_no_runtime_pod_even_if_terminal(self):
-        deployment = {"metadata": {"name": "successor", "uid": "deployment-uid"}, "spec": {"replicas": 0, "template": {"spec": {"serviceAccountName": "successor-process"}}}}
-        self.assertEqual(writer.stopped_successor(deployment, [], "successor")["replicas"], 0)
+        args = self.successor_fixture()
+        args[1].append({"spec": {"serviceAccountName": "successor-process"}, "status": {"phase": "Failed"}})
         with self.assertRaises(writer.shared.QualificationError):
-            writer.stopped_successor(deployment, [{"spec": {"serviceAccountName": "successor-process"},
-                                                   "status": {"phase": "Failed"}}], "successor")
-        deployment["spec"]["replicas"] = 1
+            writer.stopped_successor(*args)
+        args = self.successor_fixture()
+        args[0]["spec"]["replicas"] = 1
         with self.assertRaises(writer.shared.QualificationError):
-            writer.stopped_successor(deployment, [], "successor")
+            writer.stopped_successor(*args)
+        args = self.successor_fixture()
+        args[0]["spec"]["template"]["spec"]["serviceAccountName"] = "successor"
+        with self.assertRaises(writer.shared.QualificationError):
+            writer.stopped_successor(*args)
 
     def test_activation_must_remain_bound_to_draining_predecessor(self):
         binding = {"domainId": "domain", "generationId": "old", "serviceAccountName": "runtime"}
