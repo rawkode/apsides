@@ -67,6 +67,18 @@ against the unsigned assembly at `work/cnpg-five-candidate-52a5697`. Independent
 reviews rehashed both build identities, candidate bindings, probe outputs and
 the complete packaged source/diagnostic files. No generated outputs are tracked.
 
+Fixture-promotion qualification at `c6d67e0` adds the sixth check for this same
+payload. Its receipt is in `work/cnpg-fixture-promotion-c6d67e0/evidence`; the normal
+merge summary is `work/cnpg-six-merged-c6d67e0/summary.json`. All 43 cases remain
+covered, ten checks remain missing, and `releaseVerified` is false. The driver
+repeatedly verifies a locally signed production candidate and rejects the exact
+native fixture because of its mode. Fixture rejection precedes signature checks;
+the fixture is intentionally unsigned. A separate qualification policy approves
+the production compiler and temporary signer. The private key was deleted after
+signing, and this evidence does not qualify GitHub Actions trust.
+Independent review rehashed both artifact closures, source projection, policy,
+verifier and driver, and confirmed the receipt binds the current payload.
+
 ## Combining measured evidence
 
 `reakt merge-evidence` combines explicit receipts against one structurally valid

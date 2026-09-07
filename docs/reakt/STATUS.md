@@ -194,6 +194,15 @@ be carried over as measurements of this new binary/compiler payload. The fixture
 run establishes primitive reactor behavior, not CNPG operator or application
 readiness, signature trust, or full production acceptance.
 
+Fixture-promotion rejection subsequently passed at `c6d67e0`. A copy of the
+current candidate was signed with a temporary local qualification key, checked
+under an explicit compiler/signer policy, and paired with the matching native
+fixture. The driver repeated positive candidate verification and exact fixture
+mode rejection. The normal merger at `work/cnpg-six-merged-c6d67e0` now accepts
+six checks and all 43 cases, with ten checks missing and `releaseVerified: false`.
+The temporary private key was removed after signing. This local qualification
+does not establish GitHub Actions identity or full production release trust.
+
 Automated suites cover strict schema and canonical replay, claim and metadata
 store immutability, registry concurrency, capacity accounting, review privacy,
 issued-client binding, preview request shape, UID-safe cleanup, finalizer retry,
