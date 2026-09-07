@@ -11,6 +11,23 @@ import run_reproducibility as shared
 from performance import collect
 
 ROOT = Path(__file__).resolve().parents[3]
+SAFE_FAILURE_REASONS = frozenset({
+    'performance metadata is not a bounded regular file',
+    'performance controller identity changed',
+    'performance collector exceeded deadline',
+    'first performance sample failed',
+    'performance collector ended before first complete sample',
+    'performance collector ended before stimulus',
+    'performance collector failed',
+    'performance collection is incomplete',
+    'performance population is incomplete',
+    'runtime performance counters are unavailable or inconsistent',
+    'runtime sample differs from protected candidate identity',
+    'performance sample timestamps are not increasing',
+    'reaction completed outside sampled interval',
+    'workload identity changed during HTTP startup',
+    'PostgREST startup deadline exceeded',
+})
 
 
 def require(value, reason):

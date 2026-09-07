@@ -130,6 +130,14 @@ class DemoChecks(unittest.TestCase):
             runner,stored,objects=self.native_performance_fixture();mutate(stored,objects)
             with self.assertRaises(demo.shared.QualificationError):runner.performance_bindings()
 
+    def test_native_predicate_diagnostics_expose_only_static_failure(self):
+        runner,stored,objects=self.native_performance_fixture()
+        runner.failure_reasons=demo.PERFORMANCE_FAILURE_REASONS | demo.sampling.SAFE_FAILURE_REASONS
+        stored['inputs']['allocation']['artifactDigest']='PRIVATE_UNKNOWN_DIGEST'
+        with self.assertRaises(demo.shared.QualificationError) as observed:runner.performance_bindings()
+        self.assertEqual(demo.base.failure_reason(runner,observed.exception),'native performance allocation differs from signed release')
+        self.assertNotIn('PRIVATE',demo.base.failure_reason(runner,observed.exception))
+
     def test_sampling_sources_are_frozen_and_changed_helper_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)
@@ -148,7 +156,10 @@ class DemoChecks(unittest.TestCase):
                 return types.SimpleNamespace(returncode=0)
             with patch.object(demo.base.CeilingRunner,'__init__',base_init),patch.object(demo,'release_files',return_value={}),                 patch.object(demo,'reject_ignored_driver_sources'),patch.object(demo.subprocess,'run',side_effect=archive):
                 runner=demo.CnpgDemoRunner(args)
-            helper=Path(demo.sampling.__file__).resolve();collector=helper.parent/'collect.py'
+            for reason in ["native performance allocation differs from signed release", "workload identity changed during HTTP startup"]:
+                self.assertEqual(demo.base.failure_reason(runner,demo.shared.QualificationError(reason)),reason)
+            self.assertEqual(demo.base.failure_reason(runner,demo.shared.QualificationError('PRIVATE_SECRET=unexpected')),'QualificationError')
+            helper=Path(demo.sampling.__file__).resolve();collector=helper.parent/'collect.py' 
             for path in [helper,collector]:
                 self.assertIn(path,runner.sources);self.assertIn(path,runner.source_archives)
                 self.assertIn('producer/'+runner.source_archives[path],runner.snapshot)

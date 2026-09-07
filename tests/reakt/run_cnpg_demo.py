@@ -26,6 +26,24 @@ PAIR_MARKER = "reakt-candidate-pair-qualification"
 PAIR_SCHEMA = "reakt.dev/candidate-pair-qualification/v2"
 MAX_OPERATOR_BYTES = 8 * 1024 * 1024
 MAX_HTTP_BYTES = 64 * 1024
+PERFORMANCE_FAILURE_REASONS = frozenset({
+    'native performance registry UID changed',
+    'native performance transition is not Committed',
+    'native performance activation differs from stored runtime binding',
+    'native performance history differs from successor allocation',
+    'native performance allocation differs from prepared generation',
+    'native performance allocation differs from signed release',
+    'native performance runtime binding differs from successor allocation',
+    'native performance Deployment is missing or ambiguous',
+    'native performance Deployment identity changed',
+    'native performance Pod set is not singular',
+    'native performance ServiceAccount UID changed',
+    'native performance Pod account changed or Pod is deleting',
+    'native performance Pod image differs from pin',
+    'native performance container population changed',
+    'native performance container is unready or restarted',
+    'native performance proxy differs from protected identity',
+})
 
 
 class HttpObservationError(shared.QualificationError):
@@ -369,6 +387,7 @@ class CnpgDemoRunner(base.CeilingRunner):
         self.failure_reasons |= set(re.findall(
             r'(?:QualificationError|RuntimeError)\(\s*"([^"\n]+)"', Path(__file__).read_text(),
         ))
+        self.failure_reasons |= sampling.SAFE_FAILURE_REASONS | PERFORMANCE_FAILURE_REASONS
         self.checks = []
         self.disposition = "not-created"
         self.denial_observation = None
@@ -1223,15 +1242,20 @@ class CnpgDemoRunner(base.CeilingRunner):
         allocation, binding, proxy = stored["inputs"]["allocation"], stored["runtimeBinding"], stored["proxyIdentity"]
         activation = json.loads(self.k("get", "configmap", "reakt-activation-" + self.domain, "-n", self.control, "-o", "json"))
         activation = json.loads(activation["data"]["state.json"])
-        require(registry_object["metadata"]["uid"] == prepared["registryUid"]
-                and stored["record"]["phase"] == "Committed" and activation["status"] == "active"
-                and activation["binding"] == binding and registry["histories"][self.domain]["activeAllocation"] == allocation
-                and allocation["generationId"] == prepared["generation"] and allocation["transitionId"] == prepared["transition"]
-                and allocation["artifactDigest"] == self.pair["candidates"]["successorReleaseDigest"]
-                and binding["domainId"] == self.domain and binding["generationId"] == allocation["generationId"]
+        require(registry_object["metadata"]["uid"] == prepared["registryUid"], "native performance registry UID changed")
+        require(stored["record"]["phase"] == "Committed", "native performance transition is not Committed")
+        require(activation["status"] == "active" and activation["binding"] == binding,
+                "native performance activation differs from stored runtime binding")
+        require(registry["histories"][self.domain]["activeAllocation"] == allocation,
+                "native performance history differs from successor allocation")
+        require(allocation["generationId"] == prepared["generation"] and allocation["transitionId"] == prepared["transition"],
+                "native performance allocation differs from prepared generation")
+        require(allocation["artifactDigest"] == self.pair["candidates"]["successorReleaseDigest"],
+                "native performance allocation differs from signed release")
+        require(binding["domainId"] == self.domain and binding["generationId"] == allocation["generationId"]
                 and binding["buildDigest"] == allocation["artifactDigest"]
                 and binding["serviceAccountName"] == prepared["serviceAccountName"],
-                "native performance allocation is not the active signed successor")
+                "native performance runtime binding differs from successor allocation")
         objects = {kind: json.loads(self.k("get", kind, "-n", self.control, "-o", "json"))["items"]
                    for kind in ["deployments", "replicasets", "pods", "serviceaccounts"]}
         result = {}
@@ -1256,13 +1280,16 @@ class CnpgDemoRunner(base.CeilingRunner):
             pod = pods[0]; statuses = pod.get("status", {}).get("containerStatuses", [])
             accounts = [x for x in objects["serviceaccounts"] if x["metadata"]["name"] == account]
             require(len(accounts) == 1 and accounts[0]["metadata"]["uid"] == stored["stagedIdentityUids"]["v1/ServiceAccount/" + self.control + "/" + account]
-                    and not accounts[0]["metadata"].get("deletionTimestamp") and pod["spec"]["serviceAccountName"] == account
-                    and not pod["metadata"].get("deletionTimestamp")
-                    and {c["name"]: c["image"] for c in pod["spec"]["containers"]} == images
-                    and len(statuses) == len(images) and {c["name"] for c in statuses} == set(images)
-                    and all(c.get("ready") is True and c.get("restartCount") == 0 and c.get("containerID")
-                            and c.get("state", {}).get("running") for c in statuses),
-                    "native performance Pod credentials, images or containers changed")
+                    and not accounts[0]["metadata"].get("deletionTimestamp"), "native performance ServiceAccount UID changed")
+            require(pod["spec"]["serviceAccountName"] == account and not pod["metadata"].get("deletionTimestamp"),
+                    "native performance Pod account changed or Pod is deleting")
+            require({c["name"]: c["image"] for c in pod["spec"]["containers"]} == images,
+                    "native performance Pod image differs from pin")
+            require(len(statuses) == len(images) and {c["name"] for c in statuses} == set(images),
+                    "native performance container population changed")
+            require(all(c.get("ready") is True and c.get("restartCount") == 0 and c.get("containerID")
+                        and c.get("state", {}).get("running") for c in statuses),
+                    "native performance container is unready or restarted")
             containers = {c["name"]: {"containerId": c["containerID"], "restartCount": c["restartCount"]} for c in statuses}
             if role == "proxy":
                 require(pod["metadata"]["name"] == proxy["podName"] and pod["metadata"]["uid"] == proxy["podUid"]
@@ -1370,20 +1397,26 @@ class CnpgDemoRunner(base.CeilingRunner):
         resolved = self.step("resolve-successor", "successor-resolved", self.issuer, transition=transition)
         if resolved["phase"] != "Committed":
             raise shared.QualificationError("successor candidate did not commit")
+        self.phase = "successor-workload-readiness"
         before = self.workload_identity()
+        self.phase = "successor-http-readiness"
         collect_performance = getattr(self.args, "collect_performance", False)
         first_http = self.performance_http(2, before) if collect_performance else self.http_messages(2)
         def change_configmap():
+            self.phase = "successor-configmap-mutation"
             self.k("patch", "configmap", "api-settings", "-n", self.workload, "--type=merge", "-p",
                    json.dumps({"data": {"PGRST_DB_MAX_ROWS": "1"}}))
+            self.phase = "successor-configmap-rollout"
             after = self.workload_identity(previous_uid=before["podUid"])
             if (after["deploymentUid"] != before["deploymentUid"] or after["revision"] == before["revision"]
                     or after["replicaSetUid"] == before["replicaSetUid"]):
                 raise shared.QualificationError("ConfigMap change did not produce the expected PostgREST rollout")
+            self.phase = "successor-rollout-http-readiness"
             http = self.performance_http(1, after) if collect_performance else self.http_messages(1)
             return after, http
         if collect_performance:
             self.performance_successor = successor
+            self.phase = "successor-performance-bindings"
             controllers = self.performance_bindings()
             self.performance_window("idle", controllers)
             after, second_http = self.performance_window("active", controllers, change_configmap)
