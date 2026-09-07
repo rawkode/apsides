@@ -100,6 +100,22 @@ python3 tests/reakt/performance/stimulate.py \
 
 Use `--metrics-path` with the exact Kubernetes Pod proxy path for Flux's metrics
 endpoint to preserve workqueue histograms. Record the actual Pod name and UID.
+For Apsides, repeat `--runtime-status` for each measured domain:
+
+```sh
+# Add to collect.py, using the actual controller Pod and diagnostics port:
+--runtime-status "$DOMAIN=/api/v1/namespaces/$CONTROL_NAMESPACE/pods/$CONTROLLER_POD:$DIAGNOSTICS_PORT/proxy/status"
+```
+
+Include that control namespace in `--namespace`. The collector checks Pod and
+container identity before and after each status read, records only selected
+numeric metrics and public identities, and rejects missing samples, identity
+changes or counter resets across the interval. Cache measurements are retained
+apply-cache entries and serialized bytes. Scheduling reports interval count,
+sum and mean, with a separately labelled process-lifetime maximum. These are
+neither allocator heap measurements nor latency percentiles. Unit and mocked
+collection tests pass; a live paired measurement remains pending.
+
 Run collection concurrently with stimulation in the active phase; retain an
 idle phase before and after. The stimulus currently measures convergence from
 fresh unequal inputs; equal-value and relist-storm phases remain integration
