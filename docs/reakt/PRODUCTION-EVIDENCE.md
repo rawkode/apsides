@@ -593,3 +593,48 @@ A successful receipt supplies only `api-bound-gap-conformance`. It measures
 Kubernetes authorization using the projected generation credential directly;
 it does not qualify proxy-path enforcement or GitHub Actions release trust.
 See [current implementation status](STATUS.md) for accepted aggregate coverage.
+
+## Deployment phase interruption recovery
+
+`tests/reakt/run_cnpg_phase_recovery.py` measures one successor transition phase
+per disposable cluster. Select `--phase Planned`, `Staged`, `Quiesced`,
+`Activated`, `Cleaning`, or `Committed`, together with the signed pair, trust
+policy, pinned operator and fresh output arguments used by `run_cnpg_demo.py`.
+Run all six sequentially from the same clean producer commit, preserving the
+same input bytes. Keep the checkout unchanged until packaging is complete.
+
+The test executable pauses after the selected protected phase is persisted.
+The parent validates the checkpoint against API readback, kills and reaps its
+own deployment process, then issues a fresh session for the same logical owner.
+For the first three phases, authenticated resolution reads back the completed
+phase before the lifecycle advances. Later phases replay the applicable
+operation. The full CNPG upgrade must then complete, publish inventory, preserve
+that inventory on repeated commit, and pass workload and cleanup checks.
+
+Each run publishes a measurement, not a release receipt. All six measurements
+are required to qualify `phase-interruption-recovery`. Focused runner checks are
+available through `cuenv task cnpgPhaseRecoveryTest`.
+
+After all six runs succeed, package their measurements from that same checkout:
+
+```sh
+cuenv task cnpgPhaseRecoveryPackagingTest
+cuenv exec -- python3 tests/reakt/package_cnpg_phase_recovery.py \
+  --initial-artifact "$INITIAL_ARTIFACT" \
+  --successor-artifact "$SUCCESSOR_ARTIFACT" \
+  --trust-policy "$TRUST_POLICY" \
+  --measurements "$PLANNED_RUN" "$STAGED_RUN" "$QUIESCED_RUN" \
+    "$ACTIVATED_RUN" "$CLEANING_RUN" "$COMMITTED_RUN" \
+  --output "$FRESH_RECEIPT_OUTPUT"
+```
+
+The packager rejects missing or duplicate phases, mixed candidate payloads or
+producer sources, changed inputs, incomplete cleanup, and mismatched recovery
+observations. Its receipt is written last; an incomplete destination must not
+be merged as evidence.
+
+This measures recovery after a known, owned process terminates at a post-CAS
+checkpoint. It does not establish interruption safety within every operation,
+takeover from an executor whose termination is uncertain, transfer to another
+principal, or GitHub Actions provenance. Production activation still has to
+verify retirement of the previous runtime's writers.

@@ -25,6 +25,8 @@ mod envelope_writer;
 mod evidence_profile;
 mod executor_binding;
 pub use executor_binding::{EXECUTOR_BINDING_SCHEMA, ExecutorBinding};
+#[cfg(all(test, feature = "test-support"))]
+mod pair_phase_interruption_live;
 mod permissions;
 #[cfg(all(test, feature = "test-support"))]
 mod phase_interruption;

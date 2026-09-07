@@ -44,6 +44,7 @@ enum Action {
     PublishSuccessor,
     ResolveInitial,
     ResolveSuccessor,
+    ResumeCheckpoint,
 }
 
 #[derive(Deserialize)]
@@ -60,6 +61,7 @@ struct Settings {
     expected_request_digest: Option<String>,
     expected_missing_capability: Option<Capability>,
     transition: Option<String>,
+    resume_phase: Option<deploy::Phase>,
 }
 
 struct CandidatePair {
@@ -101,7 +103,14 @@ struct CandidateDigests<'a> {
 ///
 /// # Errors
 /// Returns bounded static classifications without exposing credentials or underlying errors.
+#[allow(dead_code, reason = "the libtest checkpoint wrapper calls run_configured directly")]
 pub(super) async fn run() -> Result<()> {
+    run_configured(|platform| platform).await
+}
+
+pub(super) async fn run_configured(
+    configure: impl FnOnce(PlatformClient) -> PlatformClient,
+) -> Result<()> {
     let settings: Settings = qualification_driver::load_settings("APS_PERMISSION_UPGRADE_STEP")?;
     let pair = candidate_pair(&settings).await?;
     match settings.action {
@@ -116,6 +125,7 @@ pub(super) async fn run() -> Result<()> {
                 &settings,
                 &pair,
                 CandidatePairLifecycleOperation::StageInitial,
+                configure,
             )
             .await
         }
@@ -124,18 +134,20 @@ pub(super) async fn run() -> Result<()> {
                 &settings,
                 &pair,
                 CandidatePairLifecycleOperation::ActivateInitial,
+                configure,
             )
             .await
         }
         Action::PublishInitial => publish(&settings, &pair, CandidatePairRole::Initial).await,
         Action::RejectUpgrade => reject_upgrade(&settings, &pair).await,
         Action::PrepareSuccessor => prepare(&settings, &pair, CandidatePairRole::Successor).await,
-        Action::ReserveSuccessor => reserve_successor(&settings, &pair).await,
+        Action::ReserveSuccessor => reserve_successor(&settings, &pair, configure).await,
         Action::StageSuccessor => {
             lifecycle(
                 &settings,
                 &pair,
                 CandidatePairLifecycleOperation::StageSuccessor,
+                configure,
             )
             .await
         }
@@ -144,6 +156,7 @@ pub(super) async fn run() -> Result<()> {
                 &settings,
                 &pair,
                 CandidatePairLifecycleOperation::QuiesceUpgrade,
+                configure,
             )
             .await
         }
@@ -152,6 +165,7 @@ pub(super) async fn run() -> Result<()> {
                 &settings,
                 &pair,
                 CandidatePairLifecycleOperation::ActivateUpgrade,
+                configure,
             )
             .await
         }
@@ -161,10 +175,12 @@ pub(super) async fn run() -> Result<()> {
                 &settings,
                 &pair,
                 CandidatePairLifecycleOperation::CommitUpgrade,
+                configure,
             )
             .await
         }
         Action::PublishSuccessor => publish(&settings, &pair, CandidatePairRole::Successor).await,
+        Action::ResumeCheckpoint => resume_checkpoint(&settings, &pair).await,
         Action::ResolveInitial => resolve(&settings, &pair, CandidatePairRole::Initial).await,
         Action::ResolveSuccessor => resolve(&settings, &pair, CandidatePairRole::Successor).await,
     }
@@ -253,4 +269,22 @@ fn verify(settings: &Settings, pair: &CandidatePair) -> Result<()> {
             "successorCapabilityCount": pair.successor.compiled().capabilities.len(),
         }),
     )
+}
+
+#[cfg(test)]
+mod checkpoint_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_phase_is_rejected_by_ordinary_action_fields() -> Result<()> {
+        let mut settings: Settings = serde_json::from_value(json!({
+            "action": "verify", "purpose": {"kind": "permission-expansion"},
+            "initialArtifact": "initial", "successorArtifact": "successor", "trustPolicy": "trust"
+        })).map_err(|_| DriverError("test settings invalid"))?;
+        require_fields(&settings, FieldSet::Verify)?;
+        settings.resume_phase = Some(deploy::Phase::Planned);
+        assert!(require_fields(&settings, FieldSet::Verify).is_err());
+        assert!(require_fields(&settings, FieldSet::ResumeCheckpoint).is_err());
+        Ok(())
+    }
 }

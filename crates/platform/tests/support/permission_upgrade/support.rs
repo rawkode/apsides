@@ -334,6 +334,7 @@ enum FieldSet {
     RequestMutation,
     Rejection,
     Transition,
+    ResumeCheckpoint,
 }
 
 fn require_fields(settings: &Settings, set: FieldSet) -> Result<()> {
@@ -342,6 +343,7 @@ fn require_fields(settings: &Settings, set: FieldSet) -> Result<()> {
     let request = settings.expected_request_digest.is_some();
     let missing = settings.expected_missing_capability.is_some();
     let transition = settings.transition.is_some();
+    let resume = settings.resume_phase.is_some();
     let valid = match set {
         FieldSet::Verify => !target && !bootstrap && !request && !missing && !transition,
         FieldSet::Bootstrap => target && !request && !missing && !transition,
@@ -349,9 +351,11 @@ fn require_fields(settings: &Settings, set: FieldSet) -> Result<()> {
         FieldSet::RequestMutation => target && !bootstrap && request && !missing && !transition,
         FieldSet::Rejection => target && !bootstrap && request && missing && !transition,
         FieldSet::Transition => target && !bootstrap && !request && !missing && transition,
+        FieldSet::ResumeCheckpoint => target && bootstrap && request && !missing && transition && resume,
     };
     if !valid
-        || matches!(set, FieldSet::Bootstrap)
+        || (resume && !matches!(set, FieldSet::ResumeCheckpoint))
+        || matches!(set, FieldSet::Bootstrap | FieldSet::ResumeCheckpoint)
             && (settings.registry_uid.is_none() || settings.registry_resource_version.is_none())
     {
         return Err(DriverError("action settings fields are invalid"));
