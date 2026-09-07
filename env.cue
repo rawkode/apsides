@@ -7,6 +7,8 @@ schema.#Project & {name: "apsides"}
 tasks: {
 	performanceTest: {command: "python3", args: ["tests/reakt/performance/test_performance.py"]}
 	cnpgBaselineTest: {command: "python3", args: ["tests/reakt/performance/test_cnpg_baseline.py"]}
+	cnpgBaselineLiveTest: {command: "python3", args: ["tests/reakt/performance/test_cnpg_baseline_live.py"]}
+	imageSizesTest: {command: "python3", args: ["tests/reakt/performance/test_image_sizes.py"]}
 	authoringEditorCheck: {
 		dependsOn: [build, install]
 		command: "python3"

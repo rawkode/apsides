@@ -91,6 +91,26 @@ below is not a CNPG installer. CNPG and Flux CRDs, the operator, named inputs an
 healthy workloads must be established before the steady-state comparison.
 Startup and missing-input equivalence remain outside this prepared profile.
 
+`run_cnpg_baseline.py` checks the workload prerequisites in an owned disposable
+kind cluster. Run it from a clean source revision with the prepared bundle and
+the pinned operator and Flux CRD files:
+
+```sh
+cuenv task cnpgBaselineLiveTest
+cuenv exec -- python3 tests/reakt/performance/run_cnpg_baseline.py \
+  --prepared work/cnpg-baseline --plan "$CNPG_RELEASE/plan.json" \
+  --operator-manifest "$CNPG_OPERATOR_MANIFEST" \
+  --flux-crd "$FLUX_KUSTOMIZE_CRDS" --flux-crd "$FLUX_SOURCE_CRDS" \
+  --output work/cnpg-baseline-live
+```
+
+The runner regenerates and compares the prepared inputs before installation,
+checks workload readiness, changes `api-settings`, observes an actual equal-data
+update without a rollout for at least 30 seconds, and probes Secret reactions
+with a temporary key. It verifies restoration of the original Secret data and
+cluster/container inventory, then removes its kubeconfigs. This is a prerequisite
+check, not a benchmark receipt or proof of startup/missing-input equivalence.
+
 Reloader publishes an unkeyed Secret hash in its runtime rollout annotation;
 Apsides uses an aggregate keyed revision. Do not retain that annotation, live
 Deployment templates, Secret values or Secret hashes in benchmark artifacts.
@@ -195,7 +215,7 @@ analysis without dropping either from the full total.
 | Cache size | Apsides exports apply-cache entry count and serialized bytes. Label that representation; it is not allocator heap size or total cache memory. Integrating these runtime measurements into the paired collector remains pending. Flux cache occupancy needs an actual exported measure or separately instrumented profile; RSS is not cache size. |
 | Queue latency | Preserve Flux workqueue histogram series. Apsides exports pending coalesced triggers and trigger-to-cycle scheduling count, sum and maximum. Report their different semantics explicitly; count/sum/maximum cannot establish percentiles. Paired collection remains pending. |
 | Relist-storm recovery | Requires synchronized real watch disruption/recovery for every domain, verified relists, convergence time, request spikes and memory peaks. Process startup alone is not proof of a relist storm. Not yet automated here. |
-| Image size | OCI compressed layer bytes plus local unpacked CRI/Docker size, both per image and deduplicated aggregate. Apsides totals include Envoy/admin; Flux totals include the artifact server. Not yet integrated into the collector. |
+| Image size | `image_sizes.py` verifies OCI descriptors and reports compressed layer bytes per image and deduplicated across images. Docker-reported size is labeled by storage semantics; descriptor-based stores report packed resources, not unpacked filesystem size. Unpacked aggregate remains unknown. Apsides totals must include Envoy/admin; Flux totals must include Reloader and the artifact server. Full-profile collection remains pending. |
 | Build/deployment latency | Time source build, native build, image packaging/import, platform staging/activation, and initial convergence separately. Flux artifact assembly is not a native compilation. Distinguish warm and cold caches; pre-pulled images are not network distribution measurements. Not yet integrated. |
 
 `summary.json` deliberately reports `completeSection26: false` while these
