@@ -55,6 +55,7 @@ jobs:
       - name: Run qualification harness unit tests
         run: |
           cuenv task cnpgDemoTest
+          cuenv task cnpgCliDemoTest
           cuenv task cnpgCleanupTest
           cuenv task apiGapProbesTest
           cuenv task performanceResourcesTest
