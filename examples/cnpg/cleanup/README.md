@@ -8,7 +8,7 @@ The database, API workload, configuration, and reactions remain identical.
 The Backup references `cleanup-unconfigured-database`, which must remain
 absent during the rehearsal. It is a cleanup target, not a request to back up
 the demo database. CNPG 1.30.0 accepted this resource in both owned-cluster
-rehearsals at runner revision `2c2c56b`.
+rehearsals at runner revision `7070c1e`.
 
 From the repository root:
 
@@ -32,13 +32,13 @@ use one stable policy: the predecessor runtime ceiling and a cleanup ceiling
 that additionally authorizes named `get` and `delete` for this Backup. The
 successor runtime Role still derives from its own compiled capabilities.
 
-Both separate live scenarios passed at runner revision `2c2c56b`: preserving a
+Both separate live scenarios passed at runner revision `7070c1e`: preserving a
 test-owned finalizer until its owner removed it, then completing cleanup; and
 refusing a replacement UID while retaining the original protected claim.
 Both preserved an unclaimed Backup and verified that the successor's workload
 Role omitted Backup access. Each cluster and its credentials were deleted.
-These measurements still need production receipt integration before they count
-toward the release gate.
+Their packaged receipts are accepted by the normal evidence merger for the
+current successor. Full production release acceptance remains incomplete.
 
 The local runner accepts this signed predecessor and the signed parent
 successor, verified together under one external trust policy:
@@ -60,5 +60,7 @@ directory. Each run creates and deletes its own kind cluster through the
 existing Docker context; existing clusters remain untouched.
 
 The runner emits a non-release measurement only after cluster and credential
-cleanup and repeated input verification. It does not produce a production
-cleanup receipt yet. Offline runner checks use `cuenv task cnpgCleanupTest`.
+cleanup and repeated input verification. The reviewed archival adapter packages
+that measurement into a production receipt; see the
+[packaging contract](../../../docs/reakt/PRODUCTION-EVIDENCE.md).
+Offline runner checks use `cuenv task cnpgCleanupTest`.

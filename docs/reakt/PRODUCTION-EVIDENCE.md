@@ -502,13 +502,14 @@ The permission-rejection operation cannot be used with the cleanup purpose.
 
 This enables qualification of an exact signed cleanup pair; it does not itself
 produce finalizer-preservation, UID-replacement or last-api-type-cleanup receipts.
-The separate live scenarios passed at runner revision `2c2c56b` on kind through
-OrbStack using the signed pair above:
+The separate live scenarios passed at runner revision `7070c1e` on kind through
+OrbStack using `work/cnpg-cleanup-pair-aa04c76/initial` and the current signed
+successor `work/cnpg-signed-candidate-c6d67e0`:
 
-- `work/cnpg-finalizer-first/measurement.json` records pending cleanup with the
+- `work/cnpg-finalizer-7070c1e/measurement.json` records pending cleanup with the
   pinned UID and retained claim, followed by committed cleanup after removing
   only the test-owned finalizer.
-- `work/cnpg-replacement-first/measurement.json` records the typed UID refusal
+- `work/cnpg-replacement-7070c1e/measurement.json` records the typed UID refusal
   with the original protected claim retained in Cleaning. The replacement's
   non-status content and finalizers remained unchanged.
 
@@ -518,17 +519,14 @@ This Role check is not a cluster-wide effective-authorization proof. Both
 runners removed their cluster and credentials, restored the previous inventories,
 and reverified the frozen inputs and signed pair before publication.
 
-The original measurement files remain unchanged. Their production receipts are
-in `work/cnpg-finalizer-receipt` and `work/cnpg-replacement-receipt`.
-The normal `aps merge-evidence` consumer accepted both alongside the existing
-permission-upgrade receipt in `work/cnpg-cleanup-merged`. This covers four of
-sixteen checks for the same successor; twelve checks and 43 reactor cases remain
-missing, and `releaseVerified` is false. Negative consumer checks rejected altered
-binary and runner digests without publishing output.
-Independent read-only review passed the adapter and its ten tests, rechecked
-unchanged measurement bytes and runner hashes, and confirmed that both packaged
-closures exactly match the merged evidence. That review used archived records;
-it did not rerun the cluster experiments.
+Their production receipts are in `work/cnpg-finalizer-receipt-7070c1e` and
+`work/cnpg-replacement-receipt-7070c1e`. The normal merger at
+`work/cnpg-twelve-merged-7070c1e` accepts twelve checks and all 43 required reactor
+cases. Four checks remain missing and `releaseVerified` is false. Independent
+review verified both raw measurements, exact payload/source bindings, and the
+adapter's required thirteen-source closure. All eleven adapter tests pass.
+The adapter supports only this measured producer revision; it rejects missing
+or changed CRD-helper evidence and unsupported producer or archive pins.
 
 Packaging these archived measurements must preserve the original measurement
 bytes and measured producer source. The adapter must check an explicitly supplied
@@ -545,12 +543,12 @@ The bounded archival adapter is `tests/reakt/package_cnpg_cleanup.py`:
 
 ```sh
 cuenv exec -- python3 tests/reakt/package_cnpg_cleanup.py \
-  --measurement work/cnpg-finalizer-first \
-  --measurement-sha256 sha256:d8d9898e67f7e5ea9acc45d83e50521f7526f2353138199b01df9ad97be96114 \
+  --measurement work/cnpg-finalizer-7070c1e \
+  --measurement-sha256 sha256:a650aa758ba5641878fe5092a92cf3be065011a06add3351a4a9b1585c8f863d \
   --initial-artifact work/cnpg-cleanup-pair-aa04c76/initial \
-  --successor-artifact work/cnpg-pair-5ed7b25/successor \
-  --trust-policy work/cnpg-cleanup-pair-aa04c76/trust.json \
-  --output work/cnpg-finalizer-receipt
+  --successor-artifact work/cnpg-signed-candidate-c6d67e0 \
+  --trust-policy work/cnpg-cleanup-inputs-7070c1e/trust.json \
+  --output work/cnpg-finalizer-receipt-new
 ```
 
 The destination must not exist. Publication creates it exclusively and writes

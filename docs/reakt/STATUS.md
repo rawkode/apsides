@@ -150,20 +150,16 @@ This receipt cannot be combined with the older eight-check package, which binds
 a different payload. Full production acceptance remains pending, as do
 force-enabled custom-resource writes, Secret rotation and drift correction.
 
-Two further signed-candidate rehearsals passed at `2c2c56b` using the CNPG
-cleanup predecessor and that same successor. Finalizer-delayed cleanup retained
-the original claim, then completed after removing only the test-owned finalizer.
-A separate replacement-UID run refused deletion and retained the original claim
-in Cleaning. Both preserved an unclaimed Backup, checked the successor workload
-Role omitted Backup access, and deleted their owned cluster and credentials.
-Their archived measurements have now been packaged with the original producer
-source and accepted by the normal evidence merger. Together with the permission
-receipt, `work/cnpg-cleanup-merged/summary.json` covers four of sixteen checks for
-this exact successor: permission-changing upgrade, last-API-type cleanup,
-finalizer preservation and UID-replacement rejection. Twelve checks and all 43
-reactor cases remain missing; `releaseVerified` remains false. Packaging performs
-no new cluster execution. Altered binary and runner digests were both rejected
-without publishing output.
+Current cleanup qualification passed at `7070c1e` against the current successor.
+Finalizer-delayed cleanup retained the claim until the test finalizer was removed;
+replacement-UID rejection retained the original claim in Cleaning. Both runs
+preserved an unclaimed Backup, checked the successor workload Role omitted Backup
+access, and restored the original cluster inventory after removing credentials.
+Independent raw-measurement and adapter reviews passed, with eleven adapter tests.
+`work/cnpg-twelve-merged-7070c1e` accepts all three cleanup checks alongside the
+other current evidence: twelve of sixteen checks and all 43 reactor cases.
+Remaining checks are scope-matched benchmark, phase-interruption recovery,
+uncertain-writer refusal, and API-bound gap conformance. `releaseVerified` is false.
 
 Preparing the CNPG reactor run exposed a fixture-generation defect: the observed
 Secret seed contained only `value`, while the preserved Deployment required the
