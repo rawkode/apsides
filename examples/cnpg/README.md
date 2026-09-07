@@ -1,41 +1,61 @@
-# CloudNativePG and PostgREST example
+# CloudNativePG and PostgREST demo
 
-This example composes a CloudNativePG `Cluster`, a PostgREST `Deployment`, its
-`Service` and a managed ConfigMap in one Apsides controller. The PostgREST
-container reads public settings from ConfigMaps and receives its database URI
-through a `secretKeyRef` to CloudNativePG's `database-app` Secret. Secret values
-do not enter the TypeScript build or generated IR.
+Start with a database, add an API that retains its database declaration, then
+change live inputs and watch the API react. [The initial program](initial/program.tsx)
+owns the CNPG `Cluster` and API ConfigMap; [the upgraded program](program.tsx)
+retains them and adds PostgREST, its Service and observed inputs.
 
-Changes to the managed API ConfigMap, the observed `api-settings` ConfigMap or
-the observed database Secret declare a rollout of PostgREST. The local rehearsal
-below exercises the `api-settings` reaction and database Secret consumption.
+The API consumes ConfigMaps and CNPG's `database-app` Secret in the cluster.
+Its database URI uses `secretKeyRef`; Secret values never enter the authored
+program or compiled IR.
 
-From the repository root, build the CLI and regenerate the typed component from
-the pinned CloudNativePG 1.30.0 CRD:
+## 1. Author with imported CNPG types
+
+Run from the repository root, using a new project directory:
 
 ```sh
 cuenv task build
+target/debug/aps init --directory work/cnpg-authoring
 
 target/debug/aps crds fetch \
   --url https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_clusters.yaml \
   --kind Cluster \
   --version v1 \
-  --output examples/cnpg/.aps/crds/cnpg.ts
+  --output work/cnpg-authoring/.aps/crds/cnpg.ts
 ```
 
-The `.aps/` directory is generated and ignored. You can also regenerate the
-example types with `cuenv task cnpgTypes`. Refresh the explicit source
-lock whenever `program.tsx` or the generated CRD module changes:
+Open `work/cnpg-authoring` in your editor. The scaffold includes `deno.json`,
+`tsconfig.json`, a source lock and the local SDK. For VS Code with Deno, install
+the Deno extension and enable it for this workspace.
+
+Import `Cluster` into `program.tsx` and demonstrate completion inside `spec`
+and `storage`:
+
+```tsx
+import { Cluster } from "./.aps/crds/cnpg.ts";
+
+<Cluster
+  metadata={{ name: "database", namespace: "default" }}
+  deletionPolicy="orphan"
+  spec={{ instances: 1, storage: { size: "1Gi" } }}
+/>
+```
+
+The module also exports `ClusterSpec`. Hover descriptions come from the CRD;
+misspelled fields and incorrect types produce editor diagnostics.
+`cuenv task authoringEditorCheck` tests this through the actual Deno language
+server. See [custom resource authoring](../../docs/guides/custom-resources.md)
+for the full workflow. Generated `.aps/` files stay ignored.
+
+To compile the complete checked-in API example:
 
 ```sh
+cuenv task cnpgTypes
+
 target/debug/aps lock \
   --source examples/cnpg/program.tsx \
   --modules examples/cnpg/.aps/crds/cnpg.ts
-```
 
-Typecheck and compile the example:
-
-```sh
 deno check --config examples/cnpg/deno.json examples/cnpg/program.tsx
 
 target/debug/aps compile \
@@ -43,42 +63,22 @@ target/debug/aps compile \
   --output work/cnpg-compiled
 ```
 
-The compile output directory must be fresh. The commands above use the locally
-built CLI and its checkout assets. An installed [CLI bundle](../../docs/reakt/CLI-DISTRIBUTION.md)
-provides the same commands through `aps` using its packaged assets.
+Use a fresh compile output directory. Refresh the lock after changing source
+or generated types. [Initial-version instructions](initial/README.md) cover the
+database-only program. An installed [CLI bundle](../../docs/reakt/CLI-DISTRIBUTION.md)
+provides these commands as `aps`.
 
-Compilation proves the locked source can produce validated IR and a controller
-project. It does not install the CloudNativePG operator or CRD, create the
-observed ConfigMap, deploy PostgREST, or prove database readiness, rollouts and
-drift correction. Those require a separately prepared cluster and live
-verification.
+## 2. Deploy the database, then upgrade to the API
 
-For the first deployment in the upgrade demo, use [the initial version](initial/README.md).
-It owns the same database and ConfigMap; this version adds the API workload and
-its observed inputs.
+The current runnable live path is the repository's signed-candidate rehearsal
+below. It exercises the real lifecycle protocol through the test driver.
+Compilation alone does not deploy anything, and a public `aps deploy`
+presentation remains pending the production release gate; do not present the
+rehearsal as that CLI path.
 
-## Local upgrade rehearsal
-
-The rehearsal passed on kind running through OrbStack at source revision
-`4892cbc`, using the signed initial candidate from `5ed7b25`, the current successor
-payload from `0ee1a75`, and CloudNativePG 1.30.0. It verified initial database readiness, refusal of the
-permission expansion under the initial policy, writer retirement, successor
-activation, and HTTP responses changing from two rows to one after a ConfigMap
-update. The Deployment UID stayed stable while the Pod, ReplicaSet and rollout
-revision changed. Cleanup restored the prior cluster and container inventories
-and removed the rehearsal credentials.
-
-The normal evidence consumer accepted the permission-changing upgrade receipt
-for the exact successor candidate. Full production acceptance is still pending:
-the current payload has nine of sixteen required checks and all 43 required
-reactor cases accepted by the evidence merger.
-It does not verify Secret rotation or drift correction.
-
-The repository's test driver accepts two signed, integrity-verified candidates
-built from the initial and parent examples. It uses the real lifecycle protocol
-on a new kind cluster, including the rejected permission expansion and verified
-writer retirement. It does not bypass the production `aps deploy` release gate
-and emits only the permission-changing upgrade check after successful cleanup.
+Prepare signed initial and successor candidates, their trust policy, and the
+CNPG 1.30.0 operator manifest. The operator image and `OPERATOR_IMAGE_NAME` must
+be pinned to the same digest. Use absolute input paths and a new output directory:
 
 ```sh
 cuenv exec -- python3 tests/reakt/run_cnpg_demo.py \
@@ -91,29 +91,37 @@ cuenv exec -- python3 tests/reakt/run_cnpg_demo.py \
   --output "$PWD/work/cnpg-rehearsal"
 ```
 
-Input paths must be absolute and the output directory must be new. The operator
-manifest must be CNPG 1.30.0 with its operator image and `OPERATOR_IMAGE_NAME`
-pinned to the same digest. The driver runs the existing Envoy canary first;
-its environment evidence supplements the upgrade's separate live drain,
-termination and credential-revocation checks.
+Presentation checkpoints:
 
-The HTTP checks expect the synthetic `messages` table. After the upgrade, a
-ConfigMap change sets `PGRST_DB_MAX_ROWS` from 100 to 1; the checks require a new
-Pod and ReplicaSet, a changed rollout revision and an HTTP response with one row
-instead of two. Database access verifies consumption of the CNPG Secret; this
-flow does not claim to demonstrate credential rotation.
+1. **Database ready:** the initial controller creates the database and seeds two
+   `messages` rows. There is no API Deployment yet.
+2. **API upgrade:** the driver first checks that the initial permission policy
+   rejects the expansion, then approves the policy and upgrades. The database
+   declaration stays unchanged; PostgREST serves the two seeded rows using the CNPG Secret.
+3. **ConfigMap reaction:** `api-settings` changes `PGRST_DB_MAX_ROWS` from `100`
+   to `1`. The API gets a new Pod, ReplicaSet and rollout revision while its
+   Deployment UID remains stable. HTTP now returns one row: the response limit
+   changed; this is not a database-content mutation.
+4. **Equal data:** a metadata-only ConfigMap update leaves the API workload
+   unchanged for a 30-second observation window.
+5. **Secret reaction:** adding an unused synthetic key to `database-app` triggers
+   another rollout with working database access. This demonstrates a Secret-data
+   reaction, not password rotation. The probe removes only its own key, checks
+   that the original Secret data is restored in memory and waits for the restored
+   workload. Secret values are not saved in evidence.
 
-`--check-input-reactions` also checks a real metadata update with unchanged
-ConfigMap data produces no rollout for 30 seconds. It then adds an unused
-synthetic key to the CNPG Secret and requires another rollout with working
-database access. The probe removes only its own key, verifies the original
-Secret data in memory, and waits for the restored workload. Secret values are
-not saved in evidence. These extra checks run after performance sampling when
-`--collect-performance` is also enabled.
+The rehearsal also inserts a public row in a separate `aps_demo_persistence`
+table before upgrading, then requires that row and the same CNPG resource and
+PVC identities afterward. This leaves the visible `messages` demo unchanged.
+That check has passed unit tests; its live rehearsal is still pending.
 
-By default the driver deletes its cluster and credentials, preserving existing
-clusters. `--retain-on-success` keeps the successful demo cluster and a private
-admin kubeconfig in the output directory, while removing issuer credentials.
-A retained cluster does not produce a permission-upgrade receipt.
-Failure is never treated as successful release evidence. Offline runner
-regressions are available through `cuenv task cnpgDemoTest`.
+The example uses `deletionPolicy="orphan"` for its resources. That protects the
+intended resource lifecycle; it is not a database backup. The rehearsal deletes
+its disposable cluster by default, including its demo data, and removes its
+credentials while preserving existing clusters.
+
+To inspect a successful rehearsal afterward, add `--retain-on-success`. This
+keeps the demo cluster and a private admin kubeconfig in the output directory,
+removes issuer credentials and produces no permission-upgrade receipt. Treat
+that kubeconfig as a credential and explicitly clean up the retained cluster
+when finished. Offline runner checks are available with `cuenv task cnpgDemoTest`.

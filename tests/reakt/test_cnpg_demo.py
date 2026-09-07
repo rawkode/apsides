@@ -12,6 +12,54 @@ import run_cnpg_demo as demo
 
 
 class DemoChecks(unittest.TestCase):
+    def persistence_runner(self, row="1|survives-upgrade\n"):
+        runner = demo.CnpgDemoRunner.__new__(demo.CnpgDemoRunner)
+        runner.workload = "default"
+        cluster = {"metadata": {"uid": "cluster"}, "status": {"currentPrimary": "database-1"}}
+        volumes = {"items": [{"metadata": {"name": "database-1", "uid": "volume"}, "status": {"phase": "Bound"}}]}
+        runner.k = Mock(side_effect=[json.dumps(cluster), json.dumps(volumes), row,
+                                    json.dumps(cluster), json.dumps(volumes)])
+        return runner, cluster, volumes
+
+    def test_database_public_row_and_volume_survive_upgrade(self):
+        runner, _, _ = self.persistence_runner()
+        initial = runner.database_persistence()
+        invocation = runner.k.call_args_list[2].args
+        self.assertEqual(invocation[:2], ("exec", "database-1"))
+        self.assertIn("/controller/run", invocation)
+        self.assertIn("ON_ERROR_STOP=1", invocation)
+        self.assertIn("CREATE TABLE aps_demo_persistence", invocation[-1])
+        self.assertNotIn("messages", invocation[-1])
+        after, _, _ = self.persistence_runner()
+        self.assertEqual(after.database_persistence(initial), initial)
+        self.assertNotIn("CREATE", after.k.call_args_list[2].args[-1])
+
+    def test_database_persistence_rejects_wrong_or_extra_rows(self):
+        for row in ["", "1|changed", "1|survives-upgrade\n2|extra"]:
+            runner, _, _ = self.persistence_runner(row)
+            with self.assertRaisesRegex(demo.shared.QualificationError, "persistence row differs"):
+                runner.database_persistence()
+
+    def test_database_persistence_rejects_replaced_cluster_or_volume_before_sql(self):
+        for field in ["cluster", "volume"]:
+            runner, _, _ = self.persistence_runner()
+            expected = {"clusterUid": "cluster", "volumes": [{"name": "database-1", "uid": "volume"}]}
+            if field == "cluster":
+                expected["clusterUid"] = "old-cluster"
+            else:
+                expected["volumes"][0]["uid"] = "old-volume"
+            with self.assertRaisesRegex(demo.shared.QualificationError, "upgrade replaced"):
+                runner.database_persistence(expected)
+            self.assertEqual(runner.k.call_count, 2)
+
+    def test_database_persistence_rejects_volume_change_during_query(self):
+        runner, cluster, volumes = self.persistence_runner()
+        volumes["items"][0]["metadata"]["uid"] = "replacement"
+        before = {"items": [{"metadata": {"name": "database-1", "uid": "volume"}, "status": {"phase": "Bound"}}]}
+        runner.k.side_effect = [json.dumps(cluster), json.dumps(before), "1|survives-upgrade", json.dumps(cluster), json.dumps(volumes)]
+        with self.assertRaisesRegex(demo.shared.QualificationError, "identity changed"):
+            runner.database_persistence()
+
     def test_pull_secret_policy_projection_preserves_default_and_matches_both_candidates(self):
         with patch.object(demo.base, 'ceiling', return_value={'scope': 'same'}):
             original = demo.full_policy({})

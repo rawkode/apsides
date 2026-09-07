@@ -1094,6 +1094,39 @@ class CnpgDemoRunner(base.CeilingRunner):
                 raise shared.QualificationError("CNPG application Secret did not become available")
             time.sleep(2)
 
+    def database_identity(self):
+        cluster = json.loads(self.k("get", "cluster.postgresql.cnpg.io/database", "-n", self.workload, "-o", "json"))
+        primary = cluster.get("status", {}).get("currentPrimary")
+        volumes = json.loads(self.k("get", "pvc", "-n", self.workload, "-l", "cnpg.io/cluster=database", "-o", "json"))["items"]
+        if (not isinstance(primary, str) or not primary or not cluster["metadata"].get("uid")
+                or cluster["metadata"].get("deletionTimestamp") or not volumes
+                or any(v.get("status", {}).get("phase") != "Bound" or v["metadata"].get("deletionTimestamp")
+                       or not v["metadata"].get("uid") or not v["metadata"].get("name") for v in volumes)):
+            raise shared.QualificationError("demo database or bound volumes are unavailable")
+        identities = sorted((v["metadata"]["name"], v["metadata"]["uid"]) for v in volumes)
+        if len({name for name, _ in identities}) != len(identities):
+            raise shared.QualificationError("demo database volume identities are ambiguous")
+        return primary, {"clusterUid": cluster["metadata"]["uid"], "volumes": [
+            {"name": name, "uid": uid} for name, uid in identities]}
+
+    def database_persistence(self, previous=None):
+        primary, identity = self.database_identity()
+        if previous is not None and identity != previous:
+            raise shared.QualificationError("upgrade replaced the demo database or its volumes")
+        sql = "SELECT id, value FROM aps_demo_persistence ORDER BY id;"
+        if previous is None:
+            sql = ("CREATE TABLE aps_demo_persistence (id integer PRIMARY KEY, value text NOT NULL); "
+                   "INSERT INTO aps_demo_persistence VALUES (1, 'survives-upgrade'); " + sql)
+        observed = self.k("exec", primary, "-n", self.workload, "-c", "postgres", "--",
+                          "psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1",
+                          "-h", "/controller/run", "-U", "postgres", "-d", "app", "-c", sql)
+        if observed.strip() != "1|survives-upgrade":
+            raise shared.QualificationError("demo database persistence row differs")
+        _, after = self.database_identity()
+        if after != identity:
+            raise shared.QualificationError("demo database identity changed during persistence check")
+        return identity
+
     def workload_identity(self, previous_uid=None, timeout=300):
         deadline = time.monotonic() + timeout
         while True:
@@ -1460,6 +1493,8 @@ class CnpgDemoRunner(base.CeilingRunner):
         if initial["phase"] != "Committed":
             raise shared.QualificationError("initial candidate did not commit")
         self.wait_cnpg()
+        self.phase = "initial-database-persistence"
+        persistence = self.database_persistence()
         ownership = []
         for kind, name in [("cluster.postgresql.cnpg.io", "database"), ("configmap", "api-config")]:
             metadata = json.loads(self.k(
@@ -1523,6 +1558,11 @@ class CnpgDemoRunner(base.CeilingRunner):
         resolved = self.step("resolve-successor", "successor-resolved", self.issuer, transition=transition)
         if resolved["phase"] != "Committed":
             raise shared.QualificationError("successor candidate did not commit")
+        self.phase = "successor-database-persistence"
+        preserved = self.database_persistence(persistence)
+        next(check for check in self.checks if check["check"] == "cnpg-ready-and-secret-bound")["upgradePersistence"] = {
+            "passed": True, "publicRowPreserved": True, **preserved,
+        }
         self.phase = "successor-workload-readiness"
         before = self.workload_identity()
         self.phase = "successor-http-readiness"
