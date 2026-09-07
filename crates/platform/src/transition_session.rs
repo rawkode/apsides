@@ -378,6 +378,7 @@ impl PlatformClient {
         executor_binding: &crate::ExecutorBinding,
     ) -> Result<Self> {
         let policy = crate::PolicyState {
+            image_pull_secrets: vec![],
             schema_version: crate::SCHEMA_VERSION.into(),
             runtime_ceiling: plan.request.runtime_ceiling.clone(),
             cleanup_ceiling: plan.request.cleanup_ceiling.clone(),

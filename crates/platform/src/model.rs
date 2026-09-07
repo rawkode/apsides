@@ -46,6 +46,9 @@ pub struct ActivationState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PolicyState {
+    /// Platform-owned registry credential references in the control namespace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_pull_secrets: Vec<String>,
     pub schema_version: String,
     pub runtime_ceiling: PermissionCeiling,
     pub cleanup_ceiling: PermissionCeiling,
@@ -282,5 +285,23 @@ impl NamespaceRegistry {
         self.transitions
             .get(id)
             .ok_or_else(|| crate::invalid("transition is absent from registry"))
+    }
+}
+
+impl PolicyState {
+    pub(crate) fn validate_image_pull_secrets(&self) -> crate::Result<()> {
+        let mut names = std::collections::BTreeSet::new();
+        if self.image_pull_secrets.len() > 16
+            || self.image_pull_secrets.iter().any(|name| {
+                name.len() > 253
+                    || !name.split('.').all(crate::valid_namespace)
+                    || !names.insert(name)
+            })
+        {
+            return Err(crate::invalid(
+                "invalid platform image pull Secret references",
+            ));
+        }
+        Ok(())
     }
 }

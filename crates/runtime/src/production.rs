@@ -1423,6 +1423,7 @@ mod tests {
             accepted_indirect_risks: plan.indirect_risks.clone(),
         };
         PolicyState {
+            image_pull_secrets: vec![],
             schema_version: SCHEMA_VERSION.into(),
             runtime_ceiling: ceiling.clone(),
             cleanup_ceiling: ceiling,

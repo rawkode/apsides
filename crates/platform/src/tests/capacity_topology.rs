@@ -303,3 +303,26 @@ async fn capacity_resize_rejects_a_different_executor_before_live_capture() -> T
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn image_pull_secret_topology_mutation_is_rejected() -> TestResult {
+    let mut registry = qualified_upgrade_fixture()?;
+    let mut responses = admission_reads(&mut registry)?;
+    let pods = responses
+        .iter_mut()
+        .find(|v| v["kind"] == "PodList")
+        .ok_or("Pod list missing")?;
+    pods["items"][0]["spec"]["imagePullSecrets"] = json!([{"name":"unapproved"}]);
+    let checkpoint = registry
+        .active_writer_checkpoints
+        .get("example")
+        .ok_or("checkpoint missing")?;
+    let (client, _) = wire(responses);
+    let error = platform_client(client, "control", "workload", "cluster-a")?
+        .select_evidence_profile(Some(checkpoint))
+        .await
+        .err()
+        .ok_or("mutated pull references accepted")?;
+    assert!(error.to_string().contains("image pull Secret references"));
+    Ok(())
+}

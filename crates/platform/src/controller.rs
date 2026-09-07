@@ -195,6 +195,7 @@ impl PlatformClient {
             )
             .await?;
         }
+        let pull_secrets = self.controller_pull_secrets(binding).await?;
         let config_name = format!("{}-config", binding.service_account_name);
         let config = startup_config(binding, &self.control_namespace, proxy_secret.is_some());
         self.stage_object(registry, transition_id,"v1","ConfigMap",&config_name,json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":config_name,"namespace":self.control_namespace},"immutable":true,"data":{"config.json":String::from_utf8(canonical_bytes(&config)?).map_err(|_|invalid("invalid config encoding"))?}})).await?;
@@ -204,7 +205,13 @@ impl PlatformClient {
             "apps/v1",
             "Deployment",
             &binding.service_account_name,
-            controller_deployment(binding, &self.control_namespace, &config_name, proxy_secret),
+            controller_deployment(
+                binding,
+                &self.control_namespace,
+                &config_name,
+                proxy_secret,
+                &pull_secrets,
+            ),
         )
         .await?;
         Ok(())
@@ -254,6 +261,19 @@ impl PlatformClient {
             event,
         )?;
         self.persist_registry(registry, &next).await
+    }
+
+    pub(crate) async fn controller_pull_secrets(
+        &self,
+        binding: &RuntimeBinding,
+    ) -> Result<Vec<String>> {
+        let policy = self.load_policy(&binding.domain_id).await?;
+        if digest(&policy.value)? != binding.policy_digest {
+            return Err(invalid(
+                "platform policy changed before image pull configuration",
+            ));
+        }
+        Ok(policy.value.image_pull_secrets)
     }
 
     pub(crate) async fn release_binding(
@@ -498,6 +518,7 @@ fn controller_deployment(
     namespace: &str,
     config_name: &str,
     proxy_secret: Option<&str>,
+    pull_secrets: &[String],
 ) -> Value {
     let labels = json!({"reakt.dev/generation":binding.generation_id});
     let mut mounts = vec![json!({"name":"config","mountPath":"/etc/reakt","readOnly":true})];
@@ -509,7 +530,20 @@ fn controller_deployment(
     } else {
         binding.service_account_name.clone()
     };
-    json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":binding.service_account_name,"namespace":namespace},"spec":{"replicas":0,"selector":{"matchLabels":labels},"strategy":{"type":"Recreate"},"template":{"metadata":{"labels":labels,"finalizers":[crate::TERMINATION_FINALIZER]},"spec":{"serviceAccountName":account,"automountServiceAccountToken":proxy_secret.is_none(),"tolerations":[{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoExecute"},{"key":"node.kubernetes.io/unreachable","operator":"Exists","effect":"NoExecute"}],"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"controller","image":binding.controller_image,"imagePullPolicy":"IfNotPresent","env":[{"name":"REAKT_RUNTIME_CONFIG_PATH","value":"/etc/reakt/config.json"}],"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}},"volumeMounts":mounts,"ports":[{"containerPort":8080,"name":"diagnostics"}],"resources":{"requests":{"cpu":"10m","memory":"32Mi"},"limits":{"cpu":"1","memory":"256Mi"}},"livenessProbe":{"httpGet":{"path":"/livez","port":"diagnostics"}},"readinessProbe":{"httpGet":{"path":"/readyz","port":"diagnostics"}}}],"volumes":volumes}}}})
+    let mut deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":binding.service_account_name,"namespace":namespace},"spec":{"replicas":0,"selector":{"matchLabels":labels},"strategy":{"type":"Recreate"},"template":{"metadata":{"labels":labels,"finalizers":[crate::TERMINATION_FINALIZER]},"spec":{"serviceAccountName":account,"automountServiceAccountToken":proxy_secret.is_none(),"tolerations":[{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoExecute"},{"key":"node.kubernetes.io/unreachable","operator":"Exists","effect":"NoExecute"}],"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"controller","image":binding.controller_image,"imagePullPolicy":"IfNotPresent","env":[{"name":"REAKT_RUNTIME_CONFIG_PATH","value":"/etc/reakt/config.json"}],"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}},"volumeMounts":mounts,"ports":[{"containerPort":8080,"name":"diagnostics"}],"resources":{"requests":{"cpu":"10m","memory":"32Mi"},"limits":{"cpu":"1","memory":"256Mi"}},"livenessProbe":{"httpGet":{"path":"/livez","port":"diagnostics"}},"readinessProbe":{"httpGet":{"path":"/readyz","port":"diagnostics"}}}],"volumes":volumes}}}});
+    set_image_pull_secrets(&mut deployment, pull_secrets);
+    deployment
+}
+
+pub(crate) fn set_image_pull_secrets(deployment: &mut Value, names: &[String]) {
+    if !names.is_empty() {
+        deployment["spec"]["template"]["spec"]["imagePullSecrets"] = json!(
+            names
+                .iter()
+                .map(|name| json!({"name":name}))
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -591,5 +625,73 @@ mod stage_metadata_tests {
             Some(&actual),
             Some(&expected)
         ));
+    }
+}
+
+#[cfg(test)]
+mod image_pull_tests {
+    use super::*;
+    #[test]
+    fn image_pull_references_are_only_kubelet_configuration() {
+        let binding = RuntimeBinding {
+            domain_id: "domain".into(),
+            cluster_binding: "cluster".into(),
+            generation_id: "generation".into(),
+            build_digest: "build".into(),
+            ir_digest: "ir".into(),
+            policy_digest: "policy".into(),
+            capability_digest: "capability".into(),
+            service_account_name: "runtime".into(),
+            controller_image: "registry/controller@sha256:digest".into(),
+        };
+        let names = vec!["registry-auth".to_string()];
+        let populated = controller_deployment(&binding, "control", "config", Some("tls"), &names);
+        assert_eq!(
+            populated["spec"]["template"]["spec"]["imagePullSecrets"],
+            json!([{"name":"registry-auth"}])
+        );
+        let names = vec![];
+        let empty = controller_deployment(&binding, "control", "config", Some("tls"), &names);
+        let mut expected = populated;
+        if let Some(spec) = expected["spec"]["template"]["spec"].as_object_mut() {
+            spec.remove("imagePullSecrets");
+        }
+        assert_eq!(expected, empty);
+    }
+}
+
+pub(crate) fn verify_image_pull_secrets(
+    actual: &k8s_openapi::api::core::v1::PodSpec,
+    expected: &k8s_openapi::api::core::v1::PodSpec,
+) -> Result<()> {
+    if actual.image_pull_secrets.as_deref().map_or(&[][..], |v| v)
+        != expected
+            .image_pull_secrets
+            .as_deref()
+            .map_or(&[][..], |v| v)
+    {
+        return Err(invalid(
+            "Pod image pull Secret references differ from protected Deployment",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod image_pull_integrity_tests {
+    #[test]
+    fn image_pull_secret_admission_mutation_is_rejected() -> crate::Result<()> {
+        let expected: k8s_openapi::api::core::v1::PodSpec = serde_json::from_value(
+            serde_json::json!({"containers":[],"imagePullSecrets":[{"name":"registry"}]}),
+        )?;
+        let mut actual = expected.clone();
+        super::verify_image_pull_secrets(&actual, &expected)?;
+        actual.image_pull_secrets = None;
+        assert!(super::verify_image_pull_secrets(&actual, &expected).is_err());
+        let empty = actual.clone();
+        actual.image_pull_secrets = Some(vec![]);
+        super::verify_image_pull_secrets(&actual, &empty)?;
+        assert!(super::verify_image_pull_secrets(&expected, &empty).is_err());
+        Ok(())
     }
 }

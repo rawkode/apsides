@@ -68,6 +68,7 @@ fn candidate_policy(compiled: &compiler_core::CompiledPlan) -> platform_api::Pol
         accepted_indirect_risks: compiled.indirect_risks.clone(),
     };
     platform_api::PolicyState {
+        image_pull_secrets: vec![],
         schema_version: platform_api::SCHEMA_VERSION.into(),
         runtime_ceiling: ceiling.clone(),
         cleanup_ceiling: ceiling,
@@ -86,6 +87,7 @@ fn prepared_targets(
     let policy = match target.purpose {
         platform_api::CandidatePairPurpose::PermissionExpansion {} => candidate_policy(compiled),
         platform_api::CandidatePairPurpose::LastTypeCleanup { .. } => platform_api::PolicyState {
+            image_pull_secrets: vec![],
             schema_version: platform_api::SCHEMA_VERSION.into(),
             runtime_ceiling: request.runtime_ceiling.clone(),
             cleanup_ceiling: request.cleanup_ceiling.clone(),

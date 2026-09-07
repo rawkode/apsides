@@ -45,6 +45,7 @@ impl TransitionInputs {
         claims: ClaimRef,
         policy: &crate::PolicyState,
     ) -> Result<Self> {
+        policy.validate_image_pull_secrets()?;
         if !plan.request.observations.is_empty()
             || deploy::plan_transition(&plan.request)? != *plan
             || policy.runtime_ceiling != plan.request.runtime_ceiling

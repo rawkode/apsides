@@ -133,6 +133,7 @@ fn policy() -> PolicyState {
         accepted_indirect_risks: vec![],
     };
     PolicyState {
+        image_pull_secrets: vec![],
         schema_version: SCHEMA_VERSION.into(),
         runtime_ceiling: ceiling.clone(),
         cleanup_ceiling: ceiling,

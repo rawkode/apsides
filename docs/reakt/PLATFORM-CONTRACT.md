@@ -6,7 +6,7 @@ All JSON uses `schemaVersion: "reakt.dev/platform/v1"`, camelCase fields, strict
 
 | Control object in the separate control namespace | Writer | Reader / schema |
 | --- | --- | --- |
-| `reakt-policy-{domain}` | platform administration | runtime and deployer; `PolicyState { runtimeCeiling, cleanupCeiling }` |
+| `reakt-policy-{domain}` | platform administration | runtime and deployer; `PolicyState { runtimeCeiling, cleanupCeiling, imagePullSecrets }` |
 | `reakt-trust-{domain}` | platform administration | deployer only; release verifier's policy JSON |
 | `reakt-registry-authority.{controlNamespace}.{workloadNamespace}` in `reakt-platform` | platform administration and explicit recovery only | deployer exact GET only; scope and admitted registry UID |
 | `reakt-registry-{workloadNamespace}` | authorized deployment jobs | deployer only; `NamespaceRegistry` |
@@ -33,6 +33,31 @@ Runtime inventory includes the binding, activationUid, activationResourceVersion
 Kubelet-reported termination of all containers in retained Pod UIDs can establish process termination in a qualified environment. It does not establish completion of in-flight API writes. A force-deleted or disappeared Pod, an unreachable node, a cooperative drained flag, expired timeout, or deleted RoleBinding is insufficient on its own.
 
 The qualified credential-injecting API proxy is the supported request-drain boundary. Runtime must not receive a Kubernetes token. A proxy-only token volume and a proxy-admin Unix socket inaccessible to runtime avoid the shared Pod-network admin exposure. Graceful Envoy listener draining initially continues accepting connections; zero active upstream requests also does not distinguish completed responses from timed-out/reset requests whose Kubernetes outcome is unknown. Qualification must establish that admission of new requests has stopped and that every forwarded mutation has a terminal upstream response, with continuous protected evidence and no ambiguous outcomes. Unsupported environments remain blocked; this crate does not manufacture a proof from caller-provided digest strings.
+
+## Private controller images
+
+Platform bootstrap may set `imagePullSecrets` in `reakt-policy-{domain}` to at
+most sixteen unique Kubernetes Secret names, for example
+`"imagePullSecrets": ["controller-registry"]`. These references apply to the
+controller and its proxy Pod in the control namespace. The platform provisions
+the registry Secrets there separately; their contents are not deployment inputs,
+inventory records, mounted runtime files or output fields. Kubelet performs the
+image authentication. This grants no additional runtime Secret permissions.
+
+An omitted or empty list uses the cluster's existing image authentication, such
+as node credential providers, or public images. Controller references still use
+immutable image digests. References are part of the protected policy digest and
+staged Pod template integrity checks. Writer topology checks reject live Pods
+whose references differ from their Deployment template. Changing policy references
+during a transition causes
+the existing policy-drift checks to reject resume. Credential rotation under an
+unchanged name remains a platform operation and does not bind Secret contents or
+resource versions into Apsides state.
+
+Manifest tests establish reference propagation, not successful registry access.
+Private-registry qualification requires a fresh node pull of the exact image
+digest and a failure case with missing or invalid credentials. Preloaded demo
+images do not establish that evidence.
 
 ## Initial installation executor
 

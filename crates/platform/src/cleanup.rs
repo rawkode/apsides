@@ -460,6 +460,7 @@ mod tests {
         let ceiling: compiler_core::PermissionCeiling = serde_json::from_value(json!({"policyRef":"platform","domainId":"example","clusterBinding":"cluster-a","workloadNamespace":"workload","controlNamespace":"control","capabilities":[],"acceptedEnforcementGaps":[],"acceptedIndirectRisks":[]})).unwrap();
         let policy = crate::Versioned {
             value: crate::PolicyState {
+                image_pull_secrets: vec![],
                 schema_version: crate::SCHEMA_VERSION.into(),
                 runtime_ceiling: ceiling.clone(),
                 cleanup_ceiling: ceiling,

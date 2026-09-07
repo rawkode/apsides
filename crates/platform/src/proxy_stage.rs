@@ -70,6 +70,7 @@ impl PlatformClient {
         deploy::require_event_capacity(&stored.plan, &stored.record)?;
         let binding = self.release_binding(&stored, release).await?;
         let policy = self.load_proxy_policy(&binding.domain_id).await?;
+        let pull_secrets = self.controller_pull_secrets(&binding).await?;
         let mut registry = self
             .stage_runtime_identity(transition_id, executor_id)
             .await?;
@@ -94,7 +95,13 @@ impl PlatformClient {
             "apps/v1",
             "Deployment",
             &proxy_name,
-            proxy_deployment(&binding, &self.control_namespace, &config_name, &tls_name),
+            proxy_deployment(
+                &binding,
+                &self.control_namespace,
+                &config_name,
+                &tls_name,
+                &pull_secrets,
+            ),
         )
         .await?;
         self.stage_object(&mut registry,transition_id,"v1","Service",&proxy_name,json!({"apiVersion":"v1","kind":"Service","metadata":{"name":proxy_name,"namespace":self.control_namespace},"spec":{"selector":{"reakt.dev/proxy-generation":binding.generation_id},"ports":[{"name":"https","port":8443,"targetPort":8443}]}})).await?;
@@ -324,9 +331,49 @@ impl PlatformClient {
     }
 }
 
-fn proxy_deployment(binding: &RuntimeBinding, namespace: &str, config: &str, tls: &str) -> Value {
+fn proxy_deployment(
+    binding: &RuntimeBinding,
+    namespace: &str,
+    config: &str,
+    tls: &str,
+    pull_secrets: &[String],
+) -> Value {
     let name = format!("reakt-proxy-{}", binding.generation_id);
     let labels = json!({"reakt.dev/proxy-generation":binding.generation_id});
     let security = json!({"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}});
-    json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":name,"namespace":namespace},"spec":{"replicas":1,"strategy":{"type":"Recreate"},"selector":{"matchLabels":labels},"template":{"metadata":{"labels":labels,"finalizers":[crate::TERMINATION_FINALIZER]},"spec":{"serviceAccountName":binding.service_account_name,"automountServiceAccountToken":false,"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"runAsGroup":65532,"fsGroup":65532,"seccompProfile":{"type":"RuntimeDefault"}},"tolerations":[{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoExecute"},{"key":"node.kubernetes.io/unreachable","operator":"Exists","effect":"NoExecute"}],"containers":[{"name":"envoy","image":ENVOY_IMAGE,"args":["-c","/etc/reakt/envoy/envoy.json","--concurrency","2","--log-level","warning","--file-flush-interval-msec","50"],"securityContext":security,"ports":[{"name":"https","containerPort":8443}],"volumeMounts":[{"name":"config","mountPath":"/etc/reakt/envoy","readOnly":true},{"name":"server-tls","mountPath":"/etc/reakt/server-tls","readOnly":true},{"name":"api-token","mountPath":"/var/run/secrets/kubernetes.io/serviceaccount","readOnly":true},{"name":"evidence","mountPath":"/evidence"}],"resources":{"requests":{"cpu":"25m","memory":"64Mi","ephemeral-storage":"32Mi"},"limits":{"cpu":"1","memory":"256Mi","ephemeral-storage":"64Mi"}},"readinessProbe":{"tcpSocket":{"port":8443}}},{"name":"admin","image":ADMIN_IMAGE,"command":["sleep"],"args":["infinity"],"securityContext":security,"volumeMounts":[{"name":"evidence","mountPath":"/evidence"}],"resources":{"requests":{"cpu":"5m","memory":"8Mi"},"limits":{"cpu":"100m","memory":"32Mi"}}}],"volumes":[{"name":"config","configMap":{"name":config}},{"name":"server-tls","secret":{"secretName":tls,"defaultMode":416,"items":[{"key":"ca.crt","path":"ca.crt"},{"key":"server.crt","path":"tls.crt"},{"key":"server.key","path":"tls.key"}]}},{"name":"api-token","projected":{"defaultMode":416,"sources":[{"serviceAccountToken":{"path":"token","expirationSeconds":3600}},{"configMap":{"name":"kube-root-ca.crt","items":[{"key":"ca.crt","path":"ca.crt"}]}}]}},{"name":"evidence","emptyDir":{"sizeLimit":"32Mi"}}]}}}})
+    let mut deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":name,"namespace":namespace},"spec":{"replicas":1,"strategy":{"type":"Recreate"},"selector":{"matchLabels":labels},"template":{"metadata":{"labels":labels,"finalizers":[crate::TERMINATION_FINALIZER]},"spec":{"serviceAccountName":binding.service_account_name,"automountServiceAccountToken":false,"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"runAsGroup":65532,"fsGroup":65532,"seccompProfile":{"type":"RuntimeDefault"}},"tolerations":[{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoExecute"},{"key":"node.kubernetes.io/unreachable","operator":"Exists","effect":"NoExecute"}],"containers":[{"name":"envoy","image":ENVOY_IMAGE,"args":["-c","/etc/reakt/envoy/envoy.json","--concurrency","2","--log-level","warning","--file-flush-interval-msec","50"],"securityContext":security,"ports":[{"name":"https","containerPort":8443}],"volumeMounts":[{"name":"config","mountPath":"/etc/reakt/envoy","readOnly":true},{"name":"server-tls","mountPath":"/etc/reakt/server-tls","readOnly":true},{"name":"api-token","mountPath":"/var/run/secrets/kubernetes.io/serviceaccount","readOnly":true},{"name":"evidence","mountPath":"/evidence"}],"resources":{"requests":{"cpu":"25m","memory":"64Mi","ephemeral-storage":"32Mi"},"limits":{"cpu":"1","memory":"256Mi","ephemeral-storage":"64Mi"}},"readinessProbe":{"tcpSocket":{"port":8443}}},{"name":"admin","image":ADMIN_IMAGE,"command":["sleep"],"args":["infinity"],"securityContext":security,"volumeMounts":[{"name":"evidence","mountPath":"/evidence"}],"resources":{"requests":{"cpu":"5m","memory":"8Mi"},"limits":{"cpu":"100m","memory":"32Mi"}}}],"volumes":[{"name":"config","configMap":{"name":config}},{"name":"server-tls","secret":{"secretName":tls,"defaultMode":416,"items":[{"key":"ca.crt","path":"ca.crt"},{"key":"server.crt","path":"tls.crt"},{"key":"server.key","path":"tls.key"}]}},{"name":"api-token","projected":{"defaultMode":416,"sources":[{"serviceAccountToken":{"path":"token","expirationSeconds":3600}},{"configMap":{"name":"kube-root-ca.crt","items":[{"key":"ca.crt","path":"ca.crt"}]}}]}},{"name":"evidence","emptyDir":{"sizeLimit":"32Mi"}}]}}}});
+    crate::controller::set_image_pull_secrets(&mut deployment, pull_secrets);
+    deployment
+}
+
+#[cfg(test)]
+mod image_pull_tests {
+    use super::*;
+    #[test]
+    fn image_pull_references_are_only_kubelet_configuration() {
+        let binding = RuntimeBinding {
+            domain_id: "domain".into(),
+            cluster_binding: "cluster".into(),
+            generation_id: "generation".into(),
+            build_digest: "build".into(),
+            ir_digest: "ir".into(),
+            policy_digest: "policy".into(),
+            capability_digest: "capability".into(),
+            service_account_name: "runtime".into(),
+            controller_image: "registry/controller@sha256:digest".into(),
+        };
+        let names = vec!["registry-auth".to_string()];
+        let populated = proxy_deployment(&binding, "control", "config", "tls", &names);
+        assert_eq!(
+            populated["spec"]["template"]["spec"]["imagePullSecrets"],
+            json!([{"name":"registry-auth"}])
+        );
+        let names = vec![];
+        let empty = proxy_deployment(&binding, "control", "config", "tls", &names);
+        let mut expected = populated;
+        if let Some(spec) = expected["spec"]["template"]["spec"].as_object_mut() {
+            spec.remove("imagePullSecrets");
+        }
+        assert_eq!(expected, empty);
+    }
 }

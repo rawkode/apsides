@@ -675,6 +675,7 @@ fn policy(plan: &CompiledPlan) -> PolicyState {
         accepted_indirect_risks: plan.indirect_risks.clone(),
     };
     PolicyState {
+        image_pull_secrets: vec![],
         schema_version: SCHEMA_VERSION.into(),
         runtime_ceiling: ceiling.clone(),
         cleanup_ceiling: ceiling,
@@ -3536,4 +3537,48 @@ pub(crate) fn preview_pending_fixture() -> std::result::Result<
     let (staged, _, policy, trust, _) = staged_initial_fixture()?;
     let plan = staged.plan(TRANSITION_A)?.clone();
     Ok((staged.registry, plan, policy, trust))
+}
+
+#[test]
+fn image_pull_secret_policy_validation_and_empty_digest() -> Result<()> {
+    let mut policy = policy(&plan());
+    let original = compiler_core::canonical_bytes(&policy)?;
+    let encoded = serde_json::to_value(&policy)?;
+    assert!(encoded.get("imagePullSecrets").is_none());
+    let restored: PolicyState = serde_json::from_value(encoded)?;
+    assert_eq!(compiler_core::canonical_bytes(&restored)?, original);
+    policy.image_pull_secrets = vec!["registry.credentials".into(), "registry-2".into()];
+    policy.validate_image_pull_secrets()?;
+    assert_ne!(compiler_core::canonical_bytes(&policy)?, original);
+    for names in [
+        vec!["".into()],
+        vec!["a..b".into()],
+        vec!["Upper".into()],
+        vec!["a".into(), "a".into()],
+        vec!["a".repeat(254)],
+        (0..17).map(|i| format!("registry-{i}")).collect(),
+    ] {
+        policy.image_pull_secrets = names;
+        assert!(policy.validate_image_pull_secrets().is_err());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_pull_secret_read_rejects_policy_drift() -> Result<()> {
+    let plan = plan();
+    let mut policy = policy(&plan);
+    policy.image_pull_secrets = vec!["registry-a".into()];
+    let binding = activation(&plan, &policy).binding;
+    let original = object("reakt-policy-example", &policy, "policy-uid", "1");
+    policy.image_pull_secrets = vec!["registry-b".into()];
+    let changed = object("reakt-policy-example", &policy, "policy-uid", "2");
+    let (client, _) = wire(vec![original, changed]);
+    let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
+    assert_eq!(
+        platform.controller_pull_secrets(&binding).await?,
+        vec!["registry-a"]
+    );
+    assert!(platform.controller_pull_secrets(&binding).await.is_err());
+    Ok(())
 }

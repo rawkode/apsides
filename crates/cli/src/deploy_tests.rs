@@ -230,6 +230,7 @@ fn frozen_inputs(plan: &deploy::TransitionPlan) -> Result<platform::TransitionIn
         plan,
         snapshot.reference()?,
         &platform::PolicyState {
+            image_pull_secrets: vec![],
             schema_version: "reakt.dev/platform-policy/v1".into(),
             runtime_ceiling: request.runtime_ceiling.clone(),
             cleanup_ceiling: request.cleanup_ceiling.clone(),

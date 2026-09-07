@@ -291,6 +291,7 @@ impl PlatformClient {
             &format!("reakt-policy-{domain_id}"),
         )
         .await?;
+        policy.value.validate_image_pull_secrets()?;
         if policy.value.schema_version != SCHEMA_VERSION {
             return Err(invalid("unsupported policy schema"));
         }

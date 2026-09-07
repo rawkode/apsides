@@ -92,6 +92,12 @@ impl PlatformClient {
                 .spec
                 .as_ref()
                 .ok_or_else(|| invalid("writer Pod spec missing"))?;
+            let template = deployment
+                .spec
+                .as_ref()
+                .and_then(|s| s.template.spec.as_ref())
+                .ok_or_else(|| invalid("writer Deployment template missing"))?;
+            crate::controller::verify_image_pull_secrets(spec, template)?;
             if spec.service_account_name.as_ref() != Some(&account) {
                 return Err(invalid("writer Pod service account changed"));
             }

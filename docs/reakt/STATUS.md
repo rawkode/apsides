@@ -35,6 +35,10 @@ establish narrower properties.
 - The native controller reconciles its fixed resource set through conditional
   Server-Side Apply. It has no JavaScript evaluator and cannot expand its
   approved scope.
+- Protected platform policy can supply registry Secret references for controller
+  and proxy image pulls, without granting runtime Secret access. References bind
+  to the policy and staged Pod templates; credentials remain platform-owned.
+  A fresh-node private-registry pull is not yet qualified.
 - Runtime diagnostics retain completed-cycle blocked counts and specific reasons
   throughout reconciliation backoff. `/status` includes up to 256 `conditions`
   containing only `resourceId` and `reasonCode`, plus a `fieldOrVersionConflicts`

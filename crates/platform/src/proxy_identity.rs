@@ -101,6 +101,7 @@ impl PlatformClient {
             .as_ref()
             .and_then(|s| s.template.spec.as_ref())
             .ok_or_else(|| invalid("proxy Deployment template missing"))?;
+        crate::controller::verify_image_pull_secrets(spec, expected)?;
         if spec.containers != expected.containers
             || spec.volumes != expected.volumes
             || spec.service_account_name != expected.service_account_name
