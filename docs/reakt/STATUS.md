@@ -268,17 +268,20 @@ recovery, or production restore authority.
 
 ## Remaining production work
 
-- Rebuild and requalify the native candidate after correcting input watch scope.
-  The runtime now watches only observed inputs, matching compiled permissions;
-  managed inputs retain periodic reconciliation. The prior signed CNPG candidate
-  attempted managed-input watches without a matching watch grant. Live runs
-  completed the upgrade but failed readiness before or after idle sampling;
-  those runs do not prove the cause or qualify the corrected binary.
+- Complete release qualification for the corrected native candidate. The runtime
+  watches only observed inputs, matching compiled permissions; managed inputs
+  retain periodic reconciliation. `work/cnpg-native-samples-9b5097a` passed the
+  local signed-pair deployment, permission-changing upgrade, Secret consumption,
+  ConfigMap-triggered rollout and idle/active sampling. All 26 runtime health
+  samples were ready and synchronized with zero errors. This does not qualify
+  Secret update reactions, equal-value suppression or the full performance gate.
+  Previous release receipts remain bound to the previous binary.
 - Produce one signed production release containing every required reactor case
   and all sixteen authenticated release checks.
-- Preserve the current payload binding when assembling the final release. Its
-  permission-changing upgrade and cleanup receipts are accepted; a changed
-  binary or compiler closure requires matching new measurements.
+- Preserve exact payload bindings when assembling the final release. Accepted
+  permission-changing upgrade and cleanup receipts for the previous candidate
+  do not apply to the corrected binary or compiler closure; those require
+  matching new measurements and receipts.
 - Keep uncertain stalled-job takeover blocked. A lease, expired token or changed
   executor label alone does not establish that the previous executor cannot
   proceed. The spec includes the trusted deployment job in its trusted computing
