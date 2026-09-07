@@ -9,9 +9,12 @@ import time
 
 
 def command(kubeconfig, *args):
-    result = subprocess.run(["kubectl", "--kubeconfig", str(kubeconfig), *args], capture_output=True, text=True, timeout=30, check=False)
+    try:
+        result = subprocess.run(["kubectl", "--kubeconfig", str(kubeconfig), *args], capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        raise RuntimeError("Kubernetes observation did not complete") from None
     if result.returncode:
-        raise RuntimeError(result.stderr[-2000:])
+        raise RuntimeError("Kubernetes observation failed")
     return result.stdout
 
 
@@ -151,20 +154,21 @@ def collect(args):
             name = node["metadata"]["name"]
             try:
                 raw = command(args.kubeconfig, "get", "--raw", f"/api/v1/nodes/{name}/proxy/stats/summary")
+                observed_usage = container_usage(json.loads(raw), args.namespace)
                 (directory / (name + ".summary.json")).write_text(raw)
-                usage += container_usage(json.loads(raw), args.namespace)
-            except (RuntimeError, ValueError) as error:
-                errors.append({"source": name + "/stats/summary", "error": str(error)})
+                usage += observed_usage
+            except (RuntimeError, ValueError):
+                errors.append({"source": name + "/stats/summary", "error": "node statistics unavailable or invalid"})
         try:
             (directory / "apiserver.prom").write_text(command(args.kubeconfig, "get", "--raw", "/metrics"))
-        except RuntimeError as error:
-            errors.append({"source": "apiserver/metrics", "error": str(error)})
+        except RuntimeError:
+            errors.append({"source": "apiserver/metrics", "error": "API server metrics unavailable"})
         for metric_path in args.metrics_path:
             try:
                 raw = command(args.kubeconfig, "get", "--raw", metric_path)
                 (directory / ("controller-" + str(args.metrics_path.index(metric_path)) + ".prom")).write_text(raw)
-            except RuntimeError as error:
-                errors.append({"source": metric_path, "error": str(error)})
+            except RuntimeError:
+                errors.append({"source": metric_path, "error": "controller metrics unavailable"})
         runtime = []
         for target in targets:
             try:

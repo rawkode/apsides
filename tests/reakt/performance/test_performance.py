@@ -65,6 +65,37 @@ class PreparationTests(unittest.TestCase):
 
 
 class MeasurementTests(unittest.TestCase):
+    def test_command_failures_never_expose_process_output(self):
+        failures = [OSError("PRIVATE-SENTINEL"),
+                    collector.subprocess.TimeoutExpired("PRIVATE-SENTINEL", 30, output="PRIVATE-SENTINEL")]
+        for failure in failures:
+            with patch.object(collector.subprocess, "run", side_effect=failure):
+                with self.assertRaises(RuntimeError) as observed:
+                    collector.command(Path("config"), "get", "nodes")
+            self.assertNotIn("PRIVATE-SENTINEL", str(observed.exception))
+        with patch.object(collector.subprocess, "run", return_value=SimpleNamespace(returncode=1, stderr="PRIVATE-SENTINEL")):
+            with self.assertRaises(RuntimeError) as observed:
+                collector.command(Path("config"), "get", "nodes")
+        self.assertNotIn("PRIVATE-SENTINEL", str(observed.exception))
+
+    def test_all_metric_failure_sources_are_redacted(self):
+        def command(kubeconfig, *args):
+            if args == ("get", "nodes", "-o", "json"):
+                return '{"items": [{"metadata": {"name": "node"}}]}'
+            if args[-1].endswith("/stats/summary"):
+                return "PRIVATE-SENTINEL"
+            raise RuntimeError("PRIVATE-SENTINEL")
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(output=Path(directory) / "out", kubeconfig=None, samples=2, interval=0.1,
+                                   namespace=["default"], metrics_path=["/metrics"], runtime_status=[], label="test")
+            with patch.object(collector, "command", side_effect=command), patch.object(collector.time, "sleep"):
+                collector.collect(args)
+            report = json.loads((args.output / "summary.json").read_text())
+            self.assertEqual(len(report["errors"]), 6)
+            self.assertFalse(report["cpu"]["completePopulation"])
+            self.assertTrue(all("PRIVATE-SENTINEL" not in path.read_text()
+                                for path in args.output.rglob("*") if path.is_file()))
+
     def row(self):
         return {"namespace": "work", "pod": "controller", "podUid": "uid", "container": "envoy",
                 "containerStartTime": "2026-09-05T00:00:00Z", "cpuCoreNanoSeconds": 100}
