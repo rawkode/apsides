@@ -53,6 +53,12 @@ def cpu_delta(first, last, duration):
 
 RUNTIME_COUNTERS = ("triggerToCycleMicrosCount", "triggerToCycleMicrosSum", "triggerToCycleMicrosMax")
 RUNTIME_GAUGES = ("applyCacheEntries", "applyCacheSerializedBytes", "pendingCoalescedTriggers")
+RUNTIME_HEALTH_COUNTS = ("blockedTargets", "reconciliations", "errors")
+RUNTIME_HEALTH_REASONS = frozenset({
+    "activation-unavailable", "drain-publication-failed", "authority-verification-failed",
+    "inventory-unavailable", "rollout-key-unavailable", "reconciliation-authority-failed",
+    "inventory-publication-failed", "watch-recovery", "termination-requested", "activation-inactive",
+})
 IDENTITY = ("domain", "buildDigest", "generation", "podUid", "containerId", "restartCount")
 
 
@@ -101,8 +107,18 @@ def runtime_sample(kubeconfig, target):
             or values["triggerToCycleMicrosMax"] > values["triggerToCycleMicrosSum"]
             or (values["triggerToCycleMicrosCount"] == 0 and values["triggerToCycleMicrosSum"] != 0)):
         raise ValueError("runtime counters are invalid")
-    # Deliberately exclude conditions, reason codes, cache contents, and diagnostic messages.
-    return {**target, **before, **{k: status[k] for k in ["buildDigest", "generation"]}, **values}
+    health = {key: status.get(key) for key in RUNTIME_HEALTH_COUNTS}
+    if (status.get("phase") not in ("starting", "ready", "degraded", "draining", "inactive")
+            or status.get("cache") not in ("pending", "synchronized")
+            or any(type(v) is not int or not 0 <= v <= 2**64 - 1 for v in health.values())):
+        raise ValueError("runtime health projection is invalid")
+    reason = status.get("lastReasonCode")
+    health["healthReason"] = (None if reason is None else
+                              reason if isinstance(reason, str) and reason in RUNTIME_HEALTH_REASONS else "other")
+    # Only closed enums and bounded counters; never persist arbitrary reason
+    # codes, conditions, resource contents, or diagnostic messages.
+    return {**target, **before, **{k: status[k] for k in ["buildDigest", "generation", "phase", "cache"]},
+            **values, **health}
 
 
 def runtime_report(samples, targets):

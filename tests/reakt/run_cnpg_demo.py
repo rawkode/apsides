@@ -36,7 +36,8 @@ PERFORMANCE_FAILURE_REASONS = frozenset({
     'native performance runtime binding differs from successor allocation',
     'native performance Deployment is missing or ambiguous',
     'native performance Deployment identity changed',
-    'native performance Deployment is not ready',
+    'native performance runtime Deployment is not ready',
+    'native performance proxy Deployment is not ready',
     'native performance Pod set is not singular',
     'native performance ServiceAccount UID changed',
     'native performance Pod account changed or Pod is deleting',
@@ -1280,7 +1281,17 @@ class CnpgDemoRunner(base.CeilingRunner):
                 deployment = deployments[0]
                 require(deployment["metadata"]["uid"] == expected_uid and not deployment["metadata"].get("deletionTimestamp")
                         and deployment["spec"]["replicas"] == 1, "native performance Deployment identity changed")
-            require(deployment.get("status", {}).get("readyReplicas") == 1, "native performance Deployment is not ready")
+            if deployment.get("status", {}).get("readyReplicas") != 1:
+                readiness = {"desiredReplicas": deployment["spec"]["replicas"],
+                             "readyReplicas": deployment.get("status", {}).get("readyReplicas"),
+                             "generation": deployment["metadata"].get("generation"),
+                             "observedGeneration": deployment.get("status", {}).get("observedGeneration")}
+                self.checks.append({"check": "native-performance-deployment-readiness", "role": role, "passed": False,
+                                    **{key: value if type(value) is int and 0 <= value <= 2**63 - 1 else None
+                                       for key, value in readiness.items()}})
+                reason = ("native performance runtime Deployment is not ready" if role == "runtime"
+                          else "native performance proxy Deployment is not ready")
+                require(False, reason)
             replica_uids = {x["metadata"]["uid"] for x in objects["replicasets"] if any(
                 o.get("controller") is True and o.get("kind") == "Deployment" and o.get("uid") == expected_uid
                 for o in x["metadata"].get("ownerReferences", []))}

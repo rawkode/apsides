@@ -82,7 +82,7 @@ class DemoChecks(unittest.TestCase):
         self.assertNotIn('PRIVATE',str(observed.exception));connection.close.assert_called_once()
 
     def native_performance_fixture(self):
-        runner=object.__new__(demo.CnpgDemoRunner);runner.control='control';runner.workload='default';runner.domain='domain'
+        runner=object.__new__(demo.CnpgDemoRunner);runner.control='control';runner.workload='default';runner.domain='domain';runner.checks=[]
         runner.performance_successor={'transition':'t','registryUid':'registry','generation':'g','serviceAccountName':'runtime'}
         runner.pair={'candidates':{'successorReleaseDigest':self.digest()}}
         runner.successor_manifest={'image':{'reference':'controller@'+self.digest()}}
@@ -156,7 +156,20 @@ class DemoChecks(unittest.TestCase):
             reason='Deployment identity changed' if replaced else 'Deployment is not ready'
             with self.assertRaisesRegex(demo.shared.QualificationError,reason):runner.performance_bindings(wait_ready=replaced)
             self.assertFalse(any(call.args[0]=='rollout' for call in runner.k.call_args_list))
-        self.assertIn('native performance Deployment is not ready',demo.PERFORMANCE_FAILURE_REASONS)
+        self.assertIn('native performance runtime Deployment is not ready',demo.PERFORMANCE_FAILURE_REASONS)
+        self.assertIn('native performance proxy Deployment is not ready',demo.PERFORMANCE_FAILURE_REASONS)
+
+    def test_readiness_failure_identifies_role_without_retaining_dynamic_metadata(self):
+        for index,role in [(0,'runtime'),(1,'proxy')]:
+            runner,_,objects=self.native_performance_fixture()
+            deployment=objects['deployments'][index];deployment['status']['readyReplicas']=0
+            deployment['metadata']['generation']='PRIVATE_VALUE';deployment['status']['observedGeneration']=3
+            runner.failure_reasons=demo.PERFORMANCE_FAILURE_REASONS
+            with self.assertRaises(demo.shared.QualificationError) as observed:runner.performance_bindings()
+            self.assertEqual(demo.base.failure_reason(runner,observed.exception),f'native performance {role} Deployment is not ready')
+            self.assertEqual(runner.checks,[{'check':'native-performance-deployment-readiness','role':role,'passed':False,
+                'desiredReplicas':1,'readyReplicas':0,'generation':None,'observedGeneration':3}])
+            self.assertNotIn('PRIVATE',json.dumps(runner.checks));self.assertEqual(runner.k.call_count,6)
 
     def test_native_performance_rejects_wrong_allocation_account_image_or_container(self):
         for mutate in [lambda s,o:s['inputs']['allocation'].update(artifactDigest=self.digest('b')),
