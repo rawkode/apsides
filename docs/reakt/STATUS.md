@@ -174,8 +174,20 @@ IR, fixture IR or the fixture overlay. Compiler source inputs do change, so a
 fresh candidate is required; the older signed candidate is not rewritten.
 The reactor harness also accepts local CRD manifests bound to the exact imported
 schema digest, installs them through driver SSA, and packages their identities.
-The pinned CNPG schema passes offline preflight. The corrected fixture still
-needs native build and live reactor execution.
+The pinned CNPG schema passes offline preflight. The corrected native fixture at
+`0ee1a75` then passed all 43 required cases, all 46 fixture cases (including three
+reaction-removal controls), and all three reactor checks on an isolated kind
+cluster. Its cluster and credentials were removed; the two pre-existing clusters
+remained. Independent review verified the recorded inputs and results.
+
+A fresh production build from the same source was assembled unsigned at
+`work/cnpg-production-candidate-0ee1a75-1`. The normal merger at
+`work/cnpg-reactor-merged-0ee1a75` and dedicated reactor-contract consumer accepted
+all 43 cases and three reactor checks. Thirteen production checks remain missing;
+`releaseVerified` is false. The older successor's four production receipts cannot
+be carried over as measurements of this new binary/compiler payload. The fixture
+run establishes primitive reactor behavior, not CNPG operator or application
+readiness, signature trust, or full production acceptance.
 
 Automated suites cover strict schema and canonical replay, claim and metadata
 store immutability, registry concurrency, capacity accounting, review privacy,

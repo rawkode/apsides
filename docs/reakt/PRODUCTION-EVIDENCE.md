@@ -27,6 +27,30 @@ self-reference. The enclosing provenance signature authenticates the receipt.
 These are signer-attested measurements. An authenticated runner source file and
 assertions alone do not establish that the runner executed.
 
+## CNPG reactor qualification
+
+At source revision `0ee1a75`, the corrected CNPG fixture passed 43 required cases,
+46 fixture cases and the three reactor checks. Results and the closed evidence
+package are in `work/cnpg-reactor-0ee1a75-results`. The runner used
+`work/cnpg-reactor-native-0ee1a75-1` and its `.source` fixture contract, the pinned
+workload archive, and `--crd-manifest work/cnpg-demo-inputs/clusters-v1.30.0.yaml`.
+That CRD's bytes match the imported type's schema digest. No CNPG operator was
+installed; synthetic inputs provide the required Secret keys.
+
+The isolated cluster was deleted and its driver/runtime credentials removed.
+Independent review checked exact case sets, input and image hashes, CRD identity,
+runner source and packaged diagnostics. This establishes fixture reactor
+behavior; the Secret scan covers the controller log and synthetic canaries.
+
+The fresh unsigned production candidate is
+`work/cnpg-production-candidate-0ee1a75-1`. Its normal merge summary at
+`work/cnpg-reactor-merged-0ee1a75/summary.json` reports zero missing cases and
+thirteen missing checks, with `releaseVerified: false`. The dedicated
+`reactorEvidenceLive` consumer also passed against that candidate. The previous
+CNPG successor's production-check receipts bind a different binary/compiler
+payload and are not reused here. Full coverage and approved signing are still
+required before release verification.
+
 ## Combining measured evidence
 
 `reakt merge-evidence` combines explicit receipts against one structurally valid
