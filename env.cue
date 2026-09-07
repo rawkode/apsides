@@ -16,6 +16,8 @@ tasks: {
 	cnpgCleanupTest: {command: "python3", args: ["tests/reakt/test_cnpg_cleanup.py"]}
 	cnpgCleanupEvidenceTest: {command: "python3", args: ["tests/reakt/test_cnpg_cleanup_evidence.py"]}
 	uncertainWriterTest: {command: "python3", args: ["tests/reakt/test_uncertain_writer.py"]}
+	apiGapTest: {command: "python3", args: ["tests/reakt/test_api_gap.py"]}
+	apiGapProbesTest: {command: "python3", args: ["tests/reakt/test_cnpg_credential_probes.py"]}
 	crdReactorTest: {command: "python3", args: ["tests/reakt/test_cluster_crds.py"]}
 	cnpgCleanupTypes: [
 		{
