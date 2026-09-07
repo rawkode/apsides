@@ -270,11 +270,13 @@ recovery, or production restore authority.
 
 - Complete release qualification for the corrected native candidate. The runtime
   watches only observed inputs, matching compiled permissions; managed inputs
-  retain periodic reconciliation. `work/cnpg-native-samples-9b5097a` passed the
+  retain periodic reconciliation. `work/cnpg-input-reactions-89ceec4` passed the
   local signed-pair deployment, permission-changing upgrade, Secret consumption,
   ConfigMap-triggered rollout and idle/active sampling. All 26 runtime health
-  samples were ready and synchronized with zero errors. This does not qualify
-  Secret update reactions, equal-value suppression or the full performance gate.
+  samples were ready and synchronized with zero errors. Additional checks passed
+  for 30-second equal-value suppression and a synthetic Secret-key update with
+  restoration of the original data and workload revision. Database credential
+  rotation and the full performance gate remain unqualified.
   Previous release receipts remain bound to the previous binary.
 - Produce one signed production release containing every required reactor case
   and all sixteen authenticated release checks.

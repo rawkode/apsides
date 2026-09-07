@@ -6,14 +6,18 @@ input-change stimulation. It has **not completed a live comparative benchmark**.
 No speed, memory, scalability, or complete §26 claim follows from its unit tests.
 
 The corrected native CNPG candidate passed a local run in
-`work/cnpg-native-samples-9b5097a`, using producer commit `9b5097a` and release
+`work/cnpg-input-reactions-89ceec4`, using producer commit `89ceec4` and release
 digest `sha256:ae8f43a0edacd6cb40962137ac2a7243c2ec23b4e79c274706c7683c7ebef5e3`.
 It completed initial deployment and a permission-changing upgrade, then collected
 13 idle and 13 active samples. Every runtime health sample was ready and
 synchronized with zero errors; the runtime and proxy identities stayed fixed.
 Changing the observed ConfigMap produced a new workload Pod and ReplicaSet,
-and the HTTP result changed from two rows to one. Secret consumption was tested;
-Secret updates and equal-value suppression were not exercised in this run.
+and the HTTP result changed from two rows to one. After sampling, an actual
+metadata update with unchanged ConfigMap data produced no rollout for 30 seconds.
+Adding an unused synthetic Secret key caused another rollout; removing that key
+restored the original Secret data and workload revision with working database
+access. Secret values stayed in memory. This tests data-change reactions and
+restoration, not database credential rotation.
 The disposable cluster and credentials were removed.
 
 These are single-domain raw measurements, not a comparative performance result.
