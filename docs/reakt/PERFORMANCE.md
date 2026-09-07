@@ -136,6 +136,14 @@ Each window also performs four controller-identity checks of four Kubernetes GET
 each. API request rates include these checks and collection traffic; the native
 comparison must account for equivalent observer overhead.
 
+The first sampled run at `1c9563c` passed in
+`work/cnpg-baseline-samples-1c9563c`: thirteen samples per window, about 60 seconds
+per window, and no collector errors. Idle CPU population accounting was complete;
+active accounting remained incomplete because the application Pod was replaced.
+The run also passed the reaction checks and restored the original cluster and
+container inventory with credentials removed. These are baseline-only samples;
+no native performance comparison or complete §26 result is established.
+
 Reloader publishes an unkeyed Secret hash in its runtime rollout annotation;
 Apsides uses an aggregate keyed revision. Do not retain that annotation, live
 Deployment templates, Secret values or Secret hashes in benchmark artifacts.
