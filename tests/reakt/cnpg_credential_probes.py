@@ -1,7 +1,7 @@
 """Bounded credential probes; callers own credentials, live objects and cluster cleanup.
 
 No receipt is produced. A successful HTTP suite leaves Secret revision observation
-outstanding. Dry-run objects must be exact live objects supplied by the runner.
+outstanding. Creates and SSA use signed desired objects; updates use live readbacks.
 """
 import copy
 import http.client
@@ -25,12 +25,47 @@ def _path(group, namespace, resource, name=None):
     return f"{prefix}/namespaces/{namespace}/{resource}" + (f"/{name}" if name else "")
 
 
+def desired_objects(plan):
+    """Accept the four concrete, compiler-validated CNPG demo resource shapes."""
+    supported = {("v1", "ConfigMap"): "configmaps", ("v1", "Service"): "services",
+                 ("apps/v1", "Deployment"): "deployments", ("postgresql.cnpg.io/v1", "Cluster"): "clusters"}
+    objects = {}
+    for resource in plan["ir"]["resources"]:
+        version, kind = resource["apiVersion"], resource["kind"]
+        plural = supported.get((version, kind))
+        body = resource.get("desired")
+        if plural is None or not isinstance(body, dict):
+            raise ValueError("unsupported concrete desired resource")
+        if (body.get("apiVersion") != version or body.get("kind") != kind
+                or body.get("metadata") != {"name": resource["name"], "namespace": resource["namespace"]}
+                or set(body) != {"apiVersion", "kind", "metadata", "data" if kind == "ConfigMap" else "spec"}):
+            raise ValueError("desired resource identity or shape is unsupported")
+        group = version.split("/")[0] if "/" in version else ""
+        key = (group, plural, resource["namespace"], resource["name"])
+        _path(group, resource["namespace"], plural, resource["name"])
+        if key in objects:
+            raise ValueError("duplicate desired resource identity")
+        value = body.get("data") if kind == "ConfigMap" else body.get("spec")
+        if not isinstance(value, dict):
+            raise ValueError("desired object must contain concrete fields")
+        if kind == "ConfigMap" and any(not isinstance(v, str) for v in value.values()):
+            raise ValueError("ConfigMap data must be concrete strings")
+        if kind == "Cluster" and (resource.get("apiResource", {}).get("plural") != plural
+                or resource.get("apiResource", {}).get("scope") != "Namespaced"):
+            raise ValueError("Cluster descriptor differs from supported CRD")
+        # JSON encoding rejects non-JSON values; the compiler and API own schema validation.
+        json.dumps(body, allow_nan=False)
+        objects[key] = copy.deepcopy(body)
+    return objects
+
+
 def plan_probes(plan, live_objects, probe_name="aps-credential-probe"):
     """Return requests and outstanding gaps; never interpret this as acceptance.
 
     live_objects keys are (group, resource, namespace, name). They are used only
     for dry-run requests and must not be serialized into evidence.
     """
+    desired = desired_objects(plan)
     declared = set(plan["enforcementGaps"])
     unsupported = declared - GAPS
     probes = []
@@ -76,6 +111,10 @@ def plan_probes(plan, live_objects, probe_name="aps-credential-probe"):
                     if current is None:
                         unsupported.add(gap)
                         continue
+                    metadata = current.get("metadata", {})
+                    if (metadata.get("name") != name or metadata.get("namespace") != namespace
+                            or not isinstance(metadata.get("resourceVersion"), str) or not metadata["resourceVersion"]):
+                        raise ValueError("update readback requires exact identity and resourceVersion")
                     body = copy.deepcopy(current)
                     body.pop("status", None)
                     body["metadata"].setdefault("annotations", {})["qualification.apsides.dev/credential-probe"] = "true"
@@ -85,7 +124,7 @@ def plan_probes(plan, live_objects, probe_name="aps-credential-probe"):
                 covered.add(gap)
         if verb == "create":
             gap = "rbac-create-not-name-restricted"
-            candidates = [obj for (g, r, ns, _), obj in live_objects.items()
+            candidates = [obj for (g, r, ns, _), obj in desired.items()
                           if (g, r, ns) == (group, resource, namespace)]
             if not candidates:
                 unsupported.add(gap)
@@ -97,21 +136,8 @@ def plan_probes(plan, live_objects, probe_name="aps-credential-probe"):
             add(f"arbitrary-create-{len(probes)}", "POST", collection, [201], body, {"dryRun": "All"})
             covered.add(gap)
 
-    for resource in plan["ir"].get("resources", []):
-        group = resource["apiVersion"].split("/")[0] if "/" in resource["apiVersion"] else ""
-        mapping = {"ConfigMap": "configmaps", "Service": "services", "Deployment": "deployments"}
-        plural = resource.get("apiResource", {}).get("plural") or mapping.get(resource["kind"])
-        key = (group, plural, resource["namespace"], resource["name"])
-        if plural is None:
-            raise ValueError("unsupported managed SSA resource")
-        current = live_objects.get(key)
-        path = _path(group, resource["namespace"], plural, resource["name"])
-        if current is None:
-            unsupported_operations.append("ssa:" + path)
-            continue
-        body = copy.deepcopy(current)
-        body.pop("status", None)
-        body["metadata"] = {"name": key[3], "namespace": key[2]}
+    for (group, plural, namespace, name), body in desired.items():
+        path = _path(group, namespace, plural, name)
         add(f"intended-ssa-{len(probes)}", "PATCH", path, [200], body,
             {"dryRun": "All", "fieldManager": "aps-credential-qualification"}, "application/apply-patch+yaml")
 

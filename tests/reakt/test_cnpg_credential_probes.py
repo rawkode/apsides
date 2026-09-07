@@ -21,7 +21,7 @@ class CredentialProbes(unittest.TestCase):
         objects = {("", "configmaps", "default", "api-config"): {
             "apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "api-config", "namespace": "default", "resourceVersion": "42"},
             "data": {"private": "CANARY-NEVER-REPORT"}}}
-        plan["ir"]["resources"] = [{"apiVersion": "v1", "kind": "ConfigMap", "namespace": "default", "name": "api-config"}]
+        plan["ir"]["resources"] = [{"apiVersion": "v1", "kind": "ConfigMap", "namespace": "default", "name": "api-config", "desired": {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "api-config", "namespace": "default"}, "data": {"public": "declared"}}}]
         return plan, objects
 
     def test_scoped_reads_and_disclosed_gaps_are_real_requests(self):
@@ -41,7 +41,7 @@ class CredentialProbes(unittest.TestCase):
     def test_missing_objects_unknown_gaps_and_versions_fail_closed(self):
         plan, _ = self.fixture()
         spec = probes.plan_probes(plan, {})
-        self.assertIn('rbac-create-not-name-restricted', spec['unsupportedGaps'])
+        self.assertNotIn('rbac-create-not-name-restricted', spec['unsupportedGaps'])
         self.assertIn('rbac-update-not-field-restricted', spec['unsupportedGaps'])
         plan['enforcementGaps'].append('unknown-gap')
         self.assertIn('unknown-gap', probes.plan_probes(plan, {})['unsupportedGaps'])
@@ -81,15 +81,53 @@ class CredentialProbes(unittest.TestCase):
         self.assertEqual(broad["contentType"], "application/merge-patch+json")
         self.assertEqual(ssa["query"]["dryRun"], "All")
         self.assertEqual(ssa["path"], "/api/v1/namespaces/default/configmaps/api-config")
-        self.assertEqual(probes.plan_probes(plan, {})["unsupportedOperations"],
-                         ["ssa:/api/v1/namespaces/default/configmaps/api-config"])
-        self.assertTrue(probes.plan_probes(plan, {})["unsupportedOperations"])
+        self.assertEqual(probes.plan_probes(plan, {})["unsupportedOperations"], [])
         plan["requestPlan"][0]["capability"]["verb"] = "delete"
         with self.assertRaises(ValueError):
             probes.plan_probes(plan, objects)
         identity = {"releaseDigest": "wrong", "generation": "g1", "serviceAccountUid": "uid1"}
         with self.assertRaises(ValueError):
             probes.execute_probes(spec, lambda *args: 200, identity)
+
+    def test_service_create_and_ssa_use_signed_desired_without_allocations(self):
+        plan, objects = self.fixture()
+        desired = {"apiVersion": "v1", "kind": "Service", "metadata": {"name": "database-api", "namespace": "default"},
+                   "spec": {"selector": {"app": "database-api"}, "ports": [{"port": 80, "targetPort": 3000}]}}
+        plan["ir"]["resources"].append({"apiVersion": "v1", "kind": "Service", "name": "database-api", "namespace": "default", "desired": desired})
+        cap = {"apiGroup": "", "resource": "services", "namespace": "default", "verb": "create", "names": [], "subresource": None}
+        plan["capabilities"].append(cap)
+        plan["requestPlan"].append({"capability": cap})
+        live = copy.deepcopy(desired)
+        live["spec"].update(clusterIP="10.1.1.1", clusterIPs=["10.1.1.1"])
+        live["metadata"].update(uid="uid", resourceVersion="123")
+        live["status"] = {}
+        objects[("", "services", "default", "database-api")] = live
+        original = copy.deepcopy(plan)
+        spec = probes.plan_probes(plan, objects)
+        create = next(r for r in spec["requests"] if r["method"] == "POST" and r["path"].endswith("/services"))
+        self.assertEqual(create["body"]["spec"], desired["spec"])
+        self.assertEqual(create["body"]["metadata"], {"name": "aps-credential-probe", "namespace": "default"})
+        self.assertNotIn("status", create["body"])
+        ssa = next(r for r in spec["requests"] if r["id"].startswith("intended-ssa") and r["path"].endswith("services/database-api"))
+        self.assertEqual(ssa["body"], desired)
+        self.assertEqual(plan, original)
+
+    def test_unsupported_desired_and_stale_identity_readbacks_reject(self):
+        plan, objects = self.fixture()
+        for mutation in ["desired", "identity", "data"]:
+            changed = copy.deepcopy(plan)
+            desired = changed["ir"]["resources"][0]["desired"]
+            if mutation == "desired":
+                del changed["ir"]["resources"][0]["desired"]
+            elif mutation == "identity":
+                desired["metadata"]["name"] = "foreign"
+            else:
+                desired["data"]["public"] = {"expression": "unsupported"}
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                probes.plan_probes(changed, objects)
+        del objects[("", "configmaps", "default", "api-config")]["metadata"]["resourceVersion"]
+        with self.assertRaises(ValueError):
+            probes.plan_probes(plan, objects)
 
     def test_paths_and_tls_cannot_escape_scope(self):
         plan, objects = self.fixture()
