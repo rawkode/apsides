@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
+import { fixtureInputData } from "../../reakt/src/model.ts";
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type Source = { file: string; line: number; column: number };
-type Resource = { force?: boolean; id: string; kind: string; source: Source; desired: Record<string, Json> };
-type Input = { id: string; kind: "ConfigMap" | "Secret"; mode: "managed" | "observed"; managedResourceId?: string; sensitive: boolean; source: Source };
+type Resource = { force?: boolean; id: string; kind: string; namespace: string; source: Source; desired: Record<string, Json> };
+type Input = { id: string; name: string; namespace: string; kind: "ConfigMap" | "Secret"; mode: "managed" | "observed"; managedResourceId?: string; sensitive: boolean; source: Source };
 type Reaction = { id: string; op: "rollout"; inputs: string[]; target: string; source: Source };
 export type ProductionIr = {
   schemaVersion: string;
@@ -96,12 +97,10 @@ function completeFixtures(ir: ProductionIr, supplied: unknown, workloadImage: st
     const input = ir.inputs.find(candidate => candidate.id === item.inputId);
     if (input?.mode !== "observed") throw new Error(`fixture ${item.inputId} does not reference an observed input`);
   }
-  const inputs = ir.inputs.filter(input => input.mode === "observed").map(input => inputMap.get(input.id) ?? {
-    inputId: input.id,
-    source: input.source,
-    synthetic: true as const,
-    state: "present" as const,
-    data: { value: input.kind === "Secret" ? `synthetic-secret-${input.id}` : `synthetic-config-${input.id}` },
+  const inputs = ir.inputs.filter(input => input.mode === "observed").map(input => {
+    const explicit = inputMap.get(input.id);
+    const data = fixtureInputData(input, ir.resources, explicit);
+    return explicit ?? { inputId: input.id, source: input.source, synthetic: true as const, state: "present" as const, data };
   });
   const workloadMap = new Map(suppliedWorkloads.map(item => [item.targetResourceId, item]));
   for (const item of suppliedWorkloads) if (resourceMap.get(item.targetResourceId)?.kind !== "Deployment") throw new Error(`workload fixture ${item.targetResourceId} does not reference a Deployment`);

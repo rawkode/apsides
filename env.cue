@@ -15,6 +15,7 @@ tasks: {
 	cnpgDemoTest: {command: "python3", args: ["tests/reakt/test_cnpg_demo.py"]}
 	cnpgCleanupTest: {command: "python3", args: ["tests/reakt/test_cnpg_cleanup.py"]}
 	cnpgCleanupEvidenceTest: {command: "python3", args: ["tests/reakt/test_cnpg_cleanup_evidence.py"]}
+	crdReactorTest: {command: "python3", args: ["tests/reakt/test_cluster_crds.py"]}
 	cnpgCleanupTypes: [
 		{
 			dependsOn: [install]

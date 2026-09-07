@@ -85,6 +85,26 @@ try {
   assert.ok(!managedCoverage.cases.some((entry: {scenario:string}) => entry.scenario === "projected-change"), "managed data drift must not be represented as an observed input change");
   assert.deepEqual(managedCoverage.cases.find((entry: {scenario:string}) => entry.scenario === "managed-drift-repair").applicability, {inputModes:["managed"],inputIds:["managed-config"],managedResourceIds:["config"]});
   assert.deepEqual(observedCoverage.cases.find((entry: {scenario:string}) => entry.scenario === "projected-change").applicability, {inputModes:["observed"],inputIds:["secret"],managedResourceIds:[]});
+  const consumesSecret = structuredClone(production);
+  const consumer = consumesSecret.resources.find((resource: {id:string}) => resource.id === "api");
+  consumer.desired.spec.template.spec.containers = [
+    {name:"api",image:"example.invalid/api",env:[{name:"URI",valueFrom:{secretKeyRef:{name:"secret",key:"uri"}}}]},
+    {name:"sidecar",image:"example.invalid/sidecar",env:[{name:"USER",valueFrom:{secretKeyRef:{name:"secret",key:"username"}}}]},
+  ];
+  const beforeFixtures = JSON.stringify(consumesSecret);
+  const consumed = buildFixtureOutputs(consumesSecret, undefined);
+  assert.deepEqual(Object.keys(consumed.fixtures.inputs[0]?.data ?? {}).sort(), ["uri","username","value"]);
+  assert.equal(consumed.fixtures.inputs[0]?.data?.uri, "synthetic-secret-secret");
+  assert.equal(JSON.stringify(consumesSecret), beforeFixtures, "fixture seeds do not mutate production IR");
+  const explicitFixture = {...consumed.fixtures.inputs[0], data:{value:"synthetic"}};
+  assert.throws(() => buildFixtureOutputs(consumesSecret, {inputs:[explicitFixture]}), /missing required Secret key/);
+  const complete = buildFixtureOutputs(consumesSecret, {inputs:[{...explicitFixture,data:{uri:"synthetic-uri",username:"synthetic-user"}}]});
+  assert.equal(complete.fixtures.inputs[0]?.data?.uri, "synthetic-uri");
+  assert.deepEqual(complete.fixtureIr, consumed.fixtureIr, "seed values do not alter the fixture IR");
+  assert.deepEqual(complete.overlay, consumed.overlay, "seed values do not alter the overlay");
+  assert.notDeepEqual(complete.coverage, consumed.coverage, "coverage binds the exact fixture seed values");
+  consumer.namespace = "other";
+  assert.deepEqual(Object.keys(buildFixtureOutputs(consumesSecret, undefined).fixtures.inputs[0]?.data ?? {}), ["value"]);
   const forced = structuredClone(production);
   forced.resources.find((resource: {id:string}) => resource.id === "api").force = true;
   const forcedCoverage = buildFixtureOutputs(forced, undefined).coverage;

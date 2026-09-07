@@ -40,6 +40,7 @@ def stage_release_evidence(output, receipt, coverage, result):
     coverage = copy.deepcopy(coverage)
     allowed = {"tested-artifact-manifest.json", "cluster-transcript.json",
                "semantic-results.json", "canary-scan.json"}
+    allowed |= {"fixture-crds.json", *[f"fixture-crd-{index}.yaml" for index in range(16)]}
     required = {receipt["artifactManifestFile"]}
     for catalogue in ["cases", "fixtureCases", "checks"]:
         for record in receipt[catalogue].values():
@@ -127,8 +128,62 @@ def inspect_workload_archive(path):
     return inspect_docker_archive(path, WORKLOAD_TAG)
 
 
+def parse_crd_yaml(raw, root):
+    # Reuse the compiler's locked YAML parser, including duplicate-key rejection.
+    script = """import { parseAllDocuments } from 'yaml';
+import { readFileSync } from 'node:fs';
+const documents = parseAllDocuments(readFileSync(0, 'utf8'), { uniqueKeys: true });
+if (documents.some(document => document.errors.length)) process.exit(1);
+process.stdout.write(JSON.stringify(documents.map(document => document.toJS({ maxAliasCount: 0 }))));"""
+    parsed = subprocess.run(["node", "--input-type=module", "-e", script], input=raw,
+                            capture_output=True, cwd=root / "packages/compiler", timeout=30)
+    if parsed.returncode or len(parsed.stdout) > 4 * 1024 * 1024:
+        raise RuntimeError("fixture CRD YAML is invalid or exceeds its parsing bound")
+    return json.loads(parsed.stdout)
+
+
+def validate_crd_documents(ir, manifests):
+    expected = {}
+    for resource in ir["resources"]:
+        mapping = resource.get("apiResource", {})
+        schema = mapping.get("schemaSha256")
+        if schema is None:
+            continue
+        group, version = resource["apiVersion"].split("/", 1)
+        identity = (group, resource["kind"], mapping["plural"])
+        entry = expected.setdefault(identity, {"digest": schema, "versions": set()})
+        if mapping["scope"] != "Namespaced" or entry["digest"] != schema:
+            raise RuntimeError("fixture CRD declaration has inconsistent scope or schema")
+        entry["versions"].add(version)
+    seen = set()
+    for source_digest, documents in manifests:
+        if not documents:
+            raise RuntimeError("fixture CRD manifest is empty")
+        for document in documents:
+            if (not isinstance(document, dict) or document.get("apiVersion") != "apiextensions.k8s.io/v1"
+                    or document.get("kind") != "CustomResourceDefinition"):
+                raise RuntimeError("fixture CRD manifest contains a non-CRD resource")
+            spec = document.get("spec", {})
+            names = spec.get("names", {})
+            identity = (spec.get("group"), names.get("kind"), names.get("plural"))
+            declaration = expected.get(identity)
+            conversion = spec.get("conversion", {})
+            versions = spec.get("versions", [])
+            if (declaration is None or identity in seen or declaration["digest"] != source_digest
+                    or spec.get("scope") != "Namespaced"
+                    or document.get("metadata", {}).get("name") != f"{identity[2]}.{identity[0]}"
+                    or document.get("metadata", {}).get("namespace") is not None
+                    or conversion.get("strategy", "None") != "None" or "webhook" in conversion
+                    or not isinstance(versions, list)
+                    or not declaration["versions"] <= {item.get("name") for item in versions if item.get("served") is True}):
+                raise RuntimeError("fixture CRD differs from the declared schema, identity, scope or version")
+            seen.add(identity)
+    if seen != set(expected):
+        raise RuntimeError("fixture custom resources require their exact local CRD manifests")
+
+
 class ReactorRunner:
-    def __init__(self, artifact, fixture_contract, controller_archive, fixture_archive, output):
+    def __init__(self, artifact, fixture_contract, controller_archive, fixture_archive, output, crd_manifests=()):
         self.root = Path(__file__).resolve().parents[2]
         self.artifact = artifact.resolve()
         self.fixture_contract = fixture_contract.resolve()
@@ -155,6 +210,9 @@ class ReactorRunner:
         self.fixture_results = {}
         self.controller_started = False
         self.local_images_verified = False
+        self.crd_manifests = list(crd_manifests)
+        self.crd_snapshots = []
+        self.crd_installations = []
 
     def command(self, argv, data=None, check=True, timeout=180):
         result = subprocess.run(argv, input=None if data is None else json.dumps(data), text=True,
@@ -258,6 +316,34 @@ class ReactorRunner:
         self.controller_archive_digest = file_digest(self.controller_archive)
         self.fixture_image = inspect_workload_archive(self.fixture_archive)
         self.fixture_archive_digest = file_digest(self.fixture_archive)
+
+    def snapshot_crds(self):
+        if len(self.crd_manifests) > 16:
+            raise RuntimeError("too many fixture CRD manifests")
+        for index, path in enumerate(self.crd_manifests):
+            if path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= 4 * 1024 * 1024:
+                raise RuntimeError("fixture CRD manifest is not a bounded regular file")
+            raw = path.read_bytes()
+            if len(raw) > 4 * 1024 * 1024:
+                raise RuntimeError("fixture CRD manifest grew beyond its bound")
+            sha = "sha256:" + hashlib.sha256(raw).hexdigest()
+            documents = parse_crd_yaml(raw, self.root)
+            name = f"fixture-crd-{index}.yaml"
+            self.crd_snapshots.append({"source": path, "file": name, "digest": sha, "documents": documents})
+            (self.output / name).write_bytes(raw)
+        validate_crd_documents(self.ir, [(item["digest"], item["documents"]) for item in self.crd_snapshots])
+
+    def install_crds(self):
+        for snapshot in self.crd_snapshots:
+            for document in snapshot["documents"]:
+                self.k("apply", "--server-side", "--field-manager=aps-fixture-crds", "-f", "-", data=document)
+                name = document["metadata"]["name"]
+                self.k("wait", "--for=condition=Established", "crd/" + name, "--timeout=120s")
+                installed = json.loads(self.k("get", "crd", name, "-o", "json").stdout)
+                self.crd_installations.append({"name": name, "uid": installed["metadata"]["uid"],
+                                               "sourceFile": snapshot["file"], "sourceDigest": snapshot["digest"],
+                                               "group": document["spec"]["group"], "plural": document["spec"]["names"]["plural"],
+                                               "servedVersions": [item["name"] for item in document["spec"]["versions"] if item.get("served") is True]})
 
     def create_cluster(self):
         self.command(["docker", "image", "inspect", NODE_IMAGE])
@@ -1144,6 +1230,13 @@ echo REAKT_INIT_EGRESS_DENIED
                                                                  len(mutation_rows) == len(self.ir["reactions"]) and all(row["status"] == "passed" for row in mutation_rows))],
                                         "evidenceFiles": ["cluster-transcript.json"]},
         }
+        if self.crd_snapshots:
+            for snapshot in self.crd_snapshots:
+                if (file_digest(snapshot["source"]) != snapshot["digest"]
+                        or file_digest(self.output / snapshot["file"]) != snapshot["digest"]):
+                    raise RuntimeError("fixture CRD input changed during measurement")
+            (self.output / "fixture-crds.json").write_bytes(canonical({"installations": self.crd_installations}))
+            checks["offline-reactor-suite"]["evidenceFiles"] += ["fixture-crds.json", *[item["file"] for item in self.crd_snapshots]]
         reactor_evidence = {
             "schemaVersion": "reakt.dev/reactor-evidence/v1",
             "productionIrDigest": getattr(self, "production_ir_digest", None),
@@ -1183,7 +1276,9 @@ echo REAKT_INIT_EGRESS_DENIED
         error = None
         try:
             self.validate_inputs()
+            self.snapshot_crds()
             self.create_cluster()
+            self.install_crds()
             self.install_rbac()
             self.seed_inputs()
             self.runtime_configuration()
@@ -1207,8 +1302,9 @@ def main():
     parser.add_argument("--controller-archive", type=Path, required=True)
     parser.add_argument("--fixture-archive", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--crd-manifest", type=Path, action="append", default=[])
     args = parser.parse_args()
-    ReactorRunner(args.artifact, args.fixture_contract, args.controller_archive, args.fixture_archive, args.output).run()
+    ReactorRunner(args.artifact, args.fixture_contract, args.controller_archive, args.fixture_archive, args.output, args.crd_manifest).run()
 
 
 if __name__ == "__main__":

@@ -681,6 +681,43 @@ export function defineFixtureBundle(options: {
   }) as unknown as FixtureBundle);
 }
 
+/** @internal Shared fixture seed completion for the SDK and source compiler. */
+export function fixtureInputData(
+  input: { readonly id: string; readonly kind: string; readonly name: string; readonly namespace: string },
+  resources: readonly { readonly kind: string; readonly namespace: string; readonly desired: unknown }[],
+  explicit?: { readonly state: string; readonly data?: Readonly<Record<string, string>> },
+): Readonly<Record<string, string>> {
+  const keys = new Set<string>();
+  if (input.kind === "Secret") {
+    for (const resource of resources) {
+      if (resource.kind !== "Deployment" || resource.namespace !== input.namespace) continue;
+      const desired = record(resource.desired, "fixture Deployment");
+      const spec = record(record(record(desired.spec, "fixture Deployment.spec").template, "fixture Deployment.template").spec, "fixture Pod.spec");
+      for (const container of array(spec.containers, "fixture containers")) {
+        const env = record(container, "fixture container").env;
+        for (const entry of env === undefined ? [] : array(env, "fixture env")) {
+          const valueFrom = record(entry, "fixture env entry").valueFrom;
+          if (valueFrom === undefined) continue;
+          const reference = record(record(valueFrom, "fixture valueFrom").secretKeyRef, "fixture secretKeyRef");
+          if (reference.name === input.name) keys.add(text(reference.key, "fixture Secret key"));
+        }
+      }
+    }
+  }
+  if (explicit !== undefined) {
+    if (explicit.state === "present") {
+      for (const key of keys) {
+        if (!Object.hasOwn(explicit.data ?? {}, key) || typeof explicit.data?.[key] !== "string") {
+          throw new Error(`fixture input ${input.id} is missing required Secret key ${key}`);
+        }
+      }
+    }
+    return explicit.data ?? {};
+  }
+  const value = input.kind === "Secret" ? `synthetic-secret-${input.id}` : `synthetic-config-${input.id}`;
+  return freeze(Object.fromEntries(["value", ...keys].sort(compareText).map((key) => [key, value])));
+}
+
 /**
  * Completes the v1 fixture contract from the production IR. Rollout only needs
  * stable synthetic data, so observed ConfigMaps and Secrets have a supported,
@@ -697,13 +734,11 @@ export function generateFixtureBundle(ir: ReaktIR, options: GeneratedFixtureOpti
   uniqueBy(explicitWorkloads, (fixture) => fixture.targetResourceId, "workload fixture target");
   const byInput = new Map(explicitInputs.map((fixture) => [fixture.inputId, fixture]));
   const byWorkload = new Map(explicitWorkloads.map((fixture) => [fixture.targetResourceId, fixture]));
-  const inputs = ir.inputs.filter((input) => input.mode === "observed").map((input) => byInput.get(input.id) ?? freeze({
-    inputId: input.id,
-    source: input.source,
-    synthetic: true as const,
-    state: "present" as const,
-    data: freeze({ value: input.kind === "Secret" ? `synthetic-secret-${input.id}` : `synthetic-config-${input.id}` }),
-  }));
+  const inputs = ir.inputs.filter((input) => input.mode === "observed").map((input) => {
+    const explicit = byInput.get(input.id);
+    const data = fixtureInputData(input, ir.resources, explicit);
+    return explicit ?? freeze({ inputId: input.id, source: input.source, synthetic: true as const, state: "present" as const, data });
+  });
   for (const fixture of explicitInputs) {
     const input = ir.inputs.find((candidate) => candidate.id === fixture.inputId);
     if (input === undefined || input.mode !== "observed") throw new Error(`fixture input is not a declared observed input: ${fixture.inputId}`);

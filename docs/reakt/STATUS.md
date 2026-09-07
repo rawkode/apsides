@@ -165,6 +165,18 @@ reactor cases remain missing; `releaseVerified` remains false. Packaging perform
 no new cluster execution. Altered binary and runner digests were both rejected
 without publishing output.
 
+Preparing the CNPG reactor run exposed a fixture-generation defect: the observed
+Secret seed contained only `value`, while the preserved Deployment required the
+`uri` key. The shared SDK/compiler generator now supplies synthetic values for
+required Secret keys and rejects explicit present fixtures that omit them.
+Compiling the CNPG example confirms `uri` is present without changing production
+IR, fixture IR or the fixture overlay. Compiler source inputs do change, so a
+fresh candidate is required; the older signed candidate is not rewritten.
+The reactor harness also accepts local CRD manifests bound to the exact imported
+schema digest, installs them through driver SSA, and packages their identities.
+The pinned CNPG schema passes offline preflight. The corrected fixture still
+needs native build and live reactor execution.
+
 Automated suites cover strict schema and canonical replay, claim and metadata
 store immutability, registry concurrency, capacity accounting, review privacy,
 issued-client binding, preview request shape, UID-safe cleanup, finalizer retry,
