@@ -70,34 +70,36 @@ provides these commands as `aps`.
 
 ## 2. Deploy the database, then upgrade to the API
 
-The current runnable live path is the repository's signed-candidate rehearsal
-below. It exercises the real lifecycle protocol through the test driver.
-Compilation alone does not deploy anything, and a public `aps deploy`
-presentation still needs its own live rehearsal; do not present the
-rehearsal as that CLI path.
+The rehearsal below runs the public `aps deploy` command for both versions on a
+new kind cluster, then checks workload behavior. Its setup helper installs CNPG
+and provisions the platform trust, permissions and identities. Compilation alone
+does not prepare these deployment inputs.
 
-Prepare signed initial and successor candidates, their trust policy, and the
-CNPG 1.30.0 operator manifest. The operator image and `OPERATOR_IMAGE_NAME` must
-be pinned to the same digest. Use absolute input paths and a new output directory:
+Reuse the prepared local signed initial and successor candidates with their
+matching trust policy; full production qualification is not required for this
+demo. For preparing new artifacts, see [build and deployment inputs](../../docs/guides/build-and-deploy.md) for the
+artifact and platform requirements. The CNPG 1.30.0 operator manifest must pin
+its operator image and `OPERATOR_IMAGE_NAME` to the same digest. Use absolute
+input paths and a new output directory:
 
 ```sh
-cuenv exec -- python3 tests/reakt/run_cnpg_demo.py \
+cuenv exec -- python3 tests/reakt/run_cnpg_cli_demo.py \
+  --aps "$PWD/target/debug/aps" \
   --initial-artifact "$INITIAL_CANDIDATE" \
   --successor-artifact "$SUCCESSOR_CANDIDATE" \
   --trust-policy "$TRUST_POLICY" \
   --operator-manifest "$PINNED_OPERATOR_MANIFEST" \
   --operator-sha256 "$OPERATOR_MANIFEST_DIGEST" \
-  --check-input-reactions \
-  --output "$PWD/work/cnpg-rehearsal"
+  --output "$PWD/work/cnpg-cli-rehearsal"
 ```
 
 Presentation checkpoints:
 
 1. **Database ready:** the initial controller creates the database and seeds two
    `messages` rows. There is no API Deployment yet.
-2. **API upgrade:** the driver first checks that the initial permission policy
-   rejects the expansion, then approves the policy and upgrades. The database
-   declaration stays unchanged; PostgREST serves the two seeded rows using the CNPG Secret.
+2. **API upgrade:** the setup helper updates the approved permission policy, then
+   `aps deploy` upgrades to the API version. The database declaration stays
+   unchanged; PostgREST serves the two seeded rows using the CNPG Secret.
 3. **ConfigMap reaction:** `api-settings` changes `PGRST_DB_MAX_ROWS` from `100`
    to `1`. The API gets a new Pod, ReplicaSet and rollout revision while its
    Deployment UID remains stable. HTTP now returns one row: the response limit
@@ -113,17 +115,15 @@ Presentation checkpoints:
 The rehearsal also inserts a public row in a separate `aps_demo_persistence`
 table before upgrading, then requires that row and the same CNPG resource and
 PVC identities afterward. This leaves the visible `messages` demo unchanged.
-The live rehearsal in `work/demo-preservation-7f30cce` passed this checkpoint,
-both input reactions and cleanup. It used the signed-candidate test driver;
-the public CLI deployment checkpoint above remains pending.
+The public CLI rehearsal in `work/cnpg-cli-demo-a01463e` passed both deployments,
+this persistence checkpoint, the input reactions and cleanup. Deployment reports
+verify artifact trust and explicitly leave full release qualification unevaluated.
 
 The example uses `deletionPolicy="orphan"` for its resources. That protects the
 intended resource lifecycle; it is not a database backup. The rehearsal deletes
-its disposable cluster by default, including its demo data, and removes its
+its disposable cluster, including its demo data, and removes its
 credentials while preserving existing clusters.
 
-To inspect a successful rehearsal afterward, add `--retain-on-success`. This
-keeps the demo cluster and a private admin kubeconfig in the output directory,
-removes issuer credentials and produces no permission-upgrade receipt. Treat
-that kubeconfig as a credential and explicitly clean up the retained cluster
-when finished. Offline runner checks are available with `cuenv task cnpgDemoTest`.
+Read `result.json` and `cli-reports.json` in the output directory for the checks
+and actual CLI commit reports. This runner always cleans up; it has no retain
+option. ConfigMap and Secret reaction checks are included automatically.
