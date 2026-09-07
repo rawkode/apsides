@@ -1,6 +1,6 @@
 # Apsides implementation status
 
-Apsides implements the current protocol described by specification 0.2. Existing `reakt.dev` identifiers are its active wire names.
+Apsides targets specification 0.2. Existing `reakt.dev` identifiers are its active wire names.
 The complete production release gate is **not satisfied**. Local compilation,
 unit tests, signed disposable candidates, and individual cluster qualifications
 establish narrower properties.
@@ -136,11 +136,10 @@ establish narrower properties.
 ## Verified boundaries
 
 The current signed CNPG candidate is `work/cnpg-signed-candidate-c6d67e0`.
-The normal merger at `work/cnpg-thirteen-merged-d36a7c4` accepts **thirteen of
+The normal merger at `work/cnpg-fourteen-merged-1d68c7f` accepts **fourteen of
 sixteen checks and all 43 required reactor cases** for that exact payload.
-`releaseVerified` remains false. The missing checks are scope-matched benchmark,
-phase-interruption recovery, and API-bound gap conformance. The local qualification
-signers do not establish GitHub Actions identity or production release trust.
+`releaseVerified` remains false. The missing checks are scope-matched benchmark
+and phase-interruption recovery. The local qualification signers do not establish GitHub Actions identity or production release trust.
 
 The matching native fixture passed all 43 required cases, all 46 fixture cases
 (including three reaction-removal controls), and all three reactor checks. Its
@@ -155,7 +154,7 @@ authorized staging, old-writer retirement, activation, commit, and inventory
 publication. Live PostgREST responses confirmed consumption of the CNPG-generated
 Secret and a ConfigMap-triggered rollout: two rows before the change and one
 after, with a new Pod and ReplicaSet and the same Deployment UID. This does not
-measure Secret rotation or force-enabled custom-resource writes.
+measure database password rotation or force-enabled custom-resource writes.
 
 Cleanup qualification at `7070c1e` retained the claim while a finalizer delayed
 deletion and retained the original claim in Cleaning after replacement-UID
@@ -171,6 +170,20 @@ metadata-store observations. The successor controller remained at zero replicas
 with no runtime Pod; only its recorded staged proxy was allowed. This measures
 lost termination evidence, not a real network partition or every possible
 uncertain-writer failure.
+
+The API-gap qualification at `1d68c7f` used the active generation proxy's actual
+projected token, authenticated its Pod and ServiceAccount binding through
+TokenReview, and made 42 direct API requests. Required operations succeeded;
+out-of-scope operations were denied; arbitrary-name create and broader-field
+patch/update behavior matched the compiler's declared RBAC gaps. Request bodies
+and credentials are excluded from the receipt. These probes measure Kubernetes
+API authorization with a stolen runtime credential, not proxy-path enforcement.
+
+A guarded synthetic addition to the observed Secret produced a different HMAC
+revision, ReplicaSet and ready Pod, with unchanged Deployment UID and workload
+image. Existing Secret data stayed equal in memory and ConfigMap resource
+versions remained stable; the probe key was removed afterward. This establishes
+Secret projection change detection and rollout, not database password rotation.
 
 Each of these live harnesses removed its owned clusters and credentials and
 preserved the pre-existing cluster and container inventories. Receipts bind the
@@ -254,13 +267,15 @@ recovery, or production restore authority.
 - Preserve the current payload binding when assembling the final release. Its
   permission-changing upgrade and cleanup receipts are accepted; a changed
   binary or compiler closure requires matching new measurements.
-- Qualify and package Planned, Staged, Quiesced, Activated, Cleaning, and Committed
-  interruption recovery against the exact production payload, including safe
-  recovery by a different CI executor and `unsafe-activation: false`.
-- Define and qualify executor transfer for a different CI run. The current
-  executor label and recorded credential expiry do not prove that an earlier
-  executor cannot mint credentials, complete admitted requests, or write the
-  metadata store.
+- Qualify six post-CAS interruption boundaries against the exact production
+  payload. Terminate and reap the owned deploy process, then recover through a
+  fresh issued session under the same protected deployment identity and logical
+  owner. This does not establish within-phase recovery, uncertain stalled-job
+  takeover, transfer to another principal, or GitHub identity provenance.
+- Keep uncertain stalled-job takeover blocked. A lease, expired token or changed
+  executor label alone does not establish that the previous executor cannot
+  proceed. The spec includes the trusted deployment job in its trusted computing
+  base and forbids requiring a new broadly privileged coordinator.
 - Complete claim, review and audit persistent-volume interrupted-write
   qualification, and qualify remote Turso/libSQL restart,
   unavailable-storage, conflict and recovery behavior.
@@ -270,9 +285,8 @@ recovery, or production restore authority.
 - Complete production API authorization and admission qualification for the
   supported Kubernetes versions, including the declared preview permissions and
   request-drain profile.
-- Complete scope-matched performance evidence and API-gap conformance under their
-  production evidence contracts. The current
-  payload's live workload-readiness, last-resource-type cleanup, UID replacement
+- Complete scope-matched performance evidence under its production evidence
+  contract. The current payload's live workload-readiness, last-resource-type cleanup, UID replacement
   and finalizer measurements have passed their stated qualification scopes.
 - Define operator recovery for incompatible or corrupt protected state. Current
   schemas fail closed and do not infer missing authority or perform automatic

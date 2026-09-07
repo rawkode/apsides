@@ -555,3 +555,41 @@ The destination must not exist. Publication creates it exclusively and writes
 the receipt last; a directory without a valid receipt is incomplete and must not
 be selected for merging. `cuenv task cnpgCleanupEvidenceTest` checks incomplete
 observations, changed bindings and source archives, and output protection.
+
+## API-bound credential qualification
+
+`tests/reakt/run_api_gap.py` completes the signed CNPG pair lifecycle, then reads
+Envoy's actual projected token into memory. It pins the protected Pod, container,
+ServiceAccount and active generation; TokenReview authenticates the token before
+verified-TLS requests exercise the compiler's required operations, denied scope,
+and disclosed create/patch/update gaps. Evidence contains request tuples and
+statuses, never bearer tokens or API response bodies.
+
+```sh
+cuenv task apiGapTest
+cuenv task apiGapProbesTest
+cuenv exec -- python3 tests/reakt/run_api_gap.py \
+  --initial-artifact "$INITIAL_ARTIFACT" \
+  --successor-artifact "$SUCCESSOR_ARTIFACT" \
+  --trust-policy "$TRUST_POLICY" \
+  --operator-manifest "$CNPG_OPERATOR_MANIFEST" \
+  --operator-sha256 "$CNPG_OPERATOR_SHA256" \
+  --output "$FRESH_OUTPUT"
+```
+
+The inputs must be the supported signed CNPG pair and pinned operator used by
+`run_cnpg_demo.py`. Run from a clean, committed checkout and keep source and
+inputs unchanged until completion. The runner creates its own disposable kind
+cluster and removes it and its credential files before publishing a receipt.
+
+The Secret observation adds and removes one synthetic key with UID and resource
+version guards. It requires a changed HMAC revision, ReplicaSet and ready Pod,
+while existing Secret data and ConfigMap versions stay unchanged. It does not
+rotate the database password. Missing observations, unexpected HTTP statuses,
+changed identities or incomplete cleanup prevent receipt publication. Safe
+partial request statuses and fixed failure diagnostics remain available on failure.
+
+A successful receipt supplies only `api-bound-gap-conformance`. It measures
+Kubernetes authorization using the projected generation credential directly;
+it does not qualify proxy-path enforcement or GitHub Actions release trust.
+See [current implementation status](STATUS.md) for accepted aggregate coverage.
