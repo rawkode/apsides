@@ -111,6 +111,17 @@ with a temporary key. It verifies restoration of the original Secret data and
 cluster/container inventory, then removes its kubeconfigs. This is a prerequisite
 check, not a benchmark receipt or proof of startup/missing-input equivalence.
 
+The live prerequisite run at source revision `45101cb` passed in
+`work/cnpg-baseline-live-45101cb/result.json`. It observed HTTP 200 with two rows
+initially, a new Pod and ReplicaSet with one row after the ConfigMap change,
+30 seconds without a rollout after an actual equal-data update, and another
+rollout with one row after the temporary Secret key change. The original Secret
+data was restored. Cleanup restored the prior cluster/container inventory and
+removed the run's kubeconfigs. Earlier runs exposed and fixed tagged-digest
+image import normalization and transient PostgREST startup HTTP 503 handling.
+This establishes workload prerequisites only; paired performance, relist storms,
+cache measurements and increasing-domain results remain pending.
+
 Reloader publishes an unkeyed Secret hash in its runtime rollout annotation;
 Apsides uses an aggregate keyed revision. Do not retain that annotation, live
 Deployment templates, Secret values or Secret hashes in benchmark artifacts.
