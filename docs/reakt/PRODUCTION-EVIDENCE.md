@@ -51,6 +51,22 @@ CNPG successor's production-check receipts bind a different binary/compiler
 payload and are not reused here. Full coverage and approved signing are still
 required before release verification.
 
+At `52a5697`, two independent `--cache disabled` builds produced identical complete
+identities and matched this candidate. The reproducibility receipt is in
+`work/cnpg-reproducibility-52a5697/evidence`. Declared-input isolation also passed,
+with its receipt in `work/cnpg-input-isolation-52a5697/evidence`. Baseline
+compilations bracket seven probes: a declared module succeeds, while an
+undeclared module and clock, randomness, environment, filesystem and network
+capabilities reject. This checks source declarations and SES capabilities, not
+operating-system confinement or actual network egress.
+
+The normal merger at `work/cnpg-five-merged-52a5697` accepts both receipts with the
+reactor evidence: five checks, all 43 required cases, eleven missing checks, and
+`releaseVerified: false`. Both dedicated production-evidence consumer tests pass
+against the unsigned assembly at `work/cnpg-five-candidate-52a5697`. Independent
+reviews rehashed both build identities, candidate bindings, probe outputs and
+the complete packaged source/diagnostic files. No generated outputs are tracked.
+
 ## Combining measured evidence
 
 `reakt merge-evidence` combines explicit receipts against one structurally valid

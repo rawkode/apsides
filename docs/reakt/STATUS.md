@@ -183,7 +183,12 @@ remained. Independent review verified the recorded inputs and results.
 A fresh production build from the same source was assembled unsigned at
 `work/cnpg-production-candidate-0ee1a75-1`. The normal merger at
 `work/cnpg-reactor-merged-0ee1a75` and dedicated reactor-contract consumer accepted
-all 43 cases and three reactor checks. Thirteen production checks remain missing;
+all 43 cases and three reactor checks. Subsequent qualification at `52a5697`
+produced two matching no-cache builds and passed declared-input isolation against
+that same payload. The normal merger at `work/cnpg-five-merged-52a5697` now covers
+five checks and all 43 cases; eleven checks remain missing. Both dedicated
+production-evidence consumer tests passed against the unsigned assembly at
+`work/cnpg-five-candidate-52a5697`, with independent receipt review also passing.
 `releaseVerified` is false. The older successor's four production receipts cannot
 be carried over as measurements of this new binary/compiler payload. The fixture
 run establishes primitive reactor behavior, not CNPG operator or application
