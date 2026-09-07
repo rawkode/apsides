@@ -221,17 +221,35 @@ class BaselineRunner(demo.base.CeilingRunner):
             time.sleep(2)
         raise shared.QualificationError("baseline workload did not reach expected readiness")
 
+    def wait_http(self, expected_count, expected_identity, timeout=120):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            require(self.workload_state() == expected_identity, "workload identity changed during HTTP startup")
+            try:
+                result = self.http_messages(expected_count)
+            except demo.HttpObservationError as error:
+                if not (error.reason == "transport" or (error.reason == "status" and error.status == 503)):
+                    raise
+            else:
+                require(self.workload_state() == expected_identity, "workload identity changed during HTTP startup")
+                require(time.monotonic() < deadline, "PostgREST startup deadline exceeded")
+                return result
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(2, remaining))
+        raise shared.QualificationError("PostgREST startup deadline exceeded")
+
     def measure(self):
         self.phase = "initial-readiness"
         initial = self.ready()
         desired = json.loads(self.bundle["managed.json"])["items"]
         expected_image = next(x["spec"]["template"]["spec"]["containers"][0]["image"] for x in desired if x["kind"] == "Deployment")
         require(initial["image"] == expected_image, "workload image differs from prepared candidate")
-        self.checks.append({"check": self.phase, "identity": initial, "http": self.http_messages(2)})
+        self.checks.append({"check": self.phase, "identity": initial, "http": self.wait_http(2, initial)})
         self.phase = "configmap-reaction"
         self.apply({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "api-settings", "namespace": self.workload}, "data": {"PGRST_DB_MAX_ROWS": "1"}})
         changed = self.ready(initial)
-        self.checks.append({"check": self.phase, "identity": changed, "http": self.http_messages(1)})
+        self.checks.append({"check": self.phase, "identity": changed, "http": self.wait_http(1, changed)})
         self.phase = "equal-value-update"
         cm = json.loads(self.k("get", "configmap/api-settings", "-n", self.workload, "-o", "json"))
         patch = [{"op": "test", "path": "/metadata/uid", "value": cm["metadata"]["uid"]},
@@ -281,7 +299,7 @@ class BaselineRunner(demo.base.CeilingRunner):
             observed = secret()
             require(observed["data"] == {**original["data"], KEY: value}, "Secret data changed outside synthetic key")
             require(config_versions() == config_before, "ConfigMap changed during Secret experiment")
-            self.checks.append({"check": "secret-reaction", "identity": current, "secretUid": original["metadata"]["uid"], "http": self.http_messages(1)})
+            self.checks.append({"check": "secret-reaction", "identity": current, "secretUid": original["metadata"]["uid"], "http": self.wait_http(1, current)})
         finally:
             current = secret()
             if current.get("data", {}).get(KEY) == value:

@@ -152,6 +152,38 @@ class BaselineLiveTests(unittest.TestCase):
                 live.demo.base.CeilingRunner.cleanup(runner)
             self.assertFalse(runner.admin.exists());self.assertFalse(runner.issuer.exists())
 
+    def test_http_startup_retries_only_transient_failures_with_same_identity(self):
+        runner=object.__new__(live.BaselineRunner);expected={'podUid':'pod','replicaSetUid':'rs'}
+        runner.workload_state=Mock(return_value=expected)
+        runner.http_messages=Mock(side_effect=[live.demo.HttpObservationError('status',503),
+                                              live.demo.HttpObservationError('transport'), {'status':200,'rowCount':2}])
+        now=[0.0]
+        with patch.object(live.time,'monotonic',side_effect=lambda:now[0]), patch.object(live.time,'sleep',side_effect=lambda seconds:now.__setitem__(0,now[0]+seconds)):
+            self.assertEqual(runner.wait_http(2,expected),{'status':200,'rowCount':2})
+        self.assertEqual(runner.http_messages.call_count,3);self.assertEqual(now[0],4)
+
+    def test_http_startup_persistent_failure_reaches_bounded_deadline(self):
+        runner=object.__new__(live.BaselineRunner);runner.workload_state=Mock(return_value={})
+        runner.http_messages=Mock(side_effect=live.demo.HttpObservationError('status',503));now=[0.0]
+        with patch.object(live.time,'monotonic',side_effect=lambda:now[0]), patch.object(live.time,'sleep',side_effect=lambda seconds:now.__setitem__(0,now[0]+seconds)):
+            with self.assertRaisesRegex(live.shared.QualificationError,'deadline'):runner.wait_http(2,{},timeout=3)
+        self.assertEqual(now[0],3);self.assertEqual(runner.http_messages.call_count,2)
+
+    def test_http_startup_wrong_rows_and_other_status_fail_without_retry(self):
+        for error in [live.demo.HttpObservationError('unexpected-rows',200), live.demo.HttpObservationError('status',500)]:
+            runner=object.__new__(live.BaselineRunner);runner.workload_state=Mock(return_value={})
+            runner.http_messages=Mock(side_effect=error)
+            with patch.object(live.time,'sleep') as sleep:
+                with self.assertRaises(live.demo.HttpObservationError):runner.wait_http(2,{})
+                sleep.assert_not_called();runner.http_messages.assert_called_once_with(2)
+
+    def test_http_startup_rejects_changed_identity_before_or_after_success(self):
+        for states in [[{'podUid':'other'}],[{'podUid':'expected'},{'podUid':'other'}]]:
+            runner=object.__new__(live.BaselineRunner);runner.workload_state=Mock(side_effect=states)
+            runner.http_messages=Mock(return_value={'status':200,'rowCount':2})
+            with self.assertRaisesRegex(live.shared.QualificationError,'identity changed'):
+                runner.wait_http(2,{'podUid':'expected'})
+
     def test_successful_secret_observation_cannot_skip_restoration_check(self):
         for fault in ['changed-key','changed-uid']:
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
@@ -171,7 +203,7 @@ class BaselineLiveTests(unittest.TestCase):
                     if last['op']=='add':current['data'][live.KEY]=last['value']
                     else:remove_calls.append(True)
                     return ''
-                runner.k=Mock(side_effect=kubectl);runner.ready=Mock(return_value={});runner.http_messages=Mock(return_value={'rowCount':1})
+                runner.k=Mock(side_effect=kubectl);runner.ready=Mock(return_value={});runner.wait_http=Mock(return_value={'rowCount':1})
                 with self.assertRaisesRegex(live.shared.QualificationError,'restoration'):
                     runner.secret_reaction({})
                 self.assertEqual(remove_calls,[])
