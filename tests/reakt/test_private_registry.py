@@ -5,6 +5,8 @@ import hashlib
 import json
 from pathlib import Path
 import unittest
+import tempfile
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import private_registry as registry
@@ -79,6 +81,20 @@ class RegistryTests(unittest.TestCase):
             with self.assertRaisesRegex(registry.RegistryError, 'ownership mismatch'):
                 value.close()
         self.assertEqual(len(run.call_args_list), 1)
+
+    def test_node_trust_uses_effective_containerd_configuration(self):
+        value = self.fixture()
+        value.docker_context = 'orbstack'
+        value.container_id = 'b' * 64
+        value.before_containers = []
+        runner = SimpleNamespace(container_id='a' * 64, docker_context='orbstack')
+        config = b'[plugins."io.containerd.cri.v1.images".registry]\nconfig_path = "/etc/containerd/certs.d:/etc/docker/certs.d"\n'
+        with tempfile.TemporaryDirectory() as directory:
+            value.ca_path = Path(directory) / 'ca.crt'
+            value.ca_path.write_bytes(b'public certificate fixture')
+            with patch.object(value, 'require_owned'), patch.object(registry, 'command', side_effect=[b'', config, b'', b'', b'']) as run:
+                value.install_node_trust(runner)
+        self.assertEqual(run.call_args_list[1].args[0][-3:], ['containerd', 'config', 'dump'])
 
 
 if __name__ == '__main__':

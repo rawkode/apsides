@@ -10,6 +10,7 @@ import ssl
 import subprocess
 import tempfile
 import time
+import tomllib
 
 REGISTRY_IMAGE = "registry@sha256:1be55279f18a2fe1a74edf2664cac61c1bea305b7b4642dab412e7affdcb3e33"
 ORAS_SHA256 = "50ae33461ea6e2746b774587d2cb060850961ce01bfd6e70b48d4267919b491c"
@@ -170,8 +171,9 @@ class PrivateRegistry:
             raise RegistryError("private-pull node is not a fresh owned container")
         self.require_owned()
         command(["docker", "network", "connect", "kind", self.container_id])
-        config = command(["docker", "exec", node, "cat", "/etc/containerd/config.toml"])
-        if b"/etc/containerd/certs.d" not in config:
+        config = tomllib.loads(command(["docker", "exec", node, "containerd", "config", "dump"]).decode())
+        registry = config.get("plugins", {}).get("io.containerd.cri.v1.images", {}).get("registry", {})
+        if "/etc/containerd/certs.d" not in registry.get("config_path", "").split(":"):
             raise RegistryError("kind containerd registry trust directory unavailable")
         target = "/etc/containerd/certs.d/" + self.host
         command(["docker", "exec", node, "mkdir", "-p", target])
