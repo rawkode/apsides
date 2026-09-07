@@ -13,6 +13,14 @@ establish narrower properties.
   `aps crds fetch` generates ignored, importable types from a pinned CRD source.
   A generated CloudNativePG import was checked through the TypeScript language
   service with zero diagnostics and 55 property completions.
+- `cuenv task packageCli` builds a relocatable macOS/Linux CLI prefix with
+  compiler dependencies and the native build source closure. Distribution builds
+  verify the exact asset tree against a manifest digest embedded in the executable.
+  A relocated macOS development-profile bundle passed init, CNPG import, locking,
+  compilation and artifact verification with checkout reads denied; six asset
+  tamper/removal checks failed without publishing projects. A separate checkout-denied
+  build produced the Linux/arm64 controller, OCI image and SBOM. Linux-host execution
+  and complete production release acceptance remain unqualified.
 - Imported namespaced resources retain their explicit plural, scope and schema
   digest through compilation and deployment review. Force apply remains a
   per-resource choice requiring explicit policy acceptance, including custom

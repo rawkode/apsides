@@ -11,9 +11,9 @@ workload.
 ## Create the project
 
 Run these commands from the Apsides repository root after installing its pnpm
-dependencies. This increment executes the CRD and source-lock tooling from the
-source checkout, so keep the checkout and its installed JavaScript dependencies
-available while using the locally built CLI.
+dependencies. The locally built CLI uses the checkout assets. With an installed
+CLI bundle, use `aps` in place of `target/debug/aps`; compiler and CRD tooling
+resolve from that installation.
 
 ```sh
 cuenv task build

@@ -1,10 +1,9 @@
 use crate::{Result, only};
-use std::{collections::BTreeMap, path::Path, process::Command};
+use std::{collections::BTreeMap, process::Command};
 
 pub fn command(options: &BTreeMap<String, String>) -> Result<()> {
     only(options, &["--source", "--modules"])?;
-    let script =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/compiler/src/source-lock.ts");
+    let script = crate::assets::root()?.join("packages/compiler/src/source-lock.ts");
     if !script.is_file() {
         return Err("source lock assets are unavailable".into());
     }

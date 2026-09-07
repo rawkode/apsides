@@ -43,9 +43,9 @@ target/debug/aps compile \
   --output work/cnpg-compiled
 ```
 
-The compile output directory must be fresh. These commands use compiler assets
-and installed JavaScript dependencies from this source checkout; the current CLI
-is not a standalone installed distribution.
+The compile output directory must be fresh. The commands above use the locally
+built CLI and its checkout assets. An installed [CLI bundle](../../docs/reakt/CLI-DISTRIBUTION.md)
+provides the same commands through `aps` using its packaged assets.
 
 Compilation proves the locked source can produce validated IR and a controller
 project. It does not install the CloudNativePG operator or CRD, create the

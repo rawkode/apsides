@@ -30,6 +30,9 @@ The [complete example guide](examples/reakt/README.md) explains source locking a
 compilation. The [IR contract](docs/reakt/IR-CONTRACT.md) documents the supported
 resource subset; unsupported operations fail validation.
 
+A relocatable CLI bundle is available through `cuenv task packageCli`; see
+[CLI distribution](docs/reakt/CLI-DISTRIBUTION.md) for installation and prerequisites.
+
 ## Local compiler
 
 ```sh
@@ -42,7 +45,7 @@ target/debug/aps verify --artifact work/reakt-native
 
 Use a fresh output directory for each build. The source path uses Oxc and Rolldown for compilation and Deno with denied filesystem, network, environment, subprocess, and remote-import permissions for evaluation. SES compartments constrain ambient JavaScript capabilities, and the compiler compares independent bundle and evaluation runs. Final release reproducibility requires the separate native/image checks. Local compilation emits the validated IR, recomputed effects and capabilities, generated scenario plan, Rust controller source, and an integrity manifest. The complete build uses a pinned [build profile](docs/reakt/OCI-PACKAGING.md#complete-cli-build), the prepared Cargo cache, Docker BuildKit, and cargo-cyclonedx to produce a Linux image, binary, SBOM, and compiler closure. `verify` checks local integrity and recomputes the plan; it does not establish approved provenance or production readiness.
 
-The CI interface is `reakt deploy`, independent of the Kubernetes provider. CI prepares a short-lived Kubernetes identity through its normal authentication setup; Apsides owns artifact/policy checks and the resumable deployment protocol. The privileged CI deployer creates the next generation’s Roles and RoleBindings, deploys its controller image, and retires the previous writer. The runtime receives only its approved reconciliation capabilities; it does not manage RBAC or upgrade itself. The deployment review lists [required CI access](docs/reakt/DEPLOYMENT-PERMISSIONS.md). CI can select an immutable OCI release with `REAKT_RELEASE_REFERENCE`; see [artifact retrieval](docs/reakt/ARTIFACT-RESOLUTION.md#deploy-from-an-immutable-reference). Configure `REAKT_INVENTORY_DATABASE` for persistent libSQL storage and `REAKT_INVENTORY_TOKEN` for a remote primary; see [resource inventory](docs/reakt/INVENTORY.md#deployment-connection). Deployment requires platform-owned trust, ceiling, identity and proxy qualification records; current live acceptance limits are listed in the implementation status.
+The CI interface is `aps deploy`, independent of the Kubernetes provider. CI prepares a short-lived Kubernetes identity through its normal authentication setup; Apsides owns artifact/policy checks and the resumable deployment protocol. The privileged CI deployer creates the next generation’s Roles and RoleBindings, deploys its controller image, and retires the previous writer. The runtime receives only its approved reconciliation capabilities; it does not manage RBAC or upgrade itself. The deployment review lists [required CI access](docs/reakt/DEPLOYMENT-PERMISSIONS.md). CI can select an immutable OCI release with `REAKT_RELEASE_REFERENCE`; see [artifact retrieval](docs/reakt/ARTIFACT-RESOLUTION.md#deploy-from-an-immutable-reference). Configure `REAKT_INVENTORY_DATABASE` for persistent libSQL storage and `REAKT_INVENTORY_TOKEN` for a remote primary; see [resource inventory](docs/reakt/INVENTORY.md#deployment-connection). Deployment requires platform-owned trust, ceiling, identity and proxy qualification records; current live acceptance limits are listed in the implementation status.
 
 ## Implementation and verification
 

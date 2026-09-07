@@ -24,6 +24,7 @@ fn hash(bytes: &[u8]) -> String {
 }
 
 pub fn emit(plan: &CompiledPlan, output: &Path) -> Result<()> {
+    let assets = crate::assets::root()?;
     if output.exists() {
         return Err(
             "output already exists; use a fresh directory to avoid replacing an artifact".into(),
@@ -63,9 +64,7 @@ pub fn emit(plan: &CompiledPlan, output: &Path) -> Result<()> {
         &serde_json::to_vec_pretty(&plan.ir)?,
         &mut files,
     )?;
-    let runtime_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../runtime")
-        .canonicalize()?;
+    let runtime_path = assets.join("crates/runtime").canonicalize()?;
     let manifest = format!(
         "[package]\nname = \"controller\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n\n[dependencies]\nruntime = {{ path = {} }}\ntokio = {{ version = \"1\", features = [\"macros\", \"rt-multi-thread\"] }}\n",
         serde_json::to_string(runtime_path.to_str().ok_or("non UTF-8 runtime path")?)?
@@ -203,7 +202,7 @@ pub fn verify(root: &Path) -> Result<Value> {
 }
 
 pub fn prepare_lock(root: &Path) -> Result<()> {
-    let workspace_lock = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
+    let workspace_lock = crate::assets::root()?.join("Cargo.lock");
     fs::copy(workspace_lock, root.join("controller/Cargo.lock"))?;
     // Start from the compiler's own lock. Cargo adds the generated root package
     // without upgrading versions already selected in that lock; resolution is

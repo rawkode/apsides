@@ -60,6 +60,7 @@ The profile defaults to `reakt.build.json` in the invoking directory.
 
 `build-result.json` explicitly remains unsigned and cannot authorize deployment.
 Approved provenance and complete reactor/security evidence must be assembled into
-and verified as a release before `reakt deploy` accepts it. The CLI currently runs
-its compiler/packaging assets from the trusted source checkout; standalone release
-packaging must include and resolve that tool closure before distribution.
+and verified as a release before `aps deploy` accepts it. Development builds use
+the source checkout. The [CLI distribution](CLI-DISTRIBUTION.md) bundles the
+compiler and native packaging source closure and verifies it against a manifest
+digest embedded in its executable.

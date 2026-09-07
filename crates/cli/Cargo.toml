@@ -10,6 +10,9 @@ publish = false
 name = "aps"
 path = "src/main.rs"
 
+[features]
+distribution = []
+
 [dependencies]
 compiler-core = { path = "../compiler-core" }
 release = { path = "../release" }

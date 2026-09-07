@@ -5,6 +5,8 @@ import "github.com/cuenv/cuenv/schema"
 schema.#Project & {name: "apsides"}
 
 tasks: {
+	packageCli: {command: "python3", args: ["scripts/reakt/package_cli.py", "--output", "work/aps-distribution", "--target-dir", "work/cli-package-target"]}
+	packageCliTest: {command: "python3", args: ["tests/reakt/test_package_cli.py"]}
 	cnpgDemoTest: {command: "python3", args: ["tests/reakt/test_cnpg_demo.py"]}
 	cnpgInitialTypes: {
 		dependsOn: [install]

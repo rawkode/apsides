@@ -250,8 +250,7 @@ fn write_stage(stage: &Path) -> Result<()> {
 }
 
 fn generate_source_lock(stage: &Path) -> Result<()> {
-    let script =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/compiler/src/source-lock.ts");
+    let script = crate::assets::root()?.join("packages/compiler/src/source-lock.ts");
     let metadata =
         fs::symlink_metadata(&script).map_err(|_| "Apsides compiler assets are unavailable")?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {

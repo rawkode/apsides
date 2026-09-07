@@ -11,6 +11,7 @@
 )]
 mod artifact;
 mod artifact_input;
+mod assets;
 mod audit_command;
 mod crds_command;
 mod deploy_command;
@@ -323,12 +324,10 @@ fn compile_source_stage(source: Option<&str>, output: &Path) -> Result<Option<Pa
     if stage.exists() {
         return Err("source staging directory already exists; choose a fresh output".into());
     }
+    let root = assets::root()?;
     if let Some(parent) = stage.parent() {
         fs::create_dir_all(parent)?;
     }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()?;
     let status = Command::new("node")
         .arg(root.join("packages/compiler/src/compiler.ts"))
         .arg(fs::canonicalize(source)?)
@@ -348,12 +347,11 @@ fn build_native(
     output: &Path,
     no_cache: bool,
 ) -> Result<()> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()?;
+    let root = assets::root()?;
     let mut builder = Command::new("python3");
     builder
         .arg(root.join("scripts/reakt/build.py"))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("REAKT_CLI", env::current_exe()?)
         .arg("--artifact")
         .arg(output)
