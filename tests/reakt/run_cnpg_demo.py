@@ -25,6 +25,16 @@ PAIR_MARKER = "reakt-candidate-pair-qualification"
 PAIR_SCHEMA = "reakt.dev/candidate-pair-qualification/v2"
 MAX_OPERATOR_BYTES = 8 * 1024 * 1024
 MAX_HTTP_BYTES = 64 * 1024
+
+
+class HttpObservationError(shared.QualificationError):
+    """Closed HTTP failure metadata; never contains response content."""
+    def __init__(self, reason, status=None):
+        reasons = {"transport", "status", "oversized-body", "invalid-json", "unexpected-rows"}
+        self.reason = reason if reason in reasons else "transport"
+        self.status = status if type(status) is int and 100 <= status <= 599 else None
+        super().__init__("PostgREST HTTP observation failed: " + self.reason)
+
 MEASUREMENT_SCHEMA = "reakt.dev/permission-upgrade-measurement/v1"
 TARGET_FIELDS = {"apiGroup", "resource", "namespace", "name"}
 EXPECTED_SCOPE = {
@@ -1159,17 +1169,24 @@ class CnpgDemoRunner(base.CeilingRunner):
                 connection.request("GET", "/messages?select=id,message&order=id.asc")
                 response = connection.getresponse()
                 body = response.read(MAX_HTTP_BYTES + 1)
+            except (OSError, http.client.HTTPException):
+                raise HttpObservationError("transport") from None
             finally:
                 connection.close()
-        if response.status != 200 or len(body) > MAX_HTTP_BYTES:
-            raise shared.QualificationError("PostgREST messages endpoint returned an unexpected response")
-        value = json.loads(body, object_pairs_hook=shared.unique_object)
+        if response.status != 200:
+            raise HttpObservationError("status", response.status)
+        if len(body) > MAX_HTTP_BYTES:
+            raise HttpObservationError("oversized-body", response.status)
+        try:
+            value = json.loads(body, object_pairs_hook=shared.unique_object)
+        except (ValueError, UnicodeError, shared.QualificationError):
+            raise HttpObservationError("invalid-json", response.status) from None
         expected = [
             {"id": 1, "message": "Hello from CloudNativePG"},
             {"id": 2, "message": "Configured by Apsides"},
         ][:expected_count]
         if value != expected:
-            raise shared.QualificationError("PostgREST messages endpoint returned unexpected rows")
+            raise HttpObservationError("unexpected-rows", response.status)
         return {"status": response.status, "rowCount": len(value), "bodyDigest": shared.digest_bytes(body)}
 
     def replace_policy(self):

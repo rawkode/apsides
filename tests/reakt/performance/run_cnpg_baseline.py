@@ -302,9 +302,12 @@ class BaselineRunner(demo.base.CeilingRunner):
             self.measure()
             self.frozen()
             passed = True
-        except Exception:
+        except Exception as error:
             # Never reflect kubectl output, HTTP bodies, Secret values or annotations.
-            self.failures.append({"phase": self.phase, "reason": "baseline prerequisite failed"})
+            failure = {"phase": self.phase, "reason": "baseline prerequisite failed"}
+            if isinstance(error, demo.HttpObservationError):
+                failure.update(httpFailureClass=error.reason, httpStatus=error.status)
+            self.failures.append(failure)
         finally:
             try:
                 self.cleanup()

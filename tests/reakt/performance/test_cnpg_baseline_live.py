@@ -126,6 +126,18 @@ class BaselineLiveTests(unittest.TestCase):
                 self.assertEqual(result['failures'][-1]['phase'],f'image-0-{operation}')
                 self.assertNotIn('PRIVATE',json.dumps(result));self.assertNotIn('private-image',json.dumps(result))
 
+    def test_http_failure_persists_safe_status_and_class_after_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner=self.runner(Path(directory))
+            runner.measure=Mock(side_effect=live.demo.HttpObservationError('status',503))
+            def cleanup():
+                runner.admin.unlink();runner.issuer.unlink();runner.cleanup_confirmed=True
+            runner.cleanup=Mock(side_effect=cleanup)
+            result=runner.run()
+            self.assertFalse(result['passed']);self.assertTrue(result['credentialsRemoved'])
+            self.assertEqual(result['failures'][-1]['httpStatus'],503)
+            self.assertEqual(result['failures'][-1]['httpFailureClass'],'status')
+
     def test_cleanup_failure_prevents_success_and_redacts_errors(self):
         with tempfile.TemporaryDirectory() as directory:
             runner=self.runner(Path(directory));runner.measure=Mock();runner.cleanup=Mock(side_effect=RuntimeError('PRIVATE_TOKEN'))

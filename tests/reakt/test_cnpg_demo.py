@@ -1,4 +1,5 @@
 """Offline regressions for the live CNPG demo's polling and image assertions."""
+from contextlib import nullcontext
 import hashlib
 import json
 from pathlib import Path
@@ -44,6 +45,40 @@ class DemoChecks(unittest.TestCase):
             with self.assertRaises(demo.shared.QualificationError):
                 runner.import_archive(Path("missing"), "registry.example/image:latest")
             run.assert_not_called()
+
+    def test_http_diagnostics_are_status_only_and_preserve_acceptance(self):
+        cases = [(503, b'PRIVATE_SERVER_MESSAGE', 'status'),
+                 (200, b'PRIVATE_NOT_JSON', 'invalid-json'),
+                 (200, b'[{"message":"PRIVATE_ROW"}]', 'unexpected-rows'),
+                 (200, b'x' * (demo.MAX_HTTP_BYTES + 1), 'oversized-body')]
+        for status, body, reason in cases:
+            with self.subTest(reason=reason):
+                runner=object.__new__(demo.CnpgDemoRunner)
+                runner.forwarded_service=lambda:nullcontext(1234)
+                response=Mock(status=status);response.read.return_value=body
+                connection=Mock();connection.getresponse.return_value=response
+                with patch.object(demo.http.client,'HTTPConnection',return_value=connection):
+                    with self.assertRaises(demo.HttpObservationError) as observed:
+                        runner.http_messages(2)
+                self.assertEqual(observed.exception.reason,reason)
+                self.assertEqual(observed.exception.status,status)
+                self.assertNotIn('PRIVATE',str(observed.exception))
+                connection.close.assert_called_once()
+                response.read.assert_called_once_with(demo.MAX_HTTP_BYTES+1)
+        runner=object.__new__(demo.CnpgDemoRunner);runner.forwarded_service=lambda:nullcontext(1234)
+        response=Mock(status=200);response.read.return_value=json.dumps([
+            {'id':1,'message':'Hello from CloudNativePG'}, {'id':2,'message':'Configured by Apsides'}]).encode()
+        connection=Mock();connection.getresponse.return_value=response
+        with patch.object(demo.http.client,'HTTPConnection',return_value=connection):
+            self.assertEqual(runner.http_messages(2)['rowCount'],2)
+
+    def test_http_transport_failure_does_not_reflect_exception_text(self):
+        runner=object.__new__(demo.CnpgDemoRunner);runner.forwarded_service=lambda:nullcontext(1234)
+        connection=Mock();connection.request.side_effect=OSError('PRIVATE_TRANSPORT')
+        with patch.object(demo.http.client,'HTTPConnection',return_value=connection):
+            with self.assertRaises(demo.HttpObservationError) as observed:runner.http_messages(2)
+        self.assertEqual(observed.exception.reason,'transport');self.assertIsNone(observed.exception.status)
+        self.assertNotIn('PRIVATE',str(observed.exception));connection.close.assert_called_once()
 
     def candidates(self):
         return {name: self.digest() for name in demo.PAIR_DIGESTS}
