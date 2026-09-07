@@ -159,7 +159,7 @@ class DemoChecks(unittest.TestCase):
             for reason in ["native performance allocation differs from signed release", "workload identity changed during HTTP startup"]:
                 self.assertEqual(demo.base.failure_reason(runner,demo.shared.QualificationError(reason)),reason)
             self.assertEqual(demo.base.failure_reason(runner,demo.shared.QualificationError('PRIVATE_SECRET=unexpected')),'QualificationError')
-            helper=Path(demo.sampling.__file__).resolve();collector=helper.parent/'collect.py' 
+            helper=Path(demo.sampling.__file__).resolve();collector=helper.parent/'collect.py'
             for path in [helper,collector]:
                 self.assertIn(path,runner.sources);self.assertIn(path,runner.source_archives)
                 self.assertIn('producer/'+runner.source_archives[path],runner.snapshot)
