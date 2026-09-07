@@ -57,11 +57,10 @@ establish narrower properties.
 - The verifier requires every compiler-generated reactor case and all sixteen
   named release checks. Missing, duplicate, failed, fixture-substituted, or
   unauthenticated production checks reject the release.
-- `reakt merge-evidence` combines selected receipts against one exact production
+- `aps merge-evidence` combines selected receipts against one exact production
   candidate using the existing validators. It copies only referenced files, rejects
   conflicts and duplicate coverage, and reports missing checks without claiming
-  release verification. The current producers cover five production checks and
-  three reactor checks; eight production check producers remain unfinished.
+  release verification. Current accepted coverage is recorded below.
 - The deployment-ceiling producer passed on a dedicated kind cluster: removing
   one required capability rejected the exact signed candidate without state
   changes; restoring the policy allowed the same allocation to reach `Planned`.
@@ -73,13 +72,11 @@ establish narrower properties.
   candidates on a dedicated kind cluster. The first reserved their shared target;
   the second received the protected claim-collision rejection without changing
   Kubernetes or metadata state. Both generations' writer targets remained absent,
-  cleanup preserved existing clusters, and the receipt merged with the other six
-  checks and all 43 reactor cases. One qualification executor was authorized for
+  cleanup preserved existing clusters. One qualification executor was authorized for
   both domains; this does not establish isolation between distinct principals.
 - The fixture-promotion producer passed with the exact signed production candidate
   and a real native/OCI fixture release. The fixture matched the signed compiler
-  projection and received the exact promotion rejection. Its source-bound receipt
-  merged with the other seven checks and all 43 reactor cases. The fixture is
+  projection and received the exact promotion rejection. The fixture is
   rejected before signature verification; this does not prove a fixture signature
   or qualify runtime deployment.
 - Production evidence binds the exact binary, image, IR, compiler closure, build
@@ -125,7 +122,8 @@ establish narrower properties.
   live impact before a fresh reservation or against a resumable pending
   transition. Reports contain path classifications and coarse ownership/server
   evidence, never live values, managed-field keys, selectors, or response bodies.
-- Staging creates a distinct inactive generation. Upgrade activation requires
+- Staging starts the generation's protected API proxy while keeping its controller
+  Deployment at zero replicas. Upgrade activation requires
   captured predecessor topology, process termination, qualified request drain,
   claim transfer, and protected activation state before starting the successor.
 - Cleanup applies the predecessor's recorded delete/orphan policy and requires
@@ -137,88 +135,47 @@ establish narrower properties.
 
 ## Verified boundaries
 
-The CNPG example passed a local exact signed-candidate lifecycle rehearsal on
-kind through OrbStack at `fed891c`: initial database readiness and application
-Secret creation, refusal of the permission expansion without registry changes,
-approved successor staging, writer retirement, activation and commit. PostgREST
-returned two database rows, then one after a ConfigMap update caused a new Pod,
-ReplicaSet and rollout revision while preserving the Deployment UID. Cleanup
-restored the previous cluster/container inventories and removed credentials.
-The normal evidence merger accepted the permission-changing upgrade receipt for
-this exact successor: one of sixteen checks, with 43 reactor cases still missing.
-This receipt cannot be combined with the older eight-check package, which binds
-a different payload. Full production acceptance remains pending, as do
-force-enabled custom-resource writes, Secret rotation and drift correction.
+The current signed CNPG candidate is `work/cnpg-signed-candidate-c6d67e0`.
+The normal merger at `work/cnpg-thirteen-merged-d36a7c4` accepts **thirteen of
+sixteen checks and all 43 required reactor cases** for that exact payload.
+`releaseVerified` remains false. The missing checks are scope-matched benchmark,
+phase-interruption recovery, and API-bound gap conformance. The local qualification
+signers do not establish GitHub Actions identity or production release trust.
 
-Current cleanup qualification passed at `7070c1e` against the current successor.
-Finalizer-delayed cleanup retained the claim until the test finalizer was removed;
-replacement-UID rejection retained the original claim in Cleaning. Both runs
-preserved an unclaimed Backup, checked the successor workload Role omitted Backup
-access, and restored the original cluster inventory after removing credentials.
-Independent raw-measurement and adapter reviews passed, with eleven adapter tests.
-`work/cnpg-twelve-merged-7070c1e` accepts all three cleanup checks alongside the
-other current evidence: twelve of sixteen checks and all 43 reactor cases.
-Remaining checks are scope-matched benchmark, phase-interruption recovery,
-uncertain-writer refusal, and API-bound gap conformance. `releaseVerified` is false.
+The matching native fixture passed all 43 required cases, all 46 fixture cases
+(including three reaction-removal controls), and all three reactor checks. Its
+synthetic Secret contains the required `uri` key; the harness installs the exact
+imported CRD schema. Two independent no-cache builds matched, and declared-input
+isolation passed against the same production payload. Fixture execution proves
+primitive reactor behavior, not CNPG operator or application readiness.
 
-Preparing the CNPG reactor run exposed a fixture-generation defect: the observed
-Secret seed contained only `value`, while the preserved Deployment required the
-`uri` key. The shared SDK/compiler generator now supplies synthetic values for
-required Secret keys and rejects explicit present fixtures that omit them.
-Compiling the CNPG example confirms `uri` is present without changing production
-IR, fixture IR or the fixture overlay. Compiler source inputs do change, so a
-fresh candidate is required; the older signed candidate is not rewritten.
-The reactor harness also accepts local CRD manifests bound to the exact imported
-schema digest, installs them through driver SSA, and packages their identities.
-The pinned CNPG schema passes offline preflight. The corrected native fixture at
-`0ee1a75` then passed all 43 required cases, all 46 fixture cases (including three
-reaction-removal controls), and all three reactor checks on an isolated kind
-cluster. Its cluster and credentials were removed; the two pre-existing clusters
-remained. Independent review verified the recorded inputs and results.
+The current successor separately passed a signed permission-changing upgrade at
+`4892cbc`: initial database readiness, policy rejection without registry changes,
+authorized staging, old-writer retirement, activation, commit, and inventory
+publication. Live PostgREST responses confirmed consumption of the CNPG-generated
+Secret and a ConfigMap-triggered rollout: two rows before the change and one
+after, with a new Pod and ReplicaSet and the same Deployment UID. This does not
+measure Secret rotation or force-enabled custom-resource writes.
 
-A fresh production build from the same source was assembled unsigned at
-`work/cnpg-production-candidate-0ee1a75-1`. The normal merger at
-`work/cnpg-reactor-merged-0ee1a75` and dedicated reactor-contract consumer accepted
-all 43 cases and three reactor checks. Subsequent qualification at `52a5697`
-produced two matching no-cache builds and passed declared-input isolation against
-that same payload. The normal merger at `work/cnpg-five-merged-52a5697` now covers
-five checks and all 43 cases; eleven checks remain missing. Both dedicated
-production-evidence consumer tests passed against the unsigned assembly at
-`work/cnpg-five-candidate-52a5697`, with independent receipt review also passing.
-`releaseVerified` is false. The older successor's four production receipts cannot
-be carried over as measurements of this new binary/compiler payload. The fixture
-run establishes primitive reactor behavior, not CNPG operator or application
-readiness, signature trust, or full production acceptance.
+Cleanup qualification at `7070c1e` retained the claim while a finalizer delayed
+deletion and retained the original claim in Cleaning after replacement-UID
+rejection. Both runs preserved an unclaimed Backup and checked that the successor
+workload Role omitted Backup access. This Role inspection does not establish
+cluster-wide effective authorization. Independent measurement and adapter reviews
+passed, with eleven adapter tests.
 
-Fixture-promotion rejection subsequently passed at `c6d67e0`. A copy of the
-current candidate was signed with a temporary local qualification key, checked
-under an explicit compiler/signer policy, and paired with the matching native
-fixture. The driver repeated positive candidate verification and exact fixture
-mode rejection. The normal merger at `work/cnpg-six-merged-c6d67e0` now accepts
-six checks and all 43 cases, with ten checks missing and `releaseVerified: false`.
-The temporary private key was removed after signing. This local qualification
-does not establish GitHub Actions identity or full production release trust.
+The uncertain-writer qualification at `d36a7c4` removed the exact retained terminal
+predecessor Pod record after Quiesced. Activation returned the expected protected
+writer-history rejection, with unchanged registry, activation, inventory, and
+metadata-store observations. The successor controller remained at zero replicas
+with no runtime Pod; only its recorded staged proxy was allowed. This measures
+lost termination evidence, not a real network partition or every possible
+uncertain-writer failure.
 
-Deployment-ceiling rejection passed for the same candidate at `fcf3e45`, using
-the exact declared CNPG CRD and an owned disposable kind cluster. No writer was
-started. Cleanup removed its cluster and credentials and preserved the two
-existing clusters. `work/cnpg-seven-merged-fcf3e45` covers seven checks and all 43
-cases; nine checks remain missing and `releaseVerified` is false.
-
-Ownership-collision qualification passed at `4662270` against a separately signed
-owner with exactly one shared ConfigMap identity. The owner reserved its claim;
-the contender was rejected without changing measured state or starting a writer.
-Cluster and credential cleanup passed. `work/cnpg-eight-merged-4662270` now covers
-eight checks and all 43 cases, with eight checks missing and `releaseVerified:
-false`. The temporary local signer does not establish GitHub Actions trust.
-
-The current successor passed a fresh permission-changing upgrade rehearsal at
-`4892cbc`: initial deploy, policy rejection, authorized upgrade, old-writer
-retirement, commit, and inventory publication. Live PostgREST responses confirmed
-CNPG Secret consumption and a ConfigMap-triggered rollout (two rows before, one
-after). Cleanup preserved the existing clusters. The normal merger at
-`work/cnpg-nine-merged-4892cbc` accepts nine checks and all 43 cases; seven checks
-remain missing and `releaseVerified` is false. Secret rotation remains unmeasured.
+Each of these live harnesses removed its owned clusters and credentials and
+preserved the pre-existing cluster and container inventories. Receipts bind the
+exact candidate payload and archived runner sources. They do not establish
+production `VerifiedRelease` deployment or qualify a changed compiler or binary.
 
 Automated suites cover strict schema and canonical replay, claim and metadata
 store immutability, registry concurrency, capacity accounting, review privacy,
@@ -313,8 +270,8 @@ recovery, or production restore authority.
 - Complete production API authorization and admission qualification for the
   supported Kubernetes versions, including the declared preview permissions and
   request-drain profile.
-- Complete scope-matched performance evidence, uncertain-writer refusal and
-  API-gap conformance under their production evidence contracts. The current
+- Complete scope-matched performance evidence and API-gap conformance under their
+  production evidence contracts. The current
   payload's live workload-readiness, last-resource-type cleanup, UID replacement
   and finalizer measurements have passed their stated qualification scopes.
 - Define operator recovery for incompatible or corrupt protected state. Current
