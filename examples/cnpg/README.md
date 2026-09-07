@@ -60,7 +60,7 @@ its observed inputs.
 ## Local upgrade rehearsal
 
 The rehearsal passed on kind running through OrbStack at source revision
-`207a405`, using the signed initial and successor examples from `5ed7b25` and
+`fed891c`, using the signed initial and successor examples from `5ed7b25` and
 CloudNativePG 1.30.0. It verified initial database readiness, refusal of the
 permission expansion under the initial policy, writer retirement, successor
 activation, and HTTP responses changing from two rows to one after a ConfigMap
@@ -68,14 +68,16 @@ update. The Deployment UID stayed stable while the Pod, ReplicaSet and rollout
 revision changed. Cleanup restored the prior cluster and container inventories
 and removed the rehearsal credentials.
 
-This is local signed-candidate demo evidence; production release acceptance is
-still pending. It does not verify Secret rotation or drift correction.
+The normal evidence consumer accepted the permission-changing upgrade receipt
+for the exact successor candidate. Full production acceptance is still pending:
+this candidate has one of sixteen required checks and no reactor-case receipts.
+It does not verify Secret rotation or drift correction.
 
 The repository's test driver accepts two signed, integrity-verified candidates
 built from the initial and parent examples. It uses the real lifecycle protocol
 on a new kind cluster, including the rejected permission expansion and verified
 writer retirement. It does not bypass the production `aps deploy` release gate
-or produce a production acceptance receipt.
+and emits only the permission-changing upgrade check after successful cleanup.
 
 ```sh
 cuenv exec -- python3 tests/reakt/run_cnpg_demo.py \
@@ -102,5 +104,6 @@ flow does not claim to demonstrate credential rotation.
 By default the driver deletes its cluster and credentials, preserving existing
 clusters. `--retain-on-success` keeps the successful demo cluster and a private
 admin kubeconfig in the output directory, while removing issuer credentials.
+A retained cluster does not produce a permission-upgrade receipt.
 Failure is never treated as successful release evidence. Offline runner
 regressions are available through `cuenv task cnpgDemoTest`.

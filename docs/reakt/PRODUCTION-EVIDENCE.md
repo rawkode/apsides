@@ -337,3 +337,28 @@ missing reactor cases (43 covered), and `releaseVerified: false`. The remaining
 checks are scope-matched benchmark, permission-changing upgrade, phase
 interruption recovery, last API type cleanup, UID replacement rejection,
 finalizer preservation, uncertain-writer refusal, and API-bound gap conformance.
+
+
+## CNPG permission-changing upgrade
+
+`tests/reakt/run_cnpg_demo.py` produces the `permission-changing-upgrade` check
+from the exact signed initial/successor CNPG pair. It verifies rejection under
+the initial policy before successor creation, unchanged registry and initial
+writer identities, explicit policy expansion, and the actual staged, quiesced,
+activated and committed successor lifecycle. The no-unapproved-writer assertion
+is scoped to the owned, single-actor test cluster.
+
+The producer freezes the candidate payloads, trust, operator manifest, tracked
+source archive and executables. It publishes atomically only after successful
+application checks, input revalidation, cluster cleanup and credential removal.
+Retaining the demo cluster suppresses receipt publication. The receipt belongs
+to the successor; the initial candidate is supplemental evidence.
+
+The live producer at `fed891c` passed using the signed pair built from `5ed7b25`.
+The receipt is
+`work/cnpg-permission-evidence-fed891c/evidence/permission-upgrade-evidence.json`.
+The normal `aps merge-evidence` consumer accepted it for the exact successor in
+`work/cnpg-permission-merged-fed891c/summary.json`: one covered check, fifteen
+missing checks, 43 missing reactor cases, and `releaseVerified: false`. This
+CNPG payload differs from the earlier eight-check package; those receipts must
+not be combined.

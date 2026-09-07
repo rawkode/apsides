@@ -130,14 +130,17 @@ establish narrower properties.
 ## Verified boundaries
 
 The CNPG example passed a local exact signed-candidate lifecycle rehearsal on
-kind through OrbStack at `207a405`: initial database readiness and application
+kind through OrbStack at `fed891c`: initial database readiness and application
 Secret creation, refusal of the permission expansion without registry changes,
 approved successor staging, writer retirement, activation and commit. PostgREST
 returned two database rows, then one after a ConfigMap update caused a new Pod,
 ReplicaSet and rollout revision while preserving the Deployment UID. Cleanup
 restored the previous cluster/container inventories and removed credentials.
-This is not a production acceptance receipt and does not qualify force-enabled
-custom-resource writes, Secret rotation or drift correction.
+The normal evidence merger accepted the permission-changing upgrade receipt for
+this exact successor: one of sixteen checks, with 43 reactor cases still missing.
+This receipt cannot be combined with the older eight-check package, which binds
+a different payload. Full production acceptance remains pending, as do
+force-enabled custom-resource writes, Secret rotation and drift correction.
 
 Automated suites cover strict schema and canonical replay, claim and metadata
 store immutability, registry concurrency, capacity accounting, review privacy,
