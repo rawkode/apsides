@@ -126,38 +126,44 @@ class CleanupEvidenceChecks(unittest.TestCase):
         with self.assertRaises(evidence.shared.QualificationError):
             evidence.validate_measurement(value)
 
-    def test_archive_requires_complete_crd_support_closure(self):
-        helper = "permission-upgrade-crd-support.py"
-        self.assertEqual(evidence.SOURCES.get(helper), "tests/reakt/run_cluster.py")
+    def test_archive_requires_complete_helper_closure(self):
+        helpers = {
+            "permission-upgrade-crd-support.py": "tests/reakt/run_cluster.py",
+            "permission-upgrade-sampling.py": "tests/reakt/performance/sampling.py",
+            "permission-upgrade-collector.py": "tests/reakt/performance/collect.py",
+        }
+        for helper, path in helpers.items():
+            self.assertEqual(evidence.SOURCES.get(helper), path)
         contents = {alias: path.encode() for alias, path in evidence.SOURCES.items()}
         frozen = {"producer/" + alias: evidence.shared.digest_bytes(raw) for alias, raw in contents.items()}
 
-        def archive(omit_helper=False):
+        def archive(omit_helper=None):
             stream = io.BytesIO()
             with tarfile.open(fileobj=stream, mode="w") as output:
                 for alias, path in evidence.SOURCES.items():
-                    if omit_helper and alias == helper:
+                    if alias == omit_helper:
                         continue
                     member = tarfile.TarInfo(path)
                     member.size = len(contents[alias])
                     output.addfile(member, io.BytesIO(contents[alias]))
             return stream.getvalue()
 
-        raw = archive()
-        with patch.object(evidence, "PRODUCER_ARCHIVE", evidence.shared.digest_bytes(raw)):
-            self.assertEqual(evidence.archive_sources(raw, frozen), contents)
-            for digest in [None, "sha256:" + "b" * 64]:
-                changed = dict(frozen)
-                if digest is None:
-                    del changed["producer/" + helper]
-                else:
-                    changed["producer/" + helper] = digest
-                with self.subTest(digest=digest), self.assertRaises(evidence.shared.QualificationError):
-                    evidence.archive_sources(raw, changed)
-        raw = archive(omit_helper=True)
-        with patch.object(evidence, "PRODUCER_ARCHIVE", evidence.shared.digest_bytes(raw)), \
-                self.assertRaises(evidence.shared.QualificationError):
-            evidence.archive_sources(raw, frozen)
+        for helper in helpers:
+            raw = archive()
+            with patch.object(evidence, "PRODUCER_ARCHIVE", evidence.shared.digest_bytes(raw)):
+                self.assertEqual(evidence.archive_sources(raw, frozen), contents)
+                for digest in [None, "sha256:" + "b" * 64]:
+                    changed = dict(frozen)
+                    if digest is None:
+                        del changed["producer/" + helper]
+                    else:
+                        changed["producer/" + helper] = digest
+                    with self.subTest(digest=digest), self.assertRaises(evidence.shared.QualificationError):
+                        evidence.archive_sources(raw, changed)
+            raw = archive(omit_helper=helper)
+            with patch.object(evidence, "PRODUCER_ARCHIVE", evidence.shared.digest_bytes(raw)), \
+                    self.assertRaises(evidence.shared.QualificationError):
+                evidence.archive_sources(raw, frozen)
 
     def test_archive_sources_reject_symlinks_duplicate_members_and_digest_drift(self):
         def archive(symlink=False, duplicate=False):

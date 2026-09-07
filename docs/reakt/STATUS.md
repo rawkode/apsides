@@ -137,12 +137,14 @@ establish narrower properties.
 
 The current signed CNPG candidate is `work/cnpg-signed-candidate-9b5097a`,
 which includes the observed-input watch correction. The fresh merger at
-`work/cnpg-nine-merged-35187dd` accepts **nine of sixteen checks and all 43
+`work/cnpg-twelve-merged-64f2b39` accepts **twelve of sixteen checks and all 43
 required reactor cases**. These are the three reactor checks, signed
 permission-changing upgrade, reproducible payload, declared-input isolation,
-fixture-promotion rejection, deployment-ceiling rejection, and ownership
-collision. `releaseVerified` remains false; seven checks still
-need matching evidence. Local qualification signers do not
+fixture-promotion rejection, deployment-ceiling rejection, ownership
+collision, last-type cleanup, finalizer preservation, and UID-replacement
+rejection. `releaseVerified` remains false. Scope-matched benchmark, phase
+interruption recovery, uncertain-writer blocking, and API-bound gap conformance
+still need matching evidence. Local qualification signers do not
 establish GitHub Actions identity or production release trust.
 
 The rebuilt fixture at `work/cnpg-reactor-native-820dd7c` passed all 43 required
@@ -183,6 +185,20 @@ Both harnesses deleted their owned clusters, removed both kubeconfigs, and
 confirmed exact preservation of the prior cluster and container inventories.
 These checks qualify reservation-time enforcement, not full deployment or
 production release trust.
+
+Fresh cleanup runs at `work/cnpg-finalizer-64f2b39` and
+`work/cnpg-replacement-64f2b39` upgraded the signed cleanup predecessor to the
+corrected successor. The finalizer run retained the original claim in Cleaning
+while deletion was blocked, then committed after removal of the finalizer and
+the pinned Backup. The replacement run rejected the new UID and retained the
+original claim in Cleaning. Both preserved an unclaimed same-type Backup and
+checked that the successor workload Role omitted Backup access. That Role
+inspection does not establish cluster-wide effective authorization. Both runs
+removed their clusters and credentials and restored prior host inventories.
+The reviewed adapter binds the original measurement bytes and all 15 producer
+sources; its eleven tests passed. Packaged receipts under
+`work/cnpg-cleanup-finalizer-receipt-64f2b39` and
+`work/cnpg-cleanup-replacement-receipt-64f2b39` passed the normal merger.
 
 The following qualification results belong to the **previous candidate**,
 `work/cnpg-signed-candidate-c6d67e0`. Its merger at
@@ -346,9 +362,8 @@ recovery, or production restore authority.
   supported Kubernetes versions, including the declared preview permissions and
   request-drain profile.
 - Complete scope-matched performance evidence under its production evidence
-  contract. Current-candidate workload readiness has passed its stated scope;
-  last-resource-type cleanup, UID replacement and finalizer receipts still belong
-  to the previous candidate and need fresh matching qualification.
+  contract. Current-candidate workload readiness, last-resource-type cleanup,
+  UID replacement and finalizer measurements have passed their stated scopes.
 - Define operator recovery for incompatible or corrupt protected state. Current
   schemas fail closed and do not infer missing authority or perform automatic
   conversion.
