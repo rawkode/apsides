@@ -79,6 +79,19 @@ signing, and this evidence does not qualify GitHub Actions trust.
 Independent review rehashed both artifact closures, source projection, policy,
 verifier and driver, and confirmed the receipt binds the current payload.
 
+Deployment-ceiling rejection passed at `fcf3e45` against the same signed CNPG
+candidate. The reservation harness installed only the exact declared Cluster CRD
+and pinned the existing `default` namespace in its owned kind cluster. The
+restricted ceiling rejected reservation without starting a writer; the positive
+control exercised reservation under the approved ceiling. The receipt and frozen
+CRD/source files are in `work/cnpg-deployment-ceiling-fcf3e45/evidence`.
+Independent review rehashed the candidate binding, seven archived sources, driver
+and CRD, and checked unchanged denied-state snapshots and the positive control.
+The cluster and credentials were removed, and the original cluster inventory was
+restored. The normal merger at `work/cnpg-seven-merged-fcf3e45/summary.json` accepts
+seven checks and all 43 cases, with nine checks missing and `releaseVerified:
+false`. This is reservation qualification, not a CNPG operator deployment.
+
 ## Combining measured evidence
 
 `reakt merge-evidence` combines explicit receipts against one structurally valid

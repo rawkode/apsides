@@ -203,6 +203,12 @@ six checks and all 43 cases, with ten checks missing and `releaseVerified: false
 The temporary private key was removed after signing. This local qualification
 does not establish GitHub Actions identity or full production release trust.
 
+Deployment-ceiling rejection passed for the same candidate at `fcf3e45`, using
+the exact declared CNPG CRD and an owned disposable kind cluster. No writer was
+started. Cleanup removed its cluster and credentials and preserved the two
+existing clusters. `work/cnpg-seven-merged-fcf3e45` covers seven checks and all 43
+cases; nine checks remain missing and `releaseVerified` is false.
+
 Automated suites cover strict schema and canonical replay, claim and metadata
 store immutability, registry concurrency, capacity accounting, review privacy,
 issued-client binding, preview request shape, UID-safe cleanup, finalizer retry,
