@@ -137,10 +137,11 @@ establish narrower properties.
 
 The current signed CNPG candidate is `work/cnpg-signed-candidate-9b5097a`,
 which includes the observed-input watch correction. The fresh merger at
-`work/cnpg-seven-merged-968224c` accepts **seven of sixteen checks and all 43
+`work/cnpg-nine-merged-35187dd` accepts **nine of sixteen checks and all 43
 required reactor cases**. These are the three reactor checks, signed
-permission-changing upgrade, reproducible payload, declared-input isolation, and
-fixture-promotion rejection. `releaseVerified` remains false; nine checks still
+permission-changing upgrade, reproducible payload, declared-input isolation,
+fixture-promotion rejection, deployment-ceiling rejection, and ownership
+collision. `releaseVerified` remains false; seven checks still
 need matching evidence. Local qualification signers do not
 establish GitHub Actions identity or production release trust.
 
@@ -170,6 +171,18 @@ signed production candidate and compiler fixture projection, then required the
 specific fixture-promotion rejection. It does not establish runtime behavior.
 The unsigned assembly at `work/cnpg-seven-assembled-968224c` passed both exact
 reproducibility and input-isolation evidence consumer tests.
+
+Fresh reservation qualification passed in
+`work/cnpg-deployment-ceiling-35187dd` and `work/cnpg-ownership-35187dd`.
+Removing a required capability rejected the exact candidate without changing
+protected state; restoring the ceiling allowed the same reservation. A distinct
+signed owner reserved `default/api-config`, and the corrected contender was
+rejected without state changes or a new runtime writer. The existing owner
+artifact was verified under its own trust policy; its binary was not executed.
+Both harnesses deleted their owned clusters, removed both kubeconfigs, and
+confirmed exact preservation of the prior cluster and container inventories.
+These checks qualify reservation-time enforcement, not full deployment or
+production release trust.
 
 The following qualification results belong to the **previous candidate**,
 `work/cnpg-signed-candidate-c6d67e0`. Its merger at
