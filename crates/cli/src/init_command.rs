@@ -143,7 +143,8 @@ const TYPESCRIPT_CONFIG: &str = r#"{
     "strict": true,
     "target": "ES2022"
   },
-  "include": ["program.tsx", ".aps/sdk/**/*.ts"]
+  "include": ["**/*.ts", "**/*.tsx"],
+  "exclude": ["node_modules", ".aps"]
 }
 "#;
 

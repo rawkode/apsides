@@ -5,6 +5,11 @@ import "github.com/cuenv/cuenv/schema"
 schema.#Project & {name: "apsides"}
 
 tasks: {
+	authoringEditorCheck: {
+		dependsOn: [build, install]
+		command: "python3"
+		args: ["tests/reakt/run_authoring_editor.py", "--aps", "target/debug/aps"]
+	}
 	packageCli: {command: "python3", args: ["scripts/reakt/package_cli.py", "--output", "work/aps-distribution", "--target-dir", "work/cli-package-target"]}
 	packageCliTest: {command: "python3", args: ["tests/reakt/test_package_cli.py"]}
 	cnpgDemoTest: {command: "python3", args: ["tests/reakt/test_cnpg_demo.py"]}

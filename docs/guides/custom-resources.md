@@ -24,6 +24,13 @@ target/debug/aps init --directory work/cnpg-authoring
 embedded SDK under `.aps/sdk/`. The generated `.aps/` directory is ignored by
 Git.
 
+Open the project directory in your editor. `tsconfig.json` supplies JSX and
+local SDK resolution to TypeScript editors, including additional `.ts` and
+`.tsx` modules. For the Deno language server, use the generated `deno.json`;
+in VS Code, install the Deno extension and run **Deno: Enable** for this workspace.
+Generated modules stay ignored but their imports remain available to the type
+checker and language server.
+
 ## Generate the typed component
 
 Fetch the CRD from the versioned `v1.30.0` tag and select its served `v1`
@@ -58,6 +65,23 @@ import { Cluster } from "./.aps/crds/cnpg.ts";
   }}
 />
 ```
+
+Completion works inside the component's `spec` and nested objects such as
+`storage`. You can also import the spec type when extracting configuration:
+
+```ts
+import type { ClusterSpec } from "./.aps/crds/cnpg.ts";
+
+const database = {
+  instances: 1,
+  storage: { size: "1Gi" },
+} satisfies ClusterSpec;
+```
+
+The generated types retain descriptions from the CRD for editor hover help.
+Misspelled fields and values of the wrong type produce TypeScript diagnostics.
+To exercise this through the actual Deno language server in a freshly
+initialized CNPG project, run `cuenv task authoringEditorCheck` from the repository.
 
 The factory owns `apiVersion`, `kind` and REST routing metadata; application JSX
 cannot replace them. A later Kubernetes server-side apply validates the object
