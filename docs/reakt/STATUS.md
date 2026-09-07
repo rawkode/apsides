@@ -136,10 +136,10 @@ establish narrower properties.
 ## Verified boundaries
 
 The current signed CNPG candidate is `work/cnpg-signed-candidate-c6d67e0`.
-The normal merger at `work/cnpg-fourteen-merged-1d68c7f` accepts **fourteen of
+The normal merger at `work/cnpg-fifteen-merged-7dacabb` accepts **fifteen of
 sixteen checks and all 43 required reactor cases** for that exact payload.
-`releaseVerified` remains false. The missing checks are scope-matched benchmark
-and phase-interruption recovery. The local qualification signers do not establish GitHub Actions identity or production release trust.
+`releaseVerified` remains false. The missing check is scope-matched benchmark.
+The local qualification signers do not establish GitHub Actions identity or production release trust.
 
 The matching native fixture passed all 43 required cases, all 46 fixture cases
 (including three reaction-removal controls), and all three reactor checks. Its
@@ -213,14 +213,20 @@ promoted as a complete release.
 A test-only interruption hook can pause after an exact validated registry CAS,
 allow the parent harness to inspect the protected phase, and remain parked until
 the owned child is killed and reaped. It is excluded from production builds.
-The six-phase live recovery matrix has passed for signed test candidates. Each
+The six-phase live recovery matrix at producer `7dacabb` passed against the
+current signed CNPG production payload. Each
 isolated run kills and reaps the parked deploy process, then uses a fresh issued
 client under the same executor binding to complete the recorded transition,
 publish inventory, verify repeated commit, and remove its cluster and credentials.
+The first three phases use authenticated checkpoint resolution before advancing
+the lifecycle; Activated, Cleaning and Committed replay the applicable operation.
+All six runs passed independent review, including their 83 frozen inputs,
+workload HTTP checks and ConfigMap-driven rollout. The aggregate receipt at
+`work/cnpg-phase-recovery-receipt-7dacabb` preserves the original measurements and
+passed the normal merger's `phase-interruption-recovery` check.
 This covers the validated post-CAS boundary of each phase. It does not prove
-within-phase interruption, transfer to a different CI executor, or recovery of a
-matching production release payload, and does not satisfy the production
-phase-recovery release check.
+within-phase interruption, uncertain stalled-executor takeover, transfer to a
+different principal, or GitHub Actions provenance.
 
 Inventory storage has passed a separate local-PV qualification with 2,220,976
 bytes of canonical metadata, exact history across Pods, one winner and one
@@ -267,11 +273,6 @@ recovery, or production restore authority.
 - Preserve the current payload binding when assembling the final release. Its
   permission-changing upgrade and cleanup receipts are accepted; a changed
   binary or compiler closure requires matching new measurements.
-- Qualify six post-CAS interruption boundaries against the exact production
-  payload. Terminate and reap the owned deploy process, then recover through a
-  fresh issued session under the same protected deployment identity and logical
-  owner. This does not establish within-phase recovery, uncertain stalled-job
-  takeover, transfer to another principal, or GitHub identity provenance.
 - Keep uncertain stalled-job takeover blocked. A lease, expired token or changed
   executor label alone does not establish that the previous executor cannot
   proceed. The spec includes the trusted deployment job in its trusted computing
