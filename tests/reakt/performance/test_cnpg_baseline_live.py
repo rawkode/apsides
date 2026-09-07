@@ -152,6 +152,64 @@ class BaselineLiveTests(unittest.TestCase):
                 live.demo.base.CeilingRunner.cleanup(runner)
             self.assertFalse(runner.admin.exists());self.assertFalse(runner.issuer.exists())
 
+    def collection_fixture(self, directory, *, completed=True, errors=False):
+        runner=self.runner(Path(directory));runner.workload='default'
+        runner.args=types.SimpleNamespace(performance_samples=3,performance_interval=5)
+        controllers={name:{'podUid':name,'metricsPath':'/api/v1/namespaces/default/pods/'+name+':8080/proxy/metrics'} for name in ['flux','reloader']}
+        runner.controller_bindings=Mock(return_value=controllers)
+        output=Path(directory)/'performance-active';output.mkdir()
+        if completed:
+            for index in range(3):
+                folder=output/f'sample-{index:04d}';folder.mkdir()
+                (folder/'sample.json').write_text(json.dumps({'elapsedSeconds':index*5,'collectionSeconds':0.1,'errors':[],
+                    'usage':[{'namespace':'default','podUid':name} for name in controllers]+[{'namespace':'cnpg-system','podUid':'cnpg'}]}))
+            (output/'summary.json').write_text(json.dumps({'schemaVersion':'reakt.dev/performance-samples/v1',
+                'samples':3,'errors':['failure'] if errors else [],'namespaces':['default','cnpg-system'],
+                'rawMetricPaths':[controllers[name]['metricsPath'] for name in sorted(controllers)]}))
+        process=Mock(pid=12345);process.poll.side_effect=[None,0,0];process.wait.return_value=0
+        return runner,controllers,process
+
+    def test_collection_requires_first_sample_and_post_action_sample(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner,controllers,process=self.collection_fixture(directory)
+            clock=[0.0]
+            def action():clock[0]=6;return 'changed'
+            with patch.object(live.os,'killpg') as killpg, patch.object(live.subprocess,'Popen',return_value=process) as launch, patch.object(live.time,'monotonic',side_effect=lambda:clock[0]):
+                self.assertEqual(runner.collection_window('active',controllers,action),'changed')
+            self.assertEqual(runner.checks[-1]['actionCompletedAfterLaunchSeconds'],6)
+            self.assertFalse(runner.checks[-1]['completeSection26'])
+            self.assertIn('--metrics-path',launch.call_args.args[0]);self.assertTrue(launch.call_args.kwargs['start_new_session']);process.wait.assert_called()
+
+    def test_collection_early_exit_never_runs_stimulus(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner,controllers,process=self.collection_fixture(directory,completed=False)
+            process.poll.side_effect=None;process.poll.return_value=0;action=Mock()
+            with patch.object(live.os,'killpg') as killpg, patch.object(live.subprocess,'Popen',return_value=process):
+                with self.assertRaisesRegex(live.shared.QualificationError,'first complete sample'):
+                    runner.collection_window('active',controllers,action)
+            action.assert_not_called();process.wait.assert_called()
+
+    def test_collection_action_error_terminates_and_reaps_before_return(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner,controllers,process=self.collection_fixture(directory)
+            process.poll.side_effect=None;process.poll.return_value=None
+            action=Mock(side_effect=RuntimeError('private action failure'))
+            process.wait.side_effect=[live.subprocess.TimeoutExpired('collector',10),0]
+            with patch.object(live.os,'killpg') as killpg, patch.object(live.subprocess,'Popen',return_value=process):
+                with self.assertRaises(RuntimeError):runner.collection_window('active',controllers,action)
+            self.assertEqual(killpg.call_args_list,[unittest.mock.call(12345,live.signal.SIGTERM),unittest.mock.call(12345,live.signal.SIGKILL)])
+            process.wait.assert_called_with(timeout=10)
+            self.assertEqual(runner.checks,[])
+
+    def test_collection_rejects_late_action_or_incomplete_summary(self):
+        for fault in ['late','errors']:
+            with self.subTest(fault=fault),tempfile.TemporaryDirectory() as directory:
+                runner,controllers,process=self.collection_fixture(directory,errors=fault=='errors');clock=[0.0]
+                def action():clock[0]=12 if fault=='late' else 1
+                with patch.object(live.os,'killpg') as killpg, patch.object(live.subprocess,'Popen',return_value=process),patch.object(live.time,'monotonic',side_effect=lambda:clock[0]):
+                    with self.assertRaises(live.shared.QualificationError):runner.collection_window('active',controllers,action)
+                self.assertEqual(runner.checks,[]);process.wait.assert_called()
+
     def test_http_startup_retries_only_transient_failures_with_same_identity(self):
         runner=object.__new__(live.BaselineRunner);expected={'podUid':'pod','replicaSetUid':'rs'}
         runner.workload_state=Mock(return_value=expected)

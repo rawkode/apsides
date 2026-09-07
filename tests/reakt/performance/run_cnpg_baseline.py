@@ -6,7 +6,9 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import sys
+import subprocess
 import tempfile
 import time
 import uuid
@@ -72,7 +74,8 @@ def identity(deployment, pods, replicasets):
         return None
     owner = next(o for o in pod["metadata"]["ownerReferences"] if o.get("controller") is True)
     return {"deploymentUid": uid, "podUid": pod["metadata"]["uid"], "replicaSetUid": owner["uid"],
-            "image": pod["spec"]["containers"][0]["image"], "imageId": statuses[0]["imageID"]}
+            "image": pod["spec"]["containers"][0]["image"], "imageId": statuses[0]["imageID"],
+            "containerId": statuses[0].get("containerID"), "restartCount": statuses[0]["restartCount"]}
 
 
 class BaselineRunner(demo.base.CeilingRunner):
@@ -103,7 +106,7 @@ class BaselineRunner(demo.base.CeilingRunner):
                         Path(preparation.generate.__file__).resolve(), Path(demo.__file__).resolve(),
                         Path(demo.base.__file__).resolve(), Path(shared.__file__).resolve(),
                         Path(demo.base.observations.__file__).resolve(), Path(demo.base.crds.__file__).resolve(),
-                        Path(__file__).parent / "pins.json"]
+                        Path(__file__).parent / "pins.json", Path(__file__).parent / "collect.py"]
         self.source_digests = {str(p.relative_to(ROOT)): shared.digest_file(p) for p in self.sources}
         self.input_digests = {}
 
@@ -239,6 +242,100 @@ class BaselineRunner(demo.base.CeilingRunner):
                 time.sleep(min(2, remaining))
         raise shared.QualificationError("PostgREST startup deadline exceeded")
 
+    def controller_bindings(self):
+        pods = json.loads(self.k("get", "pods", "-n", self.workload, "-o", "json"))["items"]
+        replicasets = json.loads(self.k("get", "replicasets", "-n", self.workload, "-o", "json"))["items"]
+        desired = json.loads(self.bundle["flux.json"])["items"]
+        result = {}
+        for name, port in [("benchmark-flux", 8080), ("benchmark-reloader", 9090)]:
+            deployment = json.loads(self.k("get", "deployment/" + name, "-n", self.workload, "-o", "json"))
+            current = identity(deployment, pods, replicasets)
+            expected = next(x for x in desired if x["kind"] == "Deployment" and x["metadata"]["name"] == name)
+            require(current is not None and bool(current["containerId"])
+                    and current["image"] == expected["spec"]["template"]["spec"]["containers"][0]["image"],
+                    "performance controller identity is not ready or differs from pin")
+            pod = next(x for x in pods if x["metadata"]["uid"] == current["podUid"])
+            result[name] = {**current, "metricsPath": f"/api/v1/namespaces/{self.workload}/pods/{pod['metadata']['name']}:{port}/proxy/metrics"}
+        return result
+
+    def collection_window(self, label, controllers, action=None):
+        """Run the existing collector; all timestamps use the host monotonic clock."""
+        require(self.controller_bindings() == controllers, "performance controller identity changed")
+        output = self.output / ("performance-" + label)
+        paths = [controllers[name]["metricsPath"] for name in sorted(controllers)]
+        command = [sys.executable, str(Path(__file__).parent / "collect.py"), "--kubeconfig", str(self.admin),
+                   "--output", str(output), "--label", "cnpg-baseline-" + label,
+                   "--namespace", "default", "--namespace", "cnpg-system",
+                   "--samples", str(self.args.performance_samples), "--interval", str(self.args.performance_interval)]
+        for path in paths:
+            command += ["--metrics-path", path]
+        launched = time.monotonic()
+        deadline = launched + self.args.performance_samples * (self.args.performance_interval + 120) + 60
+        process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            first = output / "sample-0000" / "sample.json"
+            while True:
+                require(time.monotonic() < deadline, "performance collector exceeded deadline")
+                try:
+                    sample = json.loads(read(first)) if first.exists() and first.stat().st_size else None
+                except json.JSONDecodeError:
+                    sample = None
+                if sample is not None:
+                    require(not sample["errors"] and sample["collectionSeconds"] >= 0, "first performance sample failed")
+                    break
+                require(process.poll() is None, "performance collector ended before first complete sample")
+                time.sleep(0.2)
+            require(process.poll() is None, "performance collector ended before stimulus")
+            require(self.controller_bindings() == controllers, "performance controller identity changed")
+            action_started = time.monotonic() - launched if action else None
+            result = action() if action else None
+            action_ended = time.monotonic() - launched if action else None
+            require(self.controller_bindings() == controllers, "performance controller identity changed")
+            while process.poll() is None:
+                require(time.monotonic() < deadline, "performance collector exceeded deadline")
+                time.sleep(1)
+            require(process.wait(timeout=10) == 0, "performance collector failed")
+            require(self.controller_bindings() == controllers, "performance controller identity changed")
+            summary = json.loads(read(output / "summary.json"))
+            samples = [json.loads(read(output / f"sample-{index:04d}" / "sample.json"))
+                       for index in range(self.args.performance_samples)]
+            require(summary["schemaVersion"] == "reakt.dev/performance-samples/v1"
+                    and summary["samples"] == self.args.performance_samples and not summary["errors"]
+                    and summary["namespaces"] == ["default", "cnpg-system"] and summary["rawMetricPaths"] == paths
+                    and all(not sample["errors"] for sample in samples), "performance collection is incomplete")
+            require(len(list(output.glob("sample-*/sample.json"))) == self.args.performance_samples
+                    and all({row["namespace"] for row in sample["usage"]} >= {"default", "cnpg-system"}
+                            and {row["podUid"] for row in sample["usage"]} >= {item["podUid"] for item in controllers.values()}
+                            for sample in samples), "performance population is incomplete")
+            require(all(b["elapsedSeconds"] > a["elapsedSeconds"] for a, b in zip(samples, samples[1:])),
+                    "performance sample timestamps are not increasing")
+            if action:
+                # Child collection starts after launch; this conservative inequality
+                # proves at least one sample started after the completed reaction.
+                require(action_ended < samples[-1]["elapsedSeconds"], "reaction completed outside sampled interval")
+            self.checks.append({"check": "performance-" + label, "directory": output.name,
+                                "samples": len(samples), "controllers": controllers,
+                                "observer": {"controllerIdentityChecks": 4, "kubectlGetsPerIdentityCheck": 4,
+                                             "identityPolling": False, "apiRateIncludesObserverTraffic": True},
+                                "actionStartedAfterLaunchSeconds": action_started,
+                                "actionCompletedAfterLaunchSeconds": action_ended,
+                                "completeSection26": False})
+            return result
+        finally:
+            # The collector invokes kubectl children. Stop the entire session-owned
+            # group, including children left behind if the collector already exited.
+            for sig in [signal.SIGTERM, signal.SIGKILL]:
+                try:
+                    os.killpg(process.pid, sig)
+                except ProcessLookupError:
+                    pass
+                if sig == signal.SIGTERM:
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        pass
+            process.wait(timeout=10)
+
     def measure(self):
         self.phase = "initial-readiness"
         initial = self.ready()
@@ -246,10 +343,20 @@ class BaselineRunner(demo.base.CeilingRunner):
         expected_image = next(x["spec"]["template"]["spec"]["containers"][0]["image"] for x in desired if x["kind"] == "Deployment")
         require(initial["image"] == expected_image, "workload image differs from prepared candidate")
         self.checks.append({"check": self.phase, "identity": initial, "http": self.wait_http(2, initial)})
-        self.phase = "configmap-reaction"
-        self.apply({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "api-settings", "namespace": self.workload}, "data": {"PGRST_DB_MAX_ROWS": "1"}})
-        changed = self.ready(initial)
-        self.checks.append({"check": self.phase, "identity": changed, "http": self.wait_http(1, changed)})
+        def change_configmap():
+            self.phase = "configmap-reaction"
+            self.apply({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "api-settings", "namespace": self.workload}, "data": {"PGRST_DB_MAX_ROWS": "1"}})
+            changed = self.ready(initial)
+            self.checks.append({"check": self.phase, "identity": changed, "http": self.wait_http(1, changed)})
+            return changed
+        if getattr(self.args, "collect_performance", False):
+            controllers = self.controller_bindings()
+            self.phase = "performance-idle"
+            self.collection_window("idle", controllers)
+            self.phase = "performance-active"
+            changed = self.collection_window("active", controllers, change_configmap)
+        else:
+            changed = change_configmap()
         self.phase = "equal-value-update"
         cm = json.loads(self.k("get", "configmap/api-settings", "-n", self.workload, "-o", "json"))
         patch = [{"op": "test", "path": "/metadata/uid", "value": cm["metadata"]["uid"]},
@@ -355,7 +462,12 @@ def main():
         parser.add_argument("--" + flag, type=Path, required=True)
     parser.add_argument("--flux-crd", type=Path, action="append", required=True)
     parser.add_argument("--equal-observation-seconds", type=int, default=30)
+    parser.add_argument("--collect-performance", action="store_true")
+    parser.add_argument("--performance-samples", type=int, default=13)
+    parser.add_argument("--performance-interval", type=float, default=5)
     args = parser.parse_args()
+    if not 3 <= args.performance_samples <= 61 or not 1 <= args.performance_interval <= 10:
+        parser.error("performance samples must be 3..61 and interval 1..10 seconds")
     if not 30 <= args.equal_observation_seconds <= 300:
         parser.error("equal observation must be between 30 and 300 seconds")
     try:

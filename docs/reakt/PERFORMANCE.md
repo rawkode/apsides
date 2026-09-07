@@ -122,6 +122,20 @@ image import normalization and transient PostgREST startup HTTP 503 handling.
 This establishes workload prerequisites only; paired performance, relist storms,
 cache measurements and increasing-domain results remain pending.
 
+Add `--collect-performance` to collect an idle window and a ConfigMap-change
+window with the existing collector. `--performance-samples` (default 13) and
+`--performance-interval` (default 5 seconds) configure both windows. Collection
+includes `default` and `cnpg-system`, plus the exact Flux and Reloader Pod metrics
+endpoints. A completed sample must precede the change and a sample must follow
+its completion. Collector failures or controller identity changes reject the
+window. These baseline samples still require a matching native run and analysis;
+they do not close the benchmark gate. Retain replaced application-container
+accounting as unavailable rather than treating the endpoint CPU delta as a full
+active-window total.
+Each window also performs four controller-identity checks of four Kubernetes GETs
+each. API request rates include these checks and collection traffic; the native
+comparison must account for equivalent observer overhead.
+
 Reloader publishes an unkeyed Secret hash in its runtime rollout annotation;
 Apsides uses an aggregate keyed revision. Do not retain that annotation, live
 Deployment templates, Secret values or Secret hashes in benchmark artifacts.
