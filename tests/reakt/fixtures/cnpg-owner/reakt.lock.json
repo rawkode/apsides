@@ -1,0 +1,10 @@
+{
+  "entry": "program.tsx",
+  "inputs": [
+    {
+      "path": "program.tsx",
+      "sha256": "dc958dfc4b845f75dd64d817dd66affd6a8709bf79fe446a5a35f8bcc7df5840"
+    }
+  ],
+  "schemaVersion": "reakt.dev/source-lock/v1"
+}

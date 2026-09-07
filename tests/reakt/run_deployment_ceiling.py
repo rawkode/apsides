@@ -14,6 +14,7 @@ import time
 
 import run_reproducibility as shared
 import ceiling_observations as observations
+import run_cluster as crds
 
 ROOT = Path(__file__).resolve().parents[2]
 NODE = "kindest/node:v1.34.3@sha256:08497ee19eace7b4b5348db5c6a1591d7752b164530a36f855cb0f2bdcbadd48"
@@ -84,6 +85,21 @@ def unchanged_except(before, after, allowed):
         raise shared.QualificationError("ceiling experiment changed an unapproved Kubernetes object")
 
 
+def managed_target(resource):
+    builtins = {("v1", "ConfigMap"): ("", "configmaps"), ("v1", "Service"): ("", "services"),
+                ("apps/v1", "Deployment"): ("apps", "deployments")}
+    mapping = builtins.get((resource.get("apiVersion"), resource.get("kind")))
+    if mapping is None:
+        descriptor = resource.get("apiResource", {})
+        version = resource.get("apiVersion", "")
+        if (descriptor.get("scope") != "Namespaced" or not shared.valid_digest(descriptor.get("schemaSha256"))
+                or not isinstance(version, str) or version.count("/") != 1
+                or not isinstance(descriptor.get("plural"), str) or not descriptor["plural"]):
+            raise shared.QualificationError("managed resource lacks an exact namespaced API mapping")
+        mapping = (version.split("/", 1)[0], descriptor["plural"])
+    return {"namespace": resource["namespace"], "apiGroup": mapping[0], "resource": mapping[1], "name": resource["name"]}
+
+
 def public_snapshot(value):
     return {key: value[key] for key in ["objects", "coordination", "inventory"]}
 
@@ -117,9 +133,13 @@ class CeilingRunner:
         self.steps = []
         self.failures = []
         self.primary_failure = None
+        self.crd_manifests = list(getattr(args, "crd_manifest", []))
+        self.crd_snapshots = []
+        self.crd_installations = []
         self.phase = "prepare"
         self.sources = [Path(__file__).resolve(), Path(shared.__file__).resolve(),
-                        Path(observations.__file__).resolve(), ROOT / "crates/platform/tests/deployment_ceiling.rs"]
+                        Path(observations.__file__).resolve(), Path(crds.__file__).resolve(),
+                        ROOT / "crates/platform/tests/deployment_ceiling.rs"]
         self.sources += sorted((ROOT / "crates/platform/tests/support").glob("deployment_ceiling*.rs"))
         self.sources.append(ROOT / "crates/platform/tests/support/qualification_driver.rs")
         self.driver_error_reasons = set(re.findall(r'DriverError\(\s*"([a-zA-Z0-9 -]+)"',
@@ -226,6 +246,73 @@ class CeilingRunner:
         if self.docker_identity() != self.docker_binding:
             raise shared.QualificationError("Docker context or daemon changed")
 
+    def crd_resources(self):
+        return self.plan["ir"]["resources"]
+
+    def snapshot_crds(self):
+        if len(self.crd_manifests) > 16:
+            raise shared.QualificationError("too many reservation CRD manifests")
+        for index, path in enumerate(self.crd_manifests):
+            if path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= 4 * 1024 * 1024:
+                raise shared.QualificationError("reservation CRD manifest is not a bounded regular file")
+            raw = path.read_bytes()
+            if len(raw) > 4 * 1024 * 1024:
+                raise shared.QualificationError("reservation CRD manifest grew beyond its bound")
+            name = f"reservation-crd-{index}.yaml"
+            snapshot = {"source": path, "file": name, "digest": shared.digest_bytes(raw),
+                        "documents": crds.parse_crd_yaml(raw, ROOT)}
+            self.crd_snapshots.append(snapshot)
+            (self.output / name).write_bytes(raw)
+        crds.validate_crd_documents({"resources": self.crd_resources()}, [
+            (item["digest"], item["documents"]) for item in self.crd_snapshots])
+
+    def verify_crds(self):
+        for item in self.crd_snapshots:
+            if (shared.digest_file(item["source"]) != item["digest"]
+                    or shared.digest_file(self.output / item["file"]) != item["digest"]):
+                raise shared.QualificationError("reservation CRD manifest changed")
+
+    def install_crds(self):
+        self.verify_crds()
+        for snapshot in self.crd_snapshots:
+            for document in snapshot["documents"]:
+                self.k("apply", "--server-side", "--field-manager=aps-reservation-crds", "-f", "-",
+                       data=json.dumps(document))
+                name = document["metadata"]["name"]
+                self.k("wait", "--for=condition=Established", "crd/" + name, "--timeout=120s")
+                installed = json.loads(self.k("get", "crd", name, "-o", "json"))
+                metadata = installed.get("metadata", {})
+                if metadata.get("name") != name or not metadata.get("uid") or metadata.get("deletionTimestamp"):
+                    raise shared.QualificationError("reservation CRD installation identity is invalid")
+                self.crd_installations.append({"name": name, "uid": metadata["uid"],
+                                               "sourceFile": snapshot["file"], "sourceDigest": snapshot["digest"]})
+        self.verify_crds()
+
+    def publish_crds(self, evidence, prefix=""):
+        self.verify_crds()
+        names = []
+        for item in self.crd_snapshots:
+            name = prefix + item["file"]
+            shutil.copyfile(self.output / item["file"], evidence / name)
+            if shared.digest_file(evidence / name) != item["digest"]:
+                raise shared.QualificationError("staged reservation CRD differs from the measured manifest")
+            names.append("evidence/" + name)
+        return names
+
+    def namespace_uid(self, name):
+        if not self.owned:
+            raise shared.QualificationError("namespace binding requires an owned cluster")
+        if name == self.workload == "default":
+            namespace = json.loads(self.k("get", "namespace", name, "-o", "json"))
+        else:
+            namespace = self.create({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": name}})
+        metadata = namespace.get("metadata", {})
+        if (namespace.get("kind") != "Namespace" or metadata.get("name") != name
+                or not isinstance(metadata.get("uid"), str) or not metadata["uid"]
+                or metadata.get("deletionTimestamp")):
+            raise shared.QualificationError("namespace binding has an invalid identity")
+        return metadata["uid"]
+
     def create_cluster(self):
         self.docker_context = self.command(["docker", "context", "show"]).strip()
         if not self.docker_context or len(self.docker_context) > 256:
@@ -255,7 +342,7 @@ class CeilingRunner:
         self.host_identity = observations.validate_kind_target(node, containers[0], self.cluster, NODE, self.node_image_id)
         namespaces = {}
         for name in [self.control, self.workload, self.cluster]:
-            namespaces[name] = self.create({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": name}})["metadata"]["uid"]
+            namespaces[name] = self.namespace_uid(name)
         system = json.loads(self.k("get", "namespace", "kube-system", "-o", "json"))
         self.target = {"runId": self.cluster.removeprefix("reakt-qual-"),
                        "kubeSystemNamespaceUid": system["metadata"]["uid"],
@@ -382,11 +469,7 @@ class CeilingRunner:
             raise shared.QualificationError("unknown creation target projection")
         # None requests only the candidate's declared resource absence check.
         targets = [] if prepared is None else list(prepared["creationTargets"])
-        kinds = {"ConfigMap": ("", "configmaps"), "Service": ("", "services"), "Deployment": ("apps", "deployments")}
-        for resource in self.plan["ir"]["resources"]:
-            group, plural = kinds[resource["kind"]]
-            targets.append({"namespace": resource["namespace"], "apiGroup": group,
-                            "resource": plural, "name": resource["name"]})
+        targets.extend(managed_target(resource) for resource in self.plan["ir"]["resources"])
         for target in targets:
             if target["namespace"] not in {self.control, self.workload}:
                 raise shared.QualificationError("creation target escaped candidate namespaces")
@@ -498,12 +581,14 @@ class CeilingRunner:
 
     def publish(self):
         self.verify_docker()
+        self.verify_crds()
         if (shared.source_state(Path(__file__).resolve()) != (self.repository, self.commit)
                 or any(shared.digest_file(path) != self.source_digests[path.name] for path in self.sources)
                 or self.step("verify", "verified") != self.verified
                 or shared.digest_file(self.driver) != self.driver_digest):
             raise shared.QualificationError("ceiling subject or measurement code changed")
-        measurement_bytes = shared.canonical({**self.measurement, "clusterDeleted": True,
+        measurement_bytes = shared.canonical({**self.measurement, "customResourceDefinitions": [
+                {**item, "sourceFile": "evidence/" + item["sourceFile"]} for item in self.crd_installations], "clusterDeleted": True,
             "credentialsRemoved": not self.admin.exists() and not self.issuer.exists()})
         if len(measurement_bytes) > shared.MAX_EVIDENCE_BYTES or any(path.stat().st_size > shared.MAX_EVIDENCE_BYTES for path in self.sources):
             raise shared.QualificationError("ceiling evidence exceeds its size limit")
@@ -513,6 +598,7 @@ class CeilingRunner:
             shutil.copyfile(path, evidence / path.name)
             if shared.digest_file(evidence / path.name) != self.source_digests[path.name]:
                 raise shared.QualificationError("staged ceiling source differs from measured source")
+        crd_files = self.publish_crds(evidence)
         (evidence / "deployment-ceiling-measurement.json").write_bytes(measurement_bytes)
         manifest = self.manifest
         receipt = {"schemaVersion": shared.SCHEMA, "irDigest": manifest["irDigest"], "compilerDigest": manifest["compilerDigest"],
@@ -523,7 +609,7 @@ class CeilingRunner:
                    "checks": {"deployment-ceiling-rejection": {"status": "passed", "assertions": [
                        {"checkId": name, "expected": value, "actual": value, "passed": True}
                        for name, value in [("above-ceiling-rejected", True), ("next-writer-started", False)]],
-                       "evidenceFiles": ["evidence/deployment-ceiling-measurement.json", *["evidence/" + path.name for path in self.sources]]}}}
+                       "evidenceFiles": ["evidence/deployment-ceiling-measurement.json", *["evidence/" + path.name for path in self.sources], *crd_files]}}}
         (evidence / "deployment-ceiling-evidence.json").write_bytes(shared.canonical(receipt))
         return evidence
 
@@ -536,14 +622,17 @@ def main(runner_class=None, extra_arguments=()):
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ["artifact", "trust-policy", "output", *extra_arguments]:
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--crd-manifest", type=Path, action="append", default=[])
     args = parser.parse_args()
     runner = None
     try:
         runner = (runner_class or CeilingRunner)(args)
         try:
             runner.prepare()
+            runner.snapshot_crds()
             runner.phase = "cluster-create"
             runner.create_cluster()
+            runner.install_crds()
             runner.phase = "bootstrap"
             runner.bootstrap()
             runner.phase = "measurement"

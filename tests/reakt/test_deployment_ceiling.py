@@ -212,6 +212,92 @@ class PolicyAndSnapshotTests(unittest.TestCase):
             }), "binding-uid")
 
 
+class CustomResourceReservationTests(unittest.TestCase):
+    def resource(self):
+        return {"apiVersion": "postgresql.cnpg.io/v1", "kind": "Cluster", "name": "database", "namespace": "default",
+                "apiResource": {"plural": "clusters", "scope": "Namespaced", "schemaSha256": DIGEST}}
+
+    def test_absence_uses_declared_plural_and_group(self):
+        runner = object.__new__(CEILING.CeilingRunner)
+        runner.plan = {"ir": {"resources": [self.resource()]}}
+        runner.control, runner.workload = "apsides-system", "default"
+        runner.k = mock.Mock(return_value="")
+        runner.assert_targets_absent(None)
+        runner.k.assert_called_once_with("get", "clusters.postgresql.cnpg.io", "database", "-n", "default", "--ignore-not-found", "-o", "name")
+        runner.k.return_value = "cluster.postgresql.cnpg.io/database"
+        with self.assertRaisesRegex(CEILING.shared.QualificationError, "object exists"):
+            runner.assert_targets_absent(None)
+        for changes in [{"apiResource": {}}, {"apiResource": {"plural": "clusters", "scope": "Cluster", "schemaSha256": DIGEST}},
+                        {"apiVersion": "v1"}]:
+            with self.assertRaisesRegex(CEILING.shared.QualificationError, "exact namespaced API mapping"):
+                CEILING.managed_target({**self.resource(), **changes})
+
+    def test_default_namespace_is_read_only_after_cluster_ownership_and_uid_is_pinned(self):
+        runner = object.__new__(CEILING.CeilingRunner)
+        runner.workload = "default"
+        runner.owned = False
+        runner.k = mock.Mock(return_value=json.dumps({"kind": "Namespace", "metadata": {"name": "default", "uid": "default-uid"}}))
+        runner.create = mock.Mock()
+        with self.assertRaisesRegex(CEILING.shared.QualificationError, "owned cluster"):
+            runner.namespace_uid("default")
+        runner.k.assert_not_called()
+        runner.owned = True
+        self.assertEqual(runner.namespace_uid("default"), "default-uid")
+        runner.create.assert_not_called()
+        runner.k.assert_called_once_with("get", "namespace", "default", "-o", "json")
+        for metadata in [{"name": "default"}, {"name": "other", "uid": "uid"},
+                         {"name": "default", "uid": "uid", "deletionTimestamp": "now"}]:
+            runner.k.return_value = json.dumps({"kind": "Namespace", "metadata": metadata})
+            with self.assertRaisesRegex(CEILING.shared.QualificationError, "invalid identity"):
+                runner.namespace_uid("default")
+        runner.create.return_value = {"kind": "Namespace", "metadata": {"name": "apsides-system", "uid": "control-uid"}}
+        self.assertEqual(runner.namespace_uid("apsides-system"), "control-uid")
+        runner.create.assert_called_once()
+
+    def crd(self):
+        return {"apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+                "metadata": {"name": "clusters.postgresql.cnpg.io"}, "spec": {"group": "postgresql.cnpg.io",
+                "scope": "Namespaced", "names": {"kind": "Cluster", "plural": "clusters"},
+                "versions": [{"name": "v1", "served": True, "storage": True,
+                              "schema": {"openAPIV3Schema": {"type": "object"}}}]}}
+
+    def test_crd_missing_mismatch_and_post_snapshot_drift_reject(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = object.__new__(CEILING.CeilingRunner)
+            runner.output = Path(directory)
+            runner.crd_manifests, runner.crd_snapshots, runner.crd_installations = [], [], []
+            resource = self.resource()
+            runner.plan = {"ir": {"resources": [resource]}}
+            with self.assertRaisesRegex(RuntimeError, "exact local CRD"):
+                runner.snapshot_crds()
+            path = runner.output / "input.yaml"
+            path.write_bytes(CEILING.shared.canonical(self.crd()))
+            runner.crd_manifests = [path]
+            with mock.patch.object(CEILING.crds, "parse_crd_yaml", return_value=[self.crd()]):
+                with self.assertRaisesRegex(RuntimeError, "declared schema"):
+                    runner.snapshot_crds()
+                resource["apiResource"]["schemaSha256"] = CEILING.shared.digest_file(path)
+                runner.crd_snapshots = []
+                runner.snapshot_crds()
+            runner.verify_crds()
+            path.write_text("changed")
+            with self.assertRaisesRegex(CEILING.shared.QualificationError, "manifest changed"):
+                runner.verify_crds()
+
+    def test_crd_installation_is_admin_ssa_and_does_not_modify_runtime_policy(self):
+        runner = object.__new__(CEILING.CeilingRunner)
+        runner.verify_crds = mock.Mock()
+        runner.crd_snapshots = [{"file": "reservation-crd-0.yaml", "digest": DIGEST, "documents": [self.crd()]}]
+        runner.crd_installations = []
+        runner.policy = {"unchanged": True}
+        runner.k = mock.Mock(side_effect=["", "", json.dumps({"metadata": {"name": "clusters.postgresql.cnpg.io", "uid": "crd-uid"}})])
+        runner.install_crds()
+        self.assertEqual(runner.k.call_args_list[0], mock.call("apply", "--server-side", "--field-manager=aps-reservation-crds", "-f", "-", data=json.dumps(self.crd())))
+        self.assertEqual(runner.k.call_args_list[1], mock.call("wait", "--for=condition=Established", "crd/clusters.postgresql.cnpg.io", "--timeout=120s"))
+        self.assertEqual(runner.policy, {"unchanged": True})
+        self.assertEqual(runner.crd_installations[0]["uid"], "crd-uid")
+
+
 class CleanupTests(unittest.TestCase):
     def test_command_pins_docker_context_and_scrubs_ambient_endpoint(self):
         runner = CEILING.CeilingRunner.__new__(CEILING.CeilingRunner)
@@ -398,6 +484,12 @@ class FailureTests(unittest.TestCase):
                 def prepare(self):
                     return None
 
+                def snapshot_crds(self):
+                    return None
+
+                def install_crds(self):
+                    return None
+
                 def create_cluster(self):
                     return None
 
@@ -453,6 +545,12 @@ class FailureTests(unittest.TestCase):
                     self.issuer.write_text("issuer-secret")
 
                 def prepare(self):
+                    return None
+
+                def snapshot_crds(self):
+                    return None
+
+                def install_crds(self):
                     return None
 
                 def create_cluster(self):

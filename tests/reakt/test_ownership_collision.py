@@ -162,5 +162,16 @@ class AbsenceTests(unittest.TestCase):
             runner.assert_all_absent(prepared, prepared)
 
 
+class CustomResourcePairTests(unittest.TestCase):
+    def test_crd_validation_includes_contender_when_owner_only_manages_configmap(self):
+        runner = object.__new__(collision.CollisionRunner)
+        owner = {"kind": "ConfigMap", "name": "api-config"}
+        contender = {"kind": "Cluster", "name": "database"}
+        runner.owner_plan = {"ir": {"resources": [owner]}}
+        runner.contender_plan = {"ir": {"resources": [contender]}}
+        runner.plan = runner.owner_plan
+        self.assertEqual(runner.crd_resources(), [owner, contender])
+
+
 if __name__ == "__main__":
     unittest.main()

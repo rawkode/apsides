@@ -111,6 +111,9 @@ class CollisionRunner(base.CeilingRunner):
         self.plan = self.owner_plan
         self.verified = {"releaseDigest": self.pair["ownerReleaseDigest"]}
 
+    def crd_resources(self):
+        return [*self.owner_plan["ir"]["resources"], *self.contender_plan["ir"]["resources"]]
+
     def step(self, action, expected, kubeconfig=None, **extra):
         settings = {"action": action, "ownerArtifact": str(self.owner_artifact), "ownerTrustPolicy": str(self.owner_trust),
                     "contenderArtifact": str(self.artifact), "contenderTrustPolicy": str(self.trust), **extra}
@@ -254,11 +257,13 @@ class CollisionRunner(base.CeilingRunner):
 
     def publish(self):
         self.verify_docker()
+        self.verify_crds()
         if (shared.source_state(Path(__file__).resolve()) != (self.repository, self.commit)
                 or any(shared.digest_file(path) != self.source_digests[path.name] for path in self.sources)
                 or self.step("verify", "verified-pair") != self.pair or shared.digest_file(self.driver) != self.driver_digest):
             raise shared.QualificationError("collision subjects or measurement source changed")
-        payload = shared.canonical({**self.measurement, "clusterDeleted": True, "credentialsRemoved": not self.admin.exists() and not self.issuer.exists()})
+        payload = shared.canonical({**self.measurement, "customResourceDefinitions": [
+                {**item, "sourceFile": "evidence/ownership-collision-" + item["sourceFile"]} for item in self.crd_installations], "clusterDeleted": True, "credentialsRemoved": not self.admin.exists() and not self.issuer.exists()})
         if len(payload) > shared.MAX_EVIDENCE_BYTES or any(path.stat().st_size > shared.MAX_EVIDENCE_BYTES for path in self.sources):
             raise shared.QualificationError("collision evidence exceeds size limit")
         evidence = self.output / "evidence"
@@ -267,6 +272,7 @@ class CollisionRunner(base.CeilingRunner):
             shutil.copyfile(path, evidence / self.archives[path])
             if shared.digest_file(evidence / self.archives[path]) != self.source_digests[path.name]:
                 raise shared.QualificationError("staged collision source differs from measured source")
+        crd_files = self.publish_crds(evidence, prefix="ownership-collision-")
         (evidence / "ownership-collision-measurement.json").write_bytes(payload)
         receipt = {"schemaVersion": shared.SCHEMA, "irDigest": self.manifest["irDigest"], "compilerDigest": self.manifest["compilerDigest"],
                    "binaryDigest": self.manifest["binaryDigest"], "image": self.manifest["image"],
@@ -276,7 +282,7 @@ class CollisionRunner(base.CeilingRunner):
                    "checks": {"ownership-collision": {"status": "passed", "assertions": [
                        {"checkId": key, "expected": value, "actual": value, "passed": True}
                        for key, value in [("claim-collision-rejected", True), ("next-writer-started", False)]],
-                       "evidenceFiles": ["evidence/ownership-collision-measurement.json", *["evidence/" + self.archives[path] for path in self.sources]]}}}
+                       "evidenceFiles": ["evidence/ownership-collision-measurement.json", *["evidence/" + self.archives[path] for path in self.sources], *crd_files]}}}
         (evidence / "ownership-collision-evidence.json").write_bytes(shared.canonical(receipt))
         return evidence
 

@@ -299,6 +299,7 @@ class CnpgDemoRunner(base.CeilingRunner):
         source_names = {
             Path(__file__).resolve(): "permission-upgrade-runner.py",
             Path(base.__file__).resolve(): "permission-upgrade-cluster-base.py",
+            Path(base.crds.__file__).resolve(): "permission-upgrade-crd-support.py",
             Path(shared.__file__).resolve(): "permission-upgrade-shared.py",
             Path(base.observations.__file__).resolve(): "permission-upgrade-observations.py",
             canary: "permission-upgrade-proxy-canary.py",
@@ -312,7 +313,7 @@ class CnpgDemoRunner(base.CeilingRunner):
             source_names[path] = "permission-upgrade-" + path.name
         if set(source_names) != set(self.pair_sources) | {
                 Path(base.__file__).resolve(), Path(shared.__file__).resolve(),
-                Path(base.observations.__file__).resolve(), canary}:
+                Path(base.observations.__file__).resolve(), Path(base.crds.__file__).resolve(), canary}:
             raise shared.QualificationError("permission upgrade source closure is incomplete")
         if len(set(source_names.values())) != len(source_names):
             raise shared.QualificationError("permission upgrade source archive names collide")
