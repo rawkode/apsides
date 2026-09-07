@@ -17,6 +17,23 @@ import run_cnpg_demo as demo
 shared = demo.shared
 
 
+def pull_diagnostic(pod, events):
+    """Project only closed classifications; never persist Kubernetes messages."""
+    statuses = (pod or {}).get('status', {}).get('containerStatuses', [])
+    waiting = {s.get('state', {}).get('waiting', {}).get('reason') for s in statuses}
+    messages = [e.get('message', '').lower() for e in events
+                if pod and e.get('involvedObject', {}).get('uid') == pod['metadata']['uid']]
+    return {
+        'podPresent': pod is not None,
+        'imagePullError': bool(waiting & {'ErrImagePull', 'ImagePullBackOff'}),
+        'authenticationRequired': any('no basic auth credentials' in m for m in messages),
+        'http401': any('401 unauthorized' in m or '401 (unauthorized)' in m or 'unexpected status: 401' in m for m in messages),
+        'certificateError': any('x509:' in m for m in messages),
+        'dnsError': any('no such host' in m for m in messages),
+        'connectionRefused': any('connection refused' in m for m in messages),
+    }
+
+
 def require(ok, reason):
     if not ok:
         raise shared.QualificationError(reason)
@@ -45,6 +62,7 @@ class PrivatePullRunner(demo.CnpgDemoRunner):
         args.check_input_reactions = False
         self.registry = registry
         super().__init__(args)
+        self.failure_reasons.add('private registry authentication rejection was not observed')
         source = Path(__file__).resolve()
         require(shared.source_state(source) == (self.repository, self.commit), 'private pull source is not frozen')
         self.sources.append(source)
@@ -114,12 +132,16 @@ class PrivatePullRunner(demo.CnpgDemoRunner):
         deadline = time.monotonic()+180
         while True:
             _, pod = self.pinned_workload(name, binding)
+            events = []
             if pod:
                 events = json.loads(self.k('get', 'events', '-n', self.control, '-o', 'json'))['items']
                 result = authentication_failure(pod, events, previous)
                 if result:
                     return result
-            require(time.monotonic() < deadline, 'private registry authentication rejection was not observed')
+            if time.monotonic() >= deadline:
+                (self.output / 'private-pull-diagnostic.json').write_bytes(
+                    shared.canonical({'phase': self.phase, **pull_diagnostic(pod, events)}))
+                raise shared.QualificationError('private registry authentication rejection was not observed')
             time.sleep(2)
 
     def secret(self):

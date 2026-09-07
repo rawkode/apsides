@@ -8,6 +8,23 @@ import run_private_pull as p
 
 
 class PrivatePullTests(unittest.TestCase):
+    def test_diagnostic_does_not_copy_private_messages(self):
+        pod = {'metadata': {'uid': 'pod'}, 'status': {'containerStatuses': [
+            {'state': {'waiting': {'reason': 'ImagePullBackOff', 'message': 'private'}}}
+        ]}}
+        events = [
+            {'involvedObject': {'uid': 'pod'}, 'message': 'private: no basic auth credentials'},
+            {'involvedObject': {'uid': 'other'}, 'message': 'x509: private'},
+        ]
+        result = p.pull_diagnostic(pod, events)
+        self.assertTrue(result['authenticationRequired'])
+        self.assertTrue(result['imagePullError'])
+        self.assertFalse(result['certificateError'])
+        self.assertFalse(result['http401'])
+        self.assertTrue(all(type(value) is bool for value in result.values()))
+        self.assertNotIn('private', json.dumps(result))
+        self.assertFalse(p.pull_diagnostic(None, events)['podPresent'])
+
     def test_only_fresh_authentication_failure_is_accepted(self):
         pod={'metadata':{'uid':'pod'},'status':{'containerStatuses':[{'name':'controller','state':{'waiting':{'reason':'ErrImagePull'}}}]}}
         event={'metadata':{'uid':'event'},'involvedObject':{'uid':'pod'},'count':2,'reason':'Failed','message':'private details: failed to authorize: 401 Unauthorized'}
