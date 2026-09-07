@@ -10,6 +10,33 @@ import run_uncertain_writer as writer
 
 
 class UncertainWriterChecks(unittest.TestCase):
+    def test_only_static_require_messages_are_reportable(self):
+        source = '''
+require(False, "safe static reason")
+require(False, dynamic_message)
+require(False, f"private {value}")
+other(False, "not an approved reason")
+'''
+        reasons = writer.static_failure_reasons(source)
+        self.assertEqual(reasons, {"safe static reason"})
+        runner = Mock(failure_reasons=reasons)
+        self.assertEqual(writer.demo.base.failure_reason(runner, writer.shared.QualificationError("safe static reason")),
+                         "safe static reason")
+        self.assertEqual(writer.demo.base.failure_reason(runner, writer.shared.QualificationError("private secret")),
+                         "QualificationError")
+
+    def test_checkpoint_records_only_fixed_stage_and_survives_cleanup_phase(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = object.__new__(writer.UncertainWriterRunner)
+            runner.output = Path(directory)
+            runner.checkpoint("fault-removal")
+            self.assertEqual(runner.phase, "uncertain-writer-fault-removal")
+            runner.phase = "cleanup"
+            self.assertEqual(json.loads((runner.output / "progress.json").read_bytes()), {"stage": "fault-removal"})
+            with self.assertRaises(writer.shared.QualificationError):
+                runner.checkpoint("arbitrary private value")
+            self.assertEqual(json.loads((runner.output / "progress.json").read_bytes()), {"stage": "fault-removal"})
+
     def pod(self):
         return {"metadata": {"name": "runtime-pod", "namespace": "control", "uid": "pod-uid",
                              "resourceVersion": "42", "ownerReferences": [{"kind": "ReplicaSet", "controller": True, "uid": "rs-uid"}], "finalizers": [writer.FINALIZER, "other/hold"]},

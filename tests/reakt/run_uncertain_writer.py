@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Qualify refusal of activation after retained predecessor Pod evidence is lost."""
 import argparse
+import ast
 import json
 from pathlib import Path
 import sys
@@ -11,11 +12,21 @@ import run_cnpg_demo as demo
 shared = demo.shared
 FINALIZER = "reakt.dev/termination-evidence"
 OUTCOME = "uncertain-writer-rejected"
+STAGES = frozenset({"initial-start", "initial-inventory", "initial-writer-pin", "successor-reserve",
+                    "successor-stage", "quiesce", "baseline-protected-state", "protected-history-pin",
+                    "successor-stopped", "fault-removal", "after-fault-protected-state",
+                    "activation-refusal", "after-refusal-protected-state"})
 
 
 def require(condition, message):
     if not condition:
         raise shared.QualificationError(message)
+
+
+def static_failure_reasons(source):
+    return {node.args[1].value for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "require"
+            and len(node.args) == 2 and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str)}
 
 
 def result_record(output, expected):
@@ -97,11 +108,17 @@ class UncertainWriterRunner(demo.CnpgDemoRunner):
         args.retain_on_success = False
         super().__init__(args)
         source = Path(__file__).resolve()
+        self.failure_reasons |= static_failure_reasons(source.read_text())
         require(shared.source_state(source) == (self.repository, self.commit), "uncertain writer source is not frozen")
         self.sources.append(source)
         self.source_archives[source] = "uncertain-writer-runner.py"
         self.source_digests[source] = shared.digest_file(source)
         self.freeze_file("producer/uncertain-writer-runner.py", source)
+
+    def checkpoint(self, stage):
+        require(stage in STAGES, "uncertain writer diagnostic stage is invalid")
+        self.phase = "uncertain-writer-" + stage
+        (self.output / "progress.json").write_bytes(shared.canonical({"stage": stage}))
 
     def reserve(self, role, plan):
         prepared = self.step("prepare-" + role, role + "-prepared", self.issuer)
@@ -165,12 +182,15 @@ class UncertainWriterRunner(demo.CnpgDemoRunner):
                 "resourceVersion": pod["metadata"]["resourceVersion"], "removedFinalizer": FINALIZER, "absent": True}
 
     def measure(self):
+        self.checkpoint("initial-start")
         initial = self.reserve("initial", self.initial_plan)
         self.initial_prepared = initial
         self.lifecycle("stage-initial", initial["transition"])
         self.lifecycle("activate-initial", initial["transition"])
         self.wait_cnpg()
+        self.checkpoint("initial-inventory")
         self.step("publish-initial", "initial-inventory-published", self.issuer, transition=initial["transition"])
+        self.checkpoint("initial-writer-pin")
         writers = self.writer_identity(initial)
         runtime = [writer for writer in writers if writer["name"] == initial["serviceAccountName"]]
         require(len(runtime) == 1, "initial runtime writer is ambiguous")
@@ -182,20 +202,30 @@ class UncertainWriterRunner(demo.CnpgDemoRunner):
         self.create({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {
             "name": "api-settings", "namespace": self.workload}, "data": {"PGRST_DB_MAX_ROWS": "100"}})
         self.policy_change = self.replace_policy()
+        self.checkpoint("successor-reserve")
         successor = self.reserve("successor", self.successor_plan)
         self.successor_prepared = successor
         transition = successor["transition"]
+        self.checkpoint("successor-stage")
         self.lifecycle("stage-successor", transition)
+        self.checkpoint("quiesce")
         self.lifecycle("quiesce-upgrade", transition)
+        self.checkpoint("baseline-protected-state")
         before, registry = self.protected_state()
+        self.checkpoint("protected-history-pin")
         expected = pinned_history(registry, transition, runtime[0])
+        self.checkpoint("successor-stopped")
         stopped = self.successor_state(successor)
+        self.checkpoint("fault-removal")
         fault = self.lose_pod_record(expected)
+        self.checkpoint("after-fault-protected-state")
         injected, registry = self.protected_state()
         require(before == injected and pinned_history(registry, transition, runtime[0]) == expected,
                 "writer evidence fault changed protected state")
         require(self.successor_state(successor) == stopped, "writer fault changed successor identity")
+        self.checkpoint("activation-refusal")
         rejected = self.step("reject-uncertain-writer", OUTCOME, self.issuer, transition=transition)
+        self.checkpoint("after-refusal-protected-state")
         after, registry = self.protected_state()
         require(before == after and pinned_history(registry, transition, runtime[0]) == expected
                 and self.successor_state(successor) == stopped and self.get_pod(expected["name"]) is None
