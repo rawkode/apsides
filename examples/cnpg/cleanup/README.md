@@ -7,8 +7,8 @@ The database, API workload, configuration, and reactions remain identical.
 
 The Backup references `cleanup-unconfigured-database`, which must remain
 absent during the rehearsal. It is a cleanup target, not a request to back up
-the demo database. Acceptance by the operator's admission webhook still needs
-live verification.
+the demo database. CNPG 1.30.0 accepted this resource in both owned-cluster
+rehearsals at runner revision `2c2c56b`.
 
 From the repository root:
 
@@ -32,10 +32,13 @@ use one stable policy: the predecessor runtime ceiling and a cleanup ceiling
 that additionally authorizes named `get` and `delete` for this Backup. The
 successor runtime Role still derives from its own compiled capabilities.
 
-Two independent live scenarios remain required: preserving a test-owned
-finalizer until its owner removes it, then completing cleanup; and refusing a
-replacement UID while retaining the original protected claim. Compilation and
-driver checks alone do not satisfy either live release check.
+Both separate live scenarios passed at runner revision `2c2c56b`: preserving a
+test-owned finalizer until its owner removed it, then completing cleanup; and
+refusing a replacement UID while retaining the original protected claim.
+Both preserved an unclaimed Backup and verified that the successor's workload
+Role omitted Backup access. Each cluster and its credentials were deleted.
+These measurements still need production receipt integration before they count
+toward the release gate.
 
 The local runner accepts this signed predecessor and the signed parent
 successor, verified together under one external trust policy:

@@ -150,6 +150,15 @@ This receipt cannot be combined with the older eight-check package, which binds
 a different payload. Full production acceptance remains pending, as do
 force-enabled custom-resource writes, Secret rotation and drift correction.
 
+Two further signed-candidate rehearsals passed at `2c2c56b` using the CNPG
+cleanup predecessor and that same successor. Finalizer-delayed cleanup retained
+the original claim, then completed after removing only the test-owned finalizer.
+A separate replacement-UID run refused deletion and retained the original claim
+in Cleaning. Both preserved an unclaimed Backup, checked the successor workload
+Role omitted Backup access, and deleted their owned cluster and credentials.
+They currently produce non-release measurements; production receipt integration
+is pending, so the accepted check count remains one of sixteen.
+
 Automated suites cover strict schema and canonical replay, claim and metadata
 store immutability, registry concurrency, capacity accounting, review privacy,
 issued-client binding, preview request shape, UID-safe cleanup, finalizer retry,

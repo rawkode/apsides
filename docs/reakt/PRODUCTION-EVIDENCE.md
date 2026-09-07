@@ -406,4 +406,22 @@ The permission-rejection operation cannot be used with the cleanup purpose.
 
 This enables qualification of an exact signed cleanup pair; it does not itself
 produce finalizer-preservation, UID-replacement or last-api-type-cleanup receipts.
-Those require separate live finalizer-completion and replacement-UID scenarios.
+The separate live scenarios passed at runner revision `2c2c56b` on kind through
+OrbStack using the signed pair above:
+
+- `work/cnpg-finalizer-first/measurement.json` records pending cleanup with the
+  pinned UID and retained claim, followed by committed cleanup after removing
+  only the test-owned finalizer.
+- `work/cnpg-replacement-first/measurement.json` records the typed UID refusal
+  with the original protected claim retained in Cleaning. The replacement's
+  non-status content and finalizers remained unchanged.
+
+Both runs preserved an unclaimed same-type Backup and verified that the Role
+bound to the successor in the workload namespace granted no Backup access.
+This Role check is not a cluster-wide effective-authorization proof. Both
+runners removed their cluster and credentials, restored the previous inventories,
+and reverified the frozen inputs and signed pair before publication.
+
+These are non-release measurements, not production evidence receipts. The
+production receipt adapter and normal evidence-consumer verification remain
+outstanding; the accepted production check count has not increased.
