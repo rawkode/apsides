@@ -121,6 +121,43 @@ class CleanupEvidenceChecks(unittest.TestCase):
     def test_archive_pin_prevents_self_described_producer_replacement(self):
         with self.assertRaises(evidence.shared.QualificationError):
             evidence.archive_sources(b"changed archive", {"producer/source-archive": evidence.shared.digest_bytes(b"changed archive")})
+        value = self.fixture()
+        value["frozenInputDigests"]["producer/source-archive"] = "sha256:" + "b" * 64
+        with self.assertRaises(evidence.shared.QualificationError):
+            evidence.validate_measurement(value)
+
+    def test_archive_requires_complete_crd_support_closure(self):
+        helper = "permission-upgrade-crd-support.py"
+        self.assertEqual(evidence.SOURCES.get(helper), "tests/reakt/run_cluster.py")
+        contents = {alias: path.encode() for alias, path in evidence.SOURCES.items()}
+        frozen = {"producer/" + alias: evidence.shared.digest_bytes(raw) for alias, raw in contents.items()}
+
+        def archive(omit_helper=False):
+            stream = io.BytesIO()
+            with tarfile.open(fileobj=stream, mode="w") as output:
+                for alias, path in evidence.SOURCES.items():
+                    if omit_helper and alias == helper:
+                        continue
+                    member = tarfile.TarInfo(path)
+                    member.size = len(contents[alias])
+                    output.addfile(member, io.BytesIO(contents[alias]))
+            return stream.getvalue()
+
+        raw = archive()
+        with patch.object(evidence, "PRODUCER_ARCHIVE", evidence.shared.digest_bytes(raw)):
+            self.assertEqual(evidence.archive_sources(raw, frozen), contents)
+            for digest in [None, "sha256:" + "b" * 64]:
+                changed = dict(frozen)
+                if digest is None:
+                    del changed["producer/" + helper]
+                else:
+                    changed["producer/" + helper] = digest
+                with self.subTest(digest=digest), self.assertRaises(evidence.shared.QualificationError):
+                    evidence.archive_sources(raw, changed)
+        raw = archive(omit_helper=True)
+        with patch.object(evidence, "PRODUCER_ARCHIVE", evidence.shared.digest_bytes(raw)), \
+                self.assertRaises(evidence.shared.QualificationError):
+            evidence.archive_sources(raw, frozen)
 
     def test_archive_sources_reject_symlinks_duplicate_members_and_digest_drift(self):
         def archive(symlink=False, duplicate=False):

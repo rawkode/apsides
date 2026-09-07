@@ -13,12 +13,13 @@ import run_cnpg_cleanup as cleanup
 shared = cleanup.shared
 LIMIT = shared.MAX_EVIDENCE_BYTES
 # This adapter interprets the readback assertions of this reviewed producer version only.
-PRODUCER_COMMIT = "2c2c56b13a2b2d65f27e2673b0b8089b22bba73f"
-PRODUCER_ARCHIVE = "sha256:c9e5da94f42001b672050f8cb24bf6870f79bdb3c4bb1306917dd01b0be08f84"
+PRODUCER_COMMIT = "7070c1e6d05b03e648a17935e088fd470eafcb98"
+PRODUCER_ARCHIVE = "sha256:8a94f5b460b63aa30dbaed063d11cadebf197ccf915d887c9b4a23c0a95cb98b"
 SOURCES = {
     "cnpg-cleanup-runner.py": "tests/reakt/run_cnpg_cleanup.py",
     "permission-upgrade-runner.py": "tests/reakt/run_cnpg_demo.py",
     "permission-upgrade-cluster-base.py": "tests/reakt/run_deployment_ceiling.py",
+    "permission-upgrade-crd-support.py": "tests/reakt/run_cluster.py",
     "permission-upgrade-shared.py": "tests/reakt/run_reproducibility.py",
     "permission-upgrade-observations.py": "tests/reakt/ceiling_observations.py",
     "permission-upgrade-proxy-canary.py": "crates/platform/tests/envoy/canary.py",
