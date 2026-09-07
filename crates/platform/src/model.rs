@@ -289,7 +289,10 @@ impl NamespaceRegistry {
 }
 
 impl PolicyState {
-    pub(crate) fn validate_image_pull_secrets(&self) -> crate::Result<()> {
+    /// Validate bounded platform-owned registry credential reference names.
+    /// # Errors
+    /// Rejects duplicate, malformed, or excessive Secret references.
+    pub fn validate_image_pull_secrets(&self) -> crate::Result<()> {
         let mut names = std::collections::BTreeSet::new();
         if self.image_pull_secrets.len() > 16
             || self.image_pull_secrets.iter().any(|name| {

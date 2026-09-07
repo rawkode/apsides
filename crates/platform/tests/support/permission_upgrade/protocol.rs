@@ -51,6 +51,8 @@ enum Action {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Settings {
     action: Action,
+    #[serde(default)]
+    image_pull_secrets: Vec<String>,
     purpose: platform_api::CandidatePairPurpose,
     initial_artifact: PathBuf,
     successor_artifact: PathBuf,
@@ -205,7 +207,7 @@ async fn candidate_pair(settings: &Settings) -> Result<CandidatePair> {
     {
         return Err(DriverError("candidate pair identities differ"));
     }
-    let mut initial_policy = candidate_policy(initial.compiled());
+    let mut initial_policy = candidate_policy(initial.compiled(), &settings.image_pull_secrets)?;
     if let platform_api::CandidatePairPurpose::LastTypeCleanup { identity } = &settings.purpose {
         for verb in ["get", "delete"] {
             initial_policy
@@ -225,7 +227,7 @@ async fn candidate_pair(settings: &Settings) -> Result<CandidatePair> {
     }
     let successor_policy = match settings.purpose {
         platform_api::CandidatePairPurpose::PermissionExpansion {} => {
-            candidate_policy(successor.compiled())
+            candidate_policy(successor.compiled(), &settings.image_pull_secrets)?
         }
         platform_api::CandidatePairPurpose::LastTypeCleanup { .. } => initial_policy.clone(),
     };
@@ -285,6 +287,30 @@ mod checkpoint_protocol_tests {
         settings.resume_phase = Some(deploy::Phase::Planned);
         assert!(require_fields(&settings, FieldSet::Verify).is_err());
         assert!(require_fields(&settings, FieldSet::ResumeCheckpoint).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pull_secret_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn image_pull_setting_preserves_empty_policy_and_reuses_validation() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let base = json!({"action":"verify","purpose":{"kind":"permission-expansion"},"initialArtifact":"initial","successorArtifact":"successor","trustPolicy":"trust"});
+        let empty: Settings = serde_json::from_value(base.clone())?;
+        assert!(empty.image_pull_secrets.is_empty());
+        let ceiling = json!({"policyRef":"policy","domainId":"domain","clusterBinding":"cluster","workloadNamespace":"workload","controlNamespace":"control","capabilities":[],"acceptedEnforcementGaps":[],"acceptedIndirectRisks":[]});
+        let mut policy: platform_api::PolicyState = serde_json::from_value(json!({"schemaVersion":"reakt.dev/platform/v1","runtimeCeiling":ceiling,"cleanupCeiling":ceiling}))?;
+        let original = compiler_core::digest(&policy)?;
+        for names in [vec!["registry"], vec!["registry", "registry"], vec!["invalid/name"]] {
+            let mut encoded = base.clone();
+            encoded["imagePullSecrets"] = json!(names);
+            let settings: Settings = serde_json::from_value(encoded)?;
+            policy.image_pull_secrets = settings.image_pull_secrets;
+            assert_eq!(policy.validate_image_pull_secrets().is_ok(), names == vec!["registry"]);
+            assert_ne!(compiler_core::digest(&policy)?, original);
+        }
         Ok(())
     }
 }

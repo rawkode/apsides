@@ -245,9 +245,12 @@ def reject_ignored_driver_sources(repository):
         raise shared.QualificationError("permission upgrade source closure contains ignored files")
 
 
-def full_policy(plan):
+def full_policy(plan, pull_secrets=()):
     ceiling = base.ceiling(plan)
-    return {"schemaVersion": "reakt.dev/platform/v1", "runtimeCeiling": ceiling, "cleanupCeiling": ceiling}
+    policy = {"schemaVersion": "reakt.dev/platform/v1", "runtimeCeiling": ceiling, "cleanupCeiling": ceiling}
+    if pull_secrets:
+        policy["imagePullSecrets"] = list(pull_secrets)
+    return policy
 
 
 def resource_projection(resource):
@@ -481,8 +484,8 @@ class CnpgDemoRunner(base.CeilingRunner):
 
     def configure_pair(self):
         validate_demo_pair(self.initial_plan, self.successor_plan)
-        self.initial_policy = full_policy(self.initial_plan)
-        self.successor_policy = full_policy(self.successor_plan)
+        self.initial_policy = full_policy(self.initial_plan, getattr(self.args, "image_pull_secret", []))
+        self.successor_policy = full_policy(self.successor_plan, getattr(self.args, "image_pull_secret", []))
         self.initial_policy_digest = shared.digest_bytes(shared.canonical(self.initial_policy))
         self.successor_policy_digest = shared.digest_bytes(shared.canonical(self.successor_policy))
         if self.initial_policy_digest == self.successor_policy_digest:
@@ -553,6 +556,7 @@ class CnpgDemoRunner(base.CeilingRunner):
         settings = {
             "action": action,
             "purpose": self.purpose,
+            **({"imagePullSecrets": list(self.args.image_pull_secret)} if getattr(self.args, "image_pull_secret", []) else {}),
             "initialArtifact": str(self.initial_artifact),
             "successorArtifact": str(self.successor_artifact),
             "trustPolicy": str(self.trust),
@@ -1748,6 +1752,7 @@ def main():
     ]:
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--operator-sha256", required=True)
+    parser.add_argument("--image-pull-secret", action="append", default=[], help="Platform-owned control-namespace registry Secret name (test qualification)")
     parser.add_argument("--retain-on-success", action="store_true")
     parser.add_argument("--check-input-reactions", action="store_true")
     parser.add_argument("--collect-performance", action="store_true")

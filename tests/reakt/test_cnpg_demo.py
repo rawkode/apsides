@@ -12,6 +12,23 @@ import run_cnpg_demo as demo
 
 
 class DemoChecks(unittest.TestCase):
+    def test_pull_secret_policy_projection_preserves_default_and_matches_both_candidates(self):
+        with patch.object(demo.base, 'ceiling', return_value={'scope': 'same'}):
+            original = demo.full_policy({})
+            self.assertNotIn('imagePullSecrets', original)
+            self.assertEqual(original, demo.full_policy({}, []))
+            expected = {**original, 'imagePullSecrets': ['registry-auth']}
+            self.assertEqual(demo.full_policy({}, ['registry-auth']), expected)
+            runner = demo.CnpgDemoRunner.__new__(demo.CnpgDemoRunner)
+            runner.args = types.SimpleNamespace(image_pull_secret=['registry-auth'])
+            runner.initial_plan = {'initial': True}
+            runner.successor_plan = {'successor': True}
+            with patch.object(demo, 'validate_demo_pair'), patch.object(demo, 'missing_capability', return_value={}), patch.object(demo.base, 'ceiling', side_effect=[{'scope': 'initial'}, {'scope': 'successor'}]):
+                runner.configure_pair()
+            for policy, digest in [(runner.initial_policy, runner.initial_policy_digest), (runner.successor_policy, runner.successor_policy_digest)]:
+                self.assertEqual(policy['imagePullSecrets'], ['registry-auth'])
+                self.assertEqual(digest, demo.shared.digest_bytes(demo.shared.canonical(policy)))
+
     @staticmethod
     def digest(character="a"):
         return "sha256:" + character * 64

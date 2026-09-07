@@ -63,7 +63,7 @@ async fn prepare(
     )
     .map_err(|_| DriverError("canonical allocation derivation failed"))?;
     let (creation_targets, managed_targets) =
-        prepared_targets(&prepared.request, required_target(settings)?, request_role)?;
+        prepared_targets(&prepared.request, required_target(settings)?, request_role, &settings.image_pull_secrets)?;
     emit(
         match settings.action {
             Action::PrepareInitial => "initial-prepared",

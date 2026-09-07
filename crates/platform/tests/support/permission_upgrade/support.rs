@@ -55,7 +55,7 @@ async fn prepare_request(
     })
 }
 
-fn candidate_policy(compiled: &compiler_core::CompiledPlan) -> platform_api::PolicyState {
+fn candidate_policy(compiled: &compiler_core::CompiledPlan, pull_secrets: &[String]) -> Result<platform_api::PolicyState> {
     let domain = &compiled.ir.domain;
     let ceiling = compiler_core::PermissionCeiling {
         policy_ref: domain.policy_ref.clone(),
@@ -67,32 +67,36 @@ fn candidate_policy(compiled: &compiler_core::CompiledPlan) -> platform_api::Pol
         accepted_enforcement_gaps: compiled.enforcement_gaps.clone(),
         accepted_indirect_risks: compiled.indirect_risks.clone(),
     };
-    platform_api::PolicyState {
-        image_pull_secrets: vec![],
+    let policy = platform_api::PolicyState {
+        image_pull_secrets: pull_secrets.to_vec(),
         schema_version: platform_api::SCHEMA_VERSION.into(),
         runtime_ceiling: ceiling.clone(),
         cleanup_ceiling: ceiling,
-    }
+    };
+    policy.validate_image_pull_secrets().map_err(|_| DriverError("invalid image pull Secret references"))?;
+    Ok(policy)
 }
 
 fn prepared_targets(
     request: &DeploymentRequest,
     target: &CandidatePairQualificationTarget,
     role: CandidatePairRole,
+    pull_secrets: &[String],
 ) -> Result<(
     Vec<platform_api::CreationTarget>,
     Vec<platform_api::CreationTarget>,
 )> {
     let compiled = &request.next.compiled;
     let policy = match target.purpose {
-        platform_api::CandidatePairPurpose::PermissionExpansion {} => candidate_policy(compiled),
+        platform_api::CandidatePairPurpose::PermissionExpansion {} => candidate_policy(compiled, pull_secrets)?,
         platform_api::CandidatePairPurpose::LastTypeCleanup { .. } => platform_api::PolicyState {
-            image_pull_secrets: vec![],
+            image_pull_secrets: pull_secrets.to_vec(),
             schema_version: platform_api::SCHEMA_VERSION.into(),
             runtime_ceiling: request.runtime_ceiling.clone(),
             cleanup_ceiling: request.cleanup_ceiling.clone(),
         },
     };
+    policy.validate_image_pull_secrets().map_err(|_| DriverError("invalid image pull Secret references"))?;
     let expected = match role {
         CandidatePairRole::Initial => &target.initial_policy_digest,
         CandidatePairRole::Successor => &target.successor_policy_digest,
