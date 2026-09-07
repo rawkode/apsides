@@ -60,8 +60,8 @@ its observed inputs.
 ## Local upgrade rehearsal
 
 The rehearsal passed on kind running through OrbStack at source revision
-`fed891c`, using the signed initial and successor examples from `5ed7b25` and
-CloudNativePG 1.30.0. It verified initial database readiness, refusal of the
+`4892cbc`, using the signed initial candidate from `5ed7b25`, the current successor
+payload from `0ee1a75`, and CloudNativePG 1.30.0. It verified initial database readiness, refusal of the
 permission expansion under the initial policy, writer retirement, successor
 activation, and HTTP responses changing from two rows to one after a ConfigMap
 update. The Deployment UID stayed stable while the Pod, ReplicaSet and rollout
@@ -70,7 +70,8 @@ and removed the rehearsal credentials.
 
 The normal evidence consumer accepted the permission-changing upgrade receipt
 for the exact successor candidate. Full production acceptance is still pending:
-this candidate has one of sixteen required checks and no reactor-case receipts.
+the current payload has nine of sixteen required checks and all 43 required
+reactor cases accepted by the evidence merger.
 It does not verify Secret rotation or drift correction.
 
 The repository's test driver accepts two signed, integrity-verified candidates

@@ -216,6 +216,14 @@ Cluster and credential cleanup passed. `work/cnpg-eight-merged-4662270` now cove
 eight checks and all 43 cases, with eight checks missing and `releaseVerified:
 false`. The temporary local signer does not establish GitHub Actions trust.
 
+The current successor passed a fresh permission-changing upgrade rehearsal at
+`4892cbc`: initial deploy, policy rejection, authorized upgrade, old-writer
+retirement, commit, and inventory publication. Live PostgREST responses confirmed
+CNPG Secret consumption and a ConfigMap-triggered rollout (two rows before, one
+after). Cleanup preserved the existing clusters. The normal merger at
+`work/cnpg-nine-merged-4892cbc` accepts nine checks and all 43 cases; seven checks
+remain missing and `releaseVerified` is false. Secret rotation remains unmeasured.
+
 Automated suites cover strict schema and canonical replay, claim and metadata
 store immutability, registry concurrency, capacity accounting, review privacy,
 issued-client binding, preview request shape, UID-safe cleanup, finalizer retry,

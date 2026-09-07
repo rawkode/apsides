@@ -107,6 +107,22 @@ The temporary owner signing key was removed after signing. The normal merger at
 eight checks remain missing and `releaseVerified` is false. This measures
 reservation ownership, not runtime execution or GitHub Actions identity.
 
+Permission-changing upgrade passed at `4892cbc`, using the signed initial from
+`work/cnpg-pair-5ed7b25/initial` and the current signed successor. A new local trust
+policy approves both existing public signers and their exact compiler digests.
+The rehearsal measured a fresh initial deployment, rejection under the initial
+permission ceiling, authorized successor staging, old-writer retirement,
+activation, commit, and inventory publication. PostgREST consumed the CNPG Secret;
+an observed ConfigMap change caused Pod/ReplicaSet turnover and changed HTTP
+responses from two rows to one while retaining the Deployment UID.
+The receipt is in `work/cnpg-permission-upgrade-4892cbc/evidence`. Both rehearsal
+clusters and their credentials were removed; the original cluster inventory was
+restored. Independent review rehashed the complete source archive, both payload
+bindings, local trust, drivers and operator, and verified denial, lifecycle and
+workload observations. `work/cnpg-nine-merged-4892cbc/summary.json` accepts nine checks and all
+43 cases, leaving seven checks missing and `releaseVerified: false`. This does not
+measure Secret rotation or qualify GitHub Actions trust.
+
 ## Combining measured evidence
 
 `reakt merge-evidence` combines explicit receipts against one structurally valid
