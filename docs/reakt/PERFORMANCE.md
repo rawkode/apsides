@@ -28,6 +28,34 @@ total cache memory. Relist storms, increasing domain counts, full image and
 build/deploy costs, and baseline cache occupancy remain open. New release
 qualification must use the corrected candidate rather than old binary receipts.
 
+## Offline metric analysis
+
+Use the official [Prometheus Python parser](https://prometheus.github.io/client_python/parser/)
+through the pinned dependency file to analyze an existing collection window:
+
+```sh
+cuenv task performanceMetricsTest
+cuenv exec -- uv run --cache-dir work/uv-cache --no-project \
+  --with-requirements tests/reakt/performance/requirements.txt \
+  python3 tests/reakt/performance/analyze_metrics.py \
+  --samples "$SAMPLE_WINDOW" --output "$NEW_REPORT_JSON"
+```
+
+The output path must be new. Reports bind every consumed sample and metrics file
+by digest, plus the analyzer, dependency declaration and parser version. They
+report concurrent WATCH gauges, API-server request rates, and separate controller
+client request rates and per-queue duration means. Missing or changing counter
+series, resets and invalid values produce unavailable metrics, not assumed zeros.
+Queue means do not establish percentiles or share the native scheduling metric's
+semantics. Reports do not authenticate producer identity or replace release evidence.
+
+The four reports in `work/cnpg-metrics-analysis-68c2d8b` analyze the saved CNPG
+baseline and corrected native idle/active windows. Baseline cluster-wide WATCH
+counts were 197 throughout; native idle samples ranged from 182 to 184 and active
+samples were 184 throughout. API-server request rates are unavailable in all
+four windows because counter series changed. These observations include system
+controllers and observers, and do not complete the scope-matched comparison.
+
 ## Equivalent work
 
 Run each controller on a separate fresh cluster made from the same pinned kind

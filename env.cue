@@ -5,6 +5,10 @@ import "github.com/cuenv/cuenv/schema"
 schema.#Project & {name: "apsides"}
 
 tasks: {
+	performanceMetricsTest: {
+		command: "uv"
+		args: ["run", "--cache-dir", "work/uv-cache", "--no-project", "--with-requirements", "tests/reakt/performance/requirements.txt", "python3", "tests/reakt/performance/test_analyze_metrics.py"]
+	}
 	performanceTest: {command: "python3", args: ["tests/reakt/performance/test_performance.py"]}
 	cnpgBaselineTest: {command: "python3", args: ["tests/reakt/performance/test_cnpg_baseline.py"]}
 	cnpgBaselineLiveTest: {command: "python3", args: ["tests/reakt/performance/test_cnpg_baseline_live.py"]}
