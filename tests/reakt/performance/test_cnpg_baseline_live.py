@@ -103,6 +103,29 @@ class BaselineLiveTests(unittest.TestCase):
             runner.cleanup.assert_called_once();self.assertFalse(result['passed'])
             self.assertTrue(result['credentialsRemoved']);self.assertNotIn('PRIVATE',json.dumps(result))
 
+    def test_image_failure_reports_only_index_and_operation_and_still_cleans(self):
+        for operation in ['pull', 'save', 'import']:
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                runner=self.runner(Path(directory))
+                runner.operator_image='a-private-image-reference@sha256:'+'a'*64
+                runner.bundle={'managed.json':json.dumps({'items':[r['desired'] for r in candidate()['ir']['resources']]}).encode(),
+                               'flux.json':b'{"items":[]}'}
+                def command(args, **kwargs):
+                    if (operation=='pull' and args[1]=='pull') or (operation=='save' and args[1:3]==['image','save']):
+                        raise RuntimeError('PRIVATE_COMMAND_OUTPUT')
+                    return ''
+                runner.command=Mock(side_effect=command)
+                runner.import_archive=Mock(side_effect=RuntimeError('PRIVATE_COMMAND_OUTPUT') if operation=='import' else None)
+                runner.install=lambda:live.BaselineRunner.install(runner)
+                runner.measure=Mock()
+                def cleanup():
+                    runner.admin.unlink();runner.issuer.unlink();runner.cleanup_confirmed=True
+                runner.cleanup=Mock(side_effect=cleanup)
+                result=runner.run()
+                self.assertFalse(result['passed']);runner.cleanup.assert_called_once()
+                self.assertEqual(result['failures'][-1]['phase'],f'image-0-{operation}')
+                self.assertNotIn('PRIVATE',json.dumps(result));self.assertNotIn('private-image',json.dumps(result))
+
     def test_cleanup_failure_prevents_success_and_redacts_errors(self):
         with tempfile.TemporaryDirectory() as directory:
             runner=self.runner(Path(directory));runner.measure=Mock();runner.cleanup=Mock(side_effect=RuntimeError('PRIVATE_TOKEN'))

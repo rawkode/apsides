@@ -161,31 +161,44 @@ class BaselineRunner(demo.base.CeilingRunner):
         self.namespace_identity = json.loads(self.k("get", "namespace", "default", "-o", "json"))["metadata"]["uid"]
 
     def install(self):
+        self.phase = "install-input-verification"
         self.frozen()
         desired = json.loads(self.bundle["managed.json"])["items"]
         flux = json.loads(self.bundle["flux.json"])["items"]
         images = {self.operator_image, next(x["spec"]["imageName"] for x in desired if x["kind"] == "Cluster")}
         images.update(c["image"] for x in desired + flux if x["kind"] == "Deployment" for c in x["spec"]["template"]["spec"]["containers"])
         for index, reference in enumerate(sorted(images)):
+            self.phase = f"image-{index}-pull"
             self.command(["docker", "pull", reference], timeout=300)
             archive = self.output / f"image-{index}.tar"
             try:
+                self.phase = f"image-{index}-save"
                 self.command(["docker", "image", "save", "--output", archive, reference], timeout=300)
+                self.phase = f"image-{index}-import"
                 self.import_archive(archive, reference)
             finally:
                 archive.unlink(missing_ok=True)
+        self.phase = "operator-install-and-readiness"
         self.install_operator()
-        for raw in self.crds:
+        for index, raw in enumerate(self.crds):
+            self.phase = f"flux-crd-{index}-apply"
             self.k("apply", "--server-side", "-f", "-", data=raw.decode())
-        for name in ["kustomizations.kustomize.toolkit.fluxcd.io", "gitrepositories.source.toolkit.fluxcd.io"]:
+        for index, name in enumerate(["kustomizations.kustomize.toolkit.fluxcd.io", "gitrepositories.source.toolkit.fluxcd.io"]):
+            self.phase = f"flux-crd-{index}-established"
             self.k("wait", "--for=condition=Established", "crd/" + name, "--timeout=120s")
+        self.phase = "public-configmap-apply"
         self.apply({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "api-settings", "namespace": self.workload}, "data": {"PGRST_DB_MAX_ROWS": "100"}})
+        self.phase = "baseline-controllers-apply"
         self.k("apply", "--server-side", "--field-manager=aps-baseline", "-f", "-", data=self.bundle["flux.json"].decode())
         for name in ["benchmark-artifacts", "benchmark-flux", "benchmark-reloader"]:
+            self.phase = name + "-ready"
             self.k("rollout", "status", "deployment/" + name, "-n", self.workload, "--timeout=300s")
+        self.phase = "source-artifact-status-patch"
         status = json.loads(self.bundle["source-status.json"])
         self.k("patch", "gitrepository", status["name"], "-n", self.workload, "--subresource=status", "--type=merge", "-p", json.dumps({"status": status["status"]}))
+        self.phase = "kustomization-ready"
         self.k("wait", "--for=condition=Ready", "kustomization/benchmark-cnpg", "-n", self.workload, "--timeout=300s")
+        self.phase = "cnpg-ready-and-secret-present"
         self.wait_cnpg()
 
     def apply(self, obj):
