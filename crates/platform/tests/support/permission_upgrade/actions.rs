@@ -62,11 +62,8 @@ async fn prepare(
         prepared.registry.value.next_sequence,
     )
     .map_err(|_| DriverError("canonical allocation derivation failed"))?;
-    let (creation_targets, managed_targets) = prepared_targets(
-        &prepared.request,
-        required_target(settings)?,
-        request_role,
-    )?;
+    let (creation_targets, managed_targets) =
+        prepared_targets(&prepared.request, required_target(settings)?, request_role)?;
     emit(
         match settings.action {
             Action::PrepareInitial => "initial-prepared",
@@ -124,6 +121,14 @@ async fn reserve_initial(settings: &Settings, pair: &CandidatePair) -> Result<()
 
 async fn reject_upgrade(settings: &Settings, pair: &CandidatePair) -> Result<()> {
     require_fields(settings, FieldSet::Rejection)?;
+    if !matches!(
+        settings.purpose,
+        platform_api::CandidatePairPurpose::PermissionExpansion {}
+    ) {
+        return Err(DriverError(
+            "permission rejection requires expansion purpose",
+        ));
+    }
     let missing = settings
         .expected_missing_capability
         .as_ref()
@@ -221,6 +226,31 @@ async fn lifecycle(
         .await;
     match written {
         Ok(written) => report_registry(operation_name(operation), pair, &written, transition, ""),
+        Err(platform_api::Error::Deploy(deploy::Error::CleanupUidMismatch))
+            if operation == CandidatePairLifecycleOperation::CommitUpgrade
+                && matches!(
+                    settings.purpose,
+                    platform_api::CandidatePairPurpose::LastTypeCleanup { .. }
+                ) =>
+        {
+            let resolved = platform
+                .resolve_pair_transition(
+                    CandidatePairRole::Successor,
+                    &authorized,
+                    &inventory,
+                    transition,
+                )
+                .await
+                .map_err(|_| DriverError("cleanup refusal state readback failed"))?;
+            require_retained_cleanup_claim(&resolved, &settings.purpose)?;
+            report_registry(
+                "cleanup-uid-rejected",
+                pair,
+                resolved.registry(),
+                transition,
+                "",
+            )
+        }
         Err(platform_api::Error::Pending(_)) => {
             let registry = platform
                 .load_registry()
@@ -236,6 +266,46 @@ async fn lifecycle(
         }
         Err(_) => Err(DriverError("pair lifecycle operation failed")),
     }
+}
+
+fn require_retained_cleanup_claim(
+    resolved: &platform_api::ResolvedTransition,
+    purpose: &platform_api::CandidatePairPurpose,
+) -> Result<()> {
+    let platform_api::CandidatePairPurpose::LastTypeCleanup { identity } = purpose else {
+        return Err(DriverError("cleanup refusal requires cleanup purpose"));
+    };
+    let plan = resolved.plan();
+    let [item] = plan.cleanup.as_slice() else {
+        return Err(DriverError(
+            "cleanup refusal lacks one exact cleanup target",
+        ));
+    };
+    let claims: Vec<_> = resolved
+        .registry()
+        .value
+        .claims
+        .iter()
+        .filter(|claim| &claim.identity == identity)
+        .collect();
+    let [claim] = claims.as_slice() else {
+        return Err(DriverError("cleanup refusal lost the protected claim"));
+    };
+    if resolved.stored().record.phase != deploy::Phase::Cleaning
+        || &item.identity != identity
+        || item.policy != compiler_core::DeletionPolicy::Delete
+        || item.expected_uid.as_ref().is_none_or(String::is_empty)
+        || claim.uid != item.expected_uid
+        || claim.state != deploy::ClaimState::Releasing
+        || claim.transition_id != plan.request.transition_id
+        || claim.generation_id != item.prior_generation_id
+        || claim.domain_id != plan.request.next.compiled.ir.domain.id
+    {
+        return Err(DriverError(
+            "cleanup refusal changed protected cleanup authority",
+        ));
+    }
+    Ok(())
 }
 
 async fn publish(settings: &Settings, pair: &CandidatePair, role: CandidatePairRole) -> Result<()> {

@@ -545,9 +545,7 @@ pub fn cleanup_decision(
         .ok_or_else(|| Error::Plan("cleanup lacks a trusted UID".into()))?;
     match live {
         LiveCleanupObject::Absent => Ok(CleanupDecision::AlreadyAbsent),
-        LiveCleanupObject::Present { uid, .. } if uid != expected => Err(Error::Plan(
-            "cleanup refuses to delete a replacement UID".into(),
-        )),
+        LiveCleanupObject::Present { uid, .. } if uid != expected => Err(Error::CleanupUidMismatch),
         LiveCleanupObject::Present {
             finalizers,
             deletion_started: true,

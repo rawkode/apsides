@@ -31,6 +31,22 @@ pub enum CandidatePairPurpose {
     LastTypeCleanup { identity: deploy::ResourceIdentity },
 }
 
+impl CandidatePairPurpose {
+    /// Validate the compiled relation without authorizing any cluster operation.
+    ///
+    /// # Errors
+    /// Rejects plans or policy identities outside this qualification purpose.
+    pub fn validate_plans(
+        &self,
+        initial: &compiler_core::CompiledPlan,
+        successor: &compiler_core::CompiledPlan,
+        initial_policy: &str,
+        successor_policy: &str,
+    ) -> Result<()> {
+        purpose::validate_relation(self, initial, successor, initial_policy, successor_policy)
+    }
+}
+
 /// One immutable pair marker and the two platform-policy identities it binds.
 /// The nested marker UID and resourceVersion identify the pair marker, never the
 /// single-candidate marker used by reservation and collision qualification.

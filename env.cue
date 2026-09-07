@@ -13,6 +13,17 @@ tasks: {
 	packageCli: {command: "python3", args: ["scripts/reakt/package_cli.py", "--output", "work/aps-distribution", "--target-dir", "work/cli-package-target"]}
 	packageCliTest: {command: "python3", args: ["tests/reakt/test_package_cli.py"]}
 	cnpgDemoTest: {command: "python3", args: ["tests/reakt/test_cnpg_demo.py"]}
+	cnpgCleanupTypes: [
+		{
+			dependsOn: [install]
+			command: "node"
+			args: ["packages/compiler/src/crds.ts", "https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_clusters.yaml", "Cluster", "examples/cnpg/cleanup/.aps/crds/cnpg.ts", "v1"]
+		},
+		{
+			command: "node"
+			args: ["packages/compiler/src/crds.ts", "https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_backups.yaml", "Backup", "examples/cnpg/cleanup/.aps/crds/backup.ts", "v1"]
+		},
+	]
 	cnpgInitialTypes: {
 		dependsOn: [install]
 		command: "node"

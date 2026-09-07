@@ -55,12 +55,7 @@ async fn prepare_request(
     })
 }
 
-fn prepared_targets(
-    request: &DeploymentRequest,
-    target: &CandidatePairQualificationTarget,
-    role: CandidatePairRole,
-) -> Result<(Vec<platform_api::CreationTarget>, Vec<platform_api::CreationTarget>)> {
-    let compiled = &request.next.compiled;
+fn candidate_policy(compiled: &compiler_core::CompiledPlan) -> platform_api::PolicyState {
     let domain = &compiled.ir.domain;
     let ceiling = compiler_core::PermissionCeiling {
         policy_ref: domain.policy_ref.clone(),
@@ -72,19 +67,41 @@ fn prepared_targets(
         accepted_enforcement_gaps: compiled.enforcement_gaps.clone(),
         accepted_indirect_risks: compiled.indirect_risks.clone(),
     };
-    let policy = platform_api::PolicyState {
+    platform_api::PolicyState {
         schema_version: platform_api::SCHEMA_VERSION.into(),
         runtime_ceiling: ceiling.clone(),
         cleanup_ceiling: ceiling,
+    }
+}
+
+fn prepared_targets(
+    request: &DeploymentRequest,
+    target: &CandidatePairQualificationTarget,
+    role: CandidatePairRole,
+) -> Result<(
+    Vec<platform_api::CreationTarget>,
+    Vec<platform_api::CreationTarget>,
+)> {
+    let compiled = &request.next.compiled;
+    let policy = match target.purpose {
+        platform_api::CandidatePairPurpose::PermissionExpansion {} => candidate_policy(compiled),
+        platform_api::CandidatePairPurpose::LastTypeCleanup { .. } => platform_api::PolicyState {
+            schema_version: platform_api::SCHEMA_VERSION.into(),
+            runtime_ceiling: request.runtime_ceiling.clone(),
+            cleanup_ceiling: request.cleanup_ceiling.clone(),
+        },
     };
     let expected = match role {
         CandidatePairRole::Initial => &target.initial_policy_digest,
         CandidatePairRole::Successor => &target.successor_policy_digest,
     };
     if compiler_core::digest(&policy)
-        .map_err(|_| DriverError("candidate target policy digest failed"))? != *expected
+        .map_err(|_| DriverError("candidate target policy digest failed"))?
+        != *expected
     {
-        return Err(DriverError("candidate target projection differs from approved policy"));
+        return Err(DriverError(
+            "candidate target projection differs from approved policy",
+        ));
     }
     // Project names under the marker-bound candidate policy without changing the
     // actual request: rejection still runs against the current initial policy.
@@ -186,16 +203,25 @@ async fn prepare_predecessor(
 
 fn claim_capture_error(error: platform_api::Error) -> DriverError {
     match error {
-        platform_api::Error::Kubernetes(kube::Error::Api(response)) if response.code == 403 =>
-            DriverError("active claim UID capture authorization denied"),
-        platform_api::Error::Kubernetes(_) =>
-            DriverError("active claim UID capture Kubernetes request failed"),
-        platform_api::Error::Invalid(message) if message == "live cleanup candidate lacks exact approved Apply ownership" =>
-            DriverError("active claim UID capture lacks approved Apply ownership"),
-        platform_api::Error::Invalid(message) if message == "live resource is a replacement of the protected UID" =>
-            DriverError("active claim UID capture observed a replacement"),
-        platform_api::Error::Coordination(_) =>
-            DriverError("active claim UID capture coordination failed"),
+        platform_api::Error::Kubernetes(kube::Error::Api(response)) if response.code == 403 => {
+            DriverError("active claim UID capture authorization denied")
+        }
+        platform_api::Error::Kubernetes(_) => {
+            DriverError("active claim UID capture Kubernetes request failed")
+        }
+        platform_api::Error::Invalid(message)
+            if message == "live cleanup candidate lacks exact approved Apply ownership" =>
+        {
+            DriverError("active claim UID capture lacks approved Apply ownership")
+        }
+        platform_api::Error::Invalid(message)
+            if message == "live resource is a replacement of the protected UID" =>
+        {
+            DriverError("active claim UID capture observed a replacement")
+        }
+        platform_api::Error::Coordination(_) => {
+            DriverError("active claim UID capture coordination failed")
+        }
         _ => DriverError("active claim UID capture failed"),
     }
 }

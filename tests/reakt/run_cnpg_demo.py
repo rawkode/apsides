@@ -506,6 +506,7 @@ class CnpgDemoRunner(base.CeilingRunner):
             self.refresh_issuer()
         settings = {
             "action": action,
+            "purpose": {"kind": "permission-expansion"},
             "initialArtifact": str(self.initial_artifact),
             "successorArtifact": str(self.successor_artifact),
             "trustPolicy": str(self.trust),

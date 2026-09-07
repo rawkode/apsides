@@ -49,6 +49,7 @@ enum Action {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Settings {
     action: Action,
+    purpose: platform_api::CandidatePairPurpose,
     initial_artifact: PathBuf,
     successor_artifact: PathBuf,
     trust_policy: PathBuf,
@@ -183,15 +184,53 @@ async fn candidate_pair(settings: &Settings) -> Result<CandidatePair> {
         || initial.release_digest() == successor.release_digest()
         || initial.compiled().ir_digest == successor.compiled().ir_digest
         || initial.trust_policy_digest() != successor.trust_policy_digest()
-        || initial.compiled().capabilities.len() >= successor.compiled().capabilities.len()
-        || !initial
-            .compiled()
-            .capabilities
-            .iter()
-            .all(|capability| successor.compiled().capabilities.contains(capability))
     {
+        return Err(DriverError("candidate pair identities differ"));
+    }
+    let mut initial_policy = candidate_policy(initial.compiled());
+    if let platform_api::CandidatePairPurpose::LastTypeCleanup { identity } = &settings.purpose {
+        for verb in ["get", "delete"] {
+            initial_policy
+                .cleanup_ceiling
+                .capabilities
+                .push(Capability {
+                    namespace: identity.namespace.clone(),
+                    api_group: identity.api_group.clone(),
+                    resource: identity.resource.clone(),
+                    subresource: None,
+                    verb: verb.into(),
+                    names: vec![identity.name.clone()],
+                });
+        }
+        initial_policy.cleanup_ceiling.capabilities.sort();
+        initial_policy.cleanup_ceiling.capabilities.dedup();
+    }
+    let successor_policy = match settings.purpose {
+        platform_api::CandidatePairPurpose::PermissionExpansion {} => {
+            candidate_policy(successor.compiled())
+        }
+        platform_api::CandidatePairPurpose::LastTypeCleanup { .. } => initial_policy.clone(),
+    };
+    let initial_digest = compiler_core::digest(&initial_policy)
+        .map_err(|_| DriverError("candidate policy digest failed"))?;
+    let successor_digest = compiler_core::digest(&successor_policy)
+        .map_err(|_| DriverError("candidate policy digest failed"))?;
+    settings
+        .purpose
+        .validate_plans(
+            initial.compiled(),
+            successor.compiled(),
+            &initial_digest,
+            &successor_digest,
+        )
+        .map_err(|_| DriverError("candidate pair purpose validation failed"))?;
+    if settings.target.as_ref().is_some_and(|target| {
+        target.purpose != settings.purpose
+            || target.initial_policy_digest != initial_digest
+            || target.successor_policy_digest != successor_digest
+    }) {
         return Err(DriverError(
-            "candidate pair is not one exact permission expansion",
+            "candidate pair target differs from selected purpose",
         ));
     }
     Ok(CandidatePair { initial, successor })

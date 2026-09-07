@@ -366,6 +366,14 @@ not be combined.
 
 ## Exact cleanup candidate pairs
 
+The [CNPG cleanup predecessor](../../examples/cnpg/cleanup/README.md) provides
+the removable Backup resource. The signed-pair driver accepts an explicit
+purpose and validates it with the same compiled-plan relation used by the
+platform. A replacement UID has a typed refusal; the driver reports it only
+after authorized readback confirms the transition remains in Cleaning with
+the exact original UID claim retained. These are producer prerequisites, not
+live cleanup receipts.
+
 The test-support pair marker requires an explicit purpose. Permission-expansion
 qualification retains its strict capability addition and distinct approved policy
 identities. Last-type cleanup qualification instead binds one selected resource

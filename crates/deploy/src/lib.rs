@@ -35,6 +35,8 @@ pub use reducer::{advance, begin, require_event_capacity, service_account_name, 
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Error {
+    #[error("deployment plan rejected: cleanup refuses to delete a replacement UID")]
+    CleanupUidMismatch,
     #[error("deployment plan rejected: {0}")]
     Plan(String),
     #[error("deployment transition blocked: {0}")]

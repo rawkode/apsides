@@ -1,0 +1,7 @@
+{
+  "compilerOptions": { "jsx": "react-jsxdev", "jsxImportSource": "@reakt/kubernetes", "strict": true },
+  "imports": {
+    "@reakt/kubernetes": "../../../packages/reakt/src/index.ts",
+    "@reakt/kubernetes/jsx-dev-runtime": "../../../packages/reakt/src/jsx-dev-runtime.ts"
+  }
+}

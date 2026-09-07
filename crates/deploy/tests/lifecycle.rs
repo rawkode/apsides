@@ -893,7 +893,7 @@ fn cleanup_refuses_replacement_uid_and_preserves_unknown_finalizers() {
     let mut claim = request.registry.claims[0].clone();
     claim.transition_id = plan.request.transition_id.clone();
     claim.state = ClaimState::Releasing;
-    assert!(
+    assert_eq!(
         cleanup_decision(
             &plan,
             &record,
@@ -904,8 +904,8 @@ fn cleanup_refuses_replacement_uid_and_preserves_unknown_finalizers() {
                 finalizers: vec![],
                 deletion_started: false
             }
-        )
-        .is_err()
+        ),
+        Err(Error::CleanupUidMismatch)
     );
     assert_eq!(
         cleanup_decision(
