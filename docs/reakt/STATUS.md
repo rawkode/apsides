@@ -137,10 +137,11 @@ establish narrower properties.
 
 The current signed CNPG candidate is `work/cnpg-signed-candidate-9b5097a`,
 which includes the observed-input watch correction. The fresh merger at
-`work/cnpg-corrected-merged-820dd7c` accepts **four of sixteen checks and all 43
-required reactor cases**. These are the three reactor checks and the signed
-permission-changing upgrade check. `releaseVerified` remains false; twelve
-checks still need matching evidence. Local qualification signers do not
+`work/cnpg-seven-merged-968224c` accepts **seven of sixteen checks and all 43
+required reactor cases**. These are the three reactor checks, signed
+permission-changing upgrade, reproducible payload, declared-input isolation, and
+fixture-promotion rejection. `releaseVerified` remains false; nine checks still
+need matching evidence. Local qualification signers do not
 establish GitHub Actions identity or production release trust.
 
 The rebuilt fixture at `work/cnpg-reactor-native-820dd7c` passed all 43 required
@@ -157,6 +158,18 @@ and containers were preserved. The unsigned assembly at
 `work/cnpg-corrected-assembled-820dd7c` also passed the exact ignored
 `assembled_reactor_evidence_matches_production_contract` consumer test; this is
 evidence-contract validation, not release promotion.
+
+Two fresh cache-disabled builds in `work/cnpg-reproducibility-968224c` matched
+one another and the corrected signed candidate's binary, OCI image, compiler
+closure, and payload identities. `work/cnpg-input-isolation-968224c` compiled the
+declared-input control and rejected undeclared imports, clock, random,
+environment, filesystem, and network access with the expected reasons. This
+measures the declared-module and SES capability boundary, not independent OS
+syscall or network isolation. `work/cnpg-fixture-promotion-968224c` verified the
+signed production candidate and compiler fixture projection, then required the
+specific fixture-promotion rejection. It does not establish runtime behavior.
+The unsigned assembly at `work/cnpg-seven-assembled-968224c` passed both exact
+reproducibility and input-isolation evidence consumer tests.
 
 The following qualification results belong to the **previous candidate**,
 `work/cnpg-signed-candidate-c6d67e0`. Its merger at
