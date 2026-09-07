@@ -135,11 +135,33 @@ establish narrower properties.
 
 ## Verified boundaries
 
-The current signed CNPG candidate is `work/cnpg-signed-candidate-c6d67e0`.
-The normal merger at `work/cnpg-fifteen-merged-7dacabb` accepts **fifteen of
-sixteen checks and all 43 required reactor cases** for that exact payload.
-`releaseVerified` remains false. The missing check is scope-matched benchmark.
-The local qualification signers do not establish GitHub Actions identity or production release trust.
+The current signed CNPG candidate is `work/cnpg-signed-candidate-9b5097a`,
+which includes the observed-input watch correction. The fresh merger at
+`work/cnpg-corrected-merged-820dd7c` accepts **four of sixteen checks and all 43
+required reactor cases**. These are the three reactor checks and the signed
+permission-changing upgrade check. `releaseVerified` remains false; twelve
+checks still need matching evidence. Local qualification signers do not
+establish GitHub Actions identity or production release trust.
+
+The rebuilt fixture at `work/cnpg-reactor-native-820dd7c` passed all 43 required
+cases and all 46 fixture cases in `work/cnpg-reactor-820dd7c-retry-results`.
+Its compiler closure matches the corrected production build except for the
+expected fixture IR overlay. The harness installed the imported CNPG CRD schema;
+this proves fixture reactor behavior, not execution of the exact production
+binary. The current candidate separately passed first deploy, privileged
+permission-changing upgrade, ConfigMap reaction, equal-data no-rollout, and
+synthetic Secret-key reaction and restoration in
+`work/cnpg-input-reactions-89ceec4`. Both fresh runs removed their clusters and
+credentials; external inventory comparisons confirmed the pre-existing clusters
+and containers were preserved. The unsigned assembly at
+`work/cnpg-corrected-assembled-820dd7c` also passed the exact ignored
+`assembled_reactor_evidence_matches_production_contract` consumer test; this is
+evidence-contract validation, not release promotion.
+
+The following qualification results belong to the **previous candidate**,
+`work/cnpg-signed-candidate-c6d67e0`. Its merger at
+`work/cnpg-fifteen-merged-7dacabb` accepted fifteen of sixteen checks, missing the
+scope-matched benchmark. Those receipts do not qualify the corrected candidate.
 
 The matching native fixture passed all 43 required cases, all 46 fixture cases
 (including three reaction-removal controls), and all three reactor checks. Its
@@ -148,7 +170,7 @@ imported CRD schema. Two independent no-cache builds matched, and declared-input
 isolation passed against the same production payload. Fixture execution proves
 primitive reactor behavior, not CNPG operator or application readiness.
 
-The current successor separately passed a signed permission-changing upgrade at
+The previous successor separately passed a signed permission-changing upgrade at
 `4892cbc`: initial database readiness, policy rejection without registry changes,
 authorized staging, old-writer retirement, activation, commit, and inventory
 publication. Live PostgREST responses confirmed consumption of the CNPG-generated
@@ -214,7 +236,7 @@ A test-only interruption hook can pause after an exact validated registry CAS,
 allow the parent harness to inspect the protected phase, and remain parked until
 the owned child is killed and reaped. It is excluded from production builds.
 The six-phase live recovery matrix at producer `7dacabb` passed against the
-current signed CNPG production payload. Each
+previous signed CNPG production payload (`c6d67e0`). Each
 isolated run kills and reaps the parked deploy process, then uses a fresh issued
 client under the same executor binding to complete the recorded transition,
 publish inventory, verify repeated commit, and remove its cluster and credentials.
@@ -298,8 +320,9 @@ recovery, or production restore authority.
   supported Kubernetes versions, including the declared preview permissions and
   request-drain profile.
 - Complete scope-matched performance evidence under its production evidence
-  contract. The current payload's live workload-readiness, last-resource-type cleanup, UID replacement
-  and finalizer measurements have passed their stated qualification scopes.
+  contract. Current-candidate workload readiness has passed its stated scope;
+  last-resource-type cleanup, UID replacement and finalizer receipts still belong
+  to the previous candidate and need fresh matching qualification.
 - Define operator recovery for incompatible or corrupt protected state. Current
   schemas fail closed and do not infer missing authority or perform automatic
   conversion.
