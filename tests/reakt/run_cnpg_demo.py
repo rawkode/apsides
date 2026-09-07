@@ -644,10 +644,22 @@ class CnpgDemoRunner(base.CeilingRunner):
         }
 
     def import_archive(self, archive, reference):
-        repository = reference.split("@", 1)[0]
+        repository, separator, digest = reference.partition("@")
+        if (not separator or not shared.valid_digest(digest) or not repository
+                or any(character.isspace() for character in repository)):
+            raise shared.QualificationError("archive import requires an immutable image reference")
+        # A tag belongs to the final path component; a registry port does not.
+        prefix, slash, name = repository.rpartition("/")
+        name = name.split(":", 1)[0]
+        if not name:
+            raise shared.QualificationError("archive import requires a repository name")
+        repository = prefix + slash + name
         registry = repository.split("/")[0]
-        if "." not in registry and ":" not in registry and registry != "localhost":
+        if not slash:
+            repository = "docker.io/library/" + repository
+        elif "." not in registry and ":" not in registry and registry != "localhost":
             repository = "docker.io/" + repository
+        canonical_reference = repository + "@" + digest
         environment = dict(os.environ, DOCKER_CONTEXT=self.docker_context, KIND_EXPERIMENTAL_PROVIDER="docker")
         for name in ["DOCKER_HOST", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"]:
             environment.pop(name, None)
@@ -663,7 +675,7 @@ class CnpgDemoRunner(base.CeilingRunner):
         if result.returncode or len(result.stdout) + len(result.stderr) > shared.MAX_EVIDENCE_BYTES:
             raise shared.QualificationError("exact candidate image archive import failed")
         self.command([
-            "docker", "exec", self.cluster + "-control-plane", "crictl", "inspecti", reference,
+            "docker", "exec", self.cluster + "-control-plane", "crictl", "inspecti", canonical_reference,
         ])
 
     def load_images(self):

@@ -14,6 +14,37 @@ class DemoChecks(unittest.TestCase):
     def digest(character="a"):
         return "sha256:" + character * 64
 
+    def test_archive_import_normalizes_tag_without_removing_registry_port(self):
+        digest = self.digest()
+        cases = {
+            "ghcr.io/cloudnative-pg/cloudnative-pg:1.30.0": "ghcr.io/cloudnative-pg/cloudnative-pg",
+            "ghcr.io/cloudnative-pg/cloudnative-pg": "ghcr.io/cloudnative-pg/cloudnative-pg",
+            "localhost:5000/team/controller:demo": "localhost:5000/team/controller",
+            "localhost:5000/team/controller": "localhost:5000/team/controller",
+            "localhost/controller:demo": "localhost/controller",
+            "team/controller:demo": "docker.io/team/controller",
+            "python:3.13": "docker.io/library/python",
+        }
+        for source, repository in cases.items():
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as directory:
+                archive = Path(directory) / "image.tar"; archive.write_bytes(b"archive")
+                runner = object.__new__(demo.CnpgDemoRunner)
+                runner.docker_context = "test"; runner.cluster = "owned"; runner.node_platform = "linux/arm64"
+                runner.command = Mock(return_value="")
+                result = Mock(returncode=0, stdout=b"", stderr=b"")
+                with patch.object(demo.subprocess, "run", return_value=result) as run:
+                    runner.import_archive(archive, source + "@" + digest)
+                args = run.call_args.args[0]
+                self.assertEqual(args[args.index("--base-name") + 1], repository)
+                self.assertEqual(runner.command.call_args.args[0][-1], repository + "@" + digest)
+
+    def test_archive_import_rejects_mutable_reference_before_command(self):
+        runner = object.__new__(demo.CnpgDemoRunner)
+        with patch.object(demo.subprocess, "run") as run:
+            with self.assertRaises(demo.shared.QualificationError):
+                runner.import_archive(Path("missing"), "registry.example/image:latest")
+            run.assert_not_called()
+
     def candidates(self):
         return {name: self.digest() for name in demo.PAIR_DIGESTS}
 
