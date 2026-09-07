@@ -36,6 +36,7 @@ PERFORMANCE_FAILURE_REASONS = frozenset({
     'native performance runtime binding differs from successor allocation',
     'native performance Deployment is missing or ambiguous',
     'native performance Deployment identity changed',
+    'native performance Deployment is not ready',
     'native performance Pod set is not singular',
     'native performance ServiceAccount UID changed',
     'native performance Pod account changed or Pod is deleting',
@@ -1233,7 +1234,7 @@ class CnpgDemoRunner(base.CeilingRunner):
             "policyDigest": self.successor_policy_digest,
         }
 
-    def performance_bindings(self):
+    def performance_bindings(self, wait_ready=False):
         require = sampling.require
         prepared = self.performance_successor
         registry_object = json.loads(self.k("get", "configmap", "reakt-registry-" + self.workload, "-n", self.control, "-o", "json"))
@@ -1269,8 +1270,17 @@ class CnpgDemoRunner(base.CeilingRunner):
             deployment = deployments[0]
             expected_uid = stored["stagedIdentityUids"]["apps/v1/Deployment/" + self.control + "/" + name] if role == "runtime" else proxy["deploymentUid"]
             require(deployment["metadata"]["uid"] == expected_uid and not deployment["metadata"].get("deletionTimestamp")
-                    and deployment["spec"]["replicas"] == deployment.get("status", {}).get("readyReplicas") == 1,
-                    "native performance Deployment identity changed")
+                    and deployment["spec"]["replicas"] == 1, "native performance Deployment identity changed")
+            if wait_ready and deployment.get("status", {}).get("readyReplicas") != 1:
+                self.k("rollout", "status", "deployment/" + name, "-n", self.control, "--timeout=120s")
+                objects = {kind: json.loads(self.k("get", kind, "-n", self.control, "-o", "json"))["items"]
+                           for kind in ["deployments", "replicasets", "pods", "serviceaccounts"]}
+                deployments = [x for x in objects["deployments"] if x["metadata"]["name"] == name]
+                require(len(deployments) == 1, "native performance Deployment is missing or ambiguous")
+                deployment = deployments[0]
+                require(deployment["metadata"]["uid"] == expected_uid and not deployment["metadata"].get("deletionTimestamp")
+                        and deployment["spec"]["replicas"] == 1, "native performance Deployment identity changed")
+            require(deployment.get("status", {}).get("readyReplicas") == 1, "native performance Deployment is not ready")
             replica_uids = {x["metadata"]["uid"] for x in objects["replicasets"] if any(
                 o.get("controller") is True and o.get("kind") == "Deployment" and o.get("uid") == expected_uid
                 for o in x["metadata"].get("ownerReferences", []))}
@@ -1298,7 +1308,9 @@ class CnpgDemoRunner(base.CeilingRunner):
             result[role] = {"deploymentUid": expected_uid, "podUid": pod["metadata"]["uid"], "pod": pod["metadata"]["name"],
                             "serviceAccountName": account, "serviceAccountUid": accounts[0]["metadata"]["uid"],
                             "containers": containers, "generation": allocation["generationId"], "buildDigest": allocation["artifactDigest"]}
-        return result
+        # Re-read the full protected state after initial waits. Window callbacks
+        # take this strict path directly and never wait for replacement identities.
+        return self.performance_bindings() if wait_ready else result
 
     def performance_http(self, count, expected):
         def stable(value):
@@ -1417,7 +1429,7 @@ class CnpgDemoRunner(base.CeilingRunner):
         if collect_performance:
             self.performance_successor = successor
             self.phase = "successor-performance-bindings"
-            controllers = self.performance_bindings()
+            controllers = self.performance_bindings(wait_ready=True)
             self.performance_window("idle", controllers)
             after, second_http = self.performance_window("active", controllers, change_configmap)
         else:

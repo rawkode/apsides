@@ -120,6 +120,44 @@ class DemoChecks(unittest.TestCase):
         self.assertEqual(set(bindings['proxy']['containers']),{'envoy','admin'})
         self.assertEqual(runner.k.call_count,6)
 
+    def test_initial_performance_readiness_wait_is_bounded_and_rechecks_identity(self):
+        for selected in [0,1]:
+            with self.subTest(deployment=selected):
+                runner,_,objects=self.native_performance_fixture();objects['deployments'][selected]['status']['readyReplicas']=0
+                get=runner.k.side_effect
+                def kubectl(*args):
+                    if args[0]=='rollout':
+                        self.assertEqual(args[-1],'--timeout=120s')
+                        objects['deployments'][selected]['status']['readyReplicas']=1
+                        return ''
+                    return get(*args)
+                runner.k=Mock(side_effect=kubectl)
+                result=runner.performance_bindings(wait_ready=True)
+                self.assertEqual(set(result),{'runtime','proxy'})
+                self.assertEqual(sum(call.args[0]=='rollout' for call in runner.k.call_args_list),1)
+
+    def test_initial_performance_wait_refuses_replaced_deployment(self):
+        runner,_,objects=self.native_performance_fixture();objects['deployments'][0]['status']['readyReplicas']=0
+        get=runner.k.side_effect
+        def kubectl(*args):
+            if args[0]=='rollout':
+                objects['deployments'][0]['metadata']['uid']='replacement'
+                objects['deployments'][0]['status']['readyReplicas']=1
+                return ''
+            return get(*args)
+        runner.k=Mock(side_effect=kubectl)
+        with self.assertRaisesRegex(demo.shared.QualificationError,'Deployment identity changed'):
+            runner.performance_bindings(wait_ready=True)
+
+    def test_window_bindings_never_wait_for_readiness_or_replaced_identity(self):
+        for replaced in [False,True]:
+            runner,_,objects=self.native_performance_fixture();objects['deployments'][0]['status']['readyReplicas']=0
+            if replaced:objects['deployments'][0]['metadata']['uid']='replacement'
+            reason='Deployment identity changed' if replaced else 'Deployment is not ready'
+            with self.assertRaisesRegex(demo.shared.QualificationError,reason):runner.performance_bindings(wait_ready=replaced)
+            self.assertFalse(any(call.args[0]=='rollout' for call in runner.k.call_args_list))
+        self.assertIn('native performance Deployment is not ready',demo.PERFORMANCE_FAILURE_REASONS)
+
     def test_native_performance_rejects_wrong_allocation_account_image_or_container(self):
         for mutate in [lambda s,o:s['inputs']['allocation'].update(artifactDigest=self.digest('b')),
                        lambda s,o:s['inputs']['allocation'].update(generationId='wrong'),
