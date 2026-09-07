@@ -217,11 +217,8 @@ recovery, or production restore authority.
 - Produce one signed production release containing every required reactor case
   and all sixteen authenticated release checks.
 - Qualify a permission-changing upgrade against that exact production payload.
-  The ConfigMap-only predecessor source in `tests/fixtures/permission-predecessor`
-  compiles with seven capabilities; the production example has twenty and retains
-  all seven. This establishes the intended permission delta only. Native predecessor
-  execution, rejection under its original ceiling, approved policy expansion,
-  writer retirement and successor activation still need live evidence.
+  The CNPG successor has an accepted live receipt from `fed891c`; the eventual
+  complete release must carry evidence matching its own payload.
 - Qualify and package Planned, Staged, Quiesced, Activated, Cleaning, and Committed
   interruption recovery against the exact production payload, including safe
   recovery by a different CI executor and `unsafe-activation: false`.
