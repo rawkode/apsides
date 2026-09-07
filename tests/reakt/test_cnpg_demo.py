@@ -350,6 +350,138 @@ class DemoChecks(unittest.TestCase):
             "name": "writer", "containerId": "containerd://a", "restartCount": 0,
         }])
 
+    def reaction_runner(self):
+        runner = self.runner()
+        runner.workload = "default"
+        runner.args = types.SimpleNamespace(check_input_reactions=True)
+        runner.checks = []
+        original = {"metadata": {"uid": "secret-uid", "resourceVersion": "1"}, "data": {"uri": "PRIVATE-URI"}}
+        state = json.loads(json.dumps(original))
+        patches = []
+        def kubectl(*args):
+            if args[0] == "get" and args[1].startswith("configmap/"):
+                return json.dumps({"metadata": {"uid": args[1], "resourceVersion": "2"}})
+            if args[0] == "get":
+                return json.dumps(state)
+            operations = json.loads(args[-1]); patches.append(operations)
+            self.assertEqual(operations[0], {"op": "test", "path": "/metadata/uid", "value": state["metadata"]["uid"]})
+            self.assertEqual(operations[1]["value"], state["metadata"]["resourceVersion"])
+            operation = operations[-1]
+            if operation["op"] == "add":
+                state["data"]["aps-demo-probe"] = operation["value"]
+            else:
+                self.assertEqual(operations[-2], {"op": "test", "path": "/data/aps-demo-probe", "value": state["data"]["aps-demo-probe"]})
+                del state["data"]["aps-demo-probe"]
+            state["metadata"]["resourceVersion"] = str(int(state["metadata"]["resourceVersion"]) + 1)
+            return ""
+        runner.k = Mock(side_effect=kubectl)
+        previous = {"deploymentUid": "deployment", "deploymentResourceVersion": "1", "podUid": "old-pod",
+                    "replicaSetUid": "old-rs", "revision": "hmac-sha256:key:" + "a" * 64, "containerImageId": "image",
+                    "selectedImageManifestDigest": "image-digest", "restartCount": 0}
+        changed = {**previous, "podUid": "changed-pod", "replicaSetUid": "changed-rs", "revision": "hmac-sha256:key:" + "b" * 64}
+        restored = {**previous, "podUid": "restored-pod", "deploymentResourceVersion": "9"}
+        runner.workload_identity = Mock(side_effect=[changed, restored])
+        runner.performance_http = Mock(return_value={"status": 200, "rowCount": 1})
+        return runner, previous, state, patches
+
+    def test_secret_reaction_guards_restores_and_settles_without_private_evidence(self):
+        runner, previous, state, patches = self.reaction_runner()
+        runner.secret_reaction(previous)
+        self.assertEqual(state["data"], {"uri": "PRIVATE-URI"})
+        self.assertEqual(len(patches), 2)
+        self.assertEqual(runner.workload_identity.call_args.kwargs, {"previous_uid": "changed-pod"})
+        self.assertEqual(runner.performance_http.call_count, 2)
+        evidence = json.dumps(runner.checks)
+        for private in ["PRIVATE-URI", "hmac-sha256:key:" + "a" * 64, "hmac-sha256:key:" + "b" * 64, patches[0][-1]["value"]]:
+            self.assertNotIn(private, evidence)
+
+    def test_secret_reaction_rejects_nonopaque_or_rotated_revision(self):
+        for revision in ["private", "hmac-sha256:key:short", "hmac-sha256:other:" + "b" * 64]:
+            runner, previous, state, _ = self.reaction_runner()
+            runner.workload_identity.side_effect = [{**previous, "revision": revision, "podUid": "new", "replicaSetUid": "new"}]
+            with self.assertRaises(demo.shared.QualificationError):
+                runner.secret_reaction(previous)
+            self.assertEqual(state["data"], {"uri": "PRIVATE-URI"})
+            self.assertEqual(runner.checks, [])
+
+    def test_secret_rollout_failure_still_restores(self):
+        runner, previous, state, patches = self.reaction_runner()
+        runner.workload_identity.side_effect = demo.shared.QualificationError("rollout failed")
+        with self.assertRaisesRegex(demo.shared.QualificationError, "rollout failed"):
+            runner.secret_reaction(previous)
+        self.assertEqual(state["data"], {"uri": "PRIVATE-URI"})
+        self.assertEqual(len(patches), 2)
+        self.assertEqual(runner.checks, [])
+
+    def test_secret_http_failure_still_restores(self):
+        runner, previous, state, patches = self.reaction_runner()
+        runner.performance_http.side_effect = demo.HttpObservationError("unexpected-rows", 200)
+        with self.assertRaises(demo.HttpObservationError):
+            runner.secret_reaction(previous)
+        self.assertEqual(state["data"], {"uri": "PRIVATE-URI"})
+        self.assertEqual(len(patches), 2)
+        self.assertEqual(runner.checks, [])
+
+    def test_secret_concurrent_change_is_not_clobbered_and_cannot_pass(self):
+        for mode in ["different-key", "uid", "other-data"]:
+            with self.subTest(mode=mode):
+                runner, previous, state, patches = self.reaction_runner()
+                def change(*args):
+                    if mode == "different-key":
+                        state["data"]["aps-demo-probe"] = "someone-else"
+                    elif mode == "uid":
+                        state["metadata"]["uid"] = "replacement"
+                    else:
+                        state["data"]["uri"] = "changed-private"
+                runner.performance_http.side_effect = change
+                with self.assertRaises(demo.shared.QualificationError):
+                    runner.secret_reaction(previous)
+                if mode == "different-key":
+                    self.assertEqual(state["data"]["aps-demo-probe"], "someone-else")
+                    self.assertEqual(len(patches), 1)
+                self.assertEqual(runner.checks, [])
+
+    def test_secret_restoration_must_return_original_revision(self):
+        runner, previous, state, patches = self.reaction_runner()
+        runner.workload_identity.side_effect = [
+            {**previous, "podUid": "new", "replicaSetUid": "new", "revision": "hmac-sha256:key:" + "b" * 64},
+            {**previous, "podUid": "restored", "revision": "still-wrong"}]
+        with self.assertRaisesRegex(demo.shared.QualificationError, "original workload revision"):
+            runner.secret_reaction(previous)
+        self.assertEqual(runner.checks, [])
+
+    def test_input_reactions_default_off_for_inherited_callers(self):
+        runner = self.runner(); runner.args = types.SimpleNamespace(); runner.k = Mock()
+        runner.check_input_reactions({})
+        runner.k.assert_not_called()
+
+    def test_equal_data_observes_full_window_and_ignores_only_deployment_rv(self):
+        runner, previous, _, _ = self.reaction_runner()
+        cm = {"metadata": {"uid": "cm", "resourceVersion": "1", "annotations": {"keep": "yes"}}, "data": {"value": "public"}}
+        written = {**cm, "metadata": {**cm["metadata"], "resourceVersion": "2"}}
+        runner.k = Mock(side_effect=[json.dumps(cm), "", json.dumps(written)])
+        runner.replica_set_uids = Mock(return_value=["old-rs"])
+        runner.workload_identity = Mock(return_value={**previous, "deploymentResourceVersion": "changed"})
+        runner.secret_reaction = Mock()
+        with patch.object(demo.time, "monotonic", side_effect=[0, 0, 30]), patch.object(demo.time, "sleep"):
+            runner.check_input_reactions(previous)
+        operations = json.loads(runner.k.call_args_list[1].args[-1])
+        self.assertEqual([x["path"] for x in operations[:2]], ["/metadata/uid", "/metadata/resourceVersion"])
+        self.assertEqual(operations[-1]["value"]["keep"], "yes")
+        self.assertEqual(runner.workload_identity.call_count, 2)
+        runner.secret_reaction.assert_called_once_with(previous)
+
+    def test_equal_data_rejects_no_write_or_new_replicaset(self):
+        for mode in ["same-rv", "new-rs"]:
+            runner, previous, _, _ = self.reaction_runner()
+            cm = {"metadata": {"uid": "cm", "resourceVersion": "1"}, "data": {"value": "public"}}
+            written = {**cm, "metadata": {**cm["metadata"], "resourceVersion": "1" if mode == "same-rv" else "2"}}
+            runner.k = Mock(side_effect=[json.dumps(cm), "", json.dumps(written)])
+            runner.replica_set_uids = Mock(side_effect=[["old"], ["old", "new"]])
+            runner.workload_identity = Mock(return_value=previous)
+            with self.assertRaises(demo.shared.QualificationError):
+                runner.check_input_reactions(previous)
+
     def test_retained_cluster_cannot_publish_production_evidence(self):
         runner = self.runner()
         runner.disposition = "retained"

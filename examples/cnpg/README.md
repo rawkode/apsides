@@ -87,6 +87,7 @@ cuenv exec -- python3 tests/reakt/run_cnpg_demo.py \
   --trust-policy "$TRUST_POLICY" \
   --operator-manifest "$PINNED_OPERATOR_MANIFEST" \
   --operator-sha256 "$OPERATOR_MANIFEST_DIGEST" \
+  --check-input-reactions \
   --output "$PWD/work/cnpg-rehearsal"
 ```
 
@@ -101,6 +102,14 @@ ConfigMap change sets `PGRST_DB_MAX_ROWS` from 100 to 1; the checks require a ne
 Pod and ReplicaSet, a changed rollout revision and an HTTP response with one row
 instead of two. Database access verifies consumption of the CNPG Secret; this
 flow does not claim to demonstrate credential rotation.
+
+`--check-input-reactions` also checks a real metadata update with unchanged
+ConfigMap data produces no rollout for 30 seconds. It then adds an unused
+synthetic key to the CNPG Secret and requires another rollout with working
+database access. The probe removes only its own key, verifies the original
+Secret data in memory, and waits for the restored workload. Secret values are
+not saved in evidence. These extra checks run after performance sampling when
+`--collect-performance` is also enabled.
 
 By default the driver deletes its cluster and credentials, preserving existing
 clusters. `--retain-on-success` keeps the successful demo cluster and a private

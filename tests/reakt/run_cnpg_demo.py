@@ -1340,6 +1340,105 @@ class CnpgDemoRunner(base.CeilingRunner):
             namespaces=[self.workload, self.control, "cnpg-system"], bindings=self.performance_bindings,
             runtime_status=[self.domain + "=" + path], expected_runtime=[expected], identity_gets=6, label_prefix="cnpg-native")
 
+    @staticmethod
+    def stable_workload(identity):
+        return {key: value for key, value in identity.items() if key != "deploymentResourceVersion"}
+
+    def replica_set_uids(self):
+        objects = json.loads(self.k("get", "replicasets", "-n", self.workload,
+                                    "-l", "app=database-api", "-o", "json"))["items"]
+        return sorted(item["metadata"]["uid"] for item in objects)
+
+    def check_input_reactions(self, previous):
+        if not getattr(self.args, "check_input_reactions", False):
+            return
+        self.phase = "equal-data-configmap-update"
+        original = json.loads(self.k("get", "configmap/api-settings", "-n", self.workload, "-o", "json"))
+        annotations = {**original["metadata"].get("annotations", {}), "aps-demo-probe": os.urandom(16).hex()}
+        operations = [{"op": "test", "path": "/metadata/uid", "value": original["metadata"]["uid"]},
+                      {"op": "test", "path": "/metadata/resourceVersion", "value": original["metadata"]["resourceVersion"]},
+                      {"op": "add", "path": "/metadata/annotations", "value": annotations}]
+        sets = self.replica_set_uids()
+        self.k("patch", "configmap/api-settings", "-n", self.workload, "--type=json", "-p", json.dumps(operations))
+        written = json.loads(self.k("get", "configmap/api-settings", "-n", self.workload, "-o", "json"))
+        if (written["metadata"]["uid"] != original["metadata"]["uid"]
+                or written["metadata"]["resourceVersion"] == original["metadata"]["resourceVersion"]
+                or written.get("data") != original.get("data") or written.get("binaryData") or original.get("binaryData")):
+            raise shared.QualificationError("equal-data ConfigMap update was not an unchanged-data write")
+        started = time.monotonic()
+        while True:
+            if (self.stable_workload(self.workload_identity(timeout=1)) != self.stable_workload(previous)
+                    or self.replica_set_uids() != sets):
+                raise shared.QualificationError("equal-data ConfigMap update changed workload identity")
+            if time.monotonic() - started >= 30:
+                break
+            time.sleep(1)
+        self.checks.append({"check": "equal-data-configmap-no-rollout", "passed": True, "observationSeconds": 30})
+        self.secret_reaction(previous)
+
+    def secret_reaction(self, previous):
+        self.phase = "secret-key-reaction"
+        revision_pattern = r"hmac-sha256:[A-Za-z0-9_.-]{1,128}:[0-9a-f]{64}"
+        if not re.fullmatch(revision_pattern, str(previous.get("revision"))):
+            raise shared.QualificationError("Secret reaction requires an opaque HMAC revision")
+        key = "aps-demo-probe"
+        def secret():
+            return json.loads(self.k("get", "secret/database-app", "-n", self.workload, "-o", "json"))
+        def config_versions():
+            result = {}
+            for name in ["api-config", "api-settings"]:
+                metadata = json.loads(self.k("get", "configmap/" + name, "-n", self.workload, "-o", "json"))["metadata"]
+                result[name] = {field: metadata[field] for field in ["uid", "resourceVersion"]}
+            return result
+        configs = config_versions()
+        original = secret()
+        if key in original["data"] or not original["data"].get("uri"):
+            raise shared.QualificationError("Secret reaction fixture precondition failed")
+        value = base64.b64encode(os.urandom(24)).decode()
+        def mutate(current, remove=False):
+            if current["metadata"]["uid"] != original["metadata"]["uid"]:
+                raise shared.QualificationError("Secret reaction identity changed")
+            operations = [{"op": "test", "path": "/metadata/uid", "value": original["metadata"]["uid"]},
+                          {"op": "test", "path": "/metadata/resourceVersion", "value": current["metadata"]["resourceVersion"]}]
+            if remove:
+                operations.append({"op": "test", "path": "/data/" + key, "value": value})
+            operations.append({"op": "remove", "path": "/data/" + key} if remove else
+                              {"op": "add", "path": "/data/" + key, "value": value})
+            self.k("patch", "secret/database-app", "-n", self.workload, "--type=json", "-p", json.dumps(operations))
+        changed = None
+        try:
+            mutate(original)
+            changed = self.workload_identity(previous_uid=previous["podUid"])
+            if (not re.fullmatch(revision_pattern, str(changed.get("revision")))
+                    or changed["revision"].split(":")[1] != previous["revision"].split(":")[1]
+                    or any(changed[field] != previous[field] for field in ["deploymentUid", "containerImageId", "selectedImageManifestDigest"])
+                    or any(changed[field] == previous[field] for field in ["revision", "podUid", "replicaSetUid"])):
+                raise shared.QualificationError("Secret change did not produce the expected workload rollout")
+            observed = secret()
+            if (observed["metadata"]["uid"] != original["metadata"]["uid"]
+                    or observed["data"] != {**original["data"], key: value} or config_versions() != configs):
+                raise shared.QualificationError("Secret reaction inputs changed outside the synthetic key")
+            self.performance_http(1, changed)
+        finally:
+            self.phase = "secret-key-restoration"
+            current = secret()
+            if current.get("data", {}).get(key) == value:
+                mutate(current, remove=True)
+            restored = secret()
+            if restored["metadata"]["uid"] != original["metadata"]["uid"] or restored["data"] != original["data"]:
+                raise shared.QualificationError("Secret reaction fixture restoration failed")
+        # Successful experiments settle the restoration rollout before a caller
+        # resumes inventory or lifecycle checks. No Secret-derived revision is recorded.
+        restored_workload = self.workload_identity(previous_uid=changed["podUid"])
+        if (any(restored_workload[field] != previous[field] for field in
+                ["deploymentUid", "containerImageId", "selectedImageManifestDigest", "revision"])
+                or restored_workload["replicaSetUid"] == changed["replicaSetUid"]
+                or config_versions() != configs):
+            raise shared.QualificationError("Secret restoration did not restore the original workload revision")
+        self.performance_http(1, restored_workload)
+        self.checks.append({"check": "secret-key-reaction-and-restoration", "passed": True,
+                            "revisionChanged": True, "podTurnover": True, "restored": True})
+
     def measure(self):
         prepared = self.step("prepare-initial", "initial-prepared", self.issuer)
         _, initial_managed = self.prepared_projection(prepared, self.initial_plan)
@@ -1452,6 +1551,7 @@ class CnpgDemoRunner(base.CeilingRunner):
             {"check": "secret-bound-before-successor-start", "passed": True,
              "claim": "binding-only; no Secret creation reaction claimed"},
         ])
+        self.check_input_reactions(after)
 
     def retain_cluster(self):
         self.verify_docker()
@@ -1649,6 +1749,7 @@ def main():
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--operator-sha256", required=True)
     parser.add_argument("--retain-on-success", action="store_true")
+    parser.add_argument("--check-input-reactions", action="store_true")
     parser.add_argument("--collect-performance", action="store_true")
     parser.add_argument("--performance-samples", type=int, default=13)
     parser.add_argument("--performance-interval", type=float, default=5)
