@@ -137,14 +137,14 @@ establish narrower properties.
 
 The current signed CNPG candidate is `work/cnpg-signed-candidate-9b5097a`,
 which includes the observed-input watch correction. The fresh merger at
-`work/cnpg-twelve-merged-64f2b39` accepts **twelve of sixteen checks and all 43
+`work/cnpg-thirteen-merged-dab27db` accepts **thirteen of sixteen checks and all 43
 required reactor cases**. These are the three reactor checks, signed
 permission-changing upgrade, reproducible payload, declared-input isolation,
 fixture-promotion rejection, deployment-ceiling rejection, ownership
-collision, last-type cleanup, finalizer preservation, and UID-replacement
-rejection. `releaseVerified` remains false. Scope-matched benchmark, phase
-interruption recovery, uncertain-writer blocking, and API-bound gap conformance
-still need matching evidence. Local qualification signers do not
+collision, last-type cleanup, finalizer preservation, UID-replacement rejection,
+and API-bound gap conformance. `releaseVerified` remains false. Scope-matched
+benchmark, phase interruption recovery, and uncertain-writer blocking still need
+matching evidence. Local qualification signers do not
 establish GitHub Actions identity or production release trust.
 
 The rebuilt fixture at `work/cnpg-reactor-native-820dd7c` passed all 43 required
@@ -199,6 +199,17 @@ The reviewed adapter binds the original measurement bytes and all 15 producer
 sources; its eleven tests passed. Packaged receipts under
 `work/cnpg-cleanup-finalizer-receipt-64f2b39` and
 `work/cnpg-cleanup-replacement-receipt-64f2b39` passed the normal merger.
+
+Fresh API-gap qualification at `work/cnpg-api-gap-dab27db` passed all 42
+requests for the corrected successor, with no undeclared gaps, unsupported
+operations, or outstanding observations. TokenReview authenticated the actual
+projected proxy token and its exact Pod and ServiceAccount binding. Required
+operations succeeded, out-of-scope operations were denied, and the declared
+create/field-scope limitations matched observed behavior. The guarded synthetic
+Secret-key experiment also passed and removed its probe key. The receipt binds
+all 16 producer sources and the exact signed pair; cleanup restored prior host
+inventories and removed credentials. This measures direct Kubernetes API access
+with a runtime credential, not proxy-path enforcement or GitHub release trust.
 
 The following qualification results belong to the **previous candidate**,
 `work/cnpg-signed-candidate-c6d67e0`. Its merger at
