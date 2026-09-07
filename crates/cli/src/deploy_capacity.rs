@@ -32,7 +32,7 @@ pub(super) fn require_target(
 pub(super) async fn resize_and_rebind(
     platform: &platform::PlatformClient,
     session: platform::TransitionSession,
-    verified: &release::VerifiedRelease,
+    verified: &release::IntegrityVerifiedCandidate,
     inventory: &dyn inventory::InventoryStore,
     transition: &str,
     executor: &str,

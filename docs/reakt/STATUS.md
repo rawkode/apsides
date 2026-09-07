@@ -302,7 +302,7 @@ Secret projection change detection and rollout, not database password rotation.
 Each of these live harnesses removed its owned clusters and credentials and
 preserved the pre-existing cluster and container inventories. Receipts bind the
 exact candidate payload and archived runner sources. They do not establish
-production `VerifiedRelease` deployment or qualify a changed compiler or binary.
+the public `aps deploy` path or qualify a changed compiler or binary.
 
 Automated suites cover strict schema and canonical replay, claim and metadata
 store immutability, registry concurrency, capacity accounting, review privacy,
@@ -316,7 +316,7 @@ reconnection, old-writer credential denial before expiry, adoption, conditional
 SSA, finalizer-delayed cleanup, orphan retention, repeated commit, and replacement
 UID refusal. Each harness deletes only its owned cluster and removes its
 credential files. These runs use the test-candidate authorization boundary and
-do not establish production `VerifiedRelease` deployment.
+do not establish the public `aps deploy` path.
 
 Measured production-payload work has exercised two no-cache builds, declared
 input isolation, and the required reactor suite against matching compiler and
@@ -384,8 +384,8 @@ recovery, or production restore authority.
 
 - The GitHub Actions checks workflow runs existing cuenv build, authoring,
   editor, Rust, harness and documentation tasks with read-only repository
-  permissions. Actionlint and independent review passed; hosted Linux execution
-  remains unverified. Release signing and external OIDC-to-Kubernetes identity
+  permissions. Actionlint, independent review and the hosted Linux checks passed
+  at `07b5041`. Release signing and external OIDC-to-Kubernetes identity
   configuration and claim qualification remain separate unfinished work.
 - Complete release qualification for the corrected native candidate. The runtime
   watches only observed inputs, matching compiled permissions; managed inputs

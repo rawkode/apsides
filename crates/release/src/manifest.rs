@@ -48,8 +48,8 @@ pub struct Source {
     pub inputs_digest: String,
 }
 
-/// Constructed only after an established signature verifier approves a policy-bound
-/// statement. Callers cannot manufacture this from serialized receipt strings.
+/// A trusted release whose required qualification evidence also passed.
+/// Callers cannot manufacture this from serialized receipt strings.
 #[derive(Debug)]
 pub struct VerifiedRelease {
     pub(crate) manifest: ReleaseManifest,
@@ -59,8 +59,8 @@ pub struct VerifiedRelease {
     pub(crate) trust_policy_digest: String,
 }
 
-/// A signed, policy-approved production candidate whose release evidence has
-/// not yet passed the promotion gate.
+/// A signed, policy-approved artifact usable by deployment after platform checks.
+/// This establishes integrity and provenance, not full release qualification.
 #[derive(Debug)]
 pub struct IntegrityVerifiedCandidate {
     pub(crate) manifest: ReleaseManifest,

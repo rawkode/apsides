@@ -62,7 +62,7 @@ images do not establish that evidence.
 ## Initial installation executor
 
 Enable `platform`'s `deployer` feature for `stage_controller(transition_id,
-executor_id, &VerifiedRelease)` and `activate_initial(transition_id, executor_id)`.
+executor_id, &IntegrityVerifiedCandidate)` and `activate_initial(transition_id, executor_id)`.
 The former reloads independent trust and ceilings, checks the non-deserializable
 verified release against the reserved plan, stages exact generation RBAC, an
 immutable runtime configuration, inactive activation, preprovisioned inventory,
@@ -120,7 +120,7 @@ and [access logging](https://www.envoyproxy.io/docs/envoy/latest/configuration/o
 
 ## Isolated generation staging
 
-`stage_proxy_controller(transition_id, executor_id, &VerifiedRelease)` stages the
+`stage_proxy_controller(transition_id, executor_id, &IntegrityVerifiedCandidate)` stages the
 fixed Envoy proxy before the zero-replica native controller. A protected
 `reakt-proxy-policy-{domain}` ConfigMap supplies `ProxyPolicy`: schema, domain and
 cluster bindings; the fixed Envoy/admin image digests; the digest of
@@ -187,8 +187,8 @@ UID plus a UID-pinned `reakt-test-support` ConfigMap of schema
 `reakt.dev/disposable-test-cluster/v1`, with exact cluster/control/workload scope.
 The cluster binding must begin `reakt-disposable-`, and namespaces `reakt-test-`.
 This acceptance capability never constructs `VerifiedRelease` and is absent from
-production CLI builds. Ordinary `reakt deploy` still requires final verified release
-evidence.
+production CLI builds. Ordinary `aps deploy` independently verifies artifact trust and platform
+authorization. Full qualification evidence is checked by `aps verify-release`.
 
 Every activation/resume checks the staged service account and exact derived Roles
 and RoleBindings, including their recorded UIDs and current semantic contents.

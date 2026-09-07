@@ -88,7 +88,7 @@ impl IssuedDeployment {
     /// transport failure, target drift, or the bounded operation deadline.
     pub async fn preview_transition(
         &self,
-        verified: &release::VerifiedRelease,
+        verified: &release::IntegrityVerifiedCandidate,
         inventory: &dyn inventory::InventoryStore,
         transition: &str,
     ) -> Result<PendingPreview> {

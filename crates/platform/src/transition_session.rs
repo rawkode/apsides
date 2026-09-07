@@ -115,7 +115,7 @@ impl PlatformClient {
     /// Rejects unavailable snapshots, policy drift, changed release or nonexact replay.
     pub async fn transition_session(
         &self,
-        release: &release::VerifiedRelease,
+        release: &release::IntegrityVerifiedCandidate,
         inventory: &dyn InventoryStore,
         transition: &str,
     ) -> Result<TransitionSession> {

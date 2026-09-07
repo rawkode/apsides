@@ -381,7 +381,7 @@ impl PlatformClient {
         &self,
         request: &DeploymentRequest,
         executor_id: &str,
-        verified: &release::VerifiedRelease,
+        verified: &release::IntegrityVerifiedCandidate,
         inventory: &dyn inventory::InventoryStore,
     ) -> Result<Versioned<NamespaceRegistry>> {
         if request.next.compiled != *verified.compiled()

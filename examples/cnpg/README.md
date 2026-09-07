@@ -73,7 +73,7 @@ provides these commands as `aps`.
 The current runnable live path is the repository's signed-candidate rehearsal
 below. It exercises the real lifecycle protocol through the test driver.
 Compilation alone does not deploy anything, and a public `aps deploy`
-presentation remains pending the production release gate; do not present the
+presentation still needs its own live rehearsal; do not present the
 rehearsal as that CLI path.
 
 Prepare signed initial and successor candidates, their trust policy, and the

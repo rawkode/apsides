@@ -3,7 +3,7 @@
 use crate::{IssuedDeployment, Result, invalid, preview_fields::PreviewFieldImpact};
 use deploy::DeploymentRequest;
 use inventory::InventoryStore;
-use release::VerifiedRelease;
+use release::IntegrityVerifiedCandidate;
 use serde::Serialize;
 use std::time::Duration;
 
@@ -59,7 +59,7 @@ impl IssuedDeployment {
     pub async fn preview_fresh(
         &self,
         request: &DeploymentRequest,
-        verified: &VerifiedRelease,
+        verified: &IntegrityVerifiedCandidate,
         inventory: &dyn InventoryStore,
     ) -> Result<LivePreviewReport> {
         if request.next.compiled != *verified.compiled()

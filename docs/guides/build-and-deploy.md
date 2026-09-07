@@ -11,11 +11,11 @@ running the deployment protocol.
 
 | Command | Establishes | Does not establish |
 | --- | --- | --- |
-| `reakt compile` | validated IR, plan, capabilities and generated controller source | deployable image or signed release |
-| `reakt build` | pinned Linux binary, OCI archive, SBOM and compiler closure | approved provenance or deployment authorization |
-| `reakt verify` | local artifact integrity and recomputed plan | trusted release provenance |
-| `reakt verify-release` | release validity under a supplied trust policy | live cluster acceptance |
-| `reakt deploy` | resumable, provider-neutral lifecycle execution when all prerequisites pass | application workload readiness |
+| `aps compile` | validated IR, plan, capabilities and generated controller source | deployable image or signed release |
+| `aps build` | pinned Linux binary, OCI archive, SBOM and compiler closure | approved provenance or deployment authorization |
+| `aps verify` | local artifact integrity and recomputed plan | trusted release provenance |
+| `aps verify-release` | trusted artifact and full release qualification evidence | live cluster acceptance |
+| `aps deploy` | artifact trust checks and authorized, resumable lifecycle execution | full release qualification or application workload readiness |
 
 ## Compile and build
 
@@ -42,19 +42,24 @@ offline Cargo inputs, Docker BuildKit and the configured `cargo-cyclonedx` execu
 `build-result.json`, `image/controller.oci.tar`,
 `linux-binary/reakt-controller`, `sbom/sbom.json` and `build-inputs.json`.
 
-OCI packaging is optional distribution. `reakt build` produces an OCI archive
+OCI packaging is optional distribution. `aps build` produces an OCI archive
 as part of its current complete artifact, but upgrades do not use historical
 OCI retrieval as their state store.
 
+Full release qualification is separate from deployment. `aps deploy` verifies
+signatures, payload integrity and platform trust before checking live permissions
+and executing the lifecycle. Its report says `releaseQualification: not-evaluated`;
+use `aps verify-release` to require the full qualification evidence bundle.
+
 ## Deployment inputs
 
-`reakt deploy` reads `dist/reakt` by default or accepts exactly one current
+`aps deploy` reads `dist/reakt` by default or accepts exactly one current
 artifact source:
 
 ```sh
-reakt deploy --artifact path/to/verified-release
+aps deploy --artifact path/to/verified-release
 # or
-reakt deploy --artifact-reference path/to/immutable-reference.json
+aps deploy --artifact-reference path/to/immutable-reference.json
 ```
 
 An immutable reference resolves the new release through an approved ORAS tool
@@ -74,7 +79,7 @@ For local libSQL inventory:
 
 ```sh
 export REAKT_INVENTORY_DATABASE=/absolute/path/on/persistent-storage/inventory.db
-reakt deploy --artifact path/to/verified-release
+aps deploy --artifact path/to/verified-release
 ```
 
 For a remote Turso/libSQL primary:
@@ -82,7 +87,7 @@ For a remote Turso/libSQL primary:
 ```sh
 export REAKT_INVENTORY_DATABASE=libsql://inventory.example.com
 export REAKT_INVENTORY_TOKEN='<provided-by-trusted-ci>'
-reakt deploy --artifact path/to/verified-release
+aps deploy --artifact path/to/verified-release
 ```
 
 Do not use an ephemeral CI filesystem as durable inventory. Connection values

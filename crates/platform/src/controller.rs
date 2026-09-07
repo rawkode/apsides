@@ -12,7 +12,7 @@ use kube::{
     api::{ApiResource, DynamicObject, PostParams},
     core::GroupVersionKind,
 };
-use release::VerifiedRelease;
+use release::IntegrityVerifiedCandidate;
 use serde_json::{Value, json};
 
 pub(crate) struct StagingArtifact<'a> {
@@ -23,8 +23,8 @@ pub(crate) struct StagingArtifact<'a> {
     pub trust_policy_digest: &'a str,
 }
 
-impl<'a> From<&'a VerifiedRelease> for StagingArtifact<'a> {
-    fn from(release: &'a VerifiedRelease) -> Self {
+impl<'a> From<&'a IntegrityVerifiedCandidate> for StagingArtifact<'a> {
+    fn from(release: &'a IntegrityVerifiedCandidate) -> Self {
         Self {
             compiled: release.compiled(),
             image: &release.manifest().image.reference,
@@ -113,7 +113,7 @@ impl PlatformClient {
         &self,
         transition_id: &str,
         executor_id: &str,
-        release: &VerifiedRelease,
+        release: &IntegrityVerifiedCandidate,
     ) -> Result<Versioned<NamespaceRegistry>> {
         let artifact = StagingArtifact::from(release);
         let reserved = self.load_registry().await?;

@@ -1,5 +1,5 @@
 //! These exercise the production bounded orchestration kernel after the sealed
-//! `VerifiedRelease` equality boundary. Signature/OCI verification is covered by release tests.
+//! `IntegrityVerifiedCandidate` equality boundary. Signature/OCI verification is covered by release tests.
 use super::*;
 use crate::{DeploymentIdentity, DeploymentPreviewApproval, DeploymentPreviewProfile, Versioned};
 use serde_json::{Value, json};

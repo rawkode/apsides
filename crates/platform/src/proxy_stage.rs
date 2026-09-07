@@ -12,7 +12,7 @@ use kube::{
     Api,
     api::{ListParams, PostParams},
 };
-use release::VerifiedRelease;
+use release::IntegrityVerifiedCandidate;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -44,7 +44,7 @@ impl PlatformClient {
         &self,
         transition_id: &str,
         executor_id: &str,
-        release: &VerifiedRelease,
+        release: &IntegrityVerifiedCandidate,
     ) -> Result<Versioned<NamespaceRegistry>> {
         self.stage_proxy_artifact(
             transition_id,

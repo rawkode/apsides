@@ -138,7 +138,7 @@ async fn deploy(options: &BTreeMap<String, String>, resize_capacity: bool) -> Re
 
 async fn complete_transition(
     session: &platform::TransitionSession,
-    verified: &release::VerifiedRelease,
+    verified: &release::IntegrityVerifiedCandidate,
     inventory: &dyn inventory::InventoryStore,
     transition: &str,
     executor: &str,
@@ -149,7 +149,7 @@ async fn complete_transition(
 
 async fn selected_session(
     platform: &PlatformClient,
-    verified: &release::VerifiedRelease,
+    verified: &release::IntegrityVerifiedCandidate,
     inventory: &dyn inventory::InventoryStore,
     transition: &str,
     executor: &str,
@@ -186,7 +186,7 @@ async fn review_transition(
 
 async fn already_committed_report(
     platform: &PlatformClient,
-    verified: &release::VerifiedRelease,
+    verified: &release::IntegrityVerifiedCandidate,
     inventory: &dyn inventory::InventoryStore,
     transition: &str,
 ) -> Result<Value> {
@@ -203,6 +203,7 @@ async fn already_committed_report(
     let review = crate::review::transition_review_with_live(&session.resolve().await?, &live)?;
     Ok(json!({
         "status": "already-committed", "transition": transition,
+        "artifactTrust": "verified", "releaseQualification": "not-evaluated",
         "releaseDigest": verified.release_digest(),
         "review": review,
         "inventory": {"revision": tracking.revision, "snapshotId": tracking.snapshot_id},
@@ -232,7 +233,7 @@ async fn reserve_new_transition(
     issued: &IssuedDeployment,
     inventory: &dyn inventory::InventoryStore,
     mut registry: platform::Versioned<platform::NamespaceRegistry>,
-    verified: &release::VerifiedRelease,
+    verified: &release::IntegrityVerifiedCandidate,
     transition_id: &str,
     executor: &str,
     options: &BTreeMap<String, String>,
@@ -309,7 +310,7 @@ async fn reserve_new_transition(
 
 struct DeploymentContext {
     issued: IssuedDeployment,
-    verified: release::VerifiedRelease,
+    verified: release::IntegrityVerifiedCandidate,
     compatibility: Value,
 }
 
@@ -335,7 +336,7 @@ async fn connect(root: &Path, expected_digest: Option<&str>) -> Result<Deploymen
     )?;
     let trust = platform.load_trust_policy(&domain.id).await?;
     let policy = serde_json::from_value(trust.value)?;
-    let verified = release::verify_release(root, &policy).await?;
+    let verified = release::verify_candidate(root, &policy).await?;
     verify_artifact_binding(
         &discovered_manifest,
         verified.release_digest(),
@@ -378,7 +379,7 @@ fn verify_artifact_binding(
 
 fn deployment_report(
     resolved: &platform::ResolvedTransition,
-    verified: &release::VerifiedRelease,
+    verified: &release::IntegrityVerifiedCandidate,
     compatibility: &Value,
     expires_at: &str,
     tracking: &inventory::VersionedInventory,
@@ -386,7 +387,7 @@ fn deployment_report(
 ) -> Value {
     let stored = resolved.stored();
     let transition_id = resolved.transition_id();
-    json!({"status":"committed","transition":transition_id,"generation":stored.allocation().generation_id,
+    json!({"status":"committed","artifactTrust":"verified","releaseQualification":"not-evaluated","transition":transition_id,"generation":stored.allocation().generation_id,
         "releaseDigest":verified.release_digest(),"irDigest":verified.compiled().ir_digest,"compatibility":compatibility,
         "inventory":{"revision":tracking.revision,"snapshotId":tracking.snapshot_id},
         "credentialExpiresAt":expires_at,"requestDrainQualification":stored.request_drain_qualification,
@@ -455,7 +456,7 @@ async fn prepare_request(
     platform: &PlatformClient,
     inventory: &dyn inventory::InventoryStore,
     registry: &platform::Versioned<platform::NamespaceRegistry>,
-    verified: &release::VerifiedRelease,
+    verified: &release::IntegrityVerifiedCandidate,
     transition_id: &str,
     ownership_names: Option<&str>,
 ) -> Result<DeploymentRequest> {
@@ -578,7 +579,7 @@ fn default_transition(
 
 async fn drive_transition(
     platform: &PlatformClient,
-    verified: &release::VerifiedRelease,
+    verified: &release::IntegrityVerifiedCandidate,
     transition: &str,
     executor: &str,
 ) -> Result<platform::Versioned<platform::NamespaceRegistry>> {
@@ -643,7 +644,7 @@ enum ExistingTransition {
 fn check_existing(
     registry: &platform::NamespaceRegistry,
     transition: &str,
-    verified: &release::VerifiedRelease,
+    verified: &release::IntegrityVerifiedCandidate,
     executor: &str,
     policy: &str,
 ) -> Result<ExistingTransition> {
