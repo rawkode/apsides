@@ -210,6 +210,62 @@ async fn reserve_successor(settings: &Settings, pair: &CandidatePair) -> Result<
     )
 }
 
+async fn reject_uncertain_writer(settings: &Settings, pair: &CandidatePair) -> Result<()> {
+    require_fields(settings, FieldSet::Transition)?;
+    let platform = issued_platform(&pair.successor).await?;
+    let inventory = inventory_store().await?;
+    let authorized = authorize(
+        &platform,
+        CandidatePairRole::Successor,
+        pair,
+        required_target(settings)?,
+    )
+    .await?;
+    let transition = required_transition(settings)?;
+    let before = platform
+        .load_registry()
+        .await
+        .map_err(|_| DriverError("uncertain writer registry readback failed"))?;
+    if before
+        .value
+        .transition(transition)
+        .map_err(|_| DriverError("uncertain writer transition is absent"))?
+        .record
+        .phase
+        != deploy::Phase::Quiesced
+    {
+        return Err(DriverError("uncertain writer experiment requires Quiesced"));
+    }
+    let result = platform
+        .run_pair_lifecycle_operation(
+            CandidatePairLifecycleOperation::ActivateUpgrade,
+            &authorized,
+            &inventory,
+            transition,
+        )
+        .await;
+    if !matches!(result, Err(platform_api::Error::Invalid(message))
+        if message == "live writer set differs from complete protected Pod history")
+    {
+        return Err(DriverError(
+            "uncertain writer activation did not refuse missing protected Pod history",
+        ));
+    }
+    let after = platform
+        .load_registry()
+        .await
+        .map_err(|_| DriverError("uncertain writer refusal readback failed"))?;
+    if before.uid != after.uid
+        || before.resource_version != after.resource_version
+        || before.value != after.value
+    {
+        return Err(DriverError(
+            "uncertain writer refusal changed protected registry state",
+        ));
+    }
+    report_registry("uncertain-writer-rejected", pair, &after, transition, "")
+}
+
 async fn lifecycle(
     settings: &Settings,
     pair: &CandidatePair,

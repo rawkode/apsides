@@ -39,6 +39,7 @@ enum Action {
     StageSuccessor,
     QuiesceUpgrade,
     ActivateUpgrade,
+    RejectUncertainWriter,
     CommitUpgrade,
     PublishSuccessor,
     ResolveInitial,
@@ -154,6 +155,7 @@ pub(super) async fn run() -> Result<()> {
             )
             .await
         }
+        Action::RejectUncertainWriter => reject_uncertain_writer(&settings, &pair).await,
         Action::CommitUpgrade => {
             lifecycle(
                 &settings,

@@ -294,9 +294,9 @@ recovery, or production restore authority.
 
 - Produce one signed production release containing every required reactor case
   and all sixteen authenticated release checks.
-- Qualify a permission-changing upgrade against that exact production payload.
-  The CNPG successor has an accepted live receipt from `fed891c`; the eventual
-  complete release must carry evidence matching its own payload.
+- Preserve the current payload binding when assembling the final release. Its
+  permission-changing upgrade and cleanup receipts are accepted; a changed
+  binary or compiler closure requires matching new measurements.
 - Qualify and package Planned, Staged, Quiesced, Activated, Cleaning, and Committed
   interruption recovery against the exact production payload, including safe
   recovery by a different CI executor and `unsafe-activation: false`.
@@ -313,10 +313,10 @@ recovery, or production restore authority.
 - Complete production API authorization and admission qualification for the
   supported Kubernetes versions, including the declared preview permissions and
   request-drain profile.
-- Complete scope-matched performance evidence, workload readiness and status,
-  uncertain-writer refusal, last-resource-type cleanup,
-  finalizer preservation and API-gap conformance
-  under their production evidence contracts.
+- Complete scope-matched performance evidence, uncertain-writer refusal and
+  API-gap conformance under their production evidence contracts. The current
+  payload's live workload-readiness, last-resource-type cleanup, UID replacement
+  and finalizer measurements have passed their stated qualification scopes.
 - Define operator recovery for incompatible or corrupt protected state. Current
   schemas fail closed and do not infer missing authority or perform automatic
   conversion.
