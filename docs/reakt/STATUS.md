@@ -137,13 +137,13 @@ establish narrower properties.
 
 The current signed CNPG candidate is `work/cnpg-signed-candidate-9b5097a`,
 which includes the observed-input watch correction. The fresh merger at
-`work/cnpg-thirteen-merged-dab27db` accepts **thirteen of sixteen checks and all 43
+`work/cnpg-fourteen-merged-5e63857` accepts **fourteen of sixteen checks and all 43
 required reactor cases**. These are the three reactor checks, signed
 permission-changing upgrade, reproducible payload, declared-input isolation,
 fixture-promotion rejection, deployment-ceiling rejection, ownership
 collision, last-type cleanup, finalizer preservation, UID-replacement rejection,
-and API-bound gap conformance. `releaseVerified` remains false. Scope-matched
-benchmark, phase interruption recovery, and uncertain-writer blocking still need
+API-bound gap conformance, and uncertain-writer blocking. `releaseVerified`
+remains false. Scope-matched benchmark and phase interruption recovery still need
 matching evidence. Local qualification signers do not
 establish GitHub Actions identity or production release trust.
 
@@ -210,6 +210,17 @@ Secret-key experiment also passed and removed its probe key. The receipt binds
 all 16 producer sources and the exact signed pair; cleanup restored prior host
 inventories and removed credentials. This measures direct Kubernetes API access
 with a runtime credential, not proxy-path enforcement or GitHub release trust.
+
+Fresh uncertain-writer qualification at `work/cnpg-uncertain-writer-5e63857`
+removed the exact retained terminal predecessor Pod record after Quiesced.
+Activation returned the expected protected-writer-history rejection and remained
+Quiesced, with identical registry, activation, inventory, and metadata-store
+observations before injection and after refusal. The successor runtime stayed
+at zero replicas with no runtime Pod; its recorded staged proxy was permitted.
+The receipt passed the normal merger for the corrected successor. The run
+removed its cluster and credentials and restored prior host inventories. This
+qualifies lost termination evidence, not a real network partition or uncertain
+stalled-executor takeover.
 
 The following qualification results belong to the **previous candidate**,
 `work/cnpg-signed-candidate-c6d67e0`. Its merger at
