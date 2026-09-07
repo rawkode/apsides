@@ -22,7 +22,7 @@ ROOT = base.ROOT
 SCHEMA = "reakt.dev/permission-upgrade-result/v1"
 PREFIX = "APS_PERMISSION_UPGRADE_RESULT="
 PAIR_MARKER = "reakt-candidate-pair-qualification"
-PAIR_SCHEMA = "reakt.dev/candidate-pair-qualification/v1"
+PAIR_SCHEMA = "reakt.dev/candidate-pair-qualification/v2"
 MAX_OPERATOR_BYTES = 8 * 1024 * 1024
 MAX_HTTP_BYTES = 64 * 1024
 MEASUREMENT_SCHEMA = "reakt.dev/permission-upgrade-measurement/v1"
@@ -583,6 +583,7 @@ class CnpgDemoRunner(base.CeilingRunner):
         pair = self.pair["candidates"]
         marker = {
             "schemaVersion": PAIR_SCHEMA,
+            "purpose": {"kind": "permission-expansion"},
             "runId": cluster_target["runId"],
             "clusterName": self.cluster,
             "sentinelNamespace": self.cluster,
@@ -598,6 +599,7 @@ class CnpgDemoRunner(base.CeilingRunner):
             markerResourceVersion=created["metadata"]["resourceVersion"],
         )
         self.target = {
+            "purpose": {"kind": "permission-expansion"},
             "cluster": cluster_target,
             "initialPolicyDigest": self.initial_policy_digest,
             "successorPolicyDigest": self.successor_policy_digest,

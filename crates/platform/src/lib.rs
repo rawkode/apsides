@@ -90,7 +90,7 @@ mod candidate_qualification;
 pub use candidate_qualification::{
     CANDIDATE_PAIR_QUALIFICATION_MARKER_NAME, CANDIDATE_PAIR_QUALIFICATION_SCHEMA,
     CANDIDATE_QUALIFICATION_MARKER_NAME, CANDIDATE_QUALIFICATION_SCHEMA,
-    CandidatePairLifecycleOperation, CandidatePairQualificationMarker,
+    CandidatePairLifecycleOperation, CandidatePairPurpose, CandidatePairQualificationMarker,
     CandidatePairQualificationTarget, CandidatePairRole, CandidateQualificationMarker,
     CandidateQualificationPair, CandidateQualificationTarget,
     candidate_pair_qualification_executor,

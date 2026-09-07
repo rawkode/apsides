@@ -49,6 +49,7 @@ fn cluster_target() -> CandidateQualificationTarget {
 
 fn target() -> CandidatePairQualificationTarget {
     CandidatePairQualificationTarget {
+        purpose: CandidatePairPurpose::PermissionExpansion {},
         cluster: cluster_target(),
         initial_policy_digest: DIGEST_A.into(),
         successor_policy_digest: DIGEST_B.into(),
@@ -58,6 +59,7 @@ fn target() -> CandidatePairQualificationTarget {
 fn marker() -> CandidatePairQualificationMarker {
     let target = target();
     CandidatePairQualificationMarker {
+        purpose: CandidatePairPurpose::PermissionExpansion {},
         schema_version: CANDIDATE_PAIR_QUALIFICATION_SCHEMA.into(),
         run_id: target.cluster.run_id.clone(),
         cluster_name: CLUSTER.into(),
@@ -243,6 +245,21 @@ fn pair_metadata_schemas_are_closed() -> TestResult {
         .insert("unexpected".into(), json!(true));
     assert!(serde_json::from_value::<CandidatePairQualificationTarget>(target_value).is_err());
 
+    let mut missing = serde_json::to_value(target())?;
+    missing
+        .as_object_mut()
+        .ok_or("target was not an object")?
+        .remove("purpose");
+    assert!(serde_json::from_value::<CandidatePairQualificationTarget>(missing).is_err());
+    for purpose in [
+        json!({"kind":"unknown"}),
+        json!({"kind":"last-type-cleanup"}),
+        json!({"kind":"last-type-cleanup","identity":{"apiGroup":"","resource":"services","namespace":"production","name":"obsolete","unexpected":true}}),
+        json!({"kind":"permission-expansion","identity":{}}),
+    ] {
+        assert!(serde_json::from_value::<CandidatePairPurpose>(purpose).is_err());
+    }
+
     let mut marker_value = serde_json::to_value(marker())?;
     marker_value
         .as_object_mut()
@@ -251,6 +268,7 @@ fn pair_metadata_schemas_are_closed() -> TestResult {
     assert!(serde_json::from_value::<CandidatePairQualificationMarker>(marker_value).is_err());
 
     for field in [
+        "purpose",
         "initialReleaseDigest",
         "successorReleaseDigest",
         "initialPolicyDigest",
@@ -288,6 +306,8 @@ async fn ordered_pair_marker_or_object_identity_drift_is_rejected_read_only() ->
         "ir-order",
         "provenance-order",
         "policy-order",
+        "purpose",
+        "old-schema",
         "uid",
         "revision",
         "mutable",
@@ -319,6 +339,19 @@ async fn ordered_pair_marker_or_object_identity_drift_is_rejected_read_only() ->
                     &mut observed.initial_policy_digest,
                     &mut observed.successor_policy_digest,
                 );
+            }
+            "purpose" => {
+                observed.purpose = CandidatePairPurpose::LastTypeCleanup {
+                    identity: deploy::ResourceIdentity {
+                        api_group: String::new(),
+                        resource: "services".into(),
+                        namespace: "production".into(),
+                        name: "obsolete".into(),
+                    },
+                }
+            }
+            "old-schema" => {
+                observed.schema_version = "reakt.dev/candidate-pair-qualification/v1".into();
             }
             "uid" | "revision" | "mutable" => {}
             _ => return Err("unknown pair marker mutation".into()),

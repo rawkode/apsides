@@ -14,6 +14,14 @@ impl PlatformClient {
         inventory: &dyn inventory::InventoryStore,
         expected_missing: &Capability,
     ) -> Result<()> {
+        if !matches!(
+            pair.target.purpose,
+            super::CandidatePairPurpose::PermissionExpansion {}
+        ) {
+            return Err(invalid(
+                "permission rejection requires the permission-expansion purpose",
+            ));
+        }
         self.verify_pair_operation(CandidatePairRole::Initial, pair)
             .await?;
         let binding = self.candidate_binding(request, pair.successor)?;

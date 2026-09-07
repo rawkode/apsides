@@ -10,7 +10,7 @@ mod collision;
 mod pair;
 pub use pair::{
     CANDIDATE_PAIR_QUALIFICATION_MARKER_NAME, CANDIDATE_PAIR_QUALIFICATION_SCHEMA,
-    CandidatePairLifecycleOperation, CandidatePairQualificationMarker,
+    CandidatePairLifecycleOperation, CandidatePairPurpose, CandidatePairQualificationMarker,
     CandidatePairQualificationTarget, CandidatePairRole, CandidateQualificationPair,
     candidate_pair_qualification_executor,
 };

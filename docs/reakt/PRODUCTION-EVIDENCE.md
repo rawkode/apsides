@@ -362,3 +362,28 @@ The normal `aps merge-evidence` consumer accepted it for the exact successor in
 missing checks, 43 missing reactor cases, and `releaseVerified: false`. This
 CNPG payload differs from the earlier eight-check package; those receipts must
 not be combined.
+
+
+## Exact cleanup candidate pairs
+
+The test-support pair marker requires an explicit purpose. Permission-expansion
+qualification retains its strict capability addition and distinct approved policy
+identities. Last-type cleanup qualification instead binds one selected resource
+identity and one stable policy covering both runtime generations and cleanup.
+
+A cleanup predecessor must equal the successor plus exactly that resource with
+prior deletion policy `delete`. The validator recompiles the predecessor after
+removing the selected resource and requires the exact successor plan; only new
+source coordinates and provenance may differ. Surviving declarations, inputs,
+reactions and derived behavior cannot change under this purpose. The successor
+must have no capability for the removed API group/resource.
+
+Before reservation, and when resolving the frozen successor session, qualification
+requires exactly one canonical cleanup item with its trusted UID, predecessor
+generation and exact named `get`/`delete` capabilities. Ordinary protected
+predecessor, policy, inventory, writer-retirement and lifecycle checks still apply.
+The permission-rejection operation cannot be used with the cleanup purpose.
+
+This enables qualification of an exact signed cleanup pair; it does not itself
+produce finalizer-preservation, UID-replacement or last-api-type-cleanup receipts.
+Those require separate live finalizer-completion and replacement-UID scenarios.

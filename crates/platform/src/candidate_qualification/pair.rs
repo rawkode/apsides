@@ -8,11 +8,12 @@ use deploy::Phase;
 use release::IntegrityVerifiedCandidate;
 use serde::{Deserialize, Serialize};
 
+mod purpose;
 mod rejection;
 #[cfg(test)]
 mod tests;
 
-pub const CANDIDATE_PAIR_QUALIFICATION_SCHEMA: &str = "reakt.dev/candidate-pair-qualification/v1";
+pub const CANDIDATE_PAIR_QUALIFICATION_SCHEMA: &str = "reakt.dev/candidate-pair-qualification/v2";
 pub const CANDIDATE_PAIR_QUALIFICATION_MARKER_NAME: &str = "reakt-candidate-pair-qualification";
 const CANDIDATE_PAIR_QUALIFICATION_EXECUTOR: &str = "candidate-pair-qualification";
 
@@ -22,12 +23,21 @@ pub const fn candidate_pair_qualification_executor() -> &'static str {
     CANDIDATE_PAIR_QUALIFICATION_EXECUTOR
 }
 
+/// The single lifecycle relation authorized by an immutable qualification marker.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CandidatePairPurpose {
+    PermissionExpansion {},
+    LastTypeCleanup { identity: deploy::ResourceIdentity },
+}
+
 /// One immutable pair marker and the two platform-policy identities it binds.
 /// The nested marker UID and resourceVersion identify the pair marker, never the
 /// single-candidate marker used by reservation and collision qualification.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CandidatePairQualificationTarget {
+    pub purpose: CandidatePairPurpose,
     pub cluster: CandidateQualificationTarget,
     pub initial_policy_digest: String,
     pub successor_policy_digest: String,
@@ -37,6 +47,7 @@ pub struct CandidatePairQualificationTarget {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CandidatePairQualificationMarker {
+    pub purpose: CandidatePairPurpose,
     pub schema_version: String,
     pub run_id: String,
     pub cluster_name: String,
@@ -192,6 +203,7 @@ impl PlatformClient {
             .await?;
         let successor_binding = self.candidate_binding(request, pair.successor)?;
         let current = self.validate_pair_predecessor(request, pair).await?;
+        purpose::validate_cleanup_plan(&pair.target.purpose, &deploy::plan_transition(request)?)?;
         let initial_review = current
             .value
             .transition(
@@ -225,6 +237,20 @@ impl PlatformClient {
             CANDIDATE_PAIR_QUALIFICATION_EXECUTOR,
             Some(&initial_review),
         )?;
+        if matches!(
+            pair.target.purpose,
+            CandidatePairPurpose::LastTypeCleanup { .. }
+        ) {
+            self.pair_transition_session(
+                CandidatePairRole::Successor,
+                pair,
+                inventory,
+                &request.transition_id,
+            )
+            .await?;
+            self.verify_pair_operation(CandidatePairRole::Successor, pair)
+                .await?;
+        }
         Ok(reserved)
     }
 
@@ -399,14 +425,25 @@ impl PlatformClient {
         transition: &str,
     ) -> Result<crate::TransitionSession> {
         let candidate = pair.candidate(role);
-        self.bind_release(
-            candidate.compiled(),
-            candidate.release_digest(),
-            candidate.trust_policy_digest(),
-            inventory,
-            transition,
-        )
-        .await
+        let session = self
+            .bind_release(
+                candidate.compiled(),
+                candidate.release_digest(),
+                candidate.trust_policy_digest(),
+                inventory,
+                transition,
+            )
+            .await?;
+        if role == CandidatePairRole::Successor
+            && matches!(
+                pair.target.purpose,
+                CandidatePairPurpose::LastTypeCleanup { .. }
+            )
+        {
+            let resolved = session.resolve().await?;
+            purpose::validate_cleanup_plan(&pair.target.purpose, resolved.plan())?;
+        }
+        Ok(session)
     }
 
     async fn verify_pair_operation(
@@ -449,19 +486,21 @@ impl PlatformClient {
             || initial.workload_namespace != successor.workload_namespace
             || initial.release_digest == successor.release_digest
             || pair.initial.compiled().ir_digest == pair.successor.compiled().ir_digest
-            || !strict_capability_expansion(
-                &pair.initial.compiled().capabilities,
-                &pair.successor.compiled().capabilities,
-            )
             || pair.initial.trust_policy_digest() != pair.successor.trust_policy_digest()
-            || pair.target.initial_policy_digest == pair.target.successor_policy_digest
             || !crate::valid_digest(&pair.target.initial_policy_digest)
             || !crate::valid_digest(&pair.target.successor_policy_digest)
         {
             return Err(invalid(
-                "candidate pair lacks an exact ordered permission-changing identity",
+                "candidate pair lacks an exact ordered candidate identity",
             ));
         }
+        purpose::validate_relation(
+            &pair.target.purpose,
+            pair.initial.compiled(),
+            pair.successor.compiled(),
+            &pair.target.initial_policy_digest,
+            &pair.target.successor_policy_digest,
+        )?;
         self.verify_release_trust(initial.domain_id, pair.initial.trust_policy_digest())
             .await?;
         let expected = pair_marker(pair, &successor)?;
@@ -509,6 +548,7 @@ fn pair_marker(
     let target = &pair.target.cluster;
     let cluster = qualification_cluster_name(&target.run_id)?;
     Ok(CandidatePairQualificationMarker {
+        purpose: pair.target.purpose.clone(),
         schema_version: CANDIDATE_PAIR_QUALIFICATION_SCHEMA.into(),
         run_id: target.run_id.clone(),
         cluster_name: cluster.clone(),
