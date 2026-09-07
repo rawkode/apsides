@@ -144,6 +144,31 @@ The run also passed the reaction checks and restored the original cluster and
 container inventory with credentials removed. These are baseline-only samples;
 no native performance comparison or complete §26 result is established.
 
+For the native comparison, sampling belongs after the signed successor has
+committed and published its inventory in `run_cnpg_demo.py`. It must cover
+`default`, `cnpg-system`, and the control namespace, including the native
+controller and every Envoy/admin container. The runtime exposes `/status` rather
+than `/metrics`; each recorded status must match the protected generation and
+artifact digest. The status collector makes three Kubernetes GETs per sample,
+so its observer traffic differs from the baseline's metrics-only probes. Report
+that overhead explicitly when analysing API request rates. Fixture-mode reactor
+runs cannot substitute for these production-runtime measurements.
+
+Use absolute verified input paths and a fresh ignored output directory:
+
+```sh
+cuenv exec -- python3 tests/reakt/run_cnpg_demo.py \
+  --initial-artifact "$INITIAL_RELEASE" --successor-artifact "$CNPG_RELEASE" \
+  --trust-policy "$TRUST_POLICY" --operator-manifest "$CNPG_OPERATOR_MANIFEST" \
+  --operator-sha256 "$CNPG_OPERATOR_SHA256" \
+  --output "$PWD/work/cnpg-native-samples" --collect-performance
+```
+
+The native runner uses the same sample-count and interval options as the baseline.
+Its four boundary identity checks each make six GETs to bind the active allocation,
+activation record, runtime, and proxy. The existing permission-upgrade evidence
+remains scoped to that lifecycle check; collection does not add a benchmark receipt.
+
 Reloader publishes an unkeyed Secret hash in its runtime rollout annotation;
 Apsides uses an aggregate keyed revision. Do not retain that annotation, live
 Deployment templates, Secret values or Secret hashes in benchmark artifacts.

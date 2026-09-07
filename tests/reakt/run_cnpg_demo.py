@@ -15,6 +15,7 @@ import tempfile
 import time
 
 import run_deployment_ceiling as base
+from performance import sampling
 
 
 shared = base.shared
@@ -270,6 +271,7 @@ class CnpgDemoRunner(base.CeilingRunner):
         return result_record(output, expected)
 
     def __init__(self, args):
+        self.args = args
         args.artifact = args.successor_artifact
         self.initial_artifact = args.initial_artifact
         self.successor_artifact = args.successor_artifact
@@ -306,6 +308,8 @@ class CnpgDemoRunner(base.CeilingRunner):
             ROOT / "crates/platform/tests/support/qualification_driver.rs",
         ]
         canary = ROOT / "crates/platform/tests/envoy/canary.py"
+        sampling_sources = {Path(sampling.__file__).resolve(): "permission-upgrade-sampling.py",
+                            ROOT / "tests/reakt/performance/collect.py": "permission-upgrade-collector.py"}
         source_names = {
             Path(__file__).resolve(): "permission-upgrade-runner.py",
             Path(base.__file__).resolve(): "permission-upgrade-cluster-base.py",
@@ -319,9 +323,10 @@ class CnpgDemoRunner(base.CeilingRunner):
             ROOT / "crates/platform/tests/support/qualification_driver.rs":
                 "permission-upgrade-qualification-support.rs",
         }
+        source_names.update(sampling_sources)
         for path in sorted((ROOT / "crates/platform/tests/support/permission_upgrade").glob("*.rs")):
             source_names[path] = "permission-upgrade-" + path.name
-        if set(source_names) != set(self.pair_sources) | {
+        if set(source_names) != set(self.pair_sources) | set(sampling_sources) | {
                 Path(base.__file__).resolve(), Path(shared.__file__).resolve(),
                 Path(base.observations.__file__).resolve(), Path(base.crds.__file__).resolve(), canary}:
             raise shared.QualificationError("permission upgrade source closure is incomplete")
@@ -1209,6 +1214,82 @@ class CnpgDemoRunner(base.CeilingRunner):
             "policyDigest": self.successor_policy_digest,
         }
 
+    def performance_bindings(self):
+        require = sampling.require
+        prepared = self.performance_successor
+        registry_object = json.loads(self.k("get", "configmap", "reakt-registry-" + self.workload, "-n", self.control, "-o", "json"))
+        registry = json.loads(registry_object["data"]["state.json"])
+        stored = registry["transitions"][prepared["transition"]]
+        allocation, binding, proxy = stored["inputs"]["allocation"], stored["runtimeBinding"], stored["proxyIdentity"]
+        activation = json.loads(self.k("get", "configmap", "reakt-activation-" + self.domain, "-n", self.control, "-o", "json"))
+        activation = json.loads(activation["data"]["state.json"])
+        require(registry_object["metadata"]["uid"] == prepared["registryUid"]
+                and stored["record"]["phase"] == "Committed" and activation["status"] == "active"
+                and activation["binding"] == binding and registry["histories"][self.domain]["activeAllocation"] == allocation
+                and allocation["generationId"] == prepared["generation"] and allocation["transitionId"] == prepared["transition"]
+                and allocation["artifactDigest"] == self.pair["candidates"]["successorReleaseDigest"]
+                and binding["domainId"] == self.domain and binding["generationId"] == allocation["generationId"]
+                and binding["buildDigest"] == allocation["artifactDigest"]
+                and binding["serviceAccountName"] == prepared["serviceAccountName"],
+                "native performance allocation is not the active signed successor")
+        objects = {kind: json.loads(self.k("get", kind, "-n", self.control, "-o", "json"))["items"]
+                   for kind in ["deployments", "replicasets", "pods", "serviceaccounts"]}
+        result = {}
+        runtime_name = binding["serviceAccountName"]
+        for role, name, account, images in [
+            ("runtime", runtime_name, runtime_name + "-process", {"controller": self.successor_manifest["image"]["reference"]}),
+            ("proxy", proxy["deploymentName"], runtime_name, {"envoy": self.profile["envoyImage"], "admin": self.profile["adminImage"]}),
+        ]:
+            deployments = [x for x in objects["deployments"] if x["metadata"]["name"] == name]
+            require(len(deployments) == 1, "native performance Deployment is missing or ambiguous")
+            deployment = deployments[0]
+            expected_uid = stored["stagedIdentityUids"]["apps/v1/Deployment/" + self.control + "/" + name] if role == "runtime" else proxy["deploymentUid"]
+            require(deployment["metadata"]["uid"] == expected_uid and not deployment["metadata"].get("deletionTimestamp")
+                    and deployment["spec"]["replicas"] == deployment.get("status", {}).get("readyReplicas") == 1,
+                    "native performance Deployment identity changed")
+            replica_uids = {x["metadata"]["uid"] for x in objects["replicasets"] if any(
+                o.get("controller") is True and o.get("kind") == "Deployment" and o.get("uid") == expected_uid
+                for o in x["metadata"].get("ownerReferences", []))}
+            pods = [x for x in objects["pods"] if any(o.get("controller") is True and o.get("kind") == "ReplicaSet"
+                    and o.get("uid") in replica_uids for o in x["metadata"].get("ownerReferences", []))]
+            require(len(pods) == 1, "native performance Pod set is not singular")
+            pod = pods[0]; statuses = pod.get("status", {}).get("containerStatuses", [])
+            accounts = [x for x in objects["serviceaccounts"] if x["metadata"]["name"] == account]
+            require(len(accounts) == 1 and accounts[0]["metadata"]["uid"] == stored["stagedIdentityUids"]["v1/ServiceAccount/" + self.control + "/" + account]
+                    and not accounts[0]["metadata"].get("deletionTimestamp") and pod["spec"]["serviceAccountName"] == account
+                    and not pod["metadata"].get("deletionTimestamp")
+                    and {c["name"]: c["image"] for c in pod["spec"]["containers"]} == images
+                    and len(statuses) == len(images) and {c["name"] for c in statuses} == set(images)
+                    and all(c.get("ready") is True and c.get("restartCount") == 0 and c.get("containerID")
+                            and c.get("state", {}).get("running") for c in statuses),
+                    "native performance Pod credentials, images or containers changed")
+            containers = {c["name"]: {"containerId": c["containerID"], "restartCount": c["restartCount"]} for c in statuses}
+            if role == "proxy":
+                require(pod["metadata"]["name"] == proxy["podName"] and pod["metadata"]["uid"] == proxy["podUid"]
+                        and containers["envoy"]["containerId"] == proxy["envoyContainerId"]
+                        and containers["admin"]["containerId"] == proxy["adminContainerId"], "native performance proxy differs from protected identity")
+            result[role] = {"deploymentUid": expected_uid, "podUid": pod["metadata"]["uid"], "pod": pod["metadata"]["name"],
+                            "serviceAccountName": account, "serviceAccountUid": accounts[0]["metadata"]["uid"],
+                            "containers": containers, "generation": allocation["generationId"], "buildDigest": allocation["artifactDigest"]}
+        return result
+
+    def performance_http(self, count, expected):
+        def stable(value):
+            return {key: value[key] for key in ["deploymentUid", "revision", "replicaSetUid", "podUid", "containerImageId", "restartCount"]}
+        return sampling.wait_http(self.http_messages, lambda: stable(self.workload_identity(timeout=1)),
+                                  HttpObservationError, count, stable(expected))
+
+    def performance_window(self, label, controllers, action=None):
+        self.phase = "performance-" + label
+        runtime = controllers["runtime"]
+        path = f"/api/v1/namespaces/{self.control}/pods/{runtime['pod']}:8080/proxy/status"
+        expected = {"domain": self.domain, "namespace": self.control, "pod": runtime["pod"], "path": path,
+                    "podUid": runtime["podUid"], "containerId": runtime["containers"]["controller"]["containerId"],
+                    "restartCount": 0, "generation": runtime["generation"], "buildDigest": runtime["buildDigest"]}
+        return sampling.collection_window(self, label, controllers, action,
+            namespaces=[self.workload, self.control, "cnpg-system"], bindings=self.performance_bindings,
+            runtime_status=[self.domain + "=" + path], expected_runtime=[expected], identity_gets=6, label_prefix="cnpg-native")
+
     def measure(self):
         prepared = self.step("prepare-initial", "initial-prepared", self.issuer)
         _, initial_managed = self.prepared_projection(prepared, self.initial_plan)
@@ -1290,17 +1371,24 @@ class CnpgDemoRunner(base.CeilingRunner):
         if resolved["phase"] != "Committed":
             raise shared.QualificationError("successor candidate did not commit")
         before = self.workload_identity()
-        first_http = self.http_messages(2)
-        self.k(
-            "patch", "configmap", "api-settings", "-n", self.workload, "--type=merge", "-p",
-            json.dumps({"data": {"PGRST_DB_MAX_ROWS": "1"}}),
-        )
-        after = self.workload_identity(previous_uid=before["podUid"])
-        if (after["deploymentUid"] != before["deploymentUid"]
-                or after["revision"] == before["revision"]
-                or after["replicaSetUid"] == before["replicaSetUid"]):
-            raise shared.QualificationError("ConfigMap change did not produce the expected PostgREST rollout")
-        second_http = self.http_messages(1)
+        collect_performance = getattr(self.args, "collect_performance", False)
+        first_http = self.performance_http(2, before) if collect_performance else self.http_messages(2)
+        def change_configmap():
+            self.k("patch", "configmap", "api-settings", "-n", self.workload, "--type=merge", "-p",
+                   json.dumps({"data": {"PGRST_DB_MAX_ROWS": "1"}}))
+            after = self.workload_identity(previous_uid=before["podUid"])
+            if (after["deploymentUid"] != before["deploymentUid"] or after["revision"] == before["revision"]
+                    or after["replicaSetUid"] == before["replicaSetUid"]):
+                raise shared.QualificationError("ConfigMap change did not produce the expected PostgREST rollout")
+            http = self.performance_http(1, after) if collect_performance else self.http_messages(1)
+            return after, http
+        if collect_performance:
+            self.performance_successor = successor
+            controllers = self.performance_bindings()
+            self.performance_window("idle", controllers)
+            after, second_http = self.performance_window("active", controllers, change_configmap)
+        else:
+            after, second_http = change_configmap()
         self.checks.extend([
             {"check": "postgrest-messages-live", "passed": True, **first_http},
             {"check": "configmap-driven-pod-turnover", "passed": True, "before": before, "after": after},
@@ -1505,9 +1593,15 @@ def main():
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--operator-sha256", required=True)
     parser.add_argument("--retain-on-success", action="store_true")
+    parser.add_argument("--collect-performance", action="store_true")
+    parser.add_argument("--performance-samples", type=int, default=13)
+    parser.add_argument("--performance-interval", type=float, default=5)
+    args = parser.parse_args()
+    if not 3 <= args.performance_samples <= 61 or not 1 <= args.performance_interval <= 10:
+        parser.error("performance samples must be 3..61 and interval 1..10 seconds")
     runner = None
     try:
-        runner = CnpgDemoRunner(parser.parse_args())
+        runner = CnpgDemoRunner(args)
         runner.run()
     except Exception as error:
         if runner is not None:

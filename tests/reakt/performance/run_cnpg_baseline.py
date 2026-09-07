@@ -6,9 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
-import signal
 import sys
-import subprocess
 import tempfile
 import time
 import uuid
@@ -17,6 +15,7 @@ import cnpg_baseline as preparation
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import run_cnpg_demo as demo
+from performance import sampling
 
 shared = demo.shared
 ROOT = demo.ROOT
@@ -106,7 +105,7 @@ class BaselineRunner(demo.base.CeilingRunner):
                         Path(preparation.generate.__file__).resolve(), Path(demo.__file__).resolve(),
                         Path(demo.base.__file__).resolve(), Path(shared.__file__).resolve(),
                         Path(demo.base.observations.__file__).resolve(), Path(demo.base.crds.__file__).resolve(),
-                        Path(__file__).parent / "pins.json", Path(__file__).parent / "collect.py"]
+                        Path(__file__).parent / "pins.json", Path(__file__).parent / "collect.py", Path(sampling.__file__).resolve()]
         self.source_digests = {str(p.relative_to(ROOT)): shared.digest_file(p) for p in self.sources}
         self.input_digests = {}
 
@@ -225,22 +224,8 @@ class BaselineRunner(demo.base.CeilingRunner):
         raise shared.QualificationError("baseline workload did not reach expected readiness")
 
     def wait_http(self, expected_count, expected_identity, timeout=120):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            require(self.workload_state() == expected_identity, "workload identity changed during HTTP startup")
-            try:
-                result = self.http_messages(expected_count)
-            except demo.HttpObservationError as error:
-                if not (error.reason == "transport" or (error.reason == "status" and error.status == 503)):
-                    raise
-            else:
-                require(self.workload_state() == expected_identity, "workload identity changed during HTTP startup")
-                require(time.monotonic() < deadline, "PostgREST startup deadline exceeded")
-                return result
-            remaining = deadline - time.monotonic()
-            if remaining > 0:
-                time.sleep(min(2, remaining))
-        raise shared.QualificationError("PostgREST startup deadline exceeded")
+        return sampling.wait_http(self.http_messages, self.workload_state, demo.HttpObservationError,
+                                  expected_count, expected_identity, timeout)
 
     def controller_bindings(self):
         pods = json.loads(self.k("get", "pods", "-n", self.workload, "-o", "json"))["items"]
@@ -259,82 +244,9 @@ class BaselineRunner(demo.base.CeilingRunner):
         return result
 
     def collection_window(self, label, controllers, action=None):
-        """Run the existing collector; all timestamps use the host monotonic clock."""
-        require(self.controller_bindings() == controllers, "performance controller identity changed")
-        output = self.output / ("performance-" + label)
-        paths = [controllers[name]["metricsPath"] for name in sorted(controllers)]
-        command = [sys.executable, str(Path(__file__).parent / "collect.py"), "--kubeconfig", str(self.admin),
-                   "--output", str(output), "--label", "cnpg-baseline-" + label,
-                   "--namespace", "default", "--namespace", "cnpg-system",
-                   "--samples", str(self.args.performance_samples), "--interval", str(self.args.performance_interval)]
-        for path in paths:
-            command += ["--metrics-path", path]
-        launched = time.monotonic()
-        deadline = launched + self.args.performance_samples * (self.args.performance_interval + 120) + 60
-        process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        try:
-            first = output / "sample-0000" / "sample.json"
-            while True:
-                require(time.monotonic() < deadline, "performance collector exceeded deadline")
-                try:
-                    sample = json.loads(read(first)) if first.exists() and first.stat().st_size else None
-                except json.JSONDecodeError:
-                    sample = None
-                if sample is not None:
-                    require(not sample["errors"] and sample["collectionSeconds"] >= 0, "first performance sample failed")
-                    break
-                require(process.poll() is None, "performance collector ended before first complete sample")
-                time.sleep(0.2)
-            require(process.poll() is None, "performance collector ended before stimulus")
-            require(self.controller_bindings() == controllers, "performance controller identity changed")
-            action_started = time.monotonic() - launched if action else None
-            result = action() if action else None
-            action_ended = time.monotonic() - launched if action else None
-            require(self.controller_bindings() == controllers, "performance controller identity changed")
-            while process.poll() is None:
-                require(time.monotonic() < deadline, "performance collector exceeded deadline")
-                time.sleep(1)
-            require(process.wait(timeout=10) == 0, "performance collector failed")
-            require(self.controller_bindings() == controllers, "performance controller identity changed")
-            summary = json.loads(read(output / "summary.json"))
-            samples = [json.loads(read(output / f"sample-{index:04d}" / "sample.json"))
-                       for index in range(self.args.performance_samples)]
-            require(summary["schemaVersion"] == "reakt.dev/performance-samples/v1"
-                    and summary["samples"] == self.args.performance_samples and not summary["errors"]
-                    and summary["namespaces"] == ["default", "cnpg-system"] and summary["rawMetricPaths"] == paths
-                    and all(not sample["errors"] for sample in samples), "performance collection is incomplete")
-            require(len(list(output.glob("sample-*/sample.json"))) == self.args.performance_samples
-                    and all({row["namespace"] for row in sample["usage"]} >= {"default", "cnpg-system"}
-                            and {row["podUid"] for row in sample["usage"]} >= {item["podUid"] for item in controllers.values()}
-                            for sample in samples), "performance population is incomplete")
-            require(all(b["elapsedSeconds"] > a["elapsedSeconds"] for a, b in zip(samples, samples[1:])),
-                    "performance sample timestamps are not increasing")
-            if action:
-                # Child collection starts after launch; this conservative inequality
-                # proves at least one sample started after the completed reaction.
-                require(action_ended < samples[-1]["elapsedSeconds"], "reaction completed outside sampled interval")
-            self.checks.append({"check": "performance-" + label, "directory": output.name,
-                                "samples": len(samples), "controllers": controllers,
-                                "observer": {"controllerIdentityChecks": 4, "kubectlGetsPerIdentityCheck": 4,
-                                             "identityPolling": False, "apiRateIncludesObserverTraffic": True},
-                                "actionStartedAfterLaunchSeconds": action_started,
-                                "actionCompletedAfterLaunchSeconds": action_ended,
-                                "completeSection26": False})
-            return result
-        finally:
-            # The collector invokes kubectl children. Stop the entire session-owned
-            # group, including children left behind if the collector already exited.
-            for sig in [signal.SIGTERM, signal.SIGKILL]:
-                try:
-                    os.killpg(process.pid, sig)
-                except ProcessLookupError:
-                    pass
-                if sig == signal.SIGTERM:
-                    try:
-                        process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        pass
-            process.wait(timeout=10)
+        return sampling.collection_window(self, label, controllers, action,
+            namespaces=["default", "cnpg-system"], bindings=self.controller_bindings,
+            metrics_paths=[controllers[name]["metricsPath"] for name in sorted(controllers)])
 
     def measure(self):
         self.phase = "initial-readiness"

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Offline contract checks; synthetic records are never passed to publication."""
 import copy
+import io
+import tarfile
+import types
+from unittest.mock import patch
 import unittest
 
 import package_cnpg_phase_recovery as package
@@ -123,6 +127,23 @@ class PackagingTests(unittest.TestCase):
         package.validate_measurement(m)
         m["steps"].pop(15)
         with self.assertRaises(package.shared.QualificationError): package.validate_measurement(m)
+
+    def test_current_archive_requires_shared_sampling_and_collector_closure(self):
+        stream=io.BytesIO();frozen={}
+        with tarfile.open(fileobj=stream,mode='w') as archive:
+            for alias,path in package.SOURCES.items():
+                content=(package.demo.ROOT/path).read_bytes()
+                member=tarfile.TarInfo(path);member.size=len(content)
+                archive.addfile(member,io.BytesIO(content))
+                frozen['producer/'+alias]=package.shared.digest_bytes(content)
+        raw=stream.getvalue();m={'runnerSourceCommit':'source','sourceArchiveDigest':package.shared.digest_bytes(raw),'frozenInputDigests':frozen}
+        with patch.object(package.subprocess,'run',return_value=types.SimpleNamespace(stdout=raw)):
+            package.source_closure(raw,m,package.demo.ROOT,'source')
+            for alias in ['permission-upgrade-sampling.py','permission-upgrade-collector.py']:
+                self.assertIn(alias,package.SOURCES)
+                broken=copy.deepcopy(m);broken['frozenInputDigests'].pop('producer/'+alias)
+                with self.assertRaisesRegex(package.shared.QualificationError,'source closure changed'):
+                    package.source_closure(raw,broken,package.demo.ROOT,'source')
 
     def test_stale_source_commit_rejected_without_git_access(self):
         with self.assertRaises(package.shared.QualificationError):

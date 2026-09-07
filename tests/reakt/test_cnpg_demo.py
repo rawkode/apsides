@@ -1,6 +1,7 @@
 """Offline regressions for the live CNPG demo's polling and image assertions."""
 from contextlib import nullcontext
 import hashlib
+import types
 import json
 from pathlib import Path
 import tempfile
@@ -79,6 +80,81 @@ class DemoChecks(unittest.TestCase):
             with self.assertRaises(demo.HttpObservationError) as observed:runner.http_messages(2)
         self.assertEqual(observed.exception.reason,'transport');self.assertIsNone(observed.exception.status)
         self.assertNotIn('PRIVATE',str(observed.exception));connection.close.assert_called_once()
+
+    def native_performance_fixture(self):
+        runner=object.__new__(demo.CnpgDemoRunner);runner.control='control';runner.workload='default';runner.domain='domain'
+        runner.performance_successor={'transition':'t','registryUid':'registry','generation':'g','serviceAccountName':'runtime'}
+        runner.pair={'candidates':{'successorReleaseDigest':self.digest()}}
+        runner.successor_manifest={'image':{'reference':'controller@'+self.digest()}}
+        runner.profile={'envoyImage':'envoy@'+self.digest(),'adminImage':'admin@'+self.digest()}
+        allocation={'generationId':'g','transitionId':'t','artifactDigest':self.digest()}
+        binding={'domainId':'domain','generationId':'g','buildDigest':self.digest(),'serviceAccountName':'runtime'}
+        proxy={'deploymentName':'proxy','deploymentUid':'proxy-d','podName':'proxy-p','podUid':'proxy-p-uid',
+               'envoyContainerId':'containerd://envoy','adminContainerId':'containerd://admin'}
+        staged={'apps/v1/Deployment/control/runtime':'runtime-d',
+                'v1/ServiceAccount/control/runtime':'sa','v1/ServiceAccount/control/runtime-process':'process-sa'}
+        stored={'inputs':{'allocation':allocation},'runtimeBinding':binding,'proxyIdentity':proxy,
+                'record':{'phase':'Committed'},'stagedIdentityUids':staged}
+        registry={'transitions':{'t':stored},'histories':{'domain':{'activeAllocation':allocation}}}
+        objects={'deployments':[],'replicasets':[],'pods':[],
+                 'serviceaccounts':[{'metadata':{'name':'runtime','uid':'sa'}},{'metadata':{'name':'runtime-process','uid':'process-sa'}}]}
+        for name,account,images in [('runtime','runtime-process',{'controller':runner.successor_manifest['image']['reference']}),
+                                    ('proxy','runtime',{'envoy':runner.profile['envoyImage'],'admin':runner.profile['adminImage']})]:
+            objects['deployments'].append({'metadata':{'name':name,'uid':name+'-d'},'spec':{'replicas':1},'status':{'readyReplicas':1}})
+            objects['replicasets'].append({'metadata':{'uid':name+'-rs','ownerReferences':[{'controller':True,'kind':'Deployment','uid':name+'-d'}]}})
+            objects['pods'].append({'metadata':{'name':name+'-p','uid':name+'-p-uid','ownerReferences':[{'controller':True,'kind':'ReplicaSet','uid':name+'-rs'}]},
+                'spec':{'serviceAccountName':account,'containers':[{'name':k,'image':v} for k,v in images.items()]},
+                'status':{'containerStatuses':[{'name':k,'ready':True,'restartCount':0,'state':{'running':{'startedAt':'now'}},'containerID':'containerd://'+k} for k in images]}})
+        def kubectl(*args):
+            if args[1]=='configmap':
+                state=registry if args[2].startswith('reakt-registry') else {'status':'active','binding':binding}
+                return json.dumps({'metadata':{'uid':'registry'},'data':{'state.json':json.dumps(state)}})
+            return json.dumps({'items':objects[args[1]]})
+        runner.k=Mock(side_effect=kubectl)
+        return runner,stored,objects
+
+    def test_native_performance_binds_all_containers_to_protected_candidate(self):
+        runner,_,_=self.native_performance_fixture();bindings=runner.performance_bindings()
+        self.assertEqual(bindings['runtime']['buildDigest'],self.digest())
+        self.assertEqual(bindings['runtime']['serviceAccountUid'],'process-sa')
+        self.assertEqual(set(bindings['proxy']['containers']),{'envoy','admin'})
+        self.assertEqual(runner.k.call_count,6)
+
+    def test_native_performance_rejects_wrong_allocation_account_image_or_container(self):
+        for mutate in [lambda s,o:s['inputs']['allocation'].update(artifactDigest=self.digest('b')),
+                       lambda s,o:s['inputs']['allocation'].update(generationId='wrong'),
+                       lambda s,o:s['proxyIdentity'].update(adminContainerId='replaced'),
+                       lambda s,o:o['serviceaccounts'][1]['metadata'].update(uid='replaced'),
+                       lambda s,o:o['pods'][0]['spec']['containers'][0].update(image='other'),
+                       lambda s,o:o['pods'][1]['status']['containerStatuses'][1].update(restartCount=1)]:
+            runner,stored,objects=self.native_performance_fixture();mutate(stored,objects)
+            with self.assertRaises(demo.shared.QualificationError):runner.performance_bindings()
+
+    def test_sampling_sources_are_frozen_and_changed_helper_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            for name in ['initial','successor']:
+                (root/name).mkdir();(root/name/'release.json').write_text('{}')
+            operator=root/'operator.yaml';image='ghcr.io/cloudnative-pg/cloudnative-pg:1.30.0@'+self.digest()
+            operator.write_text('image: '+image+'\nvalue: '+image+'\n');trust=root/'trust';trust.write_text('{}')
+            args=types.SimpleNamespace(initial_artifact=root/'initial',successor_artifact=root/'successor',trust_policy=trust,
+                                      operator_manifest=operator,operator_sha256=demo.shared.digest_file(operator),
+                                      output=root/'out',retain_on_success=False)
+            def base_init(self,args):
+                self.output=args.output;self.output.mkdir();self.repository=demo.ROOT;self.commit='source'
+                self.artifact=args.artifact;self.trust=args.trust_policy;self.failure_reasons=set()
+            def archive(command,**kwargs):
+                Path(command[command.index('--output')+1]).write_bytes(b'source archive')
+                return types.SimpleNamespace(returncode=0)
+            with patch.object(demo.base.CeilingRunner,'__init__',base_init),patch.object(demo,'release_files',return_value={}),                 patch.object(demo,'reject_ignored_driver_sources'),patch.object(demo.subprocess,'run',side_effect=archive):
+                runner=demo.CnpgDemoRunner(args)
+            helper=Path(demo.sampling.__file__).resolve();collector=helper.parent/'collect.py'
+            for path in [helper,collector]:
+                self.assertIn(path,runner.sources);self.assertIn(path,runner.source_archives)
+                self.assertIn('producer/'+runner.source_archives[path],runner.snapshot)
+            original=demo.shared.digest_file
+            with patch.object(demo,'reject_ignored_driver_sources'),patch.object(demo.shared,'source_state',return_value=(runner.repository,runner.commit)),                 patch.object(demo.shared,'digest_file',side_effect=lambda p:self.digest('b') if p==helper else original(p)):
+                with self.assertRaisesRegex(demo.shared.QualificationError,'inputs changed'):runner.require_inputs_unchanged()
 
     def candidates(self):
         return {name: self.digest() for name in demo.PAIR_DIGESTS}

@@ -174,17 +174,57 @@ class BaselineLiveTests(unittest.TestCase):
             runner,controllers,process=self.collection_fixture(directory)
             clock=[0.0]
             def action():clock[0]=6;return 'changed'
-            with patch.object(live.os,'killpg') as killpg, patch.object(live.subprocess,'Popen',return_value=process) as launch, patch.object(live.time,'monotonic',side_effect=lambda:clock[0]):
+            with patch.object(live.os,'killpg') as killpg, patch.object(live.sampling.subprocess,'Popen',return_value=process) as launch, patch.object(live.time,'monotonic',side_effect=lambda:clock[0]):
                 self.assertEqual(runner.collection_window('active',controllers,action),'changed')
             self.assertEqual(runner.checks[-1]['actionCompletedAfterLaunchSeconds'],6)
             self.assertFalse(runner.checks[-1]['completeSection26'])
             self.assertIn('--metrics-path',launch.call_args.args[0]);self.assertTrue(launch.call_args.kwargs['start_new_session']);process.wait.assert_called()
 
+    def test_shared_native_window_rejects_wrong_build_generation_or_counter_reset(self):
+        for fault in [None,'generation','build','counter-reset']:
+            with self.subTest(fault=fault),tempfile.TemporaryDirectory() as directory:
+                runner,controllers,process=self.collection_fixture(directory)
+                output=runner.output/'performance-active';path='/api/v1/namespaces/default/pods/runtime:8080/proxy/status'
+                expected={'domain':'domain','namespace':'default','pod':'runtime','path':path,'podUid':'flux',
+                          'containerId':'containerd://runtime','restartCount':0,'generation':'generation','buildDigest':'sha256:'+'a'*64}
+                samples=[]
+                for index in range(3):
+                    file=output/f'sample-{index:04d}'/'sample.json';sample=json.loads(file.read_text())
+                    row={**expected,'triggerToCycleMicrosCount':index+1,'triggerToCycleMicrosSum':(index+1)*10,
+                         'triggerToCycleMicrosMax':10,'applyCacheEntries':4,'applyCacheSerializedBytes':100,'pendingCoalescedTriggers':0}
+                    if fault=='generation':row['generation']='wrong'
+                    if fault=='build':row['buildDigest']='sha256:'+'b'*64
+                    if fault=='counter-reset' and index==1:row['triggerToCycleMicrosCount']=0
+                    sample['runtime']=[row];samples.append(sample);file.write_text(json.dumps(sample))
+                summary=json.loads((output/'summary.json').read_text());summary['rawMetricPaths']=[]
+                summary['runtimeDiagnostics']=live.sampling.collect.runtime_report(samples,[live.sampling.collect.runtime_target('domain='+path)])
+                (output/'summary.json').write_text(json.dumps(summary))
+                with patch.object(live.os,'killpg'),patch.object(live.sampling.subprocess,'Popen',return_value=process):
+                    if fault:
+                        with self.assertRaises(live.shared.QualificationError):
+                            live.sampling.collection_window(runner,'active',controllers,namespaces=['default','cnpg-system'],
+                                bindings=runner.controller_bindings,runtime_status=['domain='+path],expected_runtime=[expected])
+                        self.assertEqual(runner.checks,[])
+                    else:
+                        live.sampling.collection_window(runner,'active',controllers,namespaces=['default','cnpg-system'],
+                            bindings=runner.controller_bindings,runtime_status=['domain='+path],expected_runtime=[expected])
+                        self.assertEqual(runner.checks[-1]['observer']['runtimeStatusGetsPerSample'],3)
+
+    def test_baseline_freezes_shared_sampling_source(self):
+        with tempfile.TemporaryDirectory(dir=live.ROOT) as directory:
+            with patch.object(live.shared,'require_ignored'),patch.object(live.shared,'source_state',return_value=(live.ROOT,'commit')):
+                runner=live.BaselineRunner(types.SimpleNamespace(output=Path(directory)/'output'))
+                helper=Path(live.sampling.__file__).resolve()
+                self.assertIn(helper,runner.sources)
+                original=live.shared.digest_file
+                with patch.object(live.shared,'digest_file',side_effect=lambda p:'changed' if p==helper else original(p)):
+                    with self.assertRaisesRegex(live.shared.QualificationError,'changed'):runner.frozen()
+
     def test_collection_early_exit_never_runs_stimulus(self):
         with tempfile.TemporaryDirectory() as directory:
             runner,controllers,process=self.collection_fixture(directory,completed=False)
             process.poll.side_effect=None;process.poll.return_value=0;action=Mock()
-            with patch.object(live.os,'killpg') as killpg, patch.object(live.subprocess,'Popen',return_value=process):
+            with patch.object(live.os,'killpg') as killpg, patch.object(live.sampling.subprocess,'Popen',return_value=process):
                 with self.assertRaisesRegex(live.shared.QualificationError,'first complete sample'):
                     runner.collection_window('active',controllers,action)
             action.assert_not_called();process.wait.assert_called()
@@ -194,10 +234,10 @@ class BaselineLiveTests(unittest.TestCase):
             runner,controllers,process=self.collection_fixture(directory)
             process.poll.side_effect=None;process.poll.return_value=None
             action=Mock(side_effect=RuntimeError('private action failure'))
-            process.wait.side_effect=[live.subprocess.TimeoutExpired('collector',10),0]
-            with patch.object(live.os,'killpg') as killpg, patch.object(live.subprocess,'Popen',return_value=process):
+            process.wait.side_effect=[live.sampling.subprocess.TimeoutExpired('collector',10),0]
+            with patch.object(live.os,'killpg') as killpg, patch.object(live.sampling.subprocess,'Popen',return_value=process):
                 with self.assertRaises(RuntimeError):runner.collection_window('active',controllers,action)
-            self.assertEqual(killpg.call_args_list,[unittest.mock.call(12345,live.signal.SIGTERM),unittest.mock.call(12345,live.signal.SIGKILL)])
+            self.assertEqual(killpg.call_args_list,[unittest.mock.call(12345,live.sampling.signal.SIGTERM),unittest.mock.call(12345,live.sampling.signal.SIGKILL)])
             process.wait.assert_called_with(timeout=10)
             self.assertEqual(runner.checks,[])
 
@@ -206,7 +246,7 @@ class BaselineLiveTests(unittest.TestCase):
             with self.subTest(fault=fault),tempfile.TemporaryDirectory() as directory:
                 runner,controllers,process=self.collection_fixture(directory,errors=fault=='errors');clock=[0.0]
                 def action():clock[0]=12 if fault=='late' else 1
-                with patch.object(live.os,'killpg') as killpg, patch.object(live.subprocess,'Popen',return_value=process),patch.object(live.time,'monotonic',side_effect=lambda:clock[0]):
+                with patch.object(live.os,'killpg') as killpg, patch.object(live.sampling.subprocess,'Popen',return_value=process),patch.object(live.time,'monotonic',side_effect=lambda:clock[0]):
                     with self.assertRaises(live.shared.QualificationError):runner.collection_window('active',controllers,action)
                 self.assertEqual(runner.checks,[]);process.wait.assert_called()
 

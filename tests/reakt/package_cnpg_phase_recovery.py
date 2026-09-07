@@ -18,6 +18,8 @@ SOURCES = {
     "permission-upgrade-runner.py": "tests/reakt/run_cnpg_demo.py",
     "permission-upgrade-cluster-base.py": "tests/reakt/run_deployment_ceiling.py",
     "permission-upgrade-crd-support.py": "tests/reakt/run_cluster.py",
+    "permission-upgrade-sampling.py": "tests/reakt/performance/sampling.py",
+    "permission-upgrade-collector.py": "tests/reakt/performance/collect.py",
     "permission-upgrade-shared.py": "tests/reakt/run_reproducibility.py",
     "permission-upgrade-observations.py": "tests/reakt/ceiling_observations.py",
     "permission-upgrade-proxy-canary.py": "crates/platform/tests/envoy/canary.py",
