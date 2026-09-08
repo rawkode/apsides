@@ -5,6 +5,32 @@ import "github.com/cuenv/cuenv/schema"
 schema.#Project & {name: "apsides"}
 
 tasks: {
+	tsxPrototypeInstall: {command: "bun", args: ["install", "--cwd", "prototypes/tsx-controller", "--frozen-lockfile"]}
+	tsxPrototypeCheck: {
+		dependsOn: [tsxPrototypeInstall]
+		command: "bun"
+		args: ["run", "--cwd", "prototypes/tsx-controller", "check"]
+	}
+	tsxPrototypeTest: {
+		dependsOn: [tsxPrototypeInstall]
+		command: "bun"
+		args: ["run", "--cwd", "prototypes/tsx-controller", "test"]
+	}
+	tsxPrototypeBuild: {
+		dependsOn: [tsxPrototypeCheck, tsxPrototypeTest]
+		command: "bun"
+		args: ["run", "--cwd", "prototypes/tsx-controller", "build"]
+	}
+	tsxPrototypeSmoke: {
+		dependsOn: [tsxPrototypeBuild]
+		command: "bun"
+		args: ["run", "--cwd", "prototypes/tsx-controller", "smoke"]
+	}
+	tsxPrototypeE2e: {
+		dependsOn: [tsxPrototypeCheck, tsxPrototypeTest]
+		command: "bun"
+		args: ["run", "--cwd", "prototypes/tsx-controller", "e2e"]
+	}
 	performanceMetricsTest: {
 		command: "uv"
 		args: ["run", "--cache-dir", "work/uv-cache", "--no-project", "--with-requirements", "tests/reakt/performance/requirements.txt", "python3", "tests/reakt/performance/test_analyze_metrics.py"]

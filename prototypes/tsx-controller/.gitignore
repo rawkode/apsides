@@ -1,0 +1,7 @@
+node_modules/
+.*.bun-build
+dist/
+.state/
+.demo/
+.e2e/
+coverage/
