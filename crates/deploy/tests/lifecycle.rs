@@ -3,6 +3,8 @@ use deploy::*;
 use serde_json::json;
 use std::collections::BTreeSet;
 
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const REGISTRY_UID: &str = "11111111-1111-4111-8111-111111111111";
 const REGISTRY_TOKEN: &str = "ceirceircfardairceirceirce";
@@ -36,11 +38,11 @@ fn adoption_intent(request: &DeploymentRequest) -> OwnershipIntent {
 }
 
 #[test]
-fn adoption_requires_exact_bound_fields_and_cannot_expand_authority() {
-    let mut request = request(None, generation("g1", &[("existing", "orphan")]));
-    let baseline = plan_transition(&request).unwrap();
+fn adoption_requires_exact_bound_fields_and_cannot_expand_authority() -> TestResult {
+    let mut request = request(None, generation("g1", &[("existing", "orphan")])?);
+    let baseline = plan_transition(&request)?;
     request.ownership_intents.push(adoption_intent(&request));
-    let approved = plan_transition(&request).unwrap();
+    let approved = plan_transition(&request)?;
     assert_ne!(approved.plan_digest, baseline.plan_digest);
     assert_eq!(
         approved.request.next.compiled.capabilities,
@@ -68,12 +70,13 @@ fn adoption_requires_exact_bound_fields_and_cannot_expand_authority() {
         .ownership_intents
         .push(request.ownership_intents[0].clone());
     assert!(plan_transition(&request).is_err());
+    Ok(())
 }
 
 #[test]
 fn frozen_ownership_metadata_reconstructs_exact_approved_fields()
--> std::result::Result<(), Box<dyn std::error::Error>> {
-    let mut request = request(None, generation("g1", &[("existing", "orphan")]));
+-> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut request = request(None, generation("g1", &[("existing", "orphan")])?);
     request.ownership_intents.push(adoption_intent(&request));
     let frozen = freeze_ownership_intents(&request)?;
     let encoded = serde_json::to_string(&frozen)?;
@@ -105,25 +108,23 @@ fn frozen_ownership_metadata_reconstructs_exact_approved_fields()
 }
 
 #[test]
-fn empty_ownership_intents_preserve_existing_serialized_plan_identity() {
-    let request = request(None, generation("g1", &[("config", "orphan")]));
-    let encoded = serde_json::to_value(&request).unwrap();
+fn empty_ownership_intents_preserve_existing_serialized_plan_identity() -> TestResult {
+    let request = request(None, generation("g1", &[("config", "orphan")])?);
+    let encoded = serde_json::to_value(&request)?;
     assert!(encoded.get("ownershipIntents").is_none());
-    let restored: DeploymentRequest = serde_json::from_value(encoded).unwrap();
-    assert_eq!(
-        plan_transition(&restored).unwrap(),
-        plan_transition(&request).unwrap()
-    );
+    let restored: DeploymentRequest = serde_json::from_value(encoded)?;
+    assert_eq!(plan_transition(&restored)?, plan_transition(&request)?);
+    Ok(())
 }
 
-fn generation(id: &str, names: &[(&str, &str)]) -> GenerationPlan {
+fn generation(id: &str, names: &[(&str, &str)]) -> TestResult<GenerationPlan> {
     let resources=names.iter().map(|(name,policy)|json!({"id":name,"apiVersion":"v1","kind":"ConfigMap","name":name,"namespace":"workload","desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":"workload"},"data":{"value":"approved"}},"lifecycle":{"deletionPolicy":policy},"source":{"file":"program.ts","line":1,"column":1}})).collect::<Vec<_>>();
     let value = json!({"schemaVersion":"apsides.dev/ir/v1","domain":{"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound","budgets":{"maxResources":64,"maxInputs":64,"maxReactions":64,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},"resources":resources,"inputs":[],"reactions":[],"provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}});
-    GenerationPlan {
+    Ok(GenerationPlan {
         generation_id: id.into(),
         artifact_digest: DIGEST.into(),
-        compiled: parse_and_validate(&value.to_string()).unwrap(),
-    }
+        compiled: parse_and_validate(&value.to_string())?,
+    })
 }
 
 fn ceiling(generation: &GenerationPlan) -> PermissionCeiling {
@@ -303,26 +304,28 @@ fn fixture_predecessor(
 fn predecessor_mut(
     request: &mut DeploymentRequest,
 ) -> std::result::Result<&mut PredecessorGeneration, &'static str> {
-    match request.previous.as_mut() {
-        Some(previous) => Ok(previous),
-        None => Err("missing fixture predecessor"),
-    }
+    request
+        .previous
+        .as_deref_mut()
+        .ok_or("missing fixture predecessor")
 }
 
 fn events(plan: &TransitionPlan) -> Vec<Event> {
-    let quiescence = match &plan.request.previous {
-        None => Quiescence::InitialInstallation {
+    let quiescence = plan.request.previous.as_ref().map_or(
+        Quiescence::InitialInstallation {
             verification_epoch: 0,
         },
-        Some(old) => Quiescence::OldGeneration(TerminationEvidence {
-            generation_id: old.allocation.generation_id.clone(),
-            executor_id: "executor".into(),
-            verification_epoch: 0,
-            environment_qualification_digest: DIGEST.into(),
-            process_termination_receipt_digest: DIGEST.into(),
-            access_revocation_receipt_digest: DIGEST.into(),
-        }),
-    };
+        |old| {
+            Quiescence::OldGeneration(TerminationEvidence {
+                generation_id: old.allocation.generation_id.clone(),
+                executor_id: "executor".into(),
+                verification_epoch: 0,
+                environment_qualification_digest: DIGEST.into(),
+                process_termination_receipt_digest: DIGEST.into(),
+                access_revocation_receipt_digest: DIGEST.into(),
+            })
+        },
+    );
     vec![
         Event::Staged {
             event_id: "staged".into(),
@@ -368,7 +371,7 @@ fn events(plan: &TransitionPlan) -> Vec<Event> {
 fn planned_recovery_cycles(
     plan: &TransitionPlan,
     cycles: usize,
-) -> std::result::Result<TransitionRecord, Box<dyn std::error::Error>> {
+) -> std::result::Result<TransitionRecord, Box<dyn std::error::Error + Send + Sync>> {
     let mut record = begin(plan, "executor")?;
     for cycle in 0..cycles {
         record = advance(
@@ -399,7 +402,7 @@ fn stage_for_capacity(
     plan: &TransitionPlan,
     record: &TransitionRecord,
     event_id: &str,
-) -> std::result::Result<TransitionRecord, Box<dyn std::error::Error>> {
+) -> std::result::Result<TransitionRecord, Box<dyn std::error::Error + Send + Sync>> {
     Ok(advance(
         plan,
         record,
@@ -418,7 +421,7 @@ fn stage_for_capacity(
 fn completion_after_staging(
     plan: &TransitionPlan,
     record: &TransitionRecord,
-) -> std::result::Result<(TransitionRecord, Event), Box<dyn std::error::Error>> {
+) -> std::result::Result<(TransitionRecord, Event), Box<dyn std::error::Error + Send + Sync>> {
     let mut current = record.clone();
     let mut events = capacity_completion_events(plan, record.verification_epoch).into_iter();
     for event in events.by_ref().take(3) {
@@ -462,7 +465,7 @@ fn capacity_completion_events(plan: &TransitionPlan, epoch: u64) -> [Event; 4] {
 
 fn insufficient_staged(
     plan: &TransitionPlan,
-) -> std::result::Result<TransitionRecord, Box<dyn std::error::Error>> {
+) -> std::result::Result<TransitionRecord, Box<dyn std::error::Error + Send + Sync>> {
     let mut record = planned_recovery_cycles(plan, 124)?;
     record = stage_for_capacity(plan, &record, "capacity-stage-before-retry")?;
     for event in [
@@ -484,7 +487,7 @@ fn assert_capacity(
     plan: &TransitionPlan,
     record: &TransitionRecord,
     expected: bool,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if require_event_capacity(plan, record).is_ok() == expected {
         Ok(())
     } else {
@@ -494,10 +497,10 @@ fn assert_capacity(
 
 #[test]
 fn event_capacity_reserves_completion_and_failure_at_canonical_boundary()
--> std::result::Result<(), Box<dyn std::error::Error>> {
+-> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let plan = plan_transition(&request(
         None,
-        generation("capacity", &[("config", "orphan")]),
+        generation("capacity", &[("config", "orphan")])?,
     ))?;
     let mut exact = planned_recovery_cycles(&plan, 125)?;
     assert_eq!(exact.receipts.len(), 250);
@@ -567,10 +570,10 @@ fn event_capacity_reserves_completion_and_failure_at_canonical_boundary()
 
 #[test]
 fn full_committed_history_remains_valid_and_idempotent()
--> std::result::Result<(), Box<dyn std::error::Error>> {
+-> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let plan = plan_transition(&request(
         None,
-        generation("capacity", &[("config", "orphan")]),
+        generation("capacity", &[("config", "orphan")])?,
     ))?;
     let staged = insufficient_staged(&plan)?;
     assert_eq!(staged.receipts.len(), 252);
@@ -586,16 +589,16 @@ fn full_committed_history_remains_valid_and_idempotent()
 }
 
 #[test]
-fn interruption_after_every_phase_resumes_from_serialized_durable_state() {
+fn interruption_after_every_phase_resumes_from_serialized_durable_state() -> TestResult {
     let request = request(
         Some(generation(
             "generation-1",
             &[("remove", "delete"), ("keep", "orphan")],
-        )),
-        generation("generation-2", &[("keep", "orphan")]),
+        )?),
+        generation("generation-2", &[("keep", "orphan")])?,
     );
-    let plan = plan_transition(&request).unwrap();
-    let mut record = begin(&plan, "executor").unwrap();
+    let plan = plan_transition(&request)?;
+    let mut record = begin(&plan, "executor")?;
     let expected = [
         Phase::Staged,
         Phase::Quiesced,
@@ -605,23 +608,24 @@ fn interruption_after_every_phase_resumes_from_serialized_durable_state() {
     ];
     for (event, phase) in events(&plan).into_iter().zip(expected) {
         let before = record.revision;
-        record = advance(&plan, &record, before, "executor", event.clone()).unwrap();
+        record = advance(&plan, &record, before, "executor", event.clone())?;
         assert_eq!(record.phase, phase);
-        record = serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
+        record = serde_json::from_slice(&serde_json::to_vec(&record)?)?;
         assert_eq!(
-            advance(&plan, &record, before, "executor", event).unwrap(),
+            advance(&plan, &record, before, "executor", event)?,
             record,
             "response-loss replay must not repeat external intent"
         );
     }
     assert_eq!(record.revision, 5);
+    Ok(())
 }
 
 #[test]
 fn rollback_reuses_build_only_with_new_allocation_identity()
--> std::result::Result<(), Box<dyn std::error::Error>> {
-    let previous = generation("generation-1", &[("config", "orphan")]);
-    let next = generation("generation-2", &[("config", "orphan")]);
+-> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let previous = generation("generation-1", &[("config", "orphan")])?;
+    let next = generation("generation-2", &[("config", "orphan")])?;
     assert_eq!(previous.artifact_digest, next.artifact_digest);
     let plan = plan_transition(&request(Some(previous), next))?;
     let predecessor = plan.request.predecessor().ok_or("predecessor missing")?;
@@ -641,14 +645,16 @@ fn rollback_reuses_build_only_with_new_allocation_identity()
 }
 
 #[test]
-fn stale_cas_wrong_executor_and_evidence_reuse_cannot_advance() {
-    let plan =
-        plan_transition(&request(None, generation("gen-1", &[("config", "orphan")]))).unwrap();
-    let record = begin(&plan, "executor").unwrap();
+fn stale_cas_wrong_executor_and_evidence_reuse_cannot_advance() -> TestResult {
+    let plan = plan_transition(&request(
+        None,
+        generation("gen-1", &[("config", "orphan")])?,
+    ))?;
+    let record = begin(&plan, "executor")?;
     let staged = events(&plan)[0].clone();
     assert!(advance(&plan, &record, 1, "executor", staged.clone()).is_err());
     assert!(advance(&plan, &record, 0, "other-executor", staged.clone()).is_err());
-    let record = advance(&plan, &record, 0, "executor", staged).unwrap();
+    let record = advance(&plan, &record, 0, "executor", staged)?;
     let altered = Event::Staged {
         event_id: "staged".into(),
         generation_id: "different".into(),
@@ -657,18 +663,18 @@ fn stale_cas_wrong_executor_and_evidence_reuse_cannot_advance() {
         verification_epoch: 0,
     };
     assert!(advance(&plan, &record, record.revision, "executor", altered).is_err());
+    Ok(())
 }
 
 #[test]
-fn old_writer_uncertainty_blocks_activation_and_cannot_be_skipped() {
+fn old_writer_uncertainty_blocks_activation_and_cannot_be_skipped() -> TestResult {
     let plan = plan_transition(&request(
-        Some(generation("gen-1", &[("config", "orphan")])),
-        generation("gen-2", &[("config", "orphan")]),
-    ))
-    .unwrap();
-    let record = begin(&plan, "executor").unwrap();
+        Some(generation("gen-1", &[("config", "orphan")])?),
+        generation("gen-2", &[("config", "orphan")])?,
+    ))?;
+    let record = begin(&plan, "executor")?;
     let events = events(&plan);
-    let record = advance(&plan, &record, 0, "executor", events[0].clone()).unwrap();
+    let record = advance(&plan, &record, 0, "executor", events[0].clone())?;
     assert!(advance(&plan, &record, 1, "executor", events[2].clone()).is_err());
     assert!(
         advance(
@@ -685,13 +691,14 @@ fn old_writer_uncertainty_blocks_activation_and_cannot_be_skipped() {
         )
         .is_err()
     );
-    let mut evidence = match &events[1] {
-        Event::Quiesced {
-            evidence: Quiescence::OldGeneration(evidence),
-            ..
-        } => evidence.clone(),
-        _ => panic!("expected evidence"),
+    let Event::Quiesced {
+        evidence: Quiescence::OldGeneration(evidence),
+        ..
+    } = &events[1]
+    else {
+        return Err("quiesce step carries no old-generation evidence".into());
     };
+    let mut evidence = evidence.clone();
     evidence.process_termination_receipt_digest.clear();
     assert!(
         advance(
@@ -715,8 +722,7 @@ fn old_writer_uncertainty_blocks_activation_and_cannot_be_skipped() {
             event_id: "blocked".into(),
             reason: "node termination uncertain".into(),
         },
-    )
-    .unwrap();
+    )?;
     assert_eq!(blocked.phase, Phase::Blocked);
     assert!(
         advance(
@@ -737,8 +743,7 @@ fn old_writer_uncertainty_blocks_activation_and_cannot_be_skipped() {
             event_id: "resume".into(),
             recovery_receipt_digest: DIGEST.into(),
         },
-    )
-    .unwrap();
+    )?;
     assert_eq!(resumed.phase, Phase::Planned);
     assert!(
         advance(
@@ -750,34 +755,35 @@ fn old_writer_uncertainty_blocks_activation_and_cannot_be_skipped() {
         )
         .is_err()
     );
+    Ok(())
 }
 
 #[test]
-fn previous_policy_and_protected_uid_govern_removal_not_runtime_inventory() {
+fn previous_policy_and_protected_uid_govern_removal_not_runtime_inventory() -> TestResult {
     let mut request = request(
         Some(generation(
             "gen-1",
             &[("remove", "delete"), ("retain", "orphan")],
-        )),
-        generation("gen-2", &[]),
+        )?),
+        generation("gen-2", &[])?,
     );
     request.observations.push(RuntimeObservation {
         identity: identity("remove"),
         uid: "forged-runtime-uid".into(),
     });
-    let plan = plan_transition(&request).unwrap();
+    let plan = plan_transition(&request)?;
     let item = plan
         .cleanup
         .iter()
         .find(|item| item.identity.name == "remove")
-        .unwrap();
+        .ok_or("plan has no cleanup item for the removed resource")?;
     assert_eq!(item.expected_uid.as_deref(), Some("uid-remove"));
     assert_eq!(item.policy, DeletionPolicy::Delete);
     assert_eq!(
         plan.cleanup
             .iter()
             .find(|item| item.identity.name == "retain")
-            .unwrap()
+            .ok_or("plan has no cleanup item for the retained resource")?
             .policy,
         DeletionPolicy::Orphan
     );
@@ -786,7 +792,7 @@ fn previous_policy_and_protected_uid_govern_removal_not_runtime_inventory() {
         .claims
         .iter_mut()
         .find(|claim| claim.identity.name == "remove")
-        .unwrap()
+        .ok_or("registry has no claim for the removed resource")?
         .uid = None;
     if let Some(previous) = request.previous.as_mut() {
         for resource in previous
@@ -798,7 +804,7 @@ fn previous_policy_and_protected_uid_govern_removal_not_runtime_inventory() {
             resource.uid = None;
         }
     }
-    let absence_only = plan_transition(&request).unwrap();
+    let absence_only = plan_transition(&request)?;
     assert!(
         absence_only
             .cleanup_capabilities
@@ -809,18 +815,18 @@ fn previous_policy_and_protected_uid_govern_removal_not_runtime_inventory() {
         .cleanup
         .iter()
         .find(|item| item.identity.name == "remove")
-        .unwrap();
+        .ok_or("plan has no cleanup item for the removed resource")?;
     assert!(
         item.expected_uid.is_none(),
         "runtime observation cannot grant deletion authority"
     );
-    let record = cleaning_record(&absence_only);
+    let record = cleaning_record(&absence_only)?;
     let mut claim = request
         .registry
         .claims
         .iter()
         .find(|claim| claim.identity.name == "remove")
-        .unwrap()
+        .ok_or("registry has no claim for the removed resource")?
         .clone();
     claim.transition_id = absence_only.request.transition_id.clone();
     claim.state = ClaimState::Releasing;
@@ -831,8 +837,7 @@ fn previous_policy_and_protected_uid_govern_removal_not_runtime_inventory() {
             &item.identity,
             &claim,
             &LiveCleanupObject::Absent
-        )
-        .unwrap(),
+        )?,
         CleanupDecision::AlreadyAbsent
     );
     assert!(
@@ -849,15 +854,16 @@ fn previous_policy_and_protected_uid_govern_removal_not_runtime_inventory() {
         )
         .is_err()
     );
+    Ok(())
 }
 
 #[test]
-fn cleanup_authorization_is_separate_and_old_resource_type_remains_in_plan() {
+fn cleanup_authorization_is_separate_and_old_resource_type_remains_in_plan() -> TestResult {
     let mut request = request(
-        Some(generation("gen-1", &[("old-type", "delete")])),
-        generation("gen-2", &[]),
+        Some(generation("gen-1", &[("old-type", "delete")])?),
+        generation("gen-2", &[])?,
     );
-    let plan = plan_transition(&request).unwrap();
+    let plan = plan_transition(&request)?;
     assert!(
         plan.cleanup_capabilities
             .iter()
@@ -879,17 +885,18 @@ fn cleanup_authorization_is_separate_and_old_resource_type_remains_in_plan() {
         .capabilities
         .retain(|cap| cap.verb != "delete");
     assert!(plan_transition(&request).is_err());
+    Ok(())
 }
 
 #[test]
-fn cleanup_refuses_replacement_uid_and_preserves_unknown_finalizers() {
+fn cleanup_refuses_replacement_uid_and_preserves_unknown_finalizers() -> TestResult {
     let request = request(
-        Some(generation("gen-1", &[("remove", "delete")])),
-        generation("gen-2", &[]),
+        Some(generation("gen-1", &[("remove", "delete")])?),
+        generation("gen-2", &[])?,
     );
-    let plan = plan_transition(&request).unwrap();
+    let plan = plan_transition(&request)?;
     let item = &plan.cleanup[0];
-    let record = cleaning_record(&plan);
+    let record = cleaning_record(&plan)?;
     let mut claim = request.registry.claims[0].clone();
     claim.transition_id = plan.request.transition_id.clone();
     claim.state = ClaimState::Releasing;
@@ -914,8 +921,7 @@ fn cleanup_refuses_replacement_uid_and_preserves_unknown_finalizers() {
             &item.identity,
             &claim,
             &LiveCleanupObject::Absent
-        )
-        .unwrap(),
+        )?,
         CleanupDecision::AlreadyAbsent
     );
     let pending = LiveCleanupObject::Present {
@@ -924,7 +930,7 @@ fn cleanup_refuses_replacement_uid_and_preserves_unknown_finalizers() {
         deletion_started: true,
     };
     assert_eq!(
-        cleanup_decision(&plan, &record, &item.identity, &claim, &pending).unwrap(),
+        cleanup_decision(&plan, &record, &item.identity, &claim, &pending)?,
         CleanupDecision::WaitForFinalizers
     );
     let before_delete = LiveCleanupObject::Present {
@@ -933,16 +939,17 @@ fn cleanup_refuses_replacement_uid_and_preserves_unknown_finalizers() {
         deletion_started: false,
     };
     assert_eq!(
-        cleanup_decision(&plan, &record, &item.identity, &claim, &before_delete).unwrap(),
+        cleanup_decision(&plan, &record, &item.identity, &claim, &before_delete)?,
         CleanupDecision::DeleteWithUidPrecondition {
             uid: "uid-remove".into()
         }
     );
+    Ok(())
 }
 
 #[test]
-fn foreign_and_unfinished_claims_and_preexisting_targets_fail_closed() {
-    let mut req = request(None, generation("gen-1", &[("config", "orphan")]));
+fn foreign_and_unfinished_claims_and_preexisting_targets_fail_closed() -> TestResult {
+    let mut req = request(None, generation("gen-1", &[("config", "orphan")])?);
     req.registry.claims.push(ProtectedClaim {
         identity: identity("config"),
         domain_id: "foreign".into(),
@@ -959,27 +966,27 @@ fn foreign_and_unfinished_claims_and_preexisting_targets_fail_closed() {
     });
     assert!(plan_transition(&req).is_err());
     let mut req = request(
-        Some(generation("gen-1", &[("config", "orphan")])),
-        generation("gen-2", &[("config", "orphan")]),
+        Some(generation("gen-1", &[("config", "orphan")])?),
+        generation("gen-2", &[("config", "orphan")])?,
     );
     req.registry.claims[0].state = ClaimState::Reserved;
     assert!(plan_transition(&req).is_err());
+    Ok(())
 }
 
 #[test]
-fn forged_phase_without_evidence_history_and_incomplete_cleanup_cannot_commit() {
+fn forged_phase_without_evidence_history_and_incomplete_cleanup_cannot_commit() -> TestResult {
     let plan = plan_transition(&request(
-        Some(generation("gen-1", &[("remove", "delete")])),
-        generation("gen-2", &[]),
-    ))
-    .unwrap();
-    let mut record = begin(&plan, "executor").unwrap();
+        Some(generation("gen-1", &[("remove", "delete")])?),
+        generation("gen-2", &[])?,
+    ))?;
+    let mut record = begin(&plan, "executor")?;
     record.phase = Phase::Cleaning;
     let mut steps = events(&plan);
     assert!(advance(&plan, &record, 0, "executor", steps[4].clone()).is_err());
-    record = begin(&plan, "executor").unwrap();
+    record = begin(&plan, "executor")?;
     for step in steps.drain(..4) {
-        record = advance(&plan, &record, record.revision, "executor", step).unwrap();
+        record = advance(&plan, &record, record.revision, "executor", step)?;
     }
     let missing = Event::Committed {
         event_id: "commit-missing".into(),
@@ -987,21 +994,22 @@ fn forged_phase_without_evidence_history_and_incomplete_cleanup_cannot_commit() 
         obsolete_identity_retirement_digest: DIGEST.into(),
     };
     assert!(advance(&plan, &record, record.revision, "executor", missing).is_err());
+    Ok(())
 }
 
-fn cleaning_record(plan: &TransitionPlan) -> TransitionRecord {
-    let mut record = begin(plan, "executor").unwrap();
+fn cleaning_record(plan: &TransitionPlan) -> TestResult<TransitionRecord> {
+    let mut record = begin(plan, "executor")?;
     for event in events(plan).into_iter().take(4) {
-        record = advance(plan, &record, record.revision, "executor", event).unwrap();
+        record = advance(plan, &record, record.revision, "executor", event)?;
     }
-    record
+    Ok(record)
 }
 
 #[test]
 fn canonical_plan_replays_after_counter_advances_and_failed_identity_is_not_reused()
--> std::result::Result<(), Box<dyn std::error::Error>> {
+-> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let first_request =
-        request_at_sequence(None, generation("ignored", &[("config", "orphan")]), 1);
+        request_at_sequence(None, generation("ignored", &[("config", "orphan")])?, 1);
     let first = plan_transition(&first_request)?;
     let first_names = allocation_names(REGISTRY_UID, 1)?;
     assert!(
@@ -1024,7 +1032,7 @@ fn canonical_plan_replays_after_counter_advances_and_failed_identity_is_not_reus
 
     // Sequence one may fail before commit, but the protected counter still moves.
     let retry_request =
-        request_at_sequence(None, generation("ignored", &[("config", "orphan")]), 2);
+        request_at_sequence(None, generation("ignored", &[("config", "orphan")])?, 2);
     let retry = plan_transition(&retry_request)?;
     assert_ne!(
         first.generation_reservation.generation_id,
@@ -1049,8 +1057,8 @@ fn canonical_plan_replays_after_counter_advances_and_failed_identity_is_not_reus
 
 #[test]
 fn malformed_registry_and_exhausted_counter_are_rejected()
--> std::result::Result<(), Box<dyn std::error::Error>> {
-    let baseline = request_at_sequence(None, generation("ignored", &[]), 3);
+-> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let baseline = request_at_sequence(None, generation("ignored", &[])?, 3);
     plan_transition(&baseline)?;
 
     let mut malformed = baseline.clone();
@@ -1084,9 +1092,9 @@ fn malformed_registry_and_exhausted_counter_are_rejected()
 
 #[test]
 fn missing_mismatched_or_scoped_active_allocation_is_rejected()
--> std::result::Result<(), Box<dyn std::error::Error>> {
-    let previous = generation("generation-a", &[("config", "orphan")]);
-    let next = generation("generation-b", &[("config", "orphan")]);
+-> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let previous = generation("generation-a", &[("config", "orphan")])?;
+    let next = generation("generation-b", &[("config", "orphan")])?;
     let base = request(Some(previous), next);
     plan_transition(&base)?;
     let mut missing = base.clone();
@@ -1152,14 +1160,13 @@ fn missing_mismatched_or_scoped_active_allocation_is_rejected()
 }
 
 #[test]
-fn resumed_quiesced_transition_needs_fresh_staging_and_termination_evidence() {
+fn resumed_quiesced_transition_needs_fresh_staging_and_termination_evidence() -> TestResult {
     let plan = plan_transition(&request(
-        Some(generation("gen-a", &[("config", "orphan")])),
-        generation("gen-b", &[("config", "orphan")]),
-    ))
-    .unwrap();
+        Some(generation("gen-a", &[("config", "orphan")])?),
+        generation("gen-b", &[("config", "orphan")])?,
+    ))?;
     let sequence = events(&plan);
-    let mut record = block_and_resume_from_quiescence(&plan);
+    let mut record = block_and_resume_from_quiescence(&plan)?;
     assert_eq!(record.phase, Phase::Planned);
     assert_eq!(record.verification_epoch, 1);
     assert!(
@@ -1186,7 +1193,7 @@ fn resumed_quiesced_transition_needs_fresh_staging_and_termination_evidence() {
             registry_cas_receipt_digest,
             verification_epoch: 1,
         },
-        _ => unreachable!(),
+        _ => return Err("recorded step is not a staging event".into()),
     };
     assert!(
         advance(&plan, &record, record.revision, "executor", staged.clone()).is_err(),
@@ -1199,13 +1206,13 @@ fn resumed_quiesced_transition_needs_fresh_staging_and_termination_evidence() {
     {
         *registry_cas_receipt_digest = fresh_digest.clone();
     }
-    record = advance(&plan, &record, record.revision, "executor", staged).unwrap();
+    record = advance(&plan, &record, record.revision, "executor", staged)?;
     let Event::Quiesced {
         evidence: Quiescence::OldGeneration(mut evidence),
         ..
     } = sequence[1].clone()
     else {
-        unreachable!()
+        return Err("recorded step is not an old-generation quiesce".into());
     };
     let old_epoch = Event::Quiesced {
         event_id: "quiesced-again".into(),
@@ -1232,8 +1239,7 @@ fn resumed_quiesced_transition_needs_fresh_staging_and_termination_evidence() {
             event_id: "quiesced-again".into(),
             evidence: Quiescence::OldGeneration(evidence),
         },
-    )
-    .unwrap();
+    )?;
     record = advance(
         &plan,
         &record,
@@ -1245,18 +1251,20 @@ fn resumed_quiesced_transition_needs_fresh_staging_and_termination_evidence() {
             activation_receipt_digest: fresh_digest,
             verification_epoch: 1,
         },
-    )
-    .unwrap();
+    )?;
     assert_eq!(record.phase, Phase::Activated);
+    Ok(())
 }
 
 #[test]
-fn post_activation_block_cannot_restart_protocol_under_same_generation() {
-    let plan =
-        plan_transition(&request(None, generation("gen-a", &[("config", "orphan")]))).unwrap();
-    let mut record = begin(&plan, "executor").unwrap();
+fn post_activation_block_cannot_restart_protocol_under_same_generation() -> TestResult {
+    let plan = plan_transition(&request(
+        None,
+        generation("gen-a", &[("config", "orphan")])?,
+    ))?;
+    let mut record = begin(&plan, "executor")?;
     for event in events(&plan).into_iter().take(3) {
-        record = advance(&plan, &record, record.revision, "executor", event).unwrap();
+        record = advance(&plan, &record, record.revision, "executor", event)?;
     }
     record = advance(
         &plan,
@@ -1267,8 +1275,7 @@ fn post_activation_block_cannot_restart_protocol_under_same_generation() {
             event_id: "blocked-after-activation".into(),
             reason: "new writer state uncertain".into(),
         },
-    )
-    .unwrap();
+    )?;
     assert!(
         advance(
             &plan,
@@ -1282,16 +1289,17 @@ fn post_activation_block_cannot_restart_protocol_under_same_generation() {
         )
         .is_err()
     );
+    Ok(())
 }
 
 #[test]
-fn cleanup_is_bound_to_validated_plan_phase_domain_and_current_transition() {
+fn cleanup_is_bound_to_validated_plan_phase_domain_and_current_transition() -> TestResult {
     let req = request(
-        Some(generation("gen-a", &[("remove", "delete")])),
-        generation("gen-b", &[]),
+        Some(generation("gen-a", &[("remove", "delete")])?),
+        generation("gen-b", &[])?,
     );
-    let plan = plan_transition(&req).unwrap();
-    let record = cleaning_record(&plan);
+    let plan = plan_transition(&req)?;
+    let record = cleaning_record(&plan)?;
     let target = identity("remove");
     let live = LiveCleanupObject::Present {
         uid: "uid-remove".into(),
@@ -1300,7 +1308,7 @@ fn cleanup_is_bound_to_validated_plan_phase_domain_and_current_transition() {
     };
     let mut claim = req.registry.claims[0].clone();
     claim.state = ClaimState::Releasing;
-    claim.transition_id = req.transition_id.clone();
+    claim.transition_id = req.transition_id;
     assert!(cleanup_decision(&plan, &record, &target, &claim, &live).is_ok());
     let mut foreign = claim.clone();
     foreign.domain_id = "foreign-domain".into();
@@ -1312,17 +1320,18 @@ fn cleanup_is_bound_to_validated_plan_phase_domain_and_current_transition() {
     active.state = ClaimState::Active;
     assert!(cleanup_decision(&plan, &record, &target, &active, &live).is_err());
     assert!(cleanup_decision(&plan, &record, &identity("unplanned"), &claim, &live).is_err());
-    let initial = begin(&plan, "executor").unwrap();
+    let initial = begin(&plan, "executor")?;
     assert!(cleanup_decision(&plan, &initial, &target, &claim, &live).is_err());
-    let mut forged = plan.clone();
+    let mut forged = plan;
     forged.cleanup[0].expected_uid = Some("forged".into());
     assert!(cleanup_decision(&forged, &record, &target, &claim, &live).is_err());
+    Ok(())
 }
 
-fn block_and_resume_from_quiescence(plan: &TransitionPlan) -> TransitionRecord {
-    let mut record = begin(plan, "executor").unwrap();
+fn block_and_resume_from_quiescence(plan: &TransitionPlan) -> TestResult<TransitionRecord> {
+    let mut record = begin(plan, "executor")?;
     for event in events(plan).iter().take(2) {
-        record = advance(plan, &record, record.revision, "executor", event.clone()).unwrap();
+        record = advance(plan, &record, record.revision, "executor", event.clone())?;
     }
     assert_eq!(record.phase, Phase::Quiesced);
     record = advance(
@@ -1334,8 +1343,7 @@ fn block_and_resume_from_quiescence(plan: &TransitionPlan) -> TransitionRecord {
             event_id: "lost-certainty".into(),
             reason: "termination evidence no longer reliable".into(),
         },
-    )
-    .unwrap();
+    )?;
     record = advance(
         plan,
         &record,
@@ -1345,41 +1353,36 @@ fn block_and_resume_from_quiescence(plan: &TransitionPlan) -> TransitionRecord {
             event_id: "recovery-1".into(),
             recovery_receipt_digest: DIGEST.into(),
         },
-    )
-    .unwrap();
-    record
+    )?;
+    Ok(record)
 }
 
 #[test]
-fn cleanup_and_inventory_projection_exclude_resource_payloads() {
-    let mut prior = generation("g1", &[("removed", "delete"), ("retained", "orphan")]);
+fn cleanup_and_inventory_projection_exclude_resource_payloads() -> TestResult {
+    let mut prior = generation("g1", &[("removed", "delete"), ("retained", "orphan")])?;
     prior.generation_id = fixture_names(1).0;
     prior.compiled.ir.resources[0].desired["data"]["value"] = json!("private-value-canary");
     for resource in &mut prior.compiled.ir.resources {
         resource.source.file = "private-path-canary.ts".into();
     }
     prior.compiled.ir.provenance.inputs[0].path = "private-path-canary.ts".into();
-    prior.compiled = compiler_core::validate(&prior.compiled.ir).unwrap();
+    prior.compiled = compiler_core::validate(&prior.compiled.ir)?;
     let request = request(
         Some(prior.clone()),
-        generation("g2", &[("retained", "delete")]),
+        generation("g2", &[("retained", "delete")])?,
     );
-    let (scope, inventory) = generation_inventory(&prior, &request.registry.claims).unwrap();
-    let encoded = String::from_utf8(inventory.encode(&scope).unwrap()).unwrap();
+    let (scope, inventory) = generation_inventory(&prior, &request.registry.claims)?;
+    let encoded = String::from_utf8(inventory.encode(&scope)?)?;
     assert!(!encoded.contains("canary"));
     assert!(!encoded.contains(&prior.compiled.ir_digest));
     assert_eq!(inventory.resources[0].uid.as_deref(), Some("uid-removed"));
-    let plan = plan_transition(&request).unwrap();
+    let plan = plan_transition(&request)?;
     assert_eq!(plan.cleanup.len(), 1);
     let item = &plan.cleanup[0];
     assert_eq!((&*item.api_version, &*item.kind), ("v1", "ConfigMap"));
     assert_eq!(item.expected_uid.as_deref(), Some("uid-removed"));
     assert_eq!(item.policy, DeletionPolicy::Delete);
-    assert!(
-        !serde_json::to_string(&plan.cleanup)
-            .unwrap()
-            .contains("canary")
-    );
+    assert!(!serde_json::to_string(&plan.cleanup)?.contains("canary"));
     let mut tampered = plan.clone();
     tampered.cleanup[0].kind = "Secret".into();
     assert!(begin(&tampered, "executor").is_err());
@@ -1389,19 +1392,20 @@ fn cleanup_and_inventory_projection_exclude_resource_payloads() {
     let mut wrong_owner = request.registry.claims.clone();
     wrong_owner[0].generation_id = "foreign".into();
     assert!(generation_inventory(&prior, &wrong_owner).is_err());
-    let mut duplicates = request.registry.claims.clone();
+    let mut duplicates = request.registry.claims;
     duplicates.push(duplicates[0].clone());
     assert!(generation_inventory(&prior, &duplicates).is_err());
+    Ok(())
 }
 
 #[test]
 fn persisted_inventory_must_match_approved_resource_metadata()
--> std::result::Result<(), Box<dyn std::error::Error>> {
-    let initial = request(None, generation("g1", &[("old", "orphan")]));
+-> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let initial = request(None, generation("g1", &[("old", "orphan")])?);
     validate_transition_inventory(&initial, None)?;
     let upgrade = request(
         Some(initial.next.clone()),
-        generation("g2", &[("new", "delete")]),
+        generation("g2", &[("new", "delete")])?,
     );
     let snapshot = upgrade
         .predecessor()
@@ -1432,7 +1436,7 @@ fn persisted_inventory_must_match_approved_resource_metadata()
     let mut missing = snapshot.clone();
     missing.resources.clear();
     assert!(validate_transition_inventory(&upgrade, Some(&missing)).is_err());
-    let mut extra = snapshot.clone();
+    let mut extra = snapshot;
     let mut resource = extra
         .resources
         .first()
@@ -1446,8 +1450,8 @@ fn persisted_inventory_must_match_approved_resource_metadata()
 
 #[test]
 fn protected_metadata_commitment_excludes_desired_values_and_rejects_invalid_authority()
--> std::result::Result<(), Box<dyn std::error::Error>> {
-    let original = generation("g1", &[("config", "delete")]);
+-> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let original = generation("g1", &[("config", "delete")])?;
     let original_plan = plan_transition(&request(None, original.clone()))?;
     let mut changed_ir = original.compiled.ir.clone();
     changed_ir
@@ -1499,10 +1503,10 @@ fn protected_metadata_commitment_excludes_desired_values_and_rejects_invalid_aut
 
 #[test]
 fn predecessor_metadata_rejects_forged_allocation_policy_uid_transition_and_membership()
--> std::result::Result<(), Box<dyn std::error::Error>> {
-    let mut prior = generation("g1", &[("old", "orphan")]);
+-> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut prior = generation("g1", &[("old", "orphan")])?;
     prior.generation_id = fixture_names(1).0;
-    let baseline = request(Some(prior.clone()), generation("g2", &[]));
+    let baseline = request(Some(prior.clone()), generation("g2", &[])?);
     plan_transition(&baseline)?;
     let allocation = baseline
         .registry
@@ -1571,10 +1575,10 @@ fn predecessor_metadata_rejects_forged_allocation_policy_uid_transition_and_memb
 
 #[test]
 fn predecessor_metadata_validates_scope_retirement_namespaces_and_absent_uids()
--> std::result::Result<(), Box<dyn std::error::Error>> {
+-> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let baseline = request(
-        Some(generation("g1", &[("old", "delete")])),
-        generation("g2", &[]),
+        Some(generation("g1", &[("old", "delete")])?),
+        generation("g2", &[])?,
     );
 
     let mut absent = baseline.clone();
@@ -1610,9 +1614,9 @@ fn predecessor_metadata_validates_scope_retirement_namespaces_and_absent_uids()
 
 #[test]
 fn full_generation_is_rejected_as_predecessor_metadata()
--> std::result::Result<(), Box<dyn std::error::Error>> {
-    let predecessor = generation("g1", &[("old", "delete")]);
-    let request = request(Some(predecessor.clone()), generation("g2", &[]));
+-> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let predecessor = generation("g1", &[("old", "delete")])?;
+    let request = request(Some(predecessor.clone()), generation("g2", &[])?);
     let mut encoded = serde_json::to_value(request)?;
     encoded["previous"] = serde_json::to_value(predecessor)?;
     assert!(serde_json::from_value::<DeploymentRequest>(encoded).is_err());

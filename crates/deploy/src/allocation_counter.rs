@@ -31,7 +31,8 @@ mod tests {
     }
 
     #[test]
-    fn full_u64_survives_strict_canonical_json() -> Result<(), Box<dyn std::error::Error>> {
+    fn full_u64_survives_strict_canonical_json()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let expected = Counter { value: u64::MAX };
         let encoded = compiler_core::canonical_bytes(&expected)?;
         let parsed = compiler_core::parse_strict(std::str::from_utf8(&encoded)?)?;

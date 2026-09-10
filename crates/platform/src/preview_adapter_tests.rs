@@ -5,7 +5,7 @@ use crate::{DeploymentIdentity, DeploymentPreviewApproval, DeploymentPreviewProf
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
-type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type Calls = Arc<Mutex<Vec<(String, String, Value)>>>;
 struct Fixture {
     issued: IssuedDeployment,
@@ -148,7 +148,7 @@ fn fixture(scenario: Scenario) -> TestResult<Fixture> {
         }
     }
     replies.retain(|reply| reply["metadata"]["name"] != "apsides-deploy-identity-example");
-    let (client, calls) = crate::tests::wire_with_identity(replies, identity_object);
+    let (client, calls) = crate::tests::wire_with_identity(replies, identity_object)?;
     let platform = crate::tests::platform_client(client, "control", "workload", "cluster-a")?;
     let issued = IssuedDeployment::for_preview_test(
         platform,

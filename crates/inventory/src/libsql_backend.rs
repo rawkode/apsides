@@ -231,7 +231,10 @@ fn validate_remote_configuration(url: &str, token: &str) -> Result<()> {
 
 async fn validate_existing(connection: &Connection) -> Result<()> {
     let mut rows = connection
-        .query("SELECT version FROM apsides_inventory_schema WHERE id=1", ())
+        .query(
+            "SELECT version FROM apsides_inventory_schema WHERE id=1",
+            (),
+        )
         .await
         .map_err(|_| Error::Invalid("missing inventory schema"))?;
     let row = rows

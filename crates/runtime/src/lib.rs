@@ -1,14 +1,3 @@
-#![cfg_attr(
-    not(test),
-    deny(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unreachable,
-        clippy::todo,
-        clippy::unimplemented
-    )
-)]
 #![forbid(unsafe_code)]
 //! Native execution of the finite Apsides IR.
 //!
@@ -147,7 +136,7 @@ pub trait RuntimeClient: Send + Sync {
 ///
 /// Returns an error for invalid IR or startup configuration, failed protected
 /// activation, or a Kubernetes operation failure.
-pub async fn run(ir_json: &'static str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(ir_json: &'static str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let plan = parse_and_validate(ir_json)?;
     let path = env::var(CONFIG_PATH_ENV)
         .map_err(|_| RuntimeError::Configuration(format!("{CONFIG_PATH_ENV} is required")))?;
@@ -490,7 +479,7 @@ fn observation_from_desired(desired: &Value) -> Observation {
     }
 }
 
-fn block_reason(reason: &BlockReason) -> &'static str {
+const fn block_reason(reason: &BlockReason) -> &'static str {
     match reason {
         BlockReason::Missing => "missing",
         BlockReason::Unauthorized => "unauthorized",
@@ -1097,6 +1086,7 @@ fn observation_from_object(object: &DynamicObject) -> Result<Observation, Runtim
 
 #[cfg(test)]
 mod tests {
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
     use super::*;
     use compiler_core::{
         ApiResourceMapping, ApiResourceScope, DeletionPolicy, Lifecycle, SourceLocation,
@@ -1104,12 +1094,67 @@ mod tests {
     use http::{Method, Request, Response, StatusCode, header::CONTENT_TYPE};
     use http_body_util::BodyExt;
     use kube::client::Body;
+    use serde_json::json;
     use std::{
         collections::VecDeque,
         convert::Infallible,
         sync::{Arc, Mutex},
     };
     use tower::service_fn;
+
+    /// A fixture problem inside the mock transport, which itself cannot fail.
+    type FixtureError = Box<dyn std::error::Error + Send + Sync>;
+
+    /// The transport signature is infallible, so a fixture problem becomes a
+    /// 500 naming it. The assertions then fail with that text, which is more
+    /// use than a panic from inside a service future.
+    fn fixture_failure(error: &FixtureError) -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "fixtureError": error.to_string() })
+                    .to_string()
+                    .into_bytes(),
+            ))
+            .unwrap_or_else(|_| Response::new(Body::from(Vec::new())))
+    }
+
+    async fn wire_response(
+        request: Request<Body>,
+        responses: &Mutex<VecDeque<(StatusCode, Value)>>,
+        calls: &Mutex<Vec<WireCall>>,
+    ) -> std::result::Result<Response<Body>, FixtureError> {
+        let (parts, body) = request.into_parts();
+        let bytes = body.collect().await?.to_bytes();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes)?
+        };
+        calls
+            .lock()
+            .map_err(|_| "wire call log is poisoned")?
+            .push(WireCall {
+                method: parts.method,
+                uri: parts.uri.to_string(),
+                content_type: parts
+                    .headers
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned),
+                body,
+            });
+        let (status, response) = responses
+            .lock()
+            .map_err(|_| "queued responses are poisoned")?
+            .pop_front()
+            .ok_or("fixture ran out of queued responses")?;
+        Ok(Response::builder()
+            .status(status)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&response)?))?)
+    }
 
     #[derive(Debug)]
     struct WireCall {
@@ -1208,35 +1253,10 @@ mod tests {
                 let responses = Arc::clone(&responses);
                 let calls = Arc::clone(&calls);
                 async move {
-                    let (parts, body) = request.into_parts();
-                    let bytes = body.collect().await.expect("request body").to_bytes();
-                    let body = if bytes.is_empty() {
-                        Value::Null
-                    } else {
-                        serde_json::from_slice(&bytes).expect("JSON apply body")
-                    };
-                    calls.lock().unwrap().push(WireCall {
-                        method: parts.method,
-                        uri: parts.uri.to_string(),
-                        content_type: parts
-                            .headers
-                            .get(CONTENT_TYPE)
-                            .and_then(|value| value.to_str().ok())
-                            .map(str::to_owned),
-                        body,
-                    });
-                    let (status, response) = responses
-                        .lock()
-                        .unwrap()
-                        .pop_front()
-                        .expect("unexpected Kubernetes request");
-                    Ok::<_, Infallible>(
-                        Response::builder()
-                            .status(status)
-                            .header(CONTENT_TYPE, "application/json")
-                            .body(Body::from(serde_json::to_vec(&response).unwrap()))
-                            .unwrap(),
-                    )
+                    Ok::<_, Infallible>(match wire_response(request, &responses, &calls).await {
+                        Ok(response) => response,
+                        Err(error) => fixture_failure(&error),
+                    })
                 }
             }
         });
@@ -1272,7 +1292,7 @@ mod tests {
 
     #[tokio::test]
     async fn named_watch_scopes_list_and_watch_to_observed_inputs()
-    -> Result<(), Box<dyn std::error::Error>> {
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut changed = object("changed", "11", "external");
         changed["metadata"]["name"] = Value::String("observed".into());
         let (client, calls) = wire_client(vec![
@@ -1303,7 +1323,7 @@ mod tests {
 
     #[tokio::test]
     async fn named_watch_managed_only_waits_without_api_requests()
-    -> Result<(), Box<dyn std::error::Error>> {
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (client, calls) = wire_client(Vec::new());
         let inputs = [watch_input("managed", InputMode::Managed)];
         let wait = client.wait_for_named_change(&inputs, Duration::from_millis(25));
@@ -1334,18 +1354,23 @@ mod tests {
         })
     }
 
-    fn assert_strong_exact_name_list(call: &WireCall) {
+    fn assert_strong_exact_name_list(call: &WireCall) -> TestResult {
         assert_eq!(call.method, Method::GET);
         assert!(
             call.uri
                 .starts_with("/api/v1/namespaces/workload/configmaps?")
         );
-        let query = call.uri.split_once('?').unwrap().1;
+        let query = call
+            .uri
+            .split_once('?')
+            .ok_or("request URI has no query")?
+            .1;
         assert!(query.contains("fieldSelector=metadata.name%3Dconfig"));
         assert!(!query.contains("resourceVersion="));
         assert!(!query.contains("limit="));
         assert!(!query.contains("continue="));
         assert!(!query.contains("labelSelector="));
+        Ok(())
     }
 
     fn assert_conditional_apply(
@@ -1353,13 +1378,17 @@ mod tests {
         dry_run: bool,
         expected_uid: Option<&str>,
         expected_version: &str,
-    ) {
+    ) -> TestResult {
         assert_eq!(call.method, Method::PATCH);
         assert!(
             call.uri
                 .starts_with("/api/v1/namespaces/workload/configmaps/config?")
         );
-        let query = call.uri.split_once('?').unwrap().1;
+        let query = call
+            .uri
+            .split_once('?')
+            .ok_or("request URI has no query")?
+            .1;
         assert!(
             query
                 .split('&')
@@ -1386,10 +1415,11 @@ mod tests {
                 .and_then(Value::as_str),
             Some(expected_version)
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn changed_object_uses_dry_run_then_uid_and_version_conditional_ssa() {
+    async fn changed_object_uses_dry_run_then_uid_and_version_conditional_ssa() -> TestResult {
         let mut existing = object("old", "7", "apsides-example");
         existing["data"]["removed"] = Value::String("stale".into());
         let projected = object("new", "8", "apsides-example");
@@ -1403,19 +1433,19 @@ mod tests {
             wire_client(vec![object_list(&[existing], "7"), projected, persisted]);
         client
             .apply_ssa(&resource(desired.clone()), &desired)
-            .await
-            .unwrap();
-        let calls = calls.lock().unwrap();
+            .await?;
+        let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
         assert_eq!(calls.len(), 3);
-        assert_strong_exact_name_list(&calls[0]);
-        assert_conditional_apply(&calls[1], true, Some("uid-1"), "7");
-        assert_conditional_apply(&calls[2], false, Some("uid-1"), "7");
+        assert_strong_exact_name_list(&calls[0])?;
+        assert_conditional_apply(&calls[1], true, Some("uid-1"), "7")?;
+        assert_conditional_apply(&calls[2], false, Some("uid-1"), "7")?;
         assert!(calls[1].body.pointer("/data/removed").is_none());
         assert!(calls[2].body.pointer("/data/removed").is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn explicit_force_preserves_strict_uid_and_version_preconditions() {
+    async fn explicit_force_preserves_strict_uid_and_version_preconditions() -> TestResult {
         let desired = serde_json::json!({"apiVersion":"v1","kind":"ConfigMap",
             "metadata":{"name":"config","namespace":"workload"},"data":{"message":"new"}});
         let mut declared = resource(desired.clone());
@@ -1425,8 +1455,8 @@ mod tests {
             object("new", "8", "apsides-example"),
             object("new", "8", "apsides-example"),
         ]);
-        client.apply_ssa(&declared, &desired).await.unwrap();
-        let calls = calls.lock().unwrap();
+        client.apply_ssa(&declared, &desired).await?;
+        let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
         assert_eq!(calls.len(), 3);
         for call in &calls[1..] {
             assert_eq!(call.method, Method::PATCH);
@@ -1437,10 +1467,11 @@ mod tests {
         }
         assert!(calls[1].uri.contains("dryRun=All"));
         assert!(!calls[2].uri.contains("dryRun=All"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn unchanged_dry_run_projection_omits_the_real_ssa_write() {
+    async fn unchanged_dry_run_projection_omits_the_real_ssa_write() -> TestResult {
         let existing = object("same", "7", "apsides-example");
         let mut projected = object("same", "8", "apsides-example");
         projected["metadata"]["generation"] = Value::from(2);
@@ -1452,16 +1483,16 @@ mod tests {
         let (client, calls) = wire_client(vec![object_list(&[existing], "7"), projected]);
         client
             .apply_ssa(&resource(desired.clone()), &desired)
-            .await
-            .unwrap();
-        let calls = calls.lock().unwrap();
+            .await?;
+        let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
         assert_eq!(calls.len(), 2);
-        assert_strong_exact_name_list(&calls[0]);
-        assert_conditional_apply(&calls[1], true, Some("uid-1"), "7");
+        assert_strong_exact_name_list(&calls[0])?;
+        assert_conditional_apply(&calls[1], true, Some("uid-1"), "7")?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn pre_existing_update_only_ownership_is_rejected() {
+    async fn pre_existing_update_only_ownership_is_rejected() -> TestResult {
         let mut existing = object("same", "7", "apsides-example");
         existing["metadata"]["managedFields"][0]["operation"] = Value::String("Update".into());
         let desired = serde_json::json!({
@@ -1473,19 +1504,21 @@ mod tests {
         let error = client
             .apply_ssa(&resource(desired.clone()), &desired)
             .await
-            .unwrap_err();
+            .err()
+            .ok_or("expected this call to fail")?;
         assert!(
             error
                 .to_string()
                 .contains("did not establish exact Apply ownership")
         );
-        let calls = calls.lock().unwrap();
+        let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
         assert_eq!(calls.len(), 1);
-        assert_strong_exact_name_list(&calls[0]);
+        assert_strong_exact_name_list(&calls[0])?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn empty_exact_name_list_uses_its_nonzero_version_for_ssa_create() {
+    async fn empty_exact_name_list_uses_its_nonzero_version_for_ssa_create() -> TestResult {
         let desired = serde_json::json!({
             "apiVersion":"v1","kind":"ConfigMap",
             "metadata":{"name":"config","namespace":"workload"},
@@ -1496,18 +1529,18 @@ mod tests {
         let (client, calls) = wire_client(vec![object_list(&[], "7"), projected, created]);
         client
             .apply_ssa(&resource(desired.clone()), &desired)
-            .await
-            .unwrap();
-        let calls = calls.lock().unwrap();
+            .await?;
+        let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
         assert_eq!(calls.len(), 3);
-        assert_strong_exact_name_list(&calls[0]);
-        assert_conditional_apply(&calls[1], true, None, "7");
-        assert_conditional_apply(&calls[2], false, None, "7");
+        assert_strong_exact_name_list(&calls[0])?;
+        assert_conditional_apply(&calls[1], true, None, "7")?;
+        assert_conditional_apply(&calls[2], false, None, "7")?;
         assert!(calls.iter().all(|call| call.method != Method::POST));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn ssa_create_race_conflict_blocks_without_fallback_or_adoption() {
+    async fn ssa_create_race_conflict_blocks_without_fallback_or_adoption() -> TestResult {
         let desired = serde_json::json!({
             "apiVersion":"v1","kind":"ConfigMap",
             "metadata":{"name":"config","namespace":"workload"},
@@ -1522,22 +1555,24 @@ mod tests {
         let error = client
             .apply_ssa(&resource(desired.clone()), &desired)
             .await
-            .unwrap_err();
+            .err()
+            .ok_or("expected this call to fail")?;
         assert!(
             error
                 .to_string()
                 .contains("conditional SSA create without force")
         );
-        let calls = calls.lock().unwrap();
+        let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
         assert_eq!(calls.len(), 3);
-        assert_strong_exact_name_list(&calls[0]);
-        assert_conditional_apply(&calls[1], true, None, "7");
-        assert_conditional_apply(&calls[2], false, None, "7");
+        assert_strong_exact_name_list(&calls[0])?;
+        assert_conditional_apply(&calls[1], true, None, "7")?;
+        assert_conditional_apply(&calls[2], false, None, "7")?;
         assert!(calls.iter().all(|call| call.method != Method::POST));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn empty_exact_name_list_rejects_zero_or_missing_version() {
+    async fn empty_exact_name_list_rejects_zero_or_missing_version() -> TestResult {
         let desired = serde_json::json!({
             "apiVersion":"v1","kind":"ConfigMap",
             "metadata":{"name":"config","namespace":"workload"},
@@ -1557,10 +1592,15 @@ mod tests {
             let error = client
                 .apply_ssa(&resource(desired.clone()), &desired)
                 .await
-                .unwrap_err();
+                .err()
+                .ok_or("expected this call to fail")?;
             assert!(error.to_string().contains("nonzero resourceVersion"));
-            assert_eq!(calls.lock().unwrap().len(), 1);
+            assert_eq!(
+                calls.lock().map_err(|_| "calls mutex is poisoned")?.len(),
+                1
+            );
         }
+        Ok(())
     }
 
     #[tokio::test]
@@ -1597,14 +1637,14 @@ mod tests {
     }
 
     #[test]
-    fn fixture_kubeconfig_accepts_only_inline_token_and_ca() {
+    fn fixture_kubeconfig_accepts_only_inline_token_and_ca() -> TestResult {
         let valid = fixture_kubeconfig();
-        let parsed = Kubeconfig::from_yaml(&valid.to_string()).unwrap();
-        validate_fixture_kubeconfig(&parsed, "kind-fixture").unwrap();
+        let parsed = Kubeconfig::from_yaml(&valid.to_string())?;
+        validate_fixture_kubeconfig(&parsed, "kind-fixture")?;
         let mut ipv6 = valid.clone();
         ipv6["clusters"][0]["cluster"]["server"] = Value::String("https://[::1]:6443".into());
-        let parsed = Kubeconfig::from_yaml(&ipv6.to_string()).unwrap();
-        validate_fixture_kubeconfig(&parsed, "kind-fixture").unwrap();
+        let parsed = Kubeconfig::from_yaml(&ipv6.to_string())?;
+        validate_fixture_kubeconfig(&parsed, "kind-fixture")?;
 
         for user in [
             serde_json::json!({"token":"fixture-token","exec":{"apiVersion":"client.authentication.k8s.io/v1","command":"credential-plugin","interactiveMode":"Never"}}),
@@ -1615,7 +1655,7 @@ mod tests {
         ] {
             let mut candidate = valid.clone();
             candidate["users"][0]["user"] = user;
-            let parsed = Kubeconfig::from_yaml(&candidate.to_string()).unwrap();
+            let parsed = Kubeconfig::from_yaml(&candidate.to_string())?;
             assert!(validate_fixture_kubeconfig(&parsed, "kind-fixture").is_err());
         }
 
@@ -1630,29 +1670,33 @@ mod tests {
         ] {
             let mut candidate = valid.clone();
             candidate["clusters"][0]["cluster"] = cluster_override;
-            let parsed = Kubeconfig::from_yaml(&candidate.to_string()).unwrap();
+            let parsed = Kubeconfig::from_yaml(&candidate.to_string())?;
             assert!(validate_fixture_kubeconfig(&parsed, "kind-fixture").is_err());
         }
+        Ok(())
     }
 
     #[test]
-    fn startup_reader_rejects_duplicate_keys_and_oversized_files() {
-        let base =
-            std::env::temp_dir().join(format!("apsides-runtime-config-test-{}", std::process::id()));
-        fs::write(&base, br#"{"mode":"production","mode":"production"}"#).unwrap();
+    fn startup_reader_rejects_duplicate_keys_and_oversized_files() -> TestResult {
+        let base = std::env::temp_dir().join(format!(
+            "apsides-runtime-config-test-{}",
+            std::process::id()
+        ));
+        fs::write(&base, br#"{"mode":"production","mode":"production"}"#)?;
         assert!(read_startup(&base).is_err());
         fs::write(
             &base,
-            vec![b' '; usize::try_from(STARTUP_CONFIG_MAX_BYTES + 1).unwrap()],
-        )
-        .unwrap();
+            vec![b' '; usize::try_from(STARTUP_CONFIG_MAX_BYTES + 1)?],
+        )?;
         assert!(read_startup(&base).is_err());
-        fs::remove_file(base).unwrap();
+        fs::remove_file(base)?;
+        Ok(())
     }
 
     #[test]
-    fn rustls_ring_provider_is_explicitly_available() {
-        install_rustls_provider().unwrap();
-        install_rustls_provider().unwrap();
+    fn rustls_ring_provider_is_explicitly_available() -> TestResult {
+        install_rustls_provider()?;
+        install_rustls_provider()?;
+        Ok(())
     }
 }

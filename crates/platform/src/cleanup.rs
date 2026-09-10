@@ -372,6 +372,7 @@ impl PlatformClient {
 
 #[cfg(test)]
 mod tests {
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
     use super::*;
     use coordination::{ClaimRef, ClaimSnapshotV1, ClaimStore};
     use serde_json::json;
@@ -443,21 +444,67 @@ mod tests {
         }
     }
 
+    use http::{Request, Response};
+    use http_body_util::BodyExt as _;
+    use kube::client::Body;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// A fixture problem inside the mock transport, which itself cannot fail.
+    type FixtureError = Box<dyn std::error::Error + Send + Sync>;
+
+    /// The transport signature is infallible, so a fixture problem becomes a
+    /// 500 naming it; the assertions then report that rather than a panic.
+    fn fixture_failure(error: &FixtureError) -> Response<Body> {
+        Response::builder()
+            .status(500)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "fixtureError": error.to_string() })
+                    .to_string()
+                    .into_bytes(),
+            ))
+            .unwrap_or_else(|_| Response::new(Body::from(Vec::new())))
+    }
+
+    async fn reply(
+        request: Request<Body>,
+        replies: &Mutex<VecDeque<serde_json::Value>>,
+        captured: &Mutex<Vec<(String, serde_json::Value)>>,
+    ) -> std::result::Result<Response<Body>, FixtureError> {
+        let (parts, body) = request.into_parts();
+        let bytes = body.collect().await?.to_bytes();
+        captured
+            .lock()
+            .map_err(|_| "captured mutex is poisoned")?
+            .push((
+                parts.method.to_string(),
+                if bytes.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_slice(&bytes)?
+                },
+            ));
+        let reply = replies
+            .lock()
+            .map_err(|_| "replies mutex is poisoned")?
+            .pop_front()
+            .ok_or("fixture ran out of queued replies")?;
+        Ok(Response::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&reply)?))?)
+    }
+
     #[tokio::test]
     async fn delete_preserves_finalizers_and_sends_both_preconditions()
-    -> std::result::Result<(), Box<dyn std::error::Error>> {
-        use http::{Request, Response};
-        use http_body_util::BodyExt;
-        use kube::client::Body;
-        use std::{
-            collections::VecDeque,
-            convert::Infallible,
-            sync::{Arc, Mutex},
-        };
+    -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use std::{convert::Infallible, sync::Arc};
         let registry = cleanup_registry_fixture();
         let snapshot = registry.value.claim_snapshot()?;
         let state = registry.value.state(&snapshot.reference()?)?;
-        let ceiling: compiler_core::PermissionCeiling = serde_json::from_value(json!({"policyRef":"platform","domainId":"example","clusterBinding":"cluster-a","workloadNamespace":"workload","controlNamespace":"control","capabilities":[],"acceptedEnforcementGaps":[],"acceptedIndirectRisks":[]})).unwrap();
+        let ceiling: compiler_core::PermissionCeiling = serde_json::from_value(
+            json!({"policyRef":"platform","domainId":"example","clusterBinding":"cluster-a","workloadNamespace":"workload","controlNamespace":"control","capabilities":[],"acceptedEnforcementGaps":[],"acceptedIndirectRisks":[]}),
+        )?;
         let policy = crate::Versioned {
             value: crate::PolicyState {
                 image_pull_secrets: vec![],
@@ -468,7 +515,9 @@ mod tests {
             uid: "policy-uid".into(),
             resource_version: "9".into(),
         };
-        let live: DynamicObject = serde_json::from_value(json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"settings","namespace":"workload","uid":"target-uid","resourceVersion":"42","finalizers":["example.test/hold"]}})).unwrap();
+        let live: DynamicObject = serde_json::from_value(
+            json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"settings","namespace":"workload","uid":"target-uid","resourceVersion":"42","finalizers":["example.test/hold"]}}),
+        )?;
         let replies = Arc::new(Mutex::new(VecDeque::from([
             json!({"metadata":{"uid":registry.uid,"resourceVersion":registry.resource_version},"data":{"state.json":serde_json::to_string(&state)?}}),
             json!({"metadata":{"uid":"authority-uid","resourceVersion":"1"},"data":{"state.json":json!({
@@ -476,9 +525,9 @@ mod tests {
                 "registryUid":registry.uid,"clusterBinding":"cluster-a",
                 "controlNamespace":"control","workloadNamespace":"workload"
             }).to_string()}}),
-            json!({"metadata":{"uid":policy.uid,"resourceVersion":policy.resource_version},"data":{"state.json":serde_json::to_string(&policy.value).unwrap()}}),
-            serde_json::to_value(&live).unwrap(),
-            serde_json::to_value(&live).unwrap(),
+            json!({"metadata":{"uid":policy.uid,"resourceVersion":policy.resource_version},"data":{"state.json":serde_json::to_string(&policy.value)?}}),
+            serde_json::to_value(&live)?,
+            serde_json::to_value(&live)?,
         ])));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = requests.clone();
@@ -486,23 +535,10 @@ mod tests {
             let replies = replies.clone();
             let captured = captured.clone();
             async move {
-                let (parts, body) = request.into_parts();
-                let bytes = body.collect().await.unwrap().to_bytes();
-                captured.lock().unwrap().push((
-                    parts.method.to_string(),
-                    if bytes.is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::from_slice(&bytes).unwrap()
-                    },
-                ));
-                let reply = replies.lock().unwrap().pop_front().unwrap();
-                Ok::<_, Infallible>(
-                    Response::builder()
-                        .header("content-type", "application/json")
-                        .body(Body::from(serde_json::to_vec(&reply).unwrap()))
-                        .unwrap(),
-                )
+                Ok::<_, Infallible>(match reply(request, &replies, &captured).await {
+                    Ok(response) => response,
+                    Err(error) => fixture_failure(&error),
+                })
             }
         });
         let client = kube::Client::new(service, "control");
@@ -525,11 +561,10 @@ mod tests {
         assert!(
             platform
                 .delete_cleanup_object(&registry, &policy, &api, &live)
-                .await
-                .unwrap()
+                .await?
                 .is_none()
         );
-        let requests = requests.lock().unwrap();
+        let requests = requests.lock().map_err(|_| "requests mutex is poisoned")?;
         assert_eq!(
             requests.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
             ["GET", "GET", "GET", "DELETE", "GET"]
@@ -547,14 +582,13 @@ mod tests {
     }
 
     #[test]
-    fn trusted_capture_requires_exact_main_resource_apply_owner() {
-        let resource: Resource = serde_json::from_value(json!({"id":"settings","apiVersion":"v1","kind":"ConfigMap","name":"settings","namespace":"workload","desired":{},"lifecycle":{"deletionPolicy":"delete"},"source":{"file":"test.ts","line":1,"column":1}})).unwrap();
+    fn trusted_capture_requires_exact_main_resource_apply_owner() -> TestResult {
+        let resource: Resource = serde_json::from_value(
+            json!({"id":"settings","apiVersion":"v1","kind":"ConfigMap","name":"settings","namespace":"workload","desired":{},"lifecycle":{"deletionPolicy":"delete"},"source":{"file":"test.ts","line":1,"column":1}}),
+        )?;
         let value = json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"settings","namespace":"workload","uid":"created-uid","resourceVersion":"19","managedFields":[{"manager":"apsides-example","operation":"Apply","apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:data":{}}}]}});
-        let object: DynamicObject = serde_json::from_value(value.clone()).unwrap();
-        assert_eq!(
-            owned_uid(&object, &resource, "example").unwrap(),
-            "created-uid"
-        );
+        let object: DynamicObject = serde_json::from_value(value.clone())?;
+        assert_eq!(owned_uid(&object, &resource, "example")?, "created-uid");
         for (field, replacement) in [
             ("operation", json!("Update")),
             ("manager", json!("other")),
@@ -563,28 +597,15 @@ mod tests {
         ] {
             let mut changed = value.clone();
             changed["metadata"]["managedFields"][0][field] = replacement;
-            assert!(
-                owned_uid(
-                    &serde_json::from_value(changed).unwrap(),
-                    &resource,
-                    "example"
-                )
-                .is_err()
-            );
+            assert!(owned_uid(&serde_json::from_value(changed)?, &resource, "example").is_err());
         }
         let mut duplicate = value;
         let entry = duplicate["metadata"]["managedFields"][0].clone();
         duplicate["metadata"]["managedFields"]
             .as_array_mut()
-            .unwrap()
+            .ok_or("expected a JSON array")?
             .push(entry);
-        assert!(
-            owned_uid(
-                &serde_json::from_value(duplicate).unwrap(),
-                &resource,
-                "example"
-            )
-            .is_err()
-        );
+        assert!(owned_uid(&serde_json::from_value(duplicate)?, &resource, "example").is_err());
+        Ok(())
     }
 }

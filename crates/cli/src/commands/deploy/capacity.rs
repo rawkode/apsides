@@ -1,16 +1,9 @@
 //! Explicit capacity recovery keeps the release and executor checks of normal deploy.
-use crate::Result;
+//!
+//! `--capacity resize` is admissible only against an existing untouched
+//! upgrade: it can neither create a transition nor reopen a committed one.
+use crate::{Result, report};
 use deploy::Phase;
-use std::{collections::BTreeMap, io::Write as _};
-
-pub(super) fn requested(options: &BTreeMap<String, String>) -> Result<bool> {
-    match options.get("--capacity").map(String::as_str) {
-        None => Ok(false),
-        Some("resize") if options.get("--transition").is_some_and(|id| !id.is_empty()) => Ok(true),
-        Some("resize") => Err("capacity resize requires an explicit --transition ID".into()),
-        Some(_) => Err("unsupported capacity action; use --capacity resize".into()),
-    }
-}
 
 pub(super) fn require_target(
     existing: &super::ExistingTransition,
@@ -44,43 +37,20 @@ pub(super) async fn resize_and_rebind(
     let rebound = platform
         .transition_session(verified, inventory, transition)
         .await?;
-    writeln!(
-        std::io::stderr().lock(),
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "status": "capacity-resized", "transition": transition,
-            "changed": before != after, "before": before, "after": after,
-        }))?
-    )?;
+    report::note(&serde_json::json!({
+        "status": "capacity-resized", "transition": transition,
+        "changed": before != after, "before": before, "after": after,
+    }))?;
     Ok(rebound)
 }
 
-pub(super) fn required_error(transition: &str) -> Box<dyn std::error::Error> {
+pub(super) fn required_error(transition: &str) -> Box<dyn std::error::Error + Send + Sync> {
     format!("writer topology exceeds admitted capacity; rerun this deploy with --transition {transition} --capacity resize, retaining the same artifact and executor options").into()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{requested, require_target};
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn resize_requires_explicit_action_and_transition() -> crate::Result<()> {
-        assert!(!requested(&BTreeMap::new())?);
-        assert!(requested(&BTreeMap::from([("--capacity".into(), "resize".into())])).is_err());
-        assert!(requested(&BTreeMap::from([
-            ("--capacity".into(), "resize".into()),
-            ("--transition".into(), "t-example".into()),
-        ]))?);
-        assert!(
-            requested(&BTreeMap::from([
-                ("--capacity".into(), "cancel".into()),
-                ("--transition".into(), "t-example".into()),
-            ]))
-            .is_err()
-        );
-        Ok(())
-    }
+    use super::require_target;
 
     #[test]
     fn resize_cannot_create_or_reopen_committed_transition() {

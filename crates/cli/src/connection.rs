@@ -39,7 +39,7 @@ async fn open_coordination(read_only: bool) -> Result<Arc<coordination::LibsqlCo
         } else {
             let token = token.ok_or("remote coordination requires APSIDES_INVENTORY_TOKEN")?;
             if read_only {
-                Ok::<_, Box<dyn std::error::Error>>(
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
                     coordination::LibsqlCoordination::open_remote_read_only(database, token)
                         .await?,
                 )
@@ -92,7 +92,7 @@ async fn open(database: &str, token: Option<String>) -> Result<Box<dyn Inventory
                     !value.is_empty() && value.len() <= 8192 && !value.chars().any(char::is_control)
                 })
                 .ok_or("remote inventory requires APSIDES_INVENTORY_TOKEN")?;
-            Ok::<_, Box<dyn std::error::Error>>(
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
                 LibsqlInventory::open_remote(database.into(), token).await?,
             )
         }

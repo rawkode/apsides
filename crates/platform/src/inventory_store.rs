@@ -159,10 +159,11 @@ fn validate_predecessor(
 
 #[cfg(test)]
 mod tests {
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
     use super::*;
 
     #[test]
-    fn missing_upgrade_inventory_requires_recovery_but_initial_install_can_start() {
+    fn missing_upgrade_inventory_requires_recovery_but_initial_install_can_start() -> TestResult {
         let next = InventorySnapshot {
             schema_version: inventory::INVENTORY_SCHEMA.into(),
             generation: "generation-b".into(),
@@ -176,16 +177,17 @@ mod tests {
         };
         let head = VersionedInventory {
             revision: "7".into(),
-            snapshot_id: compiler_core::digest(&prior).unwrap(),
+            snapshot_id: compiler_core::digest(&prior)?,
             snapshot: prior,
         };
         assert!(validate_predecessor(Some("generation-a"), &next, Some(&head)).is_ok());
         assert!(validate_predecessor(None, &next, Some(&head)).is_err());
+        Ok(())
     }
 
     #[test]
     fn same_generation_can_complete_an_unknown_uid_only()
-    -> std::result::Result<(), Box<dyn std::error::Error>> {
+    -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let old = InventorySnapshot {
             schema_version: inventory::INVENTORY_SCHEMA.into(),
             generation: "g1".into(),

@@ -88,56 +88,7 @@ impl PlatformClient {
                     "writer Pod ownership or termination retention differs from protected Deployment",
                 ));
             }
-            let spec = pod
-                .spec
-                .as_ref()
-                .ok_or_else(|| invalid("writer Pod spec missing"))?;
-            let template = deployment
-                .spec
-                .as_ref()
-                .and_then(|s| s.template.spec.as_ref())
-                .ok_or_else(|| invalid("writer Deployment template missing"))?;
-            crate::controller::verify_image_pull_secrets(spec, template)?;
-            if spec.service_account_name.as_ref() != Some(&account) {
-                return Err(invalid("writer Pod service account changed"));
-            }
-            let node_name = spec
-                .node_name
-                .as_ref()
-                .ok_or_else(|| invalid("writer node absent"))?;
-            let node = nodes.get(node_name).await?;
-            let status = pod
-                .status
-                .as_ref()
-                .ok_or_else(|| invalid("writer container identity not observable"))?;
-            captured.push(ExpectedPod {
-                name: required(pod.metadata.name.as_deref())?,
-                uid: required(pod.metadata.uid.as_deref())?,
-                node_name: node_name.clone(),
-                node_uid: required(node.metadata.uid.as_deref())?,
-                containers: CapturedContainers {
-                    regular: capture_containers(
-                        spec.containers
-                            .iter()
-                            .map(|container| container.name.as_str()),
-                        status.container_statuses.as_deref(),
-                    )?,
-                    init: capture_containers(
-                        spec.init_containers
-                            .iter()
-                            .flatten()
-                            .map(|container| container.name.as_str()),
-                        status.init_container_statuses.as_deref(),
-                    )?,
-                    ephemeral: capture_containers(
-                        spec.ephemeral_containers
-                            .iter()
-                            .flatten()
-                            .map(|container| container.name.as_str()),
-                        status.ephemeral_container_statuses.as_deref(),
-                    )?,
-                },
-            });
+            captured.push(Self::capture_pod(&pod, &deployment, &account, &nodes).await?);
         }
         captured.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(ExpectedWriters {
@@ -145,6 +96,65 @@ impl PlatformClient {
             deployment_uid: previous.controller_deployment_uid.clone(),
             service_account_name: account,
             pods: captured,
+        })
+    }
+
+    /// Capture one writer Pod's identity, node binding and container identities.
+    async fn capture_pod(
+        pod: &Pod,
+        deployment: &Deployment,
+        account: &str,
+        nodes: &Api<Node>,
+    ) -> Result<ExpectedPod> {
+        let spec = pod
+            .spec
+            .as_ref()
+            .ok_or_else(|| invalid("writer Pod spec missing"))?;
+        let template = deployment
+            .spec
+            .as_ref()
+            .and_then(|s| s.template.spec.as_ref())
+            .ok_or_else(|| invalid("writer Deployment template missing"))?;
+        crate::controller::verify_image_pull_secrets(spec, template)?;
+        if spec.service_account_name.as_deref() != Some(account) {
+            return Err(invalid("writer Pod service account changed"));
+        }
+        let node_name = spec
+            .node_name
+            .as_ref()
+            .ok_or_else(|| invalid("writer node absent"))?;
+        let node = nodes.get(node_name).await?;
+        let status = pod
+            .status
+            .as_ref()
+            .ok_or_else(|| invalid("writer container identity not observable"))?;
+        Ok(ExpectedPod {
+            name: required(pod.metadata.name.as_deref())?,
+            uid: required(pod.metadata.uid.as_deref())?,
+            node_name: node_name.clone(),
+            node_uid: required(node.metadata.uid.as_deref())?,
+            containers: CapturedContainers {
+                regular: capture_containers(
+                    spec.containers
+                        .iter()
+                        .map(|container| container.name.as_str()),
+                    status.container_statuses.as_deref(),
+                )?,
+                init: capture_containers(
+                    spec.init_containers
+                        .iter()
+                        .flatten()
+                        .map(|container| container.name.as_str()),
+                    status.init_container_statuses.as_deref(),
+                )?,
+                ephemeral: capture_containers(
+                    spec.ephemeral_containers
+                        .iter()
+                        .flatten()
+                        .map(|container| container.name.as_str()),
+                    status.ephemeral_container_statuses.as_deref(),
+                )?,
+            },
         })
     }
 

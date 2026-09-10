@@ -210,7 +210,7 @@ mod tests {
     use coordination::{ClaimScope, ClaimSnapshotV1};
     use deploy::GenerationHistory;
 
-    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
     fn state(domains: &[&str]) -> TestResult<NamespaceRegistryState> {
         let scope = ClaimScope {

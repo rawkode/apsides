@@ -9,6 +9,7 @@ mod declarations;
 mod permissions;
 
 /// Project the entire supported declaration review from a canonical transition.
+///
 /// The caller must separately authenticate the verified release, predecessor and
 /// protected allocation before publishing or binding the returned metadata.
 /// # Errors

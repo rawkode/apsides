@@ -237,7 +237,7 @@ fn maximum_inventory(
 mod tests {
     use super::validate_runtime_control_metadata;
 
-    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
     #[test]
     fn runtime_control_metadata_uses_complete_json_string_boundary() -> TestResult {

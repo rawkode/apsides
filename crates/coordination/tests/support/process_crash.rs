@@ -31,7 +31,7 @@ enum StoreKind {
 impl StoreKind {
     const ALL: [Self; 3] = [Self::Claim, Self::Review, Self::Audit];
 
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::Claim => "claim",
             Self::Review => "review",
@@ -163,48 +163,47 @@ async fn seed_spill_rows(connection: &Connection, kind: StoreKind) -> TestResult
         .await?;
     let payload = vec![b's'; SPILL_BYTES];
     for index in 0..SPILL_ROWS {
-        let inserted = match kind {
-            StoreKind::Claim => {
-                transaction
+        let inserted =
+            match kind {
+                StoreKind::Claim => transaction
                     .execute(
                         "INSERT INTO apsides_coordination_claims(digest,metadata) VALUES (?1,?2)",
                         params![format!("synthetic-crash-claim-{index:04}"), payload.clone()],
                     )
-                    .await?
-            }
-            StoreKind::Review => {
-                transaction
-                    .execute(
-                        "INSERT INTO apsides_coordination_review_objects(\
+                    .await?,
+                StoreKind::Review => {
+                    transaction
+                        .execute(
+                            "INSERT INTO apsides_coordination_review_objects(\
                          registry_uid,cluster_binding,control_namespace,workload_namespace,\
                          domain_id,transition_id,sequence,digest,metadata) \
                          VALUES (?1,'cluster','control','workload','domain',?2,'2',?3,?4)",
-                        params![
-                            "synthetic-crash-review",
-                            format!("transition-{index:04}"),
-                            format!("synthetic-crash-review-{index:04}"),
-                            payload.clone(),
-                        ],
-                    )
-                    .await?
-            }
-            StoreKind::Audit => {
-                transaction
-                    .execute(
-                        "INSERT INTO apsides_coordination_audits(\
+                            params![
+                                "synthetic-crash-review",
+                                format!("transition-{index:04}"),
+                                format!("synthetic-crash-review-{index:04}"),
+                                payload.clone(),
+                            ],
+                        )
+                        .await?
+                }
+                StoreKind::Audit => {
+                    transaction
+                        .execute(
+                            "INSERT INTO apsides_coordination_audits(\
                          registry_uid,cluster_binding,control_namespace,workload_namespace,\
                          domain_id,transition_id,sequence,digest,metadata) \
                          VALUES (?1,'cluster','control','workload','domain',?2,'2',?3,?4)",
-                        params![
-                            "synthetic-crash-audit",
-                            format!("transition-{index:04}"),
-                            format!("synthetic-crash-audit-{index:04}"),
-                            payload.clone(),
-                        ],
-                    )
-                    .await?
-            }
-        };
+                            params![
+                                "synthetic-crash-audit",
+                                format!("transition-{index:04}"),
+                                format!("synthetic-crash-audit-{index:04}"),
+                                payload.clone(),
+                            ],
+                        )
+                        .await?
+                }
+            };
         if inserted != 1 {
             return Err("coordination crash spill row was not inserted".into());
         }

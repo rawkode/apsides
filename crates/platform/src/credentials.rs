@@ -20,6 +20,7 @@ pub enum DeploymentPreviewProfile {
 }
 
 /// Explicit preview scope for a v2 deployment identity policy.
+///
 /// An empty target list approves preview processing for a declaration with no managed objects; it
 /// does not mean all names and must not be translated to an empty Kubernetes `resourceNames` list.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

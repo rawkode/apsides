@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS apsides_coordination_audits (
 ";
 
 /// Immutable claim snapshots on a local durable database or a remote primary.
+///
 /// Remote providers must guarantee durable commits and read-after-write primary
 /// reads. This client never uses an eventually consistent replica. Authentication
 /// tokens never enter snapshot rows.

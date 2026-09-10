@@ -1,11 +1,15 @@
-#[path = "review_adoption_tests.rs"]
-mod review_adoption;
-#[path = "review_contract_tests.rs"]
-mod review_contract;
+mod adoption;
+mod contract;
 
 use super::*;
-use deploy::{GenerationHistory, begin, plan_transition};
+use compiler_core::CompiledPlan;
+use deploy::{
+    DeploymentRequest, GenerationHistory, GenerationPlan, Phase, RegistrySnapshot, begin,
+    plan_transition,
+};
 use platform::{NamespaceRegistry, RuntimeBinding, StoredTransition};
+use serde_json::json;
+use std::collections::BTreeMap;
 
 const BUILD: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OTHER: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";

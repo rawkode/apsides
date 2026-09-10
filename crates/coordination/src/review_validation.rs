@@ -7,7 +7,7 @@ use super::{ReviewInputMode, ReviewSource};
 use crate::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) fn require(ok: bool, reason: &'static str) -> Result<()> {
+pub(super) const fn require(ok: bool, reason: &'static str) -> Result<()> {
     if ok {
         Ok(())
     } else {

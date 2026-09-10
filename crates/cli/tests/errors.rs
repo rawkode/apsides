@@ -7,7 +7,8 @@ use std::os::{
 use std::process::{Command, Stdio};
 
 #[test]
-fn invalid_utf8_arguments_return_an_error() -> Result<(), Box<dyn std::error::Error>> {
+fn invalid_utf8_arguments_return_an_error() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     let output = Command::new(env!("CARGO_BIN_EXE_aps"))
         .arg(std::ffi::OsString::from_vec(vec![0xff]))
         .output()?;
@@ -20,7 +21,8 @@ fn invalid_utf8_arguments_return_an_error() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
-fn closed_stdout_returns_an_error_without_panicking() -> Result<(), Box<dyn std::error::Error>> {
+fn closed_stdout_returns_an_error_without_panicking()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (writer, reader) = UnixStream::pair()?;
     drop(reader);
     let writer: OwnedFd = writer.into();

@@ -1,62 +1,50 @@
-use crate::{Result, read_plan};
+//! Selecting and reading the compiler's staged output.
+//!
+//! The source compiler stages both the production IR and, alongside it, the
+//! synthetic fixture projection. Choosing the fixture is never implicit: it is
+//! read only when it validates against the production document it claims to
+//! project.
+
+use crate::{Result, cli::Mode, ir::read_plan};
 use compiler_core::parse_and_validate;
-use std::{collections::BTreeMap, fs, io::Read as _, path::Path};
+use std::{fs, io::Read as _, path::Path};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SourceMode {
-    Production,
-    Fixture,
-}
+/// The largest staged compiler document the CLI will read.
+const MAX_BYTES: usize = 8 * 1024 * 1024;
 
-impl SourceMode {
-    fn ir_name(self) -> &'static str {
-        match self {
-            Self::Production => "ir.json",
-            Self::Fixture => "fixture-ir.json",
-        }
+const fn ir_name(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Production => "ir.json",
+        Mode::Fixture => "fixture-ir.json",
     }
 }
 
-pub(crate) fn source_mode(options: &BTreeMap<String, String>, command: &str) -> Result<SourceMode> {
-    let Some(mode) = options.get("--mode") else {
-        return Ok(SourceMode::Production);
-    };
-    if command != "build" || !options.contains_key("--source") || options.contains_key("--ir") {
-        return Err("--mode applies only to build --source".into());
+/// Read the staged IR the requested mode selects.
+///
+/// # Errors
+/// Returns an error if the staged documents are missing, oversized, invalid, or
+/// if a requested fixture does not project the production IR beside it.
+pub(crate) fn plan(stage: &Path, mode: Mode) -> Result<compiler_core::CompiledPlan> {
+    if mode == Mode::Production {
+        return read_plan(&stage.join(ir_name(mode)));
     }
-    match mode.as_str() {
-        "production" => Ok(SourceMode::Production),
-        "fixture" => Ok(SourceMode::Fixture),
-        _ => Err("--mode must be production or fixture".into()),
-    }
-}
-
-pub(crate) fn source_plan(stage: &Path, mode: SourceMode) -> Result<compiler_core::CompiledPlan> {
-    if mode == SourceMode::Production {
-        return read_plan(
-            stage
-                .join(mode.ir_name())
-                .to_str()
-                .ok_or("non UTF-8 source output path")?,
-        );
-    }
-    let production = source_document(&stage.join("ir.json"))?;
-    let fixture = source_document(&stage.join(mode.ir_name()))?;
-    let overlay = source_document(&stage.join("fixture-overlay.json"))?;
+    let production = document(&stage.join("ir.json"))?;
+    let fixture = document(&stage.join(ir_name(mode)))?;
+    let overlay = document(&stage.join("fixture-overlay.json"))?;
     release::validate_fixture_projection(&production, &fixture, &overlay)?;
     Ok(parse_and_validate(&serde_json::to_string(&fixture)?)?)
 }
 
-fn source_document(path: &Path) -> Result<serde_json::Value> {
+fn document(path: &Path) -> Result<serde_json::Value> {
     let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() || metadata.len() > 8 * 1024 * 1024 {
+    if !metadata.file_type().is_file() || metadata.len() > MAX_BYTES as u64 {
         return Err("source compiler document is missing or oversized".into());
     }
     let mut bytes = Vec::new();
     fs::File::open(path)?
-        .take(8 * 1024 * 1024 + 1)
+        .take(MAX_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
-    if bytes.len() > 8 * 1024 * 1024 {
+    if bytes.len() > MAX_BYTES {
         return Err("source compiler document is oversized".into());
     }
     Ok(compiler_core::parse_strict(std::str::from_utf8(&bytes)?)?)
@@ -68,43 +56,9 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn mode_defaults_to_production_and_selects_exact_ir() -> Result<()> {
-        let default = BTreeMap::from([
-            ("--source".into(), "program.tsx".into()),
-            ("--output".into(), "output".into()),
-        ]);
-        assert_eq!(source_mode(&default, "build")?, SourceMode::Production);
-        assert_eq!(SourceMode::Production.ir_name(), "ir.json");
-
-        let fixture = BTreeMap::from([
-            ("--source".into(), "program.tsx".into()),
-            ("--output".into(), "output".into()),
-            ("--mode".into(), "fixture".into()),
-        ]);
-        assert_eq!(source_mode(&fixture, "build")?, SourceMode::Fixture);
-        assert_eq!(SourceMode::Fixture.ir_name(), "fixture-ir.json");
-        Ok(())
-    }
-
-    #[test]
-    fn explicit_mode_rejects_compile_raw_ir_and_unknown_values() -> Result<()> {
-        let mut options = BTreeMap::from([
-            ("--source".into(), "program.tsx".into()),
-            ("--output".into(), "output".into()),
-            ("--mode".into(), "production".into()),
-        ]);
-        assert_eq!(source_mode(&options, "build")?, SourceMode::Production);
-        assert!(source_mode(&options, "compile").is_err());
-
-        options.remove("--source");
-        options.insert("--ir".into(), "ir.json".into());
-        assert!(source_mode(&options, "build").is_err());
-
-        options.remove("--ir");
-        options.insert("--source".into(), "program.tsx".into());
-        options.insert("--mode".into(), "other".into());
-        assert!(source_mode(&options, "build").is_err());
-        Ok(())
+    fn each_mode_selects_its_exact_staged_document() {
+        assert_eq!(ir_name(Mode::Production), "ir.json");
+        assert_eq!(ir_name(Mode::Fixture), "fixture-ir.json");
     }
 
     #[test]
@@ -117,10 +71,10 @@ mod tests {
         let overlay = overlay(&production, &fixture)?;
         write_stage(directory.path(), &production, &fixture, &overlay)?;
 
-        let selected = source_plan(directory.path(), SourceMode::Fixture)?;
+        let selected = plan(directory.path(), Mode::Fixture)?;
         assert!(selected.ir.test_only);
         assert_eq!(selected.ir_digest, fixture_digest);
-        let production = source_plan(directory.path(), SourceMode::Production)?;
+        let production = plan(directory.path(), Mode::Production)?;
         assert!(!production.ir.test_only);
 
         let mut wrong_overlay = overlay;
@@ -129,7 +83,7 @@ mod tests {
             directory.path().join("fixture-overlay.json"),
             wrong_overlay.to_string(),
         )?;
-        assert!(source_plan(directory.path(), SourceMode::Fixture).is_err());
+        assert!(plan(directory.path(), Mode::Fixture).is_err());
         Ok(())
     }
 

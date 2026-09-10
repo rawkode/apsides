@@ -2,7 +2,7 @@ use super::*;
 use coordination::{ReviewMetadataV1, ReviewRef, ReviewStore};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[test]
 fn cnpg_review_preserves_the_imported_api_mapping() -> TestResult {
@@ -118,8 +118,8 @@ async fn review_publication_failures_precede_claim_and_registry_writes() -> Test
         let claims = Arc::new(CountingClaims::default());
         let (client, calls) = wire(vec![
             registry_object(&registry, REGISTRY_UID, "42")?,
-            object("policy", &policy, "policy-uid", "40"),
-        ]);
+            object("policy", &policy, "policy-uid", "40")?,
+        ])?;
         let client = platform_client(client, "control", "workload", "cluster-a")?
             .with_claim_store(claims.clone())
             .with_review_store(Arc::new(FaultyReview {
@@ -154,10 +154,10 @@ async fn lost_reservation_cas_does_not_poison_the_unconsumed_review_scope() -> T
     let before = registry_object(&registry, REGISTRY_UID, "42")?;
     let (client, _) = wire(vec![
         before.clone(),
-        object("policy", &policy, "policy-uid", "40"),
+        object("policy", &policy, "policy-uid", "40")?,
         before.clone(),
         json!({"wireHttpStatus":409,"body":{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Conflict","message":"injected CAS loss","code":409}}),
-    ]);
+    ])?;
     let client = platform_client(client, "control", "workload", "cluster-a")?
         .with_review_store(store.clone());
     assert!(
@@ -180,10 +180,10 @@ async fn lost_reservation_cas_does_not_poison_the_unconsumed_review_scope() -> T
     assert_ne!(first.reference()?, second.reference()?);
     let (client, _) = wire(vec![
         before.clone(),
-        object("policy", &policy, "policy-uid", "40"),
+        object("policy", &policy, "policy-uid", "40")?,
         before,
         json!("echo-put"),
-    ]);
+    ])?;
     let client = platform_client(client, "control", "workload", "cluster-a")?
         .with_review_store(store.clone());
     let committed_reservation = reserve_test_transition(&client, &second_request, "ci-b").await?;
@@ -218,7 +218,7 @@ async fn unsupported_schema_and_missing_review_bindings_are_rejected() -> TestRe
                 .remove("nextReviewMetadata");
         }
         object["data"]["state.json"] = json!(serde_json::to_string(&state)?);
-        let (client, calls) = wire(vec![object]);
+        let (client, calls) = wire(vec![object])?;
         assert!(
             platform_client(client, "control", "workload", "cluster-a")?
                 .load_registry()
@@ -239,7 +239,7 @@ async fn unsupported_schema_and_missing_review_bindings_are_rejected() -> TestRe
 #[tokio::test]
 async fn selected_sessions_reject_changed_references_and_backend_substitution() -> TestResult {
     let (registry, _, _, _, _) = staged_initial_fixture()?;
-    let (client, calls) = wire(vec![]);
+    let (client, calls) = wire(vec![])?;
     let selected = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_A)?;
     let protected = Versioned {
         value: registry.registry.clone(),
@@ -279,7 +279,7 @@ async fn protected_review_references_reject_foreign_scope_and_allocation() -> Te
             _ => reference["scope"]["claimScope"]["workloadNamespace"] = json!("foreign"),
         }
         object["data"]["state.json"] = json!(serde_json::to_string(&state)?);
-        let (client, calls) = wire(vec![object]);
+        let (client, calls) = wire(vec![object])?;
         assert!(
             platform_client(client, "control", "workload", "cluster-a")?
                 .load_registry()
@@ -307,7 +307,7 @@ async fn preflight_baseline_requires_the_exact_planning_registry_revision() -> T
         (REGISTRY_UID, "43", false),
         ("foreign-uid", "42", false),
     ] {
-        let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
+        let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?])?;
         let result = platform_client(client, "control", "workload", "cluster-a")?
             .load_active_review_metadata("example", uid, revision)
             .await;

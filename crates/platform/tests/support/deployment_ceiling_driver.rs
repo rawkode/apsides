@@ -548,7 +548,7 @@ fn required<'a>(value: Option<&'a str>, error: &'static str) -> Result<&'a str> 
     qualification_driver::required(value, error)
 }
 
-fn require_no_bootstrap_fields(settings: &Settings, error: &'static str) -> Result<()> {
+const fn require_no_bootstrap_fields(settings: &Settings, error: &'static str) -> Result<()> {
     if settings.registry_uid.is_some() || settings.registry_resource_version.is_some() {
         return Err(DriverError(error));
     }

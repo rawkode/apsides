@@ -12,6 +12,7 @@ pub struct ProcessTerminationObservation {
 }
 
 /// Produced by actual UID-bound Kubernetes reads and isolated helper execution.
+///
 /// This is a proxy observation. It is not sufficient to activate another writer:
 /// runtime/proxy termination, credential retirement and policy qualification are
 /// separate mandatory checks.
@@ -32,7 +33,7 @@ mod tests {
     use crate::UpgradeDrainState;
     use serde_json::{Value, json};
 
-    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
     fn drain_wire_fixture() -> Value {
         json!({

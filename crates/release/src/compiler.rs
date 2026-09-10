@@ -341,9 +341,11 @@ fn validate_native_compiler(native: &NativeCompiler) -> Result<ValidatedRuntime>
             return reject("native compiler closure omits trusted packaging code");
         }
     }
-    if native.packaging_files.iter().any(|file| {
-        !file.path.starts_with("scripts/") && !file.path.starts_with("crates/cli/")
-    }) {
+    if native
+        .packaging_files
+        .iter()
+        .any(|file| !file.path.starts_with("scripts/") && !file.path.starts_with("crates/cli/"))
+    {
         return reject("native compiler packaging manifest contains an unsupported source");
     }
     let cli_files: Vec<&CompilerFile> = native

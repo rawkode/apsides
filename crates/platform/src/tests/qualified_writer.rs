@@ -11,7 +11,7 @@ use kube::core::DynamicObject;
 use serde_json::{Value, json};
 use std::error::Error;
 
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
+type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 pub fn qualify(registry: &mut LifecycleRegistry, transition: &str) -> Result<Vec<Value>> {
     let control = registry

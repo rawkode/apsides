@@ -73,7 +73,7 @@ mod tests {
 
     #[test]
     fn recorded_secret_requires_exact_uid_and_immutable_identity()
-    -> std::result::Result<(), Box<dyn std::error::Error>> {
+    -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let valid = secret(Some("uid-one"));
         assert_eq!(
             validate_tls_secret(
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn created_secret_requires_unchanged_ephemeral_content()
-    -> std::result::Result<(), Box<dyn std::error::Error>> {
+    -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let expected = secret(None);
         let admitted = secret(Some("uid-one"));
         validate_tls_secret(

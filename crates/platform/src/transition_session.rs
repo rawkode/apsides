@@ -49,7 +49,7 @@ pub struct ResolvedTransition {
 }
 impl ResolvedTransition {
     #[must_use]
-    pub fn registry(&self) -> &Versioned<NamespaceRegistry> {
+    pub const fn registry(&self) -> &Versioned<NamespaceRegistry> {
         &self.registry
     }
     #[must_use]

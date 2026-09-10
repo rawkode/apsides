@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
 
 /// Signer-attested measurements of the exact production payload, not a fixture.
+///
 /// The enclosing release signature authenticates these assertions; this record
 /// alone is neither a signature nor proof of runner execution.
 #[derive(Clone, Debug, Serialize, Deserialize)]

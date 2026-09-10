@@ -4,13 +4,15 @@ use http_body_util::BodyExt;
 use kube::{Client, client::Body};
 use serde_json::{Value, json};
 use std::{
-    cell::Cell,
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tower::service_fn;
 
-type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type Calls = Arc<Mutex<Vec<(String, String)>>>;
 
 const RUN_ID: &str = "0123456789abcdef0123456789abcdef";
@@ -163,14 +165,14 @@ async fn verify(
     objects: BTreeMap<String, Value>,
 ) -> TestResult<(crate::Result<()>, Calls)> {
     let (platform, calls) = platform(objects)?;
-    let continued = Cell::new(false);
+    let continued = AtomicBool::new(false);
     let outcome = platform
         .after_candidate_qualification(&binding(), target, || async {
-            continued.set(true);
+            continued.store(true, Ordering::Relaxed);
             Ok(())
         })
         .await;
-    assert_eq!(continued.get(), outcome.is_ok());
+    assert_eq!(continued.load(Ordering::Relaxed), outcome.is_ok());
     Ok((outcome, calls))
 }
 
@@ -187,15 +189,15 @@ fn assert_read_only(calls: &Calls) -> TestResult {
 async fn exact_arbitrary_candidate_scope_reaches_the_reservation_boundary() -> TestResult {
     let target = target();
     let (platform, calls) = platform(objects(&target)?)?;
-    let continued = Cell::new(false);
+    let continued = AtomicBool::new(false);
     let outcome: crate::Result<()> = platform
         .after_candidate_qualification(&binding(), &target, || async {
-            continued.set(true);
+            continued.store(true, Ordering::Relaxed);
             Err(invalid("reservation boundary sentinel"))
         })
         .await;
     assert!(outcome.is_err());
-    assert!(continued.get());
+    assert!(continued.load(Ordering::Relaxed));
     assert_read_only(&calls)?;
     let paths = calls
         .lock()
@@ -217,15 +219,15 @@ async fn target_rejection_never_enters_the_reservation_continuation() -> TestRes
         format!("/api/v1/namespaces/{CLUSTER}/configmaps/{CANDIDATE_QUALIFICATION_MARKER_NAME}");
     values.get_mut(&path).ok_or("marker fixture missing")?["immutable"] = json!(false);
     let (platform, calls) = platform(values)?;
-    let continued = Cell::new(false);
+    let continued = AtomicBool::new(false);
     let outcome = platform
         .after_candidate_qualification(&binding(), &target, || async {
-            continued.set(true);
+            continued.store(true, Ordering::Relaxed);
             Ok(())
         })
         .await;
     assert!(outcome.is_err());
-    assert!(!continued.get());
+    assert!(!continued.load(Ordering::Relaxed));
     assert_read_only(&calls)?;
     Ok(())
 }

@@ -393,6 +393,7 @@ pub fn plan_transition(request: &DeploymentRequest) -> Result<TransitionPlan> {
 }
 
 /// Plan omitted-resource cleanup from tracking metadata and protected claims.
+///
 /// No previous compiled artifact, manifest or source is required by this boundary.
 /// The caller must supply the approved persisted snapshot; this does not make
 /// arbitrary database contents authoritative.

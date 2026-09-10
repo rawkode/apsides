@@ -3,7 +3,7 @@ use super::*;
 use crate::state_capacity::{measure, validate_domain_candidate, validate_reserved_capacity};
 use compiler_core::canonical_bytes;
 
-type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 fn complete_maps() -> TestResult<NamespaceRegistryState> {
     let registry = qualified_upgrade_fixture()?;
@@ -114,7 +114,7 @@ fn capacity_template_covers_every_counter_and_ceiling_width() -> TestResult {
     let template =
         CapacityAdmission::projection_placeholder(crate::completion_envelope::initial_profile());
     let maximum = canonical_bytes(&template)?.len();
-    let mut value = template.clone();
+    let mut value = template;
     let mut revisions = vec![0, u64::MAX];
     for exponent in 0..20 {
         if let Some(power) = 10u64.checked_pow(exponent) {
@@ -264,7 +264,7 @@ async fn registry_rejects_secret_commitments_and_unbounded_stage_keys_without_wr
         stored
             .staged_content_digests
             .insert(key, digest(&"private-hash-canary")?);
-        let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
+        let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?])?;
         let platform = platform_client(client, "control", "workload", "cluster-a")?;
         let error = platform
             .load_registry()
@@ -331,8 +331,8 @@ async fn reservation_refuses_aggregate_completion_overflow_before_claim_publicat
     validate_reserved_capacity(&state)?;
     let (client, calls) = wire(vec![
         registry_object(&registry, REGISTRY_UID, "42")?,
-        object("apsides-policy-example", &policy, "policy-uid", "44"),
-    ]);
+        object("apsides-policy-example", &policy, "policy-uid", "44")?,
+    ])?;
     let claims = Arc::new(CountingClaims {
         puts: std::sync::atomic::AtomicUsize::new(0),
     });
@@ -372,10 +372,10 @@ async fn oversized_activation_create_version_stops_before_inventory_creation() -
     let (client, calls) = wire(vec![
         json!({"wireHttpStatus":404,"body":{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","message":"fixture activation absent","code":404}}),
         json!("echo-activation-create-large-rv"),
-        object("apsides-policy-example", &policy, "policy-uid", "44"),
+        object("apsides-policy-example", &policy, "policy-uid", "44")?,
         protected,
         json!("echo-put"),
-    ]);
+    ])?;
     let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_A)?;
     let mut protected = Versioned {
         value: registry.registry.clone(),
@@ -405,7 +405,10 @@ async fn oversized_activation_create_version_stops_before_inventory_creation() -
         .filter(|call| call.0 == "POST")
         .collect::<Vec<_>>();
     assert_eq!(creates.len(), 1);
-    assert_eq!(creates[0].2["metadata"]["name"], "apsides-activation-example");
+    assert_eq!(
+        creates[0].2["metadata"]["name"],
+        "apsides-activation-example"
+    );
     assert!(
         !calls
             .iter()

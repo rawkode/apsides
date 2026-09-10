@@ -69,7 +69,7 @@ pub struct VerifiedActivation {
 }
 impl VerifiedActivation {
     #[must_use]
-    pub fn state(&self) -> &ActivationState {
+    pub const fn state(&self) -> &ActivationState {
         &self.activation.value
     }
     #[must_use]
@@ -133,7 +133,7 @@ impl StoredTransition {
         &self.inputs.registry.generation_history.domain_id
     }
     #[must_use]
-    pub fn allocation(&self) -> &deploy::GenerationAllocation {
+    pub const fn allocation(&self) -> &deploy::GenerationAllocation {
         &self.inputs.allocation
     }
     #[must_use]
@@ -142,7 +142,7 @@ impl StoredTransition {
     }
 
     #[cfg(feature = "deployer")]
-    pub(crate) fn reserved(
+    pub(crate) const fn reserved(
         inputs: crate::TransitionInputs,
         record: TransitionRecord,
         capacity: crate::CapacityAdmission,

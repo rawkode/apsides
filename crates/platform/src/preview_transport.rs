@@ -79,7 +79,7 @@ impl NamedPreview {
     }
     #[must_use]
     /// Return the sensitive transient object. Callers must not log or persist it.
-    pub fn object(&self) -> Option<&DynamicObject> {
+    pub const fn object(&self) -> Option<&DynamicObject> {
         self.object.as_ref()
     }
 }
@@ -88,7 +88,7 @@ pub struct PreviewObject(DynamicObject);
 impl PreviewObject {
     #[must_use]
     /// Return the sensitive transient dry-run object. Callers must not log or persist it.
-    pub fn object(&self) -> &DynamicObject {
+    pub const fn object(&self) -> &DynamicObject {
         &self.0
     }
 }

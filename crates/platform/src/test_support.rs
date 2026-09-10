@@ -137,9 +137,12 @@ impl PlatformClient {
                 "test API target cluster UID differs from bootstrap",
             ));
         }
-        let marker: Versioned<DisposableTestCluster> =
-            crate::store::read_state(&self.client, &self.control_namespace, "apsides-test-support")
-                .await?;
+        let marker: Versioned<DisposableTestCluster> = crate::store::read_state(
+            &self.client,
+            &self.control_namespace,
+            "apsides-test-support",
+        )
+        .await?;
         if marker.uid != target.marker_uid
             || marker.value.schema_version != "apsides.dev/disposable-test-cluster/v1"
             || marker.value.cluster_binding != scope.cluster_binding

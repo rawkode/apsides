@@ -1,6 +1,6 @@
 use super::*;
 
-type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub(super) fn admission_reads(registry: &mut LifecycleRegistry) -> TestResult<Vec<Value>> {
     let objects = qualified_writer::qualify(registry, TRANSITION_A)?;
@@ -22,7 +22,7 @@ pub(super) fn admission_reads(registry: &mut LifecycleRegistry) -> TestResult<Ve
     let proxy = &checkpoint.proxy_identity;
     let node = find("Node", &proxy.node_name)?;
     let policy = policy(&registry.plan(TRANSITION_A)?.request.next.compiled);
-    let mut active = activation(&registry.plan(TRANSITION_A)?.request.next.compiled, &policy);
+    let mut active = activation(&registry.plan(TRANSITION_A)?.request.next.compiled, &policy)?;
     active.binding = checkpoint.runtime_binding.clone();
     active.status = ActivationStatus::Active;
     let mut reads = vec![
@@ -31,7 +31,7 @@ pub(super) fn admission_reads(registry: &mut LifecycleRegistry) -> TestResult<Ve
             &active,
             &checkpoint.activation_uid,
             "45",
-        ),
+        )?,
         find("ConfigMap", "apsides-proxy-policy-example")?,
         node.clone(),
         find("Pod", &proxy.pod_name)?,
@@ -76,7 +76,7 @@ async fn profile_selection_accounts_for_retirement_uid_width() -> TestResult {
         .next()
         .ok_or("retirement identity missing")?;
     *uid = "u".repeat(130);
-    let (client, calls) = wire(responses);
+    let (client, calls) = wire(responses)?;
     let profile = platform_client(client, "control", "workload", "cluster-a")?
         .select_evidence_profile(Some(&checkpoint))
         .await?;
@@ -115,7 +115,7 @@ async fn topology_capture_rejects_owner_substitution_and_container_epoch_drift()
             .active_writer_checkpoints
             .get("example")
             .ok_or("checkpoint missing")?;
-        let (client, calls) = wire(responses);
+        let (client, calls) = wire(responses)?;
         let error = platform_client(client, "control", "workload", "cluster-a")?
             .select_evidence_profile(Some(checkpoint))
             .await
@@ -143,7 +143,7 @@ async fn topology_capture_rejects_owner_substitution_and_container_epoch_drift()
 #[tokio::test]
 async fn resize_changes_only_capacity_and_invalidates_the_old_session() -> TestResult {
     let (registry, responses) = resize_responses("grow")?;
-    let (client, calls) = wire(responses);
+    let (client, calls) = wire(responses)?;
     let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_B)?;
     let written =
         Box::pin(platform.resize_pre_quiescence_capacity(TRANSITION_B, "executor-b")).await?;
@@ -178,7 +178,7 @@ async fn resize_changes_only_capacity_and_invalidates_the_old_session() -> TestR
 async fn resize_rechecks_active_predecessor_and_respects_registry_cas() -> TestResult {
     for mode in ["draining-before", "draining-after", "registry-race"] {
         let (registry, responses) = resize_responses(mode)?;
-        let (client, calls) = wire(responses);
+        let (client, calls) = wire(responses)?;
         let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_B)?;
         let error = Box::pin(platform.resize_pre_quiescence_capacity(TRANSITION_B, "executor-b"))
             .await
@@ -206,7 +206,7 @@ async fn resize_rechecks_active_predecessor_and_respects_registry_cas() -> TestR
 #[tokio::test]
 async fn unchanged_resize_is_read_only_and_keeps_the_session() -> TestResult {
     let (registry, responses) = resize_responses("unchanged")?;
-    let (client, calls) = wire(responses);
+    let (client, calls) = wire(responses)?;
     let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_B)?;
     let written =
         Box::pin(platform.resize_pre_quiescence_capacity(TRANSITION_B, "executor-b")).await?;
@@ -238,7 +238,7 @@ fn resize_responses(mode: &str) -> TestResult<(LifecycleRegistry, Vec<Value>)> {
         .get("example")
         .ok_or("checkpoint missing")?;
     let policy = policy(&registry.plan(TRANSITION_B)?.request.next.compiled);
-    let mut activation = activation(&registry.plan(TRANSITION_A)?.request.next.compiled, &policy);
+    let mut activation = activation(&registry.plan(TRANSITION_A)?.request.next.compiled, &policy)?;
     activation.binding = previous.runtime_binding.clone();
     activation.status = ActivationStatus::Active;
     let active = object(
@@ -246,15 +246,15 @@ fn resize_responses(mode: &str) -> TestResult<(LifecycleRegistry, Vec<Value>)> {
         &activation,
         &previous.activation_uid,
         "45",
-    );
+    )?;
     activation.status = ActivationStatus::Draining;
     let draining = object(
         "apsides-activation-example",
         &activation,
         &previous.activation_uid,
         "46",
-    );
-    let ceiling = object("apsides-policy-example", &policy, "policy-uid", "44");
+    )?;
+    let ceiling = object("apsides-policy-example", &policy, "policy-uid", "44")?;
     let protected = registry_object(&registry, REGISTRY_UID, "42")?;
     let mut responses = vec![
         protected.clone(),
@@ -286,7 +286,7 @@ fn resize_responses(mode: &str) -> TestResult<(LifecycleRegistry, Vec<Value>)> {
 #[tokio::test]
 async fn capacity_resize_rejects_a_different_executor_before_live_capture() -> TestResult {
     let (registry, responses) = resize_responses("grow")?;
-    let (client, calls) = wire(responses);
+    let (client, calls) = wire(responses)?;
     let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_B)?;
     let error =
         Box::pin(platform.resize_pre_quiescence_capacity(TRANSITION_B, "different-executor"))
@@ -317,7 +317,7 @@ async fn image_pull_secret_topology_mutation_is_rejected() -> TestResult {
         .active_writer_checkpoints
         .get("example")
         .ok_or("checkpoint missing")?;
-    let (client, _) = wire(responses);
+    let (client, _) = wire(responses)?;
     let error = platform_client(client, "control", "workload", "cluster-a")?
         .select_evidence_profile(Some(checkpoint))
         .await

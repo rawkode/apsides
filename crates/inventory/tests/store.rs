@@ -2,6 +2,8 @@
 use compiler_core::DeletionPolicy;
 use inventory::*;
 
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 fn scope() -> InventoryScope {
     InventoryScope {
         cluster: "cluster".into(),
@@ -31,32 +33,33 @@ fn snapshot(generation: &str, count: usize) -> InventorySnapshot {
 }
 
 #[tokio::test]
-async fn large_snapshot_survives_reopen_and_preserves_history() {
-    let dir = tempfile::tempdir().unwrap();
+async fn large_snapshot_survives_reopen_and_preserves_history() -> TestResult {
+    let dir = tempfile::tempdir()?;
     let path = dir.path().join("inventory.db");
     let first = snapshot("first", 12000);
-    assert!(first.encode(&scope()).unwrap().len() > 1024 * 1024);
+    assert!(first.encode(&scope())?.len() > 1024 * 1024);
     let stored = {
-        let store = LibsqlInventory::open_local(&path).await.unwrap();
-        store.publish(&scope(), None, &first).await.unwrap()
+        let store = LibsqlInventory::open_local(&path).await?;
+        store.publish(&scope(), None, &first).await?
     };
-    let store: Box<dyn InventoryStore> =
-        Box::new(LibsqlInventory::open_local(&path).await.unwrap());
-    assert_eq!(store.load(&scope()).await.unwrap().unwrap(), stored);
+    let store: Box<dyn InventoryStore> = Box::new(LibsqlInventory::open_local(&path).await?);
+    assert_eq!(
+        store
+            .load(&scope())
+            .await?
+            .ok_or("reopened store has no head")?,
+        stored
+    );
     let second = snapshot("second", 1);
     let next = store
         .publish(&scope(), Some(&stored.revision), &second)
-        .await
-        .unwrap();
+        .await?;
     assert_eq!(
-        store
-            .read_snapshot(&scope(), &stored.snapshot_id)
-            .await
-            .unwrap(),
+        store.read_snapshot(&scope(), &stored.snapshot_id).await?,
         Some(first.clone())
     );
     assert_eq!(first.removed_from(&second).len(), 11999);
-    assert_eq!(store.publish(&scope(), None, &second).await.unwrap(), next);
+    assert_eq!(store.publish(&scope(), None, &second).await?, next);
     assert!(matches!(
         store
             .publish(&scope(), Some(&stored.revision), &snapshot("third", 2))
@@ -65,15 +68,16 @@ async fn large_snapshot_survives_reopen_and_preserves_history() {
     ));
     let mut other = scope();
     other.controller = "other".into();
-    assert!(store.load(&other).await.unwrap().is_none());
+    assert!(store.load(&other).await?.is_none());
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn competing_publishers_cannot_overwrite_a_changed_head() {
-    let dir = tempfile::tempdir().unwrap();
+async fn competing_publishers_cannot_overwrite_a_changed_head() -> TestResult {
+    let dir = tempfile::tempdir()?;
     let path = dir.path().join("inventory.db");
-    let a = LibsqlInventory::open_local(&path).await.unwrap();
-    let b = LibsqlInventory::open_local(&path).await.unwrap();
+    let a = LibsqlInventory::open_local(&path).await?;
+    let b = LibsqlInventory::open_local(&path).await?;
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
     let other_barrier = barrier.clone();
     let left = tokio::spawn(async move {
@@ -84,33 +88,36 @@ async fn competing_publishers_cannot_overwrite_a_changed_head() {
         other_barrier.wait().await;
         b.publish(&scope(), None, &snapshot("second", 2)).await
     });
-    let (left, right) = (left.await.unwrap(), right.await.unwrap());
+    let (left, right) = (left.await?, right.await?);
     assert_ne!(left.is_ok(), right.is_ok());
     assert!(matches!(left, Err(Error::Conflict)) || matches!(right, Err(Error::Conflict)));
+    Ok(())
 }
 
 #[tokio::test]
-async fn corruption_rejects_reads_and_idempotent_publication() {
-    let dir = tempfile::tempdir().unwrap();
+async fn corruption_rejects_reads_and_idempotent_publication() -> TestResult {
+    let dir = tempfile::tempdir()?;
     let path = dir.path().join("inventory.db");
-    let store = LibsqlInventory::open_local(&path).await.unwrap();
+    let store = LibsqlInventory::open_local(&path).await?;
     let first = snapshot("first", 1);
-    store.publish(&scope(), None, &first).await.unwrap();
-    let db = libsql::Builder::new_local(&path).build().await.unwrap();
-    db.connect()
-        .unwrap()
-        .execute("UPDATE apsides_inventory_snapshots SET metadata=x'7b7d'", ())
-        .await
-        .unwrap();
+    store.publish(&scope(), None, &first).await?;
+    let db = libsql::Builder::new_local(&path).build().await?;
+    db.connect()?
+        .execute(
+            "UPDATE apsides_inventory_snapshots SET metadata=x'7b7d'",
+            (),
+        )
+        .await?;
     assert!(matches!(store.load(&scope()).await, Err(Error::Invalid(_))));
     assert!(matches!(
         store.publish(&scope(), None, &first).await,
         Err(Error::Invalid(_))
     ));
+    Ok(())
 }
 
 #[test]
-fn projection_excludes_private_values_and_rejects_unknown_fields() {
+fn projection_excludes_private_values_and_rejects_unknown_fields() -> TestResult {
     let resource = compiler_core::Resource {
         api_resource: None,
         force: false,
@@ -130,32 +137,37 @@ fn projection_excludes_private_values_and_rejects_unknown_fields() {
         },
     };
     let tracked = TrackedResource::from_resource(&resource, "secrets".into(), Some("uid".into()));
-    let serialized = serde_json::to_string(&tracked).unwrap();
+    let serialized = serde_json::to_string(&tracked)?;
     assert!(!serialized.contains("canary"));
-    let mut value = serde_json::to_value(tracked).unwrap();
+    let mut value = serde_json::to_value(tracked)?;
     value["data"] = serde_json::json!({"password":"canary"});
     assert!(serde_json::from_value::<TrackedResource>(value).is_err());
     let mut invalid = snapshot("first", 2);
     invalid.resources[1] = invalid.resources[0].clone();
     assert!(invalid.encode(&scope()).is_err());
+    Ok(())
 }
 
 #[tokio::test]
-async fn unsupported_schema_is_not_migrated_or_partially_initialized() {
-    let dir = tempfile::tempdir().unwrap();
+async fn unsupported_schema_is_not_migrated_or_partially_initialized() -> TestResult {
+    let dir = tempfile::tempdir()?;
     let path = dir.path().join("inventory.db");
-    let db = libsql::Builder::new_local(&path).build().await.unwrap();
-    let connection = db.connect().unwrap();
-    connection.execute_batch("CREATE TABLE apsides_inventory_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO apsides_inventory_schema VALUES (1,99);").await.unwrap();
+    let db = libsql::Builder::new_local(&path).build().await?;
+    let connection = db.connect()?;
+    connection.execute_batch("CREATE TABLE apsides_inventory_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO apsides_inventory_schema VALUES (1,99);").await?;
     assert!(matches!(
         LibsqlInventory::open_local(&path).await,
         Err(Error::Invalid(_))
     ));
-    let mut rows = connection.query("SELECT count(*) FROM sqlite_master WHERE name IN ('apsides_inventory_heads','apsides_inventory_snapshots')", ()).await.unwrap();
+    let mut rows = connection.query("SELECT count(*) FROM sqlite_master WHERE name IN ('apsides_inventory_heads','apsides_inventory_snapshots')", ()).await?;
     assert_eq!(
-        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        rows.next()
+            .await?
+            .ok_or("count query returned no row")?
+            .get::<i64>(0)?,
         0
     );
+    Ok(())
 }
 
 #[test]

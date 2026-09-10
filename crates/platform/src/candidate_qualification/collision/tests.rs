@@ -8,7 +8,7 @@ use coordination::{ClaimScope, ClaimSnapshotV1, ReviewRef, ReviewScope};
 use serde_json::json;
 use std::collections::BTreeMap;
 
-type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const REGISTRY_UID: &str = "11111111-1111-4111-8111-111111111111";
 const OWNER_RELEASE: &str =
@@ -183,7 +183,7 @@ fn fixture() -> TestResult<(
     let plan = deploy::plan_transition(&owner_request)?;
     let record = deploy::begin(&plan, "collision-owner")?;
     let inputs = TransitionInputs::freeze(&plan, empty.reference()?, &owner_policy)?;
-    let allocation = plan.generation_reservation.clone();
+    let allocation = plan.generation_reservation;
     let stored = StoredTransition::reserved(
         inputs,
         record,
@@ -405,7 +405,7 @@ fn rejects_claim_stage_and_contender_request_drift() -> TestResult {
         CONTENDER_RELEASE,
     )));
 
-    let mut changed_request = request.clone();
+    let mut changed_request = request;
     changed_request.registry.next_sequence = 3;
     assert!(rejected(validate_compiled_collision_state(
         &current,
@@ -508,7 +508,7 @@ fn rejects_extra_missing_or_wrong_owner_claims() -> TestResult {
         &missing, &request, &owner, &contender,
     )));
 
-    let mut wrong = current.clone();
+    let mut wrong = current;
     let claim = wrong
         .value
         .claims
@@ -578,7 +578,7 @@ fn rejects_extra_missing_or_wrong_history_and_transition() -> TestResult {
         &contender,
     )));
 
-    let mut missing_transition = current.clone();
+    let mut missing_transition = current;
     missing_transition.value.transitions.clear();
     assert!(rejected(validate_fixture(
         &missing_transition,

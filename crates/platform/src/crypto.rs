@@ -29,14 +29,16 @@ pub fn install_rustls_ring_provider() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
     use super::install_rustls_ring_provider;
     use kube::{Client, Config};
 
     #[tokio::test]
-    async fn explicit_provider_constructs_a_kubernetes_tls_client() {
-        install_rustls_ring_provider().unwrap();
-        install_rustls_ring_provider().unwrap();
-        let config = Config::new("https://127.0.0.1:6443".parse().unwrap());
-        Client::try_from(config).unwrap();
+    async fn explicit_provider_constructs_a_kubernetes_tls_client() -> TestResult {
+        install_rustls_ring_provider()?;
+        install_rustls_ring_provider()?;
+        let config = Config::new("https://127.0.0.1:6443".parse()?);
+        Client::try_from(config)?;
+        Ok(())
     }
 }

@@ -312,7 +312,10 @@ fn production_kube_config(config: &ProductionConfig) -> Result<Config, RuntimeEr
                     "proxy generation identifier is not a DNS label".into(),
                 ));
             }
-            let server_name = format!("apsides-proxy-{generation}.{}.svc", config.control_namespace);
+            let server_name = format!(
+                "apsides-proxy-{generation}.{}.svc",
+                config.control_namespace
+            );
             let uri = format!("https://{server_name}:8443")
                 .parse()
                 .map_err(|_| RuntimeError::Configuration("invalid fixed proxy API URL".into()))?;
@@ -662,15 +665,14 @@ impl ProductionController {
             .iter()
             .filter(|resource| resource.kind != "ConfigMap")
         {
-            let reactions = self
+            let reacts = self
                 .plan
                 .ir
                 .reactions
                 .iter()
-                .filter(|reaction| reaction.target == resource.id)
-                .collect::<Vec<_>>();
+                .any(|reaction| reaction.target == resource.id);
             let mut desired = resource.desired.clone();
-            if !reactions.is_empty() {
+            if reacts {
                 let snapshots = snapshots(&self.plan, &current, &applied);
                 match evaluate_rollout(&self.plan, &resource.id, &snapshots, key)
                     .map_err(|error| RuntimeError::Plan(error.to_string()))?
@@ -1366,6 +1368,7 @@ async fn diagnostics_response<B>(
 
 #[cfg(test)]
 mod tests {
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
     use super::*;
     use compiler_core::{CompiledPlan, PermissionCeiling, digest, parse_and_validate};
     use deploy::{ClaimState, ProtectedClaim};
@@ -1378,8 +1381,8 @@ mod tests {
     use tower::service_fn;
 
     #[test]
-    fn write_diagnostics_preserve_status_categories_without_api_values() {
-        let plan = plan();
+    fn write_diagnostics_preserve_status_categories_without_api_values() -> TestResult {
+        let plan = plan()?;
         let resource = &plan.ir.resources[0];
         for (code, expected) in [
             (409, "field-or-version-conflict"),
@@ -1397,17 +1400,18 @@ mod tests {
             assert_eq!(condition_for(resource, &error).reason_code, expected);
             assert!(!error.to_string().contains("secret-canary-value"));
         }
+        Ok(())
     }
 
     type Calls = Arc<StdMutex<Vec<(Method, String, Value)>>>;
 
-    fn plan() -> CompiledPlan {
-        parse_and_validate(&json!({
+    fn plan() -> TestResult<CompiledPlan> {
+        Ok(parse_and_validate(&json!({
             "schemaVersion":"apsides.dev/ir/v1", "testOnly":false,
             "domain":{"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound","budgets":{"maxResources":8,"maxInputs":8,"maxReactions":8,"maxObjectBytes":262_144,"maxQueueDepth":8,"maxConcurrentRequests":2}},
             "resources":[{"id":"config","apiVersion":"v1","kind":"ConfigMap","name":"config","namespace":"workload","desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"config","namespace":"workload"},"data":{"value":"approved"}},"lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"program.ts","line":1,"column":1}}],
             "inputs":[],"reactions":[],"provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
-        }).to_string()).unwrap()
+        }).to_string())?)
     }
 
     fn policy(plan: &CompiledPlan) -> PolicyState {
@@ -1430,8 +1434,12 @@ mod tests {
         }
     }
 
-    fn activation(plan: &CompiledPlan, policy: &PolicyState, uid: Option<&str>) -> ActivationState {
-        ActivationState {
+    fn activation(
+        plan: &CompiledPlan,
+        policy: &PolicyState,
+        uid: Option<&str>,
+    ) -> TestResult<ActivationState> {
+        Ok(ActivationState {
             schema_version: SCHEMA_VERSION.into(),
             binding: RuntimeBinding {
                 domain_id: "example".into(),
@@ -1439,8 +1447,8 @@ mod tests {
                 generation_id: "generation-a".into(),
                 build_digest: format!("sha256:{}", "a".repeat(64)),
                 ir_digest: plan.ir_digest.clone(),
-                policy_digest: digest(policy).unwrap(),
-                capability_digest: digest(&plan.capabilities).unwrap(),
+                policy_digest: digest(policy)?,
+                capability_digest: digest(&plan.capabilities)?,
                 service_account_name: "apsides-example-generation-a".into(),
                 controller_image: format!("example.invalid/controller@sha256:{}", "b".repeat(64)),
             },
@@ -1463,11 +1471,18 @@ mod tests {
                 allow_create: true,
             }],
             rollout_key_id: None,
-        }
+        })
     }
 
-    fn control_object(name: &str, state: &impl Serialize, uid: &str, rv: &str) -> Value {
-        json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":"control","uid":uid,"resourceVersion":rv},"data":{"state.json":serde_json::to_string(state).unwrap()}})
+    fn control_object(
+        name: &str,
+        state: &impl Serialize,
+        uid: &str,
+        rv: &str,
+    ) -> TestResult<Value> {
+        Ok(
+            json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":"control","uid":uid,"resourceVersion":rv},"data":{"state.json":serde_json::to_string(state)?}}),
+        )
     }
 
     fn target_object(value: &str, uid: &str, rv: &str) -> Value {
@@ -1483,16 +1498,16 @@ mod tests {
         activation_uid: &str,
         activation_rv: &str,
         observations: Vec<RuntimeObservation>,
-    ) -> RuntimeInventory {
-        RuntimeInventory {
+    ) -> TestResult<RuntimeInventory> {
+        Ok(RuntimeInventory {
             schema_version: SCHEMA_VERSION.into(),
-            binding: activation(&plan(), &policy(&plan()), None).binding,
+            binding: activation(&plan()?, &policy(&plan()?), None)?.binding,
             activation_uid: activation_uid.into(),
             activation_resource_version: activation_rv.into(),
             observations,
             conditions: vec![],
             drained: false,
-        }
+        })
     }
 
     fn versioned_inventory(value: RuntimeInventory, rv: &str) -> Versioned<RuntimeInventory> {
@@ -1515,6 +1530,49 @@ mod tests {
         }
     }
 
+    /// A fixture problem inside the mock transport, which itself cannot fail.
+    type FixtureError = Box<dyn std::error::Error + Send + Sync>;
+
+    /// The transport signature is infallible, so a fixture problem becomes a
+    /// 500 naming it, which the assertions then report.
+    fn fixture_failure(error: &FixtureError) -> Response<Body> {
+        Response::builder()
+            .status(500)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "fixtureError": error.to_string() })
+                    .to_string()
+                    .into_bytes(),
+            ))
+            .unwrap_or_else(|_| Response::new(Body::from(Vec::new())))
+    }
+
+    async fn wire_response(
+        request: Request<Body>,
+        responses: &StdMutex<VecDeque<Value>>,
+        calls: &Calls,
+    ) -> std::result::Result<Response<Body>, FixtureError> {
+        let (parts, body) = request.into_parts();
+        let bytes = body.collect().await?.to_bytes();
+        let value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes)?
+        };
+        calls
+            .lock()
+            .map_err(|_| "wire call log is poisoned")?
+            .push((parts.method, parts.uri.to_string(), value));
+        let response = responses
+            .lock()
+            .map_err(|_| "queued responses are poisoned")?
+            .pop_front()
+            .ok_or("fixture ran out of queued responses")?;
+        Ok(Response::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&response)?))?)
+    }
+
     fn wire(responses: Vec<Value>) -> (Client, Calls) {
         let responses = Arc::new(StdMutex::new(VecDeque::from(responses)));
         let calls: Calls = Arc::default();
@@ -1524,28 +1582,10 @@ mod tests {
                 let responses = responses.clone();
                 let calls = calls.clone();
                 async move {
-                    let (parts, body) = request.into_parts();
-                    let bytes = body.collect().await.unwrap().to_bytes();
-                    let value = if bytes.is_empty() {
-                        Value::Null
-                    } else {
-                        serde_json::from_slice(&bytes).unwrap()
-                    };
-                    calls
-                        .lock()
-                        .unwrap()
-                        .push((parts.method, parts.uri.to_string(), value));
-                    let response = responses
-                        .lock()
-                        .unwrap()
-                        .pop_front()
-                        .expect("unexpected request");
-                    Ok::<_, Infallible>(
-                        Response::builder()
-                            .header("content-type", "application/json")
-                            .body(Body::from(serde_json::to_vec(&response).unwrap()))
-                            .unwrap(),
-                    )
+                    Ok::<_, Infallible>(match wire_response(request, &responses, &calls).await {
+                        Ok(response) => response,
+                        Err(error) => fixture_failure(&error),
+                    })
                 }
             }
         });
@@ -1556,7 +1596,7 @@ mod tests {
         plan: &CompiledPlan,
         activation: &ActivationState,
         client: Client,
-    ) -> ProductionController {
+    ) -> TestResult<ProductionController> {
         let config = ProductionConfig {
             api_access: ApiAccess::InCluster,
             control_namespace: "control".into(),
@@ -1565,19 +1605,22 @@ mod tests {
             base_backoff_millis: 100,
             max_backoff_millis: 1_000,
             min_mutation_interval_millis: 10,
-            diagnostics_bind: "127.0.0.1:0".parse().unwrap(),
+            diagnostics_bind: "127.0.0.1:0".parse()?,
         };
-        ProductionController {
+        Ok(ProductionController {
             plan: plan.clone(),
-            authority: RuntimeAuthority::new(client.clone(), "control", activation.binding.clone())
-                .unwrap(),
+            authority: RuntimeAuthority::new(
+                client.clone(),
+                "control",
+                activation.binding.clone(),
+            )?,
             kube: KubeRuntimeClient::from_client(client, 2, "example"),
             diagnostics: Arc::new(Diagnostics::new(&activation.binding)),
             terminating: Arc::new(AtomicBool::new(false)),
             last_mutation: Mutex::new(None),
             last_successful_apply: Mutex::new(BTreeMap::new()),
             config,
-        }
+        })
     }
 
     #[test]
@@ -1596,13 +1639,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_access_uses_only_fixed_mtls_identity() {
-        let plan = plan();
+    async fn proxy_access_uses_only_fixed_mtls_identity() -> TestResult {
+        let plan = plan()?;
         let policy = policy(&plan);
-        let activation = activation(&plan, &policy, None);
-        let mut controller = controller(&plan, &activation, wire(vec![]).0);
+        let activation = activation(&plan, &policy, None)?;
+        let mut controller = controller(&plan, &activation, wire(vec![]).0)?;
         controller.config.api_access = ApiAccess::Proxy;
-        let config = production_kube_config(&controller.config).unwrap();
+        let config = production_kube_config(&controller.config)?;
         assert_eq!(
             config.cluster_url.to_string(),
             "https://apsides-proxy-generation-a.control.svc:8443/"
@@ -1615,10 +1658,11 @@ mod tests {
         assert_eq!(config.auth_info.client_key.as_deref(), Some(PROXY_KEY_PATH));
         assert!(config.auth_info.token.is_none());
         assert!(config.auth_info.token_file.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn diagnostics_never_include_input_values_or_key_material() {
+    async fn diagnostics_never_include_input_values_or_key_material() -> TestResult {
         let diagnostics = Arc::new(Diagnostics::new(&RuntimeBinding {
             domain_id: "domain".into(),
             cluster_binding: "cluster".into(),
@@ -1662,20 +1706,21 @@ mod tests {
                 Some("input-unavailable"),
             )
             .await;
-        let request = Request::builder().uri("/status").body(()).unwrap();
-        let response = diagnostics_response(request, diagnostics).await.unwrap();
+        let request = Request::builder().uri("/status").body(())?;
+        let response = diagnostics_response(request, diagnostics).await?;
         assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let body = std::str::from_utf8(&body).unwrap();
+        let body = response.into_body().collect().await?.to_bytes();
+        let body = std::str::from_utf8(&body)?;
         assert!(!body.contains("secret-value"));
         assert!(!body.contains("rollout-key"));
-        let body: Value = serde_json::from_str(body).unwrap();
+        let body: Value = serde_json::from_str(body)?;
         assert_eq!(body["applyCacheEntries"], 2);
         assert_eq!(body["applyCacheSerializedBytes"], 123);
         assert_eq!(body["pendingCoalescedTriggers"], 0);
         assert_eq!(body["triggerToCycleMicrosCount"], 1);
         assert_eq!(body["triggerToCycleMicrosSum"], 7);
         assert_eq!(body["triggerToCycleMicrosMax"], 7);
+        Ok(())
     }
 
     async fn diagnostic_json(
@@ -1692,10 +1737,10 @@ mod tests {
     #[tokio::test]
     async fn completed_cycle_conditions_remain_visible_during_backoff()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let plan = plan();
+        let plan = plan()?;
         let policy = policy(&plan);
-        let activation = activation(&plan, &policy, None);
-        let runtime = controller(&plan, &activation, wire(vec![]).0);
+        let activation = activation(&plan, &policy, None)?;
+        let runtime = controller(&plan, &activation, wire(vec![]).0)?;
         let mut last_reason = None;
         let mut attempt = 0;
         for (index, reason) in ["input-missing", "field-or-version-conflict"]
@@ -1769,10 +1814,10 @@ mod tests {
     #[tokio::test]
     async fn operational_retry_replaces_stale_completed_cycle_diagnostics()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let plan = plan();
+        let plan = plan()?;
         let policy = policy(&plan);
-        let activation = activation(&plan, &policy, None);
-        let runtime = controller(&plan, &activation, wire(vec![]).0);
+        let activation = activation(&plan, &policy, None)?;
+        let runtime = controller(&plan, &activation, wire(vec![]).0)?;
         runtime
             .record_cycle(
                 &[RuntimeCondition {
@@ -1813,10 +1858,10 @@ mod tests {
     #[tokio::test]
     async fn diagnostic_conditions_are_bounded_and_exclude_api_values()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let plan = plan();
+        let plan = plan()?;
         let policy = policy(&plan);
-        let activation = activation(&plan, &policy, None);
-        let runtime = controller(&plan, &activation, wire(vec![]).0);
+        let activation = activation(&plan, &policy, None)?;
+        let runtime = controller(&plan, &activation, wire(vec![]).0)?;
         let resource = plan.ir.resources.first().ok_or("test resource missing")?;
         let api_error = kube::Error::Api(
             kube::core::Status::failure("private-api-value", "private-api-value")
@@ -1861,21 +1906,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claimed_absent_create_reverifies_activation_after_dry_run() {
-        let plan = plan();
+    async fn claimed_absent_create_reverifies_activation_after_dry_run() -> TestResult {
+        let plan = plan()?;
         let policy = policy(&plan);
-        let activation = activation(&plan, &policy, None);
-        let previous_value = inventory("activation-uid", "19", vec![]);
+        let activation = activation(&plan, &policy, None)?;
+        let previous_value = inventory("activation-uid", "19", vec![])?;
         let mut previous = versioned_inventory(previous_value.clone(), "18");
-        let next_value = inventory("activation-uid", "20", vec![target_observation()]);
+        let next_value = inventory("activation-uid", "20", vec![target_observation()])?;
         let responses = vec![
             control_object(
                 "apsides-activation-example",
                 &activation,
                 "activation-uid",
                 "20",
-            ),
-            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
+            )?,
+            control_object("apsides-policy-example", &policy, "policy-uid", "19")?,
             target_list(&[], "30"),
             target_object("approved", "target-uid", "31"),
             control_object(
@@ -1883,40 +1928,39 @@ mod tests {
                 &activation,
                 "activation-uid",
                 "20",
-            ),
-            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
+            )?,
+            control_object("apsides-policy-example", &policy, "policy-uid", "19")?,
             target_object("approved", "target-uid", "32"),
             control_object(
                 "apsides-activation-example",
                 &activation,
                 "activation-uid",
                 "20",
-            ),
+            )?,
             control_object(
                 "apsides-inventory-example",
                 &previous_value,
                 "inventory-uid",
                 "18",
-            ),
+            )?,
             control_object(
                 "apsides-inventory-example",
                 &next_value,
                 "inventory-uid",
                 "21",
-            ),
+            )?,
         ];
         let (client, calls) = wire(responses);
-        let controller = controller(&plan, &activation, client);
+        let controller = controller(&plan, &activation, client)?;
         let observed = controller
             .apply(
                 &plan.ir.resources[0],
                 &plan.ir.resources[0].desired,
                 &mut previous,
             )
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(observed.uid, "target-uid");
-        let calls = calls.lock().unwrap();
+        let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
         assert_eq!(calls.len(), 10);
         assert_eq!(calls[0].0, Method::GET);
         assert_eq!(calls[1].0, Method::GET);
@@ -1952,25 +1996,26 @@ mod tests {
         );
         assert_eq!(calls[9].0, Method::PUT, "created UID is durably recorded");
         assert_eq!(previous.value.observations[0].uid, "target-uid");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn uidless_claim_never_adopts_a_preexisting_object() {
-        let plan = plan();
+    async fn uidless_claim_never_adopts_a_preexisting_object() -> TestResult {
+        let plan = plan()?;
         let policy = policy(&plan);
-        let activation = activation(&plan, &policy, None);
+        let activation = activation(&plan, &policy, None)?;
         let (client, calls) = wire(vec![
             control_object(
                 "apsides-activation-example",
                 &activation,
                 "activation-uid",
                 "20",
-            ),
-            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
+            )?,
+            control_object("apsides-policy-example", &policy, "policy-uid", "19")?,
             target_list(&[target_object("foreign", "foreign-uid", "30")], "30"),
         ]);
-        let controller = controller(&plan, &activation, client);
-        let mut previous = versioned_inventory(inventory("activation-uid", "20", vec![]), "18");
+        let controller = controller(&plan, &activation, client)?;
+        let mut previous = versioned_inventory(inventory("activation-uid", "20", vec![])?, "18");
         let error = controller
             .apply(
                 &plan.ir.resources[0],
@@ -1978,20 +2023,22 @@ mod tests {
                 &mut previous,
             )
             .await
-            .unwrap_err();
+            .err()
+            .ok_or("expected this call to fail")?;
         assert!(error.to_string().contains("claim-forbids-existing"));
-        let calls = calls.lock().unwrap();
+        let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
         assert_eq!(calls.len(), 3);
         assert!(calls.iter().all(|call| call.0 != Method::PATCH));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn uidless_claim_resumes_only_from_bound_inventory_uid() {
-        let plan = plan();
+    async fn uidless_claim_resumes_only_from_bound_inventory_uid() -> TestResult {
+        let plan = plan()?;
         let policy = policy(&plan);
-        let activation = activation(&plan, &policy, None);
+        let activation = activation(&plan, &policy, None)?;
         let mut previous = versioned_inventory(
-            inventory("activation-uid", "20", vec![target_observation()]),
+            inventory("activation-uid", "20", vec![target_observation()])?,
             "18",
         );
         let existing = target_object("approved", "target-uid", "30");
@@ -2001,33 +2048,33 @@ mod tests {
                 &activation,
                 "activation-uid",
                 "20",
-            ),
-            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
+            )?,
+            control_object("apsides-policy-example", &policy, "policy-uid", "19")?,
             target_list(std::slice::from_ref(&existing), "30"),
             existing,
         ]);
-        let controller = controller(&plan, &activation, client);
+        let controller = controller(&plan, &activation, client)?;
         let observed = controller
             .apply(
                 &plan.ir.resources[0],
                 &plan.ir.resources[0].desired,
                 &mut previous,
             )
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(observed.uid, "target-uid");
-        let calls = calls.lock().unwrap();
+        let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
         assert_eq!(calls.len(), 4);
         assert!(calls[3].1.contains("dryRun=All"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn successful_apply_cache_skips_only_same_version_and_desired_state() {
-        let plan = plan();
+    async fn successful_apply_cache_skips_only_same_version_and_desired_state() -> TestResult {
+        let plan = plan()?;
         let policy = policy(&plan);
-        let activation = activation(&plan, &policy, None);
+        let activation = activation(&plan, &policy, None)?;
         let mut previous = versioned_inventory(
-            inventory("activation-uid", "20", vec![target_observation()]),
+            inventory("activation-uid", "20", vec![target_observation()])?,
             "18",
         );
         let existing = target_object("approved", "target-uid", "30");
@@ -2037,8 +2084,8 @@ mod tests {
                 &activation,
                 "activation-uid",
                 "20",
-            ),
-            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
+            )?,
+            control_object("apsides-policy-example", &policy, "policy-uid", "19")?,
             target_list(std::slice::from_ref(&existing), "30"),
             existing.clone(),
             control_object(
@@ -2046,11 +2093,11 @@ mod tests {
                 &activation,
                 "activation-uid",
                 "20",
-            ),
-            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
+            )?,
+            control_object("apsides-policy-example", &policy, "policy-uid", "19")?,
             target_list(std::slice::from_ref(&existing), "30"),
         ]);
-        let controller = controller(&plan, &activation, client);
+        let controller = controller(&plan, &activation, client)?;
         for _ in 0..2 {
             controller
                 .apply(
@@ -2058,10 +2105,9 @@ mod tests {
                     &plan.ir.resources[0].desired,
                     &mut previous,
                 )
-                .await
-                .unwrap();
+                .await?;
         }
-        let calls = calls.lock().unwrap();
+        let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
         assert_eq!(calls.len(), 7);
         assert_eq!(
             calls
@@ -2070,15 +2116,16 @@ mod tests {
                 .count(),
             1
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn successful_apply_cache_invalidates_on_live_version_change() {
-        let plan = plan();
+    async fn successful_apply_cache_invalidates_on_live_version_change() -> TestResult {
+        let plan = plan()?;
         let policy = policy(&plan);
-        let activation = activation(&plan, &policy, None);
+        let activation = activation(&plan, &policy, None)?;
         let mut previous = versioned_inventory(
-            inventory("activation-uid", "20", vec![target_observation()]),
+            inventory("activation-uid", "20", vec![target_observation()])?,
             "18",
         );
         let existing = target_object("approved", "target-uid", "30");
@@ -2089,8 +2136,8 @@ mod tests {
                 &activation,
                 "activation-uid",
                 "20",
-            ),
-            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
+            )?,
+            control_object("apsides-policy-example", &policy, "policy-uid", "19")?,
             target_list(std::slice::from_ref(&existing), "30"),
             existing,
             control_object(
@@ -2098,12 +2145,12 @@ mod tests {
                 &activation,
                 "activation-uid",
                 "20",
-            ),
-            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
+            )?,
+            control_object("apsides-policy-example", &policy, "policy-uid", "19")?,
             target_list(std::slice::from_ref(&drifted), "31"),
             drifted,
         ]);
-        let controller = controller(&plan, &activation, client);
+        let controller = controller(&plan, &activation, client)?;
         for _ in 0..2 {
             controller
                 .apply(
@@ -2111,10 +2158,9 @@ mod tests {
                     &plan.ir.resources[0].desired,
                     &mut previous,
                 )
-                .await
-                .unwrap();
+                .await?;
         }
-        let calls = calls.lock().unwrap();
+        let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
         assert_eq!(calls.len(), 8);
         assert_eq!(
             calls
@@ -2123,22 +2169,23 @@ mod tests {
                 .count(),
             2
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn failed_created_uid_persistence_never_falls_back_to_manager_metadata() {
-        let plan = plan();
+    async fn failed_created_uid_persistence_never_falls_back_to_manager_metadata() -> TestResult {
+        let plan = plan()?;
         let policy = policy(&plan);
-        let activation = activation(&plan, &policy, None);
-        let mut previous = versioned_inventory(inventory("activation-uid", "20", vec![]), "18");
+        let activation = activation(&plan, &policy, None)?;
+        let mut previous = versioned_inventory(inventory("activation-uid", "20", vec![])?, "18");
         let (client, _) = wire(vec![
             control_object(
                 "apsides-activation-example",
                 &activation,
                 "activation-uid",
                 "20",
-            ),
-            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
+            )?,
+            control_object("apsides-policy-example", &policy, "policy-uid", "19")?,
             target_list(&[], "30"),
             target_object("approved", "target-uid", "31"),
             control_object(
@@ -2146,17 +2193,17 @@ mod tests {
                 &activation,
                 "activation-uid",
                 "20",
-            ),
-            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
+            )?,
+            control_object("apsides-policy-example", &policy, "policy-uid", "19")?,
             target_object("approved", "target-uid", "32"),
             control_object(
                 "apsides-activation-example",
                 &activation,
                 "activation-uid",
                 "21",
-            ),
+            )?,
         ]);
-        let runtime = controller(&plan, &activation, client);
+        let runtime = controller(&plan, &activation, client)?;
         let error = runtime
             .apply(
                 &plan.ir.resources[0],
@@ -2164,7 +2211,8 @@ mod tests {
                 &mut previous,
             )
             .await
-            .unwrap_err();
+            .err()
+            .ok_or("expected this call to fail")?;
         assert!(error.to_string().contains("active inventory publication"));
         assert!(previous.value.observations.is_empty());
 
@@ -2175,11 +2223,11 @@ mod tests {
                 &activation,
                 "activation-uid",
                 "20",
-            ),
-            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
+            )?,
+            control_object("apsides-policy-example", &policy, "policy-uid", "19")?,
             target_list(&[existing], "32"),
         ]);
-        let runtime = controller(&plan, &activation, client);
+        let runtime = controller(&plan, &activation, client)?;
         let error = runtime
             .apply(
                 &plan.ir.resources[0],
@@ -2187,8 +2235,13 @@ mod tests {
                 &mut previous,
             )
             .await
-            .unwrap_err();
+            .err()
+            .ok_or("expected this call to fail")?;
         assert!(error.to_string().contains("claim-forbids-existing"));
-        assert_eq!(calls.lock().unwrap().len(), 3);
+        assert_eq!(
+            calls.lock().map_err(|_| "calls mutex is poisoned")?.len(),
+            3
+        );
+        Ok(())
     }
 }

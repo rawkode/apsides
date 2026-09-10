@@ -1,14 +1,3 @@
-#![cfg_attr(
-    not(test),
-    deny(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unreachable,
-        clippy::todo,
-        clippy::unimplemented
-    )
-)]
 #![forbid(unsafe_code)]
 //! Pure provider-neutral deployment planning. Kubernetes execution and evidence
 //! verification are deliberately outside this model's authority.

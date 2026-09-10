@@ -3,7 +3,8 @@ use serde_json::json;
 use std::{fs, process::Command};
 
 #[test]
-fn audit_does_not_create_a_missing_database() -> Result<(), Box<dyn std::error::Error>> {
+fn audit_does_not_create_a_missing_database() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     let directory = tempfile::tempdir()?;
     let kubeconfig = directory.path().join("kubeconfig.json");
     let database = directory.path().join("missing.db");

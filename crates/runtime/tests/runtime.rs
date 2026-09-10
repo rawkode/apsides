@@ -5,6 +5,8 @@ use compiler_core::parse_and_validate;
 use runtime::{FixtureConfig, Observation, RunReport, RuntimeClient, RuntimeError, reconcile_once};
 use serde_json::Value;
 
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 const IR: &str = r#"{
   "schemaVersion":"apsides.dev/ir/v1",
   "domain":{"id":"example","namespace":"workload","controlNamespace":"apsides-system","clusterBinding":"fixture","policyRef":"platform/example","enforcement":"api-bound","budgets":{"maxResources":8,"maxInputs":8,"maxReactions":8,"maxObjectBytes":262144,"maxQueueDepth":8,"maxConcurrentRequests":2}},
@@ -31,7 +33,7 @@ impl RuntimeClient for FakeClient {
     ) -> Result<(), RuntimeError> {
         self.writes
             .lock()
-            .unwrap()
+            .map_err(|_| RuntimeError::Kubernetes("writes mutex is poisoned".into()))?
             .push((resource.id.clone(), desired.clone()));
         Ok(())
     }
@@ -39,7 +41,7 @@ impl RuntimeClient for FakeClient {
         Ok(self
             .observation
             .lock()
-            .unwrap()
+            .map_err(|_| RuntimeError::Kubernetes("observation mutex is poisoned".into()))?
             .clone()
             .unwrap_or(Observation::Missing))
     }
@@ -53,18 +55,25 @@ impl RuntimeClient for FakeClient {
 }
 
 #[tokio::test]
-async fn missing_input_blocks_the_dependent_target_without_a_write() {
-    let plan = parse_and_validate(IR).unwrap();
+async fn missing_input_blocks_the_dependent_target_without_a_write() -> TestResult {
+    let plan = parse_and_validate(IR)?;
     let client = FakeClient::default();
-    let report = reconcile_once(&plan, None, &client).await.unwrap();
+    let report = reconcile_once(&plan, None, &client).await?;
     assert_eq!(report.applied, Vec::<String>::new());
     assert_eq!(report.blocked[0].target, "deployment");
-    assert!(client.writes.lock().unwrap().is_empty());
+    assert!(
+        client
+            .writes
+            .lock()
+            .map_err(|_| RuntimeError::Kubernetes("writes mutex is poisoned".into()))?
+            .is_empty()
+    );
+    Ok(())
 }
 
 #[tokio::test]
-async fn available_input_produces_a_stable_revision_and_ssa_write() {
-    let plan = parse_and_validate(IR).unwrap();
+async fn available_input_produces_a_stable_revision_and_ssa_write() -> TestResult {
+    let plan = parse_and_validate(IR)?;
     let client = FakeClient {
         observation: Mutex::new(Some(Observation::Available {
             data: BTreeMap::from([("message".into(), "vanilla".into())]),
@@ -72,8 +81,8 @@ async fn available_input_produces_a_stable_revision_and_ssa_write() {
         })),
         ..Default::default()
     };
-    let first = reconcile_once(&plan, None, &client).await.unwrap();
-    let second = reconcile_once(&plan, None, &client).await.unwrap();
+    let first = reconcile_once(&plan, None, &client).await?;
+    let second = reconcile_once(&plan, None, &client).await?;
     assert_eq!(
         first,
         RunReport {
@@ -82,7 +91,10 @@ async fn available_input_produces_a_stable_revision_and_ssa_write() {
         }
     );
     assert_eq!(second, first);
-    let writes = client.writes.lock().unwrap();
+    let writes = client
+        .writes
+        .lock()
+        .map_err(|_| RuntimeError::Kubernetes("writes mutex is poisoned".into()))?;
     let a = writes[0]
         .1
         .pointer("/spec/template/metadata/annotations/apsides.dev~1revision");
@@ -90,7 +102,12 @@ async fn available_input_produces_a_stable_revision_and_ssa_write() {
         .1
         .pointer("/spec/template/metadata/annotations/apsides.dev~1revision");
     assert_eq!(a, b);
-    assert!(a.and_then(Value::as_str).unwrap().starts_with("sha256:"));
+    assert!(
+        a.and_then(Value::as_str)
+            .ok_or("write carries no revision annotation")?
+            .starts_with("sha256:")
+    );
+    Ok(())
 }
 
 #[test]

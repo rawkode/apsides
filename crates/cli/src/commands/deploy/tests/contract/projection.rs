@@ -255,7 +255,7 @@ fn projector_rejects_forged_compiler_catalogs() -> Result<()> {
 
 #[test]
 fn projector_links_the_canonical_adoption_approval_without_private_payloads() -> Result<()> {
-    let (_, plan) = super::super::review_adoption::adoption_fixture()?;
+    let (_, plan) = super::super::adoption::adoption_fixture()?;
     let metadata = platform::project_review_metadata(&plan)?;
     let adopted = metadata
         .resources

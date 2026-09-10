@@ -1,6 +1,8 @@
-//! Pure, bounded projection comparison. Callers must authenticate metadata and
-//! bind both objects to their observation/dry-run interval before using evidence.
-//! This module neither performs SSA nor establishes transport or ownership authority.
+//! Pure, bounded projection comparison.
+//!
+//! Callers must authenticate metadata and bind both objects to their
+//! observation/dry-run interval before using evidence. This module neither
+//! performs SSA nor establishes transport or ownership authority.
 use crate::{Result, invalid, preview_limits};
 use coordination::{REVIEW_ROLLOUT_FIELD, ReviewIdentity, ReviewMetadataV1, ReviewResource};
 use serde::Serialize;
@@ -261,7 +263,7 @@ fn change(before: Option<&Value>, after: Option<&Value>) -> ProjectionChange {
 #[derive(Default)]
 struct Ignore {
     whole: bool,
-    children: BTreeMap<String, Ignore>,
+    children: BTreeMap<String, Self>,
 }
 impl Ignore {
     fn insert(&mut self, path: &[String]) {

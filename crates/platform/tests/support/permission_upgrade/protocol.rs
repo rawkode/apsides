@@ -296,7 +296,7 @@ mod pull_secret_protocol_tests {
     use super::*;
 
     #[test]
-    fn image_pull_setting_preserves_empty_policy_and_reuses_validation() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn image_pull_setting_preserves_empty_policy_and_reuses_validation() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let base = json!({"action":"verify","purpose":{"kind":"permission-expansion"},"initialArtifact":"initial","successorArtifact":"successor","trustPolicy":"trust"});
         let empty: Settings = serde_json::from_value(base.clone())?;
         assert!(empty.image_pull_secrets.is_empty());

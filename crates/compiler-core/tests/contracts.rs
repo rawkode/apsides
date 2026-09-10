@@ -2,6 +2,8 @@ use compiler_core::*;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 fn source() -> Value {
     json!({"file":"controller.ts","line":1,"column":1})
 }
@@ -17,8 +19,8 @@ fn fixture() -> Value {
     })
 }
 
-fn plan(value: &Value) -> CompiledPlan {
-    parse_and_validate(&value.to_string()).expect("valid fixture")
+fn plan(value: &Value) -> TestResult<CompiledPlan> {
+    Ok(parse_and_validate(&value.to_string())?)
 }
 
 fn snapshots(id: &str, data: Value) -> BTreeMap<String, InputSnapshot> {
@@ -45,14 +47,15 @@ fn ceiling(plan: &CompiledPlan) -> PermissionCeiling {
 }
 
 #[test]
-fn canonical_digest_is_independently_known_and_key_order_independent() {
+fn canonical_digest_is_independently_known_and_key_order_independent() -> TestResult {
     assert_eq!(
-        digest(&json!({"b":2,"a":1})).unwrap(),
+        digest(&json!({"b":2,"a":1}))?,
         "sha256:43258cff783fe7036d8a43033f830adfc60ec037382473548ac742b888292777"
     );
     let original = fixture();
-    let pretty = serde_json::to_string_pretty(&original).unwrap();
-    assert_eq!(plan(&original), parse_and_validate(&pretty).unwrap());
+    let pretty = serde_json::to_string_pretty(&original)?;
+    assert_eq!(plan(&original)?, parse_and_validate(&pretty)?);
+    Ok(())
 }
 
 #[test]
@@ -75,7 +78,7 @@ fn strict_json_rejects_duplicate_keys_unknown_fields_and_ambiguous_numbers() {
 }
 
 #[test]
-fn unsupported_effects_and_scope_cannot_cross_ir_boundary() {
+fn unsupported_effects_and_scope_cannot_cross_ir_boundary() -> TestResult {
     let mut cases = Vec::new();
     let mut value = fixture();
     value["resources"][0]["desired"]["spec"]["template"]["spec"]["hostNetwork"] = json!(true);
@@ -113,16 +116,20 @@ fn unsupported_effects_and_scope_cannot_cross_ir_boundary() {
     cases.push(value);
     let mut value = fixture();
     let duplicate = value["resources"][0].clone();
-    value["resources"].as_array_mut().unwrap().push(duplicate);
+    value["resources"]
+        .as_array_mut()
+        .ok_or("fixture resources is not an array")?
+        .push(duplicate);
     cases.push(value);
     for value in cases {
         assert!(parse_and_validate(&value.to_string()).is_err());
     }
+    Ok(())
 }
 
 #[test]
-fn capabilities_follow_requests_and_do_not_sneak_in_cleanup() {
-    let plan = plan(&fixture());
+fn capabilities_follow_requests_and_do_not_sneak_in_cleanup() -> TestResult {
+    let plan = plan(&fixture())?;
     assert!(
         plan.capabilities.iter().all(|c| c.verb != "delete"
             && c.resource != "roles"
@@ -167,6 +174,7 @@ fn capabilities_follow_requests_and_do_not_sneak_in_cleanup() {
         plan.indirect_risks
             .contains(&"workload-service-account-authority".into())
     );
+    Ok(())
 }
 
 #[test]
@@ -235,10 +243,10 @@ fn custom_resource_mapping_drives_exact_capabilities_and_base_validation() -> Re
 }
 
 #[test]
-fn independent_ceiling_requires_scope_gaps_risks_and_unmodified_derivation() {
-    let plan = plan(&fixture());
+fn independent_ceiling_requires_scope_gaps_risks_and_unmodified_derivation() -> TestResult {
+    let plan = plan(&fixture())?;
     let policy = ceiling(&plan);
-    validate_ceiling(&plan, &policy).unwrap();
+    validate_ceiling(&plan, &policy)?;
     let mut missing = policy.clone();
     missing.capabilities.pop();
     assert!(validate_ceiling(&plan, &missing).is_err());
@@ -262,41 +270,36 @@ fn independent_ceiling_requires_scope_gaps_risks_and_unmodified_derivation() {
         .capabilities
         .iter_mut()
         .find(|c| c.verb == "create")
-        .unwrap();
+        .ok_or("derived ceiling has no create capability")?;
     create.names = vec!["api".into()];
     assert!(validate_ceiling(&plan, &named_create).is_err());
+    Ok(())
 }
 
 #[test]
-fn rollout_matches_independent_python_hash_vector_and_relevant_changes_only() {
-    let plan = plan(&fixture());
+fn rollout_matches_independent_python_hash_vector_and_relevant_changes_only() -> TestResult {
+    let plan = plan(&fixture())?;
     let input = snapshots("config", json!({"fixture":"synthetic-only"}));
     let expected = RolloutOutcome::Ready {
         revision: "sha256:39e1b1b65e421a21c491e03d5c6186c610756bd9cddde84815ab1a9440a3164e".into(),
     };
-    assert_eq!(
-        evaluate_rollout(&plan, "api", &input, None).unwrap(),
-        expected
-    );
-    assert_eq!(
-        evaluate_rollout(&plan, "api", &input, None).unwrap(),
-        expected
-    );
+    assert_eq!(evaluate_rollout(&plan, "api", &input, None)?, expected);
+    assert_eq!(evaluate_rollout(&plan, "api", &input, None)?, expected);
     assert_ne!(
         evaluate_rollout(
             &plan,
             "api",
             &snapshots("config", json!({"fixture":"changed"})),
             None
-        )
-        .unwrap(),
+        )?,
         expected
     );
+    Ok(())
 }
 
 #[test]
-fn every_input_failure_blocks_without_encoding_projection_contents() {
-    let plan = plan(&fixture());
+fn every_input_failure_blocks_without_encoding_projection_contents() -> TestResult {
+    let plan = plan(&fixture())?;
     for (snapshot, reason) in [
         (InputSnapshot::Missing, BlockReason::Missing),
         (InputSnapshot::Unauthorized, BlockReason::Unauthorized),
@@ -315,8 +318,7 @@ fn every_input_failure_blocks_without_encoding_projection_contents() {
             "api",
             &BTreeMap::from([("config".into(), snapshot)]),
             None,
-        )
-        .unwrap();
+        )?;
         assert_eq!(
             result,
             RolloutOutcome::Blocked {
@@ -324,12 +326,9 @@ fn every_input_failure_blocks_without_encoding_projection_contents() {
                 reason
             }
         );
-        assert!(
-            !serde_json::to_string(&result)
-                .unwrap()
-                .contains("TOP-SECRET")
-        );
+        assert!(!serde_json::to_string(&result)?.contains("TOP-SECRET"));
     }
+    Ok(())
 }
 
 fn secret_fixture() -> Value {
@@ -342,8 +341,8 @@ fn secret_fixture() -> Value {
 }
 
 #[test]
-fn secret_rollout_matches_independent_hmac_vector_and_requires_key() {
-    let plan = plan(&secret_fixture());
+fn secret_rollout_matches_independent_hmac_vector_and_requires_key() -> TestResult {
+    let plan = plan(&secret_fixture())?;
     let input = snapshots("secret", json!({"fixture":"c3ludGhldGljLW9ubHk="}));
     let key = RolloutKey {
         id: "key-v1".into(),
@@ -355,11 +354,11 @@ fn secret_rollout_matches_independent_hmac_vector_and_requires_key() {
                 .into(),
     };
     assert_eq!(
-        evaluate_rollout(&plan, "api", &input, Some(&key)).unwrap(),
+        evaluate_rollout(&plan, "api", &input, Some(&key))?,
         expected
     );
     assert!(matches!(
-        evaluate_rollout(&plan, "api", &input, None).unwrap(),
+        evaluate_rollout(&plan, "api", &input, None)?,
         RolloutOutcome::Blocked {
             reason: BlockReason::KeyUnavailable,
             ..
@@ -370,12 +369,12 @@ fn secret_rollout_matches_independent_hmac_vector_and_requires_key() {
         bytes: vec![0x42; 32],
     };
     assert_ne!(
-        evaluate_rollout(&plan, "api", &input, Some(&other_key)).unwrap(),
+        evaluate_rollout(&plan, "api", &input, Some(&other_key))?,
         expected
     );
     let bad = snapshots("secret", json!({"fixture":"this is not base64!"}));
     assert!(matches!(
-        evaluate_rollout(&plan, "api", &bad, Some(&key)).unwrap(),
+        evaluate_rollout(&plan, "api", &bad, Some(&key))?,
         RolloutOutcome::Blocked {
             reason: BlockReason::Invalid,
             ..
@@ -387,33 +386,32 @@ fn secret_rollout_matches_independent_hmac_vector_and_requires_key() {
     let mut declassified = secret_fixture();
     declassified["inputs"][0]["sensitive"] = json!(false);
     assert!(parse_and_validate(&declassified.to_string()).is_err());
+    Ok(())
 }
 
 #[test]
-fn managed_config_uses_authoritative_projection_only_after_successful_apply() {
+fn managed_config_uses_authoritative_projection_only_after_successful_apply() -> TestResult {
     let mut value = fixture();
-    value["resources"].as_array_mut().unwrap().push(json!({"id":"owned-config","apiVersion":"v1","kind":"ConfigMap","name":"external","namespace":"workload","desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"external","namespace":"workload"},"data":{"fixture":"synthetic-only"}},"lifecycle":{"deletionPolicy":"orphan"},"source":source()}));
+    value["resources"].as_array_mut().ok_or("fixture resources is not an array")?.push(json!({"id":"owned-config","apiVersion":"v1","kind":"ConfigMap","name":"external","namespace":"workload","desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"external","namespace":"workload"},"data":{"fixture":"synthetic-only"}},"lifecycle":{"deletionPolicy":"orphan"},"source":source()}));
     assert!(
         parse_and_validate(&value.to_string()).is_err(),
         "observed alias must be rejected"
     );
     value["inputs"][0]["mode"] = json!("managed");
     value["inputs"][0]["managedResourceId"] = json!("owned-config");
-    let plan = plan(&value);
+    let plan = plan(&value)?;
     let expected = evaluate_rollout(
         &plan,
         "api",
         &snapshots("config", json!({"fixture":"synthetic-only"})),
         None,
-    )
-    .unwrap();
+    )?;
     let drift = evaluate_rollout(
         &plan,
         "api",
         &snapshots("config", json!({"fixture":"UNAPPROVED-DRIFT"})),
         None,
-    )
-    .unwrap();
+    )?;
     assert_eq!(expected, drift);
     let not_applied = BTreeMap::from([(
         "config".into(),
@@ -423,19 +421,20 @@ fn managed_config_uses_authoritative_projection_only_after_successful_apply() {
         },
     )]);
     assert!(matches!(
-        evaluate_rollout(&plan, "api", &not_applied, None).unwrap(),
+        evaluate_rollout(&plan, "api", &not_applied, None)?,
         RolloutOutcome::Blocked {
             reason: BlockReason::ManagedSourceNotApplied,
             ..
         }
     ));
+    Ok(())
 }
 
 #[test]
-fn generated_coverage_does_not_claim_unexecuted_integration_evidence() {
+fn generated_coverage_does_not_claim_unexecuted_integration_evidence() -> TestResult {
     for fixture in [fixture(), secret_fixture()] {
-        let plan = plan(&fixture);
-        let report = run_semantic_tests(&plan).unwrap();
+        let plan = plan(&fixture)?;
+        let report = run_semantic_tests(&plan)?;
         assert_eq!(report.ir_digest, plan.ir_digest);
         assert!(!report.production_release_ready);
         assert!(report.test_only);
@@ -462,33 +461,30 @@ fn generated_coverage_does_not_claim_unexecuted_integration_evidence() {
                 .iter()
                 .all(|r| r.status != CaseStatus::Failed)
         );
-        assert!(
-            !serde_json::to_string(&report)
-                .unwrap()
-                .contains("c3ludGhldGljLW9ubHk=")
-        );
+        assert!(!serde_json::to_string(&report)?.contains("c3ludGhldGljLW9ubHk="));
     }
+    Ok(())
 }
 
-fn mixed_modes_fixture() -> Value {
+fn mixed_modes_fixture() -> TestResult<Value> {
     let mut value = fixture();
-    value["resources"].as_array_mut().unwrap().push(json!({
+    value["resources"].as_array_mut().ok_or("fixture resources is not an array")?.push(json!({
         "id":"managed-config","apiVersion":"v1","kind":"ConfigMap","name":"managed-config","namespace":"workload",
         "desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"managed-config","namespace":"workload"},"data":{"fixture":"managed-baseline"}},
         "lifecycle":{"deletionPolicy":"orphan"},"source":source()
     }));
-    value["inputs"].as_array_mut().unwrap().extend([
+    value["inputs"].as_array_mut().ok_or("fixture inputs is not an array")?.extend([
         json!({"id":"secret","apiVersion":"v1","kind":"Secret","name":"external-secret","namespace":"workload","mode":"observed","projection":["data"],"sensitive":true,"missing":"block-dependent-mutations","source":source()}),
         json!({"id":"managed","apiVersion":"v1","kind":"ConfigMap","name":"managed-config","namespace":"workload","mode":"managed","managedResourceId":"managed-config","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":source()}),
     ]);
     value["reactions"][0]["inputs"] = json!(["config", "secret", "managed"]);
-    value
+    Ok(value)
 }
 
 #[test]
-fn generated_semantics_exercise_every_reaction_input_and_separate_real_auth() {
-    let value = mixed_modes_fixture();
-    let report = run_semantic_tests(&plan(&value)).unwrap();
+fn generated_semantics_exercise_every_reaction_input_and_separate_real_auth() -> TestResult {
+    let value = mixed_modes_fixture()?;
+    let report = run_semantic_tests(&plan(&value)?)?;
     for scenario in [
         "projected-change",
         "coalesced-inputs",
@@ -502,7 +498,7 @@ fn generated_semantics_exercise_every_reaction_input_and_separate_real_auth() {
             .results
             .iter()
             .find(|result| result.case.scenario == scenario)
-            .unwrap();
+            .ok_or("generated plan is missing the required scenario")?;
         assert_eq!(result.status, CaseStatus::Passed);
         assert!(result.detail.contains("[config,secret]"));
         assert_eq!(result.case.input_ids, ["config", "secret"]);
@@ -511,16 +507,18 @@ fn generated_semantics_exercise_every_reaction_input_and_separate_real_auth() {
         .results
         .iter()
         .find(|result| result.case.scenario == "credential-read-denial")
-        .unwrap();
+        .ok_or("generated plan is missing the credential-read-denial scenario")?;
     assert_eq!(credential_case.case.layer, "api");
     assert_eq!(credential_case.status, CaseStatus::Unsupported);
     assert!(!report.production_release_ready);
+    Ok(())
 }
 
 #[test]
-fn generated_cases_preserve_managed_and_observed_applicability_without_fabricated_repairs() {
-    let value = mixed_modes_fixture();
-    let compiled = plan(&value);
+fn generated_cases_preserve_managed_and_observed_applicability_without_fabricated_repairs()
+-> TestResult {
+    let value = mixed_modes_fixture()?;
+    let compiled = plan(&value)?;
     for (scenario, layer) in [
         ("managed-drift-repair", "workload"),
         ("managed-missing", "api"),
@@ -535,13 +533,13 @@ fn generated_cases_preserve_managed_and_observed_applicability_without_fabricate
         assert_eq!(matching.len(), 1);
         assert_eq!(matching[0].input_ids, ["managed"]);
         assert_eq!(matching[0].layer, layer);
-        let report = run_semantic_tests(&compiled).unwrap();
+        let report = run_semantic_tests(&compiled)?;
         assert_eq!(
             report
                 .results
                 .iter()
                 .find(|r| r.case.scenario == scenario)
-                .unwrap()
+                .ok_or("generated plan is missing the required scenario")?
                 .status,
             CaseStatus::Unsupported
         );
@@ -550,11 +548,11 @@ fn generated_cases_preserve_managed_and_observed_applicability_without_fabricate
         .test_plan
         .iter()
         .find(|case| case.scenario == "initial-evaluation")
-        .unwrap();
+        .ok_or("generated plan is missing the initial-evaluation case")?;
     assert_eq!(initial.input_ids, ["config", "managed", "secret"]);
     let mut managed_only = value;
     managed_only["reactions"][0]["inputs"] = json!(["managed"]);
-    let only = plan(&managed_only);
+    let only = plan(&managed_only)?;
     assert_eq!(only.test_plan.len(), 11);
     assert!(
         only.test_plan
@@ -570,47 +568,66 @@ fn generated_cases_preserve_managed_and_observed_applicability_without_fabricate
             | "restart-and-relist"
     )));
     assert!(
-        run_semantic_tests(&only)
-            .unwrap()
+        run_semantic_tests(&only)?
             .results
             .iter()
             .all(|result| result.status != CaseStatus::Failed)
     );
+    Ok(())
 }
 
 #[test]
-fn generated_case_identities_and_applicability_ignore_declaration_order() {
-    let mut value = mixed_modes_fixture();
+fn generated_case_identities_and_applicability_ignore_declaration_order() -> TestResult {
+    let mut value = mixed_modes_fixture()?;
     let mut additional = value["reactions"][0].clone();
     additional["id"] = json!("additional");
-    value["reactions"].as_array_mut().unwrap().push(additional);
-    let baseline = plan(&value).test_plan;
-    value["inputs"].as_array_mut().unwrap().reverse();
-    value["resources"].as_array_mut().unwrap().reverse();
-    value["reactions"].as_array_mut().unwrap().reverse();
-    for reaction in value["reactions"].as_array_mut().unwrap() {
-        reaction["inputs"].as_array_mut().unwrap().reverse();
+    value["reactions"]
+        .as_array_mut()
+        .ok_or("fixture reactions is not an array")?
+        .push(additional);
+    let baseline = plan(&value)?.test_plan;
+    value["inputs"]
+        .as_array_mut()
+        .ok_or("fixture inputs is not an array")?
+        .reverse();
+    value["resources"]
+        .as_array_mut()
+        .ok_or("fixture resources is not an array")?
+        .reverse();
+    value["reactions"]
+        .as_array_mut()
+        .ok_or("fixture reactions is not an array")?
+        .reverse();
+    for reaction in value["reactions"]
+        .as_array_mut()
+        .ok_or("fixture reactions is not an array")?
+    {
+        reaction["inputs"]
+            .as_array_mut()
+            .ok_or("reaction inputs is not an array")?
+            .reverse();
     }
-    assert_eq!(baseline, plan(&value).test_plan);
+    assert_eq!(baseline, plan(&value)?.test_plan);
     let unique: std::collections::BTreeSet<_> = baseline
         .iter()
         .map(|case| (&case.reaction_id, &case.scenario))
         .collect();
     assert_eq!(unique.len(), baseline.len());
+    Ok(())
 }
 
 #[test]
-fn managed_drift_repair_requires_a_declared_owned_data_key() {
-    let mut value = mixed_modes_fixture();
+fn managed_drift_repair_requires_a_declared_owned_data_key() -> TestResult {
+    let mut value = mixed_modes_fixture()?;
     value["reactions"][0]["inputs"] = json!(["managed"]);
     let resource = value["resources"]
         .as_array_mut()
-        .unwrap()
+        .ok_or("fixture resources is not an array")?
         .iter_mut()
         .find(|r| r["id"] == "managed-config")
-        .unwrap();
+        .ok_or("fixture has no managed-config resource")?;
     resource["desired"]["data"] = json!({});
-    let compiled = plan(&value);
+    let compiled = plan(&value)?;
     assert!(
         !compiled
             .test_plan
@@ -629,14 +646,15 @@ fn managed_drift_repair_requires_a_declared_owned_data_key() {
                 .any(|case| case.scenario == scenario && case.input_ids == ["managed"])
         );
     }
+    Ok(())
 }
 
 #[test]
-fn forced_resource_requires_exact_policy_acceptance_and_force_aware_evidence() {
-    let baseline = plan(&fixture());
+fn forced_resource_requires_exact_policy_acceptance_and_force_aware_evidence() -> TestResult {
+    let baseline = plan(&fixture())?;
     let mut value = fixture();
     value["resources"][0]["force"] = json!(true);
-    let forced = plan(&value);
+    let forced = plan(&value)?;
     assert_ne!(baseline.ir_digest, forced.ir_digest);
     assert!(
         forced
@@ -644,7 +662,7 @@ fn forced_resource_requires_exact_policy_acceptance_and_force_aware_evidence() {
             .contains(&"force-apply:Deployment/workload/api".into())
     );
     assert!(validate_ceiling(&forced, &ceiling(&baseline)).is_err());
-    validate_ceiling(&forced, &ceiling(&forced)).unwrap();
+    validate_ceiling(&forced, &ceiling(&forced))?;
     assert!(
         forced
             .test_plan
@@ -658,5 +676,6 @@ fn forced_resource_requires_exact_policy_acceptance_and_force_aware_evidence() {
             .any(|case| case.scenario == "field-conflict")
     );
     value["resources"][0]["force"] = json!(false);
-    assert_eq!(plan(&value), baseline);
+    assert_eq!(plan(&value)?, baseline);
+    Ok(())
 }

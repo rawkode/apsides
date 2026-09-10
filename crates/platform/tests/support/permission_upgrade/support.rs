@@ -298,7 +298,7 @@ async fn inventory_store() -> Result<inventory::LibsqlInventory> {
     qualification_driver::inventory_store("APS_PERMISSION_UPGRADE_INVENTORY_DB").await
 }
 
-fn candidate(pair: &CandidatePair, role: CandidatePairRole) -> &IntegrityVerifiedCandidate {
+const fn candidate(pair: &CandidatePair, role: CandidatePairRole) -> &IntegrityVerifiedCandidate {
     match role {
         CandidatePairRole::Initial => &pair.initial,
         CandidatePairRole::Successor => &pair.successor,
@@ -343,7 +343,7 @@ enum FieldSet {
     ResumeCheckpoint,
 }
 
-fn require_fields(settings: &Settings, set: FieldSet) -> Result<()> {
+const fn require_fields(settings: &Settings, set: FieldSet) -> Result<()> {
     let target = settings.target.is_some();
     let bootstrap = settings.registry_uid.is_some() || settings.registry_resource_version.is_some();
     let request = settings.expected_request_digest.is_some();

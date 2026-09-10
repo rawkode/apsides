@@ -1,12 +1,9 @@
-#[path = "review_live_tests.rs"]
 mod live;
 
 use super::*;
 use compiler_core::canonical_bytes;
 
-#[path = "review_projection_tests.rs"]
 mod projection;
-#[path = "review_v4_tests.rs"]
 mod v4;
 
 fn source(line: u32) -> Value {

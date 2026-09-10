@@ -63,7 +63,9 @@ struct QualificationFixture {
     claim_store: Arc<MemoryClaimStore>,
 }
 
-fn explicit_path(variable: &str) -> std::result::Result<PathBuf, Box<dyn std::error::Error>> {
+fn explicit_path(
+    variable: &str,
+) -> std::result::Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let path = PathBuf::from(env::var_os(variable).ok_or("qualification input variable missing")?);
     if !path.is_absolute() {
         return Err(format!("{variable} must be an absolute path").into());
@@ -71,7 +73,9 @@ fn explicit_path(variable: &str) -> std::result::Result<PathBuf, Box<dyn std::er
     Ok(path)
 }
 
-fn read_trust(path: &Path) -> std::result::Result<TrustPolicy, Box<dyn std::error::Error>> {
+fn read_trust(
+    path: &Path,
+) -> std::result::Result<TrustPolicy, Box<dyn std::error::Error + Send + Sync>> {
     const LIMIT: u64 = 1024 * 1024;
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file()
@@ -96,7 +100,7 @@ fn state_object(
     value: &impl serde::Serialize,
     uid: &str,
     resource_version: &str,
-) -> std::result::Result<Value, Box<dyn std::error::Error>> {
+) -> std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     Ok(json!({
         "apiVersion": "v1",
         "kind": "ConfigMap",
@@ -122,7 +126,7 @@ impl QualificationFixture {
     fn new(
         candidate: &IntegrityVerifiedCandidate,
         trust: &TrustPolicy,
-    ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let domain = &candidate.compiled().ir.domain;
         let names = deploy::allocation_names(REGISTRY_UID, 1)?;
         let policy = policy(candidate.compiled());
@@ -141,7 +145,7 @@ impl QualificationFixture {
                 compiled: candidate.compiled().clone(),
             },
             runtime_ceiling: policy.runtime_ceiling.clone(),
-            cleanup_ceiling: policy.cleanup_ceiling.clone(),
+            cleanup_ceiling: policy.cleanup_ceiling,
             registry: deploy::RegistrySnapshot {
                 registry_uid: REGISTRY_UID.into(),
                 next_sequence: 1,
@@ -235,7 +239,7 @@ fn qualification_marker(
         schema_version: CANDIDATE_QUALIFICATION_SCHEMA.into(),
         run_id: RUN_ID.into(),
         cluster_name: cluster.clone(),
-        sentinel_namespace: cluster.clone(),
+        sentinel_namespace: cluster,
         domain_id: domain.id.clone(),
         release_digest: candidate.release_digest().into(),
         cluster_binding: domain.cluster_binding.clone(),
@@ -258,7 +262,7 @@ fn qualification_objects(
     registry: &NamespaceRegistryState,
     identity: &Versioned<DeploymentIdentity>,
     target: &CandidateQualificationTarget,
-) -> std::result::Result<BTreeMap<String, Value>, Box<dyn std::error::Error>> {
+) -> std::result::Result<BTreeMap<String, Value>, Box<dyn std::error::Error + Send + Sync>> {
     let domain = &candidate.compiled().ir.domain;
     let cluster = format!("apsides-qual-{RUN_ID}");
     let node_name = &target.node_name;
@@ -424,7 +428,7 @@ fn platform(
 fn make_noninitial(
     request: &mut deploy::DeploymentRequest,
     kind: &str,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let domain = &request.next.compiled.ir.domain;
     let names = deploy::allocation_names(REGISTRY_UID, 1)?;
     let allocation = deploy::GenerationAllocation {
@@ -509,7 +513,7 @@ fn make_noninitial(
 #[tokio::test]
 #[ignore = "requires APS_QUALIFICATION_CANDIDATE and APS_QUALIFICATION_TRUST_POLICY absolute paths"]
 async fn public_candidate_qualification_rejects_drift_and_reserves_exact_candidate()
--> std::result::Result<(), Box<dyn std::error::Error>> {
+-> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let candidate_path = explicit_path(CANDIDATE_ENV)?;
     let trust_path = explicit_path(TRUST_ENV)?;
     let trust = read_trust(&trust_path)?;
@@ -524,7 +528,7 @@ async fn public_candidate_qualification_rejects_drift_and_reserves_exact_candida
 async fn reject_mismatched_candidate(
     candidate: &IntegrityVerifiedCandidate,
     trust: &TrustPolicy,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for mismatch in ["compiled", "release", "scope"] {
         let fixture = QualificationFixture::new(candidate, trust)?;
         let (client, calls) = wire_objects(fixture.objects.clone());
@@ -544,7 +548,7 @@ async fn reject_mismatched_candidate(
             platform(client, candidate, &fixture, reviews)?
         };
         if mismatch == "compiled" {
-            request.next.compiled = plan();
+            request.next.compiled = plan()?;
         } else if mismatch == "release" {
             request.next.artifact_digest = format!("sha256:{}", "0".repeat(64));
         }
@@ -577,7 +581,7 @@ async fn reject_mismatched_candidate(
 async fn reject_noninitial_requests(
     candidate: &IntegrityVerifiedCandidate,
     trust: &TrustPolicy,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for kind in [
         "previous",
         "observation",
@@ -624,7 +628,7 @@ async fn reject_noninitial_requests(
 async fn reject_deficient_ceiling(
     candidate: &IntegrityVerifiedCandidate,
     trust: &TrustPolicy,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut fixture = QualificationFixture::new(candidate, trust)?;
     let mut deficient_policy = policy(candidate.compiled());
     if deficient_policy
@@ -701,7 +705,7 @@ async fn reject_deficient_ceiling(
 async fn reserve_and_reject_dirty_state(
     candidate: &IntegrityVerifiedCandidate,
     trust: &TrustPolicy,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let fixture = QualificationFixture::new(candidate, trust)?;
     let (client, calls) = wire_objects(fixture.objects.clone());
     let reviews = Arc::new(ObservedReviewStore::default());
@@ -753,7 +757,7 @@ async fn reject_dirty_state(
     fixture: &QualificationFixture,
     reserved: &NamespaceRegistry,
     reviews: &Arc<ObservedReviewStore>,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for kind in ["transition", "claim"] {
         let mut dirty = reserved.clone();
         if kind == "transition" {

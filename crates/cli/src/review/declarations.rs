@@ -18,14 +18,14 @@ impl Unavailable {
 }
 
 #[derive(Serialize)]
-pub(super) struct Changed<'a, T: Serialize> {
+pub(super) struct Changed<'a, T> {
     before: &'a T,
     after: &'a T,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct Changes<'a, T: Serialize> {
+pub(super) struct Changes<'a, T> {
     baseline: &'static str,
     before: &'a [T],
     after: &'a [T],

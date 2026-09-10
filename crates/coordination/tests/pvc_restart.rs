@@ -52,7 +52,7 @@ impl Phase {
         }
     }
 
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::Seed => "seed",
             Self::Verify => "verify",
@@ -74,7 +74,7 @@ enum Side {
 }
 
 impl Side {
-    fn phase(self) -> Phase {
+    const fn phase(self) -> Phase {
         match self {
             Self::Left => Phase::RaceLeft,
             Self::Right => Phase::RaceRight,

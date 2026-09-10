@@ -138,11 +138,7 @@ async fn read_only_response(
     let Some(sql) = sql else {
         return Err("read-only fixture request omitted SQL".into());
     };
-    let statement = if let Some(without_semicolon) = sql.strip_suffix(';') {
-        without_semicolon
-    } else {
-        sql
-    };
+    let statement = sql.strip_suffix(';').unwrap_or(sql);
     let (columns, rows) = match statement {
         "SELECT version FROM apsides_inventory_schema WHERE id=1"
         | "SELECT version FROM apsides_inventory_schema WHERE id = 1" => (

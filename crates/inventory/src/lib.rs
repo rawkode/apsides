@@ -1,14 +1,3 @@
-#![cfg_attr(
-    not(test),
-    deny(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unreachable,
-        clippy::todo,
-        clippy::unimplemented
-    )
-)]
 #![forbid(unsafe_code)]
 //! Metadata-only pruning inventory. This store grants no mutation authority.
 mod model;
@@ -33,9 +22,10 @@ pub enum Error {
     Backend(&'static str),
 }
 
-/// Backends preserve immutable metadata snapshots and conditionally publish a
-/// head. SQL transactions are an implementation detail, not a trait requirement.
-/// An object-store backend can publish immutable Parquet files and CAS its head.
+/// Preserves immutable metadata snapshots and conditionally publishes a head.
+///
+/// SQL transactions are an implementation detail, not a trait requirement. An
+/// object-store backend can publish immutable Parquet files and CAS its head.
 #[async_trait]
 pub trait InventoryStore: Send + Sync {
     /// Read a consistent head and its immutable snapshot.

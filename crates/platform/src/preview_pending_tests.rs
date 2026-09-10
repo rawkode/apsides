@@ -6,7 +6,7 @@ use crate::Versioned;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
-type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type Calls = Arc<Mutex<Vec<(String, String, Value)>>>;
 struct Fixture {
     issued: IssuedDeployment,
@@ -68,11 +68,7 @@ fn fixture(mode: Mode) -> TestResult<Fixture> {
         crate::tests::registry_object(&registry, &plan.request.registry.registry_uid, "43")?;
     let policy_object = state("apsides-policy-example", &policy, "policy-uid", "40")?;
     let trust_object = state("apsides-trust-example", &trust, "trust-uid", "43")?;
-    let resolve = vec![
-        registry_object.clone(),
-        trust_object.clone(),
-        policy_object.clone(),
-    ];
+    let resolve = vec![registry_object, trust_object.clone(), policy_object.clone()];
     let mut group = vec![identity_object.clone()];
     group.extend(resolve.clone());
     group.extend([policy_object.clone(), trust_object.clone()]);
@@ -103,7 +99,7 @@ fn fixture(mode: Mode) -> TestResult<Fixture> {
     replies.extend(group); // final authority recheck
     replies.extend(resolve); // test's final authenticated resolve
     replies.retain(|reply| reply["metadata"]["name"] != "apsides-deploy-identity-example");
-    let (client, calls) = crate::tests::wire_with_identity(replies, identity_object);
+    let (client, calls) = crate::tests::wire_with_identity(replies, identity_object)?;
     let platform = crate::tests::platform_client(client, "control", "workload", "cluster-a")?;
     let issued = IssuedDeployment::for_preview_test(
         platform,

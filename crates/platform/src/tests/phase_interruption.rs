@@ -3,7 +3,7 @@ use crate::phase_interruption::{PauseAfterPhase, PhasePause};
 use deploy::Phase;
 use std::time::Duration;
 
-type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[tokio::test]
 async fn checkpoint_parks_only_after_successful_exact_registry_commit() -> TestResult {
@@ -25,10 +25,10 @@ async fn checkpoint_parks_only_after_successful_exact_registry_commit() -> TestR
         };
         let policy = policy(&registry.plan(TRANSITION_B)?.request.next.compiled);
         let (client, calls) = wire(vec![
-            object("apsides-policy-example", &policy, "policy-uid", "40"),
+            object("apsides-policy-example", &policy, "policy-uid", "40")?,
             registry_object(&registry, REGISTRY_UID, "42")?,
             response,
-        ]);
+        ])?;
         let mut platform =
             registry.bind(client, "control", "workload", "cluster-a", TRANSITION_B)?;
         let pause = Arc::new(PhasePause::new(

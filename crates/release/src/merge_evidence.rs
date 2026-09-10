@@ -379,10 +379,11 @@ fn publish_output(
     result
 }
 
-/// Merge bounded, typed evidence receipts into a validated, no-clobber release
-/// fragment. Validation finishes before the output directory is created; the
-/// directory is visible while its files are published and `summary.json` marks
-/// completion.
+/// Merge bounded, typed evidence receipts into a validated release fragment.
+///
+/// Nothing is clobbered: validation finishes before the output directory is
+/// created; the directory is visible while its files are published, and
+/// `summary.json` marks completion.
 ///
 /// # Errors
 /// Rejects invalid candidates, receipts, subjects, assertions, collisions,
@@ -449,7 +450,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
     #[test]
     fn single_component_paths_use_the_current_directory() -> TestResult {

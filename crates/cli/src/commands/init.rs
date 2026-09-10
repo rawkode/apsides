@@ -1,174 +1,29 @@
-use crate::{Result, only};
+mod files;
+
+use crate::{Result, cli, report};
+use files::{PROJECT_FILES, SDK_FILES};
 use serde_json::json;
 use std::{
-    collections::BTreeMap,
     env, fs,
     io::Write as _,
     path::{Path, PathBuf},
     process::Stdio,
 };
 
-const PROJECT_FILES: &[(&str, &str)] = &[
-    ("program.tsx", PROGRAM),
-    ("deno.json", DENO_CONFIG),
-    ("tsconfig.json", TYPESCRIPT_CONFIG),
-    (".gitignore", ".aps/\n"),
-];
-
-const SDK_FILES: &[(&str, &str)] = &[
-    (
-        "index.ts",
-        include_str!("../../../packages/kubernetes/src/index.ts"),
-    ),
-    (
-        "model.ts",
-        include_str!("../../../packages/kubernetes/src/model.ts"),
-    ),
-    (
-        "runtime.ts",
-        include_str!("../../../packages/kubernetes/src/runtime.ts"),
-    ),
-    (
-        "compiler.ts",
-        include_str!("../../../packages/kubernetes/src/compiler.ts"),
-    ),
-    (
-        "jsx-runtime.ts",
-        include_str!("../../../packages/kubernetes/src/jsx-runtime.ts"),
-    ),
-    (
-        "jsx-dev-runtime.ts",
-        include_str!("../../../packages/kubernetes/src/jsx-dev-runtime.ts"),
-    ),
-];
-
-const PROGRAM: &str = r#"import {
-  ConfigMap,
-  Controller,
-  Deployment,
-  useConfigMap,
-  type DomainBudgets,
-} from "@apsides/kubernetes";
-
-const budgets: DomainBudgets = {
-  maxResources: 8,
-  maxInputs: 8,
-  maxReactions: 8,
-  maxObjectBytes: 262_144,
-  maxQueueDepth: 32,
-  maxConcurrentRequests: 2,
-};
-
-const App = () => {
-  const settings = useConfigMap({ name: "app-settings" });
-  const labels = { app: "hello" };
-
-  return (
-    <>
-      <ConfigMap
-        metadata={{ name: "hello-config", namespace: "default" }}
-        data={{ LOG_LEVEL: "info" }}
-      />
-      <Deployment
-        metadata={{ name: "hello", namespace: "default" }}
-        rolloutOn={[settings.data]}
-        spec={{
-          replicas: 1,
-          selector: { matchLabels: labels },
-          template: {
-            metadata: { labels },
-            spec: {
-              automountServiceAccountToken: false,
-              containers: [{
-                name: "hello",
-                image: "docker.io/nginxinc/nginx-unprivileged@sha256:9b87ad3dd9f431c733f19dfb278c7eb3dba9dca381942c79818bb42f1a566a83",
-                ports: [{ containerPort: 8080 }],
-                resources: {
-                  requests: { cpu: "10m", memory: "16Mi" },
-                  limits: { memory: "64Mi" },
-                },
-                envFrom: [{ configMapRef: { name: "app-settings" } }],
-              }],
-            },
-          },
-        }}
-      />
-    </>
-  );
-};
-
-export default (
-  <Controller
-    id="hello"
-    namespace="default"
-    controlNamespace="apsides-system"
-    clusterBinding="local"
-    policyRef="platform/hello"
-    enforcement="api-bound"
-    budgets={budgets}
-  >
-    <App />
-  </Controller>
-);
-"#;
-
-const DENO_CONFIG: &str = r#"{
-  "compilerOptions": {
-    "jsx": "react-jsxdev",
-    "jsxImportSource": "@apsides/kubernetes",
-    "strict": true
-  },
-  "imports": {
-    "@apsides/kubernetes": "./.aps/sdk/index.ts",
-    "@apsides/kubernetes/jsx-runtime": "./.aps/sdk/jsx-runtime.ts",
-    "@apsides/kubernetes/jsx-dev-runtime": "./.aps/sdk/jsx-dev-runtime.ts"
-  }
-}
-"#;
-
-const TYPESCRIPT_CONFIG: &str = r#"{
-  "compilerOptions": {
-    "allowImportingTsExtensions": true,
-    "baseUrl": ".",
-    "jsx": "react-jsx",
-    "jsxImportSource": "@apsides/kubernetes",
-    "module": "ESNext",
-    "moduleResolution": "Bundler",
-    "noEmit": true,
-    "paths": {
-      "@apsides/kubernetes": ["./.aps/sdk/index.ts"],
-      "@apsides/kubernetes/jsx-runtime": ["./.aps/sdk/jsx-runtime.ts"],
-      "@apsides/kubernetes/jsx-dev-runtime": ["./.aps/sdk/jsx-dev-runtime.ts"]
-    },
-    "strict": true,
-    "target": "ES2022"
-  },
-  "include": ["**/*.ts", "**/*.tsx"],
-  "exclude": ["node_modules", ".aps"]
-}
-"#;
-
 /// Create one modest TypeScript authoring project in an empty file namespace.
 ///
 /// # Errors
-/// Rejects unknown options, existing generated paths, unavailable compiler assets,
-/// source-lock failures, symlinks and filesystem races without overwriting files.
-pub(crate) fn command(options: &BTreeMap<String, String>) -> Result<()> {
-    only(options, &["--directory"])?;
-    let requested = options.get("--directory").map_or(".", String::as_str);
-    let destination = destination(Path::new(requested))?;
+/// Rejects existing generated paths, unavailable compiler assets, source-lock
+/// failures, symlinks and filesystem races without overwriting files.
+pub fn command(arguments: &cli::Init) -> Result<()> {
+    let destination = destination(&arguments.directory)?;
     initialize(&destination)?;
-    writeln!(
-        std::io::stdout().lock(),
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "status": "initialized",
-            "directory": destination,
-            "entry": "program.tsx",
-            "sourceLock": "apsides.lock.json"
-        }))?
-    )?;
-    Ok(())
+    report::emit(&json!({
+        "status": "initialized",
+        "directory": destination,
+        "entry": "program.tsx",
+        "sourceLock": "apsides.lock.json"
+    }))
 }
 
 fn destination(requested: &Path) -> Result<PathBuf> {
@@ -328,8 +183,8 @@ fn copy_exclusive(source: &Path, destination: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::Value;
-    use std::process::Command;
     use sha2::{Digest as _, Sha256};
+    use std::process::Command;
 
     #[test]
     fn scaffold_is_locked_and_typechecks_outside_the_repository() -> Result<()> {

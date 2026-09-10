@@ -358,12 +358,13 @@ fn validate_ledger(bytes: &[u8], stats: &BTreeMap<String, u64>) -> Result<(u64, 
 
 #[cfg(test)]
 mod tests {
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
     use super::*;
     use serde_json::json;
     #[test]
-    fn filtered_live_envoy_statistics_remain_strict_integral_evidence() {
+    fn filtered_live_envoy_statistics_remain_strict_integral_evidence() -> TestResult {
         let captured = br#"{"stats":[{"name":"cluster.write_api.upstream_rq_active","value":0},{"name":"cluster.write_api.upstream_rq_total","value":3},{"name":"http.apsides.downstream_rq_active","value":0},{"name":"server.live","value":0}]}"#;
-        let snapshot = super::counter_snapshot(captured).unwrap();
+        let snapshot = super::counter_snapshot(captured)?;
         assert_eq!(snapshot.len(), 4);
         assert_eq!(snapshot["cluster.write_api.upstream_rq_total"], 3);
         assert!(
@@ -379,6 +380,7 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
     }
     fn stats() -> BTreeMap<String, u64> {
         [
@@ -396,8 +398,8 @@ mod tests {
         format!("{entry}\n").into_bytes()
     }
     #[test]
-    fn idle_does_not_hide_timeouts_resets_retries_or_missing_records() {
-        assert_eq!(validate_ledger(&line(&entry()), &stats()).unwrap(), (1, 0));
+    fn idle_does_not_hide_timeouts_resets_retries_or_missing_records() -> TestResult {
+        assert_eq!(validate_ledger(&line(&entry()), &stats())?, (1, 0));
         for (field, value) in [
             ("code", json!(504)),
             ("flags", json!("DC")),
@@ -415,6 +417,7 @@ mod tests {
         let mut running = stats();
         running.insert("server.live".into(), 1);
         assert!(validate_ledger(&line(&entry()), &running).is_err());
+        Ok(())
     }
 
     #[test]

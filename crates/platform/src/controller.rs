@@ -523,13 +523,16 @@ fn controller_deployment(
     let labels = json!({"apsides.dev/generation":binding.generation_id});
     let mut mounts = vec![json!({"name":"config","mountPath":"/etc/apsides","readOnly":true})];
     let mut volumes = vec![json!({"name":"config","configMap":{"name":config_name}})];
-    let account = if let Some(secret) = proxy_secret {
-        mounts.push(json!({"name":"proxy-client","mountPath":"/etc/apsides/proxy","readOnly":true}));
-        volumes.push(json!({"name":"proxy-client","secret":{"secretName":secret,"defaultMode":420,"items":[{"key":"ca.crt","path":"ca.crt"},{"key":"client.crt","path":"tls.crt"},{"key":"client.key","path":"tls.key"}]}}));
-        format!("{}-process", binding.service_account_name)
-    } else {
-        binding.service_account_name.clone()
-    };
+    let account = proxy_secret.map_or_else(
+        || binding.service_account_name.clone(),
+        |secret| {
+            mounts.push(
+                json!({"name":"proxy-client","mountPath":"/etc/apsides/proxy","readOnly":true}),
+            );
+            volumes.push(json!({"name":"proxy-client","secret":{"secretName":secret,"defaultMode":420,"items":[{"key":"ca.crt","path":"ca.crt"},{"key":"client.crt","path":"tls.crt"},{"key":"client.key","path":"tls.key"}]}}));
+            format!("{}-process", binding.service_account_name)
+        },
+    );
     let mut deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":binding.service_account_name,"namespace":namespace},"spec":{"replicas":0,"selector":{"matchLabels":labels},"strategy":{"type":"Recreate"},"template":{"metadata":{"labels":labels,"finalizers":[crate::TERMINATION_FINALIZER]},"spec":{"serviceAccountName":account,"automountServiceAccountToken":proxy_secret.is_none(),"tolerations":[{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoExecute"},{"key":"node.kubernetes.io/unreachable","operator":"Exists","effect":"NoExecute"}],"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"controller","image":binding.controller_image,"imagePullPolicy":"IfNotPresent","env":[{"name":"APSIDES_RUNTIME_CONFIG_PATH","value":"/etc/apsides/config.json"}],"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}},"volumeMounts":mounts,"ports":[{"containerPort":8080,"name":"diagnostics"}],"resources":{"requests":{"cpu":"10m","memory":"32Mi"},"limits":{"cpu":"1","memory":"256Mi"}},"livenessProbe":{"httpGet":{"path":"/livez","port":"diagnostics"}},"readinessProbe":{"httpGet":{"path":"/readyz","port":"diagnostics"}}}],"volumes":volumes}}}});
     set_image_pull_secrets(&mut deployment, pull_secrets);
     deployment
@@ -553,7 +556,7 @@ mod stage_metadata_tests {
 
     #[test]
     fn initial_state_budget_matches_the_reader_at_the_encoded_boundary()
-    -> std::result::Result<(), Box<dyn std::error::Error>> {
+    -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let state = "x".repeat(crate::MAX_STATE_BYTES - 2);
         let object = super::state_object("activation", "control", &state)?;
         let mut object: k8s_openapi::api::core::v1::ConfigMap = serde_json::from_value(object)?;

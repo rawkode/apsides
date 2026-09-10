@@ -72,11 +72,11 @@ pub struct IntegrityVerifiedCandidate {
 
 impl IntegrityVerifiedCandidate {
     #[must_use]
-    pub fn manifest(&self) -> &ReleaseManifest {
+    pub const fn manifest(&self) -> &ReleaseManifest {
         &self.manifest
     }
     #[must_use]
-    pub fn compiled(&self) -> &CompiledPlan {
+    pub const fn compiled(&self) -> &CompiledPlan {
         &self.compiled
     }
     #[must_use]
@@ -162,21 +162,21 @@ pub struct TestStagingAuthorization {
 #[cfg(feature = "test-support")]
 impl TestStagingAuthorization {
     #[must_use]
-    pub fn candidate(&self) -> &IntegrityVerifiedCandidate {
+    pub const fn candidate(&self) -> &IntegrityVerifiedCandidate {
         &self.candidate
     }
     #[must_use]
-    pub fn scope(&self) -> &TestStagingScope {
+    pub const fn scope(&self) -> &TestStagingScope {
         &self.scope
     }
 }
 impl VerifiedRelease {
     #[must_use]
-    pub fn manifest(&self) -> &ReleaseManifest {
+    pub const fn manifest(&self) -> &ReleaseManifest {
         &self.manifest
     }
     #[must_use]
-    pub fn compiled(&self) -> &CompiledPlan {
+    pub const fn compiled(&self) -> &CompiledPlan {
         &self.compiled
     }
     #[must_use]

@@ -98,7 +98,7 @@ pub(super) fn adoption_fixture() -> Result<(platform::StoredTransition, deploy::
             generation_id: request.next.generation_id.clone(),
             release_digest: request.next.artifact_digest.clone(),
             cluster_binding: domain.cluster_binding.clone(),
-            control_namespace: domain.control_namespace.clone(),
+            control_namespace: domain.control_namespace,
             identity,
             observed_uid: "existing-object-uid".into(),
             observed_resource_version: "23".into(),

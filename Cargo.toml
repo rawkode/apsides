@@ -22,5 +22,37 @@ repository = "https://github.com/rawkode/apsides"
 unsafe_code = "deny"
 
 [workspace.lints.clippy]
-all = "warn"
-pedantic = "warn"
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+
+# No panicking path anywhere, test code included. A test that cannot state why
+# it expected a value is a test that will not say why it broke.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+# Deliberate exceptions. Each is a lint we cannot satisfy without making the
+# code worse or breaking something outside this workspace.
+#
+# The dependency graph, not ours: kube pulls both hyper 0.14 and 1.x, and
+# rustls 0.22 and 0.23, through its tower stack.
+multiple_crate_versions = "allow"
+# Every hit is a validation chain comparing deliberately asymmetric fields,
+# such as `ceiling.domain_id != domain.id` where `Domain`'s field is `id`.
+# All were reviewed; none is a bug.
+suspicious_operation_groupings = "allow"
+# `pub(crate)` records the reach an item is meant to have. Collapsing it to
+# `pub` wherever the enclosing module happens to be private would drop that.
+redundant_pub_crate = "allow"
+# `test-support` is named in env.cue tasks, CI and the Python harnesses; the
+# suffix is meaningful at those call sites.
+redundant_feature_names = "allow"
+# Fires on guards whose last use is the final statement of their scope, where
+# an explicit `drop` adds nothing. Several of its suggestions place that `drop`
+# before a later `&mut` use of the guard and do not compile.
+significant_drop_tightening = "allow"

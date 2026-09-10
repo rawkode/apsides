@@ -66,7 +66,7 @@ pub(crate) async fn read_state<T: DeserializeOwned>(
     decode_state(&api.get(name).await?)
 }
 
-pub(crate) async fn replace_state<T: Serialize + DeserializeOwned>(
+pub(crate) async fn replace_state<T: Serialize + DeserializeOwned + Sync>(
     client: &Client,
     namespace: &str,
     name: &str,
@@ -84,7 +84,7 @@ pub(crate) async fn replace_state<T: Serialize + DeserializeOwned>(
     .await
 }
 
-pub(crate) async fn replace_state_at<T: Serialize + DeserializeOwned>(
+pub(crate) async fn replace_state_at<T: Serialize + DeserializeOwned + Sync>(
     client: &Client,
     namespace: &str,
     name: &str,

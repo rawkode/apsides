@@ -481,7 +481,7 @@ mod tests {
     use crate::{ExpectedPod, ProcessTerminationObservation, ProxyDrainObservation};
     use std::collections::BTreeMap;
 
-    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
     fn profile() -> EvidenceProfile {
         EvidenceProfile {
@@ -498,12 +498,8 @@ mod tests {
     }
 
     fn writers(name: &str, pod: &str) -> ExpectedWriters {
-        let mut regular = vec![CapturedContainer {
-            name: "runtime".into(),
-            container_id: "containerd://runtime".into(),
-        }];
-        if name == "proxy" {
-            regular = vec![
+        let regular = if name == "proxy" {
+            vec![
                 CapturedContainer {
                     name: "envoy".into(),
                     container_id: "containerd://envoy".into(),
@@ -512,8 +508,13 @@ mod tests {
                     name: "admin".into(),
                     container_id: "containerd://admin".into(),
                 },
-            ];
-        }
+            ]
+        } else {
+            vec![CapturedContainer {
+                name: "runtime".into(),
+                container_id: "containerd://runtime".into(),
+            }]
+        };
         ExpectedWriters {
             deployment_name: name.into(),
             deployment_uid: format!("{name}-uid"),

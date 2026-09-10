@@ -272,21 +272,21 @@ enum CandidateRole {
 }
 
 impl CandidateRole {
-    fn candidate(self, pair: &CandidatePair) -> &release::IntegrityVerifiedCandidate {
+    const fn candidate(self, pair: &CandidatePair) -> &release::IntegrityVerifiedCandidate {
         match self {
             Self::Owner => &pair.owner,
             Self::Contender => &pair.contender,
         }
     }
 
-    fn outcome(self) -> &'static str {
+    const fn outcome(self) -> &'static str {
         match self {
             Self::Owner => "owner-prepared",
             Self::Contender => "contender-prepared",
         }
     }
 
-    fn creation_source(self) -> &'static str {
+    const fn creation_source(self) -> &'static str {
         match self {
             Self::Owner => "capability-complete-projection",
             Self::Contender => "claims-empty-capability-complete-projection",
@@ -603,7 +603,7 @@ enum FieldSet {
     Mutation,
 }
 
-fn require_fields(settings: &Settings, fields: FieldSet) -> Result<()> {
+const fn require_fields(settings: &Settings, fields: FieldSet) -> Result<()> {
     let target = settings.target.is_some();
     let uid = settings.registry_uid.is_some();
     let revision = settings.registry_resource_version.is_some();

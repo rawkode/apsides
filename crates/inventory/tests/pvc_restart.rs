@@ -43,7 +43,7 @@ impl Phase {
             _ => Err("unsupported PVC probe phase".into()),
         }
     }
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::Seed => "seed",
             Self::Verify => "verify",

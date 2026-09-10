@@ -59,7 +59,7 @@ fn error_kind(error: &(dyn std::error::Error + 'static)) -> &'static str {
 #[test]
 fn ceiling_error_kind_requires_a_typed_ceiling_variant() {
     let ceiling = || compiler_core::Error::Ceiling("typed fixture".into());
-    let positives: Vec<Box<dyn std::error::Error>> = vec![
+    let positives: Vec<Box<dyn std::error::Error + Send + Sync>> = vec![
         Box::new(ceiling()),
         Box::new(deploy::Error::Core(ceiling())),
         Box::new(platform::Error::Core(ceiling())),
@@ -69,7 +69,7 @@ fn ceiling_error_kind_requires_a_typed_ceiling_variant() {
         assert_eq!(error_kind(error.as_ref()), "permission-ceiling");
     }
     let invalid = || compiler_core::Error::Invalid("permission ceiling exceeded".into());
-    let unrelated: Vec<Box<dyn std::error::Error>> = vec![
+    let unrelated: Vec<Box<dyn std::error::Error + Send + Sync>> = vec![
         Box::new(invalid()),
         Box::new(deploy::Error::Core(invalid())),
         Box::new(platform::Error::Core(invalid())),

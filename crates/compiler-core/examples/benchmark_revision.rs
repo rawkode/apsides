@@ -6,7 +6,7 @@ use compiler_core::{
 use serde_json::json;
 use std::{collections::BTreeMap, error::Error, io::Read};
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() != 2 || args[1].len() > 128 || args[1].is_empty() {
         return Err("usage: benchmark_revision IR_PATH PUBLIC_REVISION_VALUE".into());

@@ -48,6 +48,7 @@ impl CandidatePairPurpose {
 }
 
 /// One immutable pair marker and the two platform-policy identities it binds.
+///
 /// The nested marker UID and resourceVersion identify the pair marker, never the
 /// single-candidate marker used by reservation and collision qualification.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,9 +121,10 @@ impl CandidatePairLifecycleOperation {
     }
 }
 
-/// Unforgeable, ordered candidate references whose exact pair marker was read
-/// from the runner-owned cluster. Operations re-read that marker before and
-/// after delegating to the ordinary lifecycle implementation.
+/// Unforgeable, ordered candidate references bound to one runner-owned cluster.
+///
+/// The exact pair marker was read from that cluster, and operations re-read it
+/// before and after delegating to the ordinary lifecycle implementation.
 pub struct CandidateQualificationPair<'a> {
     initial: &'a IntegrityVerifiedCandidate,
     successor: &'a IntegrityVerifiedCandidate,
@@ -130,7 +132,7 @@ pub struct CandidateQualificationPair<'a> {
 }
 
 impl CandidateQualificationPair<'_> {
-    fn candidate(&self, role: CandidatePairRole) -> &IntegrityVerifiedCandidate {
+    const fn candidate(&self, role: CandidatePairRole) -> &IntegrityVerifiedCandidate {
         match role {
             CandidatePairRole::Initial => self.initial,
             CandidatePairRole::Successor => self.successor,

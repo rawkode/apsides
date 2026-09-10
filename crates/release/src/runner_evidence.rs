@@ -57,7 +57,7 @@ fn valid_id(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_.:/".contains(&b))
 }
-fn scalar(value: &Value) -> bool {
+const fn scalar(value: &Value) -> bool {
     match value {
         Value::Bool(_) | Value::Number(_) => true,
         Value::String(s) => s.len() <= 1024,

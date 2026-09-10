@@ -2,7 +2,7 @@ use super::*;
 use serde_json::json;
 use std::collections::BTreeSet;
 
-type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 fn bound_fixture(
     registry: &LifecycleRegistry,
@@ -52,10 +52,10 @@ async fn reservation_persists_exact_executor_binding_in_its_single_registry_cas(
     let before = registry_object(&registry, REGISTRY_UID, "42")?;
     let (client, calls) = wire(vec![
         before.clone(),
-        object("policy", &policy, "policy-uid", "40"),
+        object("policy", &policy, "policy-uid", "40")?,
         before,
         json!("echo-put"),
-    ]);
+    ])?;
     let client = platform_client(client, "control", "workload", "cluster-a")?;
     let written = reserve_test_transition(&client, &request, "ci_job_1").await?;
     let plan = deploy::plan_transition(&request)?;
@@ -138,7 +138,7 @@ async fn unsupported_schema_or_missing_executor_binding_is_rejected_without_a_wr
                 .remove("executorBinding");
         }
         control["data"]["state.json"] = json!(serde_json::to_string(&state)?);
-        let (client, calls) = wire(vec![control]);
+        let (client, calls) = wire(vec![control])?;
         assert!(
             platform_client(client, "control", "workload", "cluster-a")?
                 .load_registry()
@@ -171,7 +171,7 @@ async fn selection_rejects_binding_or_issued_identity_drift_but_allows_credentia
         uid: REGISTRY_UID.into(),
         resource_version: "42".into(),
     };
-    let (client, calls) = wire(Vec::new());
+    let (client, calls) = wire(Vec::new())?;
     let renewed = bound_fixture(
         &registry,
         client,
@@ -205,7 +205,7 @@ async fn selection_rejects_binding_or_issued_identity_drift_but_allows_credentia
             1 => approval.resource_version = "32".into(),
             _ => approval.value.binding_secret_uid = "replacement-secret".into(),
         }
-        let (client, _) = wire(Vec::new());
+        let (client, _) = wire(Vec::new())?;
         let changed_identity = bound_fixture(&registry, client, "2100-01-01T00:00:00Z", approval)?;
         assert!(changed_identity.selected(&protected, TRANSITION_A).is_err());
     }
@@ -227,7 +227,7 @@ async fn bare_platform_client_cannot_reserve_or_bind_a_transition() -> TestResul
     } = reservation_fixture()?;
     let inventory = MemoryInventoryStore::default();
     let (reserve_client, reserve_calls) =
-        wire_with_identity(Vec::new(), deployment_identity_object());
+        wire_with_identity(Vec::new(), deployment_identity_object()?)?;
     let reserve_client = PlatformClient::new(reserve_client, "control", "workload", "cluster-a")?
         .with_claim_store(fixture_claim_store().clone())
         .with_audit_store(Arc::new(audit_support::MemoryAuditStore::default()))
@@ -244,7 +244,7 @@ async fn bare_platform_client_cannot_reserve_or_bind_a_transition() -> TestResul
             .is_empty()
     );
 
-    let (bind_client, bind_calls) = wire_with_identity(Vec::new(), deployment_identity_object());
+    let (bind_client, bind_calls) = wire_with_identity(Vec::new(), deployment_identity_object()?)?;
     let bind_client = PlatformClient::new(bind_client, "control", "workload", "cluster-a")?
         .with_claim_store(fixture_claim_store().clone())
         .with_audit_store(Arc::new(audit_support::MemoryAuditStore::default()))
@@ -280,8 +280,8 @@ async fn changed_live_identity_is_rejected_before_any_lifecycle_write() -> TestR
         &current,
         "deployment-identity-uid",
         "31",
-    );
-    let (client, calls) = wire_with_identity(Vec::new(), identity);
+    )?;
+    let (client, calls) = wire_with_identity(Vec::new(), identity)?;
     let bound = bound_fixture(
         &registry,
         client,
@@ -307,7 +307,7 @@ async fn changed_live_identity_is_rejected_before_any_lifecycle_write() -> TestR
 
 #[tokio::test]
 async fn invalid_scope_or_expired_issued_witness_never_creates_authority() -> TestResult {
-    let (client, calls) = wire_with_identity(Vec::new(), deployment_identity_object());
+    let (client, calls) = wire_with_identity(Vec::new(), deployment_identity_object()?)?;
     let bare = PlatformClient::new(client, "control", "workload", "cluster-a")?;
     let mut foreign = fixture_deployment_identity_approval();
     foreign.value.cluster_binding = "other-cluster".into();

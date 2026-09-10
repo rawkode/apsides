@@ -2,7 +2,9 @@ use compiler_core::{canonical_bytes, digest};
 use release::validate_compiler_closure;
 use serde_json::{Value, json};
 
-fn valid_inputs() -> (Value, String) {
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+fn valid_inputs() -> TestResult<(Value, String)> {
     let build_context_files = json!([
         {"path":".cargo/config.toml","sha256":format!("sha256:{}", "1".repeat(64))},
         {"path":"Dockerfile","sha256":format!("sha256:{}", "2".repeat(64))},
@@ -26,32 +28,33 @@ fn valid_inputs() -> (Value, String) {
     ]);
     let cli: Vec<Value> = packaging_files
         .as_array()
-        .unwrap()
+        .ok_or("packaging file list is not an array")?
         .iter()
-        .filter(|file| file["path"].as_str().unwrap().starts_with("crates/cli/"))
+        .filter(|file| {
+            file["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("crates/cli/"))
+        })
         .cloned()
         .collect();
     let config = canonical_bytes(&json!({
         "architecture":"arm64","os":"linux","config":{},
         "rootfs":{"type":"layers","diff_ids":[]}
-    }))
-    .unwrap();
+    }))?;
     let manifest = canonical_bytes(&json!({
         "schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json",
         "config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":digest_bytes(&config),"size":config.len()},
         "layers":[]
-    }))
-    .unwrap();
+    }))?;
     let index = canonical_bytes(&json!({
         "schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json",
         "manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":digest_bytes(&manifest),"size":manifest.len(),"platform":{"os":"linux","architecture":"arm64"}}]
-    }))
-    .unwrap();
+    }))?;
     let approved_runtime = json!({
         "baseImage":{"reference":format!("example.invalid/runtime@{}",digest_bytes(&index)),"platform":"linux/arm64"},
-        "indexJson":String::from_utf8(index).unwrap(),
-        "manifestJson":String::from_utf8(manifest).unwrap(),
-        "configJson":String::from_utf8(config).unwrap()
+        "indexJson":String::from_utf8(index)?,
+        "manifestJson":String::from_utf8(manifest)?,
+        "configJson":String::from_utf8(config)?
     });
     let host_tools: Vec<_> = ["buildx", "cargo", "docker", "python", "apsides", "sbom"]
         .into_iter()
@@ -69,15 +72,15 @@ fn valid_inputs() -> (Value, String) {
             "packagingFiles":packaging_files,
             "buildProfileSha256":format!("sha256:{}", "5".repeat(64)),
             "hostTools":host_tools,
-            "trustedCliCodeSha256":digest(&cli).unwrap(),
+            "trustedCliCodeSha256":digest(&cli)?,
             "approvedRuntime":approved_runtime
         }
     });
-    let identity = digest(&closure).unwrap();
-    (
+    let identity = digest(&closure)?;
+    Ok((
         json!({"sdk":closure["authoringCompiler"]["sdk"],"toolchain":closure["authoringCompiler"]["toolchain"],"compilerClosure":closure,"compilerClosureDigest":identity}),
         identity,
-    )
+    ))
 }
 
 fn digest_bytes(bytes: &[u8]) -> String {
@@ -86,69 +89,77 @@ fn digest_bytes(bytes: &[u8]) -> String {
 }
 
 #[test]
-fn recomputes_complete_compiler_closure() {
-    let (inputs, identity) = valid_inputs();
-    assert_eq!(
-        validate_compiler_closure(&inputs, &identity).unwrap(),
-        identity
-    );
+fn recomputes_complete_compiler_closure() -> TestResult {
+    let (inputs, identity) = valid_inputs()?;
+    assert_eq!(validate_compiler_closure(&inputs, &identity)?, identity);
+    Ok(())
 }
 
 #[test]
-fn rejects_labels_disconnected_from_actual_closure() {
-    let (mut inputs, identity) = valid_inputs();
+fn rejects_labels_disconnected_from_actual_closure() -> TestResult {
+    let (mut inputs, identity) = valid_inputs()?;
     assert!(validate_compiler_closure(&inputs, &format!("sha256:{}", "f".repeat(64))).is_err());
     inputs["toolchain"]["deno"] = json!("other");
     assert!(validate_compiler_closure(&inputs, &identity).is_err());
+    Ok(())
 }
 
 #[test]
-fn rejects_incomplete_or_forged_native_identity() {
-    let (mut inputs, identity) = valid_inputs();
+fn rejects_incomplete_or_forged_native_identity() -> TestResult {
+    let (mut inputs, identity) = valid_inputs()?;
     inputs["compilerClosure"]["nativeCompiler"] = Value::Null;
     assert!(validate_compiler_closure(&inputs, &identity).is_err());
-    let (mut inputs, identity) = valid_inputs();
+    let (mut inputs, identity) = valid_inputs()?;
     inputs["compilerClosure"]["nativeCompiler"]["trustedCliCodeSha256"] =
         json!(format!("sha256:{}", "9".repeat(64)));
     assert!(validate_compiler_closure(&inputs, &identity).is_err());
+    Ok(())
 }
 
 #[test]
-fn rejects_ambiguous_native_file_manifests() {
-    let (mut inputs, identity) = valid_inputs();
+fn rejects_ambiguous_native_file_manifests() -> TestResult {
+    let (mut inputs, identity) = valid_inputs()?;
     inputs["compilerClosure"]["nativeCompiler"]["buildContextFiles"]
         .as_array_mut()
-        .unwrap()
+        .ok_or("build context file list is not an array")?
         .reverse();
     assert!(validate_compiler_closure(&inputs, &identity).is_err());
+    Ok(())
 }
 
 #[test]
-fn rejects_missing_packaging_sources_and_host_tools() {
-    let (mut inputs, _) = valid_inputs();
+fn rejects_missing_packaging_sources_and_host_tools() -> TestResult {
+    let (mut inputs, _) = valid_inputs()?;
     inputs["compilerClosure"]["nativeCompiler"]["packagingFiles"]
         .as_array_mut()
-        .unwrap()
+        .ok_or("expected a JSON array")?
         .pop();
-    let identity = digest(&inputs["compilerClosure"]).unwrap();
-    inputs["compilerClosureDigest"] = json!(identity.clone());
+    let identity = digest(&inputs["compilerClosure"])?;
+    inputs["compilerClosureDigest"] = json!(identity);
     assert!(validate_compiler_closure(&inputs, &identity).is_err());
 
-    let (mut inputs, _) = valid_inputs();
+    let (mut inputs, _) = valid_inputs()?;
     inputs["compilerClosure"]["nativeCompiler"]["hostTools"][0]["role"] = json!("docker");
-    let identity = digest(&inputs["compilerClosure"]).unwrap();
-    inputs["compilerClosureDigest"] = json!(identity.clone());
+    let identity = digest(&inputs["compilerClosure"])?;
+    inputs["compilerClosureDigest"] = json!(identity);
     assert!(validate_compiler_closure(&inputs, &identity).is_err());
+    Ok(())
 }
 
 #[test]
-fn rejects_runtime_documents_disconnected_from_the_approved_base() {
-    let (mut inputs, _) = valid_inputs();
+fn rejects_runtime_documents_disconnected_from_the_approved_base() -> TestResult {
+    let (mut inputs, _) = valid_inputs()?;
     inputs["compilerClosure"]["nativeCompiler"]["approvedRuntime"]["manifestJson"] = json!("{}");
-    let identity = digest(&inputs["compilerClosure"]).unwrap();
+    let identity = digest(&inputs["compilerClosure"])?;
     inputs["compilerClosureDigest"] = json!(identity);
     assert!(
-        validate_compiler_closure(&inputs, inputs["compilerClosureDigest"].as_str().unwrap())
-            .is_err()
+        validate_compiler_closure(
+            &inputs,
+            inputs["compilerClosureDigest"]
+                .as_str()
+                .ok_or("compiler closure digest is not a string")?
+        )
+        .is_err()
     );
+    Ok(())
 }

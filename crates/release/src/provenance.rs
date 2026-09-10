@@ -111,10 +111,9 @@ async fn run(tool: &Path, args: &[String], input: &[u8], directory: &Path) -> Re
         }
         Ok(output)
     };
-    match tokio::time::timeout(Duration::from_secs(60), operation).await {
-        Ok(result) => result,
-        Err(_) => reject("signature verifier timed out"),
-    }
+    tokio::time::timeout(Duration::from_secs(60), operation)
+        .await
+        .unwrap_or_else(|_| reject("signature verifier timed out"))
 }
 
 fn nonempty(value: &str, max: usize) -> bool {

@@ -1,6 +1,6 @@
 use super::*;
 
-type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[tokio::test]
 async fn reservation_wire_excludes_private_values_and_source_payloads() -> TestResult {
@@ -19,10 +19,10 @@ async fn reservation_wire_excludes_private_values_and_source_payloads() -> TestR
     let before = registry_object(&registry, REGISTRY_UID, "42")?;
     let (client, calls) = wire(vec![
         before.clone(),
-        object("policy", &policy, "policy-uid", "40"),
+        object("policy", &policy, "policy-uid", "40")?,
         before,
         json!("echo-put"),
-    ]);
+    ])?;
     let client = platform_client(client, "control", "workload", "cluster-a")?;
     let written = reserve_test_transition(&client, &request, "ci_job_1").await?;
     let stored = written.value.transition(TRANSITION_A)?;
@@ -106,10 +106,10 @@ async fn selected_session_rejects_substituted_frozen_planning_authority() -> Tes
     let before = registry_object(&registry, REGISTRY_UID, "42")?;
     let (client, _) = wire(vec![
         before.clone(),
-        object("policy", &policy, "policy-uid", "40"),
+        object("policy", &policy, "policy-uid", "40")?,
         before,
         json!("echo-put"),
-    ]);
+    ])?;
     let client = platform_client(client, "control", "workload", "cluster-a")?;
     let written = reserve_test_transition(&client, &request, "ci_job_1").await?;
     let plan = deploy::plan_transition(&request)?;

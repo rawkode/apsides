@@ -7,7 +7,7 @@ use crate::WriterCheckpoint;
 use crate::writer_checkpoint::select_retirement_identities as select;
 use std::collections::BTreeMap;
 
-pub(crate) fn identities(previous: &WriterCheckpoint) -> &BTreeMap<String, String> {
+pub(crate) const fn identities(previous: &WriterCheckpoint) -> &BTreeMap<String, String> {
     &previous.retirement_identity_uids
 }
 

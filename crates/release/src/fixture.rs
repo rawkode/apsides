@@ -51,7 +51,10 @@ fn validate_fixture_substitution(production: &Value, fixture: &Value) -> Result<
                 let container = container.as_object_mut().ok_or_else(|| {
                     crate::Error::Rejected("fixture container is not an object".into())
                 })?;
-                container.insert("image".into(), Value::String("apsides-fixture:local".into()));
+                container.insert(
+                    "image".into(),
+                    Value::String("apsides-fixture:local".into()),
+                );
                 container.insert("imagePullPolicy".into(), Value::String("Never".into()));
             }
         }

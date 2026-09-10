@@ -11,7 +11,7 @@ use serde_json::json;
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const REGISTRY_UID: &str = "11111111-1111-4111-8111-111111111111";
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 fn scope() -> InventoryScope {
     InventoryScope {
@@ -210,7 +210,7 @@ fn assert_changed(
 fn generation(
     private_value: &str,
     private_annotation: &str,
-) -> Result<GenerationPlan, Box<dyn std::error::Error>> {
+) -> Result<GenerationPlan, Box<dyn std::error::Error + Send + Sync>> {
     let value = json!({
         "schemaVersion": "apsides.dev/ir/v1",
         "domain": {

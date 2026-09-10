@@ -1,3 +1,7 @@
+//! The compiled artifact: emission, its source record, and integrity checks.
+
+pub mod input;
+
 use crate::Result;
 use compiler_core::{CompiledPlan, parse_and_validate};
 use serde::{Deserialize, Serialize};
@@ -238,9 +242,9 @@ pub fn prepare_lock(root: &Path) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn path_escape_is_rejected_before_file_access() {
+    fn path_escape_is_rejected_before_file_access() -> Result<()> {
         let root = std::env::temp_dir().join(format!("apsides-escape-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&root)?;
         let mut files = BTreeMap::from([("../escape".into(), "sha256:bad".into())]);
         for path in [
             "ir.json",
@@ -260,13 +264,13 @@ mod tests {
             production_ready: false,
             files,
         };
-        fs::write(root.join("manifest.json"), serde_json::to_vec(&m).unwrap()).unwrap();
+        fs::write(root.join("manifest.json"), serde_json::to_vec(&m)?)?;
+        let error = verify(&root).err().ok_or("path escape was accepted")?;
         assert!(
-            verify(&root)
-                .unwrap_err()
-                .to_string()
-                .contains("relative normal path")
+            error.to_string().contains("relative normal path"),
+            "{error}"
         );
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

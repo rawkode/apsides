@@ -11,7 +11,7 @@ use std::{
 };
 use tower::service_fn;
 
-type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const UID: &str = "11111111-1111-4111-8111-111111111111";
 
 fn snapshot() -> ClaimSnapshotV1 {

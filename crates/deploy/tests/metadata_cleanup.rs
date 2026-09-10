@@ -6,7 +6,8 @@ use inventory::{
 use std::collections::BTreeSet;
 
 #[test]
-fn cleanup_uses_only_metadata_and_prior_policy() -> Result<(), Box<dyn std::error::Error>> {
+fn cleanup_uses_only_metadata_and_prior_policy()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let scope = InventoryScope {
         cluster: "cluster".into(),
         namespace: "workload".into(),

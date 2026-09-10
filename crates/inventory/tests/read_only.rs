@@ -125,7 +125,10 @@ async fn read_only_open_rejects_missing_file_and_tables_without_creation() -> Te
             .is_err()
     );
     assert_eq!(std::fs::read(&incomplete)?, before);
-    assert_eq!(table_count(&incomplete, "apsides_inventory_heads").await?, 0);
+    assert_eq!(
+        table_count(&incomplete, "apsides_inventory_heads").await?,
+        0
+    );
     Ok(())
 }
 
@@ -137,7 +140,10 @@ async fn read_only_open_rejects_wrong_version_without_repair() -> TestResult {
     let database = libsql::Builder::new_local(&path).build().await?;
     database
         .connect()?
-        .execute("UPDATE apsides_inventory_schema SET version=2 WHERE id=1", ())
+        .execute(
+            "UPDATE apsides_inventory_schema SET version=2 WHERE id=1",
+            (),
+        )
         .await?;
     let before = std::fs::read(&path)?;
     assert!(matches!(
@@ -161,7 +167,10 @@ async fn read_only_load_rejects_corrupt_metadata_without_repair() -> TestResult 
     let database = libsql::Builder::new_local(&path).build().await?;
     database
         .connect()?
-        .execute("UPDATE apsides_inventory_snapshots SET metadata=x'7b7d'", ())
+        .execute(
+            "UPDATE apsides_inventory_snapshots SET metadata=x'7b7d'",
+            (),
+        )
         .await?;
     drop(database);
     let before = std::fs::read(&path)?;

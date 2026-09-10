@@ -1,14 +1,3 @@
-#![cfg_attr(
-    not(test),
-    deny(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::unreachable,
-        clippy::todo,
-        clippy::unimplemented
-    )
-)]
 #![forbid(unsafe_code)]
 //! Kubernetes-backed protected state. Hashes identify content; authenticated
 //! Kubernetes transport and platform-owned RBAC establish the writer boundary.

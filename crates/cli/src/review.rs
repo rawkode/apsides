@@ -1,15 +1,10 @@
 //! Deployment declaration review of a release-bound plan and authenticated metadata.
-#[path = "review_budget.rs"]
 mod budget;
-#[path = "review_declarations.rs"]
 mod declarations;
-#[path = "review_requirements.rs"]
+mod live;
 mod requirements;
-#[path = "review_resources.rs"]
 mod resources;
 
-#[path = "review_live.rs"]
-mod live;
 pub(crate) use live::LiveReview;
 
 use coordination::{ReviewMetadataV1, ReviewRef};

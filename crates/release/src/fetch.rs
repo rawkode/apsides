@@ -65,12 +65,13 @@ impl ResolvedRelease {
         self.directory.path()
     }
     #[must_use]
-    pub fn verified(&self) -> &VerifiedRelease {
+    pub const fn verified(&self) -> &VerifiedRelease {
         &self.verified
     }
 }
 
 /// Retrieve into a private fresh directory and verify the exact approved release.
+///
 /// Registry credentials use ORAS's normal trusted CI configuration. The caller
 /// supplies policy independently of the fetched artifact.
 /// # Errors
@@ -102,7 +103,7 @@ pub struct FetchedRelease {
 
 impl FetchedRelease {
     #[must_use]
-    pub fn reference(&self) -> &ReleaseReference {
+    pub const fn reference(&self) -> &ReleaseReference {
         &self.reference
     }
     #[must_use]

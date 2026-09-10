@@ -179,7 +179,7 @@ fn custom_resource_mapping_is_explicit_and_exact() -> Result<()> {
     invalid.resources[0].identity.api_group.clear();
     assert!(invalid.validate().is_err());
 
-    invalid = value.clone();
+    invalid = value;
     invalid.resources[0].api_resource = Some(ReviewApiResourceMapping {
         plural: "configmaps".into(),
         scope: ReviewApiResourceScope::Namespaced,

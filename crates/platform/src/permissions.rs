@@ -112,9 +112,10 @@ impl Requests {
     }
 }
 
-/// Enumerate the isolated-proxy executor's required access, conditional Role
-/// delegation, and the broader RBAC scopes needed for generated names.
-/// This report grants no authority. An upgrade's retirement namespaces must be
+/// Enumerate the isolated-proxy executor's required access.
+///
+/// This covers conditional Role delegation and the broader RBAC scopes needed
+/// for generated names. The report grants no authority. An upgrade's retirement namespaces must be
 /// authenticated against protected history by reservation before the report can
 /// be used to provision access; canonicality alone cannot establish that history.
 /// # Errors

@@ -1,6 +1,8 @@
 use release::{Assertion, validate_assertions};
 use serde_json::{Value, json};
 
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 fn assertion(id: &str, expected: Value, actual: Value) -> Assertion {
     Assertion {
         check_id: id.into(),
@@ -11,7 +13,7 @@ fn assertion(id: &str, expected: Value, actual: Value) -> Assertion {
 }
 
 #[test]
-fn validates_case_specific_expectations() {
+fn validates_case_specific_expectations() -> TestResult {
     validate_assertions(
         "case-digest",
         true,
@@ -20,8 +22,7 @@ fn validates_case_specific_expectations() {
             assertion("revision-changed", json!(true), json!(true)),
             assertion("target-converged", json!(true), json!(true)),
         ],
-    )
-    .unwrap();
+    )?;
     validate_assertions(
         "case-digest",
         true,
@@ -32,8 +33,7 @@ fn validates_case_specific_expectations() {
             assertion("revision-unchanged", json!(true), json!(true)),
             assertion("target-mutations", json!(0), json!(0)),
         ],
-    )
-    .unwrap();
+    )?;
     validate_assertions(
         "case-digest",
         true,
@@ -44,8 +44,7 @@ fn validates_case_specific_expectations() {
             assertion("revision-unchanged", json!(true), json!(true)),
             assertion("target-mutations", json!(0), json!(0)),
         ],
-    )
-    .unwrap();
+    )?;
     validate_assertions(
         "case-digest",
         true,
@@ -56,8 +55,7 @@ fn validates_case_specific_expectations() {
             assertion("revision-unchanged", json!(true), json!(true)),
             assertion("template-mutations", json!(0), json!(0)),
         ],
-    )
-    .unwrap();
+    )?;
     validate_assertions(
         "case-digest",
         true,
@@ -68,8 +66,7 @@ fn validates_case_specific_expectations() {
             assertion("revision-unchanged", json!(true), json!(true)),
             assertion("target-mutations", json!(0), json!(0)),
         ],
-    )
-    .unwrap();
+    )?;
     validate_assertions(
         "case-digest",
         true,
@@ -78,8 +75,8 @@ fn validates_case_specific_expectations() {
             assertion("ready-pods", json!(">=1"), json!(3)),
             assertion("new-template-ready", json!(true), json!(true)),
         ],
-    )
-    .unwrap();
+    )?;
+    Ok(())
 }
 
 #[test]
@@ -108,7 +105,7 @@ fn rejects_self_selected_or_incomplete_case_expectations() {
 }
 
 #[test]
-fn validates_release_check_specific_expectations() {
+fn validates_release_check_specific_expectations() -> TestResult {
     validate_assertions(
         "declared-input-isolation",
         false,
@@ -117,8 +114,7 @@ fn validates_release_check_specific_expectations() {
             assertion("sandbox-engine", json!("SES"), json!("SES")),
             assertion("undeclared-input-rejected", json!(true), json!(true)),
         ],
-    )
-    .unwrap();
+    )?;
     validate_assertions(
         "secret-canary-scan",
         false,
@@ -127,8 +123,8 @@ fn validates_release_check_specific_expectations() {
             assertion("canary-occurrences", json!(0), json!(0)),
             assertion("files-scanned", json!(">=1"), json!(42)),
         ],
-    )
-    .unwrap();
+    )?;
+    Ok(())
 }
 
 #[test]

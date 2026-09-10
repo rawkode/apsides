@@ -3,7 +3,7 @@ use coordination::{AuditRef, AuditStore, TransitionAuditV1};
 use deploy::{Event, Phase, Quiescence, TerminationEvidence};
 use std::sync::atomic::{AtomicU8, Ordering};
 
-type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const PRIVATE_STAGE_KEY: &str = "private-stage-key-canary";
 
@@ -184,10 +184,10 @@ async fn successor_commit_archives_reads_and_prunes_only_its_predecessor() -> Te
     let audit_store = Arc::new(audit_support::MemoryAuditStore::default());
     let policy = policy(&registry.plan(TRANSITION_B)?.request.next.compiled);
     let (client, calls) = wire(vec![
-        object("apsides-policy-example", &policy, "policy-uid", "40"),
+        object("apsides-policy-example", &policy, "policy-uid", "40")?,
         registry_object(&registry, REGISTRY_UID, "42")?,
         json!("echo-put"),
-    ]);
+    ])?;
     let platform = bind_audit_store(&registry, client, TRANSITION_B, audit_store.clone())?;
     let committed = platform
         .transition_event(
@@ -239,7 +239,7 @@ async fn successor_commit_archives_reads_and_prunes_only_its_predecessor() -> Te
     }
 
     let object = registry_object(&committed.value, REGISTRY_UID, &committed.resource_version)?;
-    let (client, calls) = wire(vec![object]);
+    let (client, calls) = wire(vec![object])?;
     let reader =
         platform_client(client, "control", "workload", "cluster-a")?.with_audit_store(audit_store);
     assert_eq!(
@@ -287,7 +287,7 @@ struct ControlledAuditStore {
 }
 
 impl ControlledAuditStore {
-    fn with_mode(mode: AuditMode) -> Self {
+    const fn with_mode(mode: AuditMode) -> Self {
         Self {
             mode: AtomicU8::new(mode as u8),
             rows: Mutex::new(BTreeMap::new()),
@@ -408,10 +408,10 @@ async fn attempt_upgrade_commit(
 ) -> TestResult<(platform::Result<Versioned<NamespaceRegistry>>, Calls)> {
     let policy = policy(&registry.plan(TRANSITION_B)?.request.next.compiled);
     let (client, calls) = wire(vec![
-        object("apsides-policy-example", &policy, "policy-uid", "40"),
+        object("apsides-policy-example", &policy, "policy-uid", "40")?,
         registry_object(registry, REGISTRY_UID, "42")?,
         admission,
-    ]);
+    ])?;
     let platform = bind_audit_store(registry, client, TRANSITION_B, audit_store)?;
     let previous = Versioned {
         value: registry.registry.clone(),
@@ -517,8 +517,11 @@ fn conflict_wire(responses: Vec<Value>) -> (Client, Calls) {
                     return Response::builder()
                         .header("content-type", "application/json")
                         .body(Body::from(
-                            serde_json::to_vec(&deployment_identity_object())
-                                .map_err(std::io::Error::other)?,
+                            serde_json::to_vec(
+                                &deployment_identity_object()
+                                    .map_err(|error| std::io::Error::other(error.to_string()))?,
+                            )
+                            .map_err(std::io::Error::other)?,
                         ))
                         .map_err(std::io::Error::other);
                 }
@@ -549,6 +552,7 @@ fn conflict_wire(responses: Vec<Value>) -> (Client, Calls) {
                     .ends_with("/configmaps/apsides-registry-authority.control.workload")
                 {
                     registry_authority()
+                        .map_err(|error| std::io::Error::other(error.to_string()))?
                 } else {
                     replies
                         .lock()
@@ -574,7 +578,7 @@ async fn actual_registry_conflict_leaves_truthful_archive_for_retry() -> TestRes
     let store = Arc::new(ControlledAuditStore::default());
     let policy = policy(&registry.plan(TRANSITION_B)?.request.next.compiled);
     let (client, calls) = conflict_wire(vec![
-        object("apsides-policy-example", &policy, "policy-uid", "40"),
+        object("apsides-policy-example", &policy, "policy-uid", "40")?,
         registry_object(&registry, REGISTRY_UID, "42")?,
     ]);
     let platform = bind_audit_store(&registry, client, TRANSITION_B, store.clone())?;
@@ -782,7 +786,7 @@ async fn successor_archive_rejects_missing_or_corrupt_prior_head_before_put_or_p
             resource_version: committed.resource_version,
         };
         commit_third_record(&mut registry, &transition_c)?;
-        let (client, calls) = wire(Vec::new());
+        let (client, calls) = wire(Vec::new())?;
         let platform = bind_audit_store(&registry, client, &transition_c, store.clone())?;
 
         let error = match platform
@@ -825,7 +829,7 @@ async fn protected_audit_head_rejects_missing_or_corrupt_archive_rows() -> TestR
     let control = registry_object(&committed.value, REGISTRY_UID, &committed.resource_version)?;
 
     let missing_store = Arc::new(ControlledAuditStore::with_mode(AuditMode::MissingRead));
-    let (client, calls) = wire(vec![control.clone()]);
+    let (client, calls) = wire(vec![control.clone()])?;
     let reader = platform_client(client, "control", "workload", "cluster-a")?
         .with_audit_store(missing_store);
     assert!(
@@ -843,7 +847,7 @@ async fn protected_audit_head_rejects_missing_or_corrupt_archive_rows() -> TestR
     );
 
     good_store.set_mode(AuditMode::CorruptRead);
-    let (client, calls) = wire(vec![control]);
+    let (client, calls) = wire(vec![control])?;
     let reader =
         platform_client(client, "control", "workload", "cluster-a")?.with_audit_store(good_store);
     assert!(
@@ -897,7 +901,7 @@ async fn malformed_v5_retention_states_fail_on_authenticated_load_without_writes
         .previous_writer_checkpoint = None;
 
     for registry in [multiple_committed, missing_active, invalid_pending] {
-        let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?]);
+        let (client, calls) = wire(vec![registry_object(&registry, REGISTRY_UID, "42")?])?;
         let platform = platform_client(client, "control", "workload", "cluster-a")?;
         assert!(platform.load_registry().await.is_err());
         assert!(
@@ -921,10 +925,10 @@ async fn initial_commit_retains_current_record_and_never_writes_an_archive() -> 
     };
     let policy = policy(&registry.plan(TRANSITION_A)?.request.next.compiled);
     let (client, calls) = wire(vec![
-        object("apsides-policy-example", &policy, "policy-uid", "40"),
+        object("apsides-policy-example", &policy, "policy-uid", "40")?,
         registry_object(&registry, REGISTRY_UID, "42")?,
         json!("echo-put"),
-    ]);
+    ])?;
     let platform = bind_audit_store(&registry, client, TRANSITION_A, Arc::new(RejectAuditStore))?;
     let committed = platform
         .transition_event(

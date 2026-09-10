@@ -1,29 +1,25 @@
 //! Read-only transition history. Audit output never grants lifecycle authority.
-use crate::{Result, only, required};
+use crate::{Result, cli, report};
 use kube::{Client, Config};
 use platform::PlatformClient;
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, io::Write as _, time::Duration};
+use std::time::Duration;
 
-pub fn command(options: &BTreeMap<String, String>) -> Result<()> {
-    only(
-        options,
-        &[
-            "--domain",
-            "--transition",
-            "--cluster-binding",
-            "--namespace",
-            "--control-namespace",
-        ],
-    )?;
-    let domain = required(options, "--domain")?;
-    let transition = required(options, "--transition")?;
-    let cluster = required(options, "--cluster-binding")?;
-    let namespace = required(options, "--namespace")?;
-    let control_namespace = required(options, "--control-namespace")?;
+/// # Errors
+/// Returns an error if the endpoint is not authenticated TLS, if the domain is
+/// absent from the protected registry, or if the lookup times out — in which
+/// case nothing is concluded about whether the transition exists.
+pub fn command(arguments: &cli::Audit) -> Result<()> {
+    let cli::Audit {
+        domain,
+        transition,
+        cluster_binding,
+        namespace,
+        control_namespace,
+    } = arguments;
     platform::install_rustls_ring_provider()?;
     let runtime = tokio::runtime::Runtime::new()?;
-    let report = runtime.block_on(async {
+    let status = runtime.block_on(async {
         let mut config = Config::infer().await?;
         if config.cluster_url.scheme_str() != Some("https") || config.accept_invalid_certs {
             return Err("audit requires an authenticated TLS Kubernetes endpoint".into());
@@ -31,28 +27,23 @@ pub fn command(options: &BTreeMap<String, String>) -> Result<()> {
         config.default_retry = false;
         config.connect_timeout = Some(Duration::from_secs(10));
         config.read_timeout = Some(Duration::from_secs(30));
-        let store = crate::inventory_connection::connect_audit_reader().await?;
+        let store = crate::connection::connect_audit_reader().await?;
         let client = PlatformClient::new(
             Client::try_from(config)?,
             control_namespace,
             namespace,
-            cluster,
+            cluster_binding,
         )?
         .with_claim_store(store.clone())
         .with_audit_store(store);
-        tokio::time::timeout(Duration::from_secs(30), report(&client, domain, transition))
+        tokio::time::timeout(Duration::from_secs(30), lookup(&client, domain, transition))
             .await
             .map_err(|_| "audit lookup timed out; no conclusion about transition existence")?
     })?;
-    writeln!(
-        std::io::stdout().lock(),
-        "{}",
-        serde_json::to_string_pretty(&report)?
-    )?;
-    Ok(())
+    report::emit(&status)
 }
 
-async fn report(client: &PlatformClient, domain: &str, transition: &str) -> Result<Value> {
+async fn lookup(client: &PlatformClient, domain: &str, transition: &str) -> Result<Value> {
     let registry = client.load_registry().await?;
     if !registry.value.histories.contains_key(domain) {
         return Err("audit domain is not present in the protected registry".into());
@@ -114,7 +105,7 @@ mod tests {
     use deploy::Phase;
     use serde_json::json;
 
-    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
     const REGISTRY_UID: &str = "11111111-1111-4111-8111-111111111111";
 

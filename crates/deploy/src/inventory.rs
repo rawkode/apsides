@@ -64,9 +64,10 @@ pub fn generation_inventory(
     Ok((scope, snapshot))
 }
 
-/// Project a trusted historical generation into the complete metadata needed by
-/// a future planner. The allocation remains the protected authority for the
-/// immutable inventory metadata; active claims bind its captured UIDs.
+/// Project a trusted historical generation into the metadata a future planner needs.
+///
+/// The allocation remains the protected authority for the immutable inventory
+/// metadata; active claims bind its captured UIDs.
 /// # Errors
 /// Rejects altered compiler output, allocation mismatches, incomplete claims,
 /// or malformed inventory and identity metadata.

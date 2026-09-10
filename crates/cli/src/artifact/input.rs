@@ -1,12 +1,17 @@
-use crate::Result;
+use crate::{Result, cli};
 use release::{FetchedRelease, OrasTool, ReleaseReference};
 use std::{
-    collections::BTreeMap,
     env,
     fs::File,
     io::Read as _,
     path::{Path, PathBuf},
 };
+
+/// Where a deployment reads its release from when nothing else is configured.
+const DEFAULT_ARTIFACT: &str = "dist/apsides";
+
+/// The largest release reference document the CLI will read.
+const MAX_REFERENCE_BYTES: u64 = 16 * 1024;
 
 /// Own remote downloads for the entire deployment, including verification,
 /// staging and retry checks that read files again.
@@ -29,15 +34,19 @@ impl ArtifactInput {
     }
 }
 
-pub async fn open(options: &BTreeMap<String, String>) -> Result<ArtifactInput> {
-    let reference = options
-        .get("--artifact-reference")
-        .map(PathBuf::from)
+/// Open the release this deployment should use, downloading it when the caller
+/// supplied an immutable OCI reference.
+///
+/// # Errors
+/// Returns an error if both a local artifact and a reference are in play, if
+/// the reference is unbounded, malformed or not immutable, or if the configured
+/// `oras` tool is missing.
+pub async fn open(arguments: &cli::Deploy) -> Result<ArtifactInput> {
+    let reference = arguments
+        .artifact_reference
+        .clone()
         .or_else(|| env::var_os("APSIDES_RELEASE_REFERENCE").map(PathBuf::from));
-    let local = select_local(
-        options.get("--artifact").map(PathBuf::from),
-        reference.as_deref(),
-    )?;
+    let local = select_local(arguments.artifact.clone(), reference.as_deref())?;
     let Some(reference) = reference else {
         return Ok(ArtifactInput::Local(local));
     };
@@ -45,8 +54,8 @@ pub async fn open(options: &BTreeMap<String, String>) -> Result<ArtifactInput> {
     let executable = env::var_os("APSIDES_ORAS")
         .map(PathBuf::from)
         .ok_or("OCI deployment requires APSIDES_ORAS with an absolute tool path")?;
-    let sha256 =
-        env::var("APSIDES_ORAS_SHA256").map_err(|_| "OCI deployment requires APSIDES_ORAS_SHA256")?;
+    let sha256 = env::var("APSIDES_ORAS_SHA256")
+        .map_err(|_| "OCI deployment requires APSIDES_ORAS_SHA256")?;
     let tool = OrasTool {
         executable,
         sha256,
@@ -61,15 +70,15 @@ fn select_local(local: Option<PathBuf>, reference: Option<&Path>) -> Result<Path
     if local.is_some() && reference.is_some() {
         return Err("choose a local artifact or an OCI release reference, not both".into());
     }
-    Ok(local.unwrap_or_else(|| PathBuf::from("dist/apsides")))
+    Ok(local.unwrap_or_else(|| PathBuf::from(DEFAULT_ARTIFACT)))
 }
 
 fn read_reference(path: &Path) -> Result<ReleaseReference> {
     let mut bytes = Vec::new();
     File::open(path)?
-        .take(16 * 1024 + 1)
+        .take(MAX_REFERENCE_BYTES + 1)
         .read_to_end(&mut bytes)?;
-    if bytes.len() > 16 * 1024 {
+    if bytes.len() as u64 > MAX_REFERENCE_BYTES {
         return Err("release reference exceeds 16 KiB".into());
     }
     let input = std::str::from_utf8(&bytes)?;
@@ -83,7 +92,7 @@ mod tests {
     use super::*;
     #[test]
     fn local_selection_is_explicit_and_does_not_mask_remote_configuration() -> Result<()> {
-        assert_eq!(select_local(None, None)?, PathBuf::from("dist/apsides"));
+        assert_eq!(select_local(None, None)?, PathBuf::from(DEFAULT_ARTIFACT));
         assert_eq!(
             select_local(Some("build".into()), None)?,
             PathBuf::from("build")

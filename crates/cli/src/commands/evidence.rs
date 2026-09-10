@@ -1,23 +1,28 @@
-use crate::{Result, only, required};
+use crate::{Result, cli, report};
 use std::{
-    collections::BTreeMap,
     fs,
-    io::{Read as _, Write as _},
+    io::Read as _,
     path::{Component, Path},
 };
 
-pub fn command(options: &BTreeMap<String, String>) -> Result<()> {
-    only(options, &["--artifact", "--fragments", "--output"])?;
-    let fragments = Path::new(required(options, "--fragments")?);
+/// The largest fragment list the CLI will read.
+const MAX_BYTES: usize = 1024 * 1024;
+
+/// # Errors
+/// Returns an error before the candidate is opened if the fragment list is
+/// missing, oversized, empty, over-long, or names a path that is absolute,
+/// traverses upwards, or crosses a symlink.
+pub fn command(arguments: &cli::MergeEvidence) -> Result<()> {
+    let fragments = arguments.fragments.as_path();
     let metadata = fragments.symlink_metadata()?;
-    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+    if !metadata.is_file() || metadata.len() > MAX_BYTES as u64 {
         return Err("evidence fragment list must be a bounded regular file".into());
     }
     let mut contents = String::new();
     fs::File::open(fragments)?
-        .take(1024 * 1024 + 1)
+        .take(MAX_BYTES as u64 + 1)
         .read_to_string(&mut contents)?;
-    if contents.len() > 1024 * 1024 {
+    if contents.len() > MAX_BYTES {
         return Err("evidence fragment list exceeds its size limit".into());
     }
     let values: Vec<String> = serde_json::from_value(compiler_core::parse_strict(&contents)?)?;
@@ -47,17 +52,11 @@ pub fn command(options: &BTreeMap<String, String>) -> Result<()> {
         }
         receipts.push(receipt);
     }
-    let summary = release::merge_evidence(
-        Path::new(required(options, "--artifact")?),
+    report::emit(&release::merge_evidence(
+        &arguments.artifact,
         &receipts,
-        Path::new(required(options, "--output")?),
-    )?;
-    writeln!(
-        std::io::stdout().lock(),
-        "{}",
-        serde_json::to_string_pretty(&summary)?
-    )?;
-    Ok(())
+        &arguments.output,
+    )?)
 }
 
 #[cfg(test)]
@@ -69,21 +68,11 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let fragments = directory.path().join("fragments.json");
         let output = directory.path().join("merged");
-        let options = BTreeMap::from([
-            (
-                "--artifact".into(),
-                directory
-                    .path()
-                    .join("absent")
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-            (
-                "--fragments".into(),
-                fragments.to_string_lossy().into_owned(),
-            ),
-            ("--output".into(), output.to_string_lossy().into_owned()),
-        ]);
+        let arguments = cli::MergeEvidence {
+            artifact: directory.path().join("absent"),
+            fragments: fragments.clone(),
+            output: output.clone(),
+        };
         for contents in [
             "[]",
             "[\"../receipt.json\"]",
@@ -92,7 +81,7 @@ mod tests {
             "[42]",
         ] {
             fs::write(&fragments, contents)?;
-            let error = command(&options)
+            let error = command(&arguments)
                 .err()
                 .ok_or("invalid fragment list was accepted")?;
             if error.downcast_ref::<std::io::Error>().is_some() || output.exists() {
@@ -100,7 +89,7 @@ mod tests {
             }
         }
         fs::write(&fragments, " ".repeat(1024 * 1024 + 1))?;
-        let error = command(&options)
+        let error = command(&arguments)
             .err()
             .ok_or("oversized fragment list was accepted")?;
         if error.to_string() != "evidence fragment list must be a bounded regular file" {

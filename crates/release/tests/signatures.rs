@@ -15,10 +15,10 @@ fn assertion(id: &str, expected: Value, actual: Value) -> Value {
     value.insert("passed".into(), Value::Bool(true));
     Value::Object(value)
 }
-fn case_assertions(scenario: &str) -> Vec<Value> {
+fn case_assertions(scenario: &str) -> TestResult<Vec<Value>> {
     let boolean = |id: &str, value: bool| assertion(id, json!(value), json!(value));
     let zero = |id: &str| assertion(id, json!(0), json!(0));
-    match scenario {
+    Ok(match scenario {
         "initial-evaluation" => vec![
             boolean("revision-present", true),
             boolean("target-converged", true),
@@ -75,13 +75,13 @@ fn case_assertions(scenario: &str) -> Vec<Value> {
             assertion("ready-pods", json!(">=1"), json!(1)),
             boolean("new-template-ready", true),
         ],
-        other => panic!("missing test assertion fixture for {other}"),
-    }
+        other => return Err(format!("missing test assertion fixture for {other}").into()),
+    })
 }
-fn check_assertions(check: &str) -> Vec<Value> {
+fn check_assertions(check: &str) -> TestResult<Vec<Value>> {
     let boolean = |id: &str, value: bool| assertion(id, json!(value), json!(value));
     let zero = |id: &str| assertion(id, json!(0), json!(0));
-    match check {
+    Ok(match check {
         "reproducible-payload" => vec![
             assertion("independent-builds", json!(2), json!(2)),
             boolean("payload-digests-equal", true),
@@ -146,16 +146,18 @@ fn check_assertions(check: &str) -> Vec<Value> {
             boolean("actual-credential-tests-passed", true),
             boolean("undisclosed-gap", false),
         ],
-        other => panic!("missing release-check assertion fixture for {other}"),
-    }
+        other => {
+            return Err(format!("missing release-check assertion fixture for {other}").into());
+        }
+    })
 }
-fn write_json(root: &Path, name: &str, value: &Value) -> Vec<u8> {
-    let bytes = canonical_bytes(value).unwrap();
-    fs::write(root.join(name), &bytes).unwrap();
-    bytes
+fn write_json(root: &Path, name: &str, value: &Value) -> TestResult<Vec<u8>> {
+    let bytes = canonical_bytes(value)?;
+    fs::write(root.join(name), &bytes)?;
+    Ok(bytes)
 }
 
-fn tar(files: Vec<(&str, &[u8], bool)>) -> Vec<u8> {
+fn tar(files: Vec<(&str, &[u8], bool)>) -> TestResult<Vec<u8>> {
     let mut archive = tar::Builder::new(Vec::new());
     for (path, bytes, directory) in files {
         let mut header = tar::Header::new_gnu();
@@ -167,52 +169,51 @@ fn tar(files: Vec<(&str, &[u8], bool)>) -> Vec<u8> {
             tar::EntryType::Regular
         });
         header.set_cksum();
-        archive.append_data(&mut header, path, bytes).unwrap();
+        archive.append_data(&mut header, path, bytes)?;
     }
-    archive.into_inner().unwrap()
+    Ok(archive.into_inner()?)
 }
 
-fn approved_runtime() -> Value {
-    let layer = tar(vec![]);
+fn approved_runtime() -> TestResult<Value> {
+    let layer = tar(vec![])?;
     let config = canonical_bytes(&json!({
         "architecture":"arm64","os":"linux","config":{},
         "rootfs":{"type":"layers","diff_ids":[hash(&layer)]}
-    }))
-    .unwrap();
+    }))?;
     let runtime_manifest = canonical_bytes(&json!({
         "schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json",
         "config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":hash(&config),"size":config.len()},
         "layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":hash(&layer),"size":layer.len()}]
-    }))
-    .unwrap();
+    }))?;
     let index = canonical_bytes(&json!({
         "schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json",
         "manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":hash(&runtime_manifest),"size":runtime_manifest.len(),"platform":{"os":"linux","architecture":"arm64"}}]
-    }))
-    .unwrap();
-    json!({
+    }))?;
+    Ok(json!({
         "baseImage":{"reference":format!("example.invalid/runtime@{}",hash(&index)),"platform":"linux/arm64"},
-        "indexJson":String::from_utf8(index).unwrap(),
-        "manifestJson":String::from_utf8(runtime_manifest).unwrap(),
-        "configJson":String::from_utf8(config).unwrap()
-    })
+        "indexJson":String::from_utf8(index)?,
+        "manifestJson":String::from_utf8(runtime_manifest)?,
+        "configJson":String::from_utf8(config)?
+    }))
 }
-fn command(args: &[&str]) {
-    let output = Command::new("/usr/bin/ssh-keygen")
-        .args(args)
-        .output()
-        .unwrap();
+fn command(args: &[&str]) -> TestResult {
+    let output = Command::new("/usr/bin/ssh-keygen").args(args).output()?;
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    Ok(())
 }
-fn release(root: &Path) -> TrustPolicy {
-    assert!(
-        fs::create_dir(root.join("evidence")).is_ok(),
-        "test evidence directory creation failed"
-    );
+/// The compiled documents a release is assembled from, and their digests.
+struct Documents {
+    plan: compiler_core::CompiledPlan,
+    inputs: Value,
+    compiler: String,
+    files: BTreeMap<String, String>,
+}
+
+fn write_documents(root: &Path) -> TestResult<Documents> {
     let ir = json!({
         "schemaVersion":"apsides.dev/ir/v1","testOnly":false,
         "domain":{"id":"example","namespace":"workload","controlNamespace":"apsides-system","clusterBinding":"test-cluster","policyRef":"platform/example","enforcement":"api-bound","budgets":{"maxResources":64,"maxInputs":64,"maxReactions":64,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},
@@ -220,13 +221,13 @@ fn release(root: &Path) -> TrustPolicy {
         "inputs":[],"reactions":[],
         "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"controller.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
     });
-    let plan = parse_and_validate(&ir.to_string()).unwrap();
-    let (inputs, compiler) = compiler_inputs();
+    let plan = parse_and_validate(&ir.to_string())?;
+    let (inputs, compiler) = compiler_inputs()?;
     // These are verifier test payloads, not reactor-suite acceptance evidence.
     let mut files = BTreeMap::new();
     for (name, value) in [
         ("ir.json", ir),
-        ("plan.json", serde_json::to_value(&plan).unwrap()),
+        ("plan.json", serde_json::to_value(&plan)?),
         ("build-inputs.json", inputs.clone()),
         ("source-map.json", json!({})),
         ("sbom.json", json!({})),
@@ -238,78 +239,106 @@ fn release(root: &Path) -> TrustPolicy {
             json!({"purpose":"signature verifier test only"}),
         ),
     ] {
-        files.insert(name.to_owned(), hash(&write_json(root, name, &value)));
+        files.insert(name.to_owned(), hash(&write_json(root, name, &value)?));
     }
     for (name, value) in compiler_core::review_documents(&plan) {
-        files.insert(name.into(), hash(&write_json(root, name, &value)));
+        files.insert(name.into(), hash(&write_json(root, name, &value)?));
     }
     files.insert(
         "test-plan.json".into(),
         hash(&write_json(
             root,
             "test-plan.json",
-            &serde_json::to_value(&plan.test_plan).unwrap(),
-        )),
+            &serde_json::to_value(&plan.test_plan)?,
+        )?),
     );
+    Ok(Documents {
+        plan,
+        inputs,
+        compiler,
+        files,
+    })
+}
+
+fn release(root: &Path) -> TestResult<TrustPolicy> {
+    assert!(
+        fs::create_dir(root.join("evidence")).is_ok(),
+        "test evidence directory creation failed"
+    );
+    let Documents {
+        plan,
+        inputs,
+        compiler,
+        mut files,
+    } = write_documents(root)?;
     // Minimal architecture header exercises metadata verification, not execution.
     let mut binary = vec![0_u8; 64];
     binary[..6].copy_from_slice(b"\x7fELF\x02\x01");
     binary[18] = 183;
-    fs::write(root.join("apsides-controller"), &binary).unwrap();
+    fs::write(root.join("apsides-controller"), &binary)?;
     files.insert("apsides-controller".into(), hash(&binary));
-    let image_digest = write_oci(root, &binary, &plan.ir_digest);
+    let image_digest = write_oci(root, &binary, &plan.ir_digest)?;
     files.insert(
         "controller.oci.tar".into(),
-        hash(&fs::read(root.join("controller.oci.tar")).unwrap()),
+        hash(&fs::read(root.join("controller.oci.tar"))?),
     );
-    add_evidence(root, &plan, &mut files);
-    let mut manifest = json!({"schemaVersion":"apsides.dev/release/v1","mode":"production","irDigest":plan.ir_digest,"image":{"reference":format!("example.invalid/controller@{}",image_digest),"platform":"linux/arm64"},"source":{"repository":"https://github.com/example/apsides","commit":"a".repeat(40),"inputsDigest":digest(&inputs).unwrap()},"compilerDigest":compiler,"binaryDigest":hash(&binary),"files":files});
-    add_production_evidence(root, &mut manifest);
-    let bytes = write_json(root, "release.json", &manifest);
+    add_evidence(root, &plan, &mut files)?;
+    let mut manifest = json!({"schemaVersion":"apsides.dev/release/v1","mode":"production","irDigest":plan.ir_digest,"image":{"reference":format!("example.invalid/controller@{}",image_digest),"platform":"linux/arm64"},"source":{"repository":"https://github.com/example/apsides","commit":"a".repeat(40),"inputsDigest":digest(&inputs)?},"compilerDigest":compiler,"binaryDigest":hash(&binary),"files":files});
+    add_production_evidence(root, &mut manifest)?;
+    let bytes = write_json(root, "release.json", &manifest)?;
     write_json(
         root,
         "provenance.json",
         &json!({"_type":"https://in-toto.io/Statement/v1","predicateType":"https://slsa.dev/provenance/v1","subject":[{"name":"release.json","digest":{"sha256":hash(&bytes).trim_start_matches("sha256:")}}],"predicate":{"buildDefinition":{"externalParameters":{"repository":manifest["source"]["repository"],"commit":manifest["source"]["commit"],"compilerDigest":compiler}}}}),
-    );
+    )?;
     let key = root.join("key");
-    command(&["-q", "-t", "ed25519", "-N", "", "-f", key.to_str().unwrap()]);
+    command(&[
+        "-q",
+        "-t",
+        "ed25519",
+        "-N",
+        "",
+        "-f",
+        key.to_str().ok_or("path is not valid UTF-8")?,
+    ])?;
     command(&[
         "-Y",
         "sign",
         "-f",
-        key.to_str().unwrap(),
+        key.to_str().ok_or("path is not valid UTF-8")?,
         "-n",
         "apsides.provenance.v1",
-        root.join("provenance.json").to_str().unwrap(),
-    ]);
+        root.join("provenance.json")
+            .to_str()
+            .ok_or("path is not valid UTF-8")?,
+    ])?;
     fs::rename(
         root.join("provenance.json.sig"),
         root.join("provenance.sig"),
-    )
-    .unwrap();
-    TrustPolicy {
+    )?;
+    Ok(TrustPolicy {
         schema_version: "apsides.dev/trust/v1".into(),
         repository: "https://github.com/example/apsides".into(),
         approved_compiler_digests: vec![compiler],
         verifier: VerifierTool {
             executable: "/usr/bin/ssh-keygen".into(),
-            sha256: hash(&fs::read("/usr/bin/ssh-keygen").unwrap()),
+            sha256: hash(&fs::read("/usr/bin/ssh-keygen")?),
         },
         signature: SignaturePolicy::OpenSsh {
             principal: "release@example.invalid".into(),
             allowed_signers: format!(
                 "release@example.invalid {}",
-                fs::read_to_string(root.join("key.pub")).unwrap()
+                fs::read_to_string(root.join("key.pub"))?
             ),
         },
-    }
+    })
 }
 
 #[tokio::test]
-async fn actual_openssh_signature_is_required_and_policy_bound() {
-    let root = tempfile::tempdir().unwrap();
-    let policy = release(root.path());
-    let verified = verify_release(root.path(), &policy).await.unwrap();
+async fn actual_openssh_signature_is_required_and_policy_bound() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let policy = release(root.path())?;
+    let verified = verify_release(root.path(), &policy).await?;
     assert_eq!(verified.manifest().source.repository, policy.repository);
     let mut wrong = policy.clone();
     if let SignaturePolicy::OpenSsh { principal, .. } = &mut wrong.signature {
@@ -322,122 +351,117 @@ async fn actual_openssh_signature_is_required_and_policy_bound() {
     wrong = policy.clone();
     wrong.verifier.sha256 = hash(b"different tool");
     assert!(verify_release(root.path(), &wrong).await.is_err());
-    fs::write(root.path().join("provenance.sig"), b"not a signature").unwrap();
+    fs::write(root.path().join("provenance.sig"), b"not a signature")?;
     assert!(verify_release(root.path(), &policy).await.is_err());
+    Ok(())
 }
 
 #[tokio::test]
-async fn altered_payload_and_unsigned_manifest_cannot_be_promoted() {
-    let root = tempfile::tempdir().unwrap();
-    let policy = release(root.path());
-    fs::write(root.path().join("sbom.json"), b"{\"changed\":true}").unwrap();
+async fn altered_payload_and_unsigned_manifest_cannot_be_promoted() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let policy = release(root.path())?;
+    fs::write(root.path().join("sbom.json"), b"{\"changed\":true}")?;
     assert!(verify_release(root.path(), &policy).await.is_err());
-    let root = tempfile::tempdir().unwrap();
-    let policy = release(root.path());
-    let mut manifest: Value =
-        serde_json::from_slice(&fs::read(root.path().join("release.json")).unwrap()).unwrap();
+    let root = tempfile::tempdir()?;
+    let policy = release(root.path())?;
+    let mut manifest: Value = serde_json::from_slice(&fs::read(root.path().join("release.json"))?)?;
     manifest["mode"] = json!("fixture");
-    write_json(root.path(), "release.json", &manifest);
+    write_json(root.path(), "release.json", &manifest)?;
     assert!(verify_release(root.path(), &policy).await.is_err());
+    Ok(())
 }
 
-fn resign(root: &Path) {
-    let manifest: Value =
-        serde_json::from_slice(&fs::read(root.join("release.json")).unwrap()).unwrap();
-    let mut statement: Value =
-        serde_json::from_slice(&fs::read(root.join("provenance.json")).unwrap()).unwrap();
+fn resign(root: &Path) -> TestResult {
+    let manifest: Value = serde_json::from_slice(&fs::read(root.join("release.json"))?)?;
+    let mut statement: Value = serde_json::from_slice(&fs::read(root.join("provenance.json"))?)?;
     statement["subject"][0]["digest"]["sha256"] =
-        json!(hash(&fs::read(root.join("release.json")).unwrap()).trim_start_matches("sha256:"));
+        json!(hash(&fs::read(root.join("release.json"))?).trim_start_matches("sha256:"));
     statement["predicate"]["buildDefinition"]["externalParameters"]["compilerDigest"] =
         manifest["compilerDigest"].clone();
-    write_json(root, "provenance.json", &statement);
+    write_json(root, "provenance.json", &statement)?;
     command(&[
         "-Y",
         "sign",
         "-f",
-        root.join("key").to_str().unwrap(),
+        root.join("key").to_str().ok_or("path is not valid UTF-8")?,
         "-n",
         "apsides.provenance.v1",
-        root.join("provenance.json").to_str().unwrap(),
-    ]);
+        root.join("provenance.json")
+            .to_str()
+            .ok_or("path is not valid UTF-8")?,
+    ])?;
     fs::rename(
         root.join("provenance.json.sig"),
         root.join("provenance.sig"),
-    )
-    .unwrap();
+    )?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn approved_signer_cannot_bypass_required_coverage() {
-    let root = tempfile::tempdir().unwrap();
-    let policy = release(root.path());
+async fn approved_signer_cannot_bypass_required_coverage() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let policy = release(root.path())?;
     let mut coverage: Value =
-        serde_json::from_slice(&fs::read(root.path().join("coverage.json")).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(root.path().join("coverage.json"))?)?;
     coverage["checks"]["offline-reactor-suite"]["status"] = json!("unsupported");
-    let bytes = write_json(root.path(), "coverage.json", &coverage);
-    let mut manifest: Value =
-        serde_json::from_slice(&fs::read(root.path().join("release.json")).unwrap()).unwrap();
+    let bytes = write_json(root.path(), "coverage.json", &coverage)?;
+    let mut manifest: Value = serde_json::from_slice(&fs::read(root.path().join("release.json"))?)?;
     manifest["files"]["coverage.json"] = json!(hash(&bytes));
-    write_json(root.path(), "release.json", &manifest);
-    resign(root.path());
-    let candidate = verify_candidate(root.path(), &policy).await.unwrap();
+    write_json(root.path(), "release.json", &manifest)?;
+    resign(root.path())?;
+    let candidate = verify_candidate(root.path(), &policy).await?;
     assert_eq!(candidate.manifest().ir_digest, manifest["irDigest"]);
     #[cfg(feature = "test-support")]
-    candidate
-        .authorize_test_staging(release::TestStagingScope {
-            cluster_binding: "test-cluster".into(),
-            control_namespace: "apsides-system".into(),
-            workload_namespace: "workload".into(),
-        })
-        .unwrap();
+    candidate.authorize_test_staging(release::TestStagingScope {
+        cluster_binding: "test-cluster".into(),
+        control_namespace: "apsides-system".into(),
+        workload_namespace: "workload".into(),
+    })?;
     let error = verify_release(root.path(), &policy)
         .await
-        .unwrap_err()
+        .err()
+        .ok_or("expected this call to fail")?
         .to_string();
     assert!(error.contains("required release evidence"), "{error}");
+    Ok(())
 }
 
 #[tokio::test]
-async fn embedded_fixture_marker_survives_manifest_mode_changes() {
-    let root = tempfile::tempdir().unwrap();
-    let policy = release(root.path());
-    let mut ir: Value =
-        serde_json::from_slice(&fs::read(root.path().join("ir.json")).unwrap()).unwrap();
+async fn embedded_fixture_marker_survives_manifest_mode_changes() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let policy = release(root.path())?;
+    let mut ir: Value = serde_json::from_slice(&fs::read(root.path().join("ir.json"))?)?;
     ir["testOnly"] = json!(true);
-    let compiled = parse_and_validate(&ir.to_string()).unwrap();
-    let ir_bytes = write_json(root.path(), "ir.json", &ir);
-    let plan_bytes = write_json(
-        root.path(),
-        "plan.json",
-        &serde_json::to_value(&compiled).unwrap(),
-    );
-    let mut manifest: Value =
-        serde_json::from_slice(&fs::read(root.path().join("release.json")).unwrap()).unwrap();
+    let compiled = parse_and_validate(&ir.to_string())?;
+    let ir_bytes = write_json(root.path(), "ir.json", &ir)?;
+    let plan_bytes = write_json(root.path(), "plan.json", &serde_json::to_value(&compiled)?)?;
+    let mut manifest: Value = serde_json::from_slice(&fs::read(root.path().join("release.json"))?)?;
     manifest["files"]["ir.json"] = json!(hash(&ir_bytes));
     manifest["files"]["plan.json"] = json!(hash(&plan_bytes));
     manifest["irDigest"] = json!(compiled.ir_digest);
-    let binary = fs::read(root.path().join("apsides-controller")).unwrap();
-    let image = write_oci(root.path(), &binary, &compiled.ir_digest);
+    let binary = fs::read(root.path().join("apsides-controller"))?;
+    let image = write_oci(root.path(), &binary, &compiled.ir_digest)?;
     manifest["image"]["reference"] = json!(format!("example.invalid/controller@{image}"));
-    manifest["files"]["controller.oci.tar"] = json!(hash(
-        &fs::read(root.path().join("controller.oci.tar")).unwrap()
-    ));
+    manifest["files"]["controller.oci.tar"] =
+        json!(hash(&fs::read(root.path().join("controller.oci.tar"))?));
 
     for (name, value) in compiler_core::review_documents(&compiled) {
-        let bytes = write_json(root.path(), name, &value);
+        let bytes = write_json(root.path(), name, &value)?;
         manifest["files"][name] = json!(hash(&bytes));
     }
 
-    write_json(root.path(), "release.json", &manifest);
-    resign(root.path());
+    write_json(root.path(), "release.json", &manifest)?;
+    resign(root.path())?;
     let error = verify_release(root.path(), &policy)
         .await
-        .unwrap_err()
+        .err()
+        .ok_or("expected this call to fail")?
         .to_string();
     assert!(error.contains("testOnly:false"), "{error}");
+    Ok(())
 }
 
-fn write_oci(root: &Path, binary: &[u8], ir_digest: &str) -> String {
+fn write_oci(root: &Path, binary: &[u8], ir_digest: &str) -> TestResult<String> {
     write_oci_with_extra_base(root, binary, ir_digest, false)
 }
 
@@ -446,15 +470,15 @@ fn write_oci_with_extra_base(
     binary: &[u8],
     ir_digest: &str,
     extra_base: bool,
-) -> String {
-    let base = tar(vec![]);
-    let foreign = tar(vec![("etc/foreign-runtime", b"unapproved", false)]);
+) -> TestResult<String> {
+    let base = tar(vec![])?;
+    let foreign = tar(vec![("etc/foreign-runtime", b"unapproved", false)])?;
     let layer = tar(vec![
         ("usr", b"", true),
         ("usr/local", b"", true),
         ("usr/local/bin", b"", true),
         ("usr/local/bin/apsides-controller", binary, false),
-    ]);
+    ])?;
     let mut diff_ids = vec![hash(&base)];
     let mut layers = vec![
         json!({"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":hash(&base),"size":base.len()}),
@@ -465,9 +489,15 @@ fn write_oci_with_extra_base(
     }
     diff_ids.push(hash(&layer));
     layers.push(json!({"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":hash(&layer),"size":layer.len()}));
-    let config=canonical_bytes(&json!({"architecture":"arm64","os":"linux","config":{"Entrypoint":["/usr/local/bin/apsides-controller"],"User":"65532:65532","WorkingDir":"/","Labels":{"dev.apsides.ir-digest":ir_digest,"dev.apsides.release-status":"blocked","org.opencontainers.image.title":"Apsides generated controller"}},"rootfs":{"type":"layers","diff_ids":diff_ids}})).unwrap();
-    let manifest=canonical_bytes(&json!({"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":hash(&config),"size":config.len()},"layers":layers})).unwrap();
-    let index=canonical_bytes(&json!({"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":hash(&manifest),"size":manifest.len()}]})).unwrap();
+    let config = canonical_bytes(
+        &json!({"architecture":"arm64","os":"linux","config":{"Entrypoint":["/usr/local/bin/apsides-controller"],"User":"65532:65532","WorkingDir":"/","Labels":{"dev.apsides.ir-digest":ir_digest,"dev.apsides.release-status":"blocked","org.opencontainers.image.title":"Apsides generated controller"}},"rootfs":{"type":"layers","diff_ids":diff_ids}}),
+    )?;
+    let manifest = canonical_bytes(
+        &json!({"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":hash(&config),"size":config.len()},"layers":layers}),
+    )?;
+    let index = canonical_bytes(
+        &json!({"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":hash(&manifest),"size":manifest.len()}]}),
+    )?;
     let layer_path = format!("blobs/sha256/{}", &hash(&layer)[7..]);
     let base_path = format!("blobs/sha256/{}", &hash(&base)[7..]);
     let foreign_path = format!("blobs/sha256/{}", &hash(&foreign)[7..]);
@@ -490,11 +520,11 @@ fn write_oci_with_extra_base(
         (config_path.as_str(), config.as_slice(), false),
         (manifest_path.as_str(), manifest.as_slice(), false),
     ]);
-    fs::write(root.join("controller.oci.tar"), tar(entries)).unwrap();
-    hash(&manifest)
+    fs::write(root.join("controller.oci.tar"), tar(entries)?)?;
+    Ok(hash(&manifest))
 }
 
-fn compiler_inputs() -> (Value, String) {
+fn compiler_inputs() -> TestResult<(Value, String)> {
     let build_context_files = json!([
         {"path":".cargo/config.toml","sha256":format!("sha256:{}", "1".repeat(64))},
         {"path":"Dockerfile","sha256":format!("sha256:{}", "2".repeat(64))},
@@ -518,12 +548,16 @@ fn compiler_inputs() -> (Value, String) {
     ]);
     let cli: Vec<Value> = packaging_files
         .as_array()
-        .unwrap()
+        .ok_or("expected a JSON array")?
         .iter()
-        .filter(|file| file["path"].as_str().unwrap().starts_with("crates/cli/"))
+        .filter(|file| {
+            file["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("crates/cli/"))
+        })
         .cloned()
         .collect();
-    let approved_runtime = approved_runtime();
+    let approved_runtime = approved_runtime()?;
     let host_tools: Vec<_> = ["buildx", "cargo", "docker", "python", "apsides", "sbom"]
         .into_iter()
         .map(|role| {
@@ -540,23 +574,33 @@ fn compiler_inputs() -> (Value, String) {
             "packagingFiles":packaging_files,
             "buildProfileSha256":format!("sha256:{}", "5".repeat(64)),
             "hostTools":host_tools,
-            "trustedCliCodeSha256":digest(&cli).unwrap(),
+            "trustedCliCodeSha256":digest(&cli)?,
             "approvedRuntime":approved_runtime
         }
     });
-    let identity = digest(&closure).unwrap();
-    (
+    let identity = digest(&closure)?;
+    Ok((
         json!({"sdk":closure["authoringCompiler"]["sdk"],"toolchain":closure["authoringCompiler"]["toolchain"],"compilerClosure":closure,"compilerClosureDigest":identity}),
         identity,
-    )
+    ))
 }
 
 fn add_evidence(
     root: &Path,
     plan: &compiler_core::CompiledPlan,
     files: &mut BTreeMap<String, String>,
-) {
-    let cases: Vec<_> = plan.test_plan.iter().filter(|c|c.required).map(|case| json!({"caseDigest":digest(&serde_json::to_value(case).unwrap()).unwrap(),"result":{"status":"passed","evidenceFiles":["test-evidence.json"]}})).collect();
+) -> TestResult {
+    let cases: Vec<_> = plan
+        .test_plan
+        .iter()
+        .filter(|c| c.required)
+        .map(|case| {
+            Ok(json!({
+                "caseDigest": digest(&serde_json::to_value(case)?)?,
+                "result": {"status":"passed","evidenceFiles":["test-evidence.json"]}
+            }))
+        })
+        .collect::<TestResult<Vec<_>>>()?;
     let checks: BTreeMap<_, _> = release::REQUIRED_CHECKS
         .iter()
         .map(|name| {
@@ -569,19 +613,20 @@ fn add_evidence(
     let coverage = json!({"schemaVersion":"apsides.dev/release-coverage/v1","irDigest":plan.ir_digest,"cases":cases,"checks":checks});
     files.insert(
         "coverage.json".into(),
-        hash(&write_json(root, "coverage.json", &coverage)),
+        hash(&write_json(root, "coverage.json", &coverage)?),
     );
-    let mut fixture = serde_json::to_value(&plan.ir).unwrap();
+    let mut fixture = serde_json::to_value(&plan.ir)?;
     fixture["testOnly"] = json!(true);
-    let fixture_digest = digest(&fixture).unwrap();
+    let fixture_digest = digest(&fixture)?;
     let overlay = json!({"schemaVersion":"apsides.dev/fixture-overlay/v1","testOnly":true,"productionReady":false,"productionIrSha256":plan.ir_digest.strip_prefix("sha256:"),"fixtureIrSha256":fixture_digest.strip_prefix("sha256:")});
-    let artifact = json!({"schemaVersion":"apsides.dev/local-artifact/v1","irDigest":fixture_digest});
-    let artifact_bytes = write_json(root, "tested-artifact-manifest.json", &artifact);
+    let artifact =
+        json!({"schemaVersion":"apsides.dev/local-artifact/v1","irDigest":fixture_digest});
+    let artifact_bytes = write_json(root, "tested-artifact-manifest.json", &artifact)?;
     for (name, value) in [
         ("fixture-ir.json", fixture),
         ("fixture-overlay.json", overlay.clone()),
     ] {
-        files.insert(name.into(), hash(&write_json(root, name, &value)));
+        files.insert(name.into(), hash(&write_json(root, name, &value)?));
     }
     files.insert(
         "tested-artifact-manifest.json".into(),
@@ -590,32 +635,38 @@ fn add_evidence(
     let records: BTreeMap<_, _> = plan.test_plan
         .iter()
         .filter(|case| case.required)
-        .map(|case| (digest(&serde_json::to_value(case).unwrap()).unwrap(), json!({"status":"passed","assertions":case_assertions(&case.scenario),"evidenceFiles":[]})))
-        .collect();
+        .map(|case| {
+            Ok((
+                digest(&serde_json::to_value(case)?)?,
+                json!({"status":"passed","assertions":case_assertions(&case.scenario)?,"evidenceFiles":[]}),
+            ))
+        })
+        .collect::<TestResult<BTreeMap<_, _>>>()?;
     let check_records: BTreeMap<_, _> = release::REQUIRED_CHECKS
         .iter()
         .filter(|name| fixture_check(name))
         .map(|c| {
-            (
+            Ok((
                 *c,
-                json!({"status":"passed","assertions":check_assertions(c),"evidenceFiles":[]}),
-            )
+                json!({"status":"passed","assertions":check_assertions(c)?,"evidenceFiles":[]}),
+            ))
         })
-        .collect();
+        .collect::<TestResult<BTreeMap<_, _>>>()?;
     let runner_bytes = write_json(
         root,
         "evidence/run_cluster.py",
         &json!("synthetic reactor verifier fixture; not executed acceptance evidence"),
-    );
+    )?;
     files.insert("evidence/run_cluster.py".into(), hash(&runner_bytes));
     let evidence = json!({"schemaVersion":"apsides.dev/reactor-evidence/v1","productionIrDigest":plan.ir_digest,
         "fixtureIrDigest":fixture_digest,"testedArtifactDigest":hash(&artifact_bytes),"artifactManifestFile":"tested-artifact-manifest.json",
-        "overlayDigest":digest(&overlay).unwrap(),"runnerIdentity":{"sourceSha256":hash(&runner_bytes),"controllerManifestDigest":hash(b"test controller"),"controllerArchiveDigest":hash(b"test archive"),"fixtureArchiveDigest":hash(b"test fixture"),"nodeImage":format!("example.invalid/node@{}",hash(b"node"))},
+        "overlayDigest":digest(&overlay)?,"runnerIdentity":{"sourceSha256":hash(&runner_bytes),"controllerManifestDigest":hash(b"test controller"),"controllerArchiveDigest":hash(b"test archive"),"fixtureArchiveDigest":hash(b"test fixture"),"nodeImage":format!("example.invalid/node@{}",hash(b"node"))},
         "cases":records,"checks":check_records});
     files.insert(
         "test-evidence.json".into(),
-        hash(&write_json(root, "test-evidence.json", &evidence)),
+        hash(&write_json(root, "test-evidence.json", &evidence)?),
     );
+    Ok(())
 }
 
 fn fixture_check(name: &str) -> bool {
@@ -625,25 +676,25 @@ fn fixture_check(name: &str) -> bool {
     )
 }
 
-fn add_production_evidence(root: &Path, manifest: &mut Value) {
+fn add_production_evidence(root: &Path, manifest: &mut Value) -> TestResult {
     // Synthetic verifier fixtures establish validation behavior, not execution coverage.
     let source = write_json(
         root,
         "runner-source.py",
         &json!("verifier fixture source only"),
-    );
+    )?;
     manifest["files"]["runner-source.py"] = json!(hash(&source));
     let checks: BTreeMap<_, _> = release::REQUIRED_CHECKS
         .iter()
         .filter(|name| !fixture_check(name))
         .map(|name| {
-            (
+            Ok((
                 *name,
-                json!({"status":"passed", "assertions":check_assertions(name),
+                json!({"status":"passed", "assertions":check_assertions(name)?,
             "evidenceFiles":["runner-source.py"]}),
-            )
+            ))
         })
-        .collect();
+        .collect::<TestResult<BTreeMap<_, _>>>()?;
     let payload_files: BTreeMap<_, _> = [
         "build-inputs.json",
         "controller.oci.tar",
@@ -659,13 +710,17 @@ fn add_production_evidence(root: &Path, manifest: &mut Value) {
         "sourceInputsDigest":manifest["source"]["inputsDigest"], "payloadFiles":payload_files,
         "runnerSourceFile":"runner-source.py", "runnerSourceDigest":hash(&source), "checks":checks
     });
-    let bytes = write_json(root, "production-evidence.json", &evidence);
+    let bytes = write_json(root, "production-evidence.json", &evidence)?;
     manifest["files"]["production-evidence.json"] = json!(hash(&bytes));
+    Ok(())
 }
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-fn read_fixture(root: &Path, name: &str) -> Result<Value, Box<dyn std::error::Error>> {
+fn read_fixture(
+    root: &Path,
+    name: &str,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     Ok(serde_json::from_slice(&fs::read(root.join(name))?)?)
 }
 
@@ -675,7 +730,7 @@ fn replace_signed_document(root: &Path, name: &str, document: &Value) -> TestRes
     let mut manifest = read_fixture(root, "release.json")?;
     manifest["files"][name] = json!(hash(&bytes));
     fs::write(root.join("release.json"), canonical_bytes(&manifest)?)?;
-    resign(root);
+    resign(root)?;
     Ok(())
 }
 
@@ -722,7 +777,7 @@ async fn signed_production_evidence_must_match_every_payload_subject() -> TestRe
         ),
     ] {
         let root = tempfile::tempdir()?;
-        let policy = release(root.path());
+        let policy = release(root.path())?;
         verify_release(root.path(), &policy).await?;
         let mut evidence = read_fixture(root.path(), "production-evidence.json")?;
         *evidence
@@ -742,11 +797,11 @@ async fn signed_production_evidence_must_match_every_payload_subject() -> TestRe
 #[tokio::test]
 async fn signed_fixture_evidence_cannot_satisfy_a_production_check() -> TestResult {
     let root = tempfile::tempdir()?;
-    let policy = release(root.path());
+    let policy = release(root.path())?;
     verify_release(root.path(), &policy).await?;
     let mut fixture = read_fixture(root.path(), "test-evidence.json")?;
     fixture["checks"]["reproducible-payload"] = json!({"status":"passed",
-        "assertions":check_assertions("reproducible-payload"), "evidenceFiles":[]});
+        "assertions":check_assertions("reproducible-payload")?, "evidenceFiles":[]});
     replace_signed_document(root.path(), "test-evidence.json", &fixture)?;
     let mut coverage = read_fixture(root.path(), "coverage.json")?;
     coverage["checks"]["reproducible-payload"]["evidenceFiles"] = json!(["test-evidence.json"]);
@@ -758,7 +813,7 @@ async fn signed_fixture_evidence_cannot_satisfy_a_production_check() -> TestResu
 async fn signed_production_runner_source_must_be_bound_and_match() -> TestResult {
     for mutation in ["unbound", "digest", "changed-source"] {
         let root = tempfile::tempdir()?;
-        let policy = release(root.path());
+        let policy = release(root.path())?;
         verify_release(root.path(), &policy).await?;
         let mut evidence = read_fixture(root.path(), "production-evidence.json")?;
         match mutation {
@@ -790,19 +845,19 @@ async fn signed_production_evidence_rejects_open_schema_and_wrong_check_kinds() 
         ("cases", json!({}), "unknown field"),
         (
             "unknown-check",
-            json!({"status":"passed", "assertions":check_assertions("reproducible-payload"),
+            json!({"status":"passed", "assertions":check_assertions("reproducible-payload")?,
             "evidenceFiles":[]}),
             "production evidence contains an unsupported check",
         ),
         (
             "offline-reactor-suite",
-            json!({"status":"passed", "assertions":check_assertions("offline-reactor-suite"),
+            json!({"status":"passed", "assertions":check_assertions("offline-reactor-suite")?,
             "evidenceFiles":[]}),
             "production evidence contains an unsupported check",
         ),
     ] {
         let root = tempfile::tempdir()?;
-        let policy = release(root.path());
+        let policy = release(root.path())?;
         verify_release(root.path(), &policy).await?;
         let mut evidence = read_fixture(root.path(), "production-evidence.json")?;
         if matches!(field, "unexpected" | "cases") {
@@ -819,7 +874,7 @@ async fn signed_production_evidence_rejects_open_schema_and_wrong_check_kinds() 
 #[tokio::test]
 async fn signed_coverage_cannot_add_an_unknown_release_check() -> TestResult {
     let root = tempfile::tempdir()?;
-    let policy = release(root.path());
+    let policy = release(root.path())?;
     verify_release(root.path(), &policy).await?;
     let mut coverage = read_fixture(root.path(), "coverage.json")?;
     coverage["checks"]["unknown-check"] =
@@ -847,7 +902,7 @@ async fn signed_production_assertions_must_satisfy_the_exact_contract() -> TestR
         ),
     ] {
         let root = tempfile::tempdir()?;
-        let policy = release(root.path());
+        let policy = release(root.path())?;
         verify_release(root.path(), &policy).await?;
         let mut evidence = read_fixture(root.path(), "production-evidence.json")?;
         let assertions = evidence["checks"]["reproducible-payload"]["assertions"]
@@ -881,7 +936,7 @@ async fn signed_production_assertions_must_satisfy_the_exact_contract() -> TestR
 async fn signed_reactor_evidence_requires_authenticated_fixed_runner_source() -> TestResult {
     for mutation in ["missing-entry", "swapped-claim", "changed-signed-source"] {
         let root = tempfile::tempdir()?;
-        let policy = release(root.path());
+        let policy = release(root.path())?;
         verify_release(root.path(), &policy).await?;
         match mutation {
             "missing-entry" => {
@@ -895,7 +950,7 @@ async fn signed_reactor_evidence_requires_authenticated_fixed_runner_source() ->
                     root.path().join("release.json"),
                     canonical_bytes(&manifest)?,
                 )?;
-                resign(root.path());
+                resign(root.path())?;
             }
             "swapped-claim" => {
                 let mut evidence = read_fixture(root.path(), "test-evidence.json")?;
@@ -922,96 +977,101 @@ async fn signed_reactor_evidence_requires_authenticated_fixed_runner_source() ->
 }
 
 #[tokio::test]
-async fn signed_binary_must_be_the_image_entrypoint_payload() {
-    let root = tempfile::tempdir().unwrap();
-    let policy = release(root.path());
-    let mut binary = fs::read(root.path().join("apsides-controller")).unwrap();
+async fn signed_binary_must_be_the_image_entrypoint_payload() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let policy = release(root.path())?;
+    let mut binary = fs::read(root.path().join("apsides-controller"))?;
     binary[32] = 1;
-    fs::write(root.path().join("apsides-controller"), &binary).unwrap();
-    let mut manifest: Value =
-        serde_json::from_slice(&fs::read(root.path().join("release.json")).unwrap()).unwrap();
+    fs::write(root.path().join("apsides-controller"), &binary)?;
+    let mut manifest: Value = serde_json::from_slice(&fs::read(root.path().join("release.json"))?)?;
     manifest["binaryDigest"] = json!(hash(&binary));
     manifest["files"]["apsides-controller"] = json!(hash(&binary));
-    write_json(root.path(), "release.json", &manifest);
-    resign(root.path());
+    write_json(root.path(), "release.json", &manifest)?;
+    resign(root.path())?;
     assert!(
         verify_release(root.path(), &policy)
             .await
-            .unwrap_err()
+            .err()
+            .ok_or("expected this call to fail")?
             .to_string()
             .contains("OCI controller bytes")
     );
+    Ok(())
 }
 
 #[tokio::test]
-async fn signed_image_cannot_add_an_unapproved_runtime_base_layer() {
-    let root = tempfile::tempdir().unwrap();
-    let policy = release(root.path());
-    let binary = fs::read(root.path().join("apsides-controller")).unwrap();
-    let mut manifest: Value =
-        serde_json::from_slice(&fs::read(root.path().join("release.json")).unwrap()).unwrap();
+async fn signed_image_cannot_add_an_unapproved_runtime_base_layer() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let policy = release(root.path())?;
+    let binary = fs::read(root.path().join("apsides-controller"))?;
+    let mut manifest: Value = serde_json::from_slice(&fs::read(root.path().join("release.json"))?)?;
     let image = write_oci_with_extra_base(
         root.path(),
         &binary,
-        manifest["irDigest"].as_str().unwrap(),
+        manifest["irDigest"]
+            .as_str()
+            .ok_or("expected a JSON string")?,
         true,
-    );
+    )?;
     manifest["image"]["reference"] = json!(format!("example.invalid/controller@{image}"));
-    manifest["files"]["controller.oci.tar"] = json!(hash(
-        &fs::read(root.path().join("controller.oci.tar")).unwrap()
-    ));
-    write_json(root.path(), "release.json", &manifest);
-    resign(root.path());
+    manifest["files"]["controller.oci.tar"] =
+        json!(hash(&fs::read(root.path().join("controller.oci.tar"))?));
+    write_json(root.path(), "release.json", &manifest)?;
+    resign(root.path())?;
     let error = verify_release(root.path(), &policy)
         .await
-        .unwrap_err()
+        .err()
+        .ok_or("expected this call to fail")?
         .to_string();
     assert!(error.contains("approved runtime layer chain"), "{error}");
+    Ok(())
 }
 
 #[tokio::test]
-async fn signed_status_strings_and_unrelated_files_are_not_test_evidence() {
-    let root = tempfile::tempdir().unwrap();
-    let policy = release(root.path());
+async fn signed_status_strings_and_unrelated_files_are_not_test_evidence() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let policy = release(root.path())?;
     let bytes = write_json(
         root.path(),
         "test-evidence.json",
         &json!({"purpose":"unrelated file"}),
-    );
-    let mut manifest: Value =
-        serde_json::from_slice(&fs::read(root.path().join("release.json")).unwrap()).unwrap();
+    )?;
+    let mut manifest: Value = serde_json::from_slice(&fs::read(root.path().join("release.json"))?)?;
     manifest["files"]["test-evidence.json"] = json!(hash(&bytes));
-    write_json(root.path(), "release.json", &manifest);
-    resign(root.path());
+    write_json(root.path(), "release.json", &manifest)?;
+    resign(root.path())?;
     assert!(verify_release(root.path(), &policy).await.is_err());
+    Ok(())
 }
 
 #[tokio::test]
-async fn production_requires_explicit_marker_even_with_valid_signature() {
-    let root = tempfile::tempdir().unwrap();
-    let policy = release(root.path());
-    let mut ir: Value =
-        serde_json::from_slice(&fs::read(root.path().join("ir.json")).unwrap()).unwrap();
-    ir.as_object_mut().unwrap().remove("testOnly");
-    let bytes = write_json(root.path(), "ir.json", &ir);
-    let mut manifest: Value =
-        serde_json::from_slice(&fs::read(root.path().join("release.json")).unwrap()).unwrap();
+async fn production_requires_explicit_marker_even_with_valid_signature() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let policy = release(root.path())?;
+    let mut ir: Value = serde_json::from_slice(&fs::read(root.path().join("ir.json"))?)?;
+    ir.as_object_mut()
+        .ok_or("expected a JSON object")?
+        .remove("testOnly");
+    let bytes = write_json(root.path(), "ir.json", &ir)?;
+    let mut manifest: Value = serde_json::from_slice(&fs::read(root.path().join("release.json"))?)?;
     manifest["files"]["ir.json"] = json!(hash(&bytes));
-    write_json(root.path(), "release.json", &manifest);
-    resign(root.path());
+    write_json(root.path(), "release.json", &manifest)?;
+    resign(root.path())?;
     assert!(
         verify_release(root.path(), &policy)
             .await
-            .unwrap_err()
+            .err()
+            .ok_or("expected this call to fail")?
             .to_string()
             .contains("testOnly:false")
     );
+    Ok(())
 }
 
 #[tokio::test]
 #[ignore = "requires real ORAS and a disposable TLS registry; verifier fixture only"]
 async fn signed_oci_release_resolves_after_source_workspace_is_removed()
--> Result<(), Box<dyn std::error::Error>> {
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let oras = std::path::PathBuf::from(std::env::var("APSIDES_TEST_ORAS")?);
     let ca = std::path::PathBuf::from(std::env::var("APSIDES_TEST_REGISTRY_CA")?);
     let repository = std::env::var("APSIDES_TEST_OCI_REPOSITORY")?;
@@ -1023,7 +1083,7 @@ async fn signed_oci_release_resolves_after_source_workspace_is_removed()
     }
     .validate()?;
     let source = tempfile::tempdir()?;
-    let policy = release(source.path());
+    let policy = release(source.path())?;
     let manifest_bytes = fs::read(source.path().join("release.json"))?;
     let (manifest, _, _) = release::read_release(source.path())?;
     let mut files: Vec<String> = manifest.files.keys().cloned().collect();

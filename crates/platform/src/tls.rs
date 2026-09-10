@@ -108,41 +108,40 @@ fn leaf(
 
 #[cfg(test)]
 mod tests {
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
     use super::*;
     #[test]
-    fn generations_never_share_ca_or_leaf_private_keys() {
-        let first = generation_tls_secret("tls-one", "control", "one", 86_400).unwrap();
-        let second = generation_tls_secret("tls-two", "control", "two", 86_400).unwrap();
-        let first = first.data.unwrap();
-        let second = second.data.unwrap();
+    fn generations_never_share_ca_or_leaf_private_keys() -> TestResult {
+        let first = generation_tls_secret("tls-one", "control", "one", 86_400)?;
+        let second = generation_tls_secret("tls-two", "control", "two", 86_400)?;
+        let first = first.data.ok_or("generated secret has no data")?;
+        let second = second.data.ok_or("generated secret has no data")?;
         assert_eq!(first.len(), 5);
         assert_ne!(first["ca.crt"], second["ca.crt"]);
         assert_ne!(first["client.key"], first["server.key"]);
         assert!(!first.contains_key("ca.key"));
         assert!(generation_tls_secret("tls", "control", "one", 60).is_err());
+        Ok(())
     }
 
     #[test]
-    fn copied_old_client_certificate_is_rejected_by_new_generation_trust() {
-        let old = generation_tls_secret("old", "control", "old", 86_400)
-            .unwrap()
+    fn copied_old_client_certificate_is_rejected_by_new_generation_trust() -> TestResult {
+        let old = generation_tls_secret("old", "control", "old", 86_400)?
             .data
-            .unwrap();
-        let new = generation_tls_secret("new", "control", "new", 86_400)
-            .unwrap()
+            .ok_or("generated secret has no data")?;
+        let new = generation_tls_secret("new", "control", "new", 86_400)?
             .data
-            .unwrap();
+            .ok_or("generated secret has no data")?;
         let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
         let root =
             std::env::temp_dir().join(format!("apsides-tls-trust-{}-{stamp}", std::process::id()));
-        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&root)?;
         // Only public certificates are written. No private key leaves Secret data.
-        std::fs::write(root.join("old-ca.pem"), &old["ca.crt"].0).unwrap();
-        std::fs::write(root.join("new-ca.pem"), &new["ca.crt"].0).unwrap();
-        std::fs::write(root.join("old-client.pem"), &old["client.crt"].0).unwrap();
+        std::fs::write(root.join("old-ca.pem"), &old["ca.crt"].0)?;
+        std::fs::write(root.join("new-ca.pem"), &new["ca.crt"].0)?;
+        std::fs::write(root.join("old-client.pem"), &old["client.crt"].0)?;
         let verify = |ca: &str| {
             std::process::Command::new("openssl")
                 .arg("verify")
@@ -152,11 +151,10 @@ mod tests {
                 .arg(root.join(ca))
                 .arg(root.join("old-client.pem"))
                 .output()
-                .unwrap()
         };
-        let own = verify("old-ca.pem");
-        let foreign = verify("new-ca.pem");
-        std::fs::remove_dir_all(root).unwrap();
+        let own = verify("old-ca.pem")?;
+        let foreign = verify("new-ca.pem")?;
+        std::fs::remove_dir_all(root)?;
         assert!(
             own.status.success(),
             "standard TLS verifier rejected own generation: {}",
@@ -166,5 +164,6 @@ mod tests {
             !foreign.status.success(),
             "copied client crossed generation CA boundary"
         );
+        Ok(())
     }
 }

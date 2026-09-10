@@ -131,7 +131,6 @@ impl PlatformClient {
         let node_uid = node
             .metadata
             .uid
-            .clone()
             .filter(|n| !n.is_empty())
             .ok_or_else(|| invalid("proxy node UID missing"))?;
         Ok((uid.clone(), node_name, node_uid))
@@ -272,60 +271,58 @@ fn ready_node(node: &Node) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
     use super::*;
     use serde_json::json;
 
     #[test]
-    fn identity_does_not_accept_labels_or_ambiguous_controller_owners() {
+    fn identity_does_not_accept_labels_or_ambiguous_controller_owners() -> TestResult {
         let base = json!({"labels":{"apsides.dev/proxy-generation":"g1"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"proxy-rs","uid":"rs-uid","controller":true}]});
-        let metadata: ObjectMeta = serde_json::from_value(base.clone()).unwrap();
-        assert_eq!(
-            controller_owner(&metadata, "ReplicaSet").unwrap().uid,
-            "rs-uid"
-        );
+        let metadata: ObjectMeta = serde_json::from_value(base.clone())?;
+        assert_eq!(controller_owner(&metadata, "ReplicaSet")?.uid, "rs-uid");
         for value in [
             json!({"labels":{"apsides.dev/proxy-generation":"g1"}}),
             json!({"ownerReferences":[base["ownerReferences"][0],base["ownerReferences"][0]]}),
             json!({"ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"proxy","uid":"forged","controller":true}]}),
         ] {
-            assert!(
-                controller_owner(&serde_json::from_value(value).unwrap(), "ReplicaSet").is_err()
-            );
+            assert!(controller_owner(&serde_json::from_value(value)?, "ReplicaSet").is_err());
         }
+        Ok(())
     }
 
     #[test]
-    fn readiness_never_treats_partition_or_missing_status_as_termination_certainty() {
+    fn readiness_never_treats_partition_or_missing_status_as_termination_certainty() -> TestResult {
         let ready = json!({"metadata":{"name":"node","uid":"node-uid"},"status":{"conditions":[{"type":"Ready","status":"True"}]}});
-        assert!(ready_node(&serde_json::from_value(ready.clone()).unwrap()).is_ok());
+        assert!(ready_node(&serde_json::from_value(ready.clone())?).is_ok());
         for value in [
             json!({"metadata":{"name":"node"}}),
             json!({"metadata":{"name":"node"},"status":{"conditions":[{"type":"Ready","status":"Unknown"}]}}),
             json!({"metadata":{"name":"node"},"status":ready["status"],"spec":{"taints":[{"key":"node.kubernetes.io/unreachable","effect":"NoExecute"}]}}),
         ] {
-            assert!(ready_node(&serde_json::from_value(value).unwrap()).is_err());
+            assert!(ready_node(&serde_json::from_value(value)?).is_err());
         }
+        Ok(())
     }
 
     #[test]
-    fn terminal_restarted_proxy_cannot_reuse_a_pre_restart_drain_ledger() {
+    fn terminal_restarted_proxy_cannot_reuse_a_pre_restart_drain_ledger() -> TestResult {
         let value = json!({"metadata":{"name":"proxy","uid":"pod-uid"},"spec":{"containers":[{"name":"envoy"},{"name":"admin"}]},"status":{"containerStatuses":[{"name":"envoy","image":"envoy","imageID":"envoy-image","containerID":"containerd://envoy-first","ready":false,"restartCount":0,"state":{"terminated":{"exitCode":0,"containerID":"containerd://envoy-first","finishedAt":"2026-09-05T10:00:00Z"}}},{"name":"admin","image":"admin","imageID":"admin-image","containerID":"containerd://admin-first","ready":false,"restartCount":0,"state":{"terminated":{"exitCode":0,"containerID":"containerd://admin-first","finishedAt":"2026-09-05T10:00:00Z"}}}]}});
-        let pod: Pod = serde_json::from_value(value.clone()).unwrap();
+        let pod: Pod = serde_json::from_value(value.clone())?;
         let identity = ProxyIdentity {
-            policy_digest: digest(&"policy").unwrap(),
+            policy_digest: digest(&"policy")?,
             deployment_name: "proxy".into(),
             deployment_uid: "deployment-uid".into(),
             node_name: "node".into(),
             node_uid: "node-uid".into(),
             pod_name: "proxy".into(),
             pod_uid: "pod-uid".into(),
-            pod_spec_digest: digest(&pod.spec).unwrap(),
+            pod_spec_digest: digest(&pod.spec)?,
             envoy_container_id: "containerd://envoy-first".into(),
             admin_container_id: "containerd://admin-first".into(),
             config_map_name: "config".into(),
             config_map_uid: "config-uid".into(),
-            config_digest: digest(&"config").unwrap(),
-            qualification_digest: digest(&"qualification").unwrap(),
+            config_digest: digest(&"config")?,
+            qualification_digest: digest(&"qualification")?,
         };
         assert!(verify_stop_epoch(&pod, &identity, true).is_ok());
         for (field, replacement) in [
@@ -334,16 +331,12 @@ mod tests {
         ] {
             let mut changed = value.clone();
             changed["status"]["containerStatuses"][0][field] = replacement;
-            assert!(
-                verify_stop_epoch(&serde_json::from_value(changed).unwrap(), &identity, true)
-                    .is_err()
-            );
+            assert!(verify_stop_epoch(&serde_json::from_value(changed)?, &identity, true).is_err());
         }
         let mut changed = value;
         changed["status"]["containerStatuses"][0]["state"]["terminated"]["containerID"] =
             json!("containerd://envoy-second");
-        assert!(
-            verify_stop_epoch(&serde_json::from_value(changed).unwrap(), &identity, true).is_err()
-        );
+        assert!(verify_stop_epoch(&serde_json::from_value(changed)?, &identity, true).is_err());
+        Ok(())
     }
 }

@@ -1,6 +1,8 @@
-//! Runtime-conditional preview composition. No input values or rollout keys are
-//! read, and no future contribution is calculated. Callers authenticate the
-//! metadata, canonical desired object and observation interval.
+//! Runtime-conditional preview composition.
+//!
+//! No input values or rollout keys are read, and no future contribution is
+//! calculated. Callers authenticate the metadata, canonical desired object and
+//! observation interval.
 use crate::{Result, invalid, preview_limits};
 use compiler_core::REVISION_ANNOTATION;
 use coordination::{ReviewIdentity, ReviewMetadataV1, ReviewResource};
@@ -33,11 +35,11 @@ pub struct PreviewComposition {
 
 impl PreviewComposition {
     #[must_use]
-    pub fn payload(&self) -> &Value {
+    pub const fn payload(&self) -> &Value {
         &self.payload
     }
     #[must_use]
-    pub fn runtime_conditional(&self) -> bool {
+    pub const fn runtime_conditional(&self) -> bool {
         self.runtime_conditional
     }
 

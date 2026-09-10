@@ -26,12 +26,12 @@ pub struct ConditionalApplyRequest {
 
 impl ConditionalApplyRequest {
     #[must_use]
-    pub fn payload(&self) -> &Value {
+    pub const fn payload(&self) -> &Value {
         &self.payload
     }
 
     #[must_use]
-    pub fn params(&self) -> &PatchParams {
+    pub const fn params(&self) -> &PatchParams {
         &self.params
     }
 

@@ -7,7 +7,7 @@ use release::TestStagingScope;
 use serde_json::json;
 use std::{env, fs, path::Path, sync::Arc};
 
-pub(super) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+pub(super) type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub(super) async fn transition_step(
     configure: impl FnOnce(PlatformClient, &serde_json::Value) -> Result<PlatformClient>,

@@ -7,7 +7,7 @@ use deploy::{
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
-type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const REGISTRY_UID: &str = "11111111-1111-4111-8111-111111111111";
 const INITIAL_DIGEST: &str =
@@ -562,7 +562,7 @@ fn cleanup_projection_rejects_initial_only_input_and_reaction_removal() -> TestR
 fn cleanup_projection_accepts_source_and_provenance_updates() -> TestResult {
     let (initial, successor) = cleanup_pair("delete")?;
     let cleanup = purpose(&initial)?;
-    let mut updated_ir = successor.ir.clone();
+    let mut updated_ir = successor.ir;
     updated_ir.provenance.compiler = "apsides/0.2".into();
     let input = updated_ir
         .provenance

@@ -144,7 +144,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
     fn plan(private: &str, observed_secret: bool, resources: bool) -> TestResult<TransitionPlan> {
         let (mut request, _, _, _) = crate::tests::preview_fresh_fixture()?;

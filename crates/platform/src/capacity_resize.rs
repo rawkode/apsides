@@ -182,7 +182,7 @@ mod tests {
             }
             assert!(require_expansion(&old, &shrinking).is_err());
         }
-        let mut wider = old.clone();
+        let mut wider = old;
         wider.profile.max_uid_json_bytes = 512;
         assert!(require_expansion(&wider, &next).is_err());
         Ok(())

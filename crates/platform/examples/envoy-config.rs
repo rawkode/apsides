@@ -1,6 +1,6 @@
 //! Emit the fixed profile for native Envoy schema validation, not deployment.
 #[cfg(feature = "deployer")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let directory = std::path::PathBuf::from(
         std::env::args_os()
             .nth(1)

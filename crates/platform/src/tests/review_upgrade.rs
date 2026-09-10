@@ -1,7 +1,7 @@
 use super::*;
 use coordination::ReviewMetadataV1;
 
-type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Only the successor release and immutable predecessor metadata survive setup.
 struct PrunedUpgrade {
@@ -48,10 +48,10 @@ async fn commit_and_discard_predecessor() -> TestResult<PrunedUpgrade> {
         resource_version: "42".into(),
     };
     let (wire_client, calls) = wire(vec![
-        object("apsides-policy-example", &policy, "policy-uid", "40"),
+        object("apsides-policy-example", &policy, "policy-uid", "40")?,
         registry_object(&registry, REGISTRY_UID, "42")?,
         json!("echo-put"),
-    ]);
+    ])?;
     let client = registry.bind(
         wire_client,
         "control",
@@ -105,8 +105,13 @@ fn reload_client(fixture: &PrunedUpgrade) -> TestResult<(PlatformClient, Calls)>
         &json!({"platform":"approved"}),
         "trust-uid",
         "43",
-    );
-    let policy = object("apsides-policy-example", &fixture.policy, "policy-uid", "40");
+    )?;
+    let policy = object(
+        "apsides-policy-example",
+        &fixture.policy,
+        "policy-uid",
+        "40",
+    )?;
     let (client, calls) = wire(vec![
         registry.clone(),
         trust.clone(),
@@ -114,7 +119,7 @@ fn reload_client(fixture: &PrunedUpgrade) -> TestResult<(PlatformClient, Calls)>
         registry,
         trust,
         policy,
-    ]);
+    ])?;
     Ok((
         platform_client(client, "control", "workload", "cluster-a")?,
         calls,

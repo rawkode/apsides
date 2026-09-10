@@ -7,7 +7,7 @@ use platform::preview_transport::{PreviewTarget, PreviewTransport};
 #[tokio::test]
 #[ignore = "requires APS_PREVIEW_CONTEXT selecting an explicit live Kubernetes context"]
 async fn preview_readonly_list_inherits_item_type_from_exact_list()
--> Result<(), Box<dyn std::error::Error>> {
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let context = std::env::var("APS_PREVIEW_CONTEXT")?;
     if context.is_empty() {
         return Err("live preview probe requires an explicit context".into());

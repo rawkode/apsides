@@ -3,9 +3,11 @@ use crate::{DeploymentIdentity, PlatformClient, Result, Versioned, invalid};
 use kube::{Client, Config, config::AuthInfo};
 use std::{sync::Arc, time::Duration};
 
-/// An issued client and its exact platform-owned identity approval. There is no
-/// constructor accepting a client or bearer: both clients originate from one
-/// trusted TLS configuration, and only the issued client survives construction.
+/// An issued client and its exact platform-owned identity approval.
+///
+/// There is no constructor accepting a client or bearer: both clients originate
+/// from one trusted TLS configuration, and only the issued client survives
+/// construction.
 pub struct IssuedDeployment {
     platform: PlatformClient,
     identity: Versioned<DeploymentIdentity>,
@@ -83,7 +85,7 @@ impl IssuedDeployment {
     }
 
     #[must_use]
-    pub fn platform(&self) -> &PlatformClient {
+    pub const fn platform(&self) -> &PlatformClient {
         &self.platform
     }
 
@@ -93,12 +95,12 @@ impl IssuedDeployment {
     }
 
     #[must_use]
-    pub fn identity(&self) -> &DeploymentIdentity {
+    pub const fn identity(&self) -> &DeploymentIdentity {
         &self.identity.value
     }
 
     #[must_use]
-    pub fn identity_approval(&self) -> &Versioned<DeploymentIdentity> {
+    pub const fn identity_approval(&self) -> &Versioned<DeploymentIdentity> {
         &self.identity
     }
 

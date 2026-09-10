@@ -166,7 +166,7 @@ fn owned_contribution_is_private_preserved_and_admission_checked() -> Result<()>
             .is_none()
     );
     composition.verify_projected(&before)?;
-    let mut changed = before.clone();
+    let mut changed = before;
     changed["spec"]["template"]["metadata"]["annotations"][REVISION_ANNOTATION] =
         json!("private-admission-canary");
     let error = composition

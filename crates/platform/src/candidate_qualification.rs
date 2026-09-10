@@ -21,9 +21,10 @@ pub const CANDIDATE_QUALIFICATION_MARKER_NAME: &str = "apsides-candidate-qualifi
 const KUBE_SYSTEM_NAMESPACE: &str = "kube-system";
 const MAX_IDENTITY_BYTES: usize = 256;
 
-/// API identities observed after a host runner created one disposable kind
-/// cluster. The node-image digest is a runner attestation bound into the
-/// immutable marker; Kubernetes Node data does not establish that image digest.
+/// API identities observed after a host runner created one disposable cluster.
+///
+/// The node-image digest is a runner attestation bound into the immutable
+/// marker; Kubernetes Node data does not establish that image digest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CandidateQualificationTarget {

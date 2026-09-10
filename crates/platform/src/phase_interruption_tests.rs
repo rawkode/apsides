@@ -1,6 +1,6 @@
 use super::*;
 
-type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[test]
 fn only_exact_new_phase_produces_one_metadata_only_checkpoint() -> TestResult {

@@ -25,7 +25,7 @@ impl Observation {
                 .and_then(|object| object.metadata.resource_version.clone()),
         }
     }
-    pub fn target(&self) -> &PreviewTarget {
+    pub const fn target(&self) -> &PreviewTarget {
         &self.target
     }
     pub async fn read_unchanged(&self, transport: &PreviewTransport) -> Result<NamedPreview> {
