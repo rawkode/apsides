@@ -23,9 +23,9 @@ hero:
 
 ## Names used by the current implementation
 
-**Apsides** is the project. The current CLI command is `apsides`; commands in this
+**Apsides** is the project. The current CLI command is `aps`; commands in this
 site use that executable name. Existing `apsides.dev` schema and protocol identifiers
-remain active wire names. TypeScript authoring uses `@apsides/compiler`.
+remain active wire names. TypeScript authoring uses `@apsides/kubernetes`.
 
 ## The working model
 

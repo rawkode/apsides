@@ -2,6 +2,7 @@ import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
 
 export default defineConfig({
+  site: "https://apsides.dev",
   integrations: [
     starlight({
       title: "Apsides",
@@ -58,6 +59,8 @@ export default defineConfig({
             { label: "Resource inventory", slug: "reference/inventory" },
             { label: "Transition audit history", slug: "reference/audit" },
             { label: "State capacity", slug: "reference/state-capacity" },
+            { label: "Production evidence", slug: "reference/production-evidence" },
+            { label: "CLI distribution", slug: "reference/cli-distribution" },
             { label: "Toolchain", slug: "reference/toolchain" },
             { label: "Performance contract", slug: "reference/performance" },
           ],

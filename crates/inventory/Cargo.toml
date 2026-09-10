@@ -1,6 +1,6 @@
 [package]
 name = "inventory"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -20,12 +20,9 @@ thiserror = "2"
 tokio = { version = "1", default-features = false, features = ["rt"], optional = true }
 
 [dev-dependencies]
-hyper = { version = "=0.14.32", default-features = false, features = ["server"] }
-rcgen = { version = "=0.14.8", default-features = false, features = ["crypto", "pem", "ring"] }
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 tempfile = "3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
-tokio-rustls = "=0.25.0"
 
 [lints]
 workspace = true

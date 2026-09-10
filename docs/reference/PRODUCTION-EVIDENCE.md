@@ -125,7 +125,7 @@ measure Secret rotation or qualify GitHub Actions trust.
 
 ## Combining measured evidence
 
-`apsides merge-evidence` combines explicit receipts against one structurally valid
+`aps merge-evidence` combines explicit receipts against one structurally valid
 production candidate. The candidate establishes the payload identities; this
 command does not verify signature trust or perform the measurements again.
 
@@ -421,7 +421,7 @@ trust policy, stage inputs, verifier source closure and executable across the
 measurement. Only a successful exact rejection produces an evidence receipt.
 The fixture identity is supplemental; the receipt belongs to the production
 candidate. Namespaced source archives and the measurement accompany the receipt
-for the normal `apsides merge-evidence` consumer. `cuenv task fixturePromotionTest`
+for the normal `aps merge-evidence` consumer. `cuenv task fixturePromotionTest`
 checks orchestration contracts without substituting for the real verifier run.
 
 The producer at commit `d8677cd` passed against the real Linux/arm64 fixture and

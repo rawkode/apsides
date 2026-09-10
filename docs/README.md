@@ -23,3 +23,7 @@ fail the build.
 `scripts/prepare-content.mjs` creates an ignored Starlight content tree before
 each development or production build. It mirrors the canonical contract files
 without modifying them and supplies the frontmatter Starlight requires.
+
+This directory is deliberately excluded from the root Deno workspace so the
+Astro toolchain stays out of the compiler closure. Deno prints a "not a member
+of the workspace" warning when running tasks here; that warning is expected.

@@ -32,7 +32,7 @@ and its authority anchor. Configure a read-only metadata credential for remote
 storage:
 
 ```sh
-apsides audit \
+aps audit \
   --domain team-api-production \
   --transition TRANSITION_ID \
   --cluster-binding production \

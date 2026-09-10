@@ -2,6 +2,14 @@
   "entry": "program.tsx",
   "inputs": [
     {
+      "path": ".aps/crds/backup.ts",
+      "sha256": "4c14e54325b6c7fe66eff913b6669b092bac96ee0f1803e757250fea6dd5de9d"
+    },
+    {
+      "path": ".aps/crds/cnpg.ts",
+      "sha256": "8be2cfb06546847935f10df62aa21f57a73f80abf56d76c7ac20d2fcb0881194"
+    },
+    {
       "path": "program.tsx",
       "sha256": "25488b11cb9eb4788783eb709f25a6718ed3301f92afa7d4d2043e9151bba0c0"
     }

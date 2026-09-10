@@ -5,6 +5,7 @@ const outputRoot = ".generated-content/docs";
 
 const pages = [
   ["index.md", "index.md"],
+  ["404.md", "404.md"],
   ["getting-started.md", "getting-started.md"],
   ["concepts/architecture.md", "concepts/architecture.md"],
   ["concepts/inventory-prune-upgrades.md", "concepts/inventory-prune-upgrades.md"],
@@ -63,10 +64,6 @@ const withFrontmatter = (source, title) => {
     .replace(
       /\]\(\.\.\/\.\.\/examples\/cnpg\/cleanup\/README\.md\)/g,
       "](https://github.com/rawkode/apsides/blob/main/examples/cnpg/cleanup/README.md)",
-    )
-    .replace(
-      /\]\(\.\.\/\.\.\/packages\/example-bundle\/src\/controller\.tsx\)/g,
-      "](https://github.com/rawkode/apsides/blob/main/packages/example-bundle/src/controller.tsx)",
     )
     .replace(
       /\]\(\.\.\/\.\.\/examples\/web-application\/README\.md\)/g,

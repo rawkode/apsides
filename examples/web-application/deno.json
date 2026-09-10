@@ -5,6 +5,7 @@
   },
   "imports": {
     "@apsides/kubernetes": "../../packages/kubernetes/src/index.ts",
+    "@apsides/kubernetes/jsx-runtime": "../../packages/kubernetes/src/jsx-runtime.ts",
     "@apsides/kubernetes/jsx-dev-runtime": "../../packages/kubernetes/src/jsx-dev-runtime.ts"
   }
 }

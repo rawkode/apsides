@@ -84,7 +84,8 @@ See
 | `runtime` | native fixed-plan reconciliation |
 | `release` | signed release, compiler closure, OCI and evidence verification |
 | `inventory` | metadata-only snapshots and SQLite storage |
-| `cli` | `apsides` build, verification and deployment commands |
+| `coordination` | typed immutable stores for claims, transition audits and review metadata |
+| `cli` | `aps` build, verification and deployment commands |
 
 Internal packages use role names without product prefixes. The current executable
-is `apsides`, and the authoring package is `@apsides/kubernetes`.
+is `aps`, and the authoring package is `@apsides/kubernetes`.
