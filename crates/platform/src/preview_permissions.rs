@@ -69,7 +69,7 @@ pub fn preview_permissions(plan: &TransitionPlan) -> Result<PreviewPermissions> 
         api_group: String::new(),
         resource: "configmaps".into(),
         verb: "get".into(),
-        resource_names: vec![format!("reakt-deploy-identity-{}", domain.id)],
+        resource_names: vec![format!("apsides-deploy-identity-{}", domain.id)],
     }]);
     let mut creates = BTreeSet::new();
     let mut targets = Vec::with_capacity(metadata.resources.len());
@@ -111,7 +111,7 @@ pub fn preview_permissions(plan: &TransitionPlan) -> Result<PreviewPermissions> 
     }
     targets.sort_by(|left, right| left.identity.cmp(&right.identity));
     Ok(PreviewPermissions {
-        schema_version: "reakt.dev/preview-permissions/v1",
+        schema_version: "apsides.dev/preview-permissions/v1",
         scope: "supplemental-live-preview-only",
         non_resource_gets: vec!["/version"],
         required_resources: required.into_iter().collect(),
@@ -217,7 +217,7 @@ mod tests {
             api_group: String::new(),
             resource: "configmaps".into(),
             verb: "get".into(),
-            resource_names: vec!["reakt-deploy-identity-example".into()],
+            resource_names: vec!["apsides-deploy-identity-example".into()],
         }));
         assert_eq!(
             permissions.potential_creation_targets,

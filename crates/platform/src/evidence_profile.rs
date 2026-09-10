@@ -4,7 +4,7 @@
 use crate::{ExpectedWriters, Result, UpgradeDrainState, invalid};
 use std::collections::BTreeSet;
 
-pub const EVIDENCE_PROFILE_SCHEMA: &str = "reakt.dev/evidence-profile/v1";
+pub const EVIDENCE_PROFILE_SCHEMA: &str = "apsides.dev/evidence-profile/v1";
 pub const MAX_CONTROLLER_PODS: u16 = 64;
 pub const MAX_DRAIN_BYTES: u32 = 128 * 1024;
 

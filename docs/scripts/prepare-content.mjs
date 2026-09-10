@@ -15,25 +15,25 @@ const pages = [
 ];
 
 const references = [
-  ["reakt/ARTIFACT-RESOLUTION.md", "reakt/artifact-resolution.md", "Optional OCI release retrieval"],
-  ["reakt/AUDIT.md", "reakt/audit.md", "Transition audit history"],
-  ["reakt/CLI-DISTRIBUTION.md", "reakt/cli-distribution.md", "CLI distribution"],
-  ["reakt/DEPLOYMENT-CONTRACT.md", "reakt/deployment-contract.md", "Provider-neutral deployment protocol"],
-  ["reakt/DEPLOYMENT-PERMISSIONS.md", "reakt/deployment-permissions.md", "Deployment permissions"],
-  ["reakt/INVENTORY.md", "reakt/inventory.md", "Resource inventory"],
-  ["reakt/IR-CONTRACT.md", "reakt/ir-contract.md", "IR contract"],
-  ["reakt/OCI-PACKAGING.md", "reakt/oci-packaging.md", "Native controller OCI packaging"],
-  ["reakt/PERFORMANCE.md", "reakt/performance.md", "Performance comparison contract"],
-  ["reakt/PRODUCTION-EVIDENCE.md", "reakt/production-evidence.md", "Production acceptance evidence"],
-  ["reakt/PLATFORM-CONTRACT.md", "reakt/platform-contract.md", "Platform contract"],
-  ["reakt/REVIEW-CONTRACT.md", "reakt/review-contract.md", "Deployment review contract"],
-  ["reakt/SPEC-v0.2.md", "reakt/spec-v0-2.md", "Apsides specification 0.2"],
-  ["reakt/STATE-CAPACITY.md", "reakt/state-capacity.md", "State capacity admission"],
-  ["reakt/STATUS.md", "reakt/status.md", "Apsides implementation status"],
-  ["reakt/TOOLCHAIN.md", "reakt/toolchain.md", "Toolchain choices"],
+  ["reference/ARTIFACT-RESOLUTION.md", "reference/artifact-resolution.md", "Optional OCI release retrieval"],
+  ["reference/AUDIT.md", "reference/audit.md", "Transition audit history"],
+  ["reference/CLI-DISTRIBUTION.md", "reference/cli-distribution.md", "CLI distribution"],
+  ["reference/DEPLOYMENT-CONTRACT.md", "reference/deployment-contract.md", "Provider-neutral deployment protocol"],
+  ["reference/DEPLOYMENT-PERMISSIONS.md", "reference/deployment-permissions.md", "Deployment permissions"],
+  ["reference/INVENTORY.md", "reference/inventory.md", "Resource inventory"],
+  ["reference/IR-CONTRACT.md", "reference/ir-contract.md", "IR contract"],
+  ["reference/OCI-PACKAGING.md", "reference/oci-packaging.md", "Native controller OCI packaging"],
+  ["reference/PERFORMANCE.md", "reference/performance.md", "Performance comparison contract"],
+  ["reference/PRODUCTION-EVIDENCE.md", "reference/production-evidence.md", "Production acceptance evidence"],
+  ["reference/PLATFORM-CONTRACT.md", "reference/platform-contract.md", "Platform contract"],
+  ["reference/REVIEW-CONTRACT.md", "reference/review-contract.md", "Deployment review contract"],
+  ["reference/SPEC-v0.2.md", "reference/spec-v0-2.md", "Apsides specification 0.2"],
+  ["reference/STATE-CAPACITY.md", "reference/state-capacity.md", "State capacity admission"],
+  ["reference/STATUS.md", "reference/status.md", "Apsides implementation status"],
+  ["reference/TOOLCHAIN.md", "reference/toolchain.md", "Toolchain choices"],
 ];
 
-function withFrontmatter(source, title) {
+const withFrontmatter = (source, title) => {
   const withoutHeading = source
     .replace(/^# .+\n+/, "")
     .replace(
@@ -74,14 +74,14 @@ function withFrontmatter(source, title) {
     );
   const escapedTitle = JSON.stringify(title);
   return `---\ntitle: ${escapedTitle}\n---\n\n${withoutHeading}`;
-}
+};
 
-async function copy(sourcePath, targetPath, title) {
+const copy = async (sourcePath, targetPath, title) => {
   const source = await readFile(sourcePath, "utf8");
   const target = join(outputRoot, targetPath);
   await mkdir(dirname(target), { recursive: true });
   await writeFile(target, title ? withFrontmatter(source, title) : source);
-}
+};
 
 await rm(".generated-content", { recursive: true, force: true });
 await Promise.all([

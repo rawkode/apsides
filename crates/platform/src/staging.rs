@@ -142,8 +142,8 @@ fn identity_resources(
 ) -> Result<Vec<(&'static str, &'static str, String, Value)>> {
     let name = &stored.plan.generation_reservation.service_account_name;
     let transition_id = &stored.plan.request.transition_id;
-    let annotations = json!({"reakt.dev/transition": transition_id, "reakt.dev/generation": stored.plan.request.next.generation_id,
-        "reakt.dev/plan-digest":stored.plan.plan_digest});
+    let annotations = json!({"apsides.dev/transition": transition_id, "apsides.dev/generation": stored.plan.request.next.generation_id,
+        "apsides.dev/plan-digest":stored.plan.plan_digest});
     let mut resources = vec![(
         "v1",
         "ServiceAccount",

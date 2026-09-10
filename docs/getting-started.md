@@ -9,9 +9,9 @@ deploy to a cluster or establish production readiness.
 ## Prerequisites
 
 - Rust and Cargo as selected by `rust-toolchain.toml`
-- Node.js for the source compiler
-- Deno for type checking and permission-restricted evaluation
-- the repository's JavaScript dependencies installed with pnpm
+- Deno, which hosts the source compiler and performs its type checking and
+  permission-restricted evaluation
+- the repository's JavaScript dependencies installed with `deno install`
 
 The full native image build also needs Docker BuildKit, locally cached pinned
 builder and runtime images, prepared Cargo dependencies, and
@@ -35,8 +35,8 @@ source staging directory.
 
 ```sh
 target/debug/aps compile \
-  --source examples/reakt/program.tsx \
-  --output work/reakt-compiled
+  --source examples/web-application/program.tsx \
+  --output work/apsides-compiled
 ```
 
 The output includes validated IR, a recomputed plan, capabilities, test
@@ -46,10 +46,10 @@ metadata. Compilation alone does not create a deployable release.
 ## Inspect and check the plan
 
 ```sh
-target/debug/aps check --ir work/reakt-compiled/ir.json
+target/debug/aps check --ir work/apsides-compiled/ir.json
 target/debug/aps test \
-  --ir work/reakt-compiled/ir.json \
-  --output work/reakt-semantic-tests
+  --ir work/apsides-compiled/ir.json \
+  --output work/apsides-semantic-tests
 ```
 
 `check` reports validation status, IR digest and whether the IR is production

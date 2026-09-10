@@ -4,7 +4,7 @@ use coordination::ClaimScope;
 use deploy::GenerationAllocation;
 use serde::{Deserialize, Serialize};
 
-pub const EXECUTOR_BINDING_SCHEMA: &str = "reakt.dev/executor-binding/v1";
+pub const EXECUTOR_BINDING_SCHEMA: &str = "apsides.dev/executor-binding/v1";
 
 /// Protected reservation provenance. The executor is a trusted caller's label,
 /// not a cryptographic per-job identity. No token or credential fingerprint is retained.

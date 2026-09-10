@@ -154,7 +154,7 @@ pub async fn verify_candidate(
     if release.mode != ReleaseMode::Production || compiled.ir.test_only {
         return reject("fixture-substituted artifacts cannot be promoted to production");
     }
-    if policy.schema_version != "reakt.dev/trust/v1"
+    if policy.schema_version != "apsides.dev/trust/v1"
         || release.source.repository != policy.repository
         || !policy
             .approved_compiler_digests
@@ -352,7 +352,7 @@ async fn verify_ssh(
         "-I",
         principal,
         "-n",
-        "reakt.provenance.v1",
+        "apsides.provenance.v1",
         "-s",
         "provenance.sig",
     ]

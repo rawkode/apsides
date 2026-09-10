@@ -144,17 +144,17 @@ async fn read_only_response(
         sql
     };
     let (columns, rows) = match statement {
-        "SELECT version FROM reakt_inventory_schema WHERE id=1"
-        | "SELECT version FROM reakt_inventory_schema WHERE id = 1" => (
+        "SELECT version FROM apsides_inventory_schema WHERE id=1"
+        | "SELECT version FROM apsides_inventory_schema WHERE id = 1" => (
             serde_json::json!([{"name": "version", "decltype": "INTEGER"}]),
             serde_json::json!([[{"type": "integer", "value": "1"}]]),
         ),
-        "SELECT scope,digest,metadata FROM reakt_inventory_snapshots LIMIT 0"
-        | "SELECT scope, digest, metadata FROM reakt_inventory_snapshots LIMIT 0"
-        | "SELECT scope,revision,digest FROM reakt_inventory_heads LIMIT 0"
-        | "SELECT scope, revision, digest FROM reakt_inventory_heads LIMIT 0"
-        | "SELECT revision,digest FROM reakt_inventory_heads WHERE scope=?1"
-        | "SELECT revision, digest FROM reakt_inventory_heads WHERE scope = ?1" => {
+        "SELECT scope,digest,metadata FROM apsides_inventory_snapshots LIMIT 0"
+        | "SELECT scope, digest, metadata FROM apsides_inventory_snapshots LIMIT 0"
+        | "SELECT scope,revision,digest FROM apsides_inventory_heads LIMIT 0"
+        | "SELECT scope, revision, digest FROM apsides_inventory_heads LIMIT 0"
+        | "SELECT revision,digest FROM apsides_inventory_heads WHERE scope=?1"
+        | "SELECT revision, digest FROM apsides_inventory_heads WHERE scope = ?1" => {
             (serde_json::json!([]), serde_json::json!([]))
         }
         _ => {

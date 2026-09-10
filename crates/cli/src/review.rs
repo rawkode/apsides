@@ -351,9 +351,9 @@ fn with_report<T>(
     )?;
     consume(&Report {
         schema_version: if live.is_some() {
-            "reakt.dev/deployment-review/v5"
+            "apsides.dev/deployment-review/v5"
         } else {
-            "reakt.dev/deployment-review/v4"
+            "apsides.dev/deployment-review/v4"
         },
         detail_availability: if initial {
             "initial"

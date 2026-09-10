@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { constants } from "node:fs";
-import { access, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
-import { delimiter, dirname, join, posix, relative, resolve, sep } from "node:path";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { dirname, join, posix, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
@@ -14,13 +13,13 @@ import { buildFixtureOutputs, canonicalString, type ProductionIr } from "./fixtu
 const OXC_VERSION = "0.58.0";
 const ROLLDOWN_VERSION = "1.0.0-beta.35";
 const SES_VERSION = "2.3.0";
-export const SOURCE_LOCK_SCHEMA = "reakt.dev/source-lock/v1";
-export const COMPILER_CLOSURE_SCHEMA = "reakt.dev/compiler-closure/v2";
+export const SOURCE_LOCK_SCHEMA = "apsides.dev/source-lock/v1";
+export const COMPILER_CLOSURE_SCHEMA = "apsides.dev/compiler-closure/v2";
 const MAX_MODULES = 128;
 const MAX_MODULE_BYTES = 1024 * 1024;
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const executionEnvironment = Object.freeze({ TZ: "UTC", LANG: "C", LC_ALL: "C" });
-const SDK_PACKAGE = "@reakt/kubernetes";
+const SDK_PACKAGE = "@apsides/kubernetes";
 const SDK_FILES = ["index.ts", "model.ts", "runtime.ts", "compiler.ts", "jsx-runtime.ts", "jsx-dev-runtime.ts"] as const;
 const SDK_PUBLIC_IMPORTS = new Map<string, string>([
   [SDK_PACKAGE, "index.ts"],
@@ -28,7 +27,7 @@ const SDK_PUBLIC_IMPORTS = new Map<string, string>([
   [`${SDK_PACKAGE}/jsx-dev-runtime`, "jsx-dev-runtime.ts"],
 ]);
 const SDK_COMPILER_IMPORT = `${SDK_PACKAGE}/compiler`;
-const GENERATED_ENTRY = "reakt:/compiler/entry.ts";
+const GENERATED_ENTRY = "apsides:/compiler/entry.ts";
 const sha256 = (value: string | Uint8Array): string => createHash("sha256").update(value).digest("hex");
 const order = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
 const within = (root: string, path: string): boolean => path === root || path.startsWith(`${root}${sep}`);
@@ -47,7 +46,7 @@ interface Snapshot {
   sha256: string;
 }
 
-export interface CompileReaktOptions {
+export interface CompileApsidesOptions {
   readonly lockFile?: string;
   readonly fixtureImage?: string;
 }
@@ -68,17 +67,17 @@ export interface CompilerClosure {
 }
 
 /** Canonical identity used by the release verifier after packaging fills nativeCompiler. */
-export function compilerClosureDigest(closure: CompilerClosure): string {
+export const compilerClosureDigest = (closure: CompilerClosure): string => {
   return `sha256:${sha256(canonicalString(closure))}`;
-}
+};
 
 /** Compile a digest-locked source closure and evaluate it twice in a locked-down SES Compartment hosted by Deno. */
-export async function compileReakt(sourceFile: string, output: string, options: CompileReaktOptions = {}): Promise<void> {
+export const compileApsides = async (sourceFile: string, output: string, options: CompileApsidesOptions = {}): Promise<void> => {
   const source = await realpath(sourceFile);
   const sourceRoot = dirname(source);
   const destination = resolve(output);
   if (await exists(destination)) throw new Error("source output already exists; choose a fresh directory");
-  const lockPath = await realpath(options.lockFile ?? join(sourceRoot, "reakt.lock.json"));
+  const lockPath = await realpath(options.lockFile ?? join(sourceRoot, "apsides.lock.json"));
   if (!within(sourceRoot, lockPath)) throw new Error("source lock must be inside the source root");
   const lockBytes = await readFile(lockPath, "utf8");
   const lock = parseCanonicalLock(lockBytes);
@@ -96,7 +95,7 @@ export async function compileReakt(sourceFile: string, output: string, options: 
     if (bytes.byteLength > MAX_MODULE_BYTES) throw new Error(`source module exceeds 1 MiB budget: ${input.path}`);
     const actualDigest = sha256(bytes);
     if (actualDigest !== input.sha256) throw new Error(`source lock digest mismatch: ${input.path}`);
-    author.set(input.path, { logical: input.path, virtual: `reakt:/source/${input.path}`, physical, text: bytes.toString("utf8"), sha256: actualDigest });
+    author.set(input.path, { logical: input.path, virtual: `apsides:/source/${input.path}`, physical, text: bytes.toString("utf8"), sha256: actualDigest });
   }
   if (author.size > MAX_MODULES) throw new Error(`source lock exceeds ${MAX_MODULES} module budget`);
   if (!author.has(entryLogical)) throw new Error("source lock does not include its entry");
@@ -105,9 +104,7 @@ export async function compileReakt(sourceFile: string, output: string, options: 
   const sesRoot = await findPackageRoot(fileURLToPath(import.meta.resolve("ses")));
   const sesPath = join(sesRoot, "dist", "ses.umd.min.js");
   const sesBytes = await readFile(sesPath);
-  const nodePath = await realpath(process.execPath);
-  const nodeBytes = await readFile(nodePath);
-  const deno = await findExecutable("deno");
+  const deno = await realpath(process.execPath);
   const denoBytes = await readFile(deno);
   const denoVersion = (await run(deno, ["--version"], "", { ...executionEnvironment })).stdout.trim();
   // Capture the complete compiler/tool receipt before any author typecheck,
@@ -132,7 +129,7 @@ export async function compileReakt(sourceFile: string, output: string, options: 
   if (runOne.stderr !== runTwo.stderr || runOne.stdout !== runTwo.stdout) throw new Error("isolated source evaluations were not byte-identical");
   const evaluated = parseEvaluation(runOne.stdout);
   const ir = evaluated.productionIR;
-  ir.provenance = { compiler: "reakt/0.1", inputs: provenanceInputs };
+  ir.provenance = { compiler: "apsides/0.1", inputs: provenanceInputs };
   validateSourceLocations(ir, author);
   const fixture = buildFixtureOutputs(ir, evaluated.fixtures, options.fixtureImage);
   validateSourceLocations(fixture.fixtureIr, author);
@@ -143,9 +140,8 @@ export async function compileReakt(sourceFile: string, output: string, options: 
   const sdkFiles = [...sdk.values()].map(({ logical: path, sha256 }) => ({ path, sha256 })).sort((a,b) => order(a.path,b.path));
   const sdkIdentity = { identity: SDK_PACKAGE, version: "0.1.0", files: sdkFiles, sha256: sha256(canonicalString(sdkFiles)) };
   const toolchain = {
-    node: { pathIdentity: "node", version: process.version, platform: process.platform, arch: process.arch, executableSha256: sha256(nodeBytes) },
-    deno: { pathIdentity: "deno", version: denoVersion, executableSha256: sha256(denoBytes) },
-    oxc: { version: OXC_VERSION, options: { lang: "per-extension", sourcemap: true, jsx: { runtime: "automatic", development: true, importSource: SDK_PACKAGE }, filename: "reakt:/source/<logical-path>" } },
+    deno: { pathIdentity: "deno", version: denoVersion, target: Deno.build.target, platform: process.platform, arch: process.arch, executableSha256: sha256(denoBytes) },
+    oxc: { version: OXC_VERSION, options: { lang: "per-extension", sourcemap: true, jsx: { runtime: "automatic", development: true, importSource: SDK_PACKAGE }, filename: "apsides:/source/<logical-path>" } },
     rolldown: { version: ROLLDOWN_VERSION, options: { authoringFormat: "esm", evaluationFormat: "iife", sourcemap: "hidden" } },
     ses: { version: SES_VERSION, bundle: "dist/ses.umd.min.js", bundleSha256: sha256(sesBytes) },
     compilerFiles, installedTools,
@@ -156,10 +152,10 @@ export async function compileReakt(sourceFile: string, output: string, options: 
     nativeCompiler: null,
   };
   const buildInputs = {
-    schemaVersion: "reakt.dev/build-inputs/v1",
+    schemaVersion: "apsides.dev/build-inputs/v1",
     entry: entryLogical,
-    virtualRoot: "reakt:/source",
-    lock: { path: "reakt.lock.json", sha256: sha256(lockBytes), schemaVersion: SOURCE_LOCK_SCHEMA },
+    virtualRoot: "apsides:/source",
+    lock: { path: "apsides.lock.json", sha256: sha256(lockBytes), schemaVersion: SOURCE_LOCK_SCHEMA },
     inputs: provenanceInputs,
     sdk: sdkIdentity,
     toolchain,
@@ -185,9 +181,8 @@ export async function compileReakt(sourceFile: string, output: string, options: 
 
   for (const snapshot of author.values()) if (sha256(await readFile(snapshot.physical)) !== snapshot.sha256) throw new Error(`source input changed during build: ${snapshot.logical}`);
   if (sha256(await readFile(lockPath)) !== sha256(lockBytes)) throw new Error("source lock changed during build");
-  for (const snapshot of sdk.values()) await assertSnapshotUnchanged(snapshot, "Reakt SDK changed during build");
+  for (const snapshot of sdk.values()) await assertSnapshotUnchanged(snapshot, "Apsides SDK changed during build");
   if (sha256(await readFile(sesPath)) !== sha256(sesBytes)) throw new Error("SES evaluator changed during build");
-  if (sha256(await readFile(nodePath)) !== sha256(nodeBytes)) throw new Error("Node executable changed during build");
   if (sha256(await readFile(deno)) !== sha256(denoBytes)) throw new Error("Deno executable changed during build");
   if (canonicalString(await compilerIdentity()) !== canonicalString(compilerFiles) || canonicalString(await installedToolIdentity()) !== canonicalString(installedTools)) throw new Error("source compiler or installed tool closure changed during build");
 
@@ -205,21 +200,21 @@ export async function compileReakt(sourceFile: string, output: string, options: 
     writeJson(join(destination, "fixture-catalogue.json"), fixture.catalogue),
     writeJson(join(destination, "fixture-coverage.json"), fixture.coverage),
   ]);
-}
+};
 
-async function bundleSnapshot(author: Map<string, Snapshot>, sdk: Map<string, Snapshot>, entry: string): Promise<{bundle: string; evaluationBundle: string; map: unknown}> {
+const bundleSnapshot = async (author: Map<string, Snapshot>, sdk: Map<string, Snapshot>, entry: string): Promise<{bundle: string; evaluationBundle: string; map: unknown}> => {
   const loaded = new Set<string>();
   const all = new Map<string, Snapshot>([...author.values(), ...sdk.values()].map(value => [value.virtual, value]));
   const authorEntry = author.get(entry)!;
   const render = entry.endsWith(".tsx")
     ? "return renderExport(authored, buildContext);"
     : "const value = typeof authored === \"function\" ? await authored(buildContext) : authored; return renderExport(value, buildContext);";
-  const wrapper = `import authored from ${JSON.stringify(authorEntry.virtual)};\nimport { renderExport } from ${JSON.stringify(SDK_COMPILER_IMPORT)};\nexport default ${entry.endsWith(".tsx") ? "" : "async "}function compile(buildContext) { ${render} }\n`;
+  const wrapper = `import authored from ${JSON.stringify(authorEntry.virtual)};\nimport { renderExport } from ${JSON.stringify(SDK_COMPILER_IMPORT)};\nexport default ${entry.endsWith(".tsx") ? "" : "async "}(buildContext) => { ${render} };\n`;
   const build = await rolldown({
     input: GENERATED_ENTRY,
     treeshake: false,
     plugins: [{
-      name: "reakt-locked-source-closure",
+      name: "apsides-locked-source-closure",
       resolveId(specifier, importer) {
         if (!importer) {
           if (specifier === GENERATED_ENTRY) return specifier;
@@ -230,20 +225,20 @@ async function bundleSnapshot(author: Map<string, Snapshot>, sdk: Map<string, Sn
           if (specifier === SDK_COMPILER_IMPORT) return sdk.get("compiler.ts")!.virtual;
           throw new Error(`generated compiler entry imports an undeclared module: ${specifier}`);
         }
-        if (specifier === SDK_COMPILER_IMPORT) throw new Error("author modules cannot import @reakt/kubernetes/compiler");
+        if (specifier === SDK_COMPILER_IMPORT) throw new Error("author modules cannot import @apsides/kubernetes/compiler");
         const publicSdk = SDK_PUBLIC_IMPORTS.get(specifier);
         if (publicSdk !== undefined) return sdk.get(publicSdk)!.virtual;
-        if (importer.startsWith("reakt:/sdk/")) {
+        if (importer.startsWith("apsides:/sdk/")) {
           if (!specifier.startsWith(".")) throw new Error(`SDK import is outside the allowlisted closure: ${specifier}`);
-          const importerPath = importer.slice("reakt:/sdk/".length);
+          const importerPath = importer.slice("apsides:/sdk/".length);
           const logical = normalizeLogical(posix.join(posix.dirname(importerPath), specifier), `SDK import ${specifier}`);
           const snapshot = sdk.get(logical);
           if (!snapshot) throw new Error(`SDK import is outside the allowlisted closure: ${logical}`);
           return snapshot.virtual;
         }
         if (!specifier.startsWith(".")) throw new Error(`undeclared package import: ${specifier}`);
-        if (!importer.startsWith("reakt:/source/")) throw new Error("SDK cannot import author modules");
-        const importerPath = importer.slice("reakt:/source/".length);
+        if (!importer.startsWith("apsides:/source/")) throw new Error("SDK cannot import author modules");
+        const importerPath = importer.slice("apsides:/source/".length);
         const logical = normalizeLogical(posix.join(posix.dirname(importerPath), specifier), `import ${specifier}`);
         const snapshot = author.get(logical);
         if (!snapshot) throw new Error(`relative import is absent from source lock: ${logical}`);
@@ -258,10 +253,10 @@ async function bundleSnapshot(author: Map<string, Snapshot>, sdk: Map<string, Sn
         const compiled = transform(snapshot.virtual, snapshot.text, {
           lang,
           sourcemap: true,
-          ...(id.startsWith("reakt:/source/") && lang === "tsx" ? { jsx: { runtime: "automatic" as const, development: true, importSource: SDK_PACKAGE } } : {}),
+          ...(id.startsWith("apsides:/source/") && lang === "tsx" ? { jsx: { runtime: "automatic" as const, development: true, importSource: SDK_PACKAGE } } : {}),
         });
         if (compiled.errors.length) throw new Error(`Oxc rejected ${snapshot.logical}: ${compiled.errors.map(error => error.message).join("; ")}`);
-        if (id.startsWith("reakt:/source/") && lang === "tsx") assertTrustedJsxRuntime(compiled.code, snapshot.logical);
+        if (id.startsWith("apsides:/source/") && lang === "tsx") assertTrustedJsxRuntime(compiled.code, snapshot.logical);
         return compiled.map === undefined ? { code: compiled.code } : { code: compiled.code, map: compiled.map };
       },
       resolveDynamicImport() { throw new Error("runtime imports are not declared build inputs"); },
@@ -271,16 +266,16 @@ async function bundleSnapshot(author: Map<string, Snapshot>, sdk: Map<string, Sn
     const result = await build.generate({ format: "esm", sourcemap: "hidden" });
     const chunks = result.output.filter(output => output.type === "chunk");
     if (chunks.length !== 1) throw new Error("build must emit one closed module");
-    const evaluation = await build.generate({ format: "iife", name: "ReaktProgram", exports: "named", sourcemap: false });
+    const evaluation = await build.generate({ format: "iife", name: "ApsidesProgram", exports: "named", sourcemap: false });
     const evaluationChunks = evaluation.output.filter(output => output.type === "chunk");
     if (evaluationChunks.length !== 1) throw new Error("evaluation build must emit one closed script");
     for (const item of author.values()) if (!loaded.has(item.virtual)) throw new Error(`source lock contains unreachable module: ${item.logical}`);
     if (!loaded.has(sdk.get("compiler.ts")!.virtual)) throw new Error("source bundle does not use the trusted compiler wrapper");
     return { bundle: chunks[0]!.code, evaluationBundle: evaluationChunks[0]!.code, map: chunks[0]!.map ?? null };
   } finally { await build.close(); }
-}
+};
 
-function assertTrustedJsxRuntime(code: string, logical: string): void {
+const assertTrustedJsxRuntime = (code: string, logical: string): void => {
   const body = (parseAst(code, { lang: "js", sourceType: "module" }) as { body?: unknown[] }).body ?? [];
   for (const node of body) {
     if (!node || typeof node !== "object" || (node as { type?: unknown }).type !== "ImportDeclaration") continue;
@@ -289,10 +284,10 @@ function assertTrustedJsxRuntime(code: string, logical: string): void {
       throw new Error(`author TSX cannot override the trusted JSX import source: ${logical}`);
     }
   }
-}
+};
 
-async function typecheckSnapshot(author: Map<string, Snapshot>, sdk: Map<string, Snapshot>, entry: string, deno: string): Promise<void> {
-  const stage = await mkdtemp(join(tmpdir(), "reakt-typecheck-"));
+const typecheckSnapshot = async (author: Map<string, Snapshot>, sdk: Map<string, Snapshot>, entry: string, deno: string): Promise<void> => {
+  const stage = await mkdtemp(join(tmpdir(), "apsides-typecheck-"));
   try {
     const sourceDir = join(stage, "source");
     const sdkDir = join(stage, "sdk");
@@ -304,10 +299,10 @@ async function typecheckSnapshot(author: Map<string, Snapshot>, sdk: Map<string,
     await writeFile(denoConfig, JSON.stringify({ compilerOptions: { jsx: "react-jsxdev", jsxImportSource: SDK_PACKAGE, strict: true }, imports }));
     await run(deno, ["check", "--config", denoConfig, "--no-lock", "--no-npm", "--no-remote", "--deny-import", join(sourceDir, entry)], "", { ...executionEnvironment });
   } finally { await rm(stage, {recursive:true, force:true}); }
-}
+};
 
-function evaluator(ses: string, bundle: string, buildContext: unknown): string {
-  const guest = `${bundle}\n; (async () => {\n  const exported = typeof ReaktProgram.default === "function" ? await ReaktProgram.default(buildContext) : ReaktProgram.default;\n  const payload = exported?.productionIR ? {productionIR: exported.productionIR?.toIR ? exported.productionIR.toIR() : exported.productionIR, fixtures: exported.fixtures ?? null} : {productionIR: exported?.toIR ? exported.toIR() : exported, fixtures: null};\n  if (!payload.productionIR || typeof payload.productionIR !== "object") throw new Error("source must default-export a domain, IR, build function, or {productionIR, fixtures}");\n  return payload;\n})()`;
+const evaluator = (ses: string, bundle: string, buildContext: unknown): string => {
+  const guest = `${bundle}\n; (async () => {\n  const exported = typeof ApsidesProgram.default === "function" ? await ApsidesProgram.default(buildContext) : ApsidesProgram.default;\n  const payload = exported?.productionIR ? {productionIR: exported.productionIR?.toIR ? exported.productionIR.toIR() : exported.productionIR, fixtures: exported.fixtures ?? null} : {productionIR: exported?.toIR ? exported.toIR() : exported, fixtures: null};\n  if (!payload.productionIR || typeof payload.productionIR !== "object") throw new Error("source must default-export a domain, IR, build function, or {productionIR, fixtures}");\n  return payload;\n})()`;
   return `const emit = console.log.bind(console);
 // Deno exposes a Node-compatible process.env proxy that throws under --deny-env.
 // SES receives no environment options; all lockdown choices below are explicit.
@@ -318,21 +313,21 @@ const compartment = new Compartment({buildContext:harden(${JSON.stringify(buildC
 const payload = await compartment.evaluate(${JSON.stringify(guest)});
 emit(JSON.stringify(payload));
 `;
-}
+};
 
-function denoEvaluationArgs(): string[] {
+const denoEvaluationArgs = (): string[] => {
   return ["run", "--no-config", "--no-lock", "--no-npm", "--cached-only", "--no-code-cache", "--no-prompt", "--deny-read", "--deny-write", "--deny-net", "--deny-env", "--deny-run", "--deny-ffi", "--deny-sys", "--deny-import", "--seed=0", "--v8-flags=--max-old-space-size=128", "-"];
-}
+};
 
-function parseEvaluation(stdout: string): { productionIR: ProductionIr; fixtures: unknown } {
+const parseEvaluation = (stdout: string): { productionIR: ProductionIr; fixtures: unknown } => {
   const line = stdout.trim();
   if (!line || line.includes("\n")) throw new Error("source evaluation must emit exactly one JSON payload");
   const value = JSON.parse(line) as Record<string, unknown>;
   if (!value || typeof value !== "object" || Array.isArray(value) || !("productionIR" in value)) throw new Error("source evaluation emitted an invalid payload");
   return { productionIR: value.productionIR as ProductionIr, fixtures: value.fixtures };
-}
+};
 
-function validateSourceLocations(ir: ProductionIr, author: Map<string, Snapshot>): void {
+const validateSourceLocations = (ir: ProductionIr, author: Map<string, Snapshot>): void => {
   for (const declaration of [...ir.resources, ...ir.inputs, ...ir.reactions]) {
     const source = declaration.source;
     const file = author.get(source?.file);
@@ -340,33 +335,33 @@ function validateSourceLocations(ir: ProductionIr, author: Map<string, Snapshot>
     const lines = file.text.split(/\r?\n/);
     if (!Number.isSafeInteger(source.line) || source.line < 1 || source.line > lines.length || !Number.isSafeInteger(source.column) || source.column < 1 || source.column > (lines[source.line - 1]?.length ?? 0) + 1) throw new Error(`declaration ${declaration.id} has an invalid source location`);
   }
-}
+};
 
-function buildDeclarationMap(ir: ProductionIr, fixtures: {inputs:{inputId:string;source:{file:string;line:number;column:number}}[];workloadSubstitutions:{targetResourceId:string;source:{file:string;line:number;column:number}}[]}, author: Map<string, Snapshot>) {
+const buildDeclarationMap = (ir: ProductionIr, fixtures: {inputs:{inputId:string;source:{file:string;line:number;column:number}}[];workloadSubstitutions:{targetResourceId:string;source:{file:string;line:number;column:number}}[]}, author: Map<string, Snapshot>) => {
   const entry = (category: string, id: string, source: {file:string;line:number;column:number}) => ({ category, id, source, inputSha256: author.get(source.file)!.sha256 });
   return {
-    schemaVersion: "reakt.dev/source-map/v1", virtualRoot: "reakt:/source",
+    schemaVersion: "apsides.dev/source-map/v1", virtualRoot: "apsides:/source",
     declarations: [
       ...ir.resources.map(value => entry("resource", value.id, value.source)), ...ir.inputs.map(value => entry("input", value.id, value.source)),
       ...ir.reactions.map(value => entry("reaction", value.id, value.source)), ...fixtures.inputs.map(value => entry("fixture-input", value.inputId, value.source)),
       ...fixtures.workloadSubstitutions.map(value => entry("fixture-workload", value.targetResourceId, value.source)),
     ].sort((a,b) => order(`${a.category}/${a.id}`, `${b.category}/${b.id}`)),
   };
-}
+};
 
-function normalizeSourceMap(value: unknown): unknown {
+const normalizeSourceMap = (value: unknown): unknown => {
   if (!value || typeof value !== "object") throw new Error("Rolldown did not emit a source map");
   const map = JSON.parse(String(value)) as Record<string, unknown>;
   if (Array.isArray(map.sources)) map.sources = map.sources.map(source => {
     const text = String(source);
-    const offset = text.lastIndexOf("reakt:/");
+    const offset = text.lastIndexOf("apsides:/");
     return offset < 0 ? text : text.slice(offset);
   });
   delete map.file;
   return map;
-}
+};
 
-function parseCanonicalLock(text: string): SourceLock {
+const parseCanonicalLock = (text: string): SourceLock => {
   const value = JSON.parse(text) as Record<string, unknown>;
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("source lock must be an object");
   if (canonicalPretty(value) !== text) throw new Error("source lock must be canonical JSON; duplicate, unordered, or unknown formatting is unsupported");
@@ -386,43 +381,43 @@ function parseCanonicalLock(text: string): SourceLock {
   const sorted = [...inputs].sort((a,b) => order(a.path,b.path));
   if (canonicalString(inputs) !== canonicalString(sorted)) throw new Error("source lock inputs must be sorted by path");
   return { schemaVersion: SOURCE_LOCK_SCHEMA, entry: normalizeLogical(value.entry, "source lock entry"), inputs };
-}
+};
 
-function normalizeLogical(value: string, context: string): string {
+const normalizeLogical = (value: string, context: string): string => {
   if (!value || value.startsWith("/") || value.includes("\\") || value.includes("?") || value.includes("#")) throw new Error(`${context} must be a normalized relative path`);
   const normalized = posix.normalize(value);
   if (normalized !== value || normalized === ".." || normalized.startsWith("../") || normalized.split("/").includes(".")) throw new Error(`${context} must be a normalized relative path`);
   return normalized;
-}
+};
 
-async function snapshotSdk(): Promise<Map<string, Snapshot>> {
-  const root = await realpath(fileURLToPath(new URL("../../reakt/src", import.meta.url)));
+const snapshotSdk = async (): Promise<Map<string, Snapshot>> => {
+  const root = await realpath(fileURLToPath(new URL("../../kubernetes/src", import.meta.url)));
   const snapshots = new Map<string, Snapshot>();
   for (const logical of SDK_FILES) {
     const physical = join(root, logical);
     const actual = await realpath(physical);
-    if (actual !== physical || !(await lstat(physical)).isFile()) throw new Error(`Reakt SDK module must be a regular non-symlink file: ${logical}`);
+    if (actual !== physical || !(await lstat(physical)).isFile()) throw new Error(`Apsides SDK module must be a regular non-symlink file: ${logical}`);
     const bytes = await readFile(physical);
-    snapshots.set(logical, { logical, virtual: `reakt:/sdk/${logical}`, physical, text: bytes.toString("utf8"), sha256: sha256(bytes) });
+    snapshots.set(logical, { logical, virtual: `apsides:/sdk/${logical}`, physical, text: bytes.toString("utf8"), sha256: sha256(bytes) });
   }
   return snapshots;
-}
+};
 
-async function assertSnapshotUnchanged(snapshot: Snapshot, message: string): Promise<void> {
+const assertSnapshotUnchanged = async (snapshot: Snapshot, message: string): Promise<void> => {
   let actual: string;
   try { actual = await realpath(snapshot.physical); } catch { throw new Error(`${message}: ${snapshot.logical}`); }
   if (actual !== snapshot.physical || !(await lstat(snapshot.physical)).isFile() || sha256(await readFile(snapshot.physical)) !== snapshot.sha256) {
     throw new Error(`${message}: ${snapshot.logical}`);
   }
-}
+};
 
-async function compilerIdentity(): Promise<{path:string;sha256:string}[]> {
+const compilerIdentity = async (): Promise<{path:string;sha256:string}[]> => {
   const base = dirname(fileURLToPath(import.meta.url));
   const paths = [fileURLToPath(import.meta.url), fileURLToPath(new URL("./fixtures.ts", import.meta.url))];
   return Promise.all(paths.map(async path => ({ path: `@apsides/compiler/${relative(base, path)}`, sha256: sha256(await readFile(path)) })));
-}
+};
 
-async function installedToolIdentity(): Promise<{path:string;sha256:string}[]> {
+const installedToolIdentity = async (): Promise<{path:string;sha256:string}[]> => {
   const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
   const workspaceRoot = resolve(packageRoot, "../..");
   const oxcRoot = await findPackageRoot(fileURLToPath(import.meta.resolve("oxc-transform")));
@@ -442,22 +437,20 @@ async function installedToolIdentity(): Promise<{path:string;sha256:string}[]> {
     ["node_modules/ansis", await findPackageRoot(rolldownRequire.resolve("ansis"))],
   ] as const;
   const output: {path:string;sha256:string}[] = await Promise.all(roots.map(async ([path, root]) => ({ path, sha256: await directoryDigest(root, path, path === "packages/compiler" ? new Set(["src", "node_modules"]) : new Set()) })));
-  output.push({path:"pnpm-lock.yaml",sha256:sha256(await readFile(join(workspaceRoot,"pnpm-lock.yaml")))});
+  output.push({path:"deno.lock",sha256:sha256(await readFile(join(workspaceRoot,"deno.lock")))});
   return output.sort((a,b) => order(a.path,b.path));
-}
+};
 
-function nativeBindingTarget(): string {
-  if (process.platform === "darwin") return `darwin-${process.arch}`;
-  if (process.platform === "win32") return `win32-${process.arch}-msvc`;
-  if (process.platform === "linux") {
-    const report = process.report?.getReport();
-    const glibc = typeof report === "object" && report !== null && "header" in report && typeof report.header === "object" && report.header !== null && "glibcVersionRuntime" in report.header;
-    return `linux-${process.arch}-${glibc ? "gnu" : "musl"}`;
-  }
-  throw new Error(`unsupported source compiler platform ${process.platform}/${process.arch}`);
-}
+const nativeBindingTarget = (): string => {
+  const target = Deno.build.target;
+  if (target.endsWith("-apple-darwin")) return `darwin-${process.arch}`;
+  if (target.endsWith("-pc-windows-msvc")) return `win32-${process.arch}-msvc`;
+  if (target.endsWith("-unknown-linux-gnu")) return `linux-${process.arch}-gnu`;
+  if (target.endsWith("-unknown-linux-musl")) return `linux-${process.arch}-musl`;
+  throw new Error(`unsupported source compiler target ${target}`);
+};
 
-async function findPackageRoot(path: string): Promise<string> {
+const findPackageRoot = async (path: string): Promise<string> => {
   let current = dirname(path);
   while (true) {
     if (await exists(join(current,"package.json"))) return realpath(current);
@@ -465,11 +458,11 @@ async function findPackageRoot(path: string): Promise<string> {
     if (parent === current) throw new Error(`cannot find package root for ${path}`);
     current = parent;
   }
-}
+};
 
-async function directoryDigest(root: string, logicalRoot: string, excluded: Set<string>): Promise<string> {
+const directoryDigest = async (root: string, logicalRoot: string, excluded: Set<string>): Promise<string> => {
   const entries: {path:string;sha256:string}[] = [];
-  async function visit(directory: string): Promise<void> {
+  const visit = async (directory: string): Promise<void> => {
     for (const entry of (await readdir(directory,{withFileTypes:true})).sort((a,b) => order(a.name,b.name))) {
       const path = join(directory,entry.name);
       const logical = relative(root,path).split(sep).join("/");
@@ -479,21 +472,12 @@ async function directoryDigest(root: string, logicalRoot: string, excluded: Set<
       else if (entry.isFile()) entries.push({path:`${logicalRoot}/${logical}`,sha256:sha256(await readFile(path))});
       else throw new Error(`installed tool closure contains an unsupported file type: ${logicalRoot}/${logical}`);
     }
-  }
+  };
   await visit(root);
   return sha256(canonicalString(entries));
-}
+};
 
-async function findExecutable(name: string): Promise<string> {
-  for (const directory of (process.env.PATH ?? "").split(delimiter)) {
-    if (!directory) continue;
-    const candidate = join(directory, name);
-    try { await access(candidate, constants.X_OK); return await realpath(candidate); } catch { /* try next PATH entry */ }
-  }
-  throw new Error(`${name} executable was not found in PATH`);
-}
-
-function run(command: string, args: string[], stdin: string, env: Record<string,string>): Promise<{stdout:string;stderr:string}> {
+const run = (command: string, args: string[], stdin: string, env: Record<string,string>): Promise<{stdout:string;stderr:string}> => {
   return new Promise((resolveRun, rejectRun) => {
     const child = spawn(command, args, { cwd: "/", env, stdio: ["pipe", "pipe", "pipe"] });
     const stdout: Buffer[] = []; const stderr: Buffer[] = []; let size = 0;
@@ -513,11 +497,11 @@ function run(command: string, args: string[], stdin: string, env: Record<string,
     });
     child.stdin.end(stdin);
   });
-}
+};
 
-async function writeJson(path: string, value: unknown): Promise<void> { await writeFile(path, `${JSON.stringify(JSON.parse(canonicalString(value)), null, 2)}\n`); }
-function canonicalPretty(value: unknown): string { return `${JSON.stringify(JSON.parse(canonicalString(value)), null, 2)}\n`; }
-async function exists(path: string): Promise<boolean> { try { await lstat(path); return true; } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; } }
+const writeJson = async (path: string, value: unknown): Promise<void> => { await writeFile(path, `${JSON.stringify(JSON.parse(canonicalString(value)), null, 2)}\n`); };
+const canonicalPretty = (value: unknown): string => { return `${JSON.stringify(JSON.parse(canonicalString(value)), null, 2)}\n`; };
+const exists = async (path: string): Promise<boolean> => { try { await lstat(path); return true; } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; } };
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const [source, output, ...extra] = process.argv.slice(2);
@@ -526,10 +510,10 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     process.exitCode = 2;
   } else {
     try {
-      await compileReakt(resolve(source), resolve(output));
+      await compileApsides(resolve(source), resolve(output));
     } catch {
       // Author code and tool diagnostics may contain private source or values.
-      console.error("reakt: source compilation failed");
+      console.error("apsides: source compilation failed");
       process.exitCode = 1;
     }
   }

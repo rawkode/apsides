@@ -7,7 +7,7 @@ use kube::{Api, api::ListParams};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-pub const TERMINATION_FINALIZER: &str = "reakt.dev/termination-evidence";
+pub const TERMINATION_FINALIZER: &str = "apsides.dev/termination-evidence";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

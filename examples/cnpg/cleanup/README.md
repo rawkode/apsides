@@ -44,7 +44,7 @@ The local runner accepts this signed predecessor and the signed parent
 successor, verified together under one external trust policy:
 
 ```sh
-cuenv exec -- python3 tests/reakt/run_cnpg_cleanup.py \
+cuenv exec -- python3 tests/run_cnpg_cleanup.py \
   --initial-artifact "$CLEANUP_PREDECESSOR" \
   --successor-artifact "$SUCCESSOR_CANDIDATE" \
   --trust-policy "$JOINT_TRUST_POLICY" \
@@ -62,5 +62,5 @@ existing Docker context; existing clusters remain untouched.
 The runner emits a non-release measurement only after cluster and credential
 cleanup and repeated input verification. The reviewed archival adapter packages
 that measurement into a production receipt; see the
-[packaging contract](../../../docs/reakt/PRODUCTION-EVIDENCE.md).
+[packaging contract](../../../docs/reference/PRODUCTION-EVIDENCE.md).
 Offline runner checks use `cuenv task cnpgCleanupTest`.

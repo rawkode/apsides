@@ -11,7 +11,7 @@ use std::{
 use tower::service_fn;
 
 fn identity(revision: &str) -> Value {
-    json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"reakt-deploy-identity-example","namespace":"control","uid":"identity-uid","resourceVersion":revision},"data":{"state.json":json!({"schemaVersion":SCHEMA_VERSION,"domainId":"example","clusterBinding":"cluster-a","serviceAccountName":"deployer","serviceAccountUid":"sa-uid","bindingSecretName":"binding","bindingSecretUid":"secret-uid","audience":"https://kubernetes.default.svc","lifetimeSeconds":600}).to_string()}})
+    json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"apsides-deploy-identity-example","namespace":"control","uid":"identity-uid","resourceVersion":revision},"data":{"state.json":json!({"schemaVersion":SCHEMA_VERSION,"domainId":"example","clusterBinding":"cluster-a","serviceAccountName":"deployer","serviceAccountUid":"sa-uid","bindingSecretName":"binding","bindingSecretUid":"secret-uid","audience":"https://kubernetes.default.svc","lifetimeSeconds":600}).to_string()}})
 }
 
 fn client(replies: Vec<Value>) -> (PlatformClient, Arc<Mutex<Vec<Value>>>) {

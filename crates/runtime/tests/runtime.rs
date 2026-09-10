@@ -6,14 +6,14 @@ use runtime::{FixtureConfig, Observation, RunReport, RuntimeClient, RuntimeError
 use serde_json::Value;
 
 const IR: &str = r#"{
-  "schemaVersion":"reakt.dev/ir/v1",
-  "domain":{"id":"example","namespace":"workload","controlNamespace":"reakt-system","clusterBinding":"fixture","policyRef":"platform/example","enforcement":"api-bound","budgets":{"maxResources":8,"maxInputs":8,"maxReactions":8,"maxObjectBytes":262144,"maxQueueDepth":8,"maxConcurrentRequests":2}},
+  "schemaVersion":"apsides.dev/ir/v1",
+  "domain":{"id":"example","namespace":"workload","controlNamespace":"apsides-system","clusterBinding":"fixture","policyRef":"platform/example","enforcement":"api-bound","budgets":{"maxResources":8,"maxInputs":8,"maxReactions":8,"maxObjectBytes":262144,"maxQueueDepth":8,"maxConcurrentRequests":2}},
   "resources":[
     {"id":"deployment","apiVersion":"apps/v1","kind":"Deployment","name":"api","namespace":"workload","desired":{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"api","namespace":"workload"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"api"}},"template":{"metadata":{"labels":{"app":"api"}},"spec":{"containers":[{"name":"api","image":"fixture.invalid/api@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","imagePullPolicy":"Never"}]}}}},"lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"controller.ts","line":1,"column":1}}
   ],
   "inputs":[{"id":"config","apiVersion":"v1","kind":"ConfigMap","name":"input","namespace":"workload","mode":"observed","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"controller.ts","line":2,"column":1}}],
   "reactions":[{"id":"rollout","op":"rollout","inputs":["config"],"target":"deployment","source":{"file":"controller.ts","line":3,"column":1}}],
-  "provenance":{"compiler":"reakt/0.1","inputs":[{"path":"controller.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
+  "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"controller.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
 }"#;
 
 #[derive(Default)]
@@ -85,10 +85,10 @@ async fn available_input_produces_a_stable_revision_and_ssa_write() {
     let writes = client.writes.lock().unwrap();
     let a = writes[0]
         .1
-        .pointer("/spec/template/metadata/annotations/reakt.dev~1revision");
+        .pointer("/spec/template/metadata/annotations/apsides.dev~1revision");
     let b = writes[1]
         .1
-        .pointer("/spec/template/metadata/annotations/reakt.dev~1revision");
+        .pointer("/spec/template/metadata/annotations/apsides.dev~1revision");
     assert_eq!(a, b);
     assert!(a.and_then(Value::as_str).unwrap().starts_with("sha256:"));
 }

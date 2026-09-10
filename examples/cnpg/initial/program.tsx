@@ -1,9 +1,9 @@
-import { ConfigMap, Controller } from "@reakt/kubernetes";
+import { ConfigMap, Controller } from "@apsides/kubernetes";
 import { Cluster } from "./.aps/crds/cnpg.ts";
 
 const namespace = "default";
 
-function Database() {
+const Database = () => {
 
   return (
     <>
@@ -34,7 +34,7 @@ function Database() {
       />
     </>
   );
-}
+};
 
 export default (
   <Controller

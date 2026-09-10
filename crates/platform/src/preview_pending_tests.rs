@@ -58,7 +58,7 @@ fn fixture(mode: Mode) -> TestResult<Fixture> {
             .collect(),
     );
     let identity_object = state(
-        "reakt-deploy-identity-example",
+        "apsides-deploy-identity-example",
         &identity,
         "identity-uid",
         "1",
@@ -66,8 +66,8 @@ fn fixture(mode: Mode) -> TestResult<Fixture> {
     bind_preview_executor(&mut registry, &plan, &identity)?;
     let registry_object =
         crate::tests::registry_object(&registry, &plan.request.registry.registry_uid, "43")?;
-    let policy_object = state("reakt-policy-example", &policy, "policy-uid", "40")?;
-    let trust_object = state("reakt-trust-example", &trust, "trust-uid", "43")?;
+    let policy_object = state("apsides-policy-example", &policy, "policy-uid", "40")?;
+    let trust_object = state("apsides-trust-example", &trust, "trust-uid", "43")?;
     let resolve = vec![
         registry_object.clone(),
         trust_object.clone(),
@@ -102,7 +102,7 @@ fn fixture(mode: Mode) -> TestResult<Fixture> {
     });
     replies.extend(group); // final authority recheck
     replies.extend(resolve); // test's final authenticated resolve
-    replies.retain(|reply| reply["metadata"]["name"] != "reakt-deploy-identity-example");
+    replies.retain(|reply| reply["metadata"]["name"] != "apsides-deploy-identity-example");
     let (client, calls) = crate::tests::wire_with_identity(replies, identity_object);
     let platform = crate::tests::platform_client(client, "control", "workload", "cluster-a")?;
     let issued = IssuedDeployment::for_preview_test(
@@ -156,7 +156,7 @@ fn target_object(plan: &deploy::TransitionPlan, replaced: bool) -> Value {
         "target-uid"
     });
     value["metadata"]["resourceVersion"] = json!("90");
-    value["metadata"]["managedFields"] = json!([{"manager":"reakt-example","operation":"Apply","apiVersion":"v1",
+    value["metadata"]["managedFields"] = json!([{"manager":"apsides-example","operation":"Apply","apiVersion":"v1",
         "fieldsType":"FieldsV1","fieldsV1":{"f:data":{"f:value":{}}}}]);
     value
 }

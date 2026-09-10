@@ -51,8 +51,8 @@ pub fn command(options: &BTreeMap<String, String>) -> Result<()> {
     );
     let repository = required(options, "--repository")?;
     let commit = required(options, "--commit")?;
-    let manifest = json!({"schemaVersion":"reakt.dev/release/v1","mode":mode,
-        "irDigest":digest(&ir)?,"binaryDigest":files.get("reakt-controller").ok_or("release is missing its controller binary")?,
+    let manifest = json!({"schemaVersion":"apsides.dev/release/v1","mode":mode,
+        "irDigest":digest(&ir)?,"binaryDigest":files.get("apsides-controller").ok_or("release is missing its controller binary")?,
         "image":{"reference":required(options,"--image")?,"platform":required(options,"--platform")?},
         "source":{"repository":repository,"commit":commit,"inputsDigest":digest(&inputs)?},
         "compilerDigest":compiler,"files":files});
@@ -65,8 +65,8 @@ pub fn command(options: &BTreeMap<String, String>) -> Result<()> {
         canonical_bytes(&json!({
             "_type":"https://in-toto.io/Statement/v1","predicateType":"https://slsa.dev/provenance/v1",
             "subject":[{"name":"release.json","digest":{"sha256":release_digest.trim_start_matches("sha256:")}}],
-            "predicate":{"buildDefinition":{"buildType":"https://reakt.dev/build/v1","externalParameters":{"repository":repository,"commit":commit,"compilerDigest":compiler},"internalParameters":{},"resolvedDependencies":[]},
-            "runDetails":{"builder":{"id":"https://reakt.dev/compiler/v1"}}}
+            "predicate":{"buildDefinition":{"buildType":"https://apsides.dev/build/v1","externalParameters":{"repository":repository,"commit":commit,"compilerDigest":compiler},"internalParameters":{},"resolvedDependencies":[]},
+            "runDetails":{"builder":{"id":"https://apsides.dev/compiler/v1"}}}
         }))?,
     )?;
     writeln!(
@@ -90,7 +90,7 @@ fn copy(
     }
     let max = if name == "controller.oci.tar" {
         512 * 1024 * 1024
-    } else if name == "reakt-controller" {
+    } else if name == "apsides-controller" {
         128 * 1024 * 1024
     } else {
         8 * 1024 * 1024
@@ -143,7 +143,7 @@ fn collect_files(
     copy(
         Path::new(required(options, "--binary")?),
         output,
-        "reakt-controller",
+        "apsides-controller",
         files,
     )?;
     copy(

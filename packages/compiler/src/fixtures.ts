@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { fixtureInputData } from "../../reakt/src/model.ts";
+import { fixtureInputData } from "../../kubernetes/src/model.ts";
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type Source = { file: string; line: number; column: number };
@@ -19,7 +19,7 @@ export type ProductionIr = {
 type InputFixture = { inputId: string; source: Source; synthetic: true; state: "present" | "missing" | "unauthorized" | "unavailable" | "invalid"; data?: Record<string, string> };
 type WorkloadFixture = { targetResourceId: string; source: Source; containers: { name: string; image: string; imagePullPolicy: "Never" }[] };
 export type FixtureBundle = {
-  schemaVersion: "reakt.dev/fixtures/v1";
+  schemaVersion: "apsides.dev/fixtures/v1";
   testOnly: true;
   productionReady: false;
   inputs: InputFixture[];
@@ -29,11 +29,11 @@ export type FixtureBundle = {
 const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
 const order = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
 
-export function canonicalString(value: unknown): string {
+export const canonicalString = (value: unknown): string => {
   return JSON.stringify(canonical(value));
-}
+};
 
-export function buildFixtureOutputs(ir: ProductionIr, supplied: unknown, workloadImage = "reakt-fixture:local") {
+export const buildFixtureOutputs = (ir: ProductionIr, supplied: unknown, workloadImage = "apsides-fixture:local") => {
   validateProductionIrShape(ir);
   const fixtures = completeFixtures(ir, supplied, workloadImage);
   const fixtureIr = materialize(ir, fixtures);
@@ -46,7 +46,7 @@ export function buildFixtureOutputs(ir: ProductionIr, supplied: unknown, workloa
     if (change.path !== "/testOnly" && !allowed.test(change.path)) throw new Error(`fixture overlay changes unsupported field ${change.path}`);
   }
   const overlay = {
-    schemaVersion: "reakt.dev/fixture-overlay/v1",
+    schemaVersion: "apsides.dev/fixture-overlay/v1",
     testOnly: true,
     productionReady: false,
     productionIrSha256: productionDigest,
@@ -65,11 +65,11 @@ export function buildFixtureOutputs(ir: ProductionIr, supplied: unknown, workloa
   const catalogue = fixtureCatalogue(workloadImage);
   const coverage = fixtureCoverage(ir, fixtures, productionDigest, fixtureDigest, digest(canonicalString(fixtures)));
   return { fixtures, fixtureIr, overlay, catalogue, coverage };
-}
+};
 
-function validateProductionIrShape(ir: ProductionIr): void {
-  if (!plain(ir) || ir.schemaVersion !== "reakt.dev/ir/v1" || ir.testOnly !== false) throw new Error("source must emit production Reakt IR with testOnly false");
-  if (!Array.isArray(ir.resources) || !Array.isArray(ir.inputs) || !Array.isArray(ir.reactions) || !plain(ir.provenance)) throw new Error("source emitted malformed Reakt IR arrays or provenance");
+const validateProductionIrShape = (ir: ProductionIr): void => {
+  if (!plain(ir) || ir.schemaVersion !== "apsides.dev/ir/v1" || ir.testOnly !== false) throw new Error("source must emit production Apsides IR with testOnly false");
+  if (!Array.isArray(ir.resources) || !Array.isArray(ir.inputs) || !Array.isArray(ir.reactions) || !plain(ir.provenance)) throw new Error("source emitted malformed Apsides IR arrays or provenance");
   const inputIds = new Set<string>();
   for (const input of ir.inputs) {
     if (!plain(input) || typeof input.id !== "string" || inputIds.has(input.id)) throw new Error("source emitted invalid or duplicate input identity");
@@ -78,13 +78,13 @@ function validateProductionIrShape(ir: ProductionIr): void {
     if ((input.mode === "managed") !== (typeof input.managedResourceId === "string")) throw new Error(`fixture input ${input.id} has inconsistent managed resource identity`);
     inputIds.add(input.id);
   }
-}
+};
 
-function completeFixtures(ir: ProductionIr, supplied: unknown, workloadImage: string): FixtureBundle {
-  if (workloadImage !== "reakt-fixture:local") throw new Error("v1 source builds require the locally imported reakt-fixture:local image");
+const completeFixtures = (ir: ProductionIr, supplied: unknown, workloadImage: string): FixtureBundle => {
+  if (workloadImage !== "apsides-fixture:local") throw new Error("v1 source builds require the locally imported apsides-fixture:local image");
   const value = supplied === undefined || supplied === null ? {} : expectRecord(supplied, "fixture bundle");
   for (const key of Object.keys(value)) if (!["schemaVersion", "testOnly", "productionReady", "inputs", "workloadSubstitutions"].includes(key)) throw new Error(`fixture bundle contains unsupported field ${key}`);
-  if (value.schemaVersion !== undefined && value.schemaVersion !== "reakt.dev/fixtures/v1") throw new Error("unsupported fixture schemaVersion");
+  if (value.schemaVersion !== undefined && value.schemaVersion !== "apsides.dev/fixtures/v1") throw new Error("unsupported fixture schemaVersion");
   if (value.testOnly !== undefined && value.testOnly !== true) throw new Error("fixture bundle must be testOnly");
   if (value.productionReady !== undefined && value.productionReady !== false) throw new Error("fixture bundle must never be productionReady");
   const suppliedInputs = value.inputs === undefined ? [] : expectArray(value.inputs, "fixture inputs").map(parseInputFixture);
@@ -113,10 +113,10 @@ function completeFixtures(ir: ProductionIr, supplied: unknown, workloadImage: st
     if (item.containers.some(container => container.image !== workloadImage || container.imagePullPolicy !== "Never")) throw new Error(`workload fixture ${resource.id} must use ${workloadImage} with imagePullPolicy Never`);
     return item;
   });
-  return canonical({ schemaVersion: "reakt.dev/fixtures/v1", testOnly: true, productionReady: false, inputs: inputs.sort((a,b) => order(a.inputId,b.inputId)), workloadSubstitutions: workloadSubstitutions.sort((a,b) => order(a.targetResourceId,b.targetResourceId)) }) as FixtureBundle;
-}
+  return canonical({ schemaVersion: "apsides.dev/fixtures/v1", testOnly: true, productionReady: false, inputs: inputs.sort((a,b) => order(a.inputId,b.inputId)), workloadSubstitutions: workloadSubstitutions.sort((a,b) => order(a.targetResourceId,b.targetResourceId)) }) as FixtureBundle;
+};
 
-function materialize(ir: ProductionIr, fixtures: FixtureBundle): ProductionIr {
+const materialize = (ir: ProductionIr, fixtures: FixtureBundle): ProductionIr => {
   const substitutions = new Map(fixtures.workloadSubstitutions.map(item => [item.targetResourceId, item]));
   const resources = ir.resources.map(resource => {
     const substitution = substitutions.get(resource.id);
@@ -133,21 +133,21 @@ function materialize(ir: ProductionIr, fixtures: FixtureBundle): ProductionIr {
     return { ...resource, desired };
   });
   return canonical({ ...ir, testOnly: true, resources }) as ProductionIr;
-}
+};
 
-function fixtureCatalogue(image: string) {
+const fixtureCatalogue = (image: string) => {
   return {
-    schemaVersion: "reakt.dev/fixture-catalogue/v1",
+    schemaVersion: "apsides.dev/fixture-catalogue/v1",
     testOnly: true,
-    image: { reference: image, requiredPullPolicy: "Never", sourceRecipe: "scripts/reakt/fixture-image", pinnedBase: "bash:5.2.37@sha256:3bee76a96d86d5d2d5efc7c1c570e5a7c95db22348a26944e0e546fa174e3324" },
+    image: { reference: image, requiredPullPolicy: "Never", sourceRecipe: "scripts/fixture-image", pinnedBase: "bash:5.2.37@sha256:3bee76a96d86d5d2d5efc7c1c570e5a7c95db22348a26944e0e546fa174e3324" },
     behaviors: [
       { id: "long-running", mode: "running", contract: "remains running and exits cleanly on TERM or INT" },
       { id: "exit-success", mode: "success", contract: "exits with status 0" },
       { id: "exit-failure", mode: "failure", contract: "exits with status 23" },
-      { id: "controllable-readiness", mode: "readiness", contract: "writes /tmp/reakt-ready after REAKT_READY_AFTER_SECONDS; use an exec probe for that path" },
+      { id: "controllable-readiness", mode: "readiness", contract: "writes /tmp/apsides-ready after APSIDES_READY_AFTER_SECONDS; use an exec probe for that path" },
     ],
   };
-}
+};
 
 const forceScenario = ["forced-field-conflict", "api", "approved force reconciles competing fields while preserving object UID"] as const;
 
@@ -182,7 +182,7 @@ const managedScenarios = [
 
 const mutationScenario = ["reaction-contribution-removed", "mutation", "the primitive reference assertion fails when this reaction contribution is removed"] as const;
 
-function fixtureCoverage(ir: ProductionIr, fixtures: FixtureBundle, productionIrSha256: string, fixtureIrSha256: string, fixtureSha256: string) {
+const fixtureCoverage = (ir: ProductionIr, fixtures: FixtureBundle, productionIrSha256: string, fixtureIrSha256: string, fixtureSha256: string) => {
   const inputs = new Map(ir.inputs.map(input => [input.id, input]));
   const resources = new Map(ir.resources.map(resource => [resource.id, resource]));
   let requiredCases = 0;
@@ -217,31 +217,31 @@ function fixtureCoverage(ir: ProductionIr, fixtures: FixtureBundle, productionIr
     };
   });
   return {
-    schemaVersion: "reakt.dev/fixture-coverage/v1", testOnly: true, productionReady: false,
+    schemaVersion: "apsides.dev/fixture-coverage/v1", testOnly: true, productionReady: false,
     productionIrSha256, fixtureIrSha256, fixtureSha256,
     artifactMode: "fixture-substituted",
     reactions,
     summary: { reactions: ir.reactions.length, requiredCases, generatedExternalInputs: fixtures.inputs.length, substitutedWorkloads: fixtures.workloadSubstitutions.length },
   };
-}
+};
 
-function deploymentContainers(resource: Resource): Record<string, Json>[] {
+const deploymentContainers = (resource: Resource): Record<string, Json>[] => {
   const spec = expectRecord(resource.desired.spec, `${resource.id}.spec`);
   const template = expectRecord(spec.template, `${resource.id}.spec.template`);
   const podSpec = expectRecord(template.spec, `${resource.id}.spec.template.spec`);
   return expectArray(podSpec.containers, `${resource.id} containers`).map((value, index) => expectRecord(value, `${resource.id} container ${index}`) as Record<string, Json>);
-}
+};
 
-function parseInputFixture(value: unknown): InputFixture {
+const parseInputFixture = (value: unknown): InputFixture => {
   const item = expectRecord(value, "input fixture");
   exactKeys(item, item.state === "present" ? ["inputId", "source", "synthetic", "state", "data"] : ["inputId", "source", "synthetic", "state"], "input fixture");
   if (typeof item.inputId !== "string" || item.synthetic !== true || !["present", "missing", "unauthorized", "unavailable", "invalid"].includes(String(item.state))) throw new Error("invalid input fixture identity, synthetic marker, or state");
   const output: InputFixture = { inputId: item.inputId, source: parseSource(item.source), synthetic: true, state: item.state as InputFixture["state"] };
   if (item.state === "present") output.data = stringRecord(item.data, "input fixture data");
   return output;
-}
+};
 
-function parseWorkloadFixture(value: unknown): WorkloadFixture {
+const parseWorkloadFixture = (value: unknown): WorkloadFixture => {
   const item = expectRecord(value, "workload fixture");
   exactKeys(item, ["targetResourceId", "source", "containers"], "workload fixture");
   if (typeof item.targetResourceId !== "string") throw new Error("invalid workload fixture target");
@@ -252,15 +252,15 @@ function parseWorkloadFixture(value: unknown): WorkloadFixture {
   });
   unique(containers, item => item.name, "fixture container");
   return { targetResourceId: item.targetResourceId, source: parseSource(item.source), containers };
-}
+};
 
-function parseSource(value: unknown): Source {
+const parseSource = (value: unknown): Source => {
   const item = expectRecord(value, "fixture source"); exactKeys(item, ["file", "line", "column"], "fixture source");
   if (typeof item.file !== "string" || !Number.isSafeInteger(item.line) || Number(item.line) < 1 || !Number.isSafeInteger(item.column) || Number(item.column) < 1) throw new Error("invalid fixture source location");
   return { file: item.file, line: Number(item.line), column: Number(item.column) };
-}
+};
 
-function diff(before: unknown, after: unknown, path = ""): { op: "add" | "remove" | "replace"; path: string; before?: Json; after?: Json }[] {
+const diff = (before: unknown, after: unknown, path = ""): { op: "add" | "remove" | "replace"; path: string; before?: Json; after?: Json }[] => {
   if (canonicalString(before) === canonicalString(after)) return [];
   if (Array.isArray(before) && Array.isArray(after) && before.length === after.length) return before.flatMap((value, index) => diff(value, after[index], `${path}/${index}`));
   if (plain(before) && plain(after)) {
@@ -268,9 +268,9 @@ function diff(before: unknown, after: unknown, path = ""): { op: "add" | "remove
     return keys.flatMap(key => key in before && key in after ? diff(before[key], after[key], `${path}/${escapePointer(key)}`) : key in before ? [{ op: "remove" as const, path: `${path}/${escapePointer(key)}`, before: canonical(before[key]) }] : [{ op: "add" as const, path: `${path}/${escapePointer(key)}`, after: canonical(after[key]) }]);
   }
   return [{ op: "replace", path, before: canonical(before), after: canonical(after) }];
-}
+};
 
-function canonical(value: unknown): Json {
+const canonical = (value: unknown): Json => {
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (Array.isArray(value)) return value.map(canonical);
@@ -278,12 +278,12 @@ function canonical(value: unknown): Json {
   const output: Record<string, Json> = Object.create(null);
   for (const key of Object.keys(value).sort(order)) output[key] = canonical(value[key]);
   return output;
-}
+};
 
-function plain(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null); }
-function expectRecord(value: unknown, context: string): Record<string, any> { if (!plain(value)) throw new Error(`${context} must be an object`); return value; }
-function expectArray(value: unknown, context: string): unknown[] { if (!Array.isArray(value)) throw new Error(`${context} must be an array`); return value; }
-function exactKeys(value: Record<string, unknown>, allowed: string[], context: string): void { for (const key of Object.keys(value)) if (!allowed.includes(key)) throw new Error(`${context} contains unsupported field ${key}`); }
-function stringRecord(value: unknown, context: string): Record<string, string> { const item = expectRecord(value, context); const output: Record<string,string> = Object.create(null); for (const [key, entry] of Object.entries(item)) { if (typeof entry !== "string") throw new Error(`${context}.${key} must be a string`); output[key] = entry; } return output; }
-function unique<T>(values: T[], key: (value: T) => string, context: string): void { const seen = new Set<string>(); for (const value of values) { const id = key(value); if (seen.has(id)) throw new Error(`duplicate ${context}: ${id}`); seen.add(id); } }
-function escapePointer(value: string): string { return value.replaceAll("~", "~0").replaceAll("/", "~1"); }
+const plain = (value: unknown): value is Record<string, unknown> => { return value !== null && typeof value === "object" && !Array.isArray(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null); };
+const expectRecord = (value: unknown, context: string): Record<string, any> => { if (!plain(value)) throw new Error(`${context} must be an object`); return value; };
+const expectArray = (value: unknown, context: string): unknown[] => { if (!Array.isArray(value)) throw new Error(`${context} must be an array`); return value; };
+const exactKeys = (value: Record<string, unknown>, allowed: string[], context: string): void => { for (const key of Object.keys(value)) if (!allowed.includes(key)) throw new Error(`${context} contains unsupported field ${key}`); };
+const stringRecord = (value: unknown, context: string): Record<string, string> => { const item = expectRecord(value, context); const output: Record<string,string> = Object.create(null); for (const [key, entry] of Object.entries(item)) { if (typeof entry !== "string") throw new Error(`${context}.${key} must be a string`); output[key] = entry; } return output; };
+const unique = <T>(values: T[], key: (value: T) => string, context: string): void => { const seen = new Set<string>(); for (const value of values) { const id = key(value); if (seen.has(id)) throw new Error(`duplicate ${context}: ${id}`); seen.add(id); } };
+const escapePointer = (value: string): string => { return value.replaceAll("~", "~0").replaceAll("/", "~1"); };

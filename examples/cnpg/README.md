@@ -65,7 +65,7 @@ target/debug/aps compile \
 
 Use a fresh compile output directory. Refresh the lock after changing source
 or generated types. [Initial-version instructions](initial/README.md) cover the
-database-only program. An installed [CLI bundle](../../docs/reakt/CLI-DISTRIBUTION.md)
+database-only program. An installed [CLI bundle](../../docs/reference/CLI-DISTRIBUTION.md)
 provides these commands as `aps`.
 
 ## 2. Deploy the database, then upgrade to the API
@@ -83,7 +83,7 @@ its operator image and `OPERATOR_IMAGE_NAME` to the same digest. Use absolute
 input paths and a new output directory:
 
 ```sh
-cuenv exec -- python3 tests/reakt/run_cnpg_cli_demo.py \
+cuenv exec -- python3 tests/run_cnpg_cli_demo.py \
   --aps "$PWD/target/debug/aps" \
   --initial-artifact "$INITIAL_CANDIDATE" \
   --successor-artifact "$SUCCESSOR_CANDIDATE" \

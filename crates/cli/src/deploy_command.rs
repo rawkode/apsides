@@ -399,7 +399,7 @@ fn executor_id(options: &BTreeMap<String, String>) -> Result<String> {
     if let Some(value) = options.get("--executor") {
         return Ok(value.clone());
     }
-    if let Ok(value) = std::env::var("REAKT_EXECUTOR_ID") {
+    if let Ok(value) = std::env::var("APSIDES_EXECUTOR_ID") {
         return Ok(value);
     }
     if let (Ok(run), Ok(attempt)) = (
@@ -408,7 +408,7 @@ fn executor_id(options: &BTreeMap<String, String>) -> Result<String> {
     ) {
         return Ok(format!("github-{run}-{attempt}"));
     }
-    Err("set REAKT_EXECUTOR_ID for the trusted local deployment job (GitHub Actions supplies its run identity automatically)".into())
+    Err("set APSIDES_EXECUTOR_ID for the trusted local deployment job (GitHub Actions supplies its run identity automatically)".into())
 }
 
 async fn compatibility(client: &Client, plan: &CompiledPlan) -> Result<Value> {

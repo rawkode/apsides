@@ -135,7 +135,7 @@ mod tests {
 
     fn production_ir() -> serde_json::Value {
         json!({
-            "schemaVersion":"reakt.dev/ir/v1","testOnly":false,
+            "schemaVersion":"apsides.dev/ir/v1","testOnly":false,
             "domain":{"id":"fixture-selection","namespace":"workload",
                 "controlNamespace":"control","clusterBinding":"cluster-a",
                 "policyRef":"platform/fixture-selection","enforcement":"api-bound",
@@ -149,7 +149,7 @@ mod tests {
                 "lifecycle":{"deletionPolicy":"orphan"},
                 "source":{"file":"program.tsx","line":1,"column":1}}],
             "inputs":[],"reactions":[],
-            "provenance":{"compiler":"reakt/0.1","inputs":[{"path":"program.tsx",
+            "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.tsx",
                 "sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
         })
     }
@@ -161,7 +161,7 @@ mod tests {
         let production_digest = compiler_core::digest(production)?;
         let fixture_digest = compiler_core::digest(fixture)?;
         Ok(json!({
-            "schemaVersion":"reakt.dev/fixture-overlay/v1",
+            "schemaVersion":"apsides.dev/fixture-overlay/v1",
             "testOnly":true,"productionReady":false,
             "productionIrSha256":production_digest.strip_prefix("sha256:").ok_or("digest prefix missing")?,
             "fixtureIrSha256":fixture_digest.strip_prefix("sha256:").ok_or("digest prefix missing")?

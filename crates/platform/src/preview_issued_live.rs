@@ -20,8 +20,8 @@ const CONTROL: &str = "aps-preview-control";
 const WORKLOAD: &str = "aps-preview-workload";
 const ACCOUNT: &str = "test-deployer";
 const BINDING: &str = "test-deployer-binding";
-const IDENTITY: &str = "reakt-deploy-identity-preview";
-const MANAGER: &str = "reakt-preview";
+const IDENTITY: &str = "apsides-deploy-identity-preview";
+const MANAGER: &str = "apsides-preview";
 
 #[tokio::test]
 #[ignore = "requires an explicit disposable kind-aps-preview- context and KUBECONFIG"]

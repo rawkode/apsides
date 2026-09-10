@@ -106,7 +106,7 @@ pub(crate) fn validate_record(
     }
     let evidence: ReactorEvidence =
         serde_json::from_value(json(&bounded_read(&contained(root, file)?, MAX_DOCUMENT)?)?)?;
-    if evidence.schema_version != "reakt.dev/reactor-evidence/v1"
+    if evidence.schema_version != "apsides.dev/reactor-evidence/v1"
         || evidence.production_ir_digest != release.ir_digest
     {
         return reject("runner evidence refers to another production IR");

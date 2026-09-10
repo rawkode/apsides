@@ -130,7 +130,7 @@ impl PlatformClient {
         let registry = self
             .activate_initial_claims(registry, transition_id)
             .await?;
-        let name = format!("reakt-activation-{}", binding.domain_id);
+        let name = format!("apsides-activation-{}", binding.domain_id);
         let activation: Versioned<ActivationState> =
             read_state(&self.client, &self.control_namespace, &name).await?;
         let entry = self.selected(&registry, transition_id)?;

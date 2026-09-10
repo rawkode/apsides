@@ -1,5 +1,5 @@
 use crate::{Result, only};
-use std::{collections::BTreeMap, process::Command};
+use std::collections::BTreeMap;
 
 pub fn command(options: &BTreeMap<String, String>) -> Result<()> {
     only(options, &["--source", "--modules"])?;
@@ -7,8 +7,8 @@ pub fn command(options: &BTreeMap<String, String>) -> Result<()> {
     if !script.is_file() {
         return Err("source lock assets are unavailable".into());
     }
-    let mut command = Command::new("node");
-    command.arg(script).arg(
+    let mut command = crate::deno::script(&script);
+    command.arg(
         options
             .get("--source")
             .map_or("program.tsx", String::as_str),

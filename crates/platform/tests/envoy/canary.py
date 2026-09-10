@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 IMAGE = "envoyproxy/envoy@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4"
-STATS_PATH = "/stats?format=json&filter=%5E%28server%5C.live%7Chttp%5C.reakt%5C.downstream_rq_active%7Ccluster%5C.write_api%5C.upstream_rq_%28active%7Ctotal%29%29%24"
+STATS_PATH = "/stats?format=json&filter=%5E%28server%5C.live%7Chttp%5C.apsides%5C.downstream_rq_active%7Ccluster%5C.write_api%5C.upstream_rq_%28active%7Ctotal%29%29%24"
 REMOVE = [
     "authorization",
     "x-envoy-retry-on",
@@ -31,7 +31,7 @@ REMOVE = [
 
 def base_config(upstream_port):
     return {
-        "node": {"id": "reakt-canary", "cluster": "reakt-canary"},
+        "node": {"id": "apsides-canary", "cluster": "apsides-canary"},
         "admin": {"address": {"pipe": {"path": "/evidence/admin.sock", "mode": 384}}},
         "static_resources": {
             "listeners": [
@@ -47,7 +47,7 @@ def base_config(upstream_port):
                                     "name": "envoy.filters.network.http_connection_manager",
                                     "typed_config": {
                                         "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
-                                        "stat_prefix": "reakt",
+                                        "stat_prefix": "apsides",
                                         "codec_type": "HTTP1",
                                         "stream_idle_timeout": "5s",
                                         "request_timeout": "5s",
@@ -276,7 +276,7 @@ def stats(root):
     def reject_fraction(value):
         raise AssertionError("filtered Envoy statistics contained a fractional/unsupported number: " + value)
     parsed = json.loads(raw, parse_float=reject_fraction, parse_constant=reject_fraction)
-    allowed = {"server.live", "http.reakt.downstream_rq_active", "cluster.write_api.upstream_rq_active", "cluster.write_api.upstream_rq_total"}
+    allowed = {"server.live", "http.apsides.downstream_rq_active", "cluster.write_api.upstream_rq_active", "cluster.write_api.upstream_rq_total"}
     assert {item["name"] for item in parsed["stats"]} == allowed
     assert len(parsed["stats"]) == len(allowed)
     return {
@@ -288,7 +288,7 @@ def stats(root):
 
 def validate_complete(entries, snapshot):
     if (
-        snapshot.get("http.reakt.downstream_rq_active") != 0
+        snapshot.get("http.apsides.downstream_rq_active") != 0
         or snapshot.get("cluster.write_api.upstream_rq_active") != 0
     ):
         return False
@@ -378,7 +378,7 @@ def main():
     )
     (root / "envoy.json").write_text(json.dumps(config(upstream.server_port)))
     docker = ["docker"]
-    name = "reakt-envoy-canary-" + str(os.getpid())
+    name = "apsides-envoy-canary-" + str(os.getpid())
     started = False
     try:
         subprocess.run(

@@ -214,11 +214,11 @@ fn release(root: &Path) -> TrustPolicy {
         "test evidence directory creation failed"
     );
     let ir = json!({
-        "schemaVersion":"reakt.dev/ir/v1","testOnly":false,
-        "domain":{"id":"example","namespace":"workload","controlNamespace":"reakt-system","clusterBinding":"test-cluster","policyRef":"platform/example","enforcement":"api-bound","budgets":{"maxResources":64,"maxInputs":64,"maxReactions":64,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},
+        "schemaVersion":"apsides.dev/ir/v1","testOnly":false,
+        "domain":{"id":"example","namespace":"workload","controlNamespace":"apsides-system","clusterBinding":"test-cluster","policyRef":"platform/example","enforcement":"api-bound","budgets":{"maxResources":64,"maxInputs":64,"maxReactions":64,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},
         "resources":[{"id":"config","apiVersion":"v1","kind":"ConfigMap","name":"config","namespace":"workload","desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"config","namespace":"workload"},"data":{"hello":"world"}},"lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"controller.ts","line":1,"column":1}}],
         "inputs":[],"reactions":[],
-        "provenance":{"compiler":"reakt/0.1","inputs":[{"path":"controller.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
+        "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"controller.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
     });
     let plan = parse_and_validate(&ir.to_string()).unwrap();
     let (inputs, compiler) = compiler_inputs();
@@ -255,15 +255,15 @@ fn release(root: &Path) -> TrustPolicy {
     let mut binary = vec![0_u8; 64];
     binary[..6].copy_from_slice(b"\x7fELF\x02\x01");
     binary[18] = 183;
-    fs::write(root.join("reakt-controller"), &binary).unwrap();
-    files.insert("reakt-controller".into(), hash(&binary));
+    fs::write(root.join("apsides-controller"), &binary).unwrap();
+    files.insert("apsides-controller".into(), hash(&binary));
     let image_digest = write_oci(root, &binary, &plan.ir_digest);
     files.insert(
         "controller.oci.tar".into(),
         hash(&fs::read(root.join("controller.oci.tar")).unwrap()),
     );
     add_evidence(root, &plan, &mut files);
-    let mut manifest = json!({"schemaVersion":"reakt.dev/release/v1","mode":"production","irDigest":plan.ir_digest,"image":{"reference":format!("example.invalid/controller@{}",image_digest),"platform":"linux/arm64"},"source":{"repository":"https://github.com/example/reakt","commit":"a".repeat(40),"inputsDigest":digest(&inputs).unwrap()},"compilerDigest":compiler,"binaryDigest":hash(&binary),"files":files});
+    let mut manifest = json!({"schemaVersion":"apsides.dev/release/v1","mode":"production","irDigest":plan.ir_digest,"image":{"reference":format!("example.invalid/controller@{}",image_digest),"platform":"linux/arm64"},"source":{"repository":"https://github.com/example/apsides","commit":"a".repeat(40),"inputsDigest":digest(&inputs).unwrap()},"compilerDigest":compiler,"binaryDigest":hash(&binary),"files":files});
     add_production_evidence(root, &mut manifest);
     let bytes = write_json(root, "release.json", &manifest);
     write_json(
@@ -279,7 +279,7 @@ fn release(root: &Path) -> TrustPolicy {
         "-f",
         key.to_str().unwrap(),
         "-n",
-        "reakt.provenance.v1",
+        "apsides.provenance.v1",
         root.join("provenance.json").to_str().unwrap(),
     ]);
     fs::rename(
@@ -288,8 +288,8 @@ fn release(root: &Path) -> TrustPolicy {
     )
     .unwrap();
     TrustPolicy {
-        schema_version: "reakt.dev/trust/v1".into(),
-        repository: "https://github.com/example/reakt".into(),
+        schema_version: "apsides.dev/trust/v1".into(),
+        repository: "https://github.com/example/apsides".into(),
         approved_compiler_digests: vec![compiler],
         verifier: VerifierTool {
             executable: "/usr/bin/ssh-keygen".into(),
@@ -357,7 +357,7 @@ fn resign(root: &Path) {
         "-f",
         root.join("key").to_str().unwrap(),
         "-n",
-        "reakt.provenance.v1",
+        "apsides.provenance.v1",
         root.join("provenance.json").to_str().unwrap(),
     ]);
     fs::rename(
@@ -386,7 +386,7 @@ async fn approved_signer_cannot_bypass_required_coverage() {
     candidate
         .authorize_test_staging(release::TestStagingScope {
             cluster_binding: "test-cluster".into(),
-            control_namespace: "reakt-system".into(),
+            control_namespace: "apsides-system".into(),
             workload_namespace: "workload".into(),
         })
         .unwrap();
@@ -416,7 +416,7 @@ async fn embedded_fixture_marker_survives_manifest_mode_changes() {
     manifest["files"]["ir.json"] = json!(hash(&ir_bytes));
     manifest["files"]["plan.json"] = json!(hash(&plan_bytes));
     manifest["irDigest"] = json!(compiled.ir_digest);
-    let binary = fs::read(root.path().join("reakt-controller")).unwrap();
+    let binary = fs::read(root.path().join("apsides-controller")).unwrap();
     let image = write_oci(root.path(), &binary, &compiled.ir_digest);
     manifest["image"]["reference"] = json!(format!("example.invalid/controller@{image}"));
     manifest["files"]["controller.oci.tar"] = json!(hash(
@@ -453,7 +453,7 @@ fn write_oci_with_extra_base(
         ("usr", b"", true),
         ("usr/local", b"", true),
         ("usr/local/bin", b"", true),
-        ("usr/local/bin/reakt-controller", binary, false),
+        ("usr/local/bin/apsides-controller", binary, false),
     ]);
     let mut diff_ids = vec![hash(&base)];
     let mut layers = vec![
@@ -465,7 +465,7 @@ fn write_oci_with_extra_base(
     }
     diff_ids.push(hash(&layer));
     layers.push(json!({"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":hash(&layer),"size":layer.len()}));
-    let config=canonical_bytes(&json!({"architecture":"arm64","os":"linux","config":{"Entrypoint":["/usr/local/bin/reakt-controller"],"User":"65532:65532","WorkingDir":"/","Labels":{"dev.reakt.ir-digest":ir_digest,"dev.reakt.release-status":"blocked","org.opencontainers.image.title":"Reakt generated controller"}},"rootfs":{"type":"layers","diff_ids":diff_ids}})).unwrap();
+    let config=canonical_bytes(&json!({"architecture":"arm64","os":"linux","config":{"Entrypoint":["/usr/local/bin/apsides-controller"],"User":"65532:65532","WorkingDir":"/","Labels":{"dev.apsides.ir-digest":ir_digest,"dev.apsides.release-status":"blocked","org.opencontainers.image.title":"Apsides generated controller"}},"rootfs":{"type":"layers","diff_ids":diff_ids}})).unwrap();
     let manifest=canonical_bytes(&json!({"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":hash(&config),"size":config.len()},"layers":layers})).unwrap();
     let index=canonical_bytes(&json!({"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":hash(&manifest),"size":manifest.len()}]})).unwrap();
     let layer_path = format!("blobs/sha256/{}", &hash(&layer)[7..]);
@@ -508,13 +508,13 @@ fn compiler_inputs() -> (Value, String) {
     let packaging_files = json!([
         {"path":"crates/cli/Cargo.toml","sha256":format!("sha256:{}", "1".repeat(64))},
         {"path":"crates/cli/src/main.rs","sha256":format!("sha256:{}", "1".repeat(64))},
-        {"path":"scripts/reakt/Dockerfile","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/reakt/build.py","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/reakt/extract_binary.py","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/reakt/finalize_inputs.py","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/reakt/package_oci.py","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/reakt/sbom.py","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/reakt/toolchain_snapshot.py","sha256":format!("sha256:{}", "2".repeat(64))}
+        {"path":"scripts/Dockerfile","sha256":format!("sha256:{}", "2".repeat(64))},
+        {"path":"scripts/build.py","sha256":format!("sha256:{}", "2".repeat(64))},
+        {"path":"scripts/extract_binary.py","sha256":format!("sha256:{}", "2".repeat(64))},
+        {"path":"scripts/finalize_inputs.py","sha256":format!("sha256:{}", "2".repeat(64))},
+        {"path":"scripts/package_oci.py","sha256":format!("sha256:{}", "2".repeat(64))},
+        {"path":"scripts/sbom.py","sha256":format!("sha256:{}", "2".repeat(64))},
+        {"path":"scripts/toolchain_snapshot.py","sha256":format!("sha256:{}", "2".repeat(64))}
     ]);
     let cli: Vec<Value> = packaging_files
         .as_array()
@@ -524,15 +524,15 @@ fn compiler_inputs() -> (Value, String) {
         .cloned()
         .collect();
     let approved_runtime = approved_runtime();
-    let host_tools: Vec<_> = ["buildx", "cargo", "docker", "python", "reakt", "sbom"]
+    let host_tools: Vec<_> = ["buildx", "cargo", "docker", "python", "apsides", "sbom"]
         .into_iter()
         .map(|role| {
             json!({"role":role,"sha256":format!("sha256:{}", "6".repeat(64)),"version":"1.0"})
         })
         .collect();
     let closure = json!({
-        "schemaVersion":"reakt.dev/compiler-closure/v2",
-        "authoringCompiler":{"sdk":{"identity":"@reakt/kubernetes","sha256":"sdk"},"toolchain":{"deno":"pinned"}},
+        "schemaVersion":"apsides.dev/compiler-closure/v2",
+        "authoringCompiler":{"sdk":{"identity":"@apsides/kubernetes","sha256":"sdk"},"toolchain":{"deno":"pinned"}},
         "nativeCompiler":{
             "builderImage":{"reference":format!("example.invalid/builder@sha256:{}", "3".repeat(64)),"platform":"linux/arm64"},
             "cargoLockSha256":format!("sha256:{}", "4".repeat(64)),
@@ -566,7 +566,7 @@ fn add_evidence(
             )
         })
         .collect();
-    let coverage = json!({"schemaVersion":"reakt.dev/release-coverage/v1","irDigest":plan.ir_digest,"cases":cases,"checks":checks});
+    let coverage = json!({"schemaVersion":"apsides.dev/release-coverage/v1","irDigest":plan.ir_digest,"cases":cases,"checks":checks});
     files.insert(
         "coverage.json".into(),
         hash(&write_json(root, "coverage.json", &coverage)),
@@ -574,8 +574,8 @@ fn add_evidence(
     let mut fixture = serde_json::to_value(&plan.ir).unwrap();
     fixture["testOnly"] = json!(true);
     let fixture_digest = digest(&fixture).unwrap();
-    let overlay = json!({"schemaVersion":"reakt.dev/fixture-overlay/v1","testOnly":true,"productionReady":false,"productionIrSha256":plan.ir_digest.strip_prefix("sha256:"),"fixtureIrSha256":fixture_digest.strip_prefix("sha256:")});
-    let artifact = json!({"schemaVersion":"reakt.dev/local-artifact/v1","irDigest":fixture_digest});
+    let overlay = json!({"schemaVersion":"apsides.dev/fixture-overlay/v1","testOnly":true,"productionReady":false,"productionIrSha256":plan.ir_digest.strip_prefix("sha256:"),"fixtureIrSha256":fixture_digest.strip_prefix("sha256:")});
+    let artifact = json!({"schemaVersion":"apsides.dev/local-artifact/v1","irDigest":fixture_digest});
     let artifact_bytes = write_json(root, "tested-artifact-manifest.json", &artifact);
     for (name, value) in [
         ("fixture-ir.json", fixture),
@@ -608,7 +608,7 @@ fn add_evidence(
         &json!("synthetic reactor verifier fixture; not executed acceptance evidence"),
     );
     files.insert("evidence/run_cluster.py".into(), hash(&runner_bytes));
-    let evidence = json!({"schemaVersion":"reakt.dev/reactor-evidence/v1","productionIrDigest":plan.ir_digest,
+    let evidence = json!({"schemaVersion":"apsides.dev/reactor-evidence/v1","productionIrDigest":plan.ir_digest,
         "fixtureIrDigest":fixture_digest,"testedArtifactDigest":hash(&artifact_bytes),"artifactManifestFile":"tested-artifact-manifest.json",
         "overlayDigest":digest(&overlay).unwrap(),"runnerIdentity":{"sourceSha256":hash(&runner_bytes),"controllerManifestDigest":hash(b"test controller"),"controllerArchiveDigest":hash(b"test archive"),"fixtureArchiveDigest":hash(b"test fixture"),"nodeImage":format!("example.invalid/node@{}",hash(b"node"))},
         "cases":records,"checks":check_records});
@@ -647,13 +647,13 @@ fn add_production_evidence(root: &Path, manifest: &mut Value) {
     let payload_files: BTreeMap<_, _> = [
         "build-inputs.json",
         "controller.oci.tar",
-        "reakt-controller",
+        "apsides-controller",
     ]
     .into_iter()
     .map(|name| (name, manifest["files"][name].clone()))
     .collect();
     let evidence = json!({
-        "schemaVersion":"reakt.dev/production-evidence/v1",
+        "schemaVersion":"apsides.dev/production-evidence/v1",
         "irDigest":manifest["irDigest"], "compilerDigest":manifest["compilerDigest"],
         "binaryDigest":manifest["binaryDigest"], "image":manifest["image"],
         "sourceInputsDigest":manifest["source"]["inputsDigest"], "payloadFiles":payload_files,
@@ -717,7 +717,7 @@ async fn signed_production_evidence_must_match_every_payload_subject() -> TestRe
             json!(hash(b"other OCI bytes")),
         ),
         (
-            "/payloadFiles/reakt-controller",
+            "/payloadFiles/apsides-controller",
             json!(hash(b"other controller bytes")),
         ),
     ] {
@@ -925,13 +925,13 @@ async fn signed_reactor_evidence_requires_authenticated_fixed_runner_source() ->
 async fn signed_binary_must_be_the_image_entrypoint_payload() {
     let root = tempfile::tempdir().unwrap();
     let policy = release(root.path());
-    let mut binary = fs::read(root.path().join("reakt-controller")).unwrap();
+    let mut binary = fs::read(root.path().join("apsides-controller")).unwrap();
     binary[32] = 1;
-    fs::write(root.path().join("reakt-controller"), &binary).unwrap();
+    fs::write(root.path().join("apsides-controller"), &binary).unwrap();
     let mut manifest: Value =
         serde_json::from_slice(&fs::read(root.path().join("release.json")).unwrap()).unwrap();
     manifest["binaryDigest"] = json!(hash(&binary));
-    manifest["files"]["reakt-controller"] = json!(hash(&binary));
+    manifest["files"]["apsides-controller"] = json!(hash(&binary));
     write_json(root.path(), "release.json", &manifest);
     resign(root.path());
     assert!(
@@ -947,7 +947,7 @@ async fn signed_binary_must_be_the_image_entrypoint_payload() {
 async fn signed_image_cannot_add_an_unapproved_runtime_base_layer() {
     let root = tempfile::tempdir().unwrap();
     let policy = release(root.path());
-    let binary = fs::read(root.path().join("reakt-controller")).unwrap();
+    let binary = fs::read(root.path().join("apsides-controller")).unwrap();
     let mut manifest: Value =
         serde_json::from_slice(&fs::read(root.path().join("release.json")).unwrap()).unwrap();
     let image = write_oci_with_extra_base(
@@ -1012,9 +1012,9 @@ async fn production_requires_explicit_marker_even_with_valid_signature() {
 #[ignore = "requires real ORAS and a disposable TLS registry; verifier fixture only"]
 async fn signed_oci_release_resolves_after_source_workspace_is_removed()
 -> Result<(), Box<dyn std::error::Error>> {
-    let oras = std::path::PathBuf::from(std::env::var("REAKT_TEST_ORAS")?);
-    let ca = std::path::PathBuf::from(std::env::var("REAKT_TEST_REGISTRY_CA")?);
-    let repository = std::env::var("REAKT_TEST_OCI_REPOSITORY")?;
+    let oras = std::path::PathBuf::from(std::env::var("APSIDES_TEST_ORAS")?);
+    let ca = std::path::PathBuf::from(std::env::var("APSIDES_TEST_REGISTRY_CA")?);
+    let repository = std::env::var("APSIDES_TEST_OCI_REPOSITORY")?;
     // Validate the destination syntax using an immutable dummy reference before
     // publishing the test fixture to the explicitly configured disposable registry.
     release::ReleaseReference {

@@ -206,7 +206,7 @@ impl QualificationFixture {
 }
 
 fn qualification_target() -> CandidateQualificationTarget {
-    let cluster = format!("reakt-qual-{RUN_ID}");
+    let cluster = format!("apsides-qual-{RUN_ID}");
     let node_name = format!("{cluster}-control-plane");
     let provider_id = format!("kind://docker/{cluster}/{node_name}");
     CandidateQualificationTarget {
@@ -229,7 +229,7 @@ fn qualification_marker(
     target: &CandidateQualificationTarget,
 ) -> CandidateQualificationMarker {
     let domain = &candidate.compiled().ir.domain;
-    let cluster = format!("reakt-qual-{RUN_ID}");
+    let cluster = format!("apsides-qual-{RUN_ID}");
     let node_name = &target.node_name;
     CandidateQualificationMarker {
         schema_version: CANDIDATE_QUALIFICATION_SCHEMA.into(),
@@ -260,7 +260,7 @@ fn qualification_objects(
     target: &CandidateQualificationTarget,
 ) -> std::result::Result<BTreeMap<String, Value>, Box<dyn std::error::Error>> {
     let domain = &candidate.compiled().ir.domain;
-    let cluster = format!("reakt-qual-{RUN_ID}");
+    let cluster = format!("apsides-qual-{RUN_ID}");
     let node_name = &target.node_name;
     let marker = qualification_marker(candidate, target);
     let authority_name = registry_authority_name(&domain.control_namespace, &domain.namespace)?;
@@ -283,25 +283,25 @@ fn qualification_objects(
     let mut objects = BTreeMap::new();
     for (name, value, uid, revision) in [
         (
-            format!("reakt-registry-{}", domain.namespace),
+            format!("apsides-registry-{}", domain.namespace),
             serde_json::to_value(registry)?,
             REGISTRY_UID,
             "42",
         ),
         (
-            format!("reakt-trust-{}", domain.id),
+            format!("apsides-trust-{}", domain.id),
             serde_json::to_value(trust)?,
             "trust-uid",
             "9",
         ),
         (
-            format!("reakt-policy-{}", domain.id),
+            format!("apsides-policy-{}", domain.id),
             serde_json::to_value(policy(candidate.compiled()))?,
             "policy-uid",
             "10",
         ),
         (
-            format!("reakt-deploy-identity-{}", domain.id),
+            format!("apsides-deploy-identity-{}", domain.id),
             serde_json::to_value(&identity.value)?,
             identity.uid.as_str(),
             identity.resource_version.as_str(),
@@ -642,11 +642,11 @@ async fn reject_deficient_ceiling(
     let domain = &candidate.compiled().ir.domain;
     fixture.objects.insert(
         format!(
-            "/api/v1/namespaces/{}/configmaps/reakt-policy-{}",
+            "/api/v1/namespaces/{}/configmaps/apsides-policy-{}",
             domain.control_namespace, domain.id
         ),
         state_object(
-            &format!("reakt-policy-{}", domain.id),
+            &format!("apsides-policy-{}", domain.id),
             &domain.control_namespace,
             &deficient_policy,
             "policy-uid",
@@ -767,11 +767,11 @@ async fn reject_dirty_state(
         let mut objects = fixture.objects.clone();
         objects.insert(
             format!(
-                "/api/v1/namespaces/{}/configmaps/reakt-registry-{}",
+                "/api/v1/namespaces/{}/configmaps/apsides-registry-{}",
                 domain.control_namespace, domain.namespace
             ),
             state_object(
-                &format!("reakt-registry-{}", domain.namespace),
+                &format!("apsides-registry-{}", domain.namespace),
                 &domain.control_namespace,
                 &dirty_state,
                 REGISTRY_UID,

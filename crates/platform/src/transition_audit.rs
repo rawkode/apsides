@@ -408,8 +408,8 @@ fn validate_committed_writer(
         "apps/v1/Deployment/{control}/{}",
         checkpoint.allocation.service_account_name
     );
-    let activation_key = format!("v1/ConfigMap/{control}/reakt-activation-{domain}");
-    let inventory_key = format!("v1/ConfigMap/{control}/reakt-inventory-{domain}");
+    let activation_key = format!("v1/ConfigMap/{control}/apsides-activation-{domain}");
+    let inventory_key = format!("v1/ConfigMap/{control}/apsides-inventory-{domain}");
     for (key, uid) in [
         (&controller_key, &checkpoint.controller_deployment_uid),
         (&activation_key, &checkpoint.activation_uid),

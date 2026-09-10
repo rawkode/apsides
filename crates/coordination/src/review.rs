@@ -15,11 +15,11 @@ mod types;
 mod validation;
 pub use types::*;
 
-pub const REVIEW_METADATA_SCHEMA: &str = "reakt.dev/review-metadata/v1";
+pub const REVIEW_METADATA_SCHEMA: &str = "apsides.dev/review-metadata/v1";
 pub const MAX_REVIEW_METADATA_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_REVIEW_SOURCE_ELEMENTS: usize = 100_000;
 pub const MAX_REVIEW_DECLARATIONS: usize = 256;
-pub const REVIEW_ROLLOUT_FIELD: &str = "/spec/template/metadata/annotations/reakt.dev~1revision";
+pub const REVIEW_ROLLOUT_FIELD: &str = "/spec/template/metadata/annotations/apsides.dev~1revision";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -191,7 +191,7 @@ pub enum ReviewFieldValidation {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewTransitionSchema {
-    #[serde(rename = "reakt.dev/transition-plan/v4")]
+    #[serde(rename = "apsides.dev/transition-plan/v4")]
     V4,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

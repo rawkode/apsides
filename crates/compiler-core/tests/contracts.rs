@@ -9,11 +9,11 @@ fn source() -> Value {
 fn fixture() -> Value {
     json!({
         "schemaVersion":IR_SCHEMA,
-        "domain":{"id":"example","namespace":"workload","controlNamespace":"reakt-system","clusterBinding":"test-cluster","policyRef":"platform/example","enforcement":"api-bound","budgets":{"maxResources":64,"maxInputs":64,"maxReactions":64,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},
+        "domain":{"id":"example","namespace":"workload","controlNamespace":"apsides-system","clusterBinding":"test-cluster","policyRef":"platform/example","enforcement":"api-bound","budgets":{"maxResources":64,"maxInputs":64,"maxReactions":64,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},
         "resources":[{"id":"api","apiVersion":"apps/v1","kind":"Deployment","name":"api","namespace":"workload","desired":{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"api","namespace":"workload"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"api"}},"template":{"metadata":{"labels":{"app":"api"}},"spec":{"serviceAccountName":"api-workload","containers":[{"name":"api","image":"example.invalid/api@sha256:0000000000000000000000000000000000000000000000000000000000000000"}]}}}},"lifecycle":{"deletionPolicy":"orphan"},"source":source()}],
         "inputs":[{"id":"config","apiVersion":"v1","kind":"ConfigMap","name":"external","namespace":"workload","mode":"observed","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":source()}],
         "reactions":[{"id":"restart","op":"rollout","inputs":["config"],"target":"api","source":source()}],
-        "provenance":{"compiler":"reakt/0.1","inputs":[{"path":"controller.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
+        "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"controller.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
     })
 }
 
@@ -272,7 +272,7 @@ fn rollout_matches_independent_python_hash_vector_and_relevant_changes_only() {
     let plan = plan(&fixture());
     let input = snapshots("config", json!({"fixture":"synthetic-only"}));
     let expected = RolloutOutcome::Ready {
-        revision: "sha256:0a81201fb87962c941642913beeddd7f69bfcbb65e9c16b326849f3084bd5909".into(),
+        revision: "sha256:39e1b1b65e421a21c491e03d5c6186c610756bd9cddde84815ab1a9440a3164e".into(),
     };
     assert_eq!(
         evaluate_rollout(&plan, "api", &input, None).unwrap(),
@@ -351,7 +351,7 @@ fn secret_rollout_matches_independent_hmac_vector_and_requires_key() {
     };
     let expected = RolloutOutcome::Ready {
         revision:
-            "hmac-sha256:key-v1:a6e2f3f526db99efb8e6d75fa79eba835de3198d4688f9b99609982584d6d6a3"
+            "hmac-sha256:key-v1:97c4af687ec4f1926a956792c549059aee34607fed12714bf729241342d7ab9c"
                 .into(),
     };
     assert_eq!(
@@ -382,8 +382,8 @@ fn secret_rollout_matches_independent_hmac_vector_and_requires_key() {
         }
     ));
     assert!(plan.capabilities.iter().any(|c| c.resource == "secrets"
-        && c.namespace == "reakt-system"
-        && c.names == ["reakt-rollout-key-example"]));
+        && c.namespace == "apsides-system"
+        && c.names == ["apsides-rollout-key-example"]));
     let mut declassified = secret_fixture();
     declassified["inputs"][0]["sensitive"] = json!(false);
     assert!(parse_and_validate(&declassified.to_string()).is_err());

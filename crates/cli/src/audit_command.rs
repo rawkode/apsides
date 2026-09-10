@@ -84,7 +84,7 @@ fn retained_report(
     executor: &str,
 ) -> Value {
     json!({
-        "schemaVersion":"reakt.dev/transition-status/v1", "status":"retained",
+        "schemaVersion":"apsides.dev/transition-status/v1", "status":"retained",
         "registryUid":registry_uid,"registryResourceVersion":registry_resource_version,
         "domain":domain,"transition":transition,"generation":generation,
         "phase":phase,"executor":executor,"authority":false,
@@ -99,7 +99,7 @@ fn retired_report(
     let audit =
         audit.ok_or("transition is not retained or archived in the protected audit chain")?;
     Ok(json!({
-        "schemaVersion":"reakt.dev/transition-status/v1", "status":"retired",
+        "schemaVersion":"apsides.dev/transition-status/v1", "status":"retired",
         "domain":domain,"transition":transition,"audit":audit,"authority":false,
     }))
 }
@@ -179,7 +179,7 @@ mod tests {
                 "executor-a",
             ),
             json!({
-                "schemaVersion":"reakt.dev/transition-status/v1","status":"retained",
+                "schemaVersion":"apsides.dev/transition-status/v1","status":"retained",
                 "registryUid":REGISTRY_UID,"registryResourceVersion":"43",
                 "domain":"example","transition":"transition-a","generation":"generation-a",
                 "phase":"Committed","executor":"executor-a","authority":false,

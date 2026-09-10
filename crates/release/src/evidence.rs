@@ -68,7 +68,7 @@ pub(crate) fn validate(root: &Path, manifest: &ReleaseManifest, plan: &CompiledP
         &contained(root, "coverage.json")?,
         MAX_DOCUMENT,
     )?)?)?;
-    if report.schema_version != "reakt.dev/release-coverage/v1"
+    if report.schema_version != "apsides.dev/release-coverage/v1"
         || report.ir_digest != plan.ir_digest
     {
         return reject("coverage is not bound to the approved production IR");

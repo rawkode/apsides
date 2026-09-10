@@ -1,9 +1,9 @@
-import { ConfigMap, Controller, Deployment, Service, useConfigMap, useResourceRef, useSecret } from "@reakt/kubernetes";
+import { ConfigMap, Controller, Deployment, Service, useConfigMap, useResourceRef, useSecret } from "@apsides/kubernetes";
 import { Cluster } from "./.aps/crds/cnpg.ts";
 
 const namespace = "default";
 
-function DatabaseApi() {
+const DatabaseApi = () => {
   const config = useResourceRef("ConfigMap");
   const settings = useConfigMap({ name: "api-settings" });
   const database = useSecret({ name: "database-app" });
@@ -67,7 +67,7 @@ function DatabaseApi() {
       />
     </>
   );
-}
+};
 
 export default (
   <Controller

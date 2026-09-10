@@ -25,7 +25,7 @@ async fn checkpoint_parks_only_after_successful_exact_registry_commit() -> TestR
         };
         let policy = policy(&registry.plan(TRANSITION_B)?.request.next.compiled);
         let (client, calls) = wire(vec![
-            object("reakt-policy-example", &policy, "policy-uid", "40"),
+            object("apsides-policy-example", &policy, "policy-uid", "40"),
             registry_object(&registry, REGISTRY_UID, "42")?,
             response,
         ]);

@@ -45,7 +45,7 @@ pub(crate) fn validate_record(
     }
     let evidence: ProductionEvidence =
         serde_json::from_value(json(&bounded_read(&contained(root, file)?, MAX_DOCUMENT)?)?)?;
-    if evidence.schema_version != "reakt.dev/production-evidence/v1"
+    if evidence.schema_version != "apsides.dev/production-evidence/v1"
         || release.mode != ReleaseMode::Production
         || evidence.ir_digest != release.ir_digest
         || evidence.compiler_digest != release.compiler_digest
@@ -59,7 +59,7 @@ pub(crate) fn validate_record(
     let payloads = [
         "build-inputs.json",
         "controller.oci.tar",
-        "reakt-controller",
+        "apsides-controller",
     ];
     if evidence.payload_files.len() != payloads.len()
         || payloads.iter().any(|name| {

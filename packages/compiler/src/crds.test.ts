@@ -43,18 +43,18 @@ export default <Cluster metadata={{ name: "database", namespace: "default" }} sp
 `;
   await writeFile(completionPath, completionSource);
 
-  const sdk = fileURLToPath(new URL("../../reakt/src", import.meta.url));
+  const sdk = fileURLToPath(new URL("../../kubernetes/src", import.meta.url));
   const compilerOptions: ts.CompilerOptions = {
     allowImportingTsExtensions: true,
     baseUrl: project,
     jsx: ts.JsxEmit.ReactJSX,
-    jsxImportSource: "@reakt/kubernetes",
+    jsxImportSource: "@apsides/kubernetes",
     module: ts.ModuleKind.ESNext,
     moduleResolution: ts.ModuleResolutionKind.Bundler,
     noEmit: true,
     paths: {
-      "@reakt/kubernetes": [join(sdk, "index.ts")],
-      "@reakt/kubernetes/jsx-runtime": [join(sdk, "jsx-runtime.ts")],
+      "@apsides/kubernetes": [join(sdk, "index.ts")],
+      "@apsides/kubernetes/jsx-runtime": [join(sdk, "jsx-runtime.ts")],
     },
     skipLibCheck: true,
     strict: true,

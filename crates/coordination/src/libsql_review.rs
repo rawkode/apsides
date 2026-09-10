@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use libsql::{Connection, TransactionBehavior, named_params, params};
 
 pub(super) const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS reakt_coordination_review_objects (
+CREATE TABLE IF NOT EXISTS apsides_coordination_review_objects (
  registry_uid TEXT NOT NULL,
  cluster_binding TEXT NOT NULL,
  control_namespace TEXT NOT NULL,
@@ -18,12 +18,12 @@ CREATE TABLE IF NOT EXISTS reakt_coordination_review_objects (
  PRIMARY KEY (registry_uid,cluster_binding,control_namespace,workload_namespace,domain_id,transition_id,digest));
 ";
 
-const TABLE: &str = "reakt_coordination_review_objects";
+const TABLE: &str = "apsides_coordination_review_objects";
 const READ_QUERY: &str = "SELECT \
  CASE WHEN typeof(sequence)='text' AND length(sequence)<=20 THEN sequence ELSE NULL END,\
  CASE WHEN typeof(digest)='text' AND length(digest)=71 THEN digest ELSE NULL END,\
  CASE WHEN typeof(metadata)='blob' AND length(metadata)<=?7 THEN metadata ELSE NULL END \
- FROM reakt_coordination_review_objects \
+ FROM apsides_coordination_review_objects \
  WHERE registry_uid=?1 AND cluster_binding=?2 AND control_namespace=?3 \
  AND workload_namespace=?4 AND domain_id=?5 AND transition_id=?6 AND digest=?8";
 
@@ -79,7 +79,7 @@ async fn validate_table_schema(connection: &Connection) -> Result<()> {
         ("metadata", "BLOB", 0),
     ];
     let mut rows = connection
-        .query("PRAGMA table_info(reakt_coordination_review_objects)", ())
+        .query("PRAGMA table_info(apsides_coordination_review_objects)", ())
         .await
         .map_err(|_| Error::Invalid("review table schema"))?;
     for (name, sql_type, primary_key) in expected {
@@ -148,7 +148,7 @@ impl ReviewStore for LibsqlCoordination {
             let claims = &scope.claim_scope;
             transaction
                 .execute(
-                    "INSERT OR IGNORE INTO reakt_coordination_review_objects(\
+                    "INSERT OR IGNORE INTO apsides_coordination_review_objects(\
                  registry_uid,cluster_binding,control_namespace,workload_namespace,\
                  domain_id,transition_id,sequence,digest,metadata) \
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",

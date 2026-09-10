@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::{collections::BTreeMap, io::Read, path::Path};
 
 pub(crate) const MAX_OCI_BYTES: u64 = 512 * 1024 * 1024;
-const TARGET: &str = "usr/local/bin/reakt-controller";
+const TARGET: &str = "usr/local/bin/apsides-controller";
 const ANCESTORS: &[&str] = &["usr", "usr/local", "usr/local/bin"];
 
 fn approved_runtime(
@@ -136,7 +136,7 @@ fn expected_config(base: &Value, ir_digest: &str) -> Result<Value> {
     config.insert("WorkingDir".into(), Value::String("/".into()));
     config.insert(
         "Entrypoint".into(),
-        serde_json::json!(["/usr/local/bin/reakt-controller"]),
+        serde_json::json!(["/usr/local/bin/apsides-controller"]),
     );
     config.remove("Cmd");
     let mut labels = base["config"]["Labels"]
@@ -144,11 +144,11 @@ fn expected_config(base: &Value, ir_digest: &str) -> Result<Value> {
         .cloned()
         .unwrap_or_default();
     for (key, value) in [
-        ("dev.reakt.ir-digest", ir_digest),
-        ("dev.reakt.release-status", "blocked"),
+        ("dev.apsides.ir-digest", ir_digest),
+        ("dev.apsides.release-status", "blocked"),
         (
             "org.opencontainers.image.title",
-            "Reakt generated controller",
+            "Apsides generated controller",
         ),
     ] {
         labels.insert(key.into(), Value::String(value.into()));

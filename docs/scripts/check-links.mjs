@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../dist/", import.meta.url));
 
-async function files(directory) {
+const files = async (directory) => {
   const result = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
@@ -12,19 +12,19 @@ async function files(directory) {
     else result.push(path);
   }
   return result;
-}
+};
 
 const allFiles = await files(root);
 const htmlFiles = allFiles.filter((path) => path.endsWith(".html"));
 const failures = [];
 
-function outputPath(pathname) {
+const outputPath = (pathname) => {
   const clean = decodeURIComponent(pathname).replace(/^\/+/, "");
   if (clean === "") return join(root, "index.html");
   if (clean.endsWith("/")) return join(root, clean, "index.html");
   if (/\.[a-z0-9]+$/i.test(clean)) return join(root, clean);
   return join(root, clean, "index.html");
-}
+};
 
 for (const page of htmlFiles) {
   const html = await readFile(page, "utf8");

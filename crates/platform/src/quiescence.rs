@@ -250,7 +250,7 @@ impl PlatformClient {
         previous: &WriterCheckpoint,
     ) -> Result<()> {
         let binding = &previous.runtime_binding;
-        let name = format!("reakt-activation-{}", binding.domain_id);
+        let name = format!("apsides-activation-{}", binding.domain_id);
         let state: Versioned<ActivationState> =
             crate::store::read_state(&self.client, &self.control_namespace, &name).await?;
         if previous.activation_uid != state.uid

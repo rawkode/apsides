@@ -1,0 +1,23 @@
+{
+  "name": "@apsides/compiler",
+  "version": "0.1.0",
+  "exports": {
+    "./compiler.ts": "./src/compiler.ts",
+    "./crds.ts": "./src/crds.ts",
+    "./fixtures.ts": "./src/fixtures.ts",
+    "./source-lock.ts": "./src/source-lock.ts"
+  },
+  "imports": {
+    "json-schema-to-typescript": "npm:json-schema-to-typescript@16.0.0",
+    "oxc-transform": "npm:oxc-transform@0.58.0",
+    "rolldown": "npm:rolldown@1.0.0-beta.35",
+    "rolldown/parseAst": "npm:rolldown@1.0.0-beta.35/parseAst",
+    "ses": "npm:ses@2.3.0",
+    "typescript": "npm:typescript@5.8.3",
+    "yaml": "npm:yaml@2.9.0"
+  },
+  "tasks": {
+    "typecheck": "deno check src/compiler.ts src/crds.ts src/fixtures.ts src/source-lock.ts src/compiler.test.ts src/compiler-tsx.test.ts src/compiler-cli.test.ts src/crds.test.ts",
+    "test": "deno run -A src/compiler.test.ts && deno run -A src/compiler-tsx.test.ts && deno run -A src/compiler-cli.test.ts && deno run -A src/crds.test.ts"
+  }
+}

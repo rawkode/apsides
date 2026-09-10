@@ -114,7 +114,7 @@ fn report(
         return Err("large metadata fixture size or privacy invariant failed".into());
     }
     Ok(Report {
-        schema_version: "reakt.dev/pvc-inventory-probe/v1",
+        schema_version: "apsides.dev/pvc-inventory-probe/v1",
         phase: phase.name(),
         outcome,
         revision: head.map(|value| value.revision.clone()),
@@ -257,7 +257,7 @@ async fn mutate_uncommitted(connection: &Connection, head: &VersionedInventory) 
     let bytes = candidate.encode(&scope())?;
     let mut selected = connection
         .query(
-            "SELECT scope FROM reakt_inventory_heads WHERE revision=3 AND digest=?1",
+            "SELECT scope FROM apsides_inventory_heads WHERE revision=3 AND digest=?1",
             params![head.snapshot_id.clone()],
         )
         .await?;
@@ -272,19 +272,19 @@ async fn mutate_uncommitted(connection: &Connection, head: &VersionedInventory) 
     drop(selected);
     connection
         .execute(
-            "INSERT INTO reakt_inventory_snapshots(scope,digest,metadata) VALUES (?1,?2,?3)",
+            "INSERT INTO apsides_inventory_snapshots(scope,digest,metadata) VALUES (?1,?2,?3)",
             params![scope_key.clone(), candidate_id.clone(), bytes.clone()],
         )
         .await?;
     let count = connection.execute(
-        "UPDATE reakt_inventory_heads SET revision=4,digest=?1 WHERE scope=?2 AND revision=3 AND digest=?3",
+        "UPDATE apsides_inventory_heads SET revision=4,digest=?1 WHERE scope=?2 AND revision=3 AND digest=?3",
         params![candidate_id.clone(), scope_key.clone(), head.snapshot_id.clone()],
     ).await?;
     if count != 1 {
         return Err("PVC crash mutation did not select exact head".into());
     }
     let mut rows = connection.query(
-        "SELECT h.revision,h.digest,s.metadata FROM reakt_inventory_heads h JOIN reakt_inventory_snapshots s ON h.scope=s.scope AND h.digest=s.digest WHERE h.scope=?1",
+        "SELECT h.revision,h.digest,s.metadata FROM apsides_inventory_heads h JOIN apsides_inventory_snapshots s ON h.scope=s.scope AND h.digest=s.digest WHERE h.scope=?1",
         params![scope_key],
     ).await?;
     let row = rows

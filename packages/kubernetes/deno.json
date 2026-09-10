@@ -1,0 +1,17 @@
+{
+  "name": "@apsides/kubernetes",
+  "version": "0.1.0",
+  "exports": {
+    ".": "./src/index.ts",
+    "./jsx-runtime": "./src/jsx-runtime.ts",
+    "./jsx-dev-runtime": "./src/jsx-dev-runtime.ts"
+  },
+  "compilerOptions": {
+    "jsx": "react-jsxdev",
+    "jsxImportSource": "@apsides/kubernetes"
+  },
+  "tasks": {
+    "typecheck": "deno check src/index.ts src/compiler.ts src/jsx-dev-runtime.ts src/model.test.ts src/traversal.test.ts",
+    "test": "deno run src/model.test.ts && deno run src/traversal.test.ts"
+  }
+}

@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const IR_SCHEMA: &str = "reakt.dev/ir/v1";
-pub const REVISION_ANNOTATION: &str = "reakt.dev/revision";
+pub const IR_SCHEMA: &str = "apsides.dev/ir/v1";
+pub const REVISION_ANNOTATION: &str = "apsides.dev/revision";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

@@ -14,6 +14,7 @@ mod artifact_input;
 mod assets;
 mod audit_command;
 mod crds_command;
+mod deno;
 mod deploy_command;
 mod evidence_command;
 mod init_command;
@@ -63,7 +64,7 @@ fn run() -> Result<()> {
     if matches!(command.as_str(), "help" | "--help" | "-h") {
         writeln!(
             std::io::stdout().lock(),
-            "Apsides — compiled reactive GitOps for Kubernetes\n\n  aps init [--directory DIR]\n  aps lock [--source FILE] [--modules FILE,FILE]\n  aps crds fetch --url URL --kind KIND --output FILE [--version VERSION]\n  aps check --ir FILE\n  aps plan --ir FILE --ceiling FILE\n  aps compile (--source FILE | --ir FILE) --output DIR\n  aps build --source FILE --output DIR [--profile FILE] [--mode production|fixture]\n  aps test --ir FILE --output DIR\n  aps verify --artifact DIR\n  aps verify-release --artifact DIR --trust-policy FILE\n  aps merge-evidence --artifact DIR --fragments FILE --output DIR\n  aps deploy [--artifact DIR | --artifact-reference FILE] [--transition ID --capacity resize]\n  aps audit --domain NAME --transition ID --cluster-binding NAME --namespace NAME --control-namespace NAME\n\ncompile emits validated plans and a Rust controller project.\nbuild produces a pinned Linux OCI image, native binary, SBOM and compiler closure.\ndeploy reads dist/reakt by default and uses protected Kubernetes policy and short-lived identity.\n--capacity resize expands an existing untouched upgrade, then reviews and resumes it with a fresh session."
+            "Apsides — compiled reactive GitOps for Kubernetes\n\n  aps init [--directory DIR]\n  aps lock [--source FILE] [--modules FILE,FILE]\n  aps crds fetch --url URL --kind KIND --output FILE [--version VERSION]\n  aps check --ir FILE\n  aps plan --ir FILE --ceiling FILE\n  aps compile (--source FILE | --ir FILE) --output DIR\n  aps build --source FILE --output DIR [--profile FILE] [--mode production|fixture]\n  aps test --ir FILE --output DIR\n  aps verify --artifact DIR\n  aps verify-release --artifact DIR --trust-policy FILE\n  aps merge-evidence --artifact DIR --fragments FILE --output DIR\n  aps deploy [--artifact DIR | --artifact-reference FILE] [--transition ID --capacity resize]\n  aps audit --domain NAME --transition ID --cluster-binding NAME --namespace NAME --control-namespace NAME\n\ncompile emits validated plans and a Rust controller project.\nbuild produces a pinned Linux OCI image, native binary, SBOM and compiler closure.\ndeploy reads dist/apsides by default and uses protected Kubernetes policy and short-lived identity.\n--capacity resize expands an existing untouched upgrade, then reviews and resumes it with a fresh session."
         )?;
         return Ok(());
     }
@@ -173,7 +174,7 @@ fn junit(report: &serde_json::Value) -> Result<String> {
         .ok_or("semantic report missing results")?;
     let failures = rows.iter().filter(|row| row["status"] != "passed").count();
     let mut xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><testsuite name=\"reakt-required-reactor-coverage\" tests=\"{}\" failures=\"{failures}\">",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><testsuite name=\"apsides-required-reactor-coverage\" tests=\"{}\" failures=\"{failures}\">",
         rows.len()
     );
     for row in rows {
@@ -328,13 +329,9 @@ fn compile_source_stage(source: Option<&str>, output: &Path) -> Result<Option<Pa
     if let Some(parent) = stage.parent() {
         fs::create_dir_all(parent)?;
     }
-    let status = Command::new("node")
-        .arg(root.join("packages/compiler/src/compiler.ts"))
-        .arg(fs::canonicalize(source)?)
-        .arg(&stage)
-        .env_clear()
-        .env("PATH", env::var_os("PATH").unwrap_or_default())
-        .status()?;
+    let mut command = deno::script(&root.join("packages/compiler/src/compiler.ts"));
+    command.arg(fs::canonicalize(source)?).arg(&stage);
+    let status = deno::isolate(&mut command).status()?;
     if !status.success() {
         return Err("Oxc/Deno source compilation failed".into());
     }
@@ -350,9 +347,9 @@ fn build_native(
     let root = assets::root()?;
     let mut builder = Command::new("python3");
     builder
-        .arg(root.join("scripts/reakt/build.py"))
+        .arg(root.join("scripts/build.py"))
         .env("PYTHONDONTWRITEBYTECODE", "1")
-        .env("REAKT_CLI", env::current_exe()?)
+        .env("APSIDES_CLI", env::current_exe()?)
         .arg("--artifact")
         .arg(output)
         .arg("--source-output")
@@ -361,7 +358,7 @@ fn build_native(
         .arg(
             options
                 .get("--profile")
-                .map_or("reakt.build.json", String::as_str),
+                .map_or("apsides.build.json", String::as_str),
         );
     if no_cache {
         builder.arg("--no-cache");

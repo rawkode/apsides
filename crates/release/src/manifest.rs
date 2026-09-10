@@ -251,7 +251,7 @@ pub fn read_release(root: &Path) -> Result<(ReleaseManifest, CompiledPlan, Vec<u
         return reject("release.json is not canonical JSON");
     }
     let manifest: ReleaseManifest = serde_json::from_value(value)?;
-    if manifest.schema_version != "reakt.dev/release/v1" {
+    if manifest.schema_version != "apsides.dev/release/v1" {
         return reject("unsupported release schema");
     }
     if !is_digest(&manifest.ir_digest)
@@ -305,7 +305,7 @@ pub fn read_release(root: &Path) -> Result<(ReleaseManifest, CompiledPlan, Vec<u
         "coverage.json",
         "capabilities.json",
         "ir-source-map.json",
-        "reakt-controller",
+        "apsides-controller",
         "controller.oci.tar",
     ] {
         if !manifest.files.contains_key(name) {
@@ -323,7 +323,7 @@ pub fn read_release(root: &Path) -> Result<(ReleaseManifest, CompiledPlan, Vec<u
             &contained(root, name)?,
             if name == "controller.oci.tar" {
                 crate::oci::MAX_OCI_BYTES
-            } else if name == "reakt-controller" {
+            } else if name == "apsides-controller" {
                 MAX_BINARY
             } else {
                 MAX_DOCUMENT
@@ -383,10 +383,10 @@ fn validate_compilation(root: &Path, manifest: &ReleaseManifest) -> Result<Compi
 }
 
 fn validate_binary(root: &Path, manifest: &ReleaseManifest) -> Result<()> {
-    if manifest.files.get("reakt-controller") != Some(&manifest.binary_digest) {
+    if manifest.files.get("apsides-controller") != Some(&manifest.binary_digest) {
         return reject("native controller identity differs from the release binary digest");
     }
-    let binary = bounded_read(&contained(root, "reakt-controller")?, MAX_BINARY)?;
+    let binary = bounded_read(&contained(root, "apsides-controller")?, MAX_BINARY)?;
     let machine = match manifest.image.platform.as_str() {
         "linux/arm64" => 183_u16,
         _ => 62_u16,

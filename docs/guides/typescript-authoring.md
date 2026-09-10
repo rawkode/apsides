@@ -12,9 +12,9 @@ the cluster runs a native controller compiled from their declarations.
 import {
   Controller, ConfigMap, Deployment,
   useConfigMap, useResourceRef, useSecret,
-} from "@reakt/kubernetes";
+} from "@apsides/kubernetes";
 
-function Api({ image }: { image: string }) {
+const Api = ({ image }: { image: string }) => {
   const config = useResourceRef("ConfigMap");
   const settings = useConfigMap({ name: "external-settings" });
   const credentials = useSecret({ name: "database-credentials" });
@@ -38,11 +38,11 @@ function Api({ image }: { image: string }) {
       }}
     />
   </>;
-}
+};
 ```
 
 Place `<Api image={...} />` inside a `<Controller>` with explicit identity,
-namespace, policy and budgets. The [complete example](https://github.com/rawkode/apsides/tree/main/examples/reakt)
+namespace, policy and budgets. The [complete example](https://github.com/rawkode/apsides/tree/main/examples/web-application)
 shows that boundary and the corresponding Service.
 
 Resources accept Kubernetes-shaped `metadata` and `spec` props. Write reusable
@@ -83,6 +83,6 @@ Resource locations identify JSX declarations. Hook locations currently identify
 the containing component invocation, not the hook expression itself. Source
 locations assist diagnostics; they do not confer authority.
 
-See the [IR contract](/reakt/ir-contract/) and [toolchain](/reakt/toolchain/) for
-the underlying constraints. The [implementation status](/reakt/status/) records
+See the [IR contract](/reference/ir-contract/) and [toolchain](/reference/toolchain/) for
+the underlying constraints. The [implementation status](/reference/status/) records
 the remaining production release gates.

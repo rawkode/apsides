@@ -14,7 +14,7 @@ const PRODUCTION_ARTIFACT: &str = "APS_FIXTURE_PRODUCTION_ARTIFACT";
 const FIXTURE_ARTIFACT: &str = "APS_FIXTURE_ARTIFACT";
 const TRUST_POLICY: &str = "APS_FIXTURE_TRUST_POLICY";
 const RESULT_PREFIX: &str = "APS_FIXTURE_PROMOTION_RESULT=";
-const RESULT_SCHEMA: &str = "reakt.dev/fixture-promotion-result/v1";
+const RESULT_SCHEMA: &str = "apsides.dev/fixture-promotion-result/v1";
 const MAX_DOCUMENT: u64 = 8 * 1024 * 1024;
 const MAX_POLICY: u64 = 1024 * 1024;
 

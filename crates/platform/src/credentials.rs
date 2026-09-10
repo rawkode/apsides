@@ -5,7 +5,7 @@ use crate::{
 use coordination::ReviewIdentity;
 use serde::{Deserialize, Serialize};
 
-pub const DEPLOYMENT_IDENTITY_SCHEMA_V2: &str = "reakt.dev/deployment-identity/v2";
+pub const DEPLOYMENT_IDENTITY_SCHEMA_V2: &str = "apsides.dev/deployment-identity/v2";
 const MAX_PREVIEW_TARGETS: usize = 256;
 
 /// A fixed preview mechanism approved by the deployment identity policy.
@@ -114,7 +114,7 @@ impl PlatformClient {
         let state: Versioned<DeploymentIdentity> = read_state(
             &self.client,
             &self.control_namespace,
-            &format!("reakt-deploy-identity-{domain}"),
+            &format!("apsides-deploy-identity-{domain}"),
         )
         .await?;
         let identity = &state.value;

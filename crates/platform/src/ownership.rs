@@ -15,7 +15,7 @@ use serde_json::Value;
 
 /// Separately administered from writable per-domain control state. Deployment
 /// identities receive GET only; source artifacts never select this namespace.
-pub const OWNERSHIP_INTENT_NAMESPACE: &str = "reakt-platform-intents";
+pub const OWNERSHIP_INTENT_NAMESPACE: &str = "apsides-platform-intents";
 
 impl PlatformClient {
     /// Read operator approvals and check their signed-target binding. The caller
@@ -134,7 +134,7 @@ impl PlatformClient {
             "resourceVersion".into(),
             Value::String(approval.observed_resource_version.clone()),
         );
-        let params = PatchParams::apply(&format!("reakt-{}", target.compiled.ir.domain.id))
+        let params = PatchParams::apply(&format!("apsides-{}", target.compiled.ir.domain.id))
             .dry_run()
             .validation_strict();
         let result = api.patch(&resource.name, &params, &Patch::Apply(payload)).await

@@ -82,7 +82,7 @@ impl ReviewMetadataV1 {
         self.validate()?;
         Ok(ReviewRef {
             scope: self.scope.clone(),
-            digest: compiler_core::digest(&("reakt.dev/review-metadata-digest/v1", self))
+            digest: compiler_core::digest(&("apsides.dev/review-metadata-digest/v1", self))
                 .map_err(|_| Error::Invalid("review metadata digest"))?,
         })
     }

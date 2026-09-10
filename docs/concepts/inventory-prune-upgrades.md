@@ -81,6 +81,6 @@ inventory, review metadata, claims, audit records or writer checkpoints fail
 closed. Live persistent-volume and remote Turso recovery qualification, explicit
 administrative recovery, and cross-executor takeover remain release work.
 
-For the canonical details, read [Resource inventory](/reakt/inventory/),
-[Transition audit history](/reakt/audit/), [State capacity](/reakt/state-capacity/),
-and the [Deployment protocol](/reakt/deployment-contract/).
+For the canonical details, read [Resource inventory](/reference/inventory/),
+[Transition audit history](/reference/audit/), [State capacity](/reference/state-capacity/),
+and the [Deployment protocol](/reference/deployment-contract/).

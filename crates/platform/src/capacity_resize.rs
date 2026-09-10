@@ -76,7 +76,7 @@ impl PlatformClient {
         let activation: Versioned<ActivationState> = crate::store::read_state(
             &self.client,
             &self.control_namespace,
-            &format!("reakt-activation-{}", previous.runtime_binding.domain_id),
+            &format!("apsides-activation-{}", previous.runtime_binding.domain_id),
         )
         .await?;
         if activation.uid != previous.activation_uid

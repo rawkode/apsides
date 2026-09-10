@@ -121,7 +121,7 @@ async fn references_are_scope_bound_and_domain_separated() -> TestResult {
     database
         .connect()?
         .execute(
-            "INSERT INTO reakt_coordination_claims(digest,metadata) VALUES (?1,?2)",
+            "INSERT INTO apsides_coordination_claims(digest,metadata) VALUES (?1,?2)",
             libsql::params![wrong_digest.digest.clone(), encoded],
         )
         .await?;
@@ -149,7 +149,7 @@ async fn missing_rows_are_distinct_from_corrupt_rows_and_diagnostics_are_private
     database
         .connect()?
         .execute(
-            "UPDATE reakt_coordination_claims SET metadata=?1 WHERE digest=?2",
+            "UPDATE apsides_coordination_claims SET metadata=?1 WHERE digest=?2",
             libsql::params![corrupted.into_bytes(), reference.digest.clone()],
         )
         .await?;
@@ -166,7 +166,7 @@ async fn missing_rows_are_distinct_from_corrupt_rows_and_diagnostics_are_private
     database
         .connect()?
         .execute(
-            "UPDATE reakt_coordination_claims SET metadata=?1 WHERE digest=?2",
+            "UPDATE apsides_coordination_claims SET metadata=?1 WHERE digest=?2",
             libsql::params![b"{".to_vec(), reference.digest.clone()],
         )
         .await?;

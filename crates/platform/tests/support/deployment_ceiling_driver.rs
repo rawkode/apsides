@@ -13,7 +13,7 @@ use qualification_driver::DriverError;
 pub(super) use qualification_driver::Result;
 
 const RESULT_PREFIX: &str = "APS_CEILING_RESULT=";
-const RESULT_SCHEMA: &str = "reakt.dev/deployment-ceiling-result/v1";
+const RESULT_SCHEMA: &str = "apsides.dev/deployment-ceiling-result/v1";
 const EXECUTOR: &str = "deployment-ceiling-qualification";
 
 #[derive(Clone, Copy, Deserialize)]

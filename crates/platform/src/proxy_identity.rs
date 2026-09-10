@@ -60,7 +60,7 @@ impl PlatformClient {
         binding: &RuntimeBinding,
         pod: &Pod,
     ) -> Result<(String, String, String)> {
-        let name = format!("reakt-proxy-{}", binding.generation_id);
+        let name = format!("apsides-proxy-{}", binding.generation_id);
         let api: Api<Deployment> = Api::namespaced(self.client.clone(), &self.control_namespace);
         let deployment = api.get(&name).await?;
         let key = format!("apps/v1/Deployment/{}/{name}", self.control_namespace);
@@ -277,14 +277,14 @@ mod tests {
 
     #[test]
     fn identity_does_not_accept_labels_or_ambiguous_controller_owners() {
-        let base = json!({"labels":{"reakt.dev/proxy-generation":"g1"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"proxy-rs","uid":"rs-uid","controller":true}]});
+        let base = json!({"labels":{"apsides.dev/proxy-generation":"g1"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"proxy-rs","uid":"rs-uid","controller":true}]});
         let metadata: ObjectMeta = serde_json::from_value(base.clone()).unwrap();
         assert_eq!(
             controller_owner(&metadata, "ReplicaSet").unwrap().uid,
             "rs-uid"
         );
         for value in [
-            json!({"labels":{"reakt.dev/proxy-generation":"g1"}}),
+            json!({"labels":{"apsides.dev/proxy-generation":"g1"}}),
             json!({"ownerReferences":[base["ownerReferences"][0],base["ownerReferences"][0]]}),
             json!({"ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"proxy","uid":"forged","controller":true}]}),
         ] {

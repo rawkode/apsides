@@ -210,7 +210,7 @@ async fn unsupported_schema_and_missing_review_bindings_are_rejected() -> TestRe
                 .ok_or("state missing")?,
         )?;
         if unsupported_schema {
-            state["schemaVersion"] = json!("reakt.dev/namespace-registry/v6");
+            state["schemaVersion"] = json!("apsides.dev/namespace-registry/v6");
         } else {
             state["transitions"][TRANSITION_A]
                 .as_object_mut()

@@ -83,7 +83,7 @@ impl TransitionInputs {
             })
             .transpose()?;
         Ok(Self {
-            schema_version: "reakt.dev/transition-inputs/v1".into(),
+            schema_version: "apsides.dev/transition-inputs/v1".into(),
             registry: FrozenRegistrySnapshot {
                 claim_snapshot: claims,
                 revision: plan.request.registry.revision.clone(),
@@ -107,7 +107,7 @@ impl TransitionInputs {
         deploy::validate_frozen_ownership_intents(&self.ownership_intents)?;
         deploy::validate_allocation(&self.allocation)?;
         let history = &self.registry.generation_history;
-        if self.schema_version != "reakt.dev/transition-inputs/v1"
+        if self.schema_version != "apsides.dev/transition-inputs/v1"
             || self.registry.claim_snapshot.scope != *scope
             || self.allocation.registry_uid != scope.registry_uid
             || self.allocation.transition_id != transition

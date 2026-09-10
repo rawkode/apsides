@@ -25,7 +25,7 @@ pub(crate) fn generation_tls_secret(
     ca_params.distinguished_name = DistinguishedName::new();
     ca_params.distinguished_name.push(
         DnType::CommonName,
-        format!("Reakt generation {generation} CA"),
+        format!("Apsides generation {generation} CA"),
     );
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
@@ -34,7 +34,7 @@ pub(crate) fn generation_tls_secret(
         .self_signed(&ca_key)
         .map_err(|_| invalid("TLS CA certificate generation failed"))?;
     let issuer = Issuer::new(ca_params, ca_key);
-    let server_dns = format!("reakt-proxy-{generation}.{namespace}.svc");
+    let server_dns = format!("apsides-proxy-{generation}.{namespace}.svc");
     let server = leaf(
         vec![server_dns],
         ExtendedKeyUsagePurpose::ServerAuth,
@@ -43,7 +43,7 @@ pub(crate) fn generation_tls_secret(
         &issuer,
     )?;
     let client = leaf(
-        vec![format!("reakt-runtime-{generation}")],
+        vec![format!("apsides-runtime-{generation}")],
         ExtendedKeyUsagePurpose::ClientAuth,
         now,
         lifetime_seconds,
@@ -137,7 +137,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root =
-            std::env::temp_dir().join(format!("reakt-tls-trust-{}-{stamp}", std::process::id()));
+            std::env::temp_dir().join(format!("apsides-tls-trust-{}-{stamp}", std::process::id()));
         std::fs::create_dir(&root).unwrap();
         // Only public certificates are written. No private key leaves Secret data.
         std::fs::write(root.join("old-ca.pem"), &old["ca.crt"].0).unwrap();

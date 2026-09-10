@@ -142,7 +142,7 @@ fn upgrade_reports_authenticated_resource_graph_source_and_permission_deltas() -
     after["reactions"][0]["inputs"] = json!(["managed", "new-external", "credentials"]);
     after["reactions"][0]["source"] = source(50);
     let report = render(&before, &after)?;
-    assert_eq!(report["schemaVersion"], "reakt.dev/deployment-review/v4");
+    assert_eq!(report["schemaVersion"], "apsides.dev/deployment-review/v4");
     assert_eq!(
         report["detailAvailability"],
         "authenticated-declaration-metadata"

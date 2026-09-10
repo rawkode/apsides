@@ -225,7 +225,7 @@ fn validate_owner_transition(
         || stored.inputs.previous.is_some()
         || !stored.inputs.ownership_intents.is_empty()
         || stored.previous_review_metadata.is_some()
-        || record.schema_version != "reakt.dev/transition-record/v1"
+        || record.schema_version != "apsides.dev/transition-record/v1"
         || record.transition_id != names.transition_id
         || record.plan_digest != stored.inputs.plan_digest
         || !crate::valid_digest(&record.plan_digest)

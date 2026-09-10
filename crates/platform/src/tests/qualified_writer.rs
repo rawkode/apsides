@@ -31,7 +31,7 @@ pub fn qualify(registry: &mut LifecycleRegistry, transition: &str) -> Result<Vec
         .runtime_binding
         .clone()
         .ok_or("runtime binding missing")?;
-    let name = format!("reakt-proxy-{}", binding.generation_id);
+    let name = format!("apsides-proxy-{}", binding.generation_id);
     let policy = policy(&binding)?;
     let config = configuration(&binding, &control)?;
     let pod = proxy_pod(&binding, &control)?;
@@ -39,13 +39,13 @@ pub fn qualify(registry: &mut LifecycleRegistry, transition: &str) -> Result<Vec
     let deployment = json!({
         "apiVersion":"apps/v1","kind":"Deployment",
         "metadata":{"name":name,"namespace":control,"uid":"proxy-deployment-uid","resourceVersion":"40"},
-        "spec":{"replicas":1,"selector":{"matchLabels":{"reakt.dev/proxy-generation":binding.generation_id}},
-            "strategy":{"type":"Recreate"},"template":{"metadata":{"labels":{"reakt.dev/proxy-generation":binding.generation_id}},"spec":pod.spec}}
+        "spec":{"replicas":1,"selector":{"matchLabels":{"apsides.dev/proxy-generation":binding.generation_id}},
+            "strategy":{"type":"Recreate"},"template":{"metadata":{"labels":{"apsides.dev/proxy-generation":binding.generation_id}},"spec":pod.spec}}
     });
     objects.extend([
         serde_json::to_value(&config)?, deployment, serde_json::to_value(&pod)?,
         json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"worker","uid":"worker-uid","resourceVersion":"40"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}),
-        json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("reakt-proxy-policy-{}",binding.domain_id),"namespace":control,"uid":"proxy-policy-uid","resourceVersion":"40"},"data":{"state.json":serde_json::to_string(&policy)?}}),
+        json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("apsides-proxy-policy-{}",binding.domain_id),"namespace":control,"uid":"proxy-policy-uid","resourceVersion":"40"},"data":{"state.json":serde_json::to_string(&policy)?}}),
     ]);
     stored.request_drain_qualification = Some(RequestDrainQualification::IsolatedEnvoy {
         qualification_digest: policy.environment_qualification_digest.clone(),
@@ -92,7 +92,7 @@ fn policy(binding: &RuntimeBinding) -> Result<ProxyPolicy> {
 fn configuration(binding: &RuntimeBinding, control: &str) -> Result<ConfigMap> {
     Ok(serde_json::from_value(json!({
         "apiVersion":"v1","kind":"ConfigMap","immutable":true,
-        "metadata":{"name":format!("reakt-proxy-{}-config",binding.generation_id),"namespace":control,"uid":"proxy-config-uid","resourceVersion":"40"},
+        "metadata":{"name":format!("apsides-proxy-{}-config",binding.generation_id),"namespace":control,"uid":"proxy-config-uid","resourceVersion":"40"},
         "data":{"envoy.json":String::from_utf8(canonical_bytes(&envoy_configuration(&binding.generation_id)?)?)?,
             "token-sds.json":String::from_utf8(canonical_bytes(&envoy_token_sds())?)?}
     }))?)
@@ -102,11 +102,11 @@ fn proxy_pod(binding: &RuntimeBinding, control: &str) -> Result<Pod> {
     let security = json!({"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}});
     Ok(serde_json::from_value(json!({
         "apiVersion":"v1","kind":"Pod",
-        "metadata":{"name":format!("reakt-proxy-{}-pod",binding.generation_id),"namespace":control,"uid":"proxy-pod-uid","resourceVersion":"40","labels":{"reakt.dev/proxy-generation":binding.generation_id}},
+        "metadata":{"name":format!("apsides-proxy-{}-pod",binding.generation_id),"namespace":control,"uid":"proxy-pod-uid","resourceVersion":"40","labels":{"apsides.dev/proxy-generation":binding.generation_id}},
         "spec":{"nodeName":"worker","serviceAccountName":binding.service_account_name,"automountServiceAccountToken":false,
             "securityContext":{"runAsNonRoot":true,"runAsUser":65532,"runAsGroup":65532,"fsGroup":65532,"seccompProfile":{"type":"RuntimeDefault"}},
             "containers":[
-                {"name":"envoy","image":ENVOY_IMAGE,"args":["-c","/etc/reakt/envoy/envoy.json","--concurrency","2"],"securityContext":security},
+                {"name":"envoy","image":ENVOY_IMAGE,"args":["-c","/etc/apsides/envoy/envoy.json","--concurrency","2"],"securityContext":security},
                 {"name":"admin","image":ADMIN_IMAGE,"command":["sleep"],"args":["infinity"],"securityContext":security}
             ]},
         "status":{"phase":"Running","containerStatuses":[
@@ -128,7 +128,7 @@ fn support_objects(
         activation_uid: stored
             .staged_identity_uids
             .get(&format!(
-                "v1/ConfigMap/{control}/reakt-activation-{}",
+                "v1/ConfigMap/{control}/apsides-activation-{}",
                 binding.domain_id
             ))
             .ok_or("activation UID missing")?
@@ -140,11 +140,11 @@ fn support_objects(
     };
     Ok(vec![
         json!({"apiVersion":"v1","kind":"ServiceAccount","metadata":{"name":format!("{name}-process"),"namespace":control,"uid":"process-sa-uid","resourceVersion":"40"},"automountServiceAccountToken":false}),
-        json!({"apiVersion":"v1","kind":"Service","metadata":{"name":format!("reakt-proxy-{}",binding.generation_id),"namespace":control,"uid":"proxy-service-uid","resourceVersion":"40"},"spec":{"selector":{"reakt.dev/proxy-generation":binding.generation_id},"ports":[{"name":"https","port":8443,"targetPort":8443}]}}),
+        json!({"apiVersion":"v1","kind":"Service","metadata":{"name":format!("apsides-proxy-{}",binding.generation_id),"namespace":control,"uid":"proxy-service-uid","resourceVersion":"40"},"spec":{"selector":{"apsides.dev/proxy-generation":binding.generation_id},"ports":[{"name":"https","port":8443,"targetPort":8443}]}}),
         // These tests resume a previously recorded immutable Secret. TLS bytes are
         // intentionally absent: certificate creation/handshake have separate tests.
         json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":format!("{name}-tls"),"namespace":control,"uid":"tls-secret-uid","resourceVersion":"40"},"immutable":true,"type":"Opaque"}),
-        json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("reakt-inventory-{}",binding.domain_id),"namespace":control,"uid":"inventory-uid","resourceVersion":"40"},"data":{"state.json":serde_json::to_string(&inventory)?}}),
+        json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("apsides-inventory-{}",binding.domain_id),"namespace":control,"uid":"inventory-uid","resourceVersion":"40"},"data":{"state.json":serde_json::to_string(&inventory)?}}),
     ])
 }
 
@@ -157,7 +157,7 @@ fn record_support(stored: &mut StoredTransition, value: &Value) -> Result<()> {
             .metadata
             .name
             .as_deref()
-            .is_some_and(|name| name.starts_with("reakt-proxy-policy-"))
+            .is_some_and(|name| name.starts_with("apsides-proxy-policy-"))
     {
         return Ok(());
     }

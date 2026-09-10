@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
-pub const OWNERSHIP_INTENT_SCHEMA: &str = "reakt.dev/ownership-intent/v1";
+pub const OWNERSHIP_INTENT_SCHEMA: &str = "apsides.dev/ownership-intent/v1";
 
 /// Independently administered approval content. A deserialized instance is not
 /// authorization: the platform re-reads the exact protected object before use.
@@ -275,7 +275,7 @@ fn runtime_fields(target: &GenerationPlan, resource: &Resource) -> Vec<String> {
         .iter()
         .any(|reaction| reaction.target == resource.id)
     {
-        vec!["/spec/template/metadata/annotations/reakt.dev~1revision".into()]
+        vec!["/spec/template/metadata/annotations/apsides.dev~1revision".into()]
     } else {
         Vec::new()
     }

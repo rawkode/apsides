@@ -13,7 +13,7 @@ const FIELD_PATH: [&str; 5] = [
     "f:template",
     "f:metadata",
     "f:annotations",
-    "f:reakt.dev/revision",
+    "f:apsides.dev/revision",
 ];
 
 /// Sensitive borrowed observation; expected UID comes from authenticated capture.
@@ -237,7 +237,7 @@ fn validate_ownership(value: &Value, resource: &ReviewResource, domain: &str) ->
         .and_then(|v| v.get("managedFields"))
         .and_then(Value::as_array)
         .ok_or_else(|| invalid("preview runtime contribution ownership is unavailable"))?;
-    let manager = format!("reakt-{domain}");
+    let manager = format!("apsides-{domain}");
     let mut owned = false;
     for entry in entries {
         let entry_manager = entry

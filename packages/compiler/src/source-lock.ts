@@ -7,7 +7,7 @@ const sha256 = (value: Uint8Array): string => createHash("sha256").update(value)
 const order = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
 
 /** Record an explicit source closure; dependency discovery never silently expands it. */
-export async function writeSourceLock(entryFile: string, moduleFiles: readonly string[] = []): Promise<string> {
+export const writeSourceLock = async (entryFile: string, moduleFiles: readonly string[] = []): Promise<string> => {
   const entry = await realpath(entryFile);
   const root = dirname(entry);
   const files = [entry, ...await Promise.all(moduleFiles.map(file => realpath(file)))];
@@ -20,11 +20,11 @@ export async function writeSourceLock(entryFile: string, moduleFiles: readonly s
     return { path: logical, sha256: sha256(await readFile(file)) };
   }));
   inputs.sort((a,b) => order(a.path,b.path));
-  const lock = { entry: relative(root, entry).split(sep).join("/"), inputs, schemaVersion: "reakt.dev/source-lock/v1" };
-  const path = resolve(root, "reakt.lock.json");
+  const lock = { entry: relative(root, entry).split(sep).join("/"), inputs, schemaVersion: "apsides.dev/source-lock/v1" };
+  const path = resolve(root, "apsides.lock.json");
   await writeFile(path, `${JSON.stringify(lock,null,2)}\n`);
   return path;
-}
+};
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const [entry, ...modules] = process.argv.slice(2);
@@ -35,7 +35,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     try {
       console.log(await writeSourceLock(resolve(entry), modules.map(value => resolve(value))));
     } catch {
-      console.error("reakt: source lock generation failed");
+      console.error("apsides: source lock generation failed");
       process.exitCode = 1;
     }
   }

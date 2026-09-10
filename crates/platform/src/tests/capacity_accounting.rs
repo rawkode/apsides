@@ -331,7 +331,7 @@ async fn reservation_refuses_aggregate_completion_overflow_before_claim_publicat
     validate_reserved_capacity(&state)?;
     let (client, calls) = wire(vec![
         registry_object(&registry, REGISTRY_UID, "42")?,
-        object("reakt-policy-example", &policy, "policy-uid", "44"),
+        object("apsides-policy-example", &policy, "policy-uid", "44"),
     ]);
     let claims = Arc::new(CountingClaims {
         puts: std::sync::atomic::AtomicUsize::new(0),
@@ -364,7 +364,7 @@ async fn oversized_activation_create_version_stops_before_inventory_creation() -
         .transitions
         .get_mut(TRANSITION_A)
         .ok_or("transition missing")?;
-    let activation_key = "v1/ConfigMap/control/reakt-activation-example";
+    let activation_key = "v1/ConfigMap/control/apsides-activation-example";
     transition.staged_identity_uids.remove(activation_key);
     transition.staged_content_digests.remove(activation_key);
     registry.admit(TRANSITION_A)?;
@@ -372,7 +372,7 @@ async fn oversized_activation_create_version_stops_before_inventory_creation() -
     let (client, calls) = wire(vec![
         json!({"wireHttpStatus":404,"body":{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","message":"fixture activation absent","code":404}}),
         json!("echo-activation-create-large-rv"),
-        object("reakt-policy-example", &policy, "policy-uid", "44"),
+        object("apsides-policy-example", &policy, "policy-uid", "44"),
         protected,
         json!("echo-put"),
     ]);
@@ -405,12 +405,12 @@ async fn oversized_activation_create_version_stops_before_inventory_creation() -
         .filter(|call| call.0 == "POST")
         .collect::<Vec<_>>();
     assert_eq!(creates.len(), 1);
-    assert_eq!(creates[0].2["metadata"]["name"], "reakt-activation-example");
+    assert_eq!(creates[0].2["metadata"]["name"], "apsides-activation-example");
     assert!(
         !calls
             .iter()
-            .any(|call| call.1.contains("reakt-inventory-example")
-                || call.2["metadata"]["name"] == "reakt-inventory-example")
+            .any(|call| call.1.contains("apsides-inventory-example")
+                || call.2["metadata"]["name"] == "apsides-inventory-example")
     );
     Ok(())
 }

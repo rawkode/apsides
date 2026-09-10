@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 pub(crate) fn validate(stored: &StoredTransition) -> Result<()> {
     let record = &stored.record;
-    if record.schema_version != "reakt.dev/transition-record/v1"
+    if record.schema_version != "apsides.dev/transition-record/v1"
         || record.transition_id != stored.allocation().transition_id
         || record.plan_digest != stored.plan_digest()
         || !valid_record_id(&record.executor_id)

@@ -172,7 +172,7 @@ fn protected_identity(
         "apiVersion":"v1",
         "kind":"ConfigMap",
         "metadata":{
-            "name":"reakt-deploy-identity-example",
+            "name":"apsides-deploy-identity-example",
             "namespace":"control",
             "uid":uid,
             "resourceVersion":resource_version

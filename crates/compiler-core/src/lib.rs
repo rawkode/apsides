@@ -30,7 +30,7 @@ pub use validate::{validate, validate_ceiling};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Error {
-    #[error("invalid Reakt declaration: {0}")]
+    #[error("invalid Apsides declaration: {0}")]
     Invalid(String),
     #[error("platform permission ceiling rejected plan: {0}")]
     Ceiling(String),

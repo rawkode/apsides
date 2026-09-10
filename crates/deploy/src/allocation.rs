@@ -137,7 +137,7 @@ mod tests {
                 service_account_for_generation(&names.generation_id)?,
                 names.service_account_name
             );
-            assert!(format!("reakt-proxy-{}-config", names.generation_id).len() <= 63);
+            assert!(format!("apsides-proxy-{}-config", names.generation_id).len() <= 63);
             assert_ne!(
                 names,
                 allocation_names("11111111-1111-4111-8111-111111111112", sequence)?

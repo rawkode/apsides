@@ -6,13 +6,13 @@ use std::{
     io::{self, Write},
 };
 
-pub const TRANSITION_AUDIT_SCHEMA: &str = "reakt.dev/transition-audit/v1";
+pub const TRANSITION_AUDIT_SCHEMA: &str = "apsides.dev/transition-audit/v1";
 pub const MAX_TRANSITION_AUDIT_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_AUDIT_EVENTS: usize = 256;
 pub const MAX_AUDIT_CLEANUP: usize = 100_000;
 pub const MAX_AUDIT_OWNERSHIP: usize = 4096;
 pub const MAX_AUDIT_RETIREMENT: usize = 4097;
-const DIGEST_DOMAIN: &str = "reakt.dev/transition-audit-digest/v1";
+const DIGEST_DOMAIN: &str = "apsides.dev/transition-audit-digest/v1";
 
 /// Scope and allocation identity committed by one transition audit.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

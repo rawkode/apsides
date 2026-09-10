@@ -54,7 +54,7 @@ impl PlatformClient {
         self.audit_backend()?;
         let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.control_namespace);
         let object = api
-            .get(&format!("reakt-registry-{}", self.workload_namespace))
+            .get(&format!("apsides-registry-{}", self.workload_namespace))
             .await?;
         let raw: Versioned<Value> = decode_state(&object)?;
         if raw.value.get("schemaVersion").and_then(Value::as_str)
@@ -155,7 +155,7 @@ impl PlatformClient {
         let written = replace_state_at(
             &self.client,
             &self.control_namespace,
-            &format!("reakt-registry-{}", self.workload_namespace),
+            &format!("apsides-registry-{}", self.workload_namespace),
             &previous.uid,
             &previous.resource_version,
             &state,
@@ -234,7 +234,7 @@ impl PlatformClient {
         scope.validate()?;
         let api: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.control_namespace);
         let object = api
-            .get(&format!("reakt-registry-{}", self.workload_namespace))
+            .get(&format!("apsides-registry-{}", self.workload_namespace))
             .await?;
         if object.metadata.uid.as_deref() != Some(expected_uid)
             || object.metadata.resource_version.as_deref() != Some(expected_resource_version)
@@ -292,7 +292,7 @@ impl PlatformClient {
         let written = replace_state_at(
             &self.client,
             &self.control_namespace,
-            &format!("reakt-registry-{}", self.workload_namespace),
+            &format!("apsides-registry-{}", self.workload_namespace),
             expected_uid,
             expected_resource_version,
             &state,

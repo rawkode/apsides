@@ -118,7 +118,7 @@ fn empty_ownership_intents_preserve_existing_serialized_plan_identity() {
 
 fn generation(id: &str, names: &[(&str, &str)]) -> GenerationPlan {
     let resources=names.iter().map(|(name,policy)|json!({"id":name,"apiVersion":"v1","kind":"ConfigMap","name":name,"namespace":"workload","desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":"workload"},"data":{"value":"approved"}},"lifecycle":{"deletionPolicy":policy},"source":{"file":"program.ts","line":1,"column":1}})).collect::<Vec<_>>();
-    let value = json!({"schemaVersion":"reakt.dev/ir/v1","domain":{"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound","budgets":{"maxResources":64,"maxInputs":64,"maxReactions":64,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},"resources":resources,"inputs":[],"reactions":[],"provenance":{"compiler":"reakt/0.1","inputs":[{"path":"program.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}});
+    let value = json!({"schemaVersion":"apsides.dev/ir/v1","domain":{"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound","budgets":{"maxResources":64,"maxInputs":64,"maxReactions":64,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},"resources":resources,"inputs":[],"reactions":[],"provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}});
     GenerationPlan {
         generation_id: id.into(),
         artifact_digest: DIGEST.into(),
@@ -1384,7 +1384,7 @@ fn cleanup_and_inventory_projection_exclude_resource_payloads() {
     tampered.cleanup[0].kind = "Secret".into();
     assert!(begin(&tampered, "executor").is_err());
     let mut old_schema = plan.clone();
-    old_schema.schema_version = "reakt.dev/transition-plan/v1".into();
+    old_schema.schema_version = "apsides.dev/transition-plan/v1".into();
     assert!(begin(&old_schema, "executor").is_err());
     let mut wrong_owner = request.registry.claims.clone();
     wrong_owner[0].generation_id = "foreign".into();

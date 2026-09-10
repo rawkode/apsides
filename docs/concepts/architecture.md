@@ -8,7 +8,7 @@ data. Rust validates that data, derives the allowed effects and performs the
 Kubernetes operations.
 
 <div class="architecture-flow">
-  <div><strong>Authoring</strong><span><code>@reakt/kubernetes</code> builds a domain, resources, observations and reactions.</span></div>
+  <div><strong>Authoring</strong><span><code>@apsides/kubernetes</code> builds a domain, resources, observations and reactions.</span></div>
   <div><strong>Compiler</strong><span>Oxc, Rolldown, restricted Deno evaluation and Rust validation emit canonical IR.</span></div>
   <div><strong>Release</strong><span>A native binary, OCI image, SBOM, compiler closure and evidence are bound together.</span></div>
   <div><strong>Runtime</strong><span>A generation-specific controller reconciles only its approved plan through a constrained proxy.</span></div>
@@ -72,7 +72,7 @@ lifecycle updates.
 
 See
 [Inventory, prune and upgrades](/concepts/inventory-prune-upgrades/) and the
-[implementation status](/reakt/status/).
+[implementation status](/reference/status/).
 
 ## Crate ownership
 
@@ -84,7 +84,7 @@ See
 | `runtime` | native fixed-plan reconciliation |
 | `release` | signed release, compiler closure, OCI and evidence verification |
 | `inventory` | metadata-only snapshots and libSQL storage |
-| `cli` | `reakt` build, verification and deployment commands |
+| `cli` | `apsides` build, verification and deployment commands |
 
 Internal packages use role names without product prefixes. The current executable
-is `reakt`, and the authoring package is `@reakt/kubernetes`.
+is `apsides`, and the authoring package is `@apsides/kubernetes`.

@@ -13,8 +13,8 @@ mod rejection;
 #[cfg(test)]
 mod tests;
 
-pub const CANDIDATE_PAIR_QUALIFICATION_SCHEMA: &str = "reakt.dev/candidate-pair-qualification/v2";
-pub const CANDIDATE_PAIR_QUALIFICATION_MARKER_NAME: &str = "reakt-candidate-pair-qualification";
+pub const CANDIDATE_PAIR_QUALIFICATION_SCHEMA: &str = "apsides.dev/candidate-pair-qualification/v2";
+pub const CANDIDATE_PAIR_QUALIFICATION_MARKER_NAME: &str = "apsides-candidate-pair-qualification";
 const CANDIDATE_PAIR_QUALIFICATION_EXECUTOR: &str = "candidate-pair-qualification";
 
 /// Return the fixed pair-qualification executor identity.

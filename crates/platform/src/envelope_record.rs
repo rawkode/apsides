@@ -121,7 +121,7 @@ pub(crate) fn maximum(
         return Err(invalid("receipt sizing template exceeds admitted slots"));
     }
     Ok(TransitionRecord {
-        schema_version: "reakt.dev/transition-record/v1".into(),
+        schema_version: "apsides.dev/transition-record/v1".into(),
         transition_id: stored.record.transition_id.clone(),
         plan_digest: stored.record.plan_digest.clone(),
         executor_id: stored.record.executor_id.clone(),

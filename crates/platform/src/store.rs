@@ -288,7 +288,7 @@ impl PlatformClient {
         let policy: Versioned<PolicyState> = read_state(
             &self.client,
             &self.control_namespace,
-            &format!("reakt-policy-{domain_id}"),
+            &format!("apsides-policy-{domain_id}"),
         )
         .await?;
         policy.value.validate_image_pull_secrets()?;
@@ -318,7 +318,7 @@ impl PlatformClient {
         read_state(
             &self.client,
             &self.control_namespace,
-            &format!("reakt-trust-{domain_id}"),
+            &format!("apsides-trust-{domain_id}"),
         )
         .await
     }

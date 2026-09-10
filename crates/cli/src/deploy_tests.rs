@@ -18,10 +18,10 @@ const SERVICE_ACCOUNT_1: &str = "rceirceircfardairceirceirce-1";
 
 fn routing_capacity() -> platform::CapacityAdmission {
     platform::CapacityAdmission {
-        schema_version: "reakt.dev/capacity-admission/v1".into(),
+        schema_version: "apsides.dev/capacity-admission/v1".into(),
         revision: 0,
         profile: platform::EvidenceProfile {
-            schema_version: "reakt.dev/evidence-profile/v1".into(),
+            schema_version: "apsides.dev/evidence-profile/v1".into(),
             max_controller_pods: 1,
             max_regular_containers: 1,
             max_init_containers: 0,
@@ -39,7 +39,7 @@ fn routing_capacity() -> platform::CapacityAdmission {
 
 fn routing_executor_binding(scope: coordination::ClaimScope) -> platform::ExecutorBinding {
     platform::ExecutorBinding {
-        schema_version: "reakt.dev/executor-binding/v1".into(),
+        schema_version: "apsides.dev/executor-binding/v1".into(),
         scope,
         domain_id: "example".into(),
         transition_id: TRANSITION_1.into(),
@@ -59,10 +59,10 @@ fn routing_executor_binding(scope: coordination::ClaimScope) -> platform::Execut
 
 fn registry() -> Result<(NamespaceRegistry, deploy::TransitionPlan)> {
     let compiled = compiler_core::parse_and_validate(&json!({
-        "testOnly":false,"schemaVersion":"reakt.dev/ir/v1",
+        "testOnly":false,"schemaVersion":"apsides.dev/ir/v1",
         "domain":{"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound",
         "budgets":{"maxResources":16,"maxInputs":16,"maxReactions":16,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},
-        "resources":[],"inputs":[],"reactions":[],"provenance":{"compiler":"reakt/0.1","inputs":[{"path":"program.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
+        "resources":[],"inputs":[],"reactions":[],"provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
     }).to_string())?;
     let ceiling = compiler_core::PermissionCeiling {
         policy_ref: "platform/example".into(),
@@ -231,7 +231,7 @@ fn frozen_inputs(plan: &deploy::TransitionPlan) -> Result<platform::TransitionIn
         snapshot.reference()?,
         &platform::PolicyState {
             image_pull_secrets: vec![],
-            schema_version: "reakt.dev/platform-policy/v1".into(),
+            schema_version: "apsides.dev/platform-policy/v1".into(),
             runtime_ceiling: request.runtime_ceiling.clone(),
             cleanup_ceiling: request.cleanup_ceiling.clone(),
         },
@@ -291,7 +291,7 @@ fn review_requires_exact_replay_and_predecessor_checkpoint() -> Result<()> {
         TRANSITION_2,
         Some(&previous_review),
     )?;
-    assert_eq!(review["schemaVersion"], "reakt.dev/deployment-review/v4");
+    assert_eq!(review["schemaVersion"], "apsides.dev/deployment-review/v4");
     assert_eq!(
         review["detailAvailability"],
         "authenticated-declaration-metadata"
@@ -340,7 +340,7 @@ fn review_checkpoint(
         );
     }
     let checkpoint = platform::WriterCheckpoint {
-        schema_version: "reakt.dev/writer-checkpoint/v1".into(),
+        schema_version: "apsides.dev/writer-checkpoint/v1".into(),
         allocation: allocation.clone(),
         control_namespace: control.clone(),
         runtime_binding: RuntimeBinding {
@@ -360,7 +360,7 @@ fn review_checkpoint(
         },
         proxy_identity: platform::ProxyIdentity {
             policy_digest: BUILD.into(),
-            deployment_name: format!("reakt-proxy-{generation}"),
+            deployment_name: format!("apsides-proxy-{generation}"),
             deployment_uid: "proxy-deployment-uid".into(),
             node_name: "worker".into(),
             node_uid: "node-uid".into(),
@@ -369,7 +369,7 @@ fn review_checkpoint(
             pod_spec_digest: BUILD.into(),
             envoy_container_id: "containerd://envoy".into(),
             admin_container_id: "containerd://admin".into(),
-            config_map_name: format!("reakt-proxy-{generation}-config"),
+            config_map_name: format!("apsides-proxy-{generation}-config"),
             config_map_uid: "config-uid".into(),
             config_digest: BUILD.into(),
             qualification_digest: BUILD.into(),

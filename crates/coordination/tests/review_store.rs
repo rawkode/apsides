@@ -96,8 +96,8 @@ async fn row_count(path: &std::path::Path, table: &str) -> TestResult<i64> {
     let database = libsql::Builder::new_local(path).build().await?;
     let connection = database.connect()?;
     let query = match table {
-        "reakt_coordination_review_objects" => {
-            "SELECT count(*) FROM reakt_coordination_review_objects"
+        "apsides_coordination_review_objects" => {
+            "SELECT count(*) FROM apsides_coordination_review_objects"
         }
         _ => return Err("unsupported review table fixture".into()),
     };
@@ -127,7 +127,7 @@ async fn exact_review_write_is_idempotent_and_survives_local_reopen() -> TestRes
     missing.scope.domain_id = "other-domain".to_owned();
     assert_eq!(reopened.read_review(&missing).await?, None);
     assert_eq!(
-        row_count(&path, "reakt_coordination_review_objects").await?,
+        row_count(&path, "apsides_coordination_review_objects").await?,
         1
     );
     Ok(())
@@ -153,7 +153,7 @@ async fn same_transition_scope_retains_distinct_content_addressed_reviews() -> T
         Some(subsequent)
     );
     assert_eq!(
-        row_count(&path, "reakt_coordination_review_objects").await?,
+        row_count(&path, "apsides_coordination_review_objects").await?,
         2
     );
     Ok(())
@@ -178,7 +178,7 @@ async fn concurrent_distinct_reviews_for_one_scope_both_succeed() -> TestResult 
     assert_eq!(reopened.read_review(&first_reference).await?, Some(first));
     assert_eq!(reopened.read_review(&second_reference).await?, Some(second));
     assert_eq!(
-        row_count(&path, "reakt_coordination_review_objects").await?,
+        row_count(&path, "apsides_coordination_review_objects").await?,
         2
     );
     Ok(())
@@ -197,7 +197,7 @@ async fn corrupt_review_row(path: &std::path::Path, corruption: Corruption) -> T
         Corruption::Blob(bytes) => {
             connection
                 .execute(
-                    "UPDATE reakt_coordination_review_objects SET metadata=?1",
+                    "UPDATE apsides_coordination_review_objects SET metadata=?1",
                     [bytes],
                 )
                 .await?;
@@ -205,7 +205,7 @@ async fn corrupt_review_row(path: &std::path::Path, corruption: Corruption) -> T
         Corruption::Text(value) => {
             connection
                 .execute(
-                    "UPDATE reakt_coordination_review_objects SET metadata=?1",
+                    "UPDATE apsides_coordination_review_objects SET metadata=?1",
                     [value],
                 )
                 .await?;
@@ -213,7 +213,7 @@ async fn corrupt_review_row(path: &std::path::Path, corruption: Corruption) -> T
         Corruption::Sequence(value) => {
             connection
                 .execute(
-                    "UPDATE reakt_coordination_review_objects SET sequence=?1",
+                    "UPDATE apsides_coordination_review_objects SET sequence=?1",
                     [value],
                 )
                 .await?;
@@ -242,7 +242,7 @@ async fn assert_corruption_rejected(corruption: Corruption) -> TestResult {
     };
     private(&write_error);
     assert_eq!(
-        row_count(&path, "reakt_coordination_review_objects").await?,
+        row_count(&path, "apsides_coordination_review_objects").await?,
         1
     );
     Ok(())
@@ -274,7 +274,7 @@ async fn changed_digest_is_a_missing_exact_key_and_does_not_block_republication(
     database
         .connect()?
         .execute(
-            "UPDATE reakt_coordination_review_objects SET digest=?1 WHERE digest=?2",
+            "UPDATE apsides_coordination_review_objects SET digest=?1 WHERE digest=?2",
             libsql::params![changed_digest.clone(), reference.digest.clone()],
         )
         .await?;
@@ -289,7 +289,7 @@ async fn changed_digest_is_a_missing_exact_key_and_does_not_block_republication(
     assert_eq!(store.put_review(&metadata).await?, reference);
     assert_eq!(store.read_review(&reference).await?, Some(metadata));
     assert_eq!(
-        row_count(&path, "reakt_coordination_review_objects").await?,
+        row_count(&path, "apsides_coordination_review_objects").await?,
         2
     );
     Ok(())
@@ -313,11 +313,11 @@ async fn scope_and_digest_substitution_are_rejected() -> TestResult {
     let connection = database.connect()?;
     connection
         .execute(
-            "INSERT INTO reakt_coordination_review_objects(\
+            "INSERT INTO apsides_coordination_review_objects(\
              registry_uid,cluster_binding,control_namespace,workload_namespace,\
              domain_id,transition_id,sequence,digest,metadata) \
              SELECT registry_uid,cluster_binding,control_namespace,workload_namespace,\
-             ?1,transition_id,sequence,digest,metadata FROM reakt_coordination_review_objects \
+             ?1,transition_id,sequence,digest,metadata FROM apsides_coordination_review_objects \
              WHERE domain_id=?2",
             libsql::params![
                 forged_scope.scope.domain_id.clone(),
@@ -361,7 +361,7 @@ async fn local_read_only_store_reads_without_creating_or_mutating_reviews() -> T
         Err(Error::Invalid("read-only coordination store"))
     ));
     assert_eq!(
-        row_count(&path, "reakt_coordination_review_objects").await?,
+        row_count(&path, "apsides_coordination_review_objects").await?,
         1
     );
     Ok(())
@@ -375,10 +375,10 @@ async fn read_only_database_without_review_table_is_rejected_without_repair() ->
     database
         .connect()?
         .execute_batch(
-            "CREATE TABLE reakt_coordination_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);\
-             INSERT INTO reakt_coordination_schema VALUES (1,1);\
-             CREATE TABLE reakt_coordination_claims (digest TEXT PRIMARY KEY, metadata BLOB NOT NULL);\
-             CREATE TABLE reakt_coordination_audits (digest TEXT PRIMARY KEY, metadata BLOB NOT NULL);",
+            "CREATE TABLE apsides_coordination_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);\
+             INSERT INTO apsides_coordination_schema VALUES (1,1);\
+             CREATE TABLE apsides_coordination_claims (digest TEXT PRIMARY KEY, metadata BLOB NOT NULL);\
+             CREATE TABLE apsides_coordination_audits (digest TEXT PRIMARY KEY, metadata BLOB NOT NULL);",
         )
         .await?;
 
@@ -396,7 +396,7 @@ async fn read_only_database_without_review_table_is_rejected_without_repair() ->
         .connect()?
         .query(
             "SELECT count(*) FROM sqlite_master WHERE type='table' \
-             AND name='reakt_coordination_review_objects'",
+             AND name='apsides_coordination_review_objects'",
             (),
         )
         .await?;
@@ -415,7 +415,7 @@ async fn writable_open_rejects_malformed_review_tables_without_repair() -> TestR
     let cases = [
         (
             "missing-column.db",
-            "CREATE TABLE reakt_coordination_review_objects (\
+            "CREATE TABLE apsides_coordination_review_objects (\
              registry_uid TEXT NOT NULL,cluster_binding TEXT NOT NULL,\
              control_namespace TEXT NOT NULL,workload_namespace TEXT NOT NULL,\
              domain_id TEXT NOT NULL,transition_id TEXT NOT NULL,\
@@ -426,7 +426,7 @@ async fn writable_open_rejects_malformed_review_tables_without_repair() -> TestR
         ),
         (
             "missing-primary-key.db",
-            "CREATE TABLE reakt_coordination_review_objects (\
+            "CREATE TABLE apsides_coordination_review_objects (\
              registry_uid TEXT NOT NULL,cluster_binding TEXT NOT NULL,\
              control_namespace TEXT NOT NULL,workload_namespace TEXT NOT NULL,\
              domain_id TEXT NOT NULL,transition_id TEXT NOT NULL,\
@@ -445,7 +445,7 @@ async fn writable_open_rejects_malformed_review_tables_without_repair() -> TestR
         let mut rows = database
             .connect()?
             .query(
-                "SELECT count(*) FROM pragma_table_info('reakt_coordination_review_objects')",
+                "SELECT count(*) FROM pragma_table_info('apsides_coordination_review_objects')",
                 (),
             )
             .await?;

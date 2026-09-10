@@ -46,7 +46,7 @@ async fn staging_and_activation_refuse_exhausted_receipts_before_writes() -> Tes
 
     let (client, calls) = wire(vec![
         registry_object(&registry, REGISTRY_UID, "42")?,
-        object("reakt-policy-example", &policy, "policy-uid", "40"),
+        object("apsides-policy-example", &policy, "policy-uid", "40"),
     ]);
     let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_A)?;
     let error = platform
@@ -81,7 +81,7 @@ async fn staging_and_activation_refuse_exhausted_receipts_before_writes() -> Tes
     )?;
     let (client, calls) = wire(vec![
         registry_object(&registry, REGISTRY_UID, "43")?,
-        object("reakt-policy-example", &policy, "policy-uid", "40"),
+        object("apsides-policy-example", &policy, "policy-uid", "40"),
     ]);
     let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_A)?;
     let error = Box::pin(platform.activate_initial(TRANSITION_A, "executor-a"))
@@ -121,7 +121,7 @@ async fn quiescence_and_cleanup_refuse_exhausted_receipts_before_writes() -> Tes
     stored.executor_binding = fixture_executor_binding(&plan.generation_reservation, "executor-a")?;
     qualified_writer::qualify(&mut registry, TRANSITION_B)?;
     let control = registry_object(&registry, REGISTRY_UID, "42")?;
-    let ceiling = object("reakt-policy-example", &policy, "policy-uid", "40");
+    let ceiling = object("apsides-policy-example", &policy, "policy-uid", "40");
     let (client, calls) = wire(vec![
         control.clone(),
         ceiling.clone(),

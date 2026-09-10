@@ -51,7 +51,7 @@ fn compiled_in_scope(
         .collect::<Vec<_>>();
     Ok(parse_and_validate(
         &json!({
-            "schemaVersion": "reakt.dev/ir/v1",
+            "schemaVersion": "apsides.dev/ir/v1",
             "testOnly": false,
             "domain": {
                 "id": domain,
@@ -73,7 +73,7 @@ fn compiled_in_scope(
             "inputs": [],
             "reactions": [],
             "provenance": {
-                "compiler": "reakt/0.1",
+                "compiler": "apsides/0.1",
                 "inputs": [{
                     "path": "program.tsx",
                     "sha256": "0000000000000000000000000000000000000000000000000000000000000000"

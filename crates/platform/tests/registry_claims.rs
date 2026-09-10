@@ -219,7 +219,7 @@ async fn bootstrap_checks_exact_admission_response() -> Result {
 async fn unsupported_registry_schema_is_rejected_before_claim_access() -> Result {
     for version in ["v2", "v3", "v4", "v5"] {
         let mut old = state()?;
-        old["schemaVersion"] = json!(format!("reakt.dev/namespace-registry/{version}"));
+        old["schemaVersion"] = json!(format!("apsides.dev/namespace-registry/{version}"));
         let (client, calls) = client(Some(old), false);
         let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?
             .with_claim_store(Arc::new(Store(Fault::None)))

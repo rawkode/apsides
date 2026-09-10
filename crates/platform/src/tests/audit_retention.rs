@@ -32,7 +32,7 @@ pub(super) fn prepare_cleaning_upgrade() -> TestResult<LifecycleRegistry> {
                 "controller-b-uid".to_owned(),
             ),
             (
-                "v1/ConfigMap/control/reakt-activation-example".to_owned(),
+                "v1/ConfigMap/control/apsides-activation-example".to_owned(),
                 "activation-uid".to_owned(),
             ),
             (
@@ -184,7 +184,7 @@ async fn successor_commit_archives_reads_and_prunes_only_its_predecessor() -> Te
     let audit_store = Arc::new(audit_support::MemoryAuditStore::default());
     let policy = policy(&registry.plan(TRANSITION_B)?.request.next.compiled);
     let (client, calls) = wire(vec![
-        object("reakt-policy-example", &policy, "policy-uid", "40"),
+        object("apsides-policy-example", &policy, "policy-uid", "40"),
         registry_object(&registry, REGISTRY_UID, "42")?,
         json!("echo-put"),
     ]);
@@ -408,7 +408,7 @@ async fn attempt_upgrade_commit(
 ) -> TestResult<(platform::Result<Versioned<NamespaceRegistry>>, Calls)> {
     let policy = policy(&registry.plan(TRANSITION_B)?.request.next.compiled);
     let (client, calls) = wire(vec![
-        object("reakt-policy-example", &policy, "policy-uid", "40"),
+        object("apsides-policy-example", &policy, "policy-uid", "40"),
         registry_object(registry, REGISTRY_UID, "42")?,
         admission,
     ]);
@@ -512,7 +512,7 @@ fn conflict_wire(responses: Vec<Value>) -> (Client, Calls) {
                     && parts
                         .uri
                         .path()
-                        .ends_with("/configmaps/reakt-deploy-identity-example")
+                        .ends_with("/configmaps/apsides-deploy-identity-example")
                 {
                     return Response::builder()
                         .header("content-type", "application/json")
@@ -546,7 +546,7 @@ fn conflict_wire(responses: Vec<Value>) -> (Client, Calls) {
                 let reply = if parts
                     .uri
                     .path()
-                    .ends_with("/configmaps/reakt-registry-authority.control.workload")
+                    .ends_with("/configmaps/apsides-registry-authority.control.workload")
                 {
                     registry_authority()
                 } else {
@@ -574,7 +574,7 @@ async fn actual_registry_conflict_leaves_truthful_archive_for_retry() -> TestRes
     let store = Arc::new(ControlledAuditStore::default());
     let policy = policy(&registry.plan(TRANSITION_B)?.request.next.compiled);
     let (client, calls) = conflict_wire(vec![
-        object("reakt-policy-example", &policy, "policy-uid", "40"),
+        object("apsides-policy-example", &policy, "policy-uid", "40"),
         registry_object(&registry, REGISTRY_UID, "42")?,
     ]);
     let platform = bind_audit_store(&registry, client, TRANSITION_B, store.clone())?;
@@ -921,7 +921,7 @@ async fn initial_commit_retains_current_record_and_never_writes_an_archive() -> 
     };
     let policy = policy(&registry.plan(TRANSITION_A)?.request.next.compiled);
     let (client, calls) = wire(vec![
-        object("reakt-policy-example", &policy, "policy-uid", "40"),
+        object("apsides-policy-example", &policy, "policy-uid", "40"),
         registry_object(&registry, REGISTRY_UID, "42")?,
         json!("echo-put"),
     ]);

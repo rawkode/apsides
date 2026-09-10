@@ -189,7 +189,7 @@ pub fn inventory_metadata_digest(
         resource.uid = None;
     }
     Ok(compiler_core::digest(&serde_json::json!({
-        "schemaVersion": "reakt.dev/inventory-metadata-checkpoint/v1",
+        "schemaVersion": "apsides.dev/inventory-metadata-checkpoint/v1",
         "scope": scope,
         "snapshot": metadata,
     }))?)

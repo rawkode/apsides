@@ -144,7 +144,7 @@ pub(super) async fn apply_observed(
         composition.payload(),
         &resource.name,
         &resource.namespace,
-        &format!("reakt-{}", request.next.compiled.ir.domain.id),
+        &format!("apsides-{}", request.next.compiled.ir.domain.id),
         force,
         precondition,
     )?;
@@ -252,7 +252,7 @@ pub(super) fn require_apply_owner(
     resource: &Resource,
     domain: &str,
 ) -> Result<()> {
-    let manager = format!("reakt-{domain}");
+    let manager = format!("apsides-{domain}");
     let mut apply = 0;
     for entry in object
         .metadata

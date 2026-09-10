@@ -21,7 +21,7 @@ pub fn service_account_name(generation: &GenerationPlan) -> Result<String> {
 
 fn initial(plan: &TransitionPlan, executor_id: &str) -> TransitionRecord {
     TransitionRecord {
-        schema_version: "reakt.dev/transition-record/v1".into(),
+        schema_version: "apsides.dev/transition-record/v1".into(),
         transition_id: plan.request.transition_id.clone(),
         plan_digest: plan.plan_digest.clone(),
         executor_id: executor_id.into(),
@@ -118,7 +118,7 @@ pub fn require_event_capacity(plan: &TransitionPlan, record: &TransitionRecord) 
 }
 
 fn require_inventory_checkpoint(plan: &TransitionPlan) -> Result<()> {
-    if plan.schema_version != "reakt.dev/transition-plan/v4" {
+    if plan.schema_version != "apsides.dev/transition-plan/v4" {
         return Err(reject("unsupported transition plan schema"));
     }
     crate::validate_allocation(&plan.generation_reservation)?;

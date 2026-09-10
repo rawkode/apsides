@@ -148,7 +148,7 @@ mod tests {
             &desired,
             "settings",
             "workload",
-            "reakt-example",
+            "apsides-example",
             false,
             ApplyPrecondition::Absent {
                 list_resource_version: "41",
@@ -161,7 +161,7 @@ mod tests {
         assert!(!request.params().force);
         assert_eq!(
             request.params().field_manager.as_deref(),
-            Some("reakt-example")
+            Some("apsides-example")
         );
         assert_eq!(
             request
@@ -182,7 +182,7 @@ mod tests {
             &desired,
             "settings",
             "workload",
-            "reakt-example",
+            "apsides-example",
             true,
             ApplyPrecondition::Existing {
                 uid: "protected-uid",
@@ -220,7 +220,7 @@ mod tests {
             )
         };
         for version in ["", "0", "bad\nprivate-version"] {
-            let error = attempt(&valid, version, "reakt-example");
+            let error = attempt(&valid, version, "apsides-example");
             assert!(error.is_err());
         }
         for uid in ["", "bad\nprivate-uid"] {
@@ -229,7 +229,7 @@ mod tests {
                     &valid,
                     "settings",
                     "workload",
-                    "reakt-example",
+                    "apsides-example",
                     false,
                     ApplyPrecondition::Existing {
                         uid,
@@ -245,11 +245,11 @@ mod tests {
             json!({"metadata":{"name":"settings","namespace":"other"}}),
         ];
         for desired in &malformed {
-            assert!(attempt(desired, "42", "reakt-example").is_err());
+            assert!(attempt(desired, "42", "apsides-example").is_err());
         }
         assert!(attempt(&valid, "42", "").is_err());
         let private = "private-version";
-        let error = attempt(&valid, &format!("bad\n{private}"), "reakt-example")
+        let error = attempt(&valid, &format!("bad\n{private}"), "apsides-example")
             .err()
             .ok_or_else(|| super::super::invalid("invalid private version was accepted"))?
             .to_string();

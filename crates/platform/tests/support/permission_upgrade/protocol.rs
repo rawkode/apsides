@@ -19,7 +19,7 @@ pub(super) use qualification_driver::Result;
 use qualification_driver::{ConfigIdentity, DriverError};
 
 const RESULT_PREFIX: &str = "APS_PERMISSION_UPGRADE_RESULT=";
-const RESULT_SCHEMA: &str = "reakt.dev/permission-upgrade-result/v1";
+const RESULT_SCHEMA: &str = "apsides.dev/permission-upgrade-result/v1";
 const ISSUER: &str = "ceiling-issuer";
 
 #[derive(Clone, Copy, Deserialize)]
@@ -301,7 +301,7 @@ mod pull_secret_protocol_tests {
         let empty: Settings = serde_json::from_value(base.clone())?;
         assert!(empty.image_pull_secrets.is_empty());
         let ceiling = json!({"policyRef":"policy","domainId":"domain","clusterBinding":"cluster","workloadNamespace":"workload","controlNamespace":"control","capabilities":[],"acceptedEnforcementGaps":[],"acceptedIndirectRisks":[]});
-        let mut policy: platform_api::PolicyState = serde_json::from_value(json!({"schemaVersion":"reakt.dev/platform/v1","runtimeCeiling":ceiling,"cleanupCeiling":ceiling}))?;
+        let mut policy: platform_api::PolicyState = serde_json::from_value(json!({"schemaVersion":"apsides.dev/platform/v1","runtimeCeiling":ceiling,"cleanupCeiling":ceiling}))?;
         let original = compiler_core::digest(&policy)?;
         for names in [vec!["registry"], vec!["registry", "registry"], vec!["invalid/name"]] {
             let mut encoded = base.clone();

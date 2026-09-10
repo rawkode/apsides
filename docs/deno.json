@@ -1,0 +1,18 @@
+{
+  "nodeModulesDir": "auto",
+  "imports": {
+    "astro": "npm:astro@7.3.1",
+    "astro/": "npm:/astro@7.3.1/",
+    "@astrojs/check": "npm:@astrojs/check@0.9.6",
+    "@astrojs/starlight": "npm:@astrojs/starlight@0.41.11",
+    "@astrojs/starlight/": "npm:/@astrojs/starlight@0.41.11/",
+    "typescript": "npm:typescript@5.9.3"
+  },
+  "tasks": {
+    "install": "deno install --frozen",
+    "prepare:content": "deno run --allow-read --allow-write scripts/prepare-content.mjs",
+    "dev": "deno run -A npm:astro@7.3.1 dev",
+    "build": "deno run -A npm:astro@7.3.1 check && deno run -A npm:astro@7.3.1 build && deno run --allow-read --allow-sys scripts/check-links.mjs",
+    "preview": "deno run -A npm:astro@7.3.1 preview"
+  }
+}

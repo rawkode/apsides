@@ -18,12 +18,12 @@ type RemoteConnector = tower::filter::Filter<
 >;
 
 const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS reakt_inventory_schema (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL);
-INSERT OR IGNORE INTO reakt_inventory_schema VALUES (1,1);
-CREATE TABLE IF NOT EXISTS reakt_inventory_snapshots (
+CREATE TABLE IF NOT EXISTS apsides_inventory_schema (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL);
+INSERT OR IGNORE INTO apsides_inventory_schema VALUES (1,1);
+CREATE TABLE IF NOT EXISTS apsides_inventory_snapshots (
  scope TEXT NOT NULL, digest TEXT NOT NULL, metadata BLOB NOT NULL,
  PRIMARY KEY(scope,digest));
-CREATE TABLE IF NOT EXISTS reakt_inventory_heads (
+CREATE TABLE IF NOT EXISTS apsides_inventory_heads (
  scope TEXT PRIMARY KEY, revision INTEGER NOT NULL CHECK(revision>0), digest TEXT NOT NULL);
 ";
 
@@ -231,7 +231,7 @@ fn validate_remote_configuration(url: &str, token: &str) -> Result<()> {
 
 async fn validate_existing(connection: &Connection) -> Result<()> {
     let mut rows = connection
-        .query("SELECT version FROM reakt_inventory_schema WHERE id=1", ())
+        .query("SELECT version FROM apsides_inventory_schema WHERE id=1", ())
         .await
         .map_err(|_| Error::Invalid("missing inventory schema"))?;
     let row = rows
@@ -253,14 +253,14 @@ async fn validate_existing(connection: &Connection) -> Result<()> {
     }
     connection
         .query(
-            "SELECT scope,digest,metadata FROM reakt_inventory_snapshots LIMIT 0",
+            "SELECT scope,digest,metadata FROM apsides_inventory_snapshots LIMIT 0",
             (),
         )
         .await
         .map_err(|_| Error::Invalid("missing immutable inventory snapshot table"))?;
     connection
         .query(
-            "SELECT scope,revision,digest FROM reakt_inventory_heads LIMIT 0",
+            "SELECT scope,revision,digest FROM apsides_inventory_heads LIMIT 0",
             (),
         )
         .await
@@ -271,7 +271,7 @@ async fn validate_existing(connection: &Connection) -> Result<()> {
 async fn head(connection: &Connection, scope: &str) -> Result<Option<(i64, String)>> {
     let mut rows = connection
         .query(
-            "SELECT revision,digest FROM reakt_inventory_heads WHERE scope=?1",
+            "SELECT revision,digest FROM apsides_inventory_heads WHERE scope=?1",
             [scope],
         )
         .await
@@ -322,7 +322,7 @@ impl InventoryStore for LibsqlInventory {
             return Err(Error::Invalid("snapshot identifier"));
         }
         let mut rows = self.connection()?.query(
-            "SELECT CASE WHEN length(metadata)<=?3 THEN metadata ELSE NULL END FROM reakt_inventory_snapshots WHERE scope=?1 AND digest=?2",
+            "SELECT CASE WHEN length(metadata)<=?3 THEN metadata ELSE NULL END FROM apsides_inventory_snapshots WHERE scope=?1 AND digest=?2",
             params![key, id, i64::try_from(MAX_SNAPSHOT_BYTES).map_err(|_| Error::Invalid("snapshot bound"))?],
         ).await.map_err(|_| Error::Backend("read snapshot"))?;
         let Some(row) = rows
@@ -398,7 +398,7 @@ async fn publish_in_transaction(
     // row must never be accepted or silently repaired by publication.
     let mut rows = connection
         .query(
-            "SELECT CASE WHEN length(metadata)<=?3 THEN metadata ELSE NULL END FROM reakt_inventory_snapshots WHERE scope=?1 AND digest=?2",
+            "SELECT CASE WHEN length(metadata)<=?3 THEN metadata ELSE NULL END FROM apsides_inventory_snapshots WHERE scope=?1 AND digest=?2",
             params![scope, id, i64::try_from(MAX_SNAPSHOT_BYTES).map_err(|_| Error::Invalid("snapshot bound"))?],
         )
         .await
@@ -435,9 +435,9 @@ async fn publish_in_transaction(
             .checked_add(1)
             .ok_or(Error::Invalid("revision exhausted"))
     })?;
-    connection.execute("INSERT OR IGNORE INTO reakt_inventory_snapshots(scope,digest,metadata) VALUES (?1,?2,?3)", params![scope, id, bytes]).await
+    connection.execute("INSERT OR IGNORE INTO apsides_inventory_snapshots(scope,digest,metadata) VALUES (?1,?2,?3)", params![scope, id, bytes]).await
         .map_err(|_| Error::Backend("write immutable snapshot"))?;
-    connection.execute("INSERT INTO reakt_inventory_heads(scope,revision,digest) VALUES (?1,?2,?3) ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision,digest=excluded.digest", params![scope, revision, id]).await
+    connection.execute("INSERT INTO apsides_inventory_heads(scope,revision,digest) VALUES (?1,?2,?3) ON CONFLICT(scope) DO UPDATE SET revision=excluded.revision,digest=excluded.digest", params![scope, revision, id]).await
         .map_err(|_| Error::Backend("publish head"))?;
     Ok(revision)
 }

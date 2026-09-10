@@ -183,7 +183,7 @@ fn owned_metadata_uid(
     api_version: &str,
     domain: &str,
 ) -> Result<String> {
-    let manager = format!("reakt-{domain}");
+    let manager = format!("apsides-{domain}");
     let entries: Vec<_> = object
         .metadata
         .managed_fields
@@ -549,7 +549,7 @@ mod tests {
     #[test]
     fn trusted_capture_requires_exact_main_resource_apply_owner() {
         let resource: Resource = serde_json::from_value(json!({"id":"settings","apiVersion":"v1","kind":"ConfigMap","name":"settings","namespace":"workload","desired":{},"lifecycle":{"deletionPolicy":"delete"},"source":{"file":"test.ts","line":1,"column":1}})).unwrap();
-        let value = json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"settings","namespace":"workload","uid":"created-uid","resourceVersion":"19","managedFields":[{"manager":"reakt-example","operation":"Apply","apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:data":{}}}]}});
+        let value = json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"settings","namespace":"workload","uid":"created-uid","resourceVersion":"19","managedFields":[{"manager":"apsides-example","operation":"Apply","apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:data":{}}}]}});
         let object: DynamicObject = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(
             owned_uid(&object, &resource, "example").unwrap(),

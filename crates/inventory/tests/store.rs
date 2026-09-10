@@ -99,7 +99,7 @@ async fn corruption_rejects_reads_and_idempotent_publication() {
     let db = libsql::Builder::new_local(&path).build().await.unwrap();
     db.connect()
         .unwrap()
-        .execute("UPDATE reakt_inventory_snapshots SET metadata=x'7b7d'", ())
+        .execute("UPDATE apsides_inventory_snapshots SET metadata=x'7b7d'", ())
         .await
         .unwrap();
     assert!(matches!(store.load(&scope()).await, Err(Error::Invalid(_))));
@@ -146,12 +146,12 @@ async fn unsupported_schema_is_not_migrated_or_partially_initialized() {
     let path = dir.path().join("inventory.db");
     let db = libsql::Builder::new_local(&path).build().await.unwrap();
     let connection = db.connect().unwrap();
-    connection.execute_batch("CREATE TABLE reakt_inventory_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO reakt_inventory_schema VALUES (1,99);").await.unwrap();
+    connection.execute_batch("CREATE TABLE apsides_inventory_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO apsides_inventory_schema VALUES (1,99);").await.unwrap();
     assert!(matches!(
         LibsqlInventory::open_local(&path).await,
         Err(Error::Invalid(_))
     ));
-    let mut rows = connection.query("SELECT count(*) FROM sqlite_master WHERE name IN ('reakt_inventory_heads','reakt_inventory_snapshots')", ()).await.unwrap();
+    let mut rows = connection.query("SELECT count(*) FROM sqlite_master WHERE name IN ('apsides_inventory_heads','apsides_inventory_snapshots')", ()).await.unwrap();
     assert_eq!(
         rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
         0

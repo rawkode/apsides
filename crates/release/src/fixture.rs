@@ -15,7 +15,7 @@ pub fn validate_fixture_projection(
 ) -> Result<()> {
     if production.get("testOnly") != Some(&Value::Bool(false))
         || fixture.get("testOnly") != Some(&Value::Bool(true))
-        || overlay["schemaVersion"] != "reakt.dev/fixture-overlay/v1"
+        || overlay["schemaVersion"] != "apsides.dev/fixture-overlay/v1"
         || overlay["testOnly"] != true
         || overlay["productionReady"] != false
     {
@@ -51,7 +51,7 @@ fn validate_fixture_substitution(production: &Value, fixture: &Value) -> Result<
                 let container = container.as_object_mut().ok_or_else(|| {
                     crate::Error::Rejected("fixture container is not an object".into())
                 })?;
-                container.insert("image".into(), Value::String("reakt-fixture:local".into()));
+                container.insert("image".into(), Value::String("apsides-fixture:local".into()));
                 container.insert("imagePullPolicy".into(), Value::String("Never".into()));
             }
         }
@@ -77,11 +77,11 @@ mod tests {
         let mut fixture = production.clone();
         fixture["testOnly"] = json!(true);
         fixture["resources"][0]["desired"]["spec"]["template"]["spec"]["containers"][0]["image"] =
-            json!("reakt-fixture:local");
+            json!("apsides-fixture:local");
         fixture["resources"][0]["desired"]["spec"]["template"]["spec"]["containers"][0]["imagePullPolicy"] =
             json!("Never");
         let overlay = json!({
-            "schemaVersion":"reakt.dev/fixture-overlay/v1",
+            "schemaVersion":"apsides.dev/fixture-overlay/v1",
             "testOnly":true,"productionReady":false,
             "productionIrSha256":digest(&production)?.strip_prefix("sha256:"),
             "fixtureIrSha256":digest(&fixture)?.strip_prefix("sha256:")

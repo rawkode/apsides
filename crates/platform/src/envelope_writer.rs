@@ -62,7 +62,7 @@ pub(crate) fn checkpoint(
     let scope = &stored.inputs.registry.claim_snapshot.scope;
     let control = &scope.control_namespace;
     let allocation = stored.allocation();
-    let proxy_name = format!("reakt-proxy-{}", allocation.generation_id);
+    let proxy_name = format!("apsides-proxy-{}", allocation.generation_id);
     let identity = ProxyIdentity {
         policy_digest: commitment(),
         deployment_name: proxy_name.clone(),
@@ -90,7 +90,7 @@ pub(crate) fn checkpoint(
         .map(|key| (key, uid.clone()))
         .collect();
     Ok(WriterCheckpoint {
-        schema_version: "reakt.dev/writer-checkpoint/v1".into(),
+        schema_version: "apsides.dev/writer-checkpoint/v1".into(),
         allocation: allocation.clone(),
         control_namespace: control.clone(),
         runtime_binding: binding(stored),

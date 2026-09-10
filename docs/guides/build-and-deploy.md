@@ -23,24 +23,24 @@ running the deployment protocol.
 cargo build -p cli
 
 target/debug/aps compile \
-  --source examples/reakt/program.tsx \
-  --output work/reakt-compiled
+  --source examples/web-application/program.tsx \
+  --output work/apsides-compiled
 
 # First prepare a build profile using the contract below, then:
 target/debug/aps build \
-  --source examples/reakt/program.tsx \
-  --output work/reakt-native \
-  --profile /path/to/reakt.build.json
+  --source examples/web-application/program.tsx \
+  --output work/apsides-native \
+  --profile /path/to/apsides.build.json
 
-target/debug/aps verify --artifact work/reakt-native
+target/debug/aps verify --artifact work/apsides-native
 ```
 
 Every output directory must be fresh. A build profile is not checked in: prepare
-one with the exact fields documented in [OCI packaging](/reakt/oci-packaging/#complete-cli-build).
+one with the exact fields documented in [OCI packaging](/reference/oci-packaging/#complete-cli-build).
 The complete build also requires matching locally cached builder/runtime images,
 offline Cargo inputs, Docker BuildKit and the configured `cargo-cyclonedx` executable. It emits
 `build-result.json`, `image/controller.oci.tar`,
-`linux-binary/reakt-controller`, `sbom/sbom.json` and `build-inputs.json`.
+`linux-binary/apsides-controller`, `sbom/sbom.json` and `build-inputs.json`.
 
 OCI packaging is optional distribution. `aps build` produces an OCI archive
 as part of its current complete artifact, but upgrades do not use historical
@@ -53,7 +53,7 @@ use `aps verify-release` to require the full qualification evidence bundle.
 
 ## Deployment inputs
 
-`aps deploy` reads `dist/reakt` by default or accepts exactly one current
+`aps deploy` reads `dist/apsides` by default or accepts exactly one current
 artifact source:
 
 ```sh
@@ -78,15 +78,15 @@ The trusted CI job must also provide:
 For local libSQL inventory:
 
 ```sh
-export REAKT_INVENTORY_DATABASE=/absolute/path/on/persistent-storage/inventory.db
+export APSIDES_INVENTORY_DATABASE=/absolute/path/on/persistent-storage/inventory.db
 aps deploy --artifact path/to/verified-release
 ```
 
 For a remote Turso/libSQL primary:
 
 ```sh
-export REAKT_INVENTORY_DATABASE=libsql://inventory.example.com
-export REAKT_INVENTORY_TOKEN='<provided-by-trusted-ci>'
+export APSIDES_INVENTORY_DATABASE=libsql://inventory.example.com
+export APSIDES_INVENTORY_TOKEN='<provided-by-trusted-ci>'
 aps deploy --artifact path/to/verified-release
 ```
 
@@ -104,7 +104,7 @@ remain errors. Without opt-in, the report explicitly says preview was not approv
 The review lists supplemental preview permissions separately and keeps observed
 values out of its output. The final result retains the captured review, and an
 already-committed retry performs no live preview. See the
-[deployment review contract](/reakt/review-contract/) for evidence limits;
+[deployment review contract](/reference/review-contract/) for evidence limits;
 actual issued-token SSA qualification remains outstanding.
 
 ## What privileged CI owns
@@ -124,7 +124,7 @@ libSQL/Turso recovery, the complete six-phase interruption matrix, cross-executo
 recovery, remaining release evidence, and independent final review remain release
 work.
 
-Read the [implementation status](/reakt/status/) before repeating any evidence
-claim. The canonical protocols are [Deployment contract](/reakt/deployment-contract/),
-[Deployment permissions](/reakt/deployment-permissions/), and
-[Artifact resolution](/reakt/artifact-resolution/).
+Read the [implementation status](/reference/status/) before repeating any evidence
+claim. The canonical protocols are [Deployment contract](/reference/deployment-contract/),
+[Deployment permissions](/reference/deployment-permissions/), and
+[Artifact resolution](/reference/artifact-resolution/).

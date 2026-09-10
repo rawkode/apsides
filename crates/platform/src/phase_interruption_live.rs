@@ -33,7 +33,7 @@ async fn candidate_transition_checkpoint() -> driver::Result<()> {
     let mut stdout = std::io::stdout().lock();
     writeln!(
         stdout,
-        "REAKT_TEST_ERROR={{\"pending\":{pending},\"kind\":\"{kind}\"}}"
+        "APSIDES_TEST_ERROR={{\"pending\":{pending},\"kind\":\"{kind}\"}}"
     )?;
     stdout.flush()?;
     // Only a typed Pending may be retried by the harness. Do not expose raw

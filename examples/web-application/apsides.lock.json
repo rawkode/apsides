@@ -1,0 +1,14 @@
+{
+  "entry": "program.tsx",
+  "inputs": [
+    {
+      "path": "api.tsx",
+      "sha256": "378cb1473d59f17a942f7c2f5203cefaf7d01cf6be502d411f938c0be26a6d15"
+    },
+    {
+      "path": "program.tsx",
+      "sha256": "4729e6195b4ef8c8e6780c5f668e678b2b5c7e44a35988ae38708da0b8d2306b"
+    }
+  ],
+  "schemaVersion": "apsides.dev/source-lock/v1"
+}

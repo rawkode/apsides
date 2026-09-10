@@ -102,7 +102,7 @@ fn fixture(scenario: Scenario) -> TestResult<Fixture> {
     };
     let identity = identity(targets);
     let identity_object = state(
-        "reakt-deploy-identity-example",
+        "apsides-deploy-identity-example",
         &identity,
         "identity-uid",
         "1",
@@ -112,8 +112,8 @@ fn fixture(scenario: Scenario) -> TestResult<Fixture> {
         &request.registry.registry_uid,
         &request.registry.revision,
     )?;
-    let policy_object = state("reakt-policy-example", &policy, "policy-uid", "40")?;
-    let trust_object = state("reakt-trust-example", &trust, "trust-uid", "43")?;
+    let policy_object = state("apsides-policy-example", &policy, "policy-uid", "40")?;
+    let trust_object = state("apsides-trust-example", &trust, "trust-uid", "43")?;
     let base = vec![
         identity_object.clone(),
         registry_object,
@@ -147,7 +147,7 @@ fn fixture(scenario: Scenario) -> TestResult<Fixture> {
             } else {empty_list()});
         }
     }
-    replies.retain(|reply| reply["metadata"]["name"] != "reakt-deploy-identity-example");
+    replies.retain(|reply| reply["metadata"]["name"] != "apsides-deploy-identity-example");
     let (client, calls) = crate::tests::wire_with_identity(replies, identity_object);
     let platform = crate::tests::platform_client(client, "control", "workload", "cluster-a")?;
     let issued = IssuedDeployment::for_preview_test(
@@ -171,7 +171,7 @@ pub(super) fn empty_list() -> Value {
 fn dry_run(request: &DeploymentRequest) -> Value {
     let mut desired = request.next.compiled.ir.resources[0].desired.clone();
     desired["metadata"]["resourceVersion"] = json!("77");
-    desired["metadata"]["managedFields"] = json!([{"manager":"reakt-example","operation":"Apply","apiVersion":"v1",
+    desired["metadata"]["managedFields"] = json!([{"manager":"apsides-example","operation":"Apply","apiVersion":"v1",
         "fieldsType":"FieldsV1","fieldsV1":{"f:data":{"f:value":{}}}}]);
     desired
 }
@@ -196,7 +196,7 @@ async fn all_targets_are_approved_before_any_workload_request() -> TestResult {
     assert!(
         calls
             .iter()
-            .any(|(_, path, _)| path.ends_with("reakt-deploy-identity-example"))
+            .any(|(_, path, _)| path.ends_with("apsides-deploy-identity-example"))
     );
     Ok(())
 }
@@ -233,7 +233,7 @@ async fn authenticated_absent_preview_uses_only_conditional_dry_run_and_final_re
     assert_eq!(target_calls[1].0, "PATCH");
     for query in [
         "dryRun=All",
-        "fieldManager=reakt-example",
+        "fieldManager=apsides-example",
         "fieldValidation=Strict",
     ] {
         assert!(target_calls[1].1.contains(query));

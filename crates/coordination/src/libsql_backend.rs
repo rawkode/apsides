@@ -20,11 +20,11 @@ type RemoteConnector = tower::filter::Filter<
 mod review;
 
 const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS reakt_coordination_schema (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL);
-INSERT OR IGNORE INTO reakt_coordination_schema VALUES (1,1);
-CREATE TABLE IF NOT EXISTS reakt_coordination_claims (
+CREATE TABLE IF NOT EXISTS apsides_coordination_schema (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL);
+INSERT OR IGNORE INTO apsides_coordination_schema VALUES (1,1);
+CREATE TABLE IF NOT EXISTS apsides_coordination_claims (
  digest TEXT PRIMARY KEY NOT NULL, metadata BLOB NOT NULL);
-CREATE TABLE IF NOT EXISTS reakt_coordination_audits (
+CREATE TABLE IF NOT EXISTS apsides_coordination_audits (
  registry_uid TEXT NOT NULL,
  cluster_binding TEXT NOT NULL,
  control_namespace TEXT NOT NULL,
@@ -168,7 +168,7 @@ impl LibsqlCoordination {
             review::validate_schema(&transaction).await?;
             let mut rows = transaction
                 .query(
-                    "SELECT version FROM reakt_coordination_schema WHERE id=1",
+                    "SELECT version FROM apsides_coordination_schema WHERE id=1",
                     (),
                 )
                 .await
@@ -208,7 +208,7 @@ impl LibsqlCoordination {
         let connection = self.connection()?;
         let mut rows = connection
             .query(
-                "SELECT version FROM reakt_coordination_schema WHERE id=1",
+                "SELECT version FROM apsides_coordination_schema WHERE id=1",
                 (),
             )
             .await
@@ -231,11 +231,11 @@ impl LibsqlCoordination {
             return Err(Error::Invalid("unsupported coordination schema"));
         }
         connection
-            .query("SELECT digest FROM reakt_coordination_claims LIMIT 0", ())
+            .query("SELECT digest FROM apsides_coordination_claims LIMIT 0", ())
             .await
             .map_err(|_| Error::Invalid("missing immutable claim table"))?;
         connection
-            .query("SELECT digest FROM reakt_coordination_audits LIMIT 0", ())
+            .query("SELECT digest FROM apsides_coordination_audits LIMIT 0", ())
             .await
             .map_err(|_| Error::Invalid("missing immutable audit table"))?;
         Ok(())
@@ -270,7 +270,7 @@ impl ClaimStore for LibsqlCoordination {
             // Ignoring a concurrent insert never changes an existing immutable
             // row. The required post-commit read verifies what actually won.
             transaction.execute(
-                "INSERT OR IGNORE INTO reakt_coordination_claims(digest,metadata) VALUES (?1,?2)",
+                "INSERT OR IGNORE INTO apsides_coordination_claims(digest,metadata) VALUES (?1,?2)",
                 params![reference.digest.clone(), bytes],
             ).await.map_err(|_| Error::Backend("write immutable claims"))?;
             Ok(())
@@ -333,7 +333,7 @@ impl AuditStore for LibsqlCoordination {
             let claims = &scope.claim_scope;
             transaction
                 .execute(
-                    "INSERT OR IGNORE INTO reakt_coordination_audits(\
+                    "INSERT OR IGNORE INTO apsides_coordination_audits(\
                      registry_uid,cluster_binding,control_namespace,workload_namespace,\
                      domain_id,transition_id,sequence,digest,metadata) \
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -452,7 +452,7 @@ async fn read_bytes(connection: &Connection, digest: &str) -> Result<Option<Vec<
     let limit =
         i64::try_from(MAX_CLAIM_SNAPSHOT_BYTES).map_err(|_| Error::Invalid("snapshot bound"))?;
     let mut rows = connection.query(
-        "SELECT CASE WHEN typeof(metadata)='blob' AND length(metadata)<=?2 THEN metadata ELSE NULL END FROM reakt_coordination_claims WHERE digest=?1",
+        "SELECT CASE WHEN typeof(metadata)='blob' AND length(metadata)<=?2 THEN metadata ELSE NULL END FROM apsides_coordination_claims WHERE digest=?1",
         params![digest, limit],
     ).await.map_err(|_| Error::Backend("read immutable claims"))?;
     let Some(row) = rows
@@ -488,7 +488,7 @@ async fn read_audit_bytes(
         .query(
             "SELECT sequence,digest,\
              CASE WHEN typeof(metadata)='blob' AND length(metadata)<=?7 THEN metadata ELSE NULL END \
-             FROM reakt_coordination_audits \
+             FROM apsides_coordination_audits \
              WHERE registry_uid=?1 AND cluster_binding=?2 AND control_namespace=?3 \
              AND workload_namespace=?4 AND domain_id=?5 AND transition_id=?6",
             params![

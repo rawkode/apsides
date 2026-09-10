@@ -10,7 +10,7 @@
     )
 )]
 #![forbid(unsafe_code)]
-//! Native execution of the finite Reakt IR.
+//! Native execution of the finite Apsides IR.
 //!
 //! This crate deliberately has no JavaScript engine. Production execution uses
 //! a fixed in-cluster identity and protected platform activation; fixture
@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-pub const CONFIG_PATH_ENV: &str = "REAKT_RUNTIME_CONFIG_PATH";
+pub const CONFIG_PATH_ENV: &str = "APSIDES_RUNTIME_CONFIG_PATH";
 pub const FIXTURE_ACKNOWLEDGEMENT: &str = "disposable-cluster-only";
 const STARTUP_CONFIG_MAX_BYTES: u64 = 64 * 1024;
 const KUBECONFIG_MAX_BYTES: u64 = 1024 * 1024;
@@ -564,7 +564,7 @@ impl KubeRuntimeClient {
         Ok(Self {
             client,
             max_concurrent,
-            field_manager: format!("reakt-{domain_id}"),
+            field_manager: format!("apsides-{domain_id}"),
         })
     }
 
@@ -572,7 +572,7 @@ impl KubeRuntimeClient {
         Self {
             client,
             max_concurrent,
-            field_manager: format!("reakt-{domain_id}"),
+            field_manager: format!("apsides-{domain_id}"),
         }
     }
 
@@ -1244,7 +1244,7 @@ mod tests {
             KubeRuntimeClient {
                 client: Client::new(service, "workload"),
                 max_concurrent: 1,
-                field_manager: "reakt-example".into(),
+                field_manager: "apsides-example".into(),
             },
             calls,
         )
@@ -1363,7 +1363,7 @@ mod tests {
         assert!(
             query
                 .split('&')
-                .any(|part| part == "fieldManager=reakt-example")
+                .any(|part| part == "fieldManager=apsides-example")
         );
         assert!(
             query
@@ -1390,10 +1390,10 @@ mod tests {
 
     #[tokio::test]
     async fn changed_object_uses_dry_run_then_uid_and_version_conditional_ssa() {
-        let mut existing = object("old", "7", "reakt-example");
+        let mut existing = object("old", "7", "apsides-example");
         existing["data"]["removed"] = Value::String("stale".into());
-        let projected = object("new", "8", "reakt-example");
-        let persisted = object("new", "8", "reakt-example");
+        let projected = object("new", "8", "apsides-example");
+        let persisted = object("new", "8", "apsides-example");
         let desired = serde_json::json!({
             "apiVersion":"v1","kind":"ConfigMap",
             "metadata":{"name":"config","namespace":"workload"},
@@ -1421,9 +1421,9 @@ mod tests {
         let mut declared = resource(desired.clone());
         declared.force = true;
         let (client, calls) = wire_client(vec![
-            object_list(&[object("old", "7", "reakt-example")], "7"),
-            object("new", "8", "reakt-example"),
-            object("new", "8", "reakt-example"),
+            object_list(&[object("old", "7", "apsides-example")], "7"),
+            object("new", "8", "apsides-example"),
+            object("new", "8", "apsides-example"),
         ]);
         client.apply_ssa(&declared, &desired).await.unwrap();
         let calls = calls.lock().unwrap();
@@ -1441,8 +1441,8 @@ mod tests {
 
     #[tokio::test]
     async fn unchanged_dry_run_projection_omits_the_real_ssa_write() {
-        let existing = object("same", "7", "reakt-example");
-        let mut projected = object("same", "8", "reakt-example");
+        let existing = object("same", "7", "apsides-example");
+        let mut projected = object("same", "8", "apsides-example");
         projected["metadata"]["generation"] = Value::from(2);
         let desired = serde_json::json!({
             "apiVersion":"v1","kind":"ConfigMap",
@@ -1462,7 +1462,7 @@ mod tests {
 
     #[tokio::test]
     async fn pre_existing_update_only_ownership_is_rejected() {
-        let mut existing = object("same", "7", "reakt-example");
+        let mut existing = object("same", "7", "apsides-example");
         existing["metadata"]["managedFields"][0]["operation"] = Value::String("Update".into());
         let desired = serde_json::json!({
             "apiVersion":"v1","kind":"ConfigMap",
@@ -1491,8 +1491,8 @@ mod tests {
             "metadata":{"name":"config","namespace":"workload"},
             "data":{"message":"same"}
         });
-        let projected = object("same", "8", "reakt-example");
-        let created = object("same", "9", "reakt-example");
+        let projected = object("same", "8", "apsides-example");
+        let created = object("same", "9", "apsides-example");
         let (client, calls) = wire_client(vec![object_list(&[], "7"), projected, created]);
         client
             .apply_ssa(&resource(desired.clone()), &desired)
@@ -1513,7 +1513,7 @@ mod tests {
             "metadata":{"name":"config","namespace":"workload"},
             "data":{"message":"same"}
         });
-        let projected = object("same", "8", "reakt-example");
+        let projected = object("same", "8", "apsides-example");
         let (client, calls) = wire_client_with_status(vec![
             (StatusCode::OK, object_list(&[], "7")),
             (StatusCode::OK, projected),
@@ -1638,7 +1638,7 @@ mod tests {
     #[test]
     fn startup_reader_rejects_duplicate_keys_and_oversized_files() {
         let base =
-            std::env::temp_dir().join(format!("reakt-runtime-config-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("apsides-runtime-config-test-{}", std::process::id()));
         fs::write(&base, br#"{"mode":"production","mode":"production"}"#).unwrap();
         assert!(read_startup(&base).is_err());
         fs::write(

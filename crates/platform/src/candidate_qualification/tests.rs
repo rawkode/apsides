@@ -14,9 +14,9 @@ type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 type Calls = Arc<Mutex<Vec<(String, String)>>>;
 
 const RUN_ID: &str = "0123456789abcdef0123456789abcdef";
-const CLUSTER: &str = "reakt-qual-0123456789abcdef0123456789abcdef";
-const NODE: &str = "reakt-qual-0123456789abcdef0123456789abcdef-control-plane";
-const PROVIDER: &str = "kind://docker/reakt-qual-0123456789abcdef0123456789abcdef/reakt-qual-0123456789abcdef0123456789abcdef-control-plane";
+const CLUSTER: &str = "apsides-qual-0123456789abcdef0123456789abcdef";
+const NODE: &str = "apsides-qual-0123456789abcdef0123456789abcdef-control-plane";
+const PROVIDER: &str = "kind://docker/apsides-qual-0123456789abcdef0123456789abcdef/apsides-qual-0123456789abcdef0123456789abcdef-control-plane";
 const DIGEST_A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const DIGEST_B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -236,7 +236,7 @@ async fn namespace_replacement_or_deletion_stops_before_any_write() -> TestResul
         "/api/v1/namespaces/kube-system",
         "/api/v1/namespaces/production-control",
         "/api/v1/namespaces/production-workload",
-        "/api/v1/namespaces/reakt-qual-0123456789abcdef0123456789abcdef",
+        "/api/v1/namespaces/apsides-qual-0123456789abcdef0123456789abcdef",
     ] {
         for change in ["replacement", "deleting"] {
             let target = target();

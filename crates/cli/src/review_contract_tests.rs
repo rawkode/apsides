@@ -61,7 +61,7 @@ fn report(ir: &Value) -> Result<Value> {
 #[test]
 fn initial_review_uses_complete_compiler_fields_and_explicit_empty_baselines() -> Result<()> {
     let report = report(&declaration("private-value-canary")?)?;
-    assert_eq!(report["schemaVersion"], "reakt.dev/deployment-review/v4");
+    assert_eq!(report["schemaVersion"], "apsides.dev/deployment-review/v4");
     for category in [
         "reactions",
         "inputAuthority",

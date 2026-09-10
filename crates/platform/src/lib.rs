@@ -152,14 +152,14 @@ pub fn registry_authority_name(
         return Err(invalid("invalid registry authority scope"));
     }
     Ok(format!(
-        "reakt-registry-authority.{control_namespace}.{workload_namespace}"
+        "apsides-registry-authority.{control_namespace}.{workload_namespace}"
     ))
 }
 
-pub const REGISTRY_AUTHORITY_NAMESPACE: &str = "reakt-platform";
-pub const REGISTRY_SCHEMA_VERSION: &str = "reakt.dev/namespace-registry/v8";
-pub const REGISTRY_AUTHORITY_SCHEMA_VERSION: &str = "reakt.dev/registry-authority/v1";
-pub const SCHEMA_VERSION: &str = "reakt.dev/platform/v1";
+pub const REGISTRY_AUTHORITY_NAMESPACE: &str = "apsides-platform";
+pub const REGISTRY_SCHEMA_VERSION: &str = "apsides.dev/namespace-registry/v8";
+pub const REGISTRY_AUTHORITY_SCHEMA_VERSION: &str = "apsides.dev/registry-authority/v1";
+pub const SCHEMA_VERSION: &str = "apsides.dev/platform/v1";
 pub const MAX_STATE_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, thiserror::Error)]

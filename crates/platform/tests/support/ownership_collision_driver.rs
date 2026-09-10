@@ -12,7 +12,7 @@ pub(super) use qualification_driver::Result;
 use qualification_driver::{ConfigIdentity, DriverError};
 
 const RESULT_PREFIX: &str = "APS_COLLISION_RESULT=";
-const RESULT_SCHEMA: &str = "reakt.dev/ownership-collision-result/v1";
+const RESULT_SCHEMA: &str = "apsides.dev/ownership-collision-result/v1";
 const EXECUTOR: &str = "ownership-collision-qualification";
 const ISSUER: &str = "ceiling-issuer";
 

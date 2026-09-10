@@ -10,7 +10,7 @@ workload.
 
 ## Create the project
 
-Run these commands from the Apsides repository root after installing its pnpm
+Run these commands from the Apsides repository root after installing its Deno
 dependencies. The locally built CLI uses the checkout assets. With an installed
 CLI bundle, use `aps` in place of `target/debug/aps`; compiler and CRD tooling
 resolve from that installation.

@@ -276,7 +276,7 @@ impl PlatformClient {
             .as_ref()
             .ok_or_else(|| invalid("new binding missing"))?;
         let old_binding = &previous.runtime_binding;
-        let activation_name = format!("reakt-activation-{}", binding.domain_id);
+        let activation_name = format!("apsides-activation-{}", binding.domain_id);
         let current: Versioned<ActivationState> =
             read_state(&self.client, &self.control_namespace, &activation_name).await?;
         let key = format!("v1/ConfigMap/{}/{activation_name}", self.control_namespace);
@@ -314,7 +314,7 @@ impl PlatformClient {
             &active.resource_version,
         )?;
         crate::control_capacity::validate_activation(&stored, &active.value)?;
-        let inventory_name = format!("reakt-inventory-{}", binding.domain_id);
+        let inventory_name = format!("apsides-inventory-{}", binding.domain_id);
         let inventory: Versioned<RuntimeInventory> =
             read_state(&self.client, &self.control_namespace, &inventory_name).await?;
         let inventory_key = format!("v1/ConfigMap/{}/{inventory_name}", self.control_namespace);

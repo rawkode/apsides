@@ -48,7 +48,7 @@ async fn commit_and_discard_predecessor() -> TestResult<PrunedUpgrade> {
         resource_version: "42".into(),
     };
     let (wire_client, calls) = wire(vec![
-        object("reakt-policy-example", &policy, "policy-uid", "40"),
+        object("apsides-policy-example", &policy, "policy-uid", "40"),
         registry_object(&registry, REGISTRY_UID, "42")?,
         json!("echo-put"),
     ]);
@@ -101,12 +101,12 @@ fn reload_client(fixture: &PrunedUpgrade) -> TestResult<(PlatformClient, Calls)>
         &fixture.committed.resource_version,
     )?;
     let trust = object(
-        "reakt-trust-example",
+        "apsides-trust-example",
         &json!({"platform":"approved"}),
         "trust-uid",
         "43",
     );
-    let policy = object("reakt-policy-example", &fixture.policy, "policy-uid", "40");
+    let policy = object("apsides-policy-example", &fixture.policy, "policy-uid", "40");
     let (client, calls) = wire(vec![
         registry.clone(),
         trust.clone(),

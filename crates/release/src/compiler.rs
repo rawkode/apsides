@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path};
 
-pub const COMPILER_CLOSURE_SCHEMA: &str = "reakt.dev/compiler-closure/v2";
+pub const COMPILER_CLOSURE_SCHEMA: &str = "apsides.dev/compiler-closure/v2";
 const MAX_COMPILER_CLOSURE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COMPILER_FILES: usize = 32_768;
 
@@ -324,13 +324,13 @@ fn validate_native_compiler(native: &NativeCompiler) -> Result<ValidatedRuntime>
         return reject("native compiler context omits vendored dependency sources");
     }
     for required in [
-        "scripts/reakt/Dockerfile",
-        "scripts/reakt/build.py",
-        "scripts/reakt/extract_binary.py",
-        "scripts/reakt/finalize_inputs.py",
-        "scripts/reakt/package_oci.py",
-        "scripts/reakt/sbom.py",
-        "scripts/reakt/toolchain_snapshot.py",
+        "scripts/Dockerfile",
+        "scripts/build.py",
+        "scripts/extract_binary.py",
+        "scripts/finalize_inputs.py",
+        "scripts/package_oci.py",
+        "scripts/sbom.py",
+        "scripts/toolchain_snapshot.py",
         "crates/cli/Cargo.toml",
     ] {
         if !native
@@ -342,7 +342,7 @@ fn validate_native_compiler(native: &NativeCompiler) -> Result<ValidatedRuntime>
         }
     }
     if native.packaging_files.iter().any(|file| {
-        !file.path.starts_with("scripts/reakt/") && !file.path.starts_with("crates/cli/")
+        !file.path.starts_with("scripts/") && !file.path.starts_with("crates/cli/")
     }) {
         return reject("native compiler packaging manifest contains an unsupported source");
     }
@@ -354,7 +354,7 @@ fn validate_native_compiler(native: &NativeCompiler) -> Result<ValidatedRuntime>
     if cli_files.is_empty() || digest(&cli_files)? != native.trusted_cli_code_sha256 {
         return reject("trusted CLI code identity does not match the native compiler manifest");
     }
-    let required_roles = ["buildx", "cargo", "docker", "python", "reakt", "sbom"];
+    let required_roles = ["buildx", "cargo", "docker", "python", "apsides", "sbom"];
     if native.host_tools.len() != required_roles.len()
         || native
             .host_tools

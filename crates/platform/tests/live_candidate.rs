@@ -24,7 +24,7 @@ async fn candidate_transition_step() -> Result<()> {
             Some(platform::Error::Pending(_))
         );
         println!(
-            "REAKT_TEST_ERROR={}",
+            "APSIDES_TEST_ERROR={}",
             json!({"pending":pending,"kind":error_kind(error.as_ref()),"message":error.to_string()})
         );
     }
@@ -123,7 +123,7 @@ fn kubernetes_forbidden_kind_requires_a_typed_api_403() {
 #[ignore = "metadata for explicit disposable-cluster bootstrap"]
 fn proxy_profile() -> Result<()> {
     println!(
-        "REAKT_TEST_PROFILE={}",
+        "APSIDES_TEST_PROFILE={}",
         json!({"envoyImage":platform::ENVOY_IMAGE,"adminImage":platform::ADMIN_IMAGE,"configurationTemplateDigest":compiler_core::digest(&platform::envoy_configuration("qualified-template")?)?,"maxLedgerBytes":platform::MAX_PROXY_LEDGER_BYTES})
     );
     Ok(())

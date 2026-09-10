@@ -124,8 +124,8 @@ fn live() -> Value {
     let mut value = desired();
     value["metadata"]["uid"] = json!("uid-a");
     value["metadata"]["managedFields"] = json!([{
-        "manager":"reakt-example","operation":"Apply","apiVersion":"apps/v1","fieldsType":"FieldsV1",
-        "fieldsV1":{"f:spec":{"f:template":{"f:metadata":{"f:annotations":{"f:reakt.dev/revision":{}}}}}}
+        "manager":"apsides-example","operation":"Apply","apiVersion":"apps/v1","fieldsType":"FieldsV1",
+        "fieldsV1":{"f:spec":{"f:template":{"f:metadata":{"f:annotations":{"f:apsides.dev/revision":{}}}}}}
     }]);
     value["spec"]["template"]["metadata"]["annotations"][REVISION_ANNOTATION] =
         json!(format!("hmac-sha256:private-key-id:{}", "a".repeat(64)));

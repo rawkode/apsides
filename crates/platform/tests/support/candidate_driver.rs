@@ -14,7 +14,7 @@ pub(super) async fn transition_step(
 ) -> Result<()> {
     platform_api::install_rustls_ring_provider()?;
     let settings: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(env::var("REAKT_TEST_STEP")?)?)?;
+        serde_json::from_str(&fs::read_to_string(env::var("APSIDES_TEST_STEP")?)?)?;
     let artifact = settings["artifact"].as_str().ok_or("artifact missing")?;
     let transition = settings["transition"]
         .as_str()
@@ -100,14 +100,14 @@ async fn run_action(
         let registry = platform.load_registry().await?;
         let names = deploy::allocation_names(&registry.uid, registry.value.next_sequence)?;
         println!(
-            "REAKT_TEST_ALLOCATION={}",
+            "APSIDES_TEST_ALLOCATION={}",
             json!({"generation":names.generation_id,"transition":names.transition_id})
         );
         return Ok(());
     }
     if action == "claims" {
         let registry = platform.load_registry().await?;
-        println!("REAKT_TEST_CLAIMS={}", json!(registry.value.claims));
+        println!("APSIDES_TEST_CLAIMS={}", json!(registry.value.claims));
         return Ok(());
     }
     let inventory = inventory_store().await?;
@@ -173,7 +173,7 @@ async fn run_action(
     let registry = platform.load_registry().await?;
     let state = registry.value.transition(transition)?;
     println!(
-        "REAKT_TEST_RESULT={}",
+        "APSIDES_TEST_RESULT={}",
         json!({"candidateIntegrityVerified":true,"releaseVerified":false,"transition":transition,"phase":state.record.phase,"generation":state.allocation().generation_id,"registryResourceVersion":registry.resource_version})
     );
     Ok(())
@@ -221,7 +221,7 @@ async fn report_committed_inventory(
         return Err("registry changed during committed inventory observation".into());
     }
     println!(
-        "REAKT_TEST_INVENTORY={}",
+        "APSIDES_TEST_INVENTORY={}",
         json!({
             "generation": head.snapshot.generation, "snapshotId": head.snapshot_id,
         })
@@ -230,9 +230,9 @@ async fn report_committed_inventory(
 }
 
 async fn claim_store() -> Result<Arc<coordination::LibsqlCoordination>> {
-    let database = env::var("REAKT_INVENTORY_DATABASE")?;
+    let database = env::var("APSIDES_INVENTORY_DATABASE")?;
     let path = Path::new(&database);
-    if !path.is_absolute() || env::var_os("REAKT_INVENTORY_TOKEN").is_some() {
+    if !path.is_absolute() || env::var_os("APSIDES_INVENTORY_TOKEN").is_some() {
         return Err(
             "disposable lifecycle claim store requires an absolute local database path".into(),
         );
@@ -243,9 +243,9 @@ async fn claim_store() -> Result<Arc<coordination::LibsqlCoordination>> {
 }
 
 async fn inventory_store() -> Result<inventory::LibsqlInventory> {
-    let database = env::var("REAKT_INVENTORY_DATABASE")?;
+    let database = env::var("APSIDES_INVENTORY_DATABASE")?;
     let path = Path::new(&database);
-    if !path.is_absolute() || env::var_os("REAKT_INVENTORY_TOKEN").is_some() {
+    if !path.is_absolute() || env::var_os("APSIDES_INVENTORY_TOKEN").is_some() {
         return Err(
             "disposable lifecycle inventory requires an absolute local database path".into(),
         );

@@ -32,7 +32,7 @@ fn live_report(
         )?);
     }
     Ok(LivePreviewReport {
-        schema_version: "reakt.dev/live-preview/v1",
+        schema_version: "apsides.dev/live-preview/v1",
         plan_digest: plan.plan_digest.clone(),
         interval: PreviewInterval {
             started_at: "2026-09-06T10:00:00Z".into(),
@@ -62,7 +62,7 @@ fn v5_renders_bounded_live_evidence_and_supplemental_permissions() -> Result<()>
     let report = render_live("private-live-canary")?;
     assert_eq!(
         report.pointer("/schemaVersion"),
-        Some(&json!("reakt.dev/deployment-review/v5"))
+        Some(&json!("apsides.dev/deployment-review/v5"))
     );
     assert_eq!(
         report.pointer("/liveImpact/status"),
@@ -74,7 +74,7 @@ fn v5_renders_bounded_live_evidence_and_supplemental_permissions() -> Result<()>
     );
     assert_eq!(
         report.pointer("/liveImpact/report/schemaVersion"),
-        Some(&json!("reakt.dev/live-preview/v1"))
+        Some(&json!("apsides.dev/live-preview/v1"))
     );
     assert_eq!(
         report.pointer("/liveImpact/supplementalPermissions/scope"),
@@ -141,7 +141,7 @@ fn v5_opt_out_is_explicitly_unavailable() -> Result<()> {
     )?;
     assert_eq!(
         report.pointer("/schemaVersion"),
-        Some(&json!("reakt.dev/deployment-review/v5"))
+        Some(&json!("apsides.dev/deployment-review/v5"))
     );
     assert_eq!(
         report.pointer("/liveImpact"),

@@ -218,7 +218,7 @@ fn protected_state(identity: &DeploymentIdentity, revision: &str) -> Result<Valu
         "apiVersion":"v1",
         "kind":"ConfigMap",
         "metadata":{
-            "name":"reakt-deploy-identity-example",
+            "name":"apsides-deploy-identity-example",
             "namespace":"control",
             "uid":"identity-uid",
             "resourceVersion":revision

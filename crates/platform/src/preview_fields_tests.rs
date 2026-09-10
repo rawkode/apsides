@@ -270,9 +270,9 @@ fn rollout_path_is_fixed_and_conditional_without_value_prediction() -> Result<()
     let old = rollout_metadata()?;
     let mut next = next_generation(&old)?;
     let before = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"a","namespace":"workload"},
-        "spec":{"replicas":1,"template":{"metadata":{"annotations":{"reakt.dev/revision":"private-old"}}}}});
+        "spec":{"replicas":1,"template":{"metadata":{"annotations":{"apsides.dev/revision":"private-old"}}}}});
     let mut projected = before.clone();
-    projected["spec"]["template"]["metadata"]["annotations"]["reakt.dev/revision"] =
+    projected["spec"]["template"]["metadata"]["annotations"]["apsides.dev/revision"] =
         json!("private-new");
     let report = classify_preview_fields(
         Some(&old),

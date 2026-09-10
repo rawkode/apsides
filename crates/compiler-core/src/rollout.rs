@@ -170,7 +170,7 @@ pub(crate) fn evaluate_validated_rollout(
         }
     }
     let reaction_ids: Vec<_> = reactions.iter().map(|reaction| &reaction.id).collect();
-    let payload = json!({"contract":"reakt.dev/rollout/v1","domain":plan.ir.domain.id,"target":target,"reactions":reaction_ids,"inputs":projections});
+    let payload = json!({"contract":"apsides.dev/rollout/v1","domain":plan.ir.domain.id,"target":target,"reactions":reaction_ids,"inputs":projections});
     revision(payload, sensitive, key)
 }
 

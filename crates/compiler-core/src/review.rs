@@ -40,7 +40,7 @@ pub fn review_documents(plan: &CompiledPlan) -> BTreeMap<&'static str, Value> {
         .map(|r| {
             json!({
                 "domain":ir.domain.id,"resource":r.id,"deletionPolicy":r.lifecycle.deletion_policy,
-                "fieldManager":format!("reakt-{}",ir.domain.id),
+                "fieldManager":format!("apsides-{}",ir.domain.id),
             })
         })
         .collect();
@@ -59,25 +59,25 @@ pub fn review_documents(plan: &CompiledPlan) -> BTreeMap<&'static str, Value> {
     BTreeMap::from([
         (
             "graphs.json",
-            json!({"schemaVersion":"reakt.dev/graphs/v1","irDigest":plan.ir_digest,
+            json!({"schemaVersion":"apsides.dev/graphs/v1","irDigest":plan.ir_digest,
             "resources":resources,"inputs":inputs,"ownership":ownership,"dataflow":edges,"reactions":ir.reactions}),
         ),
         (
             "capabilities.json",
-            json!({"schemaVersion":"reakt.dev/capability-report/v1","irDigest":plan.ir_digest,
+            json!({"schemaVersion":"apsides.dev/capability-report/v1","irDigest":plan.ir_digest,
             "effects":plan.effects,"requests":plan.request_plan,"capabilities":plan.capabilities,
             "enforcement":ir.domain.enforcement,"enforcementGaps":plan.enforcement_gaps,"indirectRisks":plan.indirect_risks}),
         ),
         (
             "compatibility.json",
-            json!({"schemaVersion":"reakt.dev/compatibility/v1","irDigest":plan.ir_digest,
+            json!({"schemaVersion":"apsides.dev/compatibility/v1","irDigest":plan.ir_digest,
             "schemaLibrary":"k8s-openapi/0.28.0","schemaKubernetesMinor":"1.36","requiredApis":apis,
             "qualifiedCreatePreconditionServers":["v1.34.3"],"fieldValidation":"Strict",
-            "transitionPlanSchema":"reakt.dev/transition-plan/v4","runtimeReplicas":1}),
+            "transitionPlanSchema":"apsides.dev/transition-plan/v4","runtimeReplicas":1}),
         ),
         (
             "ir-source-map.json",
-            json!({"schemaVersion":"reakt.dev/ir-source-map/v1","irDigest":plan.ir_digest,
+            json!({"schemaVersion":"apsides.dev/ir-source-map/v1","irDigest":plan.ir_digest,
             "resources":ir.resources.iter().map(|r| (&r.id,&r.source)).collect::<BTreeMap<_,_>>(),
             "inputs":ir.inputs.iter().map(|i| (&i.id,&i.source)).collect::<BTreeMap<_,_>>(),
             "reactions":ir.reactions.iter().map(|r| (&r.id,&r.source)).collect::<BTreeMap<_,_>>()}),

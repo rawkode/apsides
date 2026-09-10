@@ -38,7 +38,7 @@ pub(crate) fn validate(stored: &StoredTransition) -> Result<()> {
         crate::runtime::validate_binding(binding)?;
     }
     if let Some(proxy) = &stored.proxy_identity {
-        let name = format!("reakt-proxy-{}", stored.allocation().generation_id);
+        let name = format!("apsides-proxy-{}", stored.allocation().generation_id);
         if proxy.deployment_name != name
             || proxy.config_map_name != format!("{name}-config")
             || !crate::valid_name(&proxy.node_name)
@@ -94,7 +94,7 @@ pub(crate) fn staged_keys(stored: &StoredTransition) -> Vec<String> {
     let scope = &stored.inputs.registry.claim_snapshot.scope;
     let control = &scope.control_namespace;
     let name = &stored.allocation().service_account_name;
-    let proxy = format!("reakt-proxy-{}", stored.allocation().generation_id);
+    let proxy = format!("apsides-proxy-{}", stored.allocation().generation_id);
     let mut keys = vec![
         format!("v1/ServiceAccount/{control}/{name}"),
         format!("v1/ServiceAccount/{control}/{name}-process"),
@@ -105,11 +105,11 @@ pub(crate) fn staged_keys(stored: &StoredTransition) -> Vec<String> {
         format!("apps/v1/Deployment/{control}/{proxy}"),
         format!("v1/Service/{control}/{proxy}"),
         format!(
-            "v1/ConfigMap/{control}/reakt-activation-{}",
+            "v1/ConfigMap/{control}/apsides-activation-{}",
             stored.domain_id()
         ),
         format!(
-            "v1/ConfigMap/{control}/reakt-inventory-{}",
+            "v1/ConfigMap/{control}/apsides-inventory-{}",
             stored.domain_id()
         ),
     ];

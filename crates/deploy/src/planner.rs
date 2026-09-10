@@ -383,7 +383,7 @@ pub fn plan_transition(request: &DeploymentRequest) -> Result<TransitionPlan> {
     cleanup_allowed(&capabilities, &request.cleanup_ceiling)?;
     let generation_reservation = allocation(request)?;
     let mut plan = TransitionPlan {
-        schema_version: "reakt.dev/transition-plan/v4".into(),
+        schema_version: "apsides.dev/transition-plan/v4".into(),
         plan_digest: String::new(), request: request.clone(), reservations,
         generation_reservation, cleanup, cleanup_capabilities: capabilities,
         warnings: vec!["uncertain old-writer termination blocks activation; short-lived credentials do not undo durable changes".into()],

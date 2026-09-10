@@ -266,7 +266,7 @@ fn emit_backup(
     write_report(
         b"APS_COORDINATION_BACKUP_RESULT=",
         &BackupReport {
-            schema_version: "reakt.dev/pvc-coordination-backup/v1",
+            schema_version: "apsides.dev/pvc-coordination-backup/v1",
             nonce,
             phase: phase.name(),
             outcome,

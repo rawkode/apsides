@@ -60,7 +60,7 @@ impl PlatformClient {
             self.verify_recorded_support(
                 stored,
                 "Service",
-                &format!("reakt-proxy-{}", binding.generation_id),
+                &format!("apsides-proxy-{}", binding.generation_id),
             )
             .await?;
             let name = format!("{}-tls", binding.service_account_name);
@@ -154,7 +154,7 @@ impl PlatformClient {
             };
             crate::control_capacity::validate_activation(stored, &activation)?;
             let domain = &binding.domain_id;
-            let activation_name = format!("reakt-activation-{domain}");
+            let activation_name = format!("apsides-activation-{domain}");
             let activation_object = self
                 .stage_object(
                     registry,
@@ -184,7 +184,7 @@ impl PlatformClient {
                 drained: false,
             };
             crate::control_capacity::validate_inventory(stored, &inventory)?;
-            let inventory_name = format!("reakt-inventory-{domain}");
+            let inventory_name = format!("apsides-inventory-{domain}");
             self.stage_object(
                 registry,
                 transition_id,
@@ -333,7 +333,7 @@ impl PlatformClient {
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), &self.control_namespace);
         let secret = secrets
             .get(&format!(
-                "reakt-rollout-key-{}",
+                "apsides-rollout-key-{}",
                 stored.plan.request.next.compiled.ir.domain.id
             ))
             .await
@@ -377,9 +377,9 @@ impl PlatformClient {
         let mut desired: DynamicObject = serde_json::from_value(desired)?;
         desired.metadata.annotations = Some(
             [
-                (String::from("reakt.dev/transition"), transition_id.into()),
+                (String::from("apsides.dev/transition"), transition_id.into()),
                 (
-                    String::from("reakt.dev/desired-digest"),
+                    String::from("apsides.dev/desired-digest"),
                     digest(&desired.data)?,
                 ),
             ]
@@ -520,17 +520,17 @@ fn controller_deployment(
     proxy_secret: Option<&str>,
     pull_secrets: &[String],
 ) -> Value {
-    let labels = json!({"reakt.dev/generation":binding.generation_id});
-    let mut mounts = vec![json!({"name":"config","mountPath":"/etc/reakt","readOnly":true})];
+    let labels = json!({"apsides.dev/generation":binding.generation_id});
+    let mut mounts = vec![json!({"name":"config","mountPath":"/etc/apsides","readOnly":true})];
     let mut volumes = vec![json!({"name":"config","configMap":{"name":config_name}})];
     let account = if let Some(secret) = proxy_secret {
-        mounts.push(json!({"name":"proxy-client","mountPath":"/etc/reakt/proxy","readOnly":true}));
+        mounts.push(json!({"name":"proxy-client","mountPath":"/etc/apsides/proxy","readOnly":true}));
         volumes.push(json!({"name":"proxy-client","secret":{"secretName":secret,"defaultMode":420,"items":[{"key":"ca.crt","path":"ca.crt"},{"key":"client.crt","path":"tls.crt"},{"key":"client.key","path":"tls.key"}]}}));
         format!("{}-process", binding.service_account_name)
     } else {
         binding.service_account_name.clone()
     };
-    let mut deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":binding.service_account_name,"namespace":namespace},"spec":{"replicas":0,"selector":{"matchLabels":labels},"strategy":{"type":"Recreate"},"template":{"metadata":{"labels":labels,"finalizers":[crate::TERMINATION_FINALIZER]},"spec":{"serviceAccountName":account,"automountServiceAccountToken":proxy_secret.is_none(),"tolerations":[{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoExecute"},{"key":"node.kubernetes.io/unreachable","operator":"Exists","effect":"NoExecute"}],"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"controller","image":binding.controller_image,"imagePullPolicy":"IfNotPresent","env":[{"name":"REAKT_RUNTIME_CONFIG_PATH","value":"/etc/reakt/config.json"}],"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}},"volumeMounts":mounts,"ports":[{"containerPort":8080,"name":"diagnostics"}],"resources":{"requests":{"cpu":"10m","memory":"32Mi"},"limits":{"cpu":"1","memory":"256Mi"}},"livenessProbe":{"httpGet":{"path":"/livez","port":"diagnostics"}},"readinessProbe":{"httpGet":{"path":"/readyz","port":"diagnostics"}}}],"volumes":volumes}}}});
+    let mut deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":binding.service_account_name,"namespace":namespace},"spec":{"replicas":0,"selector":{"matchLabels":labels},"strategy":{"type":"Recreate"},"template":{"metadata":{"labels":labels,"finalizers":[crate::TERMINATION_FINALIZER]},"spec":{"serviceAccountName":account,"automountServiceAccountToken":proxy_secret.is_none(),"tolerations":[{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoExecute"},{"key":"node.kubernetes.io/unreachable","operator":"Exists","effect":"NoExecute"}],"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"controller","image":binding.controller_image,"imagePullPolicy":"IfNotPresent","env":[{"name":"APSIDES_RUNTIME_CONFIG_PATH","value":"/etc/apsides/config.json"}],"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}},"volumeMounts":mounts,"ports":[{"containerPort":8080,"name":"diagnostics"}],"resources":{"requests":{"cpu":"10m","memory":"32Mi"},"limits":{"cpu":"1","memory":"256Mi"}},"livenessProbe":{"httpGet":{"path":"/livez","port":"diagnostics"}},"readinessProbe":{"httpGet":{"path":"/readyz","port":"diagnostics"}}}],"volumes":volumes}}}});
     set_image_pull_secrets(&mut deployment, pull_secrets);
     deployment
 }
@@ -584,9 +584,9 @@ mod stage_metadata_tests {
         // Exact public staging annotations observed in the v4 disposable run.
         // Its UID and stable-data digest independently matched the registry.
         let expected: BTreeMap<String, String> = [
-            ("reakt.dev/transition".into(), "install".into()),
+            ("apsides.dev/transition".into(), "install".into()),
             (
-                "reakt.dev/desired-digest".into(),
+                "apsides.dev/desired-digest".into(),
                 "sha256:ac6ef312cae19d9fb9323ad6331033d143b1bb735455ffb66e2a913c48762bca".into(),
             ),
         ]
@@ -612,7 +612,7 @@ mod stage_metadata_tests {
             ));
         }
         actual.insert("deployment.kubernetes.io/revision".into(), "2".into());
-        actual.insert("reakt.dev/transition".into(), "other".into());
+        actual.insert("apsides.dev/transition".into(), "other".into());
         assert!(!stage_annotations_match(
             "Deployment",
             Some(&actual),

@@ -163,7 +163,7 @@ async fn preview_selected(
         conditions.push(PreviewCondition::AdoptionUsesNonForceApply);
     }
     let report = LivePreviewReport {
-        schema_version: "reakt.dev/live-preview/v1",
+        schema_version: "apsides.dev/live-preview/v1",
         plan_digest: context.binding.plan_digest.clone(),
         interval: PreviewInterval {
             started_at,

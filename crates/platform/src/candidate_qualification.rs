@@ -15,8 +15,8 @@ pub use pair::{
     candidate_pair_qualification_executor,
 };
 
-pub const CANDIDATE_QUALIFICATION_SCHEMA: &str = "reakt.dev/candidate-qualification/v1";
-pub const CANDIDATE_QUALIFICATION_MARKER_NAME: &str = "reakt-candidate-qualification";
+pub const CANDIDATE_QUALIFICATION_SCHEMA: &str = "apsides.dev/candidate-qualification/v1";
+pub const CANDIDATE_QUALIFICATION_MARKER_NAME: &str = "apsides-candidate-qualification";
 
 const KUBE_SYSTEM_NAMESPACE: &str = "kube-system";
 const MAX_IDENTITY_BYTES: usize = 256;
@@ -533,7 +533,7 @@ fn qualification_cluster_name(run_id: &str) -> Result<String> {
             "candidate qualification run ID must be 32 lowercase hexadecimal characters",
         ));
     }
-    Ok(format!("reakt-qual-{run_id}"))
+    Ok(format!("apsides-qual-{run_id}"))
 }
 
 fn bounded_identity(value: &str) -> bool {

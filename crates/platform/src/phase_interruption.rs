@@ -108,7 +108,7 @@ fn emit(checkpoint: &Checkpoint) -> std::io::Result<()> {
         ));
     }
     let mut stdout = std::io::stdout().lock();
-    stdout.write_all(b"REAKT_TEST_CHECKPOINT=")?;
+    stdout.write_all(b"APSIDES_TEST_CHECKPOINT=")?;
     stdout.write_all(&bytes)?;
     stdout.write_all(b"\n")?;
     stdout.flush()

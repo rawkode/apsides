@@ -3,7 +3,7 @@ use compiler_core::DeletionPolicy;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-pub const INVENTORY_SCHEMA: &str = "reakt.dev/resource-inventory/v1";
+pub const INVENTORY_SCHEMA: &str = "apsides.dev/resource-inventory/v1";
 pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

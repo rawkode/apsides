@@ -85,7 +85,7 @@ impl PlatformClient {
         .await?;
         let process_name = format!("{}-process", binding.service_account_name);
         self.stage_object(&mut registry,transition_id,"v1","ServiceAccount",&process_name,json!({"apiVersion":"v1","kind":"ServiceAccount","metadata":{"name":process_name,"namespace":self.control_namespace},"automountServiceAccountToken":false})).await?;
-        let proxy_name = format!("reakt-proxy-{}", binding.generation_id);
+        let proxy_name = format!("apsides-proxy-{}", binding.generation_id);
         let config_name = format!("{proxy_name}-config");
         let data = json!({"envoy.json":String::from_utf8(canonical_bytes(&envoy_configuration(&binding.generation_id)?)?).map_err(|_|invalid("proxy config encoding"))?,"token-sds.json":String::from_utf8(canonical_bytes(&envoy_token_sds())?).map_err(|_|invalid("SDS config encoding"))?});
         self.stage_object(&mut registry,transition_id,"v1","ConfigMap",&config_name,json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":config_name,"namespace":self.control_namespace},"immutable":true,"data":data})).await?;
@@ -104,7 +104,7 @@ impl PlatformClient {
             ),
         )
         .await?;
-        self.stage_object(&mut registry,transition_id,"v1","Service",&proxy_name,json!({"apiVersion":"v1","kind":"Service","metadata":{"name":proxy_name,"namespace":self.control_namespace},"spec":{"selector":{"reakt.dev/proxy-generation":binding.generation_id},"ports":[{"name":"https","port":8443,"targetPort":8443}]}})).await?;
+        self.stage_object(&mut registry,transition_id,"v1","Service",&proxy_name,json!({"apiVersion":"v1","kind":"Service","metadata":{"name":proxy_name,"namespace":self.control_namespace},"spec":{"selector":{"apsides.dev/proxy-generation":binding.generation_id},"ports":[{"name":"https","port":8443,"targetPort":8443}]}})).await?;
         let identity = self
             .observe_staged_proxy(
                 &registry,
@@ -139,7 +139,7 @@ impl PlatformClient {
         let state: Versioned<ProxyPolicy> = read_state(
             &self.client,
             &self.control_namespace,
-            &format!("reakt-proxy-policy-{domain}"),
+            &format!("apsides-proxy-policy-{domain}"),
         )
         .await?;
         let policy = &state.value;
@@ -237,7 +237,7 @@ impl PlatformClient {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.control_namespace);
         let listed = pods
             .list(&ListParams::default().labels(&format!(
-                "reakt.dev/proxy-generation={}",
+                "apsides.dev/proxy-generation={}",
                 binding.generation_id
             )))
             .await?;
@@ -298,7 +298,7 @@ impl PlatformClient {
         let config_key = format!("v1/ConfigMap/{}/{config_name}", self.control_namespace);
         let identity = ProxyIdentity {
             policy_digest: digest(policy)?,
-            deployment_name: format!("reakt-proxy-{}", binding.generation_id),
+            deployment_name: format!("apsides-proxy-{}", binding.generation_id),
             deployment_uid,
             node_name,
             node_uid,
@@ -338,10 +338,10 @@ fn proxy_deployment(
     tls: &str,
     pull_secrets: &[String],
 ) -> Value {
-    let name = format!("reakt-proxy-{}", binding.generation_id);
-    let labels = json!({"reakt.dev/proxy-generation":binding.generation_id});
+    let name = format!("apsides-proxy-{}", binding.generation_id);
+    let labels = json!({"apsides.dev/proxy-generation":binding.generation_id});
     let security = json!({"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}});
-    let mut deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":name,"namespace":namespace},"spec":{"replicas":1,"strategy":{"type":"Recreate"},"selector":{"matchLabels":labels},"template":{"metadata":{"labels":labels,"finalizers":[crate::TERMINATION_FINALIZER]},"spec":{"serviceAccountName":binding.service_account_name,"automountServiceAccountToken":false,"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"runAsGroup":65532,"fsGroup":65532,"seccompProfile":{"type":"RuntimeDefault"}},"tolerations":[{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoExecute"},{"key":"node.kubernetes.io/unreachable","operator":"Exists","effect":"NoExecute"}],"containers":[{"name":"envoy","image":ENVOY_IMAGE,"args":["-c","/etc/reakt/envoy/envoy.json","--concurrency","2","--log-level","warning","--file-flush-interval-msec","50"],"securityContext":security,"ports":[{"name":"https","containerPort":8443}],"volumeMounts":[{"name":"config","mountPath":"/etc/reakt/envoy","readOnly":true},{"name":"server-tls","mountPath":"/etc/reakt/server-tls","readOnly":true},{"name":"api-token","mountPath":"/var/run/secrets/kubernetes.io/serviceaccount","readOnly":true},{"name":"evidence","mountPath":"/evidence"}],"resources":{"requests":{"cpu":"25m","memory":"64Mi","ephemeral-storage":"32Mi"},"limits":{"cpu":"1","memory":"256Mi","ephemeral-storage":"64Mi"}},"readinessProbe":{"tcpSocket":{"port":8443}}},{"name":"admin","image":ADMIN_IMAGE,"command":["sleep"],"args":["infinity"],"securityContext":security,"volumeMounts":[{"name":"evidence","mountPath":"/evidence"}],"resources":{"requests":{"cpu":"5m","memory":"8Mi"},"limits":{"cpu":"100m","memory":"32Mi"}}}],"volumes":[{"name":"config","configMap":{"name":config}},{"name":"server-tls","secret":{"secretName":tls,"defaultMode":416,"items":[{"key":"ca.crt","path":"ca.crt"},{"key":"server.crt","path":"tls.crt"},{"key":"server.key","path":"tls.key"}]}},{"name":"api-token","projected":{"defaultMode":416,"sources":[{"serviceAccountToken":{"path":"token","expirationSeconds":3600}},{"configMap":{"name":"kube-root-ca.crt","items":[{"key":"ca.crt","path":"ca.crt"}]}}]}},{"name":"evidence","emptyDir":{"sizeLimit":"32Mi"}}]}}}});
+    let mut deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":name,"namespace":namespace},"spec":{"replicas":1,"strategy":{"type":"Recreate"},"selector":{"matchLabels":labels},"template":{"metadata":{"labels":labels,"finalizers":[crate::TERMINATION_FINALIZER]},"spec":{"serviceAccountName":binding.service_account_name,"automountServiceAccountToken":false,"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"runAsGroup":65532,"fsGroup":65532,"seccompProfile":{"type":"RuntimeDefault"}},"tolerations":[{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoExecute"},{"key":"node.kubernetes.io/unreachable","operator":"Exists","effect":"NoExecute"}],"containers":[{"name":"envoy","image":ENVOY_IMAGE,"args":["-c","/etc/apsides/envoy/envoy.json","--concurrency","2","--log-level","warning","--file-flush-interval-msec","50"],"securityContext":security,"ports":[{"name":"https","containerPort":8443}],"volumeMounts":[{"name":"config","mountPath":"/etc/apsides/envoy","readOnly":true},{"name":"server-tls","mountPath":"/etc/apsides/server-tls","readOnly":true},{"name":"api-token","mountPath":"/var/run/secrets/kubernetes.io/serviceaccount","readOnly":true},{"name":"evidence","mountPath":"/evidence"}],"resources":{"requests":{"cpu":"25m","memory":"64Mi","ephemeral-storage":"32Mi"},"limits":{"cpu":"1","memory":"256Mi","ephemeral-storage":"64Mi"}},"readinessProbe":{"tcpSocket":{"port":8443}}},{"name":"admin","image":ADMIN_IMAGE,"command":["sleep"],"args":["infinity"],"securityContext":security,"volumeMounts":[{"name":"evidence","mountPath":"/evidence"}],"resources":{"requests":{"cpu":"5m","memory":"8Mi"},"limits":{"cpu":"100m","memory":"32Mi"}}}],"volumes":[{"name":"config","configMap":{"name":config}},{"name":"server-tls","secret":{"secretName":tls,"defaultMode":416,"items":[{"key":"ca.crt","path":"ca.crt"},{"key":"server.crt","path":"tls.crt"},{"key":"server.key","path":"tls.key"}]}},{"name":"api-token","projected":{"defaultMode":416,"sources":[{"serviceAccountToken":{"path":"token","expirationSeconds":3600}},{"configMap":{"name":"kube-root-ca.crt","items":[{"key":"ca.crt","path":"ca.crt"}]}}]}},{"name":"evidence","emptyDir":{"sizeLimit":"32Mi"}}]}}}});
     crate::controller::set_image_pull_secrets(&mut deployment, pull_secrets);
     deployment
 }

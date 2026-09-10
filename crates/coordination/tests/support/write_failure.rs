@@ -73,7 +73,7 @@ async fn claim_write_failure_rolls_back_and_exact_retry_succeeds() -> TestResult
     let bytes = compiler_core::canonical_bytes(&candidate.claims)?;
     let database = Builder::new_local(&path).build().await?;
     let connection = database.connect()?;
-    install_failure_trigger(&connection, "reakt_coordination_claims").await?;
+    install_failure_trigger(&connection, "apsides_coordination_claims").await?;
 
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -81,7 +81,7 @@ async fn claim_write_failure_rolls_back_and_exact_retry_succeeds() -> TestResult
     require_raw_failure(
         transaction
             .execute(
-                "INSERT OR IGNORE INTO reakt_coordination_claims(digest,metadata) VALUES (?1,?2)",
+                "INSERT OR IGNORE INTO apsides_coordination_claims(digest,metadata) VALUES (?1,?2)",
                 params![reference.digest.clone(), bytes.clone()],
             )
             .await,
@@ -89,7 +89,7 @@ async fn claim_write_failure_rolls_back_and_exact_retry_succeeds() -> TestResult
     require_exact_metadata(
         transaction
             .query(
-                "SELECT metadata FROM reakt_coordination_claims WHERE digest=?1",
+                "SELECT metadata FROM apsides_coordination_claims WHERE digest=?1",
                 params![reference.digest.clone()],
             )
             .await?,
@@ -143,7 +143,7 @@ async fn review_write_failure_rolls_back_and_exact_retry_succeeds() -> TestResul
     let bytes = compiler_core::canonical_bytes(&candidate.left_review)?;
     let database = Builder::new_local(&path).build().await?;
     let connection = database.connect()?;
-    install_failure_trigger(&connection, "reakt_coordination_review_objects").await?;
+    install_failure_trigger(&connection, "apsides_coordination_review_objects").await?;
     let scope = &reference.scope;
     let claims = &scope.claim_scope;
 
@@ -153,7 +153,7 @@ async fn review_write_failure_rolls_back_and_exact_retry_succeeds() -> TestResul
     require_raw_failure(
         transaction
             .execute(
-                "INSERT OR IGNORE INTO reakt_coordination_review_objects(\
+                "INSERT OR IGNORE INTO apsides_coordination_review_objects(\
                  registry_uid,cluster_binding,control_namespace,workload_namespace,\
                  domain_id,transition_id,sequence,digest,metadata) \
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -174,7 +174,7 @@ async fn review_write_failure_rolls_back_and_exact_retry_succeeds() -> TestResul
     require_exact_metadata(
         transaction
             .query(
-                "SELECT metadata FROM reakt_coordination_review_objects \
+                "SELECT metadata FROM apsides_coordination_review_objects \
                  WHERE registry_uid=?1 AND cluster_binding=?2 AND control_namespace=?3 \
                  AND workload_namespace=?4 AND domain_id=?5 AND transition_id=?6",
                 params![
@@ -237,7 +237,7 @@ async fn audit_write_failure_rolls_back_and_exact_retry_succeeds() -> TestResult
     let bytes = compiler_core::canonical_bytes(&candidate.left_audit)?;
     let database = Builder::new_local(&path).build().await?;
     let connection = database.connect()?;
-    install_failure_trigger(&connection, "reakt_coordination_audits").await?;
+    install_failure_trigger(&connection, "apsides_coordination_audits").await?;
     let scope = &reference.scope;
     let claims = &scope.claim_scope;
 
@@ -247,7 +247,7 @@ async fn audit_write_failure_rolls_back_and_exact_retry_succeeds() -> TestResult
     require_raw_failure(
         transaction
             .execute(
-                "INSERT OR IGNORE INTO reakt_coordination_audits(\
+                "INSERT OR IGNORE INTO apsides_coordination_audits(\
                  registry_uid,cluster_binding,control_namespace,workload_namespace,\
                  domain_id,transition_id,sequence,digest,metadata) \
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -268,7 +268,7 @@ async fn audit_write_failure_rolls_back_and_exact_retry_succeeds() -> TestResult
     require_exact_metadata(
         transaction
             .query(
-                "SELECT metadata FROM reakt_coordination_audits \
+                "SELECT metadata FROM apsides_coordination_audits \
                  WHERE registry_uid=?1 AND cluster_binding=?2 AND control_namespace=?3 \
                  AND workload_namespace=?4 AND domain_id=?5 AND transition_id=?6",
                 params![

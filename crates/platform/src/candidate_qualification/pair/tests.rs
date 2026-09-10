@@ -15,9 +15,9 @@ type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const DIGEST_A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const DIGEST_B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const CLUSTER: &str = "reakt-qual-0123456789abcdef0123456789abcdef";
-const NODE: &str = "reakt-qual-0123456789abcdef0123456789abcdef-control-plane";
-const PROVIDER: &str = "kind://docker/reakt-qual-0123456789abcdef0123456789abcdef/reakt-qual-0123456789abcdef0123456789abcdef-control-plane";
+const CLUSTER: &str = "apsides-qual-0123456789abcdef0123456789abcdef";
+const NODE: &str = "apsides-qual-0123456789abcdef0123456789abcdef-control-plane";
+const PROVIDER: &str = "kind://docker/apsides-qual-0123456789abcdef0123456789abcdef/apsides-qual-0123456789abcdef0123456789abcdef-control-plane";
 type Calls = Arc<Mutex<Vec<(String, String)>>>;
 
 fn capability(name: &str, verb: &str) -> Capability {
@@ -66,7 +66,7 @@ fn marker() -> CandidatePairQualificationMarker {
         sentinel_namespace: CLUSTER.into(),
         domain_id: "production-domain".into(),
         cluster_binding: "production-cluster".into(),
-        control_namespace: "reakt-system".into(),
+        control_namespace: "apsides-system".into(),
         workload_namespace: "production".into(),
         kube_system_namespace_uid: target.cluster.kube_system_namespace_uid,
         control_namespace_uid: target.cluster.control_namespace_uid,
@@ -93,7 +93,7 @@ fn binding() -> CandidateBinding<'static> {
         domain_id: "production-domain",
         release_digest: DIGEST_B,
         cluster_binding: "production-cluster",
-        control_namespace: "reakt-system",
+        control_namespace: "apsides-system",
         workload_namespace: "production",
     }
 }
@@ -117,7 +117,7 @@ fn marker_object(record: &CandidatePairQualificationMarker) -> TestResult<Value>
 
 fn policy_object(value: &PolicyState) -> TestResult<Value> {
     Ok(json!({"apiVersion":"v1","kind":"ConfigMap",
-        "metadata":{"name":"reakt-policy-production-domain","namespace":"reakt-system","uid":"policy-uid","resourceVersion":"5"},
+        "metadata":{"name":"apsides-policy-production-domain","namespace":"apsides-system","uid":"policy-uid","resourceVersion":"5"},
         "data":{"state.json":serde_json::to_string(value)?}}))
 }
 
@@ -127,7 +127,7 @@ fn policy() -> PolicyState {
         domain_id: "production-domain".into(),
         cluster_binding: "production-cluster".into(),
         workload_namespace: "production".into(),
-        control_namespace: "reakt-system".into(),
+        control_namespace: "apsides-system".into(),
         capabilities: vec![],
         accepted_enforcement_gaps: vec![],
         accepted_indirect_risks: vec![],
@@ -150,8 +150,8 @@ fn objects(
             namespace("kube-system", &target.cluster.kube_system_namespace_uid),
         ),
         (
-            "/api/v1/namespaces/reakt-system".into(),
-            namespace("reakt-system", &target.cluster.control_namespace_uid),
+            "/api/v1/namespaces/apsides-system".into(),
+            namespace("apsides-system", &target.cluster.control_namespace_uid),
         ),
         (
             "/api/v1/namespaces/production".into(),
@@ -205,7 +205,7 @@ fn wire(objects: BTreeMap<String, Value>) -> (Client, Calls) {
 fn mock_platform(objects: BTreeMap<String, Value>) -> TestResult<(PlatformClient, Calls)> {
     let (client, calls) = wire(objects);
     Ok((
-        PlatformClient::new(client, "reakt-system", "production", "production-cluster")?,
+        PlatformClient::new(client, "apsides-system", "production", "production-cluster")?,
         calls,
     ))
 }
@@ -352,7 +352,7 @@ async fn ordered_pair_marker_or_object_identity_drift_is_rejected_read_only() ->
                 }
             }
             "old-schema" => {
-                observed.schema_version = "reakt.dev/candidate-pair-qualification/v1".into();
+                observed.schema_version = "apsides.dev/candidate-pair-qualification/v1".into();
             }
             "uid" | "revision" | "mutable" => {}
             _ => return Err("unknown pair marker mutation".into()),
@@ -384,7 +384,7 @@ async fn ordered_pair_marker_or_object_identity_drift_is_rejected_read_only() ->
 #[tokio::test]
 async fn current_policy_must_match_the_marker_digest() -> TestResult {
     let value = policy();
-    let path = "/api/v1/namespaces/reakt-system/configmaps/reakt-policy-production-domain";
+    let path = "/api/v1/namespaces/apsides-system/configmaps/apsides-policy-production-domain";
     let objects = BTreeMap::from([(path.into(), policy_object(&value)?)]);
     let expected = compiler_core::digest(&value)?;
     let (platform, calls) = mock_platform(objects)?;

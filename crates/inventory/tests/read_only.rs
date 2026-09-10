@@ -113,9 +113,9 @@ async fn read_only_open_rejects_missing_file_and_tables_without_creation() -> Te
     database
         .connect()?
         .execute_batch(
-            "CREATE TABLE reakt_inventory_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);\
-             INSERT INTO reakt_inventory_schema VALUES (1,1);\
-             CREATE TABLE reakt_inventory_snapshots (scope TEXT,digest TEXT);",
+            "CREATE TABLE apsides_inventory_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);\
+             INSERT INTO apsides_inventory_schema VALUES (1,1);\
+             CREATE TABLE apsides_inventory_snapshots (scope TEXT,digest TEXT);",
         )
         .await?;
     let before = std::fs::read(&incomplete)?;
@@ -125,7 +125,7 @@ async fn read_only_open_rejects_missing_file_and_tables_without_creation() -> Te
             .is_err()
     );
     assert_eq!(std::fs::read(&incomplete)?, before);
-    assert_eq!(table_count(&incomplete, "reakt_inventory_heads").await?, 0);
+    assert_eq!(table_count(&incomplete, "apsides_inventory_heads").await?, 0);
     Ok(())
 }
 
@@ -137,7 +137,7 @@ async fn read_only_open_rejects_wrong_version_without_repair() -> TestResult {
     let database = libsql::Builder::new_local(&path).build().await?;
     database
         .connect()?
-        .execute("UPDATE reakt_inventory_schema SET version=2 WHERE id=1", ())
+        .execute("UPDATE apsides_inventory_schema SET version=2 WHERE id=1", ())
         .await?;
     let before = std::fs::read(&path)?;
     assert!(matches!(
@@ -161,7 +161,7 @@ async fn read_only_load_rejects_corrupt_metadata_without_repair() -> TestResult 
     let database = libsql::Builder::new_local(&path).build().await?;
     database
         .connect()?
-        .execute("UPDATE reakt_inventory_snapshots SET metadata=x'7b7d'", ())
+        .execute("UPDATE apsides_inventory_snapshots SET metadata=x'7b7d'", ())
         .await?;
     drop(database);
     let before = std::fs::read(&path)?;

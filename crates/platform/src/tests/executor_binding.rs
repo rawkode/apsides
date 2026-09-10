@@ -130,7 +130,7 @@ async fn unsupported_schema_or_missing_executor_binding_is_rejected_without_a_wr
             .ok_or("registry state missing")?;
         let mut state: Value = serde_json::from_str(encoded)?;
         if unsupported_schema {
-            state["schemaVersion"] = json!("reakt.dev/namespace-registry/v7");
+            state["schemaVersion"] = json!("apsides.dev/namespace-registry/v7");
         } else {
             state["transitions"][TRANSITION_A]
                 .as_object_mut()
@@ -276,7 +276,7 @@ async fn changed_live_identity_is_rejected_before_any_lifecycle_write() -> TestR
     let mut current = fixture_deployment_identity();
     current.binding_secret_uid = "replacement-secret".into();
     let identity = object(
-        "reakt-deploy-identity-example",
+        "apsides-deploy-identity-example",
         &current,
         "deployment-identity-uid",
         "31",
@@ -299,7 +299,7 @@ async fn changed_live_identity_is_rejected_before_any_lifecycle_write() -> TestR
     assert!(
         calls[0]
             .1
-            .ends_with("/configmaps/reakt-deploy-identity-example")
+            .ends_with("/configmaps/apsides-deploy-identity-example")
     );
     assert!(calls.iter().all(|(method, _, _)| method == "GET"));
     Ok(())

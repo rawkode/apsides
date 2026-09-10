@@ -1,5 +1,5 @@
 use crate::{Result, only, required};
-use std::{collections::BTreeMap, process::Command};
+use std::collections::BTreeMap;
 
 pub fn fetch(options: &BTreeMap<String, String>) -> Result<()> {
     only(options, &["--url", "--kind", "--output", "--version"])?;
@@ -7,9 +7,8 @@ pub fn fetch(options: &BTreeMap<String, String>) -> Result<()> {
     if !script.is_file() {
         return Err("CRD generator assets are unavailable".into());
     }
-    let mut command = Command::new("node");
+    let mut command = crate::deno::script(&script);
     command
-        .arg(script)
         .arg(required(options, "--url")?)
         .arg(required(options, "--kind")?)
         .arg(required(options, "--output")?);

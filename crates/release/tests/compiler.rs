@@ -16,13 +16,13 @@ fn valid_inputs() -> (Value, String) {
     let packaging_files = json!([
         {"path":"crates/cli/Cargo.toml","sha256":format!("sha256:{}", "1".repeat(64))},
         {"path":"crates/cli/src/main.rs","sha256":format!("sha256:{}", "1".repeat(64))},
-        {"path":"scripts/reakt/Dockerfile","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/reakt/build.py","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/reakt/extract_binary.py","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/reakt/finalize_inputs.py","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/reakt/package_oci.py","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/reakt/sbom.py","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/reakt/toolchain_snapshot.py","sha256":format!("sha256:{}", "2".repeat(64))}
+        {"path":"scripts/Dockerfile","sha256":format!("sha256:{}", "2".repeat(64))},
+        {"path":"scripts/build.py","sha256":format!("sha256:{}", "2".repeat(64))},
+        {"path":"scripts/extract_binary.py","sha256":format!("sha256:{}", "2".repeat(64))},
+        {"path":"scripts/finalize_inputs.py","sha256":format!("sha256:{}", "2".repeat(64))},
+        {"path":"scripts/package_oci.py","sha256":format!("sha256:{}", "2".repeat(64))},
+        {"path":"scripts/sbom.py","sha256":format!("sha256:{}", "2".repeat(64))},
+        {"path":"scripts/toolchain_snapshot.py","sha256":format!("sha256:{}", "2".repeat(64))}
     ]);
     let cli: Vec<Value> = packaging_files
         .as_array()
@@ -53,15 +53,15 @@ fn valid_inputs() -> (Value, String) {
         "manifestJson":String::from_utf8(manifest).unwrap(),
         "configJson":String::from_utf8(config).unwrap()
     });
-    let host_tools: Vec<_> = ["buildx", "cargo", "docker", "python", "reakt", "sbom"]
+    let host_tools: Vec<_> = ["buildx", "cargo", "docker", "python", "apsides", "sbom"]
         .into_iter()
         .map(|role| {
             json!({"role":role,"sha256":format!("sha256:{}", "6".repeat(64)),"version":"1.0"})
         })
         .collect();
     let closure = json!({
-        "schemaVersion":"reakt.dev/compiler-closure/v2",
-        "authoringCompiler":{"sdk":{"identity":"@reakt/kubernetes","sha256":"sdk"},"toolchain":{"deno":"pinned"}},
+        "schemaVersion":"apsides.dev/compiler-closure/v2",
+        "authoringCompiler":{"sdk":{"identity":"@apsides/kubernetes","sha256":"sdk"},"toolchain":{"deno":"pinned"}},
         "nativeCompiler":{
             "builderImage":{"reference":format!("example.invalid/builder@sha256:{}", "3".repeat(64)),"platform":"linux/arm64"},
             "cargoLockSha256":format!("sha256:{}", "4".repeat(64)),

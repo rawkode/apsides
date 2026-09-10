@@ -82,7 +82,7 @@ pub fn run_semantic_tests(plan: &CompiledPlan) -> Result<SemanticReport> {
         bytes: vec![0x5a; 32],
     };
     let fixture_digest = digest(
-        &json!({"contract":"reakt.dev/synthetic-fixture/v1","seed":0,"irDigest":plan.ir_digest}),
+        &json!({"contract":"apsides.dev/synthetic-fixture/v1","seed":0,"irDigest":plan.ir_digest}),
     )?;
     let mut results = Vec::new();
     for case in &plan.test_plan {
@@ -123,9 +123,9 @@ pub fn run_semantic_tests(plan: &CompiledPlan) -> Result<SemanticReport> {
         });
     }
     Ok(SemanticReport {
-        schema_version: "reakt.dev/semantic-results/v1".into(),
+        schema_version: "apsides.dev/semantic-results/v1".into(),
         ir_digest: plan.ir_digest.clone(),
-        primitive_contract: "reakt.dev/rollout/v1".into(),
+        primitive_contract: "apsides.dev/rollout/v1".into(),
         test_only: true,
         production_release_ready: false,
         results,

@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 /// Kubernetes TLS client.
 ///
 /// Applications must call this before `kube::Config` or `kube::Client` can
-/// build a Rustls configuration. Repeated Reakt calls are idempotent; a provider
+/// build a Rustls configuration. Repeated Apsides calls are idempotent; a provider
 /// installed earlier by unrelated code is rejected because its identity cannot
 /// be established as the supported provider.
 ///
@@ -16,7 +16,7 @@ pub fn install_rustls_ring_provider() -> Result<()> {
     static INSTALLATION: OnceLock<std::result::Result<(), &'static str>> = OnceLock::new();
     match INSTALLATION.get_or_init(|| {
         if rustls::crypto::CryptoProvider::get_default().is_some() {
-            return Err("Rustls crypto provider was initialized before Reakt selected ring");
+            return Err("Rustls crypto provider was initialized before Apsides selected ring");
         }
         rustls::crypto::ring::default_provider()
             .install_default()

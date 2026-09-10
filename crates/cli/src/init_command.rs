@@ -5,7 +5,7 @@ use std::{
     env, fs,
     io::Write as _,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
 };
 
 const PROJECT_FILES: &[(&str, &str)] = &[
@@ -18,27 +18,27 @@ const PROJECT_FILES: &[(&str, &str)] = &[
 const SDK_FILES: &[(&str, &str)] = &[
     (
         "index.ts",
-        include_str!("../../../packages/reakt/src/index.ts"),
+        include_str!("../../../packages/kubernetes/src/index.ts"),
     ),
     (
         "model.ts",
-        include_str!("../../../packages/reakt/src/model.ts"),
+        include_str!("../../../packages/kubernetes/src/model.ts"),
     ),
     (
         "runtime.ts",
-        include_str!("../../../packages/reakt/src/runtime.ts"),
+        include_str!("../../../packages/kubernetes/src/runtime.ts"),
     ),
     (
         "compiler.ts",
-        include_str!("../../../packages/reakt/src/compiler.ts"),
+        include_str!("../../../packages/kubernetes/src/compiler.ts"),
     ),
     (
         "jsx-runtime.ts",
-        include_str!("../../../packages/reakt/src/jsx-runtime.ts"),
+        include_str!("../../../packages/kubernetes/src/jsx-runtime.ts"),
     ),
     (
         "jsx-dev-runtime.ts",
-        include_str!("../../../packages/reakt/src/jsx-dev-runtime.ts"),
+        include_str!("../../../packages/kubernetes/src/jsx-dev-runtime.ts"),
     ),
 ];
 
@@ -48,7 +48,7 @@ const PROGRAM: &str = r#"import {
   Deployment,
   useConfigMap,
   type DomainBudgets,
-} from "@reakt/kubernetes";
+} from "@apsides/kubernetes";
 
 const budgets: DomainBudgets = {
   maxResources: 8,
@@ -59,7 +59,7 @@ const budgets: DomainBudgets = {
   maxConcurrentRequests: 2,
 };
 
-function App() {
+const App = () => {
   const settings = useConfigMap({ name: "app-settings" });
   const labels = { app: "hello" };
 
@@ -95,7 +95,7 @@ function App() {
       />
     </>
   );
-}
+};
 
 export default (
   <Controller
@@ -115,13 +115,13 @@ export default (
 const DENO_CONFIG: &str = r#"{
   "compilerOptions": {
     "jsx": "react-jsxdev",
-    "jsxImportSource": "@reakt/kubernetes",
+    "jsxImportSource": "@apsides/kubernetes",
     "strict": true
   },
   "imports": {
-    "@reakt/kubernetes": "./.aps/sdk/index.ts",
-    "@reakt/kubernetes/jsx-runtime": "./.aps/sdk/jsx-runtime.ts",
-    "@reakt/kubernetes/jsx-dev-runtime": "./.aps/sdk/jsx-dev-runtime.ts"
+    "@apsides/kubernetes": "./.aps/sdk/index.ts",
+    "@apsides/kubernetes/jsx-runtime": "./.aps/sdk/jsx-runtime.ts",
+    "@apsides/kubernetes/jsx-dev-runtime": "./.aps/sdk/jsx-dev-runtime.ts"
   }
 }
 "#;
@@ -131,14 +131,14 @@ const TYPESCRIPT_CONFIG: &str = r#"{
     "allowImportingTsExtensions": true,
     "baseUrl": ".",
     "jsx": "react-jsx",
-    "jsxImportSource": "@reakt/kubernetes",
+    "jsxImportSource": "@apsides/kubernetes",
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "noEmit": true,
     "paths": {
-      "@reakt/kubernetes": ["./.aps/sdk/index.ts"],
-      "@reakt/kubernetes/jsx-runtime": ["./.aps/sdk/jsx-runtime.ts"],
-      "@reakt/kubernetes/jsx-dev-runtime": ["./.aps/sdk/jsx-dev-runtime.ts"]
+      "@apsides/kubernetes": ["./.aps/sdk/index.ts"],
+      "@apsides/kubernetes/jsx-runtime": ["./.aps/sdk/jsx-runtime.ts"],
+      "@apsides/kubernetes/jsx-dev-runtime": ["./.aps/sdk/jsx-dev-runtime.ts"]
     },
     "strict": true,
     "target": "ES2022"
@@ -165,7 +165,7 @@ pub(crate) fn command(options: &BTreeMap<String, String>) -> Result<()> {
             "status": "initialized",
             "directory": destination,
             "entry": "program.tsx",
-            "sourceLock": "reakt.lock.json"
+            "sourceLock": "apsides.lock.json"
         }))?
     )?;
     Ok(())
@@ -217,7 +217,7 @@ fn reject_existing_outputs(destination: &Path) -> Result<()> {
     for name in PROJECT_FILES
         .iter()
         .map(|(name, _)| *name)
-        .chain(["reakt.lock.json", ".aps"])
+        .chain(["apsides.lock.json", ".aps"])
     {
         if fs::symlink_metadata(destination.join(name)).is_ok() {
             return Err(format!("init refuses to overwrite {name}").into());
@@ -257,13 +257,9 @@ fn generate_source_lock(stage: &Path) -> Result<()> {
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err("Apsides compiler assets are invalid".into());
     }
-    let status = Command::new("node")
-        .arg(script.canonicalize()?)
-        .arg(stage.join("program.tsx"))
-        .env_clear()
-        .env("PATH", env::var_os("PATH").unwrap_or_default())
-        .stdout(Stdio::null())
-        .status()?;
+    let mut command = crate::deno::script(&script.canonicalize()?);
+    command.arg(stage.join("program.tsx")).stdout(Stdio::null());
+    let status = crate::deno::isolate(&mut command).status()?;
     if !status.success() {
         return Err("source lock generation failed".into());
     }
@@ -290,7 +286,7 @@ fn publish(stage: &Path, destination: &Path) -> Result<()> {
         for name in PROJECT_FILES
             .iter()
             .map(|(name, _)| *name)
-            .chain(["reakt.lock.json"])
+            .chain(["apsides.lock.json"])
         {
             let target = destination.join(name);
             copy_exclusive(&stage.join(name), &target)?;
@@ -332,6 +328,7 @@ fn copy_exclusive(source: &Path, destination: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::Value;
+    use std::process::Command;
     use sha2::{Digest as _, Sha256};
 
     #[test]
@@ -340,7 +337,7 @@ mod tests {
         let project = temporary.path().join("hello");
         initialize(&project)?;
 
-        let lock: Value = serde_json::from_slice(&fs::read(project.join("reakt.lock.json"))?)?;
+        let lock: Value = serde_json::from_slice(&fs::read(project.join("apsides.lock.json"))?)?;
         let program = fs::read(project.join("program.tsx"))?;
         assert_eq!(lock["entry"], "program.tsx");
         assert_eq!(lock["inputs"].as_array().map(Vec::len), Some(1));
@@ -378,7 +375,7 @@ mod tests {
         assert!(initialize(&project).is_err());
         assert_eq!(fs::read_to_string(project.join("program.tsx"))?, "keep me");
         assert!(!project.join(".aps").exists());
-        assert!(!project.join("reakt.lock.json").exists());
+        assert!(!project.join("apsides.lock.json").exists());
         Ok(())
     }
 }

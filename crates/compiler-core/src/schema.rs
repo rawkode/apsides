@@ -1,5 +1,5 @@
 //! Kubernetes field shapes come from pinned upstream generated types. The
-//! allowlist below defines Reakt's smaller effect vocabulary, not a competing
+//! allowlist below defines Apsides's smaller effect vocabulary, not a competing
 //! Kubernetes schema. API admission/defaulting remains a separate release gate.
 use crate::{Error, REVISION_ANNOTATION, Resource, Result};
 use k8s_openapi::api::{

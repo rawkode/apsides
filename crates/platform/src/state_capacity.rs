@@ -5,7 +5,7 @@ use deploy::Phase;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const CAPACITY_SCHEMA: &str = "reakt.dev/capacity-admission/v1";
+pub const CAPACITY_SCHEMA: &str = "apsides.dev/capacity-admission/v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

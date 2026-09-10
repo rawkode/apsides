@@ -33,7 +33,7 @@ pub async fn open(options: &BTreeMap<String, String>) -> Result<ArtifactInput> {
     let reference = options
         .get("--artifact-reference")
         .map(PathBuf::from)
-        .or_else(|| env::var_os("REAKT_RELEASE_REFERENCE").map(PathBuf::from));
+        .or_else(|| env::var_os("APSIDES_RELEASE_REFERENCE").map(PathBuf::from));
     let local = select_local(
         options.get("--artifact").map(PathBuf::from),
         reference.as_deref(),
@@ -42,15 +42,15 @@ pub async fn open(options: &BTreeMap<String, String>) -> Result<ArtifactInput> {
         return Ok(ArtifactInput::Local(local));
     };
     let reference = read_reference(&reference)?;
-    let executable = env::var_os("REAKT_ORAS")
+    let executable = env::var_os("APSIDES_ORAS")
         .map(PathBuf::from)
-        .ok_or("OCI deployment requires REAKT_ORAS with an absolute tool path")?;
+        .ok_or("OCI deployment requires APSIDES_ORAS with an absolute tool path")?;
     let sha256 =
-        env::var("REAKT_ORAS_SHA256").map_err(|_| "OCI deployment requires REAKT_ORAS_SHA256")?;
+        env::var("APSIDES_ORAS_SHA256").map_err(|_| "OCI deployment requires APSIDES_ORAS_SHA256")?;
     let tool = OrasTool {
         executable,
         sha256,
-        ca_file: env::var_os("REAKT_REGISTRY_CA").map(PathBuf::from),
+        ca_file: env::var_os("APSIDES_REGISTRY_CA").map(PathBuf::from),
     };
     Ok(ArtifactInput::Fetched(
         release::fetch_release(&reference, &tool).await?,
@@ -61,7 +61,7 @@ fn select_local(local: Option<PathBuf>, reference: Option<&Path>) -> Result<Path
     if local.is_some() && reference.is_some() {
         return Err("choose a local artifact or an OCI release reference, not both".into());
     }
-    Ok(local.unwrap_or_else(|| PathBuf::from("dist/reakt")))
+    Ok(local.unwrap_or_else(|| PathBuf::from("dist/apsides")))
 }
 
 fn read_reference(path: &Path) -> Result<ReleaseReference> {
@@ -83,7 +83,7 @@ mod tests {
     use super::*;
     #[test]
     fn local_selection_is_explicit_and_does_not_mask_remote_configuration() -> Result<()> {
-        assert_eq!(select_local(None, None)?, PathBuf::from("dist/reakt"));
+        assert_eq!(select_local(None, None)?, PathBuf::from("dist/apsides"));
         assert_eq!(
             select_local(Some("build".into()), None)?,
             PathBuf::from("build")

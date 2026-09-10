@@ -18,13 +18,13 @@ hero:
 
 <div class="status-strip">
   <strong>Release status</strong>
-  <p>Apsides is under active implementation. Candidate builds and focused lifecycle runs exist, but the production release gates are not complete. Start with the <a href="/reakt/status/">implementation status</a> before evaluating it for a cluster.</p>
+  <p>Apsides is under active implementation. Candidate builds and focused lifecycle runs exist, but the production release gates are not complete. Start with the <a href="/reference/status/">implementation status</a> before evaluating it for a cluster.</p>
 </div>
 
 ## Names used by the current implementation
 
-**Apsides** is the project. The current CLI command is `reakt`; commands in this
-site use that executable name. Existing `reakt.dev` schema and protocol identifiers
+**Apsides** is the project. The current CLI command is `apsides`; commands in this
+site use that executable name. Existing `apsides.dev` schema and protocol identifiers
 remain active wire names. TypeScript authoring uses `@apsides/compiler`.
 
 ## The working model

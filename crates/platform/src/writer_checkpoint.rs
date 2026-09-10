@@ -7,7 +7,7 @@ use deploy::{GenerationAllocation, PredecessorGeneration};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-const SCHEMA: &str = "reakt.dev/writer-checkpoint/v1";
+const SCHEMA: &str = "apsides.dev/writer-checkpoint/v1";
 const MAX_CHECKPOINT_BYTES: usize = 128 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,8 +173,8 @@ impl WriterCheckpoint {
             ));
         };
         let proxy = &self.proxy_identity;
-        if proxy.deployment_name != format!("reakt-proxy-{}", allocation.generation_id)
-            || proxy.config_map_name != format!("reakt-proxy-{}-config", allocation.generation_id)
+        if proxy.deployment_name != format!("apsides-proxy-{}", allocation.generation_id)
+            || proxy.config_map_name != format!("apsides-proxy-{}-config", allocation.generation_id)
             || proxy.qualification_digest != *qualification_digest
             || !valid_name(&proxy.deployment_name)
             || !valid_name(&proxy.config_map_name)
@@ -366,11 +366,11 @@ fn project_stored(
         control_namespace: control.clone(),
         controller_deployment_uid: required_uid(&format!("apps/v1/Deployment/{control}/{name}"))?,
         activation_uid: required_uid(&format!(
-            "v1/ConfigMap/{control}/reakt-activation-{}",
+            "v1/ConfigMap/{control}/apsides-activation-{}",
             binding.domain_id
         ))?,
         inventory_uid: required_uid(&format!(
-            "v1/ConfigMap/{control}/reakt-inventory-{}",
+            "v1/ConfigMap/{control}/apsides-inventory-{}",
             binding.domain_id
         ))?,
         runtime_binding: binding,

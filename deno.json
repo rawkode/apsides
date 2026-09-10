@@ -1,0 +1,16 @@
+{
+  "workspace": [
+    "./packages/compiler",
+    "./packages/kubernetes"
+  ],
+  "nodeModulesDir": "auto",
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true
+  },
+  "exclude": [
+    "docs"
+  ]
+}

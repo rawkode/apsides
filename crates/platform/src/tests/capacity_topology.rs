@@ -27,12 +27,12 @@ pub(super) fn admission_reads(registry: &mut LifecycleRegistry) -> TestResult<Ve
     active.status = ActivationStatus::Active;
     let mut reads = vec![
         object(
-            "reakt-activation-example",
+            "apsides-activation-example",
             &active,
             &checkpoint.activation_uid,
             "45",
         ),
-        find("ConfigMap", "reakt-proxy-policy-example")?,
+        find("ConfigMap", "apsides-proxy-policy-example")?,
         node.clone(),
         find("Pod", &proxy.pod_name)?,
         find("ConfigMap", &proxy.config_map_name)?,
@@ -169,7 +169,7 @@ async fn resize_changes_only_capacity_and_invalidates_the_old_session() -> TestR
     assert_eq!(writes[0].0, "PUT");
     assert_eq!(
         writes[0].1.parse::<http::Uri>()?.path(),
-        "/api/v1/namespaces/control/configmaps/reakt-registry-workload"
+        "/api/v1/namespaces/control/configmaps/apsides-registry-workload"
     );
     Ok(())
 }
@@ -242,19 +242,19 @@ fn resize_responses(mode: &str) -> TestResult<(LifecycleRegistry, Vec<Value>)> {
     activation.binding = previous.runtime_binding.clone();
     activation.status = ActivationStatus::Active;
     let active = object(
-        "reakt-activation-example",
+        "apsides-activation-example",
         &activation,
         &previous.activation_uid,
         "45",
     );
     activation.status = ActivationStatus::Draining;
     let draining = object(
-        "reakt-activation-example",
+        "apsides-activation-example",
         &activation,
         &previous.activation_uid,
         "46",
     );
-    let ceiling = object("reakt-policy-example", &policy, "policy-uid", "44");
+    let ceiling = object("apsides-policy-example", &policy, "policy-uid", "44");
     let protected = registry_object(&registry, REGISTRY_UID, "42")?;
     let mut responses = vec![
         protected.clone(),

@@ -381,7 +381,7 @@ fn validate_nonce(value: &str) -> TestResult {
 fn emit(phase: Phase, outcome: &'static str, nonce: &str, fixture: &Fixture) -> TestResult {
     validate_nonce(nonce)?;
     let report = Report {
-        schema_version: "reakt.dev/pvc-coordination-probe/v1",
+        schema_version: "apsides.dev/pvc-coordination-probe/v1",
         nonce,
         phase: phase.name(),
         outcome,
@@ -422,7 +422,7 @@ fn emit_race_ready(side: Side, nonce: &str) -> TestResult {
     write_report(
         b"APS_COORDINATION_RACE_READY=",
         &RaceReady {
-            schema_version: "reakt.dev/pvc-coordination-race/v1",
+            schema_version: "apsides.dev/pvc-coordination-race/v1",
             nonce,
             phase: side.phase().name(),
             outcome: "ready",
@@ -446,7 +446,7 @@ fn emit_race_result(
     write_report(
         b"APS_COORDINATION_RACE_RESULT=",
         &RaceReport {
-            schema_version: "reakt.dev/pvc-coordination-race/v1",
+            schema_version: "apsides.dev/pvc-coordination-race/v1",
             nonce,
             phase: phase.name(),
             outcome,

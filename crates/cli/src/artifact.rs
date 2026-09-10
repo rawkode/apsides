@@ -75,11 +75,11 @@ pub fn emit(plan: &CompiledPlan, output: &Path) -> Result<()> {
         manifest.as_bytes(),
         &mut files,
     )?;
-    write(output, "controller/src/main.rs", b"use std::io::Write as _;\n\n#[tokio::main]\nasync fn main() {\n    if let Err(error) = runtime::run(include_str!(\"ir.json\")).await {\n        let _ = writeln!(std::io::stderr().lock(), \"reakt controller: {error}\");\n        std::process::exit(1);\n    }\n}\n", &mut files)?;
+    write(output, "controller/src/main.rs", b"use std::io::Write as _;\n\n#[tokio::main]\nasync fn main() {\n    if let Err(error) = runtime::run(include_str!(\"ir.json\")).await {\n        let _ = writeln!(std::io::stderr().lock(), \"apsides controller: {error}\");\n        std::process::exit(1);\n    }\n}\n", &mut files)?;
     let boundary = b"This is a local native compilation artifact. It is not a production OCI bundle.\nDeployment remains blocked until provenance, image identity, platform ceiling, claims, short-lived credentials, and generation transition gates pass.\nThe generated Rust embeds validated IR; it never evaluates TypeScript or loads JavaScript.\nCargo dependencies currently resolve from the prepared local cache. Cross-host reproducibility is not yet established.\n";
     write(output, "BOUNDARY.txt", boundary, &mut files)?;
     let manifest = Manifest {
-        schema_version: "reakt.dev/local-artifact/v1".into(),
+        schema_version: "apsides.dev/local-artifact/v1".into(),
         ir_digest: plan.ir_digest.clone(),
         stage: "compiled-source".into(),
         production_ready: false,
@@ -138,7 +138,7 @@ pub fn verify(root: &Path) -> Result<Value> {
     let manifest: Manifest = serde_json::from_value(compiler_core::parse_strict(
         &fs::read_to_string(root.join("manifest.json"))?,
     )?)?;
-    if manifest.schema_version != "reakt.dev/local-artifact/v1" || manifest.production_ready {
+    if manifest.schema_version != "apsides.dev/local-artifact/v1" || manifest.production_ready {
         return Err("unsupported artifact or false production readiness claim".into());
     }
     if !matches!(manifest.stage.as_str(), "compiled-source" | "native-binary") {
@@ -158,7 +158,7 @@ pub fn verify(root: &Path) -> Result<Value> {
         }
     }
     if manifest.stage == "native-binary"
-        && (!manifest.files.contains_key("reakt-controller")
+        && (!manifest.files.contains_key("apsides-controller")
             || !manifest.files.contains_key("controller/Cargo.lock"))
     {
         return Err("native artifact missing binary or dependency lock".into());
@@ -239,7 +239,7 @@ mod tests {
     use super::*;
     #[test]
     fn path_escape_is_rejected_before_file_access() {
-        let root = std::env::temp_dir().join(format!("reakt-escape-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("apsides-escape-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let mut files = BTreeMap::from([("../escape".into(), "sha256:bad".into())]);
         for path in [
@@ -254,7 +254,7 @@ mod tests {
             files.insert(path.into(), "bad".into());
         }
         let m = Manifest {
-            schema_version: "reakt.dev/local-artifact/v1".into(),
+            schema_version: "apsides.dev/local-artifact/v1".into(),
             ir_digest: "bad".into(),
             stage: "compiled-source".into(),
             production_ready: false,

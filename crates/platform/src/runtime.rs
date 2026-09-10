@@ -41,7 +41,7 @@ impl RuntimeAuthority {
         let state: Versioned<ActivationState> = read_state(
             &self.client,
             &self.control_namespace,
-            &format!("reakt-activation-{}", self.binding.domain_id),
+            &format!("apsides-activation-{}", self.binding.domain_id),
         )
         .await?;
         crate::control_capacity::validate_runtime_control_metadata(
@@ -76,7 +76,7 @@ impl RuntimeAuthority {
         let policy: Versioned<PolicyState> = read_state(
             &self.client,
             &self.control_namespace,
-            &format!("reakt-policy-{}", self.binding.domain_id),
+            &format!("apsides-policy-{}", self.binding.domain_id),
         )
         .await?;
         if policy.value.schema_version != SCHEMA_VERSION
@@ -111,7 +111,7 @@ impl RuntimeAuthority {
         let inventory: Versioned<RuntimeInventory> = read_state(
             &self.client,
             &self.control_namespace,
-            &format!("reakt-inventory-{}", self.binding.domain_id),
+            &format!("apsides-inventory-{}", self.binding.domain_id),
         )
         .await?;
         crate::control_capacity::validate_runtime_control_metadata(
@@ -223,7 +223,7 @@ impl RuntimeAuthority {
         replace_state(
             &self.client,
             &self.control_namespace,
-            &format!("reakt-inventory-{}", self.binding.domain_id),
+            &format!("apsides-inventory-{}", self.binding.domain_id),
             previous,
             &next,
         )
@@ -245,7 +245,7 @@ impl RuntimeAuthority {
         let api: Api<Secret> = Api::namespaced(self.client.clone(), &self.control_namespace);
         // Avoid reflecting API response text containing Secret material.
         let secret = api
-            .get(&format!("reakt-rollout-key-{}", self.binding.domain_id))
+            .get(&format!("apsides-rollout-key-{}", self.binding.domain_id))
             .await
             .map_err(|_| invalid("protected rollout key lookup failed"))?;
         let data = secret

@@ -1,0 +1,10 @@
+{
+  "entry": "program.tsx",
+  "inputs": [
+    {
+      "path": "program.tsx",
+      "sha256": "6513348d007641437b84d4711b3bb3057a0e864be1d5e3449ebb979c55ebbd6c"
+    }
+  ],
+  "schemaVersion": "apsides.dev/source-lock/v1"
+}

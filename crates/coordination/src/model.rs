@@ -3,10 +3,10 @@ use deploy::{ClaimState, ProtectedClaim};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 
-pub const CLAIM_SNAPSHOT_SCHEMA: &str = "reakt.dev/claim-snapshot/v1";
+pub const CLAIM_SNAPSHOT_SCHEMA: &str = "apsides.dev/claim-snapshot/v1";
 pub const MAX_CLAIM_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_CLAIMS: usize = 100_000;
-const DIGEST_DOMAIN: &str = "reakt.dev/claim-snapshot-digest/v1";
+const DIGEST_DOMAIN: &str = "apsides.dev/claim-snapshot-digest/v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

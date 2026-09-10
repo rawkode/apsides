@@ -296,7 +296,7 @@ printf '%s' "$7" > "$6/reference"
             "#!/bin/sh\nprintf '{}' > \"$6/release.json\"\n",
         )?;
         let policy = TrustPolicy {
-            schema_version: "reakt.dev/trust/v1".into(),
+            schema_version: "apsides.dev/trust/v1".into(),
             repository: "https://github.com/example/project".into(),
             approved_compiler_digests: vec![],
             verifier: crate::VerifierTool {
@@ -320,13 +320,13 @@ printf '%s' "$7" > "$6/reference"
     #[tokio::test]
     #[ignore = "requires an isolated TLS registry containing release.json with bytes {} and real ORAS"]
     async fn real_oras_transport_reaches_release_verification() -> Result<()> {
-        let executable: PathBuf = std::env::var("REAKT_TEST_ORAS")
+        let executable: PathBuf = std::env::var("APSIDES_TEST_ORAS")
             .map_err(|_| crate::Error::Rejected("test ORAS path missing".into()))?
             .into();
-        let oci = std::env::var("REAKT_TEST_OCI_REFERENCE")
+        let oci = std::env::var("APSIDES_TEST_OCI_REFERENCE")
             .map_err(|_| crate::Error::Rejected("test OCI reference missing".into()))?;
         let tool = OrasTool {
-            ca_file: std::env::var_os("REAKT_TEST_REGISTRY_CA").map(PathBuf::from),
+            ca_file: std::env::var_os("APSIDES_TEST_REGISTRY_CA").map(PathBuf::from),
             sha256: manifest::raw_digest(&std::fs::read(&executable)?),
             executable,
         };
@@ -335,7 +335,7 @@ printf '%s' "$7" > "$6/reference"
             release_digest: manifest::raw_digest(b"{}"),
         };
         let policy = TrustPolicy {
-            schema_version: "reakt.dev/trust/v1".into(),
+            schema_version: "apsides.dev/trust/v1".into(),
             repository: "https://github.com/example/project".into(),
             approved_compiler_digests: vec![],
             verifier: crate::VerifierTool {

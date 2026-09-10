@@ -4,7 +4,7 @@ use deploy::{OwnershipAction, OwnershipApproval, OwnershipIntent, ResourceIdenti
 fn adoption_compiled() -> Result<CompiledPlan> {
     Ok(compiler_core::parse_and_validate(
         &json!({
-            "schemaVersion":"reakt.dev/ir/v1",
+            "schemaVersion":"apsides.dev/ir/v1",
             "testOnly":false,
             "domain":{
                 "id":"example","namespace":"workload","controlNamespace":"control",
@@ -42,7 +42,7 @@ fn adoption_compiled() -> Result<CompiledPlan> {
             ],
             "inputs":[],"reactions":[],
             "provenance":{
-                "compiler":"reakt/0.1",
+                "compiler":"apsides/0.1",
                 "inputs":[{
                     "path":"program.tsx",
                     "sha256":"0000000000000000000000000000000000000000000000000000000000000000"
@@ -146,7 +146,7 @@ fn authenticated_review_links_added_declaration_to_planned_adoption() -> Result<
     let review = crate::review::transition_review_fixture(&stored, &plan, TRANSITION_1, None)?;
     assert_eq!(
         review.get("schemaVersion").and_then(Value::as_str),
-        Some("reakt.dev/deployment-review/v4")
+        Some("apsides.dev/deployment-review/v4")
     );
     assert_eq!(
         review.get("actionSemantics").and_then(Value::as_str),

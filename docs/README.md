@@ -1,10 +1,10 @@
 # Apsides documentation site
 
 This directory is a self-contained [Astro Starlight](https://starlight.astro.build/) site. The
-existing files under `reakt/` are the detailed implementation and contract
+existing files under `reference/` are the detailed implementation and contract
 references; the other pages provide a guided path through them.
 
-Requires cuenv 0.55.0 and Node.js 22.12 or newer. Run these tasks from the repository root.
+Requires cuenv 0.55.0 and Deno 2.9.5 or newer. Run these tasks from the repository root.
 
 ```sh
 cuenv task docsDev

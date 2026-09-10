@@ -144,13 +144,13 @@ fn read_receipts(paths: &[PathBuf]) -> Result<(Vec<Receipt>, CollectedFiles)> {
             .get("schemaVersion")
             .and_then(serde_json::Value::as_str)
         {
-            Some("reakt.dev/production-evidence/v1") => {
+            Some("apsides.dev/production-evidence/v1") => {
                 let evidence: ProductionEvidence = serde_json::from_value(value)?;
                 collected.referenced(parent, &evidence.runner_source_file)?;
                 collect_record_files(&mut collected, parent, &evidence.checks)?;
                 receipts.push(Receipt::Production { file, evidence });
             }
-            Some("reakt.dev/reactor-evidence/v1") => {
+            Some("apsides.dev/reactor-evidence/v1") => {
                 let evidence: ReactorEvidence = serde_json::from_value(value)?;
                 collected.referenced(parent, REACTOR_RUNNER)?;
                 collected.referenced(parent, &evidence.artifact_manifest_file)?;
@@ -337,7 +337,7 @@ fn validate_and_select(
     };
     Ok((
         CoverageReport {
-            schema_version: "reakt.dev/release-coverage/v1".to_owned(),
+            schema_version: "apsides.dev/release-coverage/v1".to_owned(),
             ir_digest: manifest.ir_digest.clone(),
             cases: cases.into_values().collect(),
             checks,
@@ -407,7 +407,7 @@ pub fn merge_evidence(
     }
     let (receipts, collected) = read_receipts(receipt_paths)?;
     let scratch = tempfile::Builder::new()
-        .prefix(".reakt-evidence-merge-")
+        .prefix(".apsides-evidence-merge-")
         .tempdir_in(output_parent)?;
     let candidate_snapshot = scratch.path().join("candidate");
     snapshot_candidate(candidate, &manifest, &release_bytes, &candidate_snapshot)?;
@@ -498,7 +498,7 @@ mod tests {
         fs::write(&runner, b"runner")?;
         fs::write(directory.path().join("private.kubeconfig"), b"private")?;
         let receipt = json!({
-            "schemaVersion": "reakt.dev/production-evidence/v1",
+            "schemaVersion": "apsides.dev/production-evidence/v1",
             "irDigest": format!("sha256:{}", "1".repeat(64)),
             "compilerDigest": format!("sha256:{}", "2".repeat(64)),
             "binaryDigest": format!("sha256:{}", "3".repeat(64)),

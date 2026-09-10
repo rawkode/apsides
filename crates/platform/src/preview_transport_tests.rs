@@ -100,7 +100,7 @@ fn assert_fixed_calls(calls: &[Call]) -> Result<()> {
     assert_eq!(patch.0, Method::PATCH);
     assert!(patch.1.contains("dryRun=All"));
     assert!(patch.1.contains("force=true"));
-    assert!(patch.1.contains("fieldManager=reakt-example"));
+    assert!(patch.1.contains("fieldManager=apsides-example"));
     assert!(patch.1.contains("fieldValidation=Strict"));
     assert_eq!(patch.2.as_deref(), Some("application/apply-patch+yaml"));
     assert_eq!(
@@ -190,7 +190,7 @@ async fn fixed_list_and_patch_are_exact_named_strict_dry_run_requests() -> Resul
         &desired("settings"),
         "settings",
         "workload",
-        "reakt-example",
+        "apsides-example",
         true,
         crate::ApplyPrecondition::Existing {
             uid: "uid-1",
@@ -248,7 +248,7 @@ async fn unsupported_or_mismatched_targets_fail_before_transport() -> Result<()>
         &desired("other"),
         "other",
         "workload",
-        "reakt-example",
+        "apsides-example",
         false,
         crate::ApplyPrecondition::Absent {
             list_resource_version: "41",
@@ -274,7 +274,7 @@ fn uid_and_resource_version_scalars_are_bounded_ascii_graphic() -> Result<()> {
         &desired("settings"),
         "settings",
         "workload",
-        "reakt-example",
+        "apsides-example",
         false,
         crate::ApplyPrecondition::Existing {
             uid: "uid with space",
@@ -304,7 +304,7 @@ async fn existing_patch_requires_exact_bounded_response_uid() -> Result<()> {
         &desired("settings"),
         "settings",
         "workload",
-        "reakt-example",
+        "apsides-example",
         false,
         crate::ApplyPrecondition::Existing {
             uid: "uid-1",

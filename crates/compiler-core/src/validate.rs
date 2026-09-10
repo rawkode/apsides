@@ -533,7 +533,7 @@ fn derive_plan(ir: &Ir, inputs: &BTreeMap<String, &Input>) -> Result<CompiledPla
         effects.push(Effect {
             target: reaction.target.clone(),
             operation: "rollout-contribution".into(),
-            field_paths: vec!["/spec/template/metadata/annotations/reakt.dev~1revision".into()],
+            field_paths: vec!["/spec/template/metadata/annotations/apsides.dev~1revision".into()],
             source: reaction.source.clone(),
         });
     }
@@ -542,7 +542,7 @@ fn derive_plan(ir: &Ir, inputs: &BTreeMap<String, &Input>) -> Result<CompiledPla
         "activation-check",
         "ConfigMap",
         &domain.control_namespace,
-        &format!("reakt-activation-{}", domain.id),
+        &format!("apsides-activation-{}", domain.id),
         "get",
     )?;
     request(
@@ -550,7 +550,7 @@ fn derive_plan(ir: &Ir, inputs: &BTreeMap<String, &Input>) -> Result<CompiledPla
         "platform-policy-check",
         "ConfigMap",
         &domain.control_namespace,
-        &format!("reakt-policy-{}", domain.id),
+        &format!("apsides-policy-{}", domain.id),
         "get",
     )?;
     for verb in ["get", "update"] {
@@ -559,7 +559,7 @@ fn derive_plan(ir: &Ir, inputs: &BTreeMap<String, &Input>) -> Result<CompiledPla
             "runtime-inventory",
             "ConfigMap",
             &domain.control_namespace,
-            &format!("reakt-inventory-{}", domain.id),
+            &format!("apsides-inventory-{}", domain.id),
             verb,
         )?;
     }
@@ -575,7 +575,7 @@ fn derive_plan(ir: &Ir, inputs: &BTreeMap<String, &Input>) -> Result<CompiledPla
             "rollout-key",
             "Secret",
             &domain.control_namespace,
-            &format!("reakt-rollout-key-{}", domain.id),
+            &format!("apsides-rollout-key-{}", domain.id),
             "get",
         )?;
         risks.insert("rollout-key-read-authority".to_owned());

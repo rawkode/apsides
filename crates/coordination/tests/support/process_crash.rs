@@ -10,10 +10,10 @@ use std::{
 };
 
 const CHILD_TEST: &str = "process_crash::local_coordination_sigkill_child";
-const CHILD_NONCE_ENV: &str = "REAKT_COORDINATION_CRASH_CHILD_NONCE";
-const CHILD_PATH_ENV: &str = "REAKT_COORDINATION_CRASH_CHILD_PATH";
-const CHILD_READY_ENV: &str = "REAKT_COORDINATION_CRASH_CHILD_READY";
-const CHILD_STORE_ENV: &str = "REAKT_COORDINATION_CRASH_CHILD_STORE";
+const CHILD_NONCE_ENV: &str = "APSIDES_COORDINATION_CRASH_CHILD_NONCE";
+const CHILD_PATH_ENV: &str = "APSIDES_COORDINATION_CRASH_CHILD_PATH";
+const CHILD_READY_ENV: &str = "APSIDES_COORDINATION_CRASH_CHILD_READY";
+const CHILD_STORE_ENV: &str = "APSIDES_COORDINATION_CRASH_CHILD_STORE";
 const READY_LIMIT: u64 = 4096;
 const SPILL_ROWS: u64 = 96;
 const SPILL_BYTES: usize = 16 * 1024;
@@ -167,7 +167,7 @@ async fn seed_spill_rows(connection: &Connection, kind: StoreKind) -> TestResult
             StoreKind::Claim => {
                 transaction
                     .execute(
-                        "INSERT INTO reakt_coordination_claims(digest,metadata) VALUES (?1,?2)",
+                        "INSERT INTO apsides_coordination_claims(digest,metadata) VALUES (?1,?2)",
                         params![format!("synthetic-crash-claim-{index:04}"), payload.clone()],
                     )
                     .await?
@@ -175,7 +175,7 @@ async fn seed_spill_rows(connection: &Connection, kind: StoreKind) -> TestResult
             StoreKind::Review => {
                 transaction
                     .execute(
-                        "INSERT INTO reakt_coordination_review_objects(\
+                        "INSERT INTO apsides_coordination_review_objects(\
                          registry_uid,cluster_binding,control_namespace,workload_namespace,\
                          domain_id,transition_id,sequence,digest,metadata) \
                          VALUES (?1,'cluster','control','workload','domain',?2,'2',?3,?4)",
@@ -191,7 +191,7 @@ async fn seed_spill_rows(connection: &Connection, kind: StoreKind) -> TestResult
             StoreKind::Audit => {
                 transaction
                     .execute(
-                        "INSERT INTO reakt_coordination_audits(\
+                        "INSERT INTO apsides_coordination_audits(\
                          registry_uid,cluster_binding,control_namespace,workload_namespace,\
                          domain_id,transition_id,sequence,digest,metadata) \
                          VALUES (?1,'cluster','control','workload','domain',?2,'2',?3,?4)",
@@ -223,7 +223,7 @@ async fn insert_candidate(
             let bytes = compiler_core::canonical_bytes(&candidate.claims)?;
             transaction
                 .execute(
-                    "INSERT INTO reakt_coordination_claims(digest,metadata) VALUES (?1,?2)",
+                    "INSERT INTO apsides_coordination_claims(digest,metadata) VALUES (?1,?2)",
                     params![candidate.claim_ref.digest.clone(), bytes],
                 )
                 .await?
@@ -234,7 +234,7 @@ async fn insert_candidate(
             let claims = &scope.claim_scope;
             transaction
                 .execute(
-                    "INSERT INTO reakt_coordination_review_objects(\
+                    "INSERT INTO apsides_coordination_review_objects(\
                      registry_uid,cluster_binding,control_namespace,workload_namespace,\
                      domain_id,transition_id,sequence,digest,metadata) \
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -258,7 +258,7 @@ async fn insert_candidate(
             let claims = &scope.claim_scope;
             transaction
                 .execute(
-                    "INSERT INTO reakt_coordination_audits(\
+                    "INSERT INTO apsides_coordination_audits(\
                      registry_uid,cluster_binding,control_namespace,workload_namespace,\
                      domain_id,transition_id,sequence,digest,metadata) \
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -288,7 +288,7 @@ async fn delete_spill_rows(transaction: &Transaction, kind: StoreKind) -> TestRe
         StoreKind::Claim => {
             transaction
                 .execute(
-                    "DELETE FROM reakt_coordination_claims \
+                    "DELETE FROM apsides_coordination_claims \
                      WHERE digest GLOB 'synthetic-crash-claim-*'",
                     (),
                 )
@@ -297,7 +297,7 @@ async fn delete_spill_rows(transaction: &Transaction, kind: StoreKind) -> TestRe
         StoreKind::Review => {
             transaction
                 .execute(
-                    "DELETE FROM reakt_coordination_review_objects \
+                    "DELETE FROM apsides_coordination_review_objects \
                      WHERE registry_uid='synthetic-crash-review'",
                     (),
                 )
@@ -306,7 +306,7 @@ async fn delete_spill_rows(transaction: &Transaction, kind: StoreKind) -> TestRe
         StoreKind::Audit => {
             transaction
                 .execute(
-                    "DELETE FROM reakt_coordination_audits \
+                    "DELETE FROM apsides_coordination_audits \
                      WHERE registry_uid='synthetic-crash-audit'",
                     (),
                 )
@@ -326,13 +326,13 @@ async fn verify_candidate_in_transaction(
 ) -> TestResult {
     let (query, parameters, expected_digest, expected_bytes) = match kind {
         StoreKind::Claim => (
-            "SELECT digest,metadata FROM reakt_coordination_claims WHERE digest=?1",
+            "SELECT digest,metadata FROM apsides_coordination_claims WHERE digest=?1",
             vec![candidate.claim_ref.digest.clone()],
             candidate.claim_ref.digest.clone(),
             compiler_core::canonical_bytes(&candidate.claims)?,
         ),
         StoreKind::Review => (
-            "SELECT digest,metadata FROM reakt_coordination_review_objects \
+            "SELECT digest,metadata FROM apsides_coordination_review_objects \
              WHERE registry_uid=?1 AND cluster_binding=?2 AND control_namespace=?3 \
              AND workload_namespace=?4 AND domain_id=?5 AND transition_id=?6 AND digest=?7",
             {
@@ -351,7 +351,7 @@ async fn verify_candidate_in_transaction(
             compiler_core::canonical_bytes(&candidate.left_review)?,
         ),
         StoreKind::Audit => (
-            "SELECT digest,metadata FROM reakt_coordination_audits \
+            "SELECT digest,metadata FROM apsides_coordination_audits \
              WHERE registry_uid=?1 AND cluster_binding=?2 AND control_namespace=?3 \
              AND workload_namespace=?4 AND domain_id=?5 AND transition_id=?6",
             {
@@ -554,9 +554,9 @@ async fn verify_row_count(path: &Path, kind: StoreKind) -> TestResult {
     let database = Builder::new_local(path).build().await?;
     let connection = database.connect()?;
     let query = match kind {
-        StoreKind::Claim => "SELECT count(*) FROM reakt_coordination_claims",
-        StoreKind::Review => "SELECT count(*) FROM reakt_coordination_review_objects",
-        StoreKind::Audit => "SELECT count(*) FROM reakt_coordination_audits",
+        StoreKind::Claim => "SELECT count(*) FROM apsides_coordination_claims",
+        StoreKind::Review => "SELECT count(*) FROM apsides_coordination_review_objects",
+        StoreKind::Audit => "SELECT count(*) FROM apsides_coordination_audits",
     };
     let mut rows = connection.query(query, ()).await?;
     let count = rows

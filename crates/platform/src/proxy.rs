@@ -10,7 +10,7 @@ use serde_json::Value;
 // Envoy's unfiltered JSON includes fractional histogram quantiles. Ask the
 // standard admin filter for exactly the four integral counters/gauges used by
 // the proof, retaining the strict duplicate-safe integer parser below.
-const STATS_URL: &str = "http://localhost/stats?format=json&filter=%5E%28server%5C.live%7Chttp%5C.reakt%5C.downstream_rq_active%7Ccluster%5C.write_api%5C.upstream_rq_%28active%7Ctotal%29%29%24";
+const STATS_URL: &str = "http://localhost/stats?format=json&filter=%5E%28server%5C.live%7Chttp%5C.apsides%5C.downstream_rq_active%7Ccluster%5C.write_api%5C.upstream_rq_%28active%7Ctotal%29%29%24";
 use std::{collections::BTreeMap, time::Duration};
 use tokio::io::AsyncReadExt;
 
@@ -55,7 +55,7 @@ impl PlatformClient {
         let after = counter_snapshot(&self.proxy_exec(expected, AdminOperation::Stats).await?)?;
         for name in [
             "server.live",
-            "http.reakt.downstream_rq_active",
+            "http.apsides.downstream_rq_active",
             "cluster.write_api.upstream_rq_active",
             "cluster.write_api.upstream_rq_total",
         ] {
@@ -289,7 +289,7 @@ fn frozen_writes_idle(stats: &BTreeMap<String, u64>) -> Result<()> {
 fn validate_ledger(bytes: &[u8], stats: &BTreeMap<String, u64>) -> Result<(u64, u64)> {
     for name in [
         "server.live",
-        "http.reakt.downstream_rq_active",
+        "http.apsides.downstream_rq_active",
         "cluster.write_api.upstream_rq_active",
     ] {
         if stats.get(name) != Some(&0) {
@@ -362,7 +362,7 @@ mod tests {
     use serde_json::json;
     #[test]
     fn filtered_live_envoy_statistics_remain_strict_integral_evidence() {
-        let captured = br#"{"stats":[{"name":"cluster.write_api.upstream_rq_active","value":0},{"name":"cluster.write_api.upstream_rq_total","value":3},{"name":"http.reakt.downstream_rq_active","value":0},{"name":"server.live","value":0}]}"#;
+        let captured = br#"{"stats":[{"name":"cluster.write_api.upstream_rq_active","value":0},{"name":"cluster.write_api.upstream_rq_total","value":3},{"name":"http.apsides.downstream_rq_active","value":0},{"name":"server.live","value":0}]}"#;
         let snapshot = super::counter_snapshot(captured).unwrap();
         assert_eq!(snapshot.len(), 4);
         assert_eq!(snapshot["cluster.write_api.upstream_rq_total"], 3);
@@ -383,7 +383,7 @@ mod tests {
     fn stats() -> BTreeMap<String, u64> {
         [
             ("server.live".into(), 0),
-            ("http.reakt.downstream_rq_active".into(), 0),
+            ("http.apsides.downstream_rq_active".into(), 0),
             ("cluster.write_api.upstream_rq_active".into(), 0),
             ("cluster.write_api.upstream_rq_total".into(), 1),
         ]

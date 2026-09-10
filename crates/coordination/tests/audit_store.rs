@@ -186,7 +186,7 @@ async fn corrupt_existing_audit_is_an_error_and_diagnostics_are_private() -> Tes
     database
         .connect()?
         .execute(
-            "UPDATE reakt_coordination_audits SET metadata=?1 WHERE transition_id=?2",
+            "UPDATE apsides_coordination_audits SET metadata=?1 WHERE transition_id=?2",
             libsql::params![
                 corrupted.into_bytes(),
                 reference.scope.transition_id.clone()
@@ -368,9 +368,9 @@ async fn read_only_open_rejects_schema_or_table_mismatch_without_repair() -> Tes
     incomplete_database
         .connect()?
         .execute_batch(
-            "CREATE TABLE reakt_coordination_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);\
-             INSERT INTO reakt_coordination_schema VALUES (1,1);\
-             CREATE TABLE reakt_coordination_claims (digest TEXT PRIMARY KEY, metadata BLOB NOT NULL);",
+            "CREATE TABLE apsides_coordination_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);\
+             INSERT INTO apsides_coordination_schema VALUES (1,1);\
+             CREATE TABLE apsides_coordination_claims (digest TEXT PRIMARY KEY, metadata BLOB NOT NULL);",
         )
         .await?;
     assert!(
@@ -381,7 +381,7 @@ async fn read_only_open_rejects_schema_or_table_mismatch_without_repair() -> Tes
     let mut rows = incomplete_database
         .connect()?
         .query(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='reakt_coordination_audits'",
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='apsides_coordination_audits'",
             (),
         )
         .await?;
@@ -398,7 +398,7 @@ async fn read_only_open_rejects_schema_or_table_mismatch_without_repair() -> Tes
     mismatch_database
         .connect()?
         .execute(
-            "UPDATE reakt_coordination_schema SET version=2 WHERE id=1",
+            "UPDATE apsides_coordination_schema SET version=2 WHERE id=1",
             (),
         )
         .await?;
@@ -410,7 +410,7 @@ async fn read_only_open_rejects_schema_or_table_mismatch_without_repair() -> Tes
     let mut rows = mismatch_database
         .connect()?
         .query(
-            "SELECT version FROM reakt_coordination_schema WHERE id=1",
+            "SELECT version FROM apsides_coordination_schema WHERE id=1",
             (),
         )
         .await?;

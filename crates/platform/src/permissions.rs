@@ -152,7 +152,7 @@ pub fn deployment_permissions(plan: &TransitionPlan) -> Result<DeploymentPermiss
         }
     }
     Ok(DeploymentPermissions {
-        schema_version: "reakt.dev/deployment-permissions/v1",
+        schema_version: "apsides.dev/deployment-permissions/v1",
         required_resources: requests.resources.into_iter().collect(),
         creation_targets: requests.creates.into_iter().collect(),
         role_delegation: roles,
@@ -182,17 +182,17 @@ fn control_state(plan: &TransitionPlan, requests: &mut Requests) -> Result<()> {
     // The issued executor rechecks its protected approval during reservation
     // and selected lifecycle operations; bootstrap discovery is separate.
     for name in [
-        format!("reakt-deploy-identity-{}", domain.id),
-        format!("reakt-policy-{}", domain.id),
-        format!("reakt-trust-{}", domain.id),
-        format!("reakt-proxy-policy-{}", domain.id),
+        format!("apsides-deploy-identity-{}", domain.id),
+        format!("apsides-policy-{}", domain.id),
+        format!("apsides-trust-{}", domain.id),
+        format!("apsides-proxy-policy-{}", domain.id),
     ] {
         requests.add(Some(namespace), "", "configmaps", "get", Some(&name));
     }
     for name in [
-        format!("reakt-registry-{}", domain.namespace),
-        format!("reakt-activation-{}", domain.id),
-        format!("reakt-inventory-{}", domain.id),
+        format!("apsides-registry-{}", domain.namespace),
+        format!("apsides-activation-{}", domain.id),
+        format!("apsides-inventory-{}", domain.id),
     ] {
         for verb in ["get", "update"] {
             requests.add(Some(namespace), "", "configmaps", verb, Some(&name));
@@ -200,8 +200,8 @@ fn control_state(plan: &TransitionPlan, requests: &mut Requests) -> Result<()> {
     }
     if plan.request.previous.is_none() {
         for name in [
-            format!("reakt-activation-{}", domain.id),
-            format!("reakt-inventory-{}", domain.id),
+            format!("apsides-activation-{}", domain.id),
+            format!("apsides-inventory-{}", domain.id),
         ] {
             requests.stage(namespace, "", "configmaps", &name);
         }
@@ -220,7 +220,7 @@ fn control_state(plan: &TransitionPlan, requests: &mut Requests) -> Result<()> {
             "",
             "secrets",
             "get",
-            Some(&format!("reakt-rollout-key-{}", domain.id)),
+            Some(&format!("apsides-rollout-key-{}", domain.id)),
         );
     }
     requests.add(Some(namespace), "", "pods", "list", None);
@@ -232,7 +232,7 @@ fn control_state(plan: &TransitionPlan, requests: &mut Requests) -> Result<()> {
 fn stage_generation(plan: &TransitionPlan, requests: &mut Requests) -> Vec<RoleDelegation> {
     let control = &plan.request.next.compiled.ir.domain.control_namespace;
     let name = &plan.generation_reservation.service_account_name;
-    let proxy = format!("reakt-proxy-{}", plan.request.next.generation_id);
+    let proxy = format!("apsides-proxy-{}", plan.request.next.generation_id);
     for account in [name.clone(), format!("{name}-process")] {
         requests.stage(control, "", "serviceaccounts", &account);
     }
@@ -268,7 +268,7 @@ fn previous_generation(plan: &TransitionPlan, requests: &mut Requests) {
     };
     let control = &previous.control_namespace;
     let name = &previous.allocation.service_account_name;
-    let proxy = format!("reakt-proxy-{}", previous.allocation.generation_id);
+    let proxy = format!("apsides-proxy-{}", previous.allocation.generation_id);
     requests.add(Some(control), "", "serviceaccounts", "get", Some(name));
     requests.add(Some(control), "", "serviceaccounts", "delete", Some(name));
     requests.add(

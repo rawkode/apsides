@@ -84,7 +84,7 @@ fn compiled_with_behavior(
     let resources = resources.iter().copied().map(resource).collect::<Vec<_>>();
     Ok(parse_and_validate(
         &json!({
-            "schemaVersion": "reakt.dev/ir/v1",
+            "schemaVersion": "apsides.dev/ir/v1",
             "testOnly": false,
             "domain": {
                 "id": "example",
@@ -106,7 +106,7 @@ fn compiled_with_behavior(
             "inputs": inputs,
             "reactions": reactions,
             "provenance": {
-                "compiler": "reakt/0.1",
+                "compiler": "apsides/0.1",
                 "inputs": [{
                     "path": "program.ts",
                     "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
@@ -563,7 +563,7 @@ fn cleanup_projection_accepts_source_and_provenance_updates() -> TestResult {
     let (initial, successor) = cleanup_pair("delete")?;
     let cleanup = purpose(&initial)?;
     let mut updated_ir = successor.ir.clone();
-    updated_ir.provenance.compiler = "reakt/0.2".into();
+    updated_ir.provenance.compiler = "apsides/0.2".into();
     let input = updated_ir
         .provenance
         .inputs

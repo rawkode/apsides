@@ -1,10 +1,10 @@
-import { ConfigMap, Controller } from "@reakt/kubernetes";
+import { ConfigMap, Controller } from "@apsides/kubernetes";
 
 export default (
   <Controller
     id="team-api-production"
     namespace="production"
-    controlNamespace="reakt-system"
+    controlNamespace="apsides-system"
     clusterBinding="local-fixture"
     policyRef="platform/team-api"
     enforcement="api-bound"

@@ -440,7 +440,7 @@ pub(crate) fn registry_object(
     let reference = fixture_claim_store().seed(snapshot)?;
     let state = registry.state(&reference)?;
     Ok(object(
-        "reakt-registry-workload",
+        "apsides-registry-workload",
         &state,
         uid,
         resource_version,
@@ -513,23 +513,23 @@ fn transition_inputs(
 }
 fn registry_authority() -> Value {
     let mut authority = object(
-        "reakt-registry-authority.control.workload",
+        "apsides-registry-authority.control.workload",
         &json!({
-            "schemaVersion":"reakt.dev/registry-authority/v1",
+            "schemaVersion":"apsides.dev/registry-authority/v1",
             "clusterBinding":"cluster-a", "controlNamespace":"control", "workloadNamespace":"workload",
             "registryUid":REGISTRY_UID,
         }),
         "authority-uid",
         "40",
     );
-    authority["metadata"]["namespace"] = json!("reakt-platform");
+    authority["metadata"]["namespace"] = json!("apsides-platform");
     authority
 }
 
 fn deployment_identity_object() -> Value {
     let approval = fixture_deployment_identity_approval();
     object(
-        "reakt-deploy-identity-example",
+        "apsides-deploy-identity-example",
         &approval.value,
         &approval.uid,
         &approval.resource_version,
@@ -579,7 +579,7 @@ fn wire_with_identity_and_authority(
                     && parts
                         .uri
                         .path()
-                        .ends_with("/configmaps/reakt-registry-authority.control.workload");
+                        .ends_with("/configmaps/apsides-registry-authority.control.workload");
                 let identity_read = cfg!(feature = "deployer")
                     && parts.method == http::Method::GET
                     && parts
@@ -587,7 +587,7 @@ fn wire_with_identity_and_authority(
                         .path()
                         .rsplit('/')
                         .next()
-                        .is_some_and(|name| name.starts_with("reakt-deploy-identity-"));
+                        .is_some_and(|name| name.starts_with("apsides-deploy-identity-"));
                 if record_identity_reads || !identity_read {
                     calls
                         .lock()
@@ -655,10 +655,10 @@ fn wire_with_identity_and_authority(
 }
 
 fn plan() -> CompiledPlan {
-    parse_and_validate(&json!({"schemaVersion":"reakt.dev/ir/v1","testOnly":false,
+    parse_and_validate(&json!({"schemaVersion":"apsides.dev/ir/v1","testOnly":false,
         "domain":{"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound","budgets":{"maxResources":64,"maxInputs":64,"maxReactions":64,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},
         "resources":[{"id":"config","apiVersion":"v1","kind":"ConfigMap","name":"config","namespace":"workload","desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"config","namespace":"workload"},"data":{"value":"approved"}},"lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"program.ts","line":1,"column":1}}],
-        "inputs":[],"reactions":[],"provenance":{"compiler":"reakt/0.1","inputs":[{"path":"program.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
+        "inputs":[],"reactions":[],"provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
     }).to_string()).unwrap()
 }
 
@@ -692,7 +692,7 @@ fn activation(plan: &CompiledPlan, policy: &PolicyState) -> ActivationState {
             ir_digest: plan.ir_digest.clone(),
             policy_digest: digest(policy).unwrap(),
             capability_digest: digest(&plan.capabilities).unwrap(),
-            service_account_name: "reakt-example-generation-a".into(),
+            service_account_name: "apsides-example-generation-a".into(),
             controller_image: format!("example.invalid/controller@sha256:{}", "b".repeat(64)),
         },
         status: ActivationStatus::Active,
@@ -1255,7 +1255,7 @@ fn staged_initial_transition(
         staged_identity_uids: [
             (deployment_key.clone(), "controller-uid".into()),
             (
-                "v1/ConfigMap/control/reakt-activation-example".into(),
+                "v1/ConfigMap/control/apsides-activation-example".into(),
                 "activation-uid".into(),
             ),
         ]
@@ -1328,7 +1328,7 @@ fn stateful_wire_with_drift(
             if !parts
                 .uri
                 .path()
-                .ends_with("/configmaps/reakt-deploy-identity-example")
+                .ends_with("/configmaps/apsides-deploy-identity-example")
             {
                 capture.lock().unwrap().push((
                     parts.method.to_string(),
@@ -1389,13 +1389,13 @@ async fn initial_activation_starts_only_after_protected_authority_and_resumes_co
     objects.extend(vec![
         registry_object(&registry, REGISTRY_UID, "42")?,
         object(
-            "reakt-activation-example",
+            "apsides-activation-example",
             &activation,
             "activation-uid",
             "45",
         ),
-        object("reakt-policy-example", &policy, "policy-uid", "44"),
-        object("reakt-trust-example", &trust, "trust-uid", "43"),
+        object("apsides-policy-example", &policy, "policy-uid", "44"),
+        object("apsides-trust-example", &trust, "trust-uid", "43"),
         deployment,
     ]);
     let (client, calls) = stateful_wire(objects);
@@ -1412,7 +1412,7 @@ async fn initial_activation_starts_only_after_protected_authority_and_resumes_co
     assert_eq!(committed.value.claims[0].state, ClaimState::Active);
     let first = calls.lock().unwrap().clone();
     for (_, _, payload) in first.iter().filter(|(method, path, _)| {
-        method == "PUT" && path.ends_with("/configmaps/reakt-registry-workload")
+        method == "PUT" && path.ends_with("/configmaps/apsides-registry-workload")
     }) {
         let encoded = payload["data"]["state.json"]
             .as_str()
@@ -1441,7 +1441,7 @@ async fn initial_activation_starts_only_after_protected_authority_and_resumes_co
 
     let activate = first
         .iter()
-        .position(|c| c.0 == "PUT" && c.1.contains("/reakt-activation-example"))
+        .position(|c| c.0 == "PUT" && c.1.contains("/apsides-activation-example"))
         .unwrap();
     let start = first
         .iter()
@@ -1466,7 +1466,7 @@ async fn initial_activation_rejects_changed_trust_without_writes()
     let (client, calls) = wire(vec![
         registry_object(&registry, REGISTRY_UID, "42")?,
         object(
-            "reakt-trust-example",
+            "apsides-trust-example",
             &json!({"platform":"changed"}),
             "trust-uid",
             "43",
@@ -1485,7 +1485,7 @@ async fn initial_activation_rejects_changed_trust_without_writes()
     assert!(
         calls
             .iter()
-            .any(|call| call.1.ends_with("/configmaps/reakt-trust-example"))
+            .any(|call| call.1.ends_with("/configmaps/apsides-trust-example"))
     );
     Ok(())
 }
@@ -1498,7 +1498,7 @@ async fn runtime_identity_stage_rejects_changed_bound_trust_before_writes()
     let (client, calls) = wire(vec![
         registry_object(&registry, REGISTRY_UID, "42")?,
         object(
-            "reakt-trust-example",
+            "apsides-trust-example",
             &json!({"platform":"changed"}),
             "trust-uid",
             "43",
@@ -1518,7 +1518,7 @@ async fn runtime_identity_stage_rejects_changed_bound_trust_before_writes()
     assert!(
         calls
             .iter()
-            .any(|call| call.1.ends_with("/configmaps/reakt-trust-example"))
+            .any(|call| call.1.ends_with("/configmaps/apsides-trust-example"))
     );
     Ok(())
 }
@@ -1836,7 +1836,7 @@ fn initial_support_fixture(
         .get_mut(TRANSITION_A)
         .ok_or("initial transition missing")?;
     let name = stored.allocation().service_account_name.clone();
-    let annotations = json!({"reakt.dev/transition":TRANSITION_A,"reakt.dev/generation":GENERATION_A,"reakt.dev/plan-digest":stored.plan_digest()});
+    let annotations = json!({"apsides.dev/transition":TRANSITION_A,"apsides.dev/generation":GENERATION_A,"apsides.dev/plan-digest":stored.plan_digest()});
     let mut objects = vec![
         json!({"apiVersion":"v1","kind":"ServiceAccount","metadata":{"name":name,"namespace":"control","annotations":annotations},"automountServiceAccountToken":false}),
     ];
@@ -1902,10 +1902,10 @@ async fn broadened_staged_role_and_recreated_config_block_before_activation()
         }
         objects.extend(vec![
             registry_object(&registry, REGISTRY_UID, "42")?,
-            object("reakt-policy-example", &policy, "policy-uid", "44"),
-            object("reakt-trust-example", &trust, "trust-uid", "43"),
+            object("apsides-policy-example", &policy, "policy-uid", "44"),
+            object("apsides-trust-example", &trust, "trust-uid", "43"),
             object(
-                "reakt-activation-example",
+                "apsides-activation-example",
                 &activation,
                 "activation-uid",
                 "45",
@@ -1962,10 +1962,10 @@ async fn crash_after_start_resume_rechecks_authority_before_replica_one_fast_pat
     objects.extend(qualified_writer::qualify(&mut registry, TRANSITION_A)?);
     objects.extend(vec![
         registry_object(&registry, REGISTRY_UID, "42")?,
-        object("reakt-policy-example", &policy, "policy-uid", "44"),
-        object("reakt-trust-example", &trust, "trust-uid", "43"),
+        object("apsides-policy-example", &policy, "policy-uid", "44"),
+        object("apsides-trust-example", &trust, "trust-uid", "43"),
         object(
-            "reakt-activation-example",
+            "apsides-activation-example",
             &activation,
             "activation-uid",
             "45",
@@ -2020,7 +2020,7 @@ fn adoption_request() -> std::result::Result<
         compiled,
     };
     let approval: deploy::OwnershipApproval = serde_json::from_value(json!({
-        "schemaVersion":"reakt.dev/ownership-intent/v1", "transitionId":TRANSITION_A,
+        "schemaVersion":"apsides.dev/ownership-intent/v1", "transitionId":TRANSITION_A,
         "domainId":"example", "generationId":GENERATION_A, "releaseDigest":next.artifact_digest,
         "clusterBinding":"cluster-a", "controlNamespace":"control",
         "identity":{"apiGroup":"", "resource":"configmaps", "namespace":"workload", "name":"config"},
@@ -2097,7 +2097,7 @@ async fn adoption_reservation_rechecks_operator_approval_and_uses_non_force_uid_
         let calls = calls.lock().unwrap();
         assert_eq!(
             calls[3].1,
-            "/api/v1/namespaces/reakt-platform-intents/configmaps/approve-config"
+            "/api/v1/namespaces/apsides-platform-intents/configmaps/approve-config"
         );
         if corruption == "none" {
             let reserved = result.unwrap();
@@ -2185,7 +2185,7 @@ async fn committed_inventory_persists_metadata_and_retries_after_reopen()
     let response = registry_object(&registry, REGISTRY_UID, "42")?;
     let (client, calls) = stateful_wire(vec![
         response,
-        object("reakt-policy-example", &policy, "policy-uid", "44"),
+        object("apsides-policy-example", &policy, "policy-uid", "44"),
     ]);
     let platform = registry
         .bind(client, "control", "workload", "cluster-a", TRANSITION_A)
@@ -2229,11 +2229,11 @@ async fn committed_inventory_persists_metadata_and_retries_after_reopen()
     assert_eq!(calls.len(), 18);
     assert!(calls.iter().all(|call| {
         call.0 == "GET"
-            && (call.1.ends_with("/configmaps/reakt-registry-workload")
-                || call.1.ends_with("/configmaps/reakt-policy-example")
+            && (call.1.ends_with("/configmaps/apsides-registry-workload")
+                || call.1.ends_with("/configmaps/apsides-policy-example")
                 || call
                     .1
-                    .ends_with("/configmaps/reakt-registry-authority.control.workload"))
+                    .ends_with("/configmaps/apsides-registry-authority.control.workload"))
     }));
     Ok(())
 }
@@ -2251,7 +2251,7 @@ async fn registry_races_do_not_report_inventory_completion()
     let stable = registry_object(&registry, REGISTRY_UID, "42")?;
     let changed = registry_object(&registry, REGISTRY_UID, "43")?;
     let policy = object(
-        "reakt-policy-example",
+        "apsides-policy-example",
         &policy(&registry.plan(TRANSITION_A)?.request.next.compiled),
         "policy-uid",
         "44",
@@ -2382,7 +2382,7 @@ async fn inventory_refuses_forged_commits_wrong_claims_and_uid_regression()
         let policy = policy(&registry.plan(TRANSITION_A)?.request.next.compiled);
         let (client, calls) = wire(vec![
             registry_object(&registry, REGISTRY_UID, "42")?,
-            object("reakt-policy-example", &policy, "policy-uid", "44"),
+            object("apsides-policy-example", &policy, "policy-uid", "44"),
         ]);
         let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_A)?;
         assert!(
@@ -2418,7 +2418,7 @@ fn ci_permission_report_distinguishes_creation_scope_and_runtime_authority()
     assert_eq!(authority.resource, "configmaps");
     assert_eq!(
         authority.resource_names,
-        ["reakt-registry-authority.control.workload"]
+        ["apsides-registry-authority.control.workload"]
     );
     assert!(
         report
@@ -2426,7 +2426,7 @@ fn ci_permission_report_distinguishes_creation_scope_and_runtime_authority()
             .iter()
             .all(|target| target.namespace != REGISTRY_AUTHORITY_NAMESPACE)
     );
-    let identity_name = "reakt-deploy-identity-example";
+    let identity_name = "apsides-deploy-identity-example";
     let identity_access = report
         .required_resources
         .iter()
@@ -2520,7 +2520,7 @@ fn upgrade_ci_permissions_cover_retirement_and_actual_exec_method()
         (
             "deployments",
             "update",
-            format!("reakt-proxy-{}", previous.allocation.generation_id),
+            format!("apsides-proxy-{}", previous.allocation.generation_id),
         ),
     ] {
         assert!(report.required_resources.iter().any(|access| {
@@ -2546,7 +2546,7 @@ fn upgrade_ci_permissions_cover_retirement_and_actual_exec_method()
             && access.resource_names.is_empty()
     }));
     assert!(!report.creation_targets.iter().any(|target| {
-        target.name == "reakt-activation-example" || target.name == "reakt-inventory-example"
+        target.name == "apsides-activation-example" || target.name == "apsides-inventory-example"
     }));
     Ok(())
 }
@@ -2562,14 +2562,14 @@ async fn active_uid_capture_uses_inventory_and_rejects_missing_records()
             registry.plans.clear();
         }
         let snapshot: inventory::InventorySnapshot = serde_json::from_value(json!({
-            "schemaVersion":"reakt.dev/resource-inventory/v1", "generation":GENERATION_A,
+            "schemaVersion":"apsides.dev/resource-inventory/v1", "generation":GENERATION_A,
             "resources":[{"identity":{"apiGroup":"","resource":"configmaps","namespace":"workload","name":"config"},
                 "apiVersion":"v1","kind":"ConfigMap","uid":null,"deletionPolicy":"orphan"}]
         }))?;
         let control = registry_object(&registry, REGISTRY_UID, "42")?;
         let live = json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{
             "name":"config","namespace":"workload","uid":"captured-uid","resourceVersion":"9",
-            "managedFields":[{"manager":"reakt-example","operation":"Apply","apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{}}]
+            "managedFields":[{"manager":"apsides-example","operation":"Apply","apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{}}]
         }});
         let (client, calls) = wire(vec![
             control.clone(),
@@ -2840,7 +2840,7 @@ fn qualified_upgrade_fixture() -> std::result::Result<LifecycleRegistry, Box<dyn
         .get_mut(TRANSITION_A)
         .ok_or("predecessor missing")?;
     let binding = previous.runtime_binding.as_ref().ok_or("binding missing")?;
-    let proxy_name = format!("reakt-proxy-{}", binding.generation_id);
+    let proxy_name = format!("apsides-proxy-{}", binding.generation_id);
     let configuration_name = format!("{proxy_name}-config");
     let qualification = digest(&"qualified-platform-environment")?;
     previous.request_drain_qualification = Some(RequestDrainQualification::IsolatedEnvoy {
@@ -2869,7 +2869,7 @@ fn qualified_upgrade_fixture() -> std::result::Result<LifecycleRegistry, Box<dyn
             "credential-uid",
         ),
         (
-            "v1/ConfigMap/control/reakt-inventory-example".into(),
+            "v1/ConfigMap/control/apsides-inventory-example".into(),
             "inventory-uid",
         ),
         (
@@ -2949,7 +2949,7 @@ async fn writer_checkpoint_is_private_and_independent_of_old_history()
     let policy = policy(&registry.plan(TRANSITION_B)?.request.next.compiled);
     let (client, calls) = stateful_wire(vec![
         registry_object(&registry, REGISTRY_UID, "42")?,
-        object("reakt-policy-example", &policy, "policy-uid", "44"),
+        object("apsides-policy-example", &policy, "policy-uid", "44"),
     ]);
     let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_B)?;
     let captured = platform
@@ -3004,7 +3004,7 @@ async fn writer_checkpoint_is_private_and_independent_of_old_history()
     compacted.plans.remove(TRANSITION_A);
     let (client, calls) = wire(vec![
         registry_object(&compacted, REGISTRY_UID, "43")?,
-        object("reakt-policy-example", &policy, "policy-uid", "44"),
+        object("apsides-policy-example", &policy, "policy-uid", "44"),
     ]);
     let restored = compacted
         .bind(client, "control", "workload", "cluster-a", TRANSITION_B)?
@@ -3028,7 +3028,7 @@ async fn missing_previous_writer_checkpoint_requires_explicit_recovery_without_w
     let policy = policy(&registry.plan(TRANSITION_B)?.request.next.compiled);
     let (client, calls) = wire(vec![
         registry_object(&registry, REGISTRY_UID, "42")?,
-        object("reakt-policy-example", &policy, "policy-uid", "44"),
+        object("apsides-policy-example", &policy, "policy-uid", "44"),
     ]);
     let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_B)?;
     assert!(
@@ -3061,7 +3061,7 @@ async fn writer_checkpoint_substitution_never_overwrites_recorded_authority()
     let policy = policy(&registry.plan(TRANSITION_B)?.request.next.compiled);
     let (client, _) = stateful_wire(vec![
         registry_object(&registry, REGISTRY_UID, "42")?,
-        object("reakt-policy-example", &policy, "policy-uid", "44"),
+        object("apsides-policy-example", &policy, "policy-uid", "44"),
     ]);
     let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_B)?;
     let captured = platform
@@ -3106,7 +3106,7 @@ async fn writer_checkpoint_substitution_never_overwrites_recorded_authority()
         }
         let (client, calls) = wire(vec![
             registry_object(&changed, REGISTRY_UID, "43")?,
-            object("reakt-policy-example", &policy, "policy-uid", "44"),
+            object("apsides-policy-example", &policy, "policy-uid", "44"),
         ]);
         assert!(
             changed
@@ -3135,7 +3135,7 @@ async fn immutable_writer_checkpoint_rejects_changed_active_capability_commitmen
     let policy = policy(&registry.plan(TRANSITION_B)?.request.next.compiled);
     let (client, calls) = wire(vec![
         registry_object(&registry, REGISTRY_UID, "42")?,
-        object("reakt-policy-example", &policy, "policy-uid", "44"),
+        object("apsides-policy-example", &policy, "policy-uid", "44"),
     ]);
     let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_B)?;
     assert!(
@@ -3237,7 +3237,7 @@ async fn registry_authority_rejects_wrong_incarnation_scope_and_deletion()
         assert!(
             recorded[1]
                 .1
-                .contains("/namespaces/reakt-platform/configmaps/")
+                .contains("/namespaces/apsides-platform/configmaps/")
         );
     }
     Ok(())
@@ -3308,7 +3308,7 @@ async fn another_domain_uses_the_registry_counter_after_domain_entry_removal()
     let mut identity = fixture_deployment_identity_approval();
     identity.value.domain_id = "other".into();
     let identity_object = object(
-        "reakt-deploy-identity-other",
+        "apsides-deploy-identity-other",
         &identity.value,
         &identity.uid,
         &identity.resource_version,
@@ -3476,7 +3476,7 @@ async fn unqualified_initial_writer_rejects_before_activation_mutations()
     let policy = policy(&registry.plan(TRANSITION_A)?.request.next.compiled);
     let (client, calls) = wire(vec![
         registry_object(&registry, REGISTRY_UID, "42")?,
-        object("reakt-policy-example", &policy, "policy-uid", "44"),
+        object("apsides-policy-example", &policy, "policy-uid", "44"),
     ]);
     let platform = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_A)?;
     let error = Box::pin(platform.activate_initial(TRANSITION_A, "executor-a"))
@@ -3570,9 +3570,9 @@ async fn image_pull_secret_read_rejects_policy_drift() -> Result<()> {
     let mut policy = policy(&plan);
     policy.image_pull_secrets = vec!["registry-a".into()];
     let binding = activation(&plan, &policy).binding;
-    let original = object("reakt-policy-example", &policy, "policy-uid", "1");
+    let original = object("apsides-policy-example", &policy, "policy-uid", "1");
     policy.image_pull_secrets = vec!["registry-b".into()];
-    let changed = object("reakt-policy-example", &policy, "policy-uid", "2");
+    let changed = object("apsides-policy-example", &policy, "policy-uid", "2");
     let (client, _) = wire(vec![original, changed]);
     let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?;
     assert_eq!(

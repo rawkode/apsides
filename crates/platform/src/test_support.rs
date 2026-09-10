@@ -118,9 +118,9 @@ impl PlatformClient {
         if scope.cluster_binding != self.cluster_binding
             || scope.control_namespace != self.control_namespace
             || scope.workload_namespace != self.workload_namespace
-            || !scope.cluster_binding.starts_with("reakt-disposable-")
-            || !scope.control_namespace.starts_with("reakt-test-")
-            || !scope.workload_namespace.starts_with("reakt-test-")
+            || !scope.cluster_binding.starts_with("apsides-disposable-")
+            || !scope.control_namespace.starts_with("apsides-test-")
+            || !scope.workload_namespace.starts_with("apsides-test-")
             || target.marker_uid.is_empty()
             || target.kube_system_namespace_uid.is_empty()
         {
@@ -138,10 +138,10 @@ impl PlatformClient {
             ));
         }
         let marker: Versioned<DisposableTestCluster> =
-            crate::store::read_state(&self.client, &self.control_namespace, "reakt-test-support")
+            crate::store::read_state(&self.client, &self.control_namespace, "apsides-test-support")
                 .await?;
         if marker.uid != target.marker_uid
-            || marker.value.schema_version != "reakt.dev/disposable-test-cluster/v1"
+            || marker.value.schema_version != "apsides.dev/disposable-test-cluster/v1"
             || marker.value.cluster_binding != scope.cluster_binding
             || marker.value.control_namespace != scope.control_namespace
             || marker.value.workload_namespace != scope.workload_namespace

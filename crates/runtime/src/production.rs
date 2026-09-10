@@ -49,9 +49,9 @@ pub enum ApiAccess {
     Proxy,
 }
 
-const PROXY_CA_PATH: &str = "/etc/reakt/proxy/ca.crt";
-const PROXY_CERT_PATH: &str = "/etc/reakt/proxy/tls.crt";
-const PROXY_KEY_PATH: &str = "/etc/reakt/proxy/tls.key";
+const PROXY_CA_PATH: &str = "/etc/apsides/proxy/ca.crt";
+const PROXY_CERT_PATH: &str = "/etc/apsides/proxy/tls.crt";
+const PROXY_KEY_PATH: &str = "/etc/apsides/proxy/tls.key";
 
 /// Explicit production startup data. None of these values grants authority;
 /// protected platform records must independently match the binding.
@@ -135,7 +135,7 @@ impl Diagnostics {
     fn new(binding: &RuntimeBinding) -> Self {
         Self {
             snapshot: RwLock::new(DiagnosticSnapshot {
-                schema_version: "reakt.dev/runtime-status/v1",
+                schema_version: "apsides.dev/runtime-status/v1",
                 domain: binding.domain_id.clone(),
                 build_digest: binding.build_digest.clone(),
                 generation: binding.generation_id.clone(),
@@ -312,7 +312,7 @@ fn production_kube_config(config: &ProductionConfig) -> Result<Config, RuntimeEr
                     "proxy generation identifier is not a DNS label".into(),
                 ));
             }
-            let server_name = format!("reakt-proxy-{generation}.{}.svc", config.control_namespace);
+            let server_name = format!("apsides-proxy-{generation}.{}.svc", config.control_namespace);
             let uri = format!("https://{server_name}:8443")
                 .parse()
                 .map_err(|_| RuntimeError::Configuration("invalid fixed proxy API URL".into()))?;
@@ -1403,10 +1403,10 @@ mod tests {
 
     fn plan() -> CompiledPlan {
         parse_and_validate(&json!({
-            "schemaVersion":"reakt.dev/ir/v1", "testOnly":false,
+            "schemaVersion":"apsides.dev/ir/v1", "testOnly":false,
             "domain":{"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound","budgets":{"maxResources":8,"maxInputs":8,"maxReactions":8,"maxObjectBytes":262_144,"maxQueueDepth":8,"maxConcurrentRequests":2}},
             "resources":[{"id":"config","apiVersion":"v1","kind":"ConfigMap","name":"config","namespace":"workload","desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"config","namespace":"workload"},"data":{"value":"approved"}},"lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"program.ts","line":1,"column":1}}],
-            "inputs":[],"reactions":[],"provenance":{"compiler":"reakt/0.1","inputs":[{"path":"program.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
+            "inputs":[],"reactions":[],"provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
         }).to_string()).unwrap()
     }
 
@@ -1441,7 +1441,7 @@ mod tests {
                 ir_digest: plan.ir_digest.clone(),
                 policy_digest: digest(policy).unwrap(),
                 capability_digest: digest(&plan.capabilities).unwrap(),
-                service_account_name: "reakt-example-generation-a".into(),
+                service_account_name: "apsides-example-generation-a".into(),
                 controller_image: format!("example.invalid/controller@sha256:{}", "b".repeat(64)),
             },
             status: ActivationStatus::Active,
@@ -1472,7 +1472,7 @@ mod tests {
 
     fn target_object(value: &str, uid: &str, rv: &str) -> Value {
         json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"config","namespace":"workload","uid":uid,"resourceVersion":rv,
-            "managedFields":[{"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:data":{"f:value":{}}},"manager":"reakt-example","operation":"Apply"}]},"data":{"value":value}})
+            "managedFields":[{"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:data":{"f:value":{}}},"manager":"apsides-example","operation":"Apply"}]},"data":{"value":value}})
     }
 
     fn target_list(items: &[Value], rv: &str) -> Value {
@@ -1605,7 +1605,7 @@ mod tests {
         let config = production_kube_config(&controller.config).unwrap();
         assert_eq!(
             config.cluster_url.to_string(),
-            "https://reakt-proxy-generation-a.control.svc:8443/"
+            "https://apsides-proxy-generation-a.control.svc:8443/"
         );
         assert_eq!(config.root_cert_file, Some(PathBuf::from(PROXY_CA_PATH)));
         assert_eq!(
@@ -1870,36 +1870,36 @@ mod tests {
         let next_value = inventory("activation-uid", "20", vec![target_observation()]);
         let responses = vec![
             control_object(
-                "reakt-activation-example",
+                "apsides-activation-example",
                 &activation,
                 "activation-uid",
                 "20",
             ),
-            control_object("reakt-policy-example", &policy, "policy-uid", "19"),
+            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
             target_list(&[], "30"),
             target_object("approved", "target-uid", "31"),
             control_object(
-                "reakt-activation-example",
+                "apsides-activation-example",
                 &activation,
                 "activation-uid",
                 "20",
             ),
-            control_object("reakt-policy-example", &policy, "policy-uid", "19"),
+            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
             target_object("approved", "target-uid", "32"),
             control_object(
-                "reakt-activation-example",
+                "apsides-activation-example",
                 &activation,
                 "activation-uid",
                 "20",
             ),
             control_object(
-                "reakt-inventory-example",
+                "apsides-inventory-example",
                 &previous_value,
                 "inventory-uid",
                 "18",
             ),
             control_object(
-                "reakt-inventory-example",
+                "apsides-inventory-example",
                 &next_value,
                 "inventory-uid",
                 "21",
@@ -1961,12 +1961,12 @@ mod tests {
         let activation = activation(&plan, &policy, None);
         let (client, calls) = wire(vec![
             control_object(
-                "reakt-activation-example",
+                "apsides-activation-example",
                 &activation,
                 "activation-uid",
                 "20",
             ),
-            control_object("reakt-policy-example", &policy, "policy-uid", "19"),
+            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
             target_list(&[target_object("foreign", "foreign-uid", "30")], "30"),
         ]);
         let controller = controller(&plan, &activation, client);
@@ -1997,12 +1997,12 @@ mod tests {
         let existing = target_object("approved", "target-uid", "30");
         let (client, calls) = wire(vec![
             control_object(
-                "reakt-activation-example",
+                "apsides-activation-example",
                 &activation,
                 "activation-uid",
                 "20",
             ),
-            control_object("reakt-policy-example", &policy, "policy-uid", "19"),
+            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
             target_list(std::slice::from_ref(&existing), "30"),
             existing,
         ]);
@@ -2033,21 +2033,21 @@ mod tests {
         let existing = target_object("approved", "target-uid", "30");
         let (client, calls) = wire(vec![
             control_object(
-                "reakt-activation-example",
+                "apsides-activation-example",
                 &activation,
                 "activation-uid",
                 "20",
             ),
-            control_object("reakt-policy-example", &policy, "policy-uid", "19"),
+            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
             target_list(std::slice::from_ref(&existing), "30"),
             existing.clone(),
             control_object(
-                "reakt-activation-example",
+                "apsides-activation-example",
                 &activation,
                 "activation-uid",
                 "20",
             ),
-            control_object("reakt-policy-example", &policy, "policy-uid", "19"),
+            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
             target_list(std::slice::from_ref(&existing), "30"),
         ]);
         let controller = controller(&plan, &activation, client);
@@ -2085,21 +2085,21 @@ mod tests {
         let drifted = target_object("approved", "target-uid", "31");
         let (client, calls) = wire(vec![
             control_object(
-                "reakt-activation-example",
+                "apsides-activation-example",
                 &activation,
                 "activation-uid",
                 "20",
             ),
-            control_object("reakt-policy-example", &policy, "policy-uid", "19"),
+            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
             target_list(std::slice::from_ref(&existing), "30"),
             existing,
             control_object(
-                "reakt-activation-example",
+                "apsides-activation-example",
                 &activation,
                 "activation-uid",
                 "20",
             ),
-            control_object("reakt-policy-example", &policy, "policy-uid", "19"),
+            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
             target_list(std::slice::from_ref(&drifted), "31"),
             drifted,
         ]);
@@ -2133,24 +2133,24 @@ mod tests {
         let mut previous = versioned_inventory(inventory("activation-uid", "20", vec![]), "18");
         let (client, _) = wire(vec![
             control_object(
-                "reakt-activation-example",
+                "apsides-activation-example",
                 &activation,
                 "activation-uid",
                 "20",
             ),
-            control_object("reakt-policy-example", &policy, "policy-uid", "19"),
+            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
             target_list(&[], "30"),
             target_object("approved", "target-uid", "31"),
             control_object(
-                "reakt-activation-example",
+                "apsides-activation-example",
                 &activation,
                 "activation-uid",
                 "20",
             ),
-            control_object("reakt-policy-example", &policy, "policy-uid", "19"),
+            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
             target_object("approved", "target-uid", "32"),
             control_object(
-                "reakt-activation-example",
+                "apsides-activation-example",
                 &activation,
                 "activation-uid",
                 "21",
@@ -2171,12 +2171,12 @@ mod tests {
         let existing = target_object("approved", "target-uid", "32");
         let (client, calls) = wire(vec![
             control_object(
-                "reakt-activation-example",
+                "apsides-activation-example",
                 &activation,
                 "activation-uid",
                 "20",
             ),
-            control_object("reakt-policy-example", &policy, "policy-uid", "19"),
+            control_object("apsides-policy-example", &policy, "policy-uid", "19"),
             target_list(&[existing], "32"),
         ]);
         let runtime = controller(&plan, &activation, client);

@@ -60,7 +60,7 @@ pub(super) fn enforcement(plan: &TransitionPlan) -> Result<ReviewEnforcement> {
 pub(super) fn deployment(
     value: &crate::DeploymentPermissions,
 ) -> Result<ReviewDeploymentPermissions> {
-    if value.schema_version != "reakt.dev/deployment-permissions/v1"
+    if value.schema_version != "apsides.dev/deployment-permissions/v1"
         || value.authorization != "required-access-only; effective RBAC and admission not evaluated"
     {
         return Err(invalid(

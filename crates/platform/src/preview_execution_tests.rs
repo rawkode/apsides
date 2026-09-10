@@ -25,7 +25,7 @@ fn object() -> Result<DynamicObject> {
     Ok(serde_json::from_value(
         json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{
         "name":"owned","namespace":"workload","uid":"uid","resourceVersion":"2","managedFields":[{
-            "manager":"reakt-example","operation":"Apply","apiVersion":"v1","fieldsType":"FieldsV1",
+            "manager":"apsides-example","operation":"Apply","apiVersion":"v1","fieldsType":"FieldsV1",
             "fieldsV1":{"f:data":{"f:private":{}}}}]},"data":{"private":"canary"}}),
     )?)
 }
