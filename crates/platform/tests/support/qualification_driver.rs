@@ -177,10 +177,10 @@ fn issuer_only(user: &kube::config::NamedAuthInfo, expected_name: &str) -> bool 
 
 pub(super) async fn coordination_store(
     environment: &'static str,
-) -> Result<Arc<coordination::LibsqlCoordination>> {
+) -> Result<Arc<coordination::SqliteCoordination>> {
     let path = database_path(environment)?;
     Ok(Arc::new(
-        coordination::LibsqlCoordination::open_local(&path)
+        coordination::SqliteCoordination::open_local(&path)
             .await
             .map_err(|_| DriverError("local coordination database open failed"))?,
     ))
@@ -188,9 +188,9 @@ pub(super) async fn coordination_store(
 
 pub(super) async fn inventory_store(
     environment: &'static str,
-) -> Result<inventory::LibsqlInventory> {
+) -> Result<inventory::SqliteInventory> {
     let path = database_path(environment)?;
-    inventory::LibsqlInventory::open_local(&path)
+    inventory::SqliteInventory::open_local(&path)
         .await
         .map_err(|_| DriverError("local inventory database open failed"))
 }

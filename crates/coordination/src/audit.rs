@@ -236,13 +236,13 @@ impl TransitionAuditV1 {
         Ok(())
     }
 
-    #[cfg(feature = "libsql-backend")]
+    #[cfg(feature = "sqlite-backend")]
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
         compiler_core::canonical_bytes(self).map_err(|_| Error::Invalid("audit encoding"))
     }
 
-    #[cfg(feature = "libsql-backend")]
+    #[cfg(feature = "sqlite-backend")]
     pub(crate) fn decode(bytes: &[u8], reference: &AuditRef) -> Result<Self> {
         reference.validate()?;
         if bytes.len() > MAX_TRANSITION_AUDIT_BYTES {

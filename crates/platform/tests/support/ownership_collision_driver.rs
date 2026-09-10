@@ -473,7 +473,7 @@ fn creation_targets(request: &DeploymentRequest) -> Result<Vec<platform_api::Cre
 
 async fn bootstrap_platform(
     candidate: &release::IntegrityVerifiedCandidate,
-    coordination: Arc<coordination::LibsqlCoordination>,
+    coordination: Arc<coordination::SqliteCoordination>,
 ) -> Result<PlatformClient> {
     let config = qualification_driver::explicit_config(ConfigIdentity::Admin).await?;
     let domain = &candidate.compiled().ir.domain;
@@ -495,7 +495,7 @@ async fn bootstrap_platform(
 
 async fn issued_deployment(
     candidate: &release::IntegrityVerifiedCandidate,
-    coordination: Arc<coordination::LibsqlCoordination>,
+    coordination: Arc<coordination::SqliteCoordination>,
 ) -> Result<IssuedDeployment> {
     let config = qualification_driver::explicit_config(ConfigIdentity::Issuer {
         name: ISSUER,
@@ -515,11 +515,11 @@ async fn issued_deployment(
     .with_stores(coordination.clone(), coordination.clone(), coordination))
 }
 
-async fn coordination_store() -> Result<Arc<coordination::LibsqlCoordination>> {
+async fn coordination_store() -> Result<Arc<coordination::SqliteCoordination>> {
     qualification_driver::coordination_store("APS_COLLISION_COORDINATION_DB").await
 }
 
-async fn inventory_store() -> Result<inventory::LibsqlInventory> {
+async fn inventory_store() -> Result<inventory::SqliteInventory> {
     qualification_driver::inventory_store("APS_COLLISION_INVENTORY_DB").await
 }
 

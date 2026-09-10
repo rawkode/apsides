@@ -117,7 +117,7 @@ establish narrower properties.
   credential expiry. It stores no token or Secret body. A resumed session must
   use a currently valid issued credential under the same protected identity.
 - Claims, review metadata, transition audits, and resource inventory use typed
-  immutable records in the configured libSQL metadata store. The Kubernetes
+  immutable records in the configured SQLite metadata store. The Kubernetes
   registry selects their exact content-addressed references.
 - Commit archives sanitized predecessor lifecycle metadata before pruning the
   predecessor record, advances the protected audit head, promotes the new active
@@ -347,7 +347,7 @@ bytes of canonical metadata, exact history across Pods, one winner and one
 conflict from competing publishers, and recovery after an uncommitted database
 writer is killed and reaped. Read-only refusal and healthy reopen also passed.
 This covers inventory process termination on the tested local PV; it does not
-qualify CSI storage, node failure, or remote Turso. A separate small-fixture
+qualify CSI storage or node failure. A separate small-fixture
 qualification verified current claim, review and audit bodies across two Pods,
 with a read-only mount and rejection of all three write methods in the second
 Pod. Competing coordination writers also passed: identical claims were idempotent,
@@ -369,7 +369,7 @@ and restored deleted synthetic row counts; exact public retries succeeded. This
 is local SQLite transaction recovery, not interruption inside the public write
 method, persistent-volume failure, remote recovery or cross-store atomicity.
 
-Local filesystem tests cover one libSQL `VACUUM INTO` backup containing all four
+Local filesystem tests cover one SQLite `VACUUM INTO` backup containing all four
 stores, exact read-only verification, retained inventory history, exclusion of
 later source writes, refusal to overwrite existing destinations, and rejection
 of malformed backups without repair.
@@ -408,11 +408,9 @@ recovery, or production restore authority.
   proceed. The spec includes the trusted deployment job in its trusted computing
   base and forbids requiring a new broadly privileged coordinator.
 - Complete claim, review and audit persistent-volume interrupted-write
-  qualification, and qualify remote Turso/libSQL restart,
-  unavailable-storage, conflict and recovery behavior.
-- Qualify byte and time bounds and non-panicking handling of remote responses.
-  The store connectors reject non-HTTPS connection URIs, including server-directed libSQL
-  requests, but this does not bound response bodies in the pinned upstream client.
+  qualification, and qualify unavailable-storage, conflict and recovery
+  behavior. The metadata store is a local SQLite database, so the remote
+  restart, endpoint-trust and response-bound gates no longer apply.
 - Complete production API authorization and admission qualification for the
   supported Kubernetes versions, including the declared preview permissions and
   request-drain profile.

@@ -1,4 +1,4 @@
-#![cfg(feature = "libsql-backend")]
+#![cfg(feature = "sqlite-backend")]
 
 use coordination::*;
 use deploy::{ClaimState, ProtectedClaim, ResourceIdentity};
@@ -9,7 +9,7 @@ const REGISTRY_UID: &str = "11111111-1111-4111-8111-111111111111";
 const PRIVATE_VALUE: &str = "private-value-canary";
 const PRIVATE_STATE: &str = "private-state-canary";
 const PRIVATE_TOKEN: &str = "private-token-canary";
-const PRIVATE_URL: &str = "://private-url-canary";
+const PRIVATE_PATH: &str = "private-path-canary/coordination.db";
 
 fn scope() -> ClaimScope {
     ClaimScope {
@@ -60,7 +60,7 @@ fn assert_private_diagnostic(error: &coordination::Error) {
     assert!(!diagnostic.contains(PRIVATE_VALUE));
     assert!(!diagnostic.contains(PRIVATE_STATE));
     assert!(!diagnostic.contains(PRIVATE_TOKEN));
-    assert!(!diagnostic.contains(PRIVATE_URL));
+    assert!(!diagnostic.contains(PRIVATE_PATH));
 }
 
 #[tokio::test]
@@ -72,10 +72,10 @@ async fn large_snapshot_survives_local_reopen_without_a_mutable_head() -> TestRe
     assert!(serde_json::to_vec(&snapshot)?.len() < MAX_CLAIM_SNAPSHOT_BYTES);
 
     let reference = {
-        let store = LibsqlCoordination::open_local(&path).await?;
+        let store = SqliteCoordination::open_local(&path).await?;
         store.put_claims(&snapshot).await?
     };
-    let reopened = LibsqlCoordination::open_local(&path).await?;
+    let reopened = SqliteCoordination::open_local(&path).await?;
     assert_eq!(reopened.read_claims(&reference).await?, Some(snapshot));
     assert_eq!(reopened.read_claims(&missing_reference()).await?, None);
     Ok(())
@@ -85,8 +85,8 @@ async fn large_snapshot_survives_local_reopen_without_a_mutable_head() -> TestRe
 async fn identical_repeated_and_concurrent_writes_are_idempotent() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("coordination.db");
-    let left = LibsqlCoordination::open_local(&path).await?;
-    let right = LibsqlCoordination::open_local(&path).await?;
+    let left = SqliteCoordination::open_local(&path).await?;
+    let right = SqliteCoordination::open_local(&path).await?;
     let snapshot = snapshot(2)?;
     let expected = snapshot.reference()?;
 
@@ -103,7 +103,7 @@ async fn identical_repeated_and_concurrent_writes_are_idempotent() -> TestResult
 async fn references_are_scope_bound_and_domain_separated() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("coordination.db");
-    let store = LibsqlCoordination::open_local(&path).await?;
+    let store = SqliteCoordination::open_local(&path).await?;
     let snapshot = snapshot(1)?;
     let reference = store.put_claims(&snapshot).await?;
     assert_ne!(reference.digest, compiler_core::digest(&snapshot)?);
@@ -117,14 +117,11 @@ async fn references_are_scope_bound_and_domain_separated() -> TestResult {
 
     let wrong_digest = missing_reference();
     let encoded = compiler_core::canonical_bytes(&snapshot)?;
-    let database = libsql::Builder::new_local(&path).build().await?;
-    database
-        .connect()?
-        .execute(
-            "INSERT INTO apsides_coordination_claims(digest,metadata) VALUES (?1,?2)",
-            libsql::params![wrong_digest.digest.clone(), encoded],
-        )
-        .await?;
+    let database = rusqlite::Connection::open(&path)?;
+    database.execute(
+        "INSERT INTO apsides_coordination_claims(digest,metadata) VALUES (?1,?2)",
+        rusqlite::params![wrong_digest.digest.clone(), encoded],
+    )?;
     assert!(matches!(
         store.read_claims(&wrong_digest).await,
         Err(Error::Invalid(_))
@@ -136,7 +133,7 @@ async fn references_are_scope_bound_and_domain_separated() -> TestResult {
 async fn missing_rows_are_distinct_from_corrupt_rows_and_diagnostics_are_private() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("coordination.db");
-    let store = LibsqlCoordination::open_local(&path).await?;
+    let store = SqliteCoordination::open_local(&path).await?;
     let missing = missing_reference();
     assert_eq!(store.read_claims(&missing).await?, None);
 
@@ -145,14 +142,11 @@ async fn missing_rows_are_distinct_from_corrupt_rows_and_diagnostics_are_private
     let canonical = String::from_utf8(compiler_core::canonical_bytes(&snapshot)?)?;
     let corrupted = canonical.replace("\"active\"", &format!("\"{PRIVATE_STATE}\""));
     assert!(corrupted.contains(PRIVATE_STATE));
-    let database = libsql::Builder::new_local(&path).build().await?;
-    database
-        .connect()?
-        .execute(
-            "UPDATE apsides_coordination_claims SET metadata=?1 WHERE digest=?2",
-            libsql::params![corrupted.into_bytes(), reference.digest.clone()],
-        )
-        .await?;
+    let database = rusqlite::Connection::open(&path)?;
+    database.execute(
+        "UPDATE apsides_coordination_claims SET metadata=?1 WHERE digest=?2",
+        rusqlite::params![corrupted.into_bytes(), reference.digest.clone()],
+    )?;
 
     let Err(error) = store.read_claims(&reference).await else {
         return Err("corrupt claim row was accepted".into());
@@ -163,13 +157,10 @@ async fn missing_rows_are_distinct_from_corrupt_rows_and_diagnostics_are_private
     };
     assert_private_diagnostic(&repeated_error);
 
-    database
-        .connect()?
-        .execute(
-            "UPDATE apsides_coordination_claims SET metadata=?1 WHERE digest=?2",
-            libsql::params![b"{".to_vec(), reference.digest.clone()],
-        )
-        .await?;
+    database.execute(
+        "UPDATE apsides_coordination_claims SET metadata=?1 WHERE digest=?2",
+        rusqlite::params![b"{".to_vec(), reference.digest.clone()],
+    )?;
     let Err(malformed_error) = store.read_claims(&reference).await else {
         return Err("malformed claim row was accepted".into());
     };
@@ -180,7 +171,7 @@ async fn missing_rows_are_distinct_from_corrupt_rows_and_diagnostics_are_private
 #[tokio::test]
 async fn duplicate_and_unsorted_claims_are_rejected() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let store = LibsqlCoordination::open_local(&directory.path().join("coordination.db")).await?;
+    let store = SqliteCoordination::open_local(&directory.path().join("coordination.db")).await?;
 
     let mut duplicate = snapshot(2)?;
     let first = duplicate
@@ -211,7 +202,7 @@ async fn duplicate_and_unsorted_claims_are_rejected() -> TestResult {
 #[tokio::test]
 async fn claim_count_over_the_bounded_snapshot_budget_is_rejected() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let store = LibsqlCoordination::open_local(&directory.path().join("coordination.db")).await?;
+    let store = SqliteCoordination::open_local(&directory.path().join("coordination.db")).await?;
     let repeated = claim("resource".to_owned(), 1)?;
     let oversized = ClaimSnapshotV1 {
         schema_version: CLAIM_SNAPSHOT_SCHEMA.to_owned(),
@@ -250,22 +241,22 @@ fn typed_snapshot_rejects_unknown_private_payload_fields() -> TestResult {
 }
 
 #[tokio::test]
-async fn invalid_remote_configuration_never_echoes_url_or_token() -> TestResult {
-    let Err(error) =
-        LibsqlCoordination::open_remote(PRIVATE_URL.to_owned(), PRIVATE_TOKEN.to_owned()).await
-    else {
-        return Err("invalid remote URL was accepted".into());
-    };
-    assert!(matches!(&error, Error::Invalid(_)));
-    assert_private_diagnostic(&error);
-
-    let invalid_token = format!("{PRIVATE_TOKEN}\n");
-    let Err(error) =
-        LibsqlCoordination::open_remote("https://example.invalid".to_owned(), invalid_token).await
-    else {
-        return Err("invalid remote token was accepted".into());
-    };
-    assert!(matches!(&error, Error::Invalid(_)));
-    assert_private_diagnostic(&error);
+async fn a_relative_database_path_is_refused_without_echoing_it() -> TestResult {
+    for read_only in [false, true] {
+        let path = std::path::Path::new(PRIVATE_PATH);
+        let result = if read_only {
+            SqliteCoordination::open_local_read_only(path).await
+        } else {
+            SqliteCoordination::open_local(path).await
+        };
+        let Err(error) = result else {
+            return Err("relative coordination path was accepted".into());
+        };
+        assert!(matches!(&error, Error::Invalid(_)));
+        assert_private_diagnostic(&error);
+        if path.exists() {
+            return Err("refused configuration still touched the filesystem".into());
+        }
+    }
     Ok(())
 }

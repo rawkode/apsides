@@ -12,10 +12,10 @@ pub use audit::*;
 mod review;
 pub use review::*;
 
-#[cfg(feature = "libsql-backend")]
-mod libsql_backend;
-#[cfg(feature = "libsql-backend")]
-pub use libsql_backend::LibsqlCoordination;
+#[cfg(feature = "sqlite-backend")]
+mod sqlite;
+#[cfg(feature = "sqlite-backend")]
+pub use sqlite::SqliteCoordination;
 
 use async_trait::async_trait;
 

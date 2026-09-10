@@ -69,6 +69,6 @@ Secret commitments and unexpected staged keys are rejected without writes.
 
 These checks do not establish full maximal-profile end-to-end completion, every
 upgrade cleanup payload, live Pod upgrades, persistent-volume reattachment, or
-a remote Turso primary. The metadata store remains metadata-only: capacity
+a persistent volume. The metadata store remains metadata-only: capacity
 records add no manifests, desired values, source, credentials, or hashes of
 private contents.

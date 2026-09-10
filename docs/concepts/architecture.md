@@ -64,8 +64,8 @@ adoption approval, lifecycle policy, finalizers or old-writer termination.
 
 Resource history belongs in immutable metadata-only inventory through the
 `InventoryStore` trait. Review metadata, claims and transition audit records use
-their own typed immutable stores. libSQL is the default backend, using either a
-persistent local file or a remote Turso/libSQL primary. Protected Kubernetes
+their own typed immutable stores. SQLite is the default backend, using a
+persistent local file on application-owned storage. Protected Kubernetes
 coordination stores compact transition inputs, immutable references, capacity
 admission, writer checkpoints and the executor binding needed for conditional
 lifecycle updates.
@@ -83,7 +83,7 @@ See
 | `platform` | protected Kubernetes state, proxy transport and generation lifecycle |
 | `runtime` | native fixed-plan reconciliation |
 | `release` | signed release, compiler closure, OCI and evidence verification |
-| `inventory` | metadata-only snapshots and libSQL storage |
+| `inventory` | metadata-only snapshots and SQLite storage |
 | `cli` | `apsides` build, verification and deployment commands |
 
 Internal packages use role names without product prefixes. The current executable

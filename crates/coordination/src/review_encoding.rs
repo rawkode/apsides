@@ -86,12 +86,12 @@ impl ReviewMetadataV1 {
                 .map_err(|_| Error::Invalid("review metadata digest"))?,
         })
     }
-    #[cfg(feature = "libsql-backend")]
+    #[cfg(feature = "sqlite-backend")]
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
         compiler_core::canonical_bytes(self).map_err(|_| Error::Invalid("review metadata encoding"))
     }
-    #[cfg(feature = "libsql-backend")]
+    #[cfg(feature = "sqlite-backend")]
     pub(crate) fn decode(bytes: &[u8], reference: &ReviewRef) -> Result<Self> {
         reference.validate()?;
         if bytes.len() > MAX_REVIEW_METADATA_BYTES {

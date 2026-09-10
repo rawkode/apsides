@@ -1,5 +1,5 @@
 use super::*;
-use libsql::{Builder, Connection, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
@@ -126,154 +126,125 @@ impl Drop for OwnedChild {
     }
 }
 
-async fn pragma_integer(connection: &Connection, query: &'static str) -> TestResult<i64> {
-    let mut rows = connection.query(query, ()).await?;
-    let row = rows
-        .next()
-        .await?
-        .ok_or("coordination crash durability setting is missing")?;
-    Ok(row.get::<i64>(0)?)
+fn pragma_integer(connection: &Connection, query: &'static str) -> TestResult<i64> {
+    Ok(connection.query_one(query, [], |row| row.get::<usize, i64>(0))?)
 }
 
-async fn configure_crash(connection: &Connection) -> TestResult {
-    connection
-        .execute_batch(
-            "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; \
+fn configure_crash(connection: &Connection) -> TestResult {
+    connection.execute_batch(
+        "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; \
              PRAGMA cache_size=8; PRAGMA cache_spill=8;",
-        )
-        .await?;
-    let mut rows = connection.query("PRAGMA journal_mode", ()).await?;
-    let row = rows
-        .next()
-        .await?
-        .ok_or("coordination crash journal setting is missing")?;
-    if row.get::<String>(0)? != "delete"
-        || pragma_integer(connection, "PRAGMA synchronous").await? != 2
-        || pragma_integer(connection, "PRAGMA cache_size").await? != 8
-        || pragma_integer(connection, "PRAGMA cache_spill").await? != 8
+    )?;
+    let journal =
+        connection.query_one("PRAGMA journal_mode", [], |row| row.get::<usize, String>(0))?;
+    if journal != "delete"
+        || pragma_integer(connection, "PRAGMA synchronous")? != 2
+        || pragma_integer(connection, "PRAGMA cache_size")? != 8
+        || pragma_integer(connection, "PRAGMA cache_spill")? != 8
     {
         return Err("coordination crash durability profile differs".into());
     }
     Ok(())
 }
 
-async fn seed_spill_rows(connection: &Connection, kind: StoreKind) -> TestResult {
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .await?;
+fn seed_spill_rows(connection: &mut Connection, kind: StoreKind) -> TestResult {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let payload = vec![b's'; SPILL_BYTES];
     for index in 0..SPILL_ROWS {
-        let inserted =
-            match kind {
-                StoreKind::Claim => transaction
-                    .execute(
-                        "INSERT INTO apsides_coordination_claims(digest,metadata) VALUES (?1,?2)",
-                        params![format!("synthetic-crash-claim-{index:04}"), payload.clone()],
-                    )
-                    .await?,
-                StoreKind::Review => {
-                    transaction
-                        .execute(
-                            "INSERT INTO apsides_coordination_review_objects(\
+        let inserted = match kind {
+            StoreKind::Claim => transaction.execute(
+                "INSERT INTO apsides_coordination_claims(digest,metadata) VALUES (?1,?2)",
+                params![format!("synthetic-crash-claim-{index:04}"), payload.clone()],
+            )?,
+            StoreKind::Review => transaction.execute(
+                "INSERT INTO apsides_coordination_review_objects(\
                          registry_uid,cluster_binding,control_namespace,workload_namespace,\
                          domain_id,transition_id,sequence,digest,metadata) \
                          VALUES (?1,'cluster','control','workload','domain',?2,'2',?3,?4)",
-                            params![
-                                "synthetic-crash-review",
-                                format!("transition-{index:04}"),
-                                format!("synthetic-crash-review-{index:04}"),
-                                payload.clone(),
-                            ],
-                        )
-                        .await?
-                }
-                StoreKind::Audit => {
-                    transaction
-                        .execute(
-                            "INSERT INTO apsides_coordination_audits(\
+                params![
+                    "synthetic-crash-review",
+                    format!("transition-{index:04}"),
+                    format!("synthetic-crash-review-{index:04}"),
+                    payload.clone(),
+                ],
+            )?,
+            StoreKind::Audit => transaction.execute(
+                "INSERT INTO apsides_coordination_audits(\
                          registry_uid,cluster_binding,control_namespace,workload_namespace,\
                          domain_id,transition_id,sequence,digest,metadata) \
                          VALUES (?1,'cluster','control','workload','domain',?2,'2',?3,?4)",
-                            params![
-                                "synthetic-crash-audit",
-                                format!("transition-{index:04}"),
-                                format!("synthetic-crash-audit-{index:04}"),
-                                payload.clone(),
-                            ],
-                        )
-                        .await?
-                }
-            };
+                params![
+                    "synthetic-crash-audit",
+                    format!("transition-{index:04}"),
+                    format!("synthetic-crash-audit-{index:04}"),
+                    payload.clone(),
+                ],
+            )?,
+        };
         if inserted != 1 {
             return Err("coordination crash spill row was not inserted".into());
         }
     }
-    transaction.commit().await?;
+    transaction.commit()?;
     Ok(())
 }
 
-async fn insert_candidate(
-    transaction: &Transaction,
+fn insert_candidate(
+    transaction: &Transaction<'_>,
     kind: StoreKind,
     candidate: &RaceFixture,
 ) -> TestResult {
     let inserted = match kind {
         StoreKind::Claim => {
             let bytes = compiler_core::canonical_bytes(&candidate.claims)?;
-            transaction
-                .execute(
-                    "INSERT INTO apsides_coordination_claims(digest,metadata) VALUES (?1,?2)",
-                    params![candidate.claim_ref.digest.clone(), bytes],
-                )
-                .await?
+            transaction.execute(
+                "INSERT INTO apsides_coordination_claims(digest,metadata) VALUES (?1,?2)",
+                params![candidate.claim_ref.digest.clone(), bytes],
+            )?
         }
         StoreKind::Review => {
             let bytes = compiler_core::canonical_bytes(&candidate.left_review)?;
             let scope = &candidate.left_review_ref.scope;
             let claims = &scope.claim_scope;
-            transaction
-                .execute(
-                    "INSERT INTO apsides_coordination_review_objects(\
+            transaction.execute(
+                "INSERT INTO apsides_coordination_review_objects(\
                      registry_uid,cluster_binding,control_namespace,workload_namespace,\
                      domain_id,transition_id,sequence,digest,metadata) \
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                    params![
-                        claims.registry_uid.clone(),
-                        claims.cluster_binding.clone(),
-                        claims.control_namespace.clone(),
-                        claims.workload_namespace.clone(),
-                        scope.domain_id.clone(),
-                        scope.transition_id.clone(),
-                        scope.sequence.to_string(),
-                        candidate.left_review_ref.digest.clone(),
-                        bytes,
-                    ],
-                )
-                .await?
+                params![
+                    claims.registry_uid.clone(),
+                    claims.cluster_binding.clone(),
+                    claims.control_namespace.clone(),
+                    claims.workload_namespace.clone(),
+                    scope.domain_id.clone(),
+                    scope.transition_id.clone(),
+                    scope.sequence.to_string(),
+                    candidate.left_review_ref.digest.clone(),
+                    bytes,
+                ],
+            )?
         }
         StoreKind::Audit => {
             let bytes = compiler_core::canonical_bytes(&candidate.left_audit)?;
             let scope = &candidate.left_audit_ref.scope;
             let claims = &scope.claim_scope;
-            transaction
-                .execute(
-                    "INSERT INTO apsides_coordination_audits(\
+            transaction.execute(
+                "INSERT INTO apsides_coordination_audits(\
                      registry_uid,cluster_binding,control_namespace,workload_namespace,\
                      domain_id,transition_id,sequence,digest,metadata) \
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                    params![
-                        claims.registry_uid.clone(),
-                        claims.cluster_binding.clone(),
-                        claims.control_namespace.clone(),
-                        claims.workload_namespace.clone(),
-                        scope.domain_id.clone(),
-                        scope.transition_id.clone(),
-                        scope.sequence.to_string(),
-                        candidate.left_audit_ref.digest.clone(),
-                        bytes,
-                    ],
-                )
-                .await?
+                params![
+                    claims.registry_uid.clone(),
+                    claims.cluster_binding.clone(),
+                    claims.control_namespace.clone(),
+                    claims.workload_namespace.clone(),
+                    scope.domain_id.clone(),
+                    scope.transition_id.clone(),
+                    scope.sequence.to_string(),
+                    candidate.left_audit_ref.digest.clone(),
+                    bytes,
+                ],
+            )?
         }
     };
     if inserted != 1 {
@@ -282,44 +253,32 @@ async fn insert_candidate(
     Ok(())
 }
 
-async fn delete_spill_rows(transaction: &Transaction, kind: StoreKind) -> TestResult {
+fn delete_spill_rows(transaction: &Transaction<'_>, kind: StoreKind) -> TestResult {
     let deleted = match kind {
-        StoreKind::Claim => {
-            transaction
-                .execute(
-                    "DELETE FROM apsides_coordination_claims \
+        StoreKind::Claim => transaction.execute(
+            "DELETE FROM apsides_coordination_claims \
                      WHERE digest GLOB 'synthetic-crash-claim-*'",
-                    (),
-                )
-                .await?
-        }
-        StoreKind::Review => {
-            transaction
-                .execute(
-                    "DELETE FROM apsides_coordination_review_objects \
+            (),
+        )?,
+        StoreKind::Review => transaction.execute(
+            "DELETE FROM apsides_coordination_review_objects \
                      WHERE registry_uid='synthetic-crash-review'",
-                    (),
-                )
-                .await?
-        }
-        StoreKind::Audit => {
-            transaction
-                .execute(
-                    "DELETE FROM apsides_coordination_audits \
+            (),
+        )?,
+        StoreKind::Audit => transaction.execute(
+            "DELETE FROM apsides_coordination_audits \
                      WHERE registry_uid='synthetic-crash-audit'",
-                    (),
-                )
-                .await?
-        }
+            (),
+        )?,
     };
-    if deleted != SPILL_ROWS {
+    if deleted as u64 != SPILL_ROWS {
         return Err("coordination crash spill row count differs".into());
     }
     Ok(())
 }
 
-async fn verify_candidate_in_transaction(
-    transaction: &Transaction,
+fn verify_candidate_in_transaction(
+    transaction: &Transaction<'_>,
     kind: StoreKind,
     candidate: &RaceFixture,
 ) -> TestResult {
@@ -368,14 +327,14 @@ async fn verify_candidate_in_transaction(
             compiler_core::canonical_bytes(&candidate.left_audit)?,
         ),
     };
-    let mut rows = transaction.query(query, parameters).await?;
+    let mut statement = transaction.prepare(query)?;
+    let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
     let row = rows
-        .next()
-        .await?
+        .next()?
         .ok_or("coordination crash candidate is missing in its transaction")?;
-    if row.get::<String>(0)? != expected_digest
-        || row.get::<Vec<u8>>(1)? != expected_bytes
-        || rows.next().await?.is_some()
+    if row.get::<usize, String>(0)? != expected_digest
+        || row.get::<usize, Vec<u8>>(1)? != expected_bytes
+        || rows.next()?.is_some()
     {
         return Err("coordination crash candidate differs in its transaction".into());
     }
@@ -447,7 +406,7 @@ fn child_configuration() -> TestResult<(PathBuf, PathBuf, String, StoreKind)> {
     Ok((path, ready, nonce, kind))
 }
 
-async fn hold_uncommitted_candidate(
+fn hold_uncommitted_candidate(
     path: &Path,
     ready: &Path,
     nonce: &str,
@@ -455,23 +414,20 @@ async fn hold_uncommitted_candidate(
 ) -> TestResult {
     let prior = fixture()?;
     let candidate = race_fixture(&prior)?;
-    let database = Builder::new_local(path).build().await?;
-    let connection = database.connect()?;
-    configure_crash(&connection).await?;
-    seed_spill_rows(&connection, kind).await?;
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .await?;
-    insert_candidate(&transaction, kind, &candidate).await?;
-    delete_spill_rows(&transaction, kind).await?;
-    verify_candidate_in_transaction(&transaction, kind, &candidate).await?;
+    let mut connection = rusqlite::Connection::open(path)?;
+    configure_crash(&connection)?;
+    seed_spill_rows(&mut connection, kind)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    insert_candidate(&transaction, kind, &candidate)?;
+    delete_spill_rows(&transaction, kind)?;
+    verify_candidate_in_transaction(&transaction, kind, &candidate)?;
     let bytes = journal_bytes(path)?;
     write_ready(ready, nonce, kind, bytes)?;
     let deadline = Instant::now() + CHILD_TIMEOUT;
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
-    transaction.rollback().await?;
+    transaction.rollback()?;
     Err("coordination crash child was not terminated".into())
 }
 
@@ -531,7 +487,7 @@ fn wait_until_ready(
 }
 
 async fn verify_candidate_absent(
-    store: &LibsqlCoordination,
+    store: &SqliteCoordination,
     kind: StoreKind,
     candidate: &RaceFixture,
 ) -> TestResult {
@@ -549,29 +505,23 @@ async fn verify_candidate_absent(
     Ok(())
 }
 
-async fn verify_row_count(path: &Path, kind: StoreKind) -> TestResult {
-    let database = Builder::new_local(path).build().await?;
-    let connection = database.connect()?;
+fn verify_row_count(path: &Path, kind: StoreKind) -> TestResult {
+    let connection = rusqlite::Connection::open(path)?;
     let query = match kind {
         StoreKind::Claim => "SELECT count(*) FROM apsides_coordination_claims",
         StoreKind::Review => "SELECT count(*) FROM apsides_coordination_review_objects",
         StoreKind::Audit => "SELECT count(*) FROM apsides_coordination_audits",
     };
-    let mut rows = connection.query(query, ()).await?;
-    let count = rows
-        .next()
-        .await?
-        .ok_or("coordination crash recovered row count is missing")?
-        .get::<i64>(0)?;
+    let count = connection.query_one(query, [], |row| row.get::<usize, i64>(0))?;
     let expected = i64::try_from(SPILL_ROWS + 1)?;
-    if count != expected || rows.next().await?.is_some() {
+    if count != expected {
         return Err("coordination crash recovered row count differs".into());
     }
     Ok(())
 }
 
 async fn retry_candidate_twice(
-    store: &LibsqlCoordination,
+    store: &SqliteCoordination,
     kind: StoreKind,
     candidate: &RaceFixture,
 ) -> TestResult {
@@ -596,7 +546,7 @@ async fn retry_candidate_twice(
 }
 
 async fn verify_candidate_present(
-    store: &LibsqlCoordination,
+    store: &SqliteCoordination,
     kind: StoreKind,
     candidate: &RaceFixture,
 ) -> TestResult {
@@ -639,21 +589,21 @@ async fn run_crash_case(kind: StoreKind) -> TestResult {
     wait_until_ready(&mut child, &ready, &nonce, kind)?;
     child.kill_and_reap()?;
 
-    let recovery = LibsqlCoordination::open_local(&path).await?;
+    let recovery = SqliteCoordination::open_local(&path).await?;
     verify_reads(&recovery, &prior).await?;
     verify_candidate_absent(&recovery, kind, &candidate).await?;
     drop(recovery);
-    verify_row_count(&path, kind).await?;
+    verify_row_count(&path, kind)?;
 
-    let read_only = LibsqlCoordination::open_local_read_only(&path).await?;
+    let read_only = SqliteCoordination::open_local_read_only(&path).await?;
     verify_reads(&read_only, &prior).await?;
     verify_candidate_absent(&read_only, kind, &candidate).await?;
     drop(read_only);
 
-    let retry = LibsqlCoordination::open_local(&path).await?;
+    let retry = SqliteCoordination::open_local(&path).await?;
     retry_candidate_twice(&retry, kind, &candidate).await?;
     drop(retry);
-    let final_read = LibsqlCoordination::open_local_read_only(&path).await?;
+    let final_read = SqliteCoordination::open_local_read_only(&path).await?;
     verify_reads(&final_read, &prior).await?;
     verify_candidate_present(&final_read, kind, &candidate).await
 }
@@ -662,7 +612,7 @@ async fn run_crash_case(kind: StoreKind) -> TestResult {
 #[ignore = "invoked only as the bounded SIGKILL recovery child"]
 async fn local_coordination_sigkill_child() -> TestResult {
     let (path, ready, nonce, kind) = child_configuration()?;
-    hold_uncommitted_candidate(&path, &ready, &nonce, kind).await
+    hold_uncommitted_candidate(&path, &ready, &nonce, kind)
 }
 
 #[tokio::test]

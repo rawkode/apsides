@@ -159,7 +159,7 @@ pub fn snapshot_id(scope: &InventoryScope, snapshot: &InventorySnapshot) -> Resu
     compiler_core::digest(snapshot).map_err(|_| Error::Invalid("snapshot digest"))
 }
 
-#[cfg(feature = "libsql-backend")]
+#[cfg(feature = "sqlite-backend")]
 pub(crate) fn valid_digest(value: &str) -> bool {
     value.strip_prefix("sha256:").is_some_and(|hex| {
         hex.len() == 64

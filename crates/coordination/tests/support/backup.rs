@@ -1,10 +1,10 @@
 use super::*;
 use compiler_core::DeletionPolicy;
 use inventory::{
-    InventoryScope, InventorySnapshot, InventoryStore, LibsqlInventory, ResourceKey,
+    InventoryScope, InventorySnapshot, InventoryStore, ResourceKey, SqliteInventory,
     TrackedResource, VersionedInventory,
 };
-use libsql::{Builder, OpenFlags, params};
+use rusqlite::params;
 use serde::Serialize;
 use std::{fs::File, path::Path};
 
@@ -94,7 +94,7 @@ fn backup_fixture() -> TestResult<BackupFixture> {
     })
 }
 
-async fn vacuum_into(source: &Path, destination: &Path) -> TestResult {
+fn vacuum_into(source: &Path, destination: &Path) -> TestResult {
     if !source.is_absolute() || !destination.is_absolute() {
         return Err("coordination backup paths must be absolute".into());
     }
@@ -109,16 +109,10 @@ async fn vacuum_into(source: &Path, destination: &Path) -> TestResult {
     let destination_text = destination
         .to_str()
         .ok_or("coordination backup destination must be UTF-8")?;
-    let database = Builder::new_local(source)
-        .flags(OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .build()
-        .await?;
-    let connection = database.connect()?;
-    connection
-        .execute("VACUUM INTO ?1", params![destination_text])
-        .await?;
+    let connection =
+        rusqlite::Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.execute("VACUUM INTO ?1", params![destination_text])?;
     drop(connection);
-    drop(database);
     let backup = File::open(destination)?;
     backup.sync_all()?;
     drop(backup);
@@ -136,7 +130,7 @@ async fn seed_all(path: &Path, expected: &BackupFixture) -> TestResult {
     }
     seed(path, &expected.seed).await?;
     let scope = inventory_scope();
-    let store = LibsqlInventory::open_local(path).await?;
+    let store = SqliteInventory::open_local(path).await?;
     let first = store
         .publish(&scope, None, &expected.first_inventory)
         .await?;
@@ -153,7 +147,7 @@ async fn seed_all(path: &Path, expected: &BackupFixture) -> TestResult {
 }
 
 async fn verify_seed(path: &Path, expected: &BackupFixture) -> TestResult {
-    let coordination = LibsqlCoordination::open_local_read_only(path).await?;
+    let coordination = SqliteCoordination::open_local_read_only(path).await?;
     verify_reads(&coordination, &expected.seed).await?;
     if coordination
         .read_claims(&expected.later.claim_ref)
@@ -178,7 +172,7 @@ async fn verify_seed(path: &Path, expected: &BackupFixture) -> TestResult {
     {
         return Err("coordination backup contains later coordination metadata".into());
     }
-    let inventory = LibsqlInventory::open_local_read_only(path).await?;
+    let inventory = SqliteInventory::open_local_read_only(path).await?;
     let scope = inventory_scope();
     if inventory.load(&scope).await? != Some(expected.second_inventory_version.clone())
         || inventory
@@ -201,7 +195,7 @@ async fn verify_seed(path: &Path, expected: &BackupFixture) -> TestResult {
 
 async fn mutate_source(path: &Path, expected: &BackupFixture) -> TestResult {
     verify_seed(path, expected).await?;
-    let coordination = LibsqlCoordination::open_local(path).await?;
+    let coordination = SqliteCoordination::open_local(path).await?;
     if coordination.put_claims(&expected.later.claims).await? != expected.later.claim_ref
         || coordination.put_review(&expected.later.left_review).await?
             != expected.later.left_review_ref
@@ -210,7 +204,7 @@ async fn mutate_source(path: &Path, expected: &BackupFixture) -> TestResult {
     {
         return Err("coordination backup source mutation differs".into());
     }
-    let inventory = LibsqlInventory::open_local(path).await?;
+    let inventory = SqliteInventory::open_local(path).await?;
     let third = inventory
         .publish(
             &inventory_scope(),
@@ -226,7 +220,7 @@ async fn mutate_source(path: &Path, expected: &BackupFixture) -> TestResult {
 
 async fn verify_backup(path: &Path, expected: &BackupFixture) -> TestResult {
     verify_seed(path, expected).await?;
-    let coordination = LibsqlCoordination::open_local_read_only(path).await?;
+    let coordination = SqliteCoordination::open_local_read_only(path).await?;
     if !matches!(
         coordination.put_claims(&expected.seed.claims).await,
         Err(coordination::Error::Invalid("read-only coordination store"))
@@ -239,7 +233,7 @@ async fn verify_backup(path: &Path, expected: &BackupFixture) -> TestResult {
     ) {
         return Err("read-only coordination backup write was not rejected".into());
     }
-    let inventory = LibsqlInventory::open_local_read_only(path).await?;
+    let inventory = SqliteInventory::open_local_read_only(path).await?;
     if !matches!(
         inventory
             .publish(
@@ -296,7 +290,7 @@ pub(super) async fn execute_live(phase: Phase, nonce: &str) -> TestResult {
         Phase::BackupCreate => {
             verify_seed(source, &expected).await?;
             let destination = Path::new(LIVE_BACKUP_PATH);
-            vacuum_into(source, destination).await?;
+            vacuum_into(source, destination)?;
             verify_seed(destination, &expected).await?;
             emit_backup(phase, "created", "2", nonce, &expected)
         }
@@ -321,7 +315,7 @@ async fn local_vacuum_backup_reopens_all_four_stores_and_isolates_later_source_w
     let destination = directory.path().join("all-stores-'backup'.db");
     let expected = backup_fixture()?;
     seed_all(&source, &expected).await?;
-    vacuum_into(&source, &destination).await?;
+    vacuum_into(&source, &destination)?;
     mutate_source(&source, &expected).await?;
     verify_backup(&destination, &expected).await
 }
@@ -334,8 +328,7 @@ async fn local_vacuum_backup_rejects_a_nonempty_destination_without_repair() -> 
     seed_all(&source, &backup_fixture()?).await?;
     let original = b"existing-backup-canary";
     std::fs::write(&destination, original)?;
-    if vacuum_into(&source, &destination).await.is_ok() || std::fs::read(&destination)? != original
-    {
+    if vacuum_into(&source, &destination).is_ok() || std::fs::read(&destination)? != original {
         return Err("coordination backup replaced a nonempty destination".into());
     }
     Ok(())
@@ -345,11 +338,11 @@ async fn local_vacuum_backup_rejects_a_nonempty_destination_without_repair() -> 
 async fn read_only_backup_open_rejects_missing_and_truncated_files_without_repair() -> TestResult {
     let directory = tempfile::tempdir()?;
     let missing = directory.path().join("missing.db");
-    if LibsqlCoordination::open_local_read_only(&missing)
+    if SqliteCoordination::open_local_read_only(&missing)
         .await
         .is_ok()
         || missing.exists()
-        || LibsqlInventory::open_local_read_only(&missing)
+        || SqliteInventory::open_local_read_only(&missing)
             .await
             .is_ok()
         || missing.exists()
@@ -361,11 +354,11 @@ async fn read_only_backup_open_rejects_missing_and_truncated_files_without_repai
     let truncated = b"SQLite format 3\0truncated";
     std::fs::write(&truncated_coordination, truncated)?;
     std::fs::write(&truncated_inventory, truncated)?;
-    if LibsqlCoordination::open_local_read_only(&truncated_coordination)
+    if SqliteCoordination::open_local_read_only(&truncated_coordination)
         .await
         .is_ok()
         || std::fs::read(&truncated_coordination)? != truncated
-        || LibsqlInventory::open_local_read_only(&truncated_inventory)
+        || SqliteInventory::open_local_read_only(&truncated_inventory)
             .await
             .is_ok()
         || std::fs::read(&truncated_inventory)? != truncated
@@ -373,18 +366,15 @@ async fn read_only_backup_open_rejects_missing_and_truncated_files_without_repai
         return Err("read-only backup open repaired a truncated database".into());
     }
     let missing_schema = directory.path().join("missing-schema.db");
-    let database = Builder::new_local(&missing_schema).build().await?;
-    database
-        .connect()?
-        .execute("CREATE TABLE unrelated(value TEXT)", ())
-        .await?;
+    let database = rusqlite::Connection::open(&missing_schema)?;
+    database.execute("CREATE TABLE unrelated(value TEXT)", ())?;
     drop(database);
     let missing_schema_bytes = std::fs::read(&missing_schema)?;
-    if LibsqlCoordination::open_local_read_only(&missing_schema)
+    if SqliteCoordination::open_local_read_only(&missing_schema)
         .await
         .is_ok()
         || std::fs::read(&missing_schema)? != missing_schema_bytes
-        || LibsqlInventory::open_local_read_only(&missing_schema)
+        || SqliteInventory::open_local_read_only(&missing_schema)
             .await
             .is_ok()
         || std::fs::read(&missing_schema)? != missing_schema_bytes

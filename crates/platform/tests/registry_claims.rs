@@ -241,14 +241,14 @@ async fn protected_reference_survives_real_local_database_reopen() -> Result {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("metadata.db");
     {
-        let store = coordination::LibsqlCoordination::open_local(&path).await?;
+        let store = coordination::SqliteCoordination::open_local(&path).await?;
         assert_eq!(
             store.put_claims(&snapshot()).await?,
             snapshot().reference()?
         );
     }
     for _ in 0..2 {
-        let store = coordination::LibsqlCoordination::open_local(&path).await?;
+        let store = coordination::SqliteCoordination::open_local(&path).await?;
         let (client, calls) = client(Some(state()?), false);
         let platform = PlatformClient::new(client, "control", "workload", "cluster-a")?
             .with_claim_store(Arc::new(store))

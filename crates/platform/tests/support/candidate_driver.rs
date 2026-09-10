@@ -229,7 +229,7 @@ async fn report_committed_inventory(
     Ok(())
 }
 
-async fn claim_store() -> Result<Arc<coordination::LibsqlCoordination>> {
+async fn claim_store() -> Result<Arc<coordination::SqliteCoordination>> {
     let database = env::var("APSIDES_INVENTORY_DATABASE")?;
     let path = Path::new(&database);
     if !path.is_absolute() || env::var_os("APSIDES_INVENTORY_TOKEN").is_some() {
@@ -238,11 +238,11 @@ async fn claim_store() -> Result<Arc<coordination::LibsqlCoordination>> {
         );
     }
     Ok(Arc::new(
-        coordination::LibsqlCoordination::open_local(path).await?,
+        coordination::SqliteCoordination::open_local(path).await?,
     ))
 }
 
-async fn inventory_store() -> Result<inventory::LibsqlInventory> {
+async fn inventory_store() -> Result<inventory::SqliteInventory> {
     let database = env::var("APSIDES_INVENTORY_DATABASE")?;
     let path = Path::new(&database);
     if !path.is_absolute() || env::var_os("APSIDES_INVENTORY_TOKEN").is_some() {
@@ -250,7 +250,7 @@ async fn inventory_store() -> Result<inventory::LibsqlInventory> {
             "disposable lifecycle inventory requires an absolute local database path".into(),
         );
     }
-    Ok(inventory::LibsqlInventory::open_local(path).await?)
+    Ok(inventory::SqliteInventory::open_local(path).await?)
 }
 
 async fn reserve(

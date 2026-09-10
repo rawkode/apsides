@@ -1,11 +1,11 @@
-#![cfg(feature = "libsql-backend")]
+#![cfg(feature = "sqlite-backend")]
 //! Explicit disposable-PVC probe. This is storage evidence, not deployment authority.
 use compiler_core::{DeletionPolicy, Lifecycle, Resource, SourceLocation};
 use inventory::{
-    INVENTORY_SCHEMA, InventoryScope, InventorySnapshot, InventoryStore, LibsqlInventory,
-    MAX_SNAPSHOT_BYTES, TrackedResource, VersionedInventory, snapshot_id,
+    INVENTORY_SCHEMA, InventoryScope, InventorySnapshot, InventoryStore, MAX_SNAPSHOT_BYTES,
+    SqliteInventory, TrackedResource, VersionedInventory, snapshot_id,
 };
-use libsql::{Builder, Connection, TransactionBehavior, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 use serde::Serialize;
 use std::{
     io::Write,
@@ -160,14 +160,14 @@ fn emit(prefix: &str, report: &Report, nonce: &str) -> TestResult {
     Ok(())
 }
 
-async fn required_head(store: &LibsqlInventory) -> TestResult<VersionedInventory> {
+async fn required_head(store: &SqliteInventory) -> TestResult<VersionedInventory> {
     store
         .load(&scope())
         .await?
         .ok_or_else(|| "PVC inventory head missing".into())
 }
 
-async fn verify_history(store: &LibsqlInventory, raced: bool) -> TestResult<VersionedInventory> {
+async fn verify_history(store: &SqliteInventory, raced: bool) -> TestResult<VersionedInventory> {
     let head = required_head(store).await?;
     let expected_revision = if raced { "3" } else { "2" };
     if head.revision != expected_revision {
@@ -202,7 +202,7 @@ async fn verify_history(store: &LibsqlInventory, raced: bool) -> TestResult<Vers
 }
 
 async fn seed(path: &Path) -> TestResult<Report> {
-    let store = LibsqlInventory::open_local(path).await?;
+    let store = SqliteInventory::open_local(path).await?;
     if store.load(&scope()).await?.is_some() {
         return Err("PVC seed requires an empty scope".into());
     }
@@ -217,7 +217,7 @@ async fn seed(path: &Path) -> TestResult<Report> {
 }
 
 async fn race(path: &Path, phase: Phase, wait: bool, nonce: &str) -> TestResult<Report> {
-    let store = LibsqlInventory::open_local(path).await?;
+    let store = SqliteInventory::open_local(path).await?;
     if wait {
         let barrier = path.parent().ok_or("PVC parent missing")?.join("race-go");
         if barrier.exists() {
@@ -251,69 +251,58 @@ async fn race(path: &Path, phase: Phase, wait: bool, nonce: &str) -> TestResult<
 
 // Deliberately exercise OSS SQLite rollback against the current schema. This is
 // not an interruption inside InventoryStore::publish or a production fault hook.
-async fn mutate_uncommitted(connection: &Connection, head: &VersionedInventory) -> TestResult {
+fn mutate_uncommitted(connection: &Connection, head: &VersionedInventory) -> TestResult {
     let candidate = snapshot("crash-uncommitted", CRASH_COUNT);
     let candidate_id = snapshot_id(&scope(), &candidate)?;
     let bytes = candidate.encode(&scope())?;
-    let mut selected = connection
-        .query(
-            "SELECT scope FROM apsides_inventory_heads WHERE revision=3 AND digest=?1",
-            params![head.snapshot_id.clone()],
-        )
-        .await?;
+    let mut selected_statement = connection
+        .prepare("SELECT scope FROM apsides_inventory_heads WHERE revision=3 AND digest=?1")?;
+    let mut selected = selected_statement.query(params![head.snapshot_id.clone()])?;
     let scope_key = selected
-        .next()
-        .await?
+        .next()?
         .ok_or("PVC crash source head missing")?
-        .get::<String>(0)?;
-    if selected.next().await?.is_some() {
+        .get::<usize, String>(0)?;
+    if selected.next()?.is_some() {
         return Err("PVC crash source head ambiguous".into());
     }
     drop(selected);
-    connection
-        .execute(
-            "INSERT INTO apsides_inventory_snapshots(scope,digest,metadata) VALUES (?1,?2,?3)",
-            params![scope_key.clone(), candidate_id.clone(), bytes.clone()],
-        )
-        .await?;
+    connection.execute(
+        "INSERT INTO apsides_inventory_snapshots(scope,digest,metadata) VALUES (?1,?2,?3)",
+        params![scope_key, candidate_id, bytes],
+    )?;
     let count = connection.execute(
         "UPDATE apsides_inventory_heads SET revision=4,digest=?1 WHERE scope=?2 AND revision=3 AND digest=?3",
-        params![candidate_id.clone(), scope_key.clone(), head.snapshot_id.clone()],
-    ).await?;
+        params![candidate_id, scope_key, head.snapshot_id],
+    )?;
     if count != 1 {
         return Err("PVC crash mutation did not select exact head".into());
     }
-    let mut rows = connection.query(
+    let mut statement = connection.prepare(
         "SELECT h.revision,h.digest,s.metadata FROM apsides_inventory_heads h JOIN apsides_inventory_snapshots s ON h.scope=s.scope AND h.digest=s.digest WHERE h.scope=?1",
-        params![scope_key],
-    ).await?;
-    let row = rows
-        .next()
-        .await?
-        .ok_or("PVC crash transaction head missing")?;
-    if row.get::<i64>(0)? != 4
-        || row.get::<String>(1)? != candidate_id
-        || row.get::<Vec<u8>>(2)? != bytes
+    )?;
+    let mut rows = statement.query(params![scope_key])?;
+    let row = rows.next()?.ok_or("PVC crash transaction head missing")?;
+    if row.get::<usize, i64>(0)? != 4
+        || row.get::<usize, String>(1)? != candidate_id
+        || row.get::<usize, Vec<u8>>(2)? != bytes
     {
         return Err("PVC crash transaction mutation not observed".into());
     }
     Ok(())
 }
 
-async fn pragma_integer(connection: &Connection, query: &'static str) -> TestResult<i64> {
-    let mut rows = connection.query(query, ()).await?;
-    let row = rows.next().await?.ok_or("PVC durability setting missing")?;
-    Ok(row.get::<i64>(0)?)
+fn pragma_integer(connection: &Connection, query: &'static str) -> TestResult<i64> {
+    Ok(connection.query_one(query, [], |row| row.get::<usize, i64>(0))?)
 }
 
-async fn configure_crash(connection: &Connection) -> TestResult {
-    connection.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=8; PRAGMA cache_spill=8;").await?;
-    let mut rows = connection.query("PRAGMA journal_mode", ()).await?;
-    let row = rows.next().await?.ok_or("PVC journal setting missing")?;
-    if row.get::<String>(0)? != "delete"
-        || pragma_integer(connection, "PRAGMA synchronous").await? != 2
-        || pragma_integer(connection, "PRAGMA cache_size").await? != 8
-        || pragma_integer(connection, "PRAGMA cache_spill").await? != 8
+fn configure_crash(connection: &Connection) -> TestResult {
+    connection.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=8; PRAGMA cache_spill=8;")?;
+    let journal =
+        connection.query_one("PRAGMA journal_mode", [], |row| row.get::<usize, String>(0))?;
+    if journal != "delete"
+        || pragma_integer(connection, "PRAGMA synchronous")? != 2
+        || pragma_integer(connection, "PRAGMA cache_size")? != 8
+        || pragma_integer(connection, "PRAGMA cache_spill")? != 8
     {
         return Err("PVC crash durability profile differs".into());
     }
@@ -328,38 +317,46 @@ fn journal_bytes(path: &Path) -> TestResult<u64> {
     Ok(metadata.len())
 }
 
+/// Holds an uncommitted transaction open until the process is killed, so the
+/// connection is deliberately alive across the park. Only process termination
+/// ends it, and this test runs on a current-thread runtime.
+#[expect(
+    clippy::future_not_send,
+    reason = "the parked transaction is the fixture"
+)]
 async fn crash_ready(path: &Path, nonce: &str) -> TestResult<Report> {
-    let store = LibsqlInventory::open_local(path).await?;
+    let store = SqliteInventory::open_local(path).await?;
     let head = verify_history(&store, true).await?;
-    let database = Builder::new_local(path).build().await?;
-    let connection = database.connect()?;
-    configure_crash(&connection).await?;
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .await?;
-    mutate_uncommitted(&transaction, &head).await?;
+    let mut connection = rusqlite::Connection::open(path)?;
+    configure_crash(&connection)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    mutate_uncommitted(&transaction, &head)?;
     let mut checkpoint = report(Phase::CrashReady, "uncommitted", Some(&head))?;
     checkpoint.journal_bytes = Some(journal_bytes(path)?);
     emit("APS_STORAGE_CRASH_READY=", &checkpoint, nonce)?;
     std::future::pending::<()>().await;
     // Retain the live transaction across the park; only process termination ends it.
-    transaction.rollback().await?;
+    transaction.rollback()?;
     Err("PVC crash checkpoint unexpectedly resumed".into())
 }
 
+#[expect(
+    clippy::future_not_send,
+    reason = "dispatches to the parked crash fixture"
+)]
 async fn execute(path: &Path, phase: Phase, nonce: &str) -> TestResult<Report> {
     match phase {
         Phase::Seed => seed(path).await,
         Phase::RaceLeft | Phase::RaceRight => race(path, phase, true, nonce).await,
         Phase::CrashReady => crash_ready(path, nonce).await,
         Phase::Unavailable => {
-            if LibsqlInventory::open_local(path).await.is_ok() {
+            if SqliteInventory::open_local(path).await.is_ok() {
                 return Err("unavailable PVC unexpectedly opened".into());
             }
             report(phase, "rejected", None)
         }
         Phase::Verify | Phase::Recover => {
-            let store = LibsqlInventory::open_local(path).await?;
+            let store = SqliteInventory::open_local(path).await?;
             let head = verify_history(&store, phase == Phase::Recover).await?;
             report(phase, "verified", Some(&head))
         }
@@ -443,17 +440,14 @@ async fn local_probe_preserves_history_cas_and_uncommitted_rollback() -> TestRes
             .outcome,
         "conflict"
     );
-    let store = LibsqlInventory::open_local(&path).await?;
+    let store = SqliteInventory::open_local(&path).await?;
     let head = verify_history(&store, true).await?;
-    let database = Builder::new_local(&path).build().await?;
-    let connection = database.connect()?;
-    configure_crash(&connection).await?;
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .await?;
-    mutate_uncommitted(&transaction, &head).await?;
+    let mut connection = rusqlite::Connection::open(&path)?;
+    configure_crash(&connection)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    mutate_uncommitted(&transaction, &head)?;
     assert!(journal_bytes(&path)? > 512);
-    transaction.rollback().await?;
+    transaction.rollback()?;
     assert_eq!(
         execute(&path, Phase::Recover, TEST_NONCE)
             .await?

@@ -39,7 +39,7 @@ remain active wire names. TypeScript authoring uses `@apsides/compiler`.
 Reconciliation uses Kubernetes Server-Side Apply (SSA) only. Force is opt-in at
 the domain or resource level and remains subject to independent policy. Resource
 history is metadata-only inventory through an `InventoryStore` trait, with
-libSQL as the default local or remote backend. OCI is an optional way to
+SQLite as the default local backend. OCI is an optional way to
 distribute the new release; upgrades do not require retrieving historical OCI
 artifacts.
 

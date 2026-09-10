@@ -39,8 +39,8 @@ unimplemented = "deny"
 # Deliberate exceptions. Each is a lint we cannot satisfy without making the
 # code worse or breaking something outside this workspace.
 #
-# The dependency graph, not ours: kube pulls both hyper 0.14 and 1.x, and
-# rustls 0.22 and 0.23, through its tower stack.
+# The dependency graph, not ours: proc-macro crates in the kube and serde
+# derive chains still resolve both syn 2 and syn 3.
 multiple_crate_versions = "allow"
 # Every hit is a validation chain comparing deliberately asymmetric fields,
 # such as `ceiling.domain_id != domain.id` where `Domain`'s field is `id`.

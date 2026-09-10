@@ -7,34 +7,22 @@ license.workspace = true
 publish = false
 
 [features]
-default = ["libsql-backend"]
-libsql-backend = [
-  "dep:hyper",
-  "dep:hyper-rustls",
-  "dep:libsql",
-  "dep:rustls",
-  "dep:rustls-native-certs",
-  "dep:tower",
-  "dep:url",
-]
+default = ["sqlite-backend"]
+sqlite-backend = ["dep:rusqlite", "dep:tokio"]
 
 [dependencies]
 async-trait = "0.1"
-hyper = { version = "=0.14.32", default-features = false, features = ["client", "http1", "tcp"], optional = true }
-hyper-rustls = { version = "=0.25.0", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"], optional = true }
-libsql = { version = "=0.9.30", default-features = false, features = ["core", "remote", "tls"], optional = true }
 compiler-core = { path = "../compiler-core" }
-rustls = { version = "=0.22.4", default-features = false, features = ["ring", "tls12"], optional = true }
-rustls-native-certs = { version = "=0.7.3", optional = true }
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tower = { version = "=0.4.13", default-features = false, features = ["filter"], optional = true }
-url = { version = "2", optional = true }
+tokio = { version = "1", default-features = false, features = ["rt"], optional = true }
 
 [dev-dependencies]
 hyper = { version = "=0.14.32", default-features = false, features = ["server"] }
 rcgen = { version = "=0.14.8", default-features = false, features = ["crypto", "pem", "ring"] }
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
 tempfile = "3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = "=0.25.0"

@@ -1,4 +1,4 @@
-#![cfg(feature = "libsql-backend")]
+#![cfg(feature = "sqlite-backend")]
 
 use coordination::*;
 
@@ -92,21 +92,20 @@ fn private(error: &coordination::Error) {
     assert!(!error.to_string().contains(PRIVATE_CANARY));
 }
 
-async fn row_count(path: &std::path::Path, table: &str) -> TestResult<i64> {
-    let database = libsql::Builder::new_local(path).build().await?;
-    let connection = database.connect()?;
+fn row_count(path: &std::path::Path, table: &str) -> TestResult<i64> {
+    let connection = rusqlite::Connection::open(path)?;
     let query = match table {
         "apsides_coordination_review_objects" => {
             "SELECT count(*) FROM apsides_coordination_review_objects"
         }
         _ => return Err("unsupported review table fixture".into()),
     };
-    let mut rows = connection.query(query, ()).await?;
+    let mut rows_statement = connection.prepare(query)?;
+    let mut rows = rows_statement.query([])?;
     Ok(rows
-        .next()
-        .await?
+        .next()?
         .ok_or("review count row missing")?
-        .get::<i64>(0)?)
+        .get::<usize, i64>(0)?)
 }
 
 #[tokio::test]
@@ -115,21 +114,18 @@ async fn exact_review_write_is_idempotent_and_survives_local_reopen() -> TestRes
     let path = directory.path().join("coordination.db");
     let metadata = review("policy-a")?;
     let reference = {
-        let store = LibsqlCoordination::open_local(&path).await?;
+        let store = SqliteCoordination::open_local(&path).await?;
         let reference = store.put_review(&metadata).await?;
         assert_eq!(store.put_review(&metadata).await?, reference);
         reference
     };
 
-    let reopened = LibsqlCoordination::open_local(&path).await?;
+    let reopened = SqliteCoordination::open_local(&path).await?;
     assert_eq!(reopened.read_review(&reference).await?, Some(metadata));
     let mut missing = reference;
     missing.scope.domain_id = "other-domain".to_owned();
     assert_eq!(reopened.read_review(&missing).await?, None);
-    assert_eq!(
-        row_count(&path, "apsides_coordination_review_objects").await?,
-        1
-    );
+    assert_eq!(row_count(&path, "apsides_coordination_review_objects")?, 1);
     Ok(())
 }
 
@@ -137,7 +133,7 @@ async fn exact_review_write_is_idempotent_and_survives_local_reopen() -> TestRes
 async fn same_transition_scope_retains_distinct_content_addressed_reviews() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("coordination.db");
-    let store = LibsqlCoordination::open_local(&path).await?;
+    let store = SqliteCoordination::open_local(&path).await?;
     let original = review("policy-a")?;
     let original_reference = store.put_review(&original).await?;
     let subsequent = review("policy-b")?;
@@ -152,10 +148,7 @@ async fn same_transition_scope_retains_distinct_content_addressed_reviews() -> T
         store.read_review(&subsequent_reference).await?,
         Some(subsequent)
     );
-    assert_eq!(
-        row_count(&path, "apsides_coordination_review_objects").await?,
-        2
-    );
+    assert_eq!(row_count(&path, "apsides_coordination_review_objects")?, 2);
     Ok(())
 }
 
@@ -163,8 +156,8 @@ async fn same_transition_scope_retains_distinct_content_addressed_reviews() -> T
 async fn concurrent_distinct_reviews_for_one_scope_both_succeed() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("coordination.db");
-    let first_store = LibsqlCoordination::open_local(&path).await?;
-    let second_store = LibsqlCoordination::open_local(&path).await?;
+    let first_store = SqliteCoordination::open_local(&path).await?;
+    let second_store = SqliteCoordination::open_local(&path).await?;
     let first = review("policy-a")?;
     let second = review("policy-b")?;
     let (first_reference, second_reference) = tokio::join!(
@@ -174,13 +167,10 @@ async fn concurrent_distinct_reviews_for_one_scope_both_succeed() -> TestResult 
     let first_reference = first_reference?;
     let second_reference = second_reference?;
     assert_ne!(first_reference, second_reference);
-    let reopened = LibsqlCoordination::open_local(&path).await?;
+    let reopened = SqliteCoordination::open_local(&path).await?;
     assert_eq!(reopened.read_review(&first_reference).await?, Some(first));
     assert_eq!(reopened.read_review(&second_reference).await?, Some(second));
-    assert_eq!(
-        row_count(&path, "apsides_coordination_review_objects").await?,
-        2
-    );
+    assert_eq!(row_count(&path, "apsides_coordination_review_objects")?, 2);
     Ok(())
 }
 
@@ -190,33 +180,26 @@ enum Corruption {
     Sequence(String),
 }
 
-async fn corrupt_review_row(path: &std::path::Path, corruption: Corruption) -> TestResult {
-    let database = libsql::Builder::new_local(path).build().await?;
-    let connection = database.connect()?;
+fn corrupt_review_row(path: &std::path::Path, corruption: Corruption) -> TestResult {
+    let connection = rusqlite::Connection::open(path)?;
     match corruption {
         Corruption::Blob(bytes) => {
-            connection
-                .execute(
-                    "UPDATE apsides_coordination_review_objects SET metadata=?1",
-                    [bytes],
-                )
-                .await?;
+            connection.execute(
+                "UPDATE apsides_coordination_review_objects SET metadata=?1",
+                [bytes],
+            )?;
         }
         Corruption::Text(value) => {
-            connection
-                .execute(
-                    "UPDATE apsides_coordination_review_objects SET metadata=?1",
-                    [value],
-                )
-                .await?;
+            connection.execute(
+                "UPDATE apsides_coordination_review_objects SET metadata=?1",
+                [value],
+            )?;
         }
         Corruption::Sequence(value) => {
-            connection
-                .execute(
-                    "UPDATE apsides_coordination_review_objects SET sequence=?1",
-                    [value],
-                )
-                .await?;
+            connection.execute(
+                "UPDATE apsides_coordination_review_objects SET sequence=?1",
+                [value],
+            )?;
         }
     }
     Ok(())
@@ -227,12 +210,12 @@ async fn assert_corruption_rejected(corruption: Corruption) -> TestResult {
     let path = directory.path().join("coordination.db");
     let metadata = review("policy-a")?;
     let reference = {
-        let store = LibsqlCoordination::open_local(&path).await?;
+        let store = SqliteCoordination::open_local(&path).await?;
         store.put_review(&metadata).await?
     };
-    corrupt_review_row(&path, corruption).await?;
+    corrupt_review_row(&path, corruption)?;
 
-    let store = LibsqlCoordination::open_local(&path).await?;
+    let store = SqliteCoordination::open_local(&path).await?;
     let Err(read_error) = store.read_review(&reference).await else {
         return Err("corrupt review row was accepted".into());
     };
@@ -241,10 +224,7 @@ async fn assert_corruption_rejected(corruption: Corruption) -> TestResult {
         return Err("immutable review publication repaired a corrupt row".into());
     };
     private(&write_error);
-    assert_eq!(
-        row_count(&path, "apsides_coordination_review_objects").await?,
-        1
-    );
+    assert_eq!(row_count(&path, "apsides_coordination_review_objects")?, 1);
     Ok(())
 }
 
@@ -267,17 +247,14 @@ async fn changed_digest_is_a_missing_exact_key_and_does_not_block_republication(
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("coordination.db");
     let metadata = review("policy-a")?;
-    let store = LibsqlCoordination::open_local(&path).await?;
+    let store = SqliteCoordination::open_local(&path).await?;
     let reference = store.put_review(&metadata).await?;
     let changed_digest = format!("sha256:{}", "f".repeat(64));
-    let database = libsql::Builder::new_local(&path).build().await?;
-    database
-        .connect()?
-        .execute(
-            "UPDATE apsides_coordination_review_objects SET digest=?1 WHERE digest=?2",
-            libsql::params![changed_digest.clone(), reference.digest.clone()],
-        )
-        .await?;
+    let database = rusqlite::Connection::open(&path)?;
+    database.execute(
+        "UPDATE apsides_coordination_review_objects SET digest=?1 WHERE digest=?2",
+        rusqlite::params![changed_digest.clone(), reference.digest.clone()],
+    )?;
 
     assert_eq!(store.read_review(&reference).await?, None);
     let mut changed_reference = reference.clone();
@@ -288,10 +265,7 @@ async fn changed_digest_is_a_missing_exact_key_and_does_not_block_republication(
     ));
     assert_eq!(store.put_review(&metadata).await?, reference);
     assert_eq!(store.read_review(&reference).await?, Some(metadata));
-    assert_eq!(
-        row_count(&path, "apsides_coordination_review_objects").await?,
-        2
-    );
+    assert_eq!(row_count(&path, "apsides_coordination_review_objects")?, 2);
     Ok(())
 }
 
@@ -300,7 +274,7 @@ async fn scope_and_digest_substitution_are_rejected() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("coordination.db");
     let metadata = review("policy-a")?;
-    let store = LibsqlCoordination::open_local(&path).await?;
+    let store = SqliteCoordination::open_local(&path).await?;
     let reference = store.put_review(&metadata).await?;
 
     let mut forged_digest = reference.clone();
@@ -309,22 +283,19 @@ async fn scope_and_digest_substitution_are_rejected() -> TestResult {
 
     let mut forged_scope = reference.clone();
     forged_scope.scope.domain_id = "other-domain".to_owned();
-    let database = libsql::Builder::new_local(&path).build().await?;
-    let connection = database.connect()?;
-    connection
-        .execute(
-            "INSERT INTO apsides_coordination_review_objects(\
+    let connection = rusqlite::Connection::open(&path)?;
+    connection.execute(
+        "INSERT INTO apsides_coordination_review_objects(\
              registry_uid,cluster_binding,control_namespace,workload_namespace,\
              domain_id,transition_id,sequence,digest,metadata) \
              SELECT registry_uid,cluster_binding,control_namespace,workload_namespace,\
              ?1,transition_id,sequence,digest,metadata FROM apsides_coordination_review_objects \
              WHERE domain_id=?2",
-            libsql::params![
-                forged_scope.scope.domain_id.clone(),
-                reference.scope.domain_id.clone()
-            ],
-        )
-        .await?;
+        rusqlite::params![
+            forged_scope.scope.domain_id.clone(),
+            reference.scope.domain_id.clone()
+        ],
+    )?;
     let Err(error) = store.read_review(&forged_scope).await else {
         return Err("review body was accepted under a forged scope".into());
     };
@@ -337,7 +308,7 @@ async fn local_read_only_store_reads_without_creating_or_mutating_reviews() -> T
     let directory = tempfile::tempdir()?;
     let missing_path = directory.path().join("missing.db");
     assert!(
-        LibsqlCoordination::open_local_read_only(&missing_path)
+        SqliteCoordination::open_local_read_only(&missing_path)
             .await
             .is_err()
     );
@@ -346,10 +317,10 @@ async fn local_read_only_store_reads_without_creating_or_mutating_reviews() -> T
     let path = directory.path().join("coordination.db");
     let metadata = review("policy-a")?;
     let reference = {
-        let writable = LibsqlCoordination::open_local(&path).await?;
+        let writable = SqliteCoordination::open_local(&path).await?;
         writable.put_review(&metadata).await?
     };
-    let read_only = LibsqlCoordination::open_local_read_only(&path).await?;
+    let read_only = SqliteCoordination::open_local_read_only(&path).await?;
     assert_eq!(
         read_only.read_review(&reference).await?,
         Some(metadata.clone())
@@ -360,10 +331,7 @@ async fn local_read_only_store_reads_without_creating_or_mutating_reviews() -> T
         read_only.put_review(&invalid).await,
         Err(Error::Invalid("read-only coordination store"))
     ));
-    assert_eq!(
-        row_count(&path, "apsides_coordination_review_objects").await?,
-        1
-    );
+    assert_eq!(row_count(&path, "apsides_coordination_review_objects")?, 1);
     Ok(())
 }
 
@@ -371,18 +339,17 @@ async fn local_read_only_store_reads_without_creating_or_mutating_reviews() -> T
 async fn read_only_database_without_review_table_is_rejected_without_repair() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("missing-review-table.db");
-    let database = libsql::Builder::new_local(&path).build().await?;
+    let database = rusqlite::Connection::open(&path)?;
     database
-        .connect()?
+
         .execute_batch(
             "CREATE TABLE apsides_coordination_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);\
              INSERT INTO apsides_coordination_schema VALUES (1,1);\
              CREATE TABLE apsides_coordination_claims (digest TEXT PRIMARY KEY, metadata BLOB NOT NULL);\
              CREATE TABLE apsides_coordination_audits (digest TEXT PRIMARY KEY, metadata BLOB NOT NULL);",
-        )
-        .await?;
+        )?;
 
-    let read_only = LibsqlCoordination::open_local_read_only(&path).await?;
+    let read_only = SqliteCoordination::open_local_read_only(&path).await?;
     let reference = review("policy-a")?.reference()?;
     assert!(matches!(
         read_only.read_review(&reference).await,
@@ -392,19 +359,12 @@ async fn read_only_database_without_review_table_is_rejected_without_repair() ->
         read_only.put_review(&review("policy-a")?).await,
         Err(Error::Invalid("read-only coordination store"))
     ));
-    let mut rows = database
-        .connect()?
-        .query(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' \
-             AND name='apsides_coordination_review_objects'",
-            (),
-        )
-        .await?;
-    let count = rows
-        .next()
-        .await?
-        .ok_or("sqlite_master count row missing")?
-        .get::<i64>(0)?;
+    let count = database.query_one(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' \
+         AND name='apsides_coordination_review_objects'",
+        [],
+        |row| row.get::<usize, i64>(0),
+    )?;
     assert_eq!(count, 0);
     Ok(())
 }
@@ -436,24 +396,17 @@ async fn writable_open_rejects_malformed_review_tables_without_repair() -> TestR
     ];
     for (name, schema, expected_columns) in cases {
         let path = directory.path().join(name);
-        let database = libsql::Builder::new_local(&path).build().await?;
-        database.connect()?.execute_batch(schema).await?;
+        let database = rusqlite::Connection::open(&path)?;
+        database.execute_batch(schema)?;
         assert!(matches!(
-            LibsqlCoordination::open_local(&path).await,
+            SqliteCoordination::open_local(&path).await,
             Err(Error::Invalid("review table schema"))
         ));
-        let mut rows = database
-            .connect()?
-            .query(
-                "SELECT count(*) FROM pragma_table_info('apsides_coordination_review_objects')",
-                (),
-            )
-            .await?;
-        let actual_columns = rows
-            .next()
-            .await?
-            .ok_or("review table column count row missing")?
-            .get::<i64>(0)?;
+        let actual_columns = database.query_one(
+            "SELECT count(*) FROM pragma_table_info('apsides_coordination_review_objects')",
+            [],
+            |row| row.get::<usize, i64>(0),
+        )?;
         assert_eq!(actual_columns, expected_columns);
     }
     Ok(())

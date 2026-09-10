@@ -151,7 +151,7 @@ def pod_storage_contract(value):
 class StorageRunner:
     PACKAGE = "inventory"
     RESULT_SCHEMA = "apsides.dev/storage-restart-qualification/v1"
-    SCOPE = "local-libsql-on-kind-local-pv-sigkill-reopen"
+    SCOPE = "local-sqlite-on-kind-local-pv-sigkill-reopen"
     BOUNDARY = "static local PV backed by the owned kind node; no CSI, node-failure, power-loss, Turso, fencing, or interruption-inside-publish claim"
 
     def __init__(self, arguments):

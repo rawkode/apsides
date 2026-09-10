@@ -1,4 +1,4 @@
-#![cfg(feature = "libsql-backend")]
+#![cfg(feature = "sqlite-backend")]
 
 use coordination::*;
 use deploy::{CleanupOutcome, OwnershipAction, ResourceIdentity};
@@ -139,16 +139,16 @@ async fn immutable_audit_chain_survives_real_local_reopen() -> TestResult {
     let path = directory.path().join("coordination.db");
     let first = audit(1, None)?;
     let first_reference = {
-        let store = LibsqlCoordination::open_local(&path).await?;
+        let store = SqliteCoordination::open_local(&path).await?;
         store.put_audit(&first).await?
     };
     let second = audit(2, Some(first_reference.clone()))?;
     let second_reference = {
-        let store = LibsqlCoordination::open_local(&path).await?;
+        let store = SqliteCoordination::open_local(&path).await?;
         store.put_audit(&second).await?
     };
 
-    let reopened = LibsqlCoordination::open_local(&path).await?;
+    let reopened = SqliteCoordination::open_local(&path).await?;
     assert_eq!(reopened.read_audit(&first_reference).await?, Some(first));
     assert_eq!(reopened.read_audit(&second_reference).await?, Some(second));
     assert_eq!(reopened.read_audit(&missing_reference(3)?).await?, None);
@@ -158,7 +158,7 @@ async fn immutable_audit_chain_survives_real_local_reopen() -> TestResult {
 #[tokio::test]
 async fn repeated_write_is_idempotent_but_same_transition_conflict_is_rejected() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let store = LibsqlCoordination::open_local(&directory.path().join("coordination.db")).await?;
+    let store = SqliteCoordination::open_local(&directory.path().join("coordination.db")).await?;
     let original = audit(1, None)?;
     let reference = store.put_audit(&original).await?;
     assert_eq!(store.put_audit(&original).await?, reference);
@@ -177,22 +177,19 @@ async fn repeated_write_is_idempotent_but_same_transition_conflict_is_rejected()
 async fn corrupt_existing_audit_is_an_error_and_diagnostics_are_private() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("coordination.db");
-    let store = LibsqlCoordination::open_local(&path).await?;
+    let store = SqliteCoordination::open_local(&path).await?;
     let audit = audit(1, None)?;
     let reference = store.put_audit(&audit).await?;
     let canonical = String::from_utf8(compiler_core::canonical_bytes(&audit)?)?;
     let corrupted = canonical.replace("ci_job_1", PRIVATE_CANARY);
-    let database = libsql::Builder::new_local(&path).build().await?;
-    database
-        .connect()?
-        .execute(
-            "UPDATE apsides_coordination_audits SET metadata=?1 WHERE transition_id=?2",
-            libsql::params![
-                corrupted.into_bytes(),
-                reference.scope.transition_id.clone()
-            ],
-        )
-        .await?;
+    let database = rusqlite::Connection::open(&path)?;
+    database.execute(
+        "UPDATE apsides_coordination_audits SET metadata=?1 WHERE transition_id=?2",
+        rusqlite::params![
+            corrupted.into_bytes(),
+            reference.scope.transition_id.clone()
+        ],
+    )?;
 
     let Err(error) = store.read_audit(&reference).await else {
         return Err("corrupt audit row was accepted".into());
@@ -330,7 +327,7 @@ async fn local_read_only_open_never_creates_or_mutates_coordination_state() -> T
     let directory = tempfile::tempdir()?;
     let missing_path = directory.path().join("missing.db");
     assert!(
-        LibsqlCoordination::open_local_read_only(&missing_path)
+        SqliteCoordination::open_local_read_only(&missing_path)
             .await
             .is_err()
     );
@@ -339,10 +336,10 @@ async fn local_read_only_open_never_creates_or_mutates_coordination_state() -> T
     let path = directory.path().join("coordination.db");
     let original = audit(1, None)?;
     let reference = {
-        let writable = LibsqlCoordination::open_local(&path).await?;
+        let writable = SqliteCoordination::open_local(&path).await?;
         writable.put_audit(&original).await?
     };
-    let read_only = LibsqlCoordination::open_local_read_only(&path).await?;
+    let read_only = SqliteCoordination::open_local_read_only(&path).await?;
     assert_eq!(read_only.read_audit(&reference).await?, Some(original));
     assert!(matches!(
         read_only.put_audit(&audit(2, Some(reference))?).await,
@@ -364,61 +361,44 @@ async fn local_read_only_open_never_creates_or_mutates_coordination_state() -> T
 async fn read_only_open_rejects_schema_or_table_mismatch_without_repair() -> TestResult {
     let directory = tempfile::tempdir()?;
     let incomplete_path = directory.path().join("incomplete.db");
-    let incomplete_database = libsql::Builder::new_local(&incomplete_path).build().await?;
+    let incomplete_database = rusqlite::Connection::open(&incomplete_path)?;
     incomplete_database
-        .connect()?
+
         .execute_batch(
             "CREATE TABLE apsides_coordination_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);\
              INSERT INTO apsides_coordination_schema VALUES (1,1);\
              CREATE TABLE apsides_coordination_claims (digest TEXT PRIMARY KEY, metadata BLOB NOT NULL);",
-        )
-        .await?;
+        )?;
     assert!(
-        LibsqlCoordination::open_local_read_only(&incomplete_path)
+        SqliteCoordination::open_local_read_only(&incomplete_path)
             .await
             .is_err()
     );
-    let mut rows = incomplete_database
-        .connect()?
-        .query(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='apsides_coordination_audits'",
-            (),
-        )
-        .await?;
+    let mut rows_statement = incomplete_database.prepare("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='apsides_coordination_audits'")?;
+    let mut rows = rows_statement.query([])?;
     let count = rows
-        .next()
-        .await?
+        .next()?
         .ok_or("sqlite_master count row missing")?
-        .get::<i64>(0)?;
+        .get::<usize, i64>(0)?;
     assert_eq!(count, 0);
 
     let mismatch_path = directory.path().join("mismatch.db");
-    LibsqlCoordination::open_local(&mismatch_path).await?;
-    let mismatch_database = libsql::Builder::new_local(&mismatch_path).build().await?;
-    mismatch_database
-        .connect()?
-        .execute(
-            "UPDATE apsides_coordination_schema SET version=2 WHERE id=1",
-            (),
-        )
-        .await?;
+    SqliteCoordination::open_local(&mismatch_path).await?;
+    let mismatch_database = rusqlite::Connection::open(&mismatch_path)?;
+    mismatch_database.execute(
+        "UPDATE apsides_coordination_schema SET version=2 WHERE id=1",
+        (),
+    )?;
     assert!(
-        LibsqlCoordination::open_local_read_only(&mismatch_path)
+        SqliteCoordination::open_local_read_only(&mismatch_path)
             .await
             .is_err()
     );
-    let mut rows = mismatch_database
-        .connect()?
-        .query(
-            "SELECT version FROM apsides_coordination_schema WHERE id=1",
-            (),
-        )
-        .await?;
-    let version = rows
-        .next()
-        .await?
-        .ok_or("schema version row missing")?
-        .get::<i64>(0)?;
+    let version = mismatch_database.query_one(
+        "SELECT version FROM apsides_coordination_schema WHERE id=1",
+        [],
+        |row| row.get::<usize, i64>(0),
+    )?;
     assert_eq!(version, 2);
     Ok(())
 }

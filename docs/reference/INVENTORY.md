@@ -1,8 +1,8 @@
 # Resource inventory
 
 `inventory::InventoryStore` is the metadata-only boundary for resource history.
-The default backend is libSQL, using either a persistent local file or a remote
-TLS libSQL/Turso primary. The same configured database hosts separate immutable
+The default backend is SQLite, using a persistent local file on
+application-owned storage. The same configured database hosts separate immutable
 claim, review and audit records; those records do not grant each other authority.
 
 ## Stored data
@@ -20,33 +20,23 @@ on every read, including results returned by a backend implementation.
 
 ## Deployment connection
 
-Set `APSIDES_INVENTORY_DATABASE` to an absolute persistent local path or to an
-approved `libsql://` or `https://` endpoint. Remote access also requires
-`APSIDES_INVENTORY_TOKEN`. URLs, tokens and database paths are deployment
-configuration; they are not serialized into registry, inventory or review data.
+Set `APSIDES_INVENTORY_DATABASE` to an absolute persistent local path. Database
+paths are deployment configuration; they are not serialized into registry,
+inventory or review data, and a rejected path is never echoed in the error.
 
-Both store backends validate remote configuration before creating a client:
-endpoints must use `https` or `libsql`, contain a host and no embedded credentials,
-query, fragment or non-root path, and fit within 2,048 bytes. Tokens must contain
-1–8,192 bytes. Control characters are rejected, and errors omit supplied values.
-Both backends also filter every connection URI before the TLS connector: only
-HTTPS reaches the dialer, including requests directed by a server-returned
-libSQL `base_url`. Native certificate validation remains enabled; failure to load
-any usable native roots returns a closed error. This guard does not establish
-bounded response handling or remote recovery behavior.
-
-A controlled real-client test completes an authenticated TLS transaction start,
-then rejects the server's HTTP continuation before it reaches a plaintext
-listener. Its unguarded control reaches that listener. The fixture uses its own
-test certificate; it does not qualify a live Turso deployment or host trust store.
+There is no remote endpoint. Publication compares and sets the head revision
+inside one immediate transaction and then reads the committed body back, which
+requires reads to observe the last commit. A local database gives that; an
+eventually consistent replica does not. `APSIDES_INVENTORY_TOKEN` is refused
+rather than ignored, so a configuration written for a remote primary fails
+closed instead of silently opening a local file.
 
 Writable deployment initialization creates and validates the required tables.
-Inventory and coordination expose local and remote read-only openers without DDL
-or repair. These client guards do not replace server-side credential restrictions.
+Inventory and coordination expose read-only openers without DDL or repair.
 Missing tables, malformed schema, corrupt rows, foreign scope and oversized records
 fail closed.
 
-`LibsqlInventory::open_local_read_only` opens an existing local database with
+`SqliteInventory::open_local_read_only` opens an existing local database with
 SQLite read-only flags. It checks the supported version and required columns
 without initialization or repair; reads still validate each requested record.
 Publication through that handle rejects before serialization or SQL. Missing
@@ -115,7 +105,7 @@ cluster and isolated kubeconfig. Its static local PV uses the disposable node's
 filesystem. It checks inventory larger than 1 MiB, retained snapshots across Pods,
 concurrent conditional publication, rollback after a writer SIGKILL, and read-only
 storage refusal. This does not qualify CSI storage, node or power failure, remote
-Turso, writer fencing, or interruption inside inventory publication. Build outputs
+writer fencing, or interruption inside inventory publication. Build outputs
 and results remain ignored; the image is a test artifact, not a production release.
 
 The local-PV qualification passed with a 2,220,976-byte canonical inventory,
@@ -140,7 +130,7 @@ cuenv exec python3 tests/run_coordination_restart.py --image-directory work/coor
 ```
 
 Local backup tests (`cuenv task coordinationProbeTest`) seed all four stores in
-one database and use parameterized libSQL `VACUUM INTO` to create one standalone
+one database and use parameterized SQLite `VACUUM INTO` to create one standalone
 backup. They synchronize the completed file and its parent directory, reopen it
 through both read-only backends, verify exact records and inventory history, and
 check that later source writes are absent. Existing destinations are refused;
@@ -162,7 +152,7 @@ cuenv exec python3 tests/run_storage_backup.py --image-directory work/coordinati
 Canonical state and completion-envelope budgets reject oversized records before
 publication. The implementation does not provide snapshot garbage collection,
 cross-executor takeover, automatic recovery for missing authority, or completed
-live qualification of remote Turso recovery or persistent-volume recovery for
+live qualification of persistent-volume recovery for
 claim, review and audit stores after interrupted writes.
 
 See [Inventory, prune and upgrades](/concepts/inventory-prune-upgrades/),

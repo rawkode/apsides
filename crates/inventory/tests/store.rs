@@ -1,4 +1,4 @@
-#![cfg(feature = "libsql-backend")]
+#![cfg(feature = "sqlite-backend")]
 use compiler_core::DeletionPolicy;
 use inventory::*;
 
@@ -39,10 +39,10 @@ async fn large_snapshot_survives_reopen_and_preserves_history() -> TestResult {
     let first = snapshot("first", 12000);
     assert!(first.encode(&scope())?.len() > 1024 * 1024);
     let stored = {
-        let store = LibsqlInventory::open_local(&path).await?;
+        let store = SqliteInventory::open_local(&path).await?;
         store.publish(&scope(), None, &first).await?
     };
-    let store: Box<dyn InventoryStore> = Box::new(LibsqlInventory::open_local(&path).await?);
+    let store: Box<dyn InventoryStore> = Box::new(SqliteInventory::open_local(&path).await?);
     assert_eq!(
         store
             .load(&scope())
@@ -76,8 +76,8 @@ async fn large_snapshot_survives_reopen_and_preserves_history() -> TestResult {
 async fn competing_publishers_cannot_overwrite_a_changed_head() -> TestResult {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("inventory.db");
-    let a = LibsqlInventory::open_local(&path).await?;
-    let b = LibsqlInventory::open_local(&path).await?;
+    let a = SqliteInventory::open_local(&path).await?;
+    let b = SqliteInventory::open_local(&path).await?;
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
     let other_barrier = barrier.clone();
     let left = tokio::spawn(async move {
@@ -98,16 +98,14 @@ async fn competing_publishers_cannot_overwrite_a_changed_head() -> TestResult {
 async fn corruption_rejects_reads_and_idempotent_publication() -> TestResult {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("inventory.db");
-    let store = LibsqlInventory::open_local(&path).await?;
+    let store = SqliteInventory::open_local(&path).await?;
     let first = snapshot("first", 1);
     store.publish(&scope(), None, &first).await?;
-    let db = libsql::Builder::new_local(&path).build().await?;
-    db.connect()?
-        .execute(
-            "UPDATE apsides_inventory_snapshots SET metadata=x'7b7d'",
-            (),
-        )
-        .await?;
+    let db = rusqlite::Connection::open(&path)?;
+    db.execute(
+        "UPDATE apsides_inventory_snapshots SET metadata=x'7b7d'",
+        (),
+    )?;
     assert!(matches!(store.load(&scope()).await, Err(Error::Invalid(_))));
     assert!(matches!(
         store.publish(&scope(), None, &first).await,
@@ -152,19 +150,18 @@ fn projection_excludes_private_values_and_rejects_unknown_fields() -> TestResult
 async fn unsupported_schema_is_not_migrated_or_partially_initialized() -> TestResult {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("inventory.db");
-    let db = libsql::Builder::new_local(&path).build().await?;
-    let connection = db.connect()?;
-    connection.execute_batch("CREATE TABLE apsides_inventory_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO apsides_inventory_schema VALUES (1,99);").await?;
+    let connection = rusqlite::Connection::open(&path)?;
+    connection.execute_batch("CREATE TABLE apsides_inventory_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO apsides_inventory_schema VALUES (1,99);")?;
     assert!(matches!(
-        LibsqlInventory::open_local(&path).await,
+        SqliteInventory::open_local(&path).await,
         Err(Error::Invalid(_))
     ));
-    let mut rows = connection.query("SELECT count(*) FROM sqlite_master WHERE name IN ('apsides_inventory_heads','apsides_inventory_snapshots')", ()).await?;
     assert_eq!(
-        rows.next()
-            .await?
-            .ok_or("count query returned no row")?
-            .get::<i64>(0)?,
+        connection.query_one(
+            "SELECT count(*) FROM sqlite_master WHERE name IN ('apsides_inventory_heads','apsides_inventory_snapshots')",
+            [],
+            |row| row.get::<usize, i64>(0),
+        )?,
         0
     );
     Ok(())

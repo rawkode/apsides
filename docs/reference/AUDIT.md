@@ -3,7 +3,7 @@
 The protected namespace registry retains each domain's current committed
 transition and at most one unfinished transition. Before a successor replaces the
 committed record, deployment archives that predecessor through `AuditStore`. The
-default libSQL/Turso backend shares the configured metadata database with claims,
+default SQLite backend shares the configured metadata database with claims,
 reviews and inventory through separate typed tables.
 
 Audit records contain registry scope, canonical allocation identities and
@@ -41,7 +41,7 @@ apsides audit \
 ```
 
 `APSIDES_INVENTORY_DATABASE` selects the existing absolute local database or TLS
-libSQL endpoint. `APSIDES_INVENTORY_TOKEN` supplies remote authentication. The
+local database path. The
 command does not initialize or repair tables: local SQLite opens read-only and
 remote access performs SELECTs against an existing validated schema.
 

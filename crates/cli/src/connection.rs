@@ -1,51 +1,38 @@
 //! Deployment connection configuration never enters resource inventory records.
 use crate::Result;
-use inventory::{InventoryScope, InventoryStore, LibsqlInventory, VersionedInventory};
+use inventory::{InventoryScope, InventoryStore, SqliteInventory, VersionedInventory};
 use platform::{NamespaceRegistry, PlatformClient};
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn connect() -> Result<Box<dyn InventoryStore>> {
-    let (database, token) = configuration()?;
-    open(&database, token).await
+    open(&database_path()?).await
 }
 
 /// Claim and audit coordination share the configured persistent metadata database, using
 /// separate immutable tables. These credentials are never passed to the runtime.
-pub async fn connect_coordination() -> Result<Arc<coordination::LibsqlCoordination>> {
+pub async fn connect_coordination() -> Result<Arc<coordination::SqliteCoordination>> {
     open_coordination(false).await
 }
 
-pub async fn connect_audit_reader() -> Result<Arc<coordination::LibsqlCoordination>> {
+pub async fn connect_audit_reader() -> Result<Arc<coordination::SqliteCoordination>> {
     open_coordination(true).await
 }
 
-async fn open_coordination(read_only: bool) -> Result<Arc<coordination::LibsqlCoordination>> {
-    let (database, token) = configuration()?;
+async fn open_coordination(read_only: bool) -> Result<Arc<coordination::SqliteCoordination>> {
+    let database = database_path()?;
     let store = tokio::time::timeout(TIMEOUT, async {
-        if Path::new(&database).is_absolute() {
-            if token.is_some() {
-                return Err("local coordination does not accept a remote token".into());
-            }
-            if read_only {
-                Ok(
-                    coordination::LibsqlCoordination::open_local_read_only(Path::new(&database))
-                        .await?,
-                )
-            } else {
-                Ok(coordination::LibsqlCoordination::open_local(Path::new(&database)).await?)
-            }
+        if read_only {
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                coordination::SqliteCoordination::open_local_read_only(&database).await?,
+            )
         } else {
-            let token = token.ok_or("remote coordination requires APSIDES_INVENTORY_TOKEN")?;
-            if read_only {
-                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
-                    coordination::LibsqlCoordination::open_remote_read_only(database, token)
-                        .await?,
-                )
-            } else {
-                Ok(coordination::LibsqlCoordination::open_remote(database, token).await?)
-            }
+            Ok(coordination::SqliteCoordination::open_local(&database).await?)
         }
     })
     .await
@@ -53,52 +40,37 @@ async fn open_coordination(read_only: bool) -> Result<Arc<coordination::LibsqlCo
     Ok(Arc::new(store))
 }
 
-fn configuration() -> Result<(String, Option<String>)> {
-    let database = std::env::var("APSIDES_INVENTORY_DATABASE").map_err(
-        |_| "set APSIDES_INVENTORY_DATABASE to a persistent absolute path or TLS libSQL endpoint",
-    )?;
-    let token = match std::env::var("APSIDES_INVENTORY_TOKEN") {
-        Ok(value) => Some(value),
-        Err(std::env::VarError::NotPresent) => None,
-        Err(_) => return Err("inventory token must be valid UTF-8".into()),
-    };
-    Ok((database, token))
+/// The metadata database is one absolute path on application-owned storage.
+///
+/// There is no remote endpoint: the compare-and-set publication protocol reads
+/// back what it just committed, which a replica cannot promise.
+fn database_path() -> Result<PathBuf> {
+    configured_path(
+        std::env::var("APSIDES_INVENTORY_DATABASE").ok().as_deref(),
+        std::env::var_os("APSIDES_INVENTORY_TOKEN").is_some(),
+    )
 }
 
-async fn open(database: &str, token: Option<String>) -> Result<Box<dyn InventoryStore>> {
-    let store = tokio::time::timeout(TIMEOUT, async {
-        if Path::new(database).is_absolute() {
-            if token.is_some() {
-                return Err("local inventory does not accept a remote token".into());
-            }
-            Ok(LibsqlInventory::open_local(Path::new(database)).await?)
-        } else {
-            let endpoint = url::Url::parse(database).map_err(|_| "invalid inventory endpoint")?;
-            if !matches!(endpoint.scheme(), "https" | "libsql")
-                || endpoint.host_str().is_none()
-                || !endpoint.username().is_empty()
-                || endpoint.password().is_some()
-                || endpoint.query().is_some()
-                || endpoint.fragment().is_some()
-                || !matches!(endpoint.path(), "" | "/")
-            {
-                return Err(
-                    "inventory endpoint must use TLS and contain no credentials, query, or path"
-                        .into(),
-                );
-            }
-            let token = token
-                .filter(|value| {
-                    !value.is_empty() && value.len() <= 8192 && !value.chars().any(char::is_control)
-                })
-                .ok_or("remote inventory requires APSIDES_INVENTORY_TOKEN")?;
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
-                LibsqlInventory::open_remote(database.into(), token).await?,
-            )
-        }
-    })
-    .await
-    .map_err(|_| "inventory connection timed out")??;
+fn configured_path(database: Option<&str>, token_present: bool) -> Result<PathBuf> {
+    let database =
+        database.ok_or("set APSIDES_INVENTORY_DATABASE to a persistent absolute path")?;
+    let path = PathBuf::from(database);
+    if !path.is_absolute() {
+        return Err("APSIDES_INVENTORY_DATABASE must be an absolute path".into());
+    }
+    if token_present {
+        return Err(
+            "APSIDES_INVENTORY_TOKEN is not accepted; the metadata store is a local database"
+                .into(),
+        );
+    }
+    Ok(path)
+}
+
+async fn open(database: &Path) -> Result<Box<dyn InventoryStore>> {
+    let store = tokio::time::timeout(TIMEOUT, SqliteInventory::open_local(database))
+        .await
+        .map_err(|_| "inventory connection timed out")??;
     Ok(Box::new(store))
 }
 
@@ -203,8 +175,7 @@ mod tests {
     async fn local_connection_reopens_and_requires_exact_predecessor() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("inventory.db");
-        let path = path.to_str().ok_or("test path must be UTF-8")?;
-        let store = open(path, None).await?;
+        let store = open(&path).await?;
         require_head(store.as_ref(), &domain(), None).await?;
         assert!(
             require_head(store.as_ref(), &domain(), Some("g1"))
@@ -228,7 +199,7 @@ mod tests {
             )
             .await?;
         drop(store);
-        let store = open(path, None).await?;
+        let store = open(&path).await?;
         require_head(store.as_ref(), &domain(), Some("g1")).await?;
         assert!(require_head(store.as_ref(), &domain(), None).await.is_err());
         assert!(
@@ -237,33 +208,30 @@ mod tests {
                 .is_err()
         );
         drop(store);
-        std::fs::write(path, b"corrupt database")?;
-        assert!(open(path, None).await.is_err());
+        std::fs::write(&path, b"corrupt database")?;
+        assert!(open(&path).await.is_err());
         Ok(())
     }
 
-    #[tokio::test]
-    async fn invalid_connection_configuration_is_rejected_without_secrets() -> Result<()> {
+    #[test]
+    fn configuration_is_local_only_and_never_echoes_its_value() -> Result<()> {
+        // The store is a local database; there is no endpoint and no token.
         for (database, token) in [
-            ("relative.db", None),
-            ("http://example.invalid", Some("private-token".into())),
-            (
-                "https://private-user:private-password@example.invalid",
-                Some("private-token".into()),
-            ),
-            (
-                "libsql://example.invalid?token=private-value",
-                Some("private-token".into()),
-            ),
-            ("https://example.invalid/path", Some("private-token".into())),
-            ("libsql://example.invalid", None),
-            ("/unused-inventory.db", Some("private-token".into())),
+            (Some("private-relative.db"), false),
+            (Some("libsql://private-host.invalid"), false),
+            (Some("https://private-host.invalid"), true),
+            (Some("/unused-inventory.db"), true),
+            (None, false),
         ] {
-            let Err(error) = open(database, token).await else {
+            let Err(error) = configured_path(database, token) else {
                 return Err("invalid configuration accepted".into());
             };
-            assert!(!error.to_string().contains("private-"));
+            assert!(!error.to_string().contains("private-"), "{error}");
         }
+        assert_eq!(
+            configured_path(Some("/var/lib/apsides/inventory.db"), false)?,
+            PathBuf::from("/var/lib/apsides/inventory.db")
+        );
         Ok(())
     }
 }

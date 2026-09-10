@@ -2274,7 +2274,7 @@ fn committed_inventory_fixture()
 #[tokio::test]
 async fn committed_inventory_persists_metadata_and_retries_after_reopen()
 -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use inventory::{InventoryStore, LibsqlInventory};
+    use inventory::{InventoryStore, SqliteInventory};
     let registry = committed_inventory_fixture()?;
     let policy = policy(&registry.plan(TRANSITION_A)?.request.next.compiled);
     let response = registry_object(&registry, REGISTRY_UID, "42")?;
@@ -2286,7 +2286,7 @@ async fn committed_inventory_persists_metadata_and_retries_after_reopen()
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("inventory.db");
     let stored = {
-        let store = LibsqlInventory::open_local(&path).await?;
+        let store = SqliteInventory::open_local(&path).await?;
         platform
             .publish_committed_inventory(&store, TRANSITION_A, "executor-a")
             .await?
@@ -2295,7 +2295,7 @@ async fn committed_inventory_persists_metadata_and_retries_after_reopen()
         stored.snapshot.resources[0].uid.as_deref(),
         Some("observed-uid")
     );
-    let reopened = LibsqlInventory::open_local(&path).await?;
+    let reopened = SqliteInventory::open_local(&path).await?;
     assert_eq!(
         platform
             .publish_committed_inventory(&reopened, TRANSITION_A, "executor-a")
@@ -2332,7 +2332,7 @@ async fn committed_inventory_persists_metadata_and_retries_after_reopen()
 #[tokio::test]
 async fn registry_races_do_not_report_inventory_completion()
 -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use inventory::{InventoryStore, LibsqlInventory};
+    use inventory::{InventoryStore, SqliteInventory};
     let registry = committed_inventory_fixture()?;
     let scope =
         deploy::generation_inventory(&registry.plan(TRANSITION_A)?.request.next, &registry.claims)?
@@ -2347,7 +2347,7 @@ async fn registry_races_do_not_report_inventory_completion()
     )?;
     for after_commit in [false, true] {
         let directory = tempfile::tempdir()?;
-        let store = LibsqlInventory::open_local(&directory.path().join("inventory.db")).await?;
+        let store = SqliteInventory::open_local(&directory.path().join("inventory.db")).await?;
         let replies = if after_commit {
             vec![
                 stable.clone(),
@@ -2400,7 +2400,7 @@ async fn registry_races_do_not_report_inventory_completion()
 #[tokio::test]
 async fn inventory_refuses_forged_commits_wrong_claims_and_uid_regression()
 -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use inventory::{InventoryStore, LibsqlInventory};
+    use inventory::{InventoryStore, SqliteInventory};
     for corrupt in [
         "receipts",
         "claim",
@@ -2439,7 +2439,7 @@ async fn inventory_refuses_forged_commits_wrong_claims_and_uid_regression()
             _ => {}
         }
         let directory = tempfile::tempdir()?;
-        let store = LibsqlInventory::open_local(&directory.path().join("inventory.db")).await?;
+        let store = SqliteInventory::open_local(&directory.path().join("inventory.db")).await?;
         let published = store.publish(&scope, None, &snapshot).await?;
         let claim = registry.claims.first_mut().ok_or("missing fixture claim")?;
         match corrupt {
@@ -2691,10 +2691,10 @@ async fn active_uid_capture_uses_inventory_and_rejects_missing_records()
 #[tokio::test]
 async fn captured_uid_publication_preserves_metadata_and_uses_authoritative_claims()
 -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use inventory::{InventoryStore, LibsqlInventory};
+    use inventory::{InventoryStore, SqliteInventory};
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("inventory.db");
-    let store = LibsqlInventory::open_local(&path).await?;
+    let store = SqliteInventory::open_local(&path).await?;
     let mut registry = qualified_upgrade_fixture()?;
     registry.transitions.remove(TRANSITION_B);
     let (scope, snapshot) =
@@ -2731,7 +2731,7 @@ async fn captured_uid_publication_preserves_metadata_and_uses_authoritative_clai
             .iter()
             .all(|request| request.0 == "GET")
     );
-    let reopened = LibsqlInventory::open_local(&path).await?;
+    let reopened = SqliteInventory::open_local(&path).await?;
     assert_eq!(reopened.load(&scope).await?, Some(published.clone()));
     let (client, _) = wire(vec![state])?;
     assert!(
@@ -2748,9 +2748,9 @@ async fn captured_uid_publication_preserves_metadata_and_uses_authoritative_clai
 #[tokio::test]
 async fn captured_uid_publication_rejects_known_uid_change_without_overwrite()
 -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use inventory::{InventoryStore, LibsqlInventory};
+    use inventory::{InventoryStore, SqliteInventory};
     let directory = tempfile::tempdir()?;
-    let store = LibsqlInventory::open_local(&directory.path().join("inventory.db")).await?;
+    let store = SqliteInventory::open_local(&directory.path().join("inventory.db")).await?;
     let mut registry = staged_upgrade_fixture()?;
     registry.transitions.remove(TRANSITION_B);
     registry.claims.first_mut().ok_or("claim missing")?.uid = Some("original-uid".into());
@@ -2779,10 +2779,10 @@ async fn captured_uid_publication_rejects_known_uid_change_without_overwrite()
 #[tokio::test]
 async fn inventory_checkpoint_rejects_tampered_policy_and_missing_commitment_before_capture()
 -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use inventory::{InventoryStore, LibsqlInventory};
+    use inventory::{InventoryStore, SqliteInventory};
     for corruption in ["policy", "missing-commitment", "foreign-allocation"] {
         let directory = tempfile::tempdir()?;
-        let store = LibsqlInventory::open_local(&directory.path().join("inventory.db")).await?;
+        let store = SqliteInventory::open_local(&directory.path().join("inventory.db")).await?;
         let mut registry = staged_upgrade_fixture()?;
         registry.transitions.remove(TRANSITION_B);
         let mut control = registry_object(&registry, REGISTRY_UID, "42")?;
@@ -2875,9 +2875,9 @@ async fn inventory_checkpoint_rejects_tampered_policy_and_missing_commitment_bef
 #[tokio::test]
 async fn inventory_checkpoint_rejects_wrong_transition_claim_snapshot_before_capture()
 -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use inventory::{InventoryStore, LibsqlInventory};
+    use inventory::{InventoryStore, SqliteInventory};
     let directory = tempfile::tempdir()?;
-    let store = LibsqlInventory::open_local(&directory.path().join("inventory.db")).await?;
+    let store = SqliteInventory::open_local(&directory.path().join("inventory.db")).await?;
     let mut registry = staged_upgrade_fixture()?;
     registry.transitions.remove(TRANSITION_B);
     let control = registry_object(&registry, REGISTRY_UID, "42")?;

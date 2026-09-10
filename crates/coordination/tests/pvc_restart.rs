@@ -1,4 +1,4 @@
-#![cfg(feature = "libsql-backend")]
+#![cfg(feature = "sqlite-backend")]
 //! Current coordination-store reopen probe; it grants no deployment authority.
 use coordination::*;
 use deploy::{ClaimState, ProtectedClaim, ResourceIdentity};
@@ -486,7 +486,7 @@ fn wait_for_race_barrier(path: &Path) -> TestResult {
     }
 }
 
-async fn verify_reads(store: &LibsqlCoordination, fixture: &Fixture) -> TestResult {
+async fn verify_reads(store: &SqliteCoordination, fixture: &Fixture) -> TestResult {
     if store.read_claims(&fixture.claim_ref).await? != Some(fixture.claims.clone())
         || store.read_review(&fixture.review_ref).await? != Some(fixture.review.clone())
         || store.read_audit(&fixture.audit_ref).await? != Some(fixture.audit.clone())
@@ -497,7 +497,7 @@ async fn verify_reads(store: &LibsqlCoordination, fixture: &Fixture) -> TestResu
 }
 
 async fn seed(path: &Path, fixture: &Fixture) -> TestResult {
-    let store = LibsqlCoordination::open_local(path).await?;
+    let store = SqliteCoordination::open_local(path).await?;
     if store.put_claims(&fixture.claims).await? != fixture.claim_ref
         || store.put_review(&fixture.review).await? != fixture.review_ref
         || store.put_audit(&fixture.audit).await? != fixture.audit_ref
@@ -508,7 +508,7 @@ async fn seed(path: &Path, fixture: &Fixture) -> TestResult {
 }
 
 async fn verify_read_only(path: &Path, fixture: &Fixture) -> TestResult {
-    let store = LibsqlCoordination::open_local_read_only(path).await?;
+    let store = SqliteCoordination::open_local_read_only(path).await?;
     verify_reads(&store, fixture).await?;
     if !matches!(
         store.put_claims(&fixture.claims).await,
@@ -525,7 +525,7 @@ async fn verify_read_only(path: &Path, fixture: &Fixture) -> TestResult {
     Ok(())
 }
 
-async fn audit_winner(store: &LibsqlCoordination, race: &RaceFixture) -> TestResult<bool> {
+async fn audit_winner(store: &SqliteCoordination, race: &RaceFixture) -> TestResult<bool> {
     match store.read_audit(&race.left_audit_ref).await {
         Ok(Some(value)) if value == race.left_audit => {
             if !matches!(
@@ -547,7 +547,7 @@ async fn audit_winner(store: &LibsqlCoordination, race: &RaceFixture) -> TestRes
 }
 
 async fn verify_race_absent(
-    store: &LibsqlCoordination,
+    store: &SqliteCoordination,
     seed: &Fixture,
     race: &RaceFixture,
 ) -> TestResult {
@@ -571,7 +571,7 @@ async fn publish_race(
 ) -> TestResult<(&'static str, bool)> {
     let seed = fixture()?;
     let race = race_fixture(&seed)?;
-    let store = LibsqlCoordination::open_local(path).await?;
+    let store = SqliteCoordination::open_local(path).await?;
     if let Some(barrier) = live_barrier {
         verify_race_absent(&store, &seed, &race).await?;
         require_race_barrier_absent(barrier)?;
@@ -616,7 +616,7 @@ async fn publish_race(
 async fn verify_race_read_only(path: &Path) -> TestResult<bool> {
     let seed = fixture()?;
     let race = race_fixture(&seed)?;
-    let store = LibsqlCoordination::open_local_read_only(path).await?;
+    let store = SqliteCoordination::open_local_read_only(path).await?;
     verify_reads(&store, &seed).await?;
     if store.read_claims(&race.claim_ref).await? != Some(race.claims.clone())
         || store.read_review(&race.left_review_ref).await? != Some(race.left_review.clone())
@@ -745,7 +745,7 @@ async fn local_competing_writers_preserve_both_content_addressed_reviews() -> Te
     execute(&path, Phase::Seed, TEST_NONCE).await?;
     let seed = fixture()?;
     let race = race_fixture(&seed)?;
-    let before = LibsqlCoordination::open_local_read_only(&path).await?;
+    let before = SqliteCoordination::open_local_read_only(&path).await?;
     verify_race_absent(&before, &seed, &race).await?;
     drop(before);
     let (left, right) = tokio::join!(

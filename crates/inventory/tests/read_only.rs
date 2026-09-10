@@ -1,4 +1,4 @@
-#![cfg(feature = "libsql-backend")]
+#![cfg(feature = "sqlite-backend")]
 use compiler_core::DeletionPolicy;
 use inventory::*;
 use std::path::Path;
@@ -32,20 +32,13 @@ fn snapshot(generation: &str, name: &str) -> InventorySnapshot {
     }
 }
 
-async fn table_count(path: &Path, table: &str) -> TestResult<i64> {
-    let database = libsql::Builder::new_local(path).build().await?;
-    let mut rows = database
-        .connect()?
-        .query(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
-            [table],
-        )
-        .await?;
-    Ok(rows
-        .next()
-        .await?
-        .ok_or("sqlite table count is missing")?
-        .get::<i64>(0)?)
+fn table_count(path: &Path, table: &str) -> TestResult<i64> {
+    let database = rusqlite::Connection::open(path)?;
+    Ok(database.query_one(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        [table],
+        |row| row.get::<usize, i64>(0),
+    )?)
 }
 
 #[tokio::test]
@@ -55,7 +48,7 @@ async fn read_only_open_reads_exact_head_and_history_without_mutation() -> TestR
     let first = snapshot("first", "first");
     let second = snapshot("second", "second");
     let (stored_first, stored_second) = {
-        let writable = LibsqlInventory::open_local(&path).await?;
+        let writable = SqliteInventory::open_local(&path).await?;
         let stored_first = writable.publish(&scope(), None, &first).await?;
         let stored_second = writable
             .publish(&scope(), Some(&stored_first.revision), &second)
@@ -63,7 +56,7 @@ async fn read_only_open_reads_exact_head_and_history_without_mutation() -> TestR
         (stored_first, stored_second)
     };
     let before = std::fs::read(&path)?;
-    let read_only = LibsqlInventory::open_local_read_only(&path).await?;
+    let read_only = SqliteInventory::open_local_read_only(&path).await?;
     assert_eq!(read_only.load(&scope()).await?, Some(stored_second));
     assert_eq!(
         read_only
@@ -102,33 +95,27 @@ async fn read_only_open_rejects_missing_file_and_tables_without_creation() -> Te
     let directory = tempfile::tempdir()?;
     let missing = directory.path().join("missing.db");
     assert!(
-        LibsqlInventory::open_local_read_only(&missing)
+        SqliteInventory::open_local_read_only(&missing)
             .await
             .is_err()
     );
     assert!(!missing.exists());
 
     let incomplete = directory.path().join("incomplete.db");
-    let database = libsql::Builder::new_local(&incomplete).build().await?;
-    database
-        .connect()?
-        .execute_batch(
-            "CREATE TABLE apsides_inventory_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);\
+    let database = rusqlite::Connection::open(&incomplete)?;
+    database.execute_batch(
+        "CREATE TABLE apsides_inventory_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);\
              INSERT INTO apsides_inventory_schema VALUES (1,1);\
              CREATE TABLE apsides_inventory_snapshots (scope TEXT,digest TEXT);",
-        )
-        .await?;
+    )?;
     let before = std::fs::read(&incomplete)?;
     assert!(
-        LibsqlInventory::open_local_read_only(&incomplete)
+        SqliteInventory::open_local_read_only(&incomplete)
             .await
             .is_err()
     );
     assert_eq!(std::fs::read(&incomplete)?, before);
-    assert_eq!(
-        table_count(&incomplete, "apsides_inventory_heads").await?,
-        0
-    );
+    assert_eq!(table_count(&incomplete, "apsides_inventory_heads")?, 0);
     Ok(())
 }
 
@@ -136,18 +123,15 @@ async fn read_only_open_rejects_missing_file_and_tables_without_creation() -> Te
 async fn read_only_open_rejects_wrong_version_without_repair() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("wrong-version.db");
-    LibsqlInventory::open_local(&path).await?;
-    let database = libsql::Builder::new_local(&path).build().await?;
-    database
-        .connect()?
-        .execute(
-            "UPDATE apsides_inventory_schema SET version=2 WHERE id=1",
-            (),
-        )
-        .await?;
+    SqliteInventory::open_local(&path).await?;
+    let database = rusqlite::Connection::open(&path)?;
+    database.execute(
+        "UPDATE apsides_inventory_schema SET version=2 WHERE id=1",
+        (),
+    )?;
     let before = std::fs::read(&path)?;
     assert!(matches!(
-        LibsqlInventory::open_local_read_only(&path).await,
+        SqliteInventory::open_local_read_only(&path).await,
         Err(Error::Invalid("unsupported inventory schema"))
     ));
     assert_eq!(std::fs::read(&path)?, before);
@@ -159,22 +143,19 @@ async fn read_only_load_rejects_corrupt_metadata_without_repair() -> TestResult 
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("corrupt.db");
     {
-        let writable = LibsqlInventory::open_local(&path).await?;
+        let writable = SqliteInventory::open_local(&path).await?;
         writable
             .publish(&scope(), None, &snapshot("first", "first"))
             .await?;
     }
-    let database = libsql::Builder::new_local(&path).build().await?;
-    database
-        .connect()?
-        .execute(
-            "UPDATE apsides_inventory_snapshots SET metadata=x'7b7d'",
-            (),
-        )
-        .await?;
+    let database = rusqlite::Connection::open(&path)?;
+    database.execute(
+        "UPDATE apsides_inventory_snapshots SET metadata=x'7b7d'",
+        (),
+    )?;
     drop(database);
     let before = std::fs::read(&path)?;
-    let read_only = LibsqlInventory::open_local_read_only(&path).await?;
+    let read_only = SqliteInventory::open_local_read_only(&path).await?;
     assert!(matches!(
         read_only.load(&scope()).await,
         Err(Error::Invalid("snapshot shape"))

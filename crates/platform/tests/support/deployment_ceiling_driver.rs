@@ -268,7 +268,7 @@ async fn reserve(
     platform: &PlatformClient,
     candidate: &release::IntegrityVerifiedCandidate,
     target: &CandidateQualificationTarget,
-    inventory: &inventory::LibsqlInventory,
+    inventory: &inventory::SqliteInventory,
     expected_request: &str,
 ) -> Result<()> {
     let prepared = prepare_request(platform, candidate).await?;
@@ -497,7 +497,7 @@ fn report_planned(
 
 async fn issued_deployment(
     candidate: &release::IntegrityVerifiedCandidate,
-    coordination: Arc<coordination::LibsqlCoordination>,
+    coordination: Arc<coordination::SqliteCoordination>,
 ) -> Result<IssuedDeployment> {
     let config = explicit_config(ConfigIdentity::Issuer).await?;
     let domain = &candidate.compiled().ir.domain;
@@ -536,11 +536,11 @@ async fn explicit_config(identity: ConfigIdentity) -> Result<Config> {
     qualification_driver::explicit_config(identity).await
 }
 
-async fn coordination_store() -> Result<Arc<coordination::LibsqlCoordination>> {
+async fn coordination_store() -> Result<Arc<coordination::SqliteCoordination>> {
     qualification_driver::coordination_store("APS_CEILING_COORDINATION_DB").await
 }
 
-async fn inventory_store() -> Result<inventory::LibsqlInventory> {
+async fn inventory_store() -> Result<inventory::SqliteInventory> {
     qualification_driver::inventory_store("APS_CEILING_INVENTORY_DB").await
 }
 

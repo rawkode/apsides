@@ -234,7 +234,7 @@ fn claim_capture_error(error: platform_api::Error) -> DriverError {
 
 async fn bootstrap_platform(
     candidate: &IntegrityVerifiedCandidate,
-    coordination: Arc<coordination::LibsqlCoordination>,
+    coordination: Arc<coordination::SqliteCoordination>,
 ) -> Result<PlatformClient> {
     let config = qualification_driver::explicit_config(ConfigIdentity::Admin).await?;
     configured_platform(candidate, config, coordination)
@@ -242,7 +242,7 @@ async fn bootstrap_platform(
 
 async fn issued_deployment(
     candidate: &IntegrityVerifiedCandidate,
-    coordination: Arc<coordination::LibsqlCoordination>,
+    coordination: Arc<coordination::SqliteCoordination>,
 ) -> Result<IssuedDeployment> {
     let config = qualification_driver::explicit_config(ConfigIdentity::Issuer {
         name: ISSUER,
@@ -271,7 +271,7 @@ async fn issued_platform(candidate: &IntegrityVerifiedCandidate) -> Result<Platf
 fn configured_platform(
     candidate: &IntegrityVerifiedCandidate,
     config: kube::Config,
-    coordination: Arc<coordination::LibsqlCoordination>,
+    coordination: Arc<coordination::SqliteCoordination>,
 ) -> Result<PlatformClient> {
     let domain = &candidate.compiled().ir.domain;
     PlatformClient::new(
@@ -290,11 +290,11 @@ fn configured_platform(
     })
 }
 
-async fn coordination_store() -> Result<Arc<coordination::LibsqlCoordination>> {
+async fn coordination_store() -> Result<Arc<coordination::SqliteCoordination>> {
     qualification_driver::coordination_store("APS_PERMISSION_UPGRADE_COORDINATION_DB").await
 }
 
-async fn inventory_store() -> Result<inventory::LibsqlInventory> {
+async fn inventory_store() -> Result<inventory::SqliteInventory> {
     qualification_driver::inventory_store("APS_PERMISSION_UPGRADE_INVENTORY_DB").await
 }
 

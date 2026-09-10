@@ -23,8 +23,8 @@ It excludes manifests, desired and observed values, arbitrary labels and
 annotations, source paths, credentials, and hashes of private contents. Names
 are operational metadata and should not contain secrets.
 
-The default implementation is libSQL. A local deployment uses a persistent
-absolute database path; a remote deployment uses a TLS `libsql://` or `https://`
+The default implementation is SQLite. A deployment uses a persistent
+absolute database path on application-owned storage; there is no remote
 primary and a token supplied by the trusted job environment. A future backend
 can implement the same immutable-snapshot and conditional-head contract.
 
@@ -78,7 +78,7 @@ mutation authority or prove that an old writer stopped.
 Registry schema v8 stores compact transition inputs and immutable references;
 selected sessions reconstruct the plan from the freshly verified release. Missing
 inventory, review metadata, claims, audit records or writer checkpoints fail
-closed. Live persistent-volume and remote Turso recovery qualification, explicit
+closed. Live persistent-volume recovery qualification, explicit
 administrative recovery, and cross-executor takeover remain release work.
 
 For the canonical details, read [Resource inventory](/reference/inventory/),

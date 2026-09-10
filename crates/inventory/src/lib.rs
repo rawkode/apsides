@@ -3,10 +3,10 @@
 mod model;
 pub use model::*;
 
-#[cfg(feature = "libsql-backend")]
-mod libsql_backend;
-#[cfg(feature = "libsql-backend")]
-pub use libsql_backend::LibsqlInventory;
+#[cfg(feature = "sqlite-backend")]
+mod sqlite;
+#[cfg(feature = "sqlite-backend")]
+pub use sqlite::SqliteInventory;
 
 use async_trait::async_trait;
 

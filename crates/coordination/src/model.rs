@@ -102,13 +102,13 @@ impl ClaimSnapshotV1 {
         })
     }
 
-    #[cfg(feature = "libsql-backend")]
+    #[cfg(feature = "sqlite-backend")]
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
         compiler_core::canonical_bytes(self).map_err(|_| Error::Invalid("snapshot encoding"))
     }
 
-    #[cfg(feature = "libsql-backend")]
+    #[cfg(feature = "sqlite-backend")]
     pub(crate) fn decode(bytes: &[u8], reference: &ClaimRef) -> Result<Self> {
         reference.validate()?;
         if bytes.len() > MAX_CLAIM_SNAPSHOT_BYTES {

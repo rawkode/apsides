@@ -75,18 +75,11 @@ The trusted CI job must also provide:
 - persistent inventory configuration; and
 - any separately approved ownership intent required for adoption.
 
-For local libSQL inventory:
+The metadata store is a local SQLite database on application-owned persistent
+storage. `APSIDES_INVENTORY_DATABASE` must be an absolute path:
 
 ```sh
 export APSIDES_INVENTORY_DATABASE=/absolute/path/on/persistent-storage/inventory.db
-aps deploy --artifact path/to/verified-release
-```
-
-For a remote Turso/libSQL primary:
-
-```sh
-export APSIDES_INVENTORY_DATABASE=libsql://inventory.example.com
-export APSIDES_INVENTORY_TOKEN='<provided-by-trusted-ci>'
 aps deploy --artifact path/to/verified-release
 ```
 
@@ -120,7 +113,7 @@ authority on a cluster.
 Focused candidate lifecycle runs have exercised install and upgrade behaviour,
 including writer quiescence, adoption, explicit force and finalizer-delayed
 cleanup. They are not final production-artifact acceptance. Persistent
-libSQL/Turso recovery, the complete six-phase interruption matrix, cross-executor
+volume recovery, the complete six-phase interruption matrix, cross-executor
 recovery, remaining release evidence, and independent final review remain release
 work.
 
