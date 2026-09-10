@@ -8,6 +8,10 @@ export default defineConfig({
       title: "Apsides",
       description: "Documentation for the Apsides compiled Kubernetes controller toolchain",
       customCss: ["./src/styles/custom.css"],
+      components: {
+        ThemeProvider: "./src/components/ThemeProvider.astro",
+        ThemeSelect: "./src/components/ThemeSelect.astro",
+      },
       social: [
         {
           icon: "github",
@@ -21,7 +25,7 @@ export default defineConfig({
         {
           label: "Start here",
           items: [
-            { label: "Overview", slug: "" },
+            { label: "Overview", slug: "index" },
             { label: "Getting started", slug: "getting-started" },
             { label: "Implementation status", slug: "reference/status" },
           ],
