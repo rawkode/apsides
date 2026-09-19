@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "@apsides/tsx-prototype",
+    "types": ["bun"],
+    "allowImportingTsExtensions": true
+  },
+  "include": ["src", "tests", "examples", "scripts"]
+}
