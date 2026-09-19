@@ -247,9 +247,11 @@ async function main() {
   assert.notEqual((await get("configmap", "nginx-config")).metadata.uid, oldConfigUid);
   evidence.configRecreated = recreated;
 
-  const probe = await kubectl(["run", "http-probe", "--image=busybox:1.37", "--restart=Never", "--attach=true", "--rm",
-    "--pod-running-timeout=120s", "--command", "--", "wget", "-q", "-O", "-", `http://nginx.${namespace}.svc.cluster.local`]);
+  await kubectl(["run", "http-probe", "--image=busybox:1.37", "--restart=Never", "--command", "--", "sleep", "300"]);
+  await kubectl(["wait", "--for=condition=Ready", "pod/http-probe", "--timeout=120s"]);
+  const probe = await kubectl(["exec", "http-probe", "--", "wget", "-q", "-O", "-", `http://nginx.${namespace}.svc.cluster.local`]);
   assert.match(probe.stdout, /Welcome to nginx!/);
+  await kubectl(["delete", "pod/http-probe", "--wait=true"]);
   evidence.clusterHttp = "nginx welcome page via Service DNS and ClusterIP from a separate Pod";
   console.log("PASS in-cluster HTTP through Service DNS and ClusterIP");
 

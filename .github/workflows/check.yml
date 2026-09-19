@@ -121,6 +121,7 @@ jobs:
         with:
           name: tsx-prototype-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
+          include-hidden-files: true
           retention-days: 14
           path: |
             prototypes/tsx-controller/.e2e/${{ env.TSX_E2E_CLUSTER }}-*/result.json
