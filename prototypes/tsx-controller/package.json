@@ -10,6 +10,7 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
+    "ci": "bun install --frozen-lockfile && bun run check && bun test && bun run build && bun run smoke",
     "test": "bun test",
     "demo": "bun run scripts/kubernetes-e2e.ts",
     "e2e": "bun run scripts/kubernetes-e2e.ts",

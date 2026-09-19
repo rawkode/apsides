@@ -41,7 +41,7 @@ bun test
 bun run e2e
 ```
 
-The test creates a fresh isolated kind cluster named `tsx-reactive`, builds a Linux executable image and installs the generated Role. It uses a dedicated kubeconfig under `.e2e/` and preserves your selected context. It refuses to overwrite existing clusters; choose another name for subsequent runs:
+The test creates a fresh isolated kind cluster named `tsx-reactive`, builds a Linux executable image and installs the generated Role. It pins the kind node image by digest, uses a dedicated kubeconfig under `.e2e/` and preserves your selected context. It refuses to overwrite existing clusters; choose another name for subsequent runs:
 
 ```sh
 TSX_E2E_CLUSTER=tsx-reactive-next bun run e2e
@@ -57,9 +57,10 @@ The live test checks:
 6. Recreating the ConfigMap with a new UID and changed data resumes reconciliation and rolls new Pods.
 7. Desired replica updates, drift repair and persistent-state restart recovery still work.
 8. The generated Role permits named ConfigMap get/list/watch; real unauthorized create/patch/delete requests are denied.
-9. Managed-resource finalization runs the hook and deletes nginx/Service while the unmanaged ConfigMap survives with the same UID and data.
+9. Managed-resource finalization recovers its last real inputs after the ConfigMap is removed, runs the hook, and never recreates the observed ConfigMap.
+10. A foreign finalizer continues to hold deletion after the controller removes only its own key; releasing the foreign key completes deletion.
 
-The cluster and `.e2e/<run>/` remain for inspection. Evidence contains a source SHA256 manifest, Kubernetes/image details, Pod/configuration checks, plan and controller/finalizer logs. The script rejects source changes during acceptance. It ends with managed workloads cleaned up and the controller scaled to zero.
+The cluster and `.e2e/<run>/` remain for local inspection. Evidence contains the source revision and SHA256 manifest, pinned tool and node-image versions, Kubernetes/image details, Pod/configuration checks, plan and controller/finalizer logs. The script rejects source changes during acceptance. CI uploads an explicit evidence allowlist and excludes the credential-bearing kubeconfig and buildx directory. It ends with managed workloads cleaned up and the controller scaled to zero.
 
 Use the kubeconfig printed by the test to inspect its cluster. Remove it when finished:
 
@@ -67,7 +68,7 @@ Use the kubeconfig printed by the test to inspect its cluster. Remove it when fi
 kind delete cluster --name tsx-reactive
 ```
 
-`cuenv task tsxPrototypeE2e` is configured at the repository root. Repository CUE evaluation previously hit its 10-second timeout; the direct Bun commands are the verified path.
+`cuenv task tsxPrototypeCheck` and `cuenv task tsxPrototypeE2e` are configured at the repository root. This remains an intentionally isolated Bun/Alchemy prototype inside the repository's otherwise Deno-based TypeScript toolchain; promotion or a Deno port is a separate decision.
 
 ## Reactive behavior
 

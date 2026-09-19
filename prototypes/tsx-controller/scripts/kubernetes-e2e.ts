@@ -4,15 +4,20 @@ import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// Deliberately leaves the isolated cluster and evidence for inspection.
+// Deliberately leaves the isolated cluster and evidence for local inspection.
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const cluster = process.env.TSX_E2E_CLUSTER ?? "tsx-reactive";
+const nodeImage = process.env.TSX_E2E_NODE_IMAGE ??
+  "kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed";
 const namespace = "tsx-e2e";
 const directory = join(root, ".e2e", `${cluster}-${Date.now()}`);
 const kubeconfig = join(directory, "kubeconfig");
 const context = `kind-${cluster}`;
 const image = `tsx-controller:e2e-${Date.now()}`;
-const evidence: Record<string, unknown> = { cluster, context, namespace, directory, image };
+const evidence: Record<string, unknown> = {
+  cluster, context, namespace, directory, image, nodeImage,
+  sourceRevision: process.env.GITHUB_SHA ?? process.env.TSX_E2E_SOURCE_REVISION ?? "local",
+};
 mkdirSync(directory, { recursive: true });
 
 function sourceManifest() {
@@ -108,6 +113,13 @@ async function main() {
   const sources = sourceManifest();
   writeFileSync(join(directory, "source-sha256.json"), JSON.stringify(sources, null, 2));
   evidence.sourceManifest = "source-sha256.json";
+  evidence.tools = {
+    bun: (await command([process.execPath, "--version"])).stdout.trim(),
+    kind: (await command(["kind", "version"])).stdout.trim(),
+    kubectl: (await command(["kubectl", "version", "--client=true", "-o", "json"])).stdout.trim(),
+    docker: (await command(["docker", "version", "--format", "{{.Server.Version}}"]))
+      .stdout.trim(),
+  };
   console.log(`Building standalone Linux controller ${image}`);
   await command(["docker", "build", "-t", image, "."]);
   const [built] = JSON.parse((await command(["docker", "image", "inspect", image])).stdout);
@@ -115,7 +127,8 @@ async function main() {
   evidence.imagePlatform = `${built.Os}/${built.Architecture}`;
   evidence.imageCreated = built.Created;
   console.log(`Creating isolated cluster ${cluster}; your default kubeconfig is unchanged.`);
-  await command(["kind", "create", "cluster", "--name", cluster, "--kubeconfig", kubeconfig, "--wait", "120s"]);
+  await command(["kind", "create", "cluster", "--name", cluster, "--image", nodeImage,
+    "--kubeconfig", kubeconfig, "--wait", "120s"]);
   await command(["kind", "load", "docker-image", image, "--name", cluster]);
   evidence.kubernetes = JSON.parse((await kubectl(["version", "-o", "json"])).stdout);
   const nodeList = JSON.parse((await kubectl(["get", "nodes", "-o", "json"])).stdout);
@@ -289,12 +302,17 @@ async function main() {
   await kubectl(["logs", "deployment/tsx-controller"]).then(result => writeFileSync(join(directory, "controller.log"), result.stdout));
   await kubectl(["scale", "deployment/tsx-controller", "--replicas", "0"]);
   await kubectl(["wait", "--for=delete", "pod", "-l", "app=tsx-controller", "--timeout=120s"]);
+  const configBeforeFinalize = await get("configmap", "nginx-config");
+  assert(configBeforeFinalize, "Unmanaged ConfigMap exists before missing-input finalization test");
+  await kubectl(["delete", "configmap/nginx-config"]);
+  assert.equal(await get("configmap", "nginx-config"), undefined);
+  await kubectl(["patch", "deployment/nginx", "--type=json", "-p", JSON.stringify([
+    { op: "add", path: "/metadata/finalizers/-", value: "foreign.example/hold" },
+  ])]);
   await kubectl(["delete", "deployment/nginx", "--wait=false"]);
   const pending = await get("deployment", "nginx");
   assert(pending?.metadata.deletionTimestamp, "Deletion must be held by registered finalizer");
-  const configBeforeFinalize = await get("configmap", "nginx-config");
-  assert(configBeforeFinalize, "Unmanaged ConfigMap remains present");
-  console.log("PASS deletion held while controller is stopped");
+  console.log("PASS deletion held while controller and required ConfigMap are absent");
   await apply([{
     apiVersion: "batch/v1", kind: "Job", metadata: { name: "tsx-finalize", namespace },
     spec: { backoffLimit: 0, activeDeadlineSeconds: 180, template: { spec: {
@@ -302,17 +320,25 @@ async function main() {
       containers: [{ ...container, args: ["finalize", "--kubernetes", "--namespace", namespace, "--state", "/state"] }],
     } } },
   }]);
+  await waitFor("owned finalizer completes while foreign finalizer holds deletion", async () => {
+    const deployment = await get("deployment", "nginx");
+    return JSON.stringify(deployment?.metadata.finalizers) === JSON.stringify(["foreign.example/hold"])
+      && !await get("service", "nginx");
+  });
+  await kubectl(["patch", "deployment/nginx", "--type=json", "-p", JSON.stringify([
+    { op: "test", path: "/metadata/finalizers/0", value: "foreign.example/hold" },
+    { op: "remove", path: "/metadata/finalizers/0" },
+  ])]);
   await kubectl(["wait", "--for=condition=complete", "job/tsx-finalize", "--timeout=180s"]);
   await waitFor("inline finalizer releases managed Deployment and Service deletion", async () =>
     !await get("deployment", "nginx") && !await get("service", "nginx"));
   const finalizerLog = (await kubectl(["logs", "job/tsx-finalize"])).stdout;
   writeFileSync(join(directory, "finalizer.log"), finalizerLog);
   assert.match(finalizerLog, /managed-finalizer-complete/);
-  const configAfterFinalize = await get("configmap", "nginx-config");
-  assert.equal(configAfterFinalize?.metadata.uid, configBeforeFinalize.metadata.uid);
-  assert.deepEqual(configAfterFinalize.data, configBeforeFinalize.data);
+  assert.equal(await get("configmap", "nginx-config"), undefined, "Finalization must not recreate an observed ConfigMap");
   evidence.finalizer = { managedResourcesDeleted: true, hookExecuted: true,
-    unmanagedConfigUid: configAfterFinalize.metadata.uid, unmanagedConfigData: configAfterFinalize.data };
+    missingObservedInput: true, foreignFinalizerHeldDeletion: true,
+    removedConfigUid: configBeforeFinalize.metadata.uid, removedConfigData: configBeforeFinalize.data };
   assert.deepEqual(sourceManifest(), sources, "Source files changed during acceptance; rerun with the final source");
   evidence.sourceUnchanged = true;
   evidence.status = "passed";
