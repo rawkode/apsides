@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { Finalizer, Observation, ObservedResource, Output, ResourceOperations, ResourceRef } from "../contracts";
+import type { Finalizer, Observation, ObservedResource, Output, ResourceRef } from "../contracts";
 import { resourceKind, type ResourceComponent } from "./components";
 
 export interface DeclarationContext {
@@ -32,8 +32,8 @@ export function useResourceRef<T = Record<string, unknown>>(): ResourceRef<T> {
   return ref;
 }
 
-/** Finalizers cannot declare new hooks during execution. */
-export function withResourceOperations<T>(_ops: ResourceOperations, fn: () => T): T {
+/** Run code outside component declaration context so it cannot register hooks. */
+export function withoutDeclarationContext<T>(fn: () => T): T {
   return declarations.run(undefined, fn);
 }
 

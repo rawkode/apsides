@@ -35,12 +35,6 @@ export interface ObservedResource {
   readonly binaryData?: Record<string, string>;
 }
 
-export interface ResourceHandle {
-  get(options?: { signal?: AbortSignal }): Promise<Record<string, unknown> | undefined>;
-  ensureDeleted(options?: { signal?: AbortSignal }): Promise<void>;
-  patch(value: Record<string, unknown>, options?: { signal?: AbortSignal }): Promise<void>;
-}
-
 export interface ResourceOperations {
   get(target: Observation, signal?: AbortSignal): Promise<Record<string, unknown> | undefined>;
   ensureDeleted(target: Observation, signal?: AbortSignal): Promise<void>;

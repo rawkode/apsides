@@ -1,5 +1,5 @@
-import type { LiveResource, ResourceEngine, ResourceGraph, ResourceNode, ResourceOperations, ResolvedResource } from "./contracts.ts";
-import { withResourceOperations } from "./authoring/context.ts";
+import type { LiveResource, ResourceEngine, ResourceGraph, ResourceNode, ResolvedResource } from "./contracts.ts";
+import { withoutDeclarationContext } from "./authoring/context.ts";
 import { orderedResources, PendingOutput, resolveInputs } from "./outputs.ts";
 import { readInventory, saveInventory, withControllerLock, type Inventory, type InventoryEntry } from "./state.ts";
 
@@ -170,7 +170,7 @@ export class ControllerRunner {
         const timeoutMs = this.options.finalizerTimeoutMs ?? 5_000;
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
-          const execution = withResourceOperations(this.finalizerOperations(abort.signal), () => callback({
+          const execution = withoutDeclarationContext(() => callback({
             signal: abort.signal,
             resource: { id, name: observed.name, uid: observed.uid, outputs: observed.outputs },
           }));
@@ -195,18 +195,6 @@ export class ControllerRunner {
         conditions.push({ resource: id, reason: "DeletionPending" }); failed.add(id);
       } else { delete inventory.resources[id]; this.save(inventory); }
     }
-  }
-
-  private finalizerOperations(signal: AbortSignal): ResourceOperations {
-    const combined = (provided?: AbortSignal) => {
-      const result = provided ? AbortSignal.any([signal, provided]) : signal;
-      result.throwIfAborted(); return result;
-    };
-    return {
-      get: (target, provided) => this.engine.operations.get(target, combined(provided)),
-      ensureDeleted: (target, provided) => this.engine.operations.ensureDeleted(target, combined(provided)),
-      patch: (target, value, provided) => this.engine.operations.patch(target, value, combined(provided)),
-    };
   }
 
   private save(inventory: Inventory) { saveInventory(this.options.directory, inventory); }

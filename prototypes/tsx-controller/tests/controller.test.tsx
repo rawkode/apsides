@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Cloudflare, compile, ConfigMap, Controller, Deployment, PlanetScale, Service, useResourceRef, type Finalizer } from "../src";
+import { Cloudflare, compile, ConfigMap, Controller, Deployment, PlanetScale, Service, useFinalizer, useResource, useResourceRef, type Finalizer } from "../src";
 import { ControllerRunner } from "../src/controller";
 import { createAlchemyEngine } from "../src/engine";
 import { readInventory } from "../src/state";
@@ -124,6 +124,33 @@ test("timeout cancels cleanup and preserves the finalizer", async () => {
   release(); await done;
   expect(lateError).toBeDefined();
   expect(engine.world.get("web")?.finalizers).toEqual([key]);
+});
+
+test("finalizer callbacks cannot register declaration hooks after an await", async () => {
+  const errors: string[] = [];
+  function App() {
+    const ref = useResourceRef();
+    useFinalizer(ref, key, async () => {
+      await Promise.resolve();
+      for (const declare of [
+        () => useResource(ConfigMap, { name: "forbidden" }),
+        () => useFinalizer(ref, "example.com/forbidden", async () => {}),
+      ]) {
+        try { declare(); }
+        catch (error) { errors.push(String(error)); }
+      }
+    });
+    return <Deployment id="web" name="web" image="nginx" ref={ref} />;
+  }
+  const graph = compile(<Controller name="test" namespace="demo"><App /></Controller>);
+  const path = directory(), engine = createAlchemyEngine({ directory: path });
+  const runner = new ControllerRunner(graph, engine, { directory: path });
+  await runner.reconcile();
+  expect((await runner.finalizeOnly()).phase).toBe("ready");
+  expect(errors).toEqual([
+    "Error: useResource must be declared inside a component",
+    "Error: useFinalizer must be declared inside a component",
+  ]);
 });
 
 test("two runners cannot share a state directory during a live finalizer", async () => {

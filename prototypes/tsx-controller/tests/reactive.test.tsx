@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { compile, ConfigMap, Controller, Deployment, useFinalizer, useResource, useResourceRef } from "../src";
 import { ControllerRunner } from "../src/controller";
 import { createAlchemyEngine } from "../src/engine";
-import { prepareReactive, type Snapshots } from "../src/reactive";
+import { assertWithinPlan, prepareReactive, type Snapshots } from "../src/reactive";
 import { waitForChanges } from "../src/kubernetes/watch";
 import { observationKey } from "../src/authoring/context";
 
@@ -89,6 +89,29 @@ test("runtime permission expansion is rejected before snapshot or provider mutat
   expect(f.engine.world.get("web")!.name).toBe("web");
 });
 
+test("plan scope rejects observation identity and retained-resource deletion expansion", () => {
+  const f = setup();
+  const plan = f.runner().graph;
+  const copy = (): typeof plan => ({
+    ...plan,
+    observations: plan.observations.map(value => ({ ...value, access: [...value.access] })),
+    resources: plan.resources.map(value => ({ ...value, dependsOn: [...value.dependsOn], readyAfter: [...value.readyAfter] })),
+  });
+  for (const mutate of [
+    (graph: typeof plan) => { graph.observations[0]!.name = "other"; },
+    (graph: typeof plan) => { graph.observations[0]!.namespace = "other"; },
+    (graph: typeof plan) => { graph.observations[0]!.kind = "kubernetes:Service"; },
+  ]) {
+    const graph = copy(); mutate(graph);
+    expect(() => assertWithinPlan(plan, graph)).toThrow("requires redeployment");
+  }
+  const retained = copy();
+  retained.resources[0]!.deletionPolicy = "retain";
+  const expanded = { ...retained, resources: retained.resources.map(value => ({ ...value })) };
+  expanded.resources[0]!.deletionPolicy = "delete";
+  expect(() => assertWithinPlan(retained, expanded)).toThrow("requires redeployment");
+});
+
 test("named Kubernetes watch resumes from observed version and wakes on modification", async () => {
   let query: URL | undefined;
   const server = Bun.serve({ port: 0, fetch(request) {
@@ -103,6 +126,21 @@ test("named Kubernetes watch resumes from observed version and wakes on modifica
     expect(query!.searchParams.get("resourceVersion")).toBe("11");
     expect(query!.searchParams.get("fieldSelector")).toBe("metadata.name=config");
   } finally { server.stop(true); }
+});
+
+test("closed and expired Kubernetes watches fall back to bounded refresh", async () => {
+  for (const response of [
+    () => new Response("", { status: 200 }),
+    () => new Response(JSON.stringify({ kind: "Status", code: 410 }), { status: 410 }),
+  ]) {
+    const server = Bun.serve({ port: 0, fetch: response });
+    try {
+      const target = { kind: "kubernetes:ConfigMap" as const, name: "config", namespace: "demo", access: ["read" as const] };
+      const reason = await waitForChanges({ server: server.url.toString() }, "demo", [target],
+        new Map([[observationKey(target), "11"]]), new AbortController().signal, 20);
+      expect(reason).toBe("refresh");
+    } finally { server.stop(true); }
+  }
 });
 
 
