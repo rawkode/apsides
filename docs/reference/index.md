@@ -20,10 +20,8 @@ contracts.
   <a href="/reference/state-capacity/">State capacity</a>
   <a href="/reference/artifact-resolution/">Artifact resolution</a>
   <a href="/reference/oci-packaging/">OCI packaging</a>
-  <a href="/reference/production-evidence/">Production evidence</a>
   <a href="/reference/cli-distribution/">CLI distribution</a>
   <a href="/reference/toolchain/">Toolchain</a>
-  <a href="/reference/performance/">Performance contract</a>
 </div>
 
 ## Choosing a document
@@ -40,7 +38,5 @@ contracts.
 | What persists for prune and upgrades? | [Resource inventory](/reference/inventory/), [transition audit](/reference/audit/), and [state capacity](/reference/state-capacity/) |
 | How can a current release be retrieved? | [Artifact resolution](/reference/artifact-resolution/) |
 | How is a native image constructed? | [OCI packaging](/reference/oci-packaging/) |
-| What measured evidence backs a production candidate? | [Production evidence](/reference/production-evidence/) |
 | How is the CLI packaged and distributed? | [CLI distribution](/reference/cli-distribution/) |
 | Which OSS tools and isolation boundaries are used? | [Toolchain](/reference/toolchain/) |
-| Is there a performance comparison? | [Performance contract](/reference/performance/), which records why no completed comparison is claimed |
