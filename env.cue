@@ -13,6 +13,7 @@ tasks: {
 	}
 	packageCli: {command: "python3", args: ["scripts/package_cli.py", "--output", "work/aps-distribution", "--target-dir", "work/cli-package-target"]}
 	packageCliTest: {command: "python3", args: ["tests/test_package_cli.py"]}
+	packagingTest: {command: "python3", args: ["tests/test_packaging.py"]}
 	cnpgDemoTest: {command: "python3", args: ["tests/test_cnpg_demo.py"]}
 	cnpgCliDemoTest: {command: "python3", args: ["tests/test_cnpg_cli_demo.py"]}
 	cnpgCleanupTest: {command: "python3", args: ["tests/test_cnpg_cleanup.py"]}
@@ -59,6 +60,10 @@ tasks: {
 	storagePrepare: {command: "python3", args: ["tests/storage/build.py"]}
 	storageRestart: {command: "python3", args: ["tests/run_storage_restart.py"]}
 	coordinationTest: {command: "cargo", args: ["test", "--locked", "-p", "coordination"]}
+	inventoryTest: {command: "cargo", args: ["test", "--locked", "-p", "inventory"]}
+	compilerCoreTest: {command: "cargo", args: ["test", "--locked", "-p", "compiler-core"]}
+	inventoryCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "inventory", "--all-targets", "--", "-D", "warnings"]}
+	compilerCoreCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "compiler-core", "--all-targets", "--", "-D", "warnings"]}
 	coordinationCheck: [
 		{command: "cargo", args: ["clippy", "--locked", "-p", "coordination", "--all-targets", "--", "-D", "warnings"]},
 		{command: "cargo", args: ["check", "--locked", "-p", "coordination", "--no-default-features"]},
@@ -82,6 +87,12 @@ tasks: {
 		command: "deno"
 		env: {CI: "1"}
 		args: ["task", "--filter", "@apsides/compiler", "test"]
+	}
+	authorCompilerCheck: {
+		dependsOn: [install]
+		command: "deno"
+		env: {CI: "1"}
+		args: ["task", "--filter", "@apsides/compiler", "typecheck"]
 	}
 	authorCheck: {
 		dependsOn: [install]
