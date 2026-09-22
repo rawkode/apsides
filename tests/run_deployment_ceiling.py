@@ -387,10 +387,11 @@ class CeilingRunner:
         secret = self.binding_metadata(self.k("create", "-f", "-", "-o", BINDING_PATH, data=json.dumps(secret_definition)))
         self.secret_uid = secret["uid"]
         self.state("apsides-deploy-identity-" + self.domain,
-                   {"schemaVersion": "apsides.dev/platform/v1", "domainId": self.domain, "clusterBinding": self.binding,
+                   {"schemaVersion": "apsides.dev/deployment-identity/v2", "domainId": self.domain, "clusterBinding": self.binding,
                     "serviceAccountName": "ceiling-deployer", "serviceAccountUid": accounts["ceiling-deployer"]["metadata"]["uid"],
                     "bindingSecretName": "ceiling-binding", "bindingSecretUid": self.secret_uid,
-                    "audience": "https://kubernetes.default.svc.cluster.local", "lifetimeSeconds": 600})
+                    "audience": "https://kubernetes.default.svc.cluster.local", "lifetimeSeconds": 600,
+                    "preview": None})
         self.permissions()
         config = json.loads(self.k("config", "view", "--raw", "--minify", "-o", "json"))
         token = self.k("create", "token", "ceiling-issuer", "-n", self.control, "--duration=10m").strip()

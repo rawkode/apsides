@@ -478,7 +478,8 @@ fn valid_container_name(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ExpectedPod, ProcessTerminationObservation, ProxyDrainObservation};
+    use crate::termination::ExpectedPod;
+    use crate::{ProcessTerminationObservation, ProxyDrainObservation};
     use std::collections::BTreeMap;
 
     type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;

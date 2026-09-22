@@ -45,11 +45,6 @@ pub struct OwnershipApproval {
 )]
 pub enum OwnershipAction {
     Adopt,
-    Transfer {
-        source_domain_id: String,
-        source_generation_id: String,
-        source_transition_id: String,
-    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,7 +96,7 @@ pub fn freeze_ownership_intents(request: &DeploymentRequest) -> Result<Vec<Froze
 
 /// Validate bounded metadata independently of any selected generation.
 /// # Errors
-/// Rejects malformed identities, duplicates, oversized metadata or unsupported transfers.
+/// Rejects malformed identities, duplicates or oversized metadata.
 pub fn validate_frozen_ownership_intents(frozen: &[FrozenOwnershipIntent]) -> Result<()> {
     if frozen.len() > 4096 || compiler_core::canonical_bytes(&frozen)?.len() > 1024 * 1024 {
         return Err(Error::Plan(
@@ -118,7 +113,6 @@ pub fn validate_frozen_ownership_intents(frozen: &[FrozenOwnershipIntent]) -> Re
             || !valid_version(&metadata.observed_resource_version)
             || !valid_digest(&metadata.prior_managed_fields_digest)
             || !bounded_identity(&metadata.identity)
-            || metadata.action != OwnershipAction::Adopt
             || !names.insert(&metadata.object_name)
             || !identities.insert(&metadata.identity)
         {
@@ -132,7 +126,7 @@ pub fn validate_frozen_ownership_intents(frozen: &[FrozenOwnershipIntent]) -> Re
 
 /// Reconstruct exact ownership approvals from an authenticated generation.
 /// # Errors
-/// Rejects unknown, duplicate or malformed metadata and unsupported transfers.
+/// Rejects unknown, duplicate or malformed metadata.
 pub fn restore_ownership_intents(
     target: &GenerationPlan,
     transition: &str,
@@ -305,11 +299,30 @@ pub(crate) fn validate_intents(request: &DeploymentRequest) -> Result<()> {
                 "ownership intent cannot relabel an already managed resource".into(),
             ));
         }
-        if intent.approval.action != OwnershipAction::Adopt {
-            return Err(Error::Plan(
-                "cross-domain transfer requires the qualified transfer executor".into(),
-            ));
-        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OwnershipAction;
+    use serde_json::json;
+
+    #[test]
+    fn adoption_is_the_only_ownership_action() -> Result<(), serde_json::Error> {
+        assert_eq!(
+            serde_json::from_value::<OwnershipAction>(json!({"kind": "adopt"}))?,
+            OwnershipAction::Adopt
+        );
+        assert!(
+            serde_json::from_value::<OwnershipAction>(json!({
+                "kind": "transfer",
+                "sourceDomainId": "other",
+                "sourceGenerationId": "other-generation",
+                "sourceTransitionId": "other-transition",
+            }))
+            .is_err()
+        );
+        Ok(())
+    }
 }

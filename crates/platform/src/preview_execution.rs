@@ -5,7 +5,7 @@ use crate::preview_transport::{NamedPreview, PreviewTarget, PreviewTransport};
 use crate::{ApplyPrecondition, Result, invalid};
 use compiler_core::Resource;
 use coordination::ReviewResource;
-use deploy::{DeploymentRequest, OwnershipAction, ResourceIdentity};
+use deploy::{DeploymentRequest, ResourceIdentity};
 use kube::api::DynamicObject;
 
 pub(super) struct Observation {
@@ -222,8 +222,7 @@ fn require_target_authority(
     }
     if let Some(intent) = intent {
         let approval = &intent.approval;
-        if approval.action != OwnershipAction::Adopt
-            || approval.permitted_apply != resource.desired
+        if approval.permitted_apply != resource.desired
             || object.metadata.uid.as_deref() != Some(approval.observed_uid.as_str())
             || object.metadata.resource_version.as_deref()
                 != Some(approval.observed_resource_version.as_str())

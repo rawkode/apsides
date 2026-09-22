@@ -198,7 +198,6 @@ pub struct NamespaceRegistryState {
     pub workload_namespace: String,
     pub claim_snapshot: coordination::ClaimRef,
     pub histories: BTreeMap<String, GenerationHistory>,
-    #[serde(default)]
     pub active_writer_checkpoints: BTreeMap<String, crate::WriterCheckpoint>,
     pub audit_heads: BTreeMap<String, coordination::AuditRef>,
     pub transitions: BTreeMap<String, StoredTransition>,
@@ -232,7 +231,6 @@ pub struct DeploymentCredential {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RequestDrainQualification {
-    UnqualifiedDirectApi,
     IsolatedEnvoy {
         qualification_digest: String,
         node_image_digest: String,

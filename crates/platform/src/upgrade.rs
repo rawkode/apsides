@@ -192,7 +192,7 @@ impl PlatformClient {
             || drain.runtime_termination.is_none()
             || drain.final_proxy_ledger.is_none()
             || drain.proxy_termination.is_none()
-            || &drain.retired_identity_uids != crate::retirement::identities(previous)
+            || drain.retired_identity_uids != previous.retirement_identity_uids
         {
             return Err(invalid("upgrade lacks complete source evidence"));
         }

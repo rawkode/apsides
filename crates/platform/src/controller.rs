@@ -104,42 +104,12 @@ impl PlatformClient {
         }
         Ok(())
     }
-    /// Stage an immutable verified native image with zero replicas and protected
-    /// inactive activation/inventory. Direct API generations are explicitly not
-    /// qualified for a subsequent automatic upgrade.
-    /// # Errors
-    /// Rejects stale release/policy, existing unrecorded objects and all upgrades.
-    pub async fn stage_controller(
-        &self,
-        transition_id: &str,
-        executor_id: &str,
-        release: &IntegrityVerifiedCandidate,
-    ) -> Result<Versioned<NamespaceRegistry>> {
-        let artifact = StagingArtifact::from(release);
-        let reserved = self.load_registry().await?;
-        let stored = self.selected(&reserved, transition_id)?;
-        if stored.plan.request.previous.is_some() {
-            return Err(invalid(
-                "controller upgrade staging requires a qualified proxy transport",
-            ));
-        }
-        deploy::require_event_capacity(&stored.plan, &stored.record)?;
-        let binding = self.release_binding(&stored, &artifact).await?;
-        let mut registry = self
-            .stage_runtime_identity(transition_id, executor_id)
-            .await?;
-        self.stage_initial_controller_resources(&mut registry, &stored, &binding, None)
-            .await?;
-        self.record_staged_controller(&registry, transition_id, executor_id, binding, &artifact)
-            .await
-    }
-
     pub(crate) async fn stage_initial_controller_resources(
         &self,
         registry: &mut Versioned<NamespaceRegistry>,
         stored: &crate::transition_session::ResolvedStoredTransition,
         binding: &RuntimeBinding,
-        proxy_secret: Option<&str>,
+        proxy_secret: &str,
     ) -> Result<()> {
         let transition_id = &stored.plan.request.transition_id;
         if stored.plan.request.previous.is_none() {
@@ -197,7 +167,7 @@ impl PlatformClient {
         }
         let pull_secrets = self.controller_pull_secrets(binding).await?;
         let config_name = format!("{}-config", binding.service_account_name);
-        let config = startup_config(binding, &self.control_namespace, proxy_secret.is_some());
+        let config = startup_config(binding, &self.control_namespace);
         self.stage_object(registry, transition_id,"v1","ConfigMap",&config_name,json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":config_name,"namespace":self.control_namespace},"immutable":true,"data":{"config.json":String::from_utf8(canonical_bytes(&config)?).map_err(|_|invalid("invalid config encoding"))?}})).await?;
         self.stage_object(
             registry,
@@ -234,10 +204,6 @@ impl PlatformClient {
         entry.runtime_binding = Some(binding);
         entry.staged_trust_policy_digest = Some(release.trust_policy_digest.into());
         entry.staged_provenance_digest = Some(release.provenance_digest.into());
-        if entry.request_drain_qualification.is_none() {
-            entry.request_drain_qualification =
-                Some(crate::RequestDrainQualification::UnqualifiedDirectApi);
-        }
         let event = Event::Staged {
             event_id: format!("stage-{}", entry.record.verification_epoch),
             generation_id: selected.plan.request.next.generation_id.clone(),
@@ -509,31 +475,28 @@ pub(crate) fn state_object(
     )
 }
 
-fn startup_config(binding: &RuntimeBinding, control_namespace: &str, proxy: bool) -> Value {
-    json!({"mode":"production","apiAccess":if proxy {"proxy"} else {"inCluster"},"controlNamespace":control_namespace,"binding":binding,"pollIntervalMillis":1_000,"baseBackoffMillis":500,"maxBackoffMillis":30_000,"minMutationIntervalMillis":100,"diagnosticsBind":"0.0.0.0:8080"})
+fn startup_config(binding: &RuntimeBinding, control_namespace: &str) -> Value {
+    json!({"mode":"production","apiAccess":"proxy","controlNamespace":control_namespace,"binding":binding,"pollIntervalMillis":1_000,"baseBackoffMillis":500,"maxBackoffMillis":30_000,"minMutationIntervalMillis":100,"diagnosticsBind":"0.0.0.0:8080"})
 }
 
 fn controller_deployment(
     binding: &RuntimeBinding,
     namespace: &str,
     config_name: &str,
-    proxy_secret: Option<&str>,
+    proxy_secret: &str,
     pull_secrets: &[String],
 ) -> Value {
     let labels = json!({"apsides.dev/generation":binding.generation_id});
-    let mut mounts = vec![json!({"name":"config","mountPath":"/etc/apsides","readOnly":true})];
-    let mut volumes = vec![json!({"name":"config","configMap":{"name":config_name}})];
-    let account = proxy_secret.map_or_else(
-        || binding.service_account_name.clone(),
-        |secret| {
-            mounts.push(
-                json!({"name":"proxy-client","mountPath":"/etc/apsides/proxy","readOnly":true}),
-            );
-            volumes.push(json!({"name":"proxy-client","secret":{"secretName":secret,"defaultMode":420,"items":[{"key":"ca.crt","path":"ca.crt"},{"key":"client.crt","path":"tls.crt"},{"key":"client.key","path":"tls.key"}]}}));
-            format!("{}-process", binding.service_account_name)
-        },
-    );
-    let mut deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":binding.service_account_name,"namespace":namespace},"spec":{"replicas":0,"selector":{"matchLabels":labels},"strategy":{"type":"Recreate"},"template":{"metadata":{"labels":labels,"finalizers":[crate::TERMINATION_FINALIZER]},"spec":{"serviceAccountName":account,"automountServiceAccountToken":proxy_secret.is_none(),"tolerations":[{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoExecute"},{"key":"node.kubernetes.io/unreachable","operator":"Exists","effect":"NoExecute"}],"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"controller","image":binding.controller_image,"imagePullPolicy":"IfNotPresent","env":[{"name":"APSIDES_RUNTIME_CONFIG_PATH","value":"/etc/apsides/config.json"}],"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}},"volumeMounts":mounts,"ports":[{"containerPort":8080,"name":"diagnostics"}],"resources":{"requests":{"cpu":"10m","memory":"32Mi"},"limits":{"cpu":"1","memory":"256Mi"}},"livenessProbe":{"httpGet":{"path":"/livez","port":"diagnostics"}},"readinessProbe":{"httpGet":{"path":"/readyz","port":"diagnostics"}}}],"volumes":volumes}}}});
+    let mounts = [
+        json!({"name":"config","mountPath":"/etc/apsides","readOnly":true}),
+        json!({"name":"proxy-client","mountPath":"/etc/apsides/proxy","readOnly":true}),
+    ];
+    let volumes = [
+        json!({"name":"config","configMap":{"name":config_name}}),
+        json!({"name":"proxy-client","secret":{"secretName":proxy_secret,"defaultMode":420,"items":[{"key":"ca.crt","path":"ca.crt"},{"key":"client.crt","path":"tls.crt"},{"key":"client.key","path":"tls.key"}]}}),
+    ];
+    let account = format!("{}-process", binding.service_account_name);
+    let mut deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":binding.service_account_name,"namespace":namespace},"spec":{"replicas":0,"selector":{"matchLabels":labels},"strategy":{"type":"Recreate"},"template":{"metadata":{"labels":labels,"finalizers":[crate::TERMINATION_FINALIZER]},"spec":{"serviceAccountName":account,"automountServiceAccountToken":false,"tolerations":[{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoExecute"},{"key":"node.kubernetes.io/unreachable","operator":"Exists","effect":"NoExecute"}],"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"controller","image":binding.controller_image,"imagePullPolicy":"IfNotPresent","env":[{"name":"APSIDES_RUNTIME_CONFIG_PATH","value":"/etc/apsides/config.json"}],"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}},"volumeMounts":mounts,"ports":[{"containerPort":8080,"name":"diagnostics"}],"resources":{"requests":{"cpu":"10m","memory":"32Mi"},"limits":{"cpu":"1","memory":"256Mi"}},"livenessProbe":{"httpGet":{"path":"/livez","port":"diagnostics"}},"readinessProbe":{"httpGet":{"path":"/readyz","port":"diagnostics"}}}],"volumes":volumes}}}});
     set_image_pull_secrets(&mut deployment, pull_secrets);
     deployment
 }
@@ -648,13 +611,13 @@ mod image_pull_tests {
             controller_image: "registry/controller@sha256:digest".into(),
         };
         let names = vec!["registry-auth".to_string()];
-        let populated = controller_deployment(&binding, "control", "config", Some("tls"), &names);
+        let populated = controller_deployment(&binding, "control", "config", "tls", &names);
         assert_eq!(
             populated["spec"]["template"]["spec"]["imagePullSecrets"],
             json!([{"name":"registry-auth"}])
         );
         let names = vec![];
-        let empty = controller_deployment(&binding, "control", "config", Some("tls"), &names);
+        let empty = controller_deployment(&binding, "control", "config", "tls", &names);
         let mut expected = populated;
         if let Some(spec) = expected["spec"]["template"]["spec"].as_object_mut() {
             spec.remove("imagePullSecrets");

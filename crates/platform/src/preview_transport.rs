@@ -1,4 +1,4 @@
-//! Bounded raw transport for a future authenticated live-impact preview.
+//! Bounded raw transport for the authenticated live-impact preview.
 //!
 //! This module fixes request shape and response handling. It grants no approval or session
 //! authority and never converts a preview into a live write.

@@ -99,11 +99,6 @@ impl IssuedDeployment {
         &self.identity.value
     }
 
-    #[must_use]
-    pub const fn identity_approval(&self) -> &Versioned<DeploymentIdentity> {
-        &self.identity
-    }
-
     /// Recheck the pinned preview opt-in through the issued identity. This check
     /// alone does not authenticate a release, target set, or observation interval.
     /// # Errors

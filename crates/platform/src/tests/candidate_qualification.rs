@@ -183,7 +183,7 @@ impl QualificationFixture {
         };
         let identity = Versioned {
             value: DeploymentIdentity {
-                schema_version: SCHEMA_VERSION.into(),
+                schema_version: crate::DEPLOYMENT_IDENTITY_SCHEMA_V2.into(),
                 domain_id: domain.id.clone(),
                 cluster_binding: domain.cluster_binding.clone(),
                 service_account_name: "deployer".into(),

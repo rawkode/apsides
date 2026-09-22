@@ -883,7 +883,7 @@ class CnpgDemoRunner(base.CeilingRunner):
         ))
         self.secret_uid = secret["uid"]
         self.state("apsides-deploy-identity-" + self.domain, {
-            "schemaVersion": "apsides.dev/platform/v1",
+            "schemaVersion": "apsides.dev/deployment-identity/v2",
             "domainId": self.domain,
             "clusterBinding": self.binding,
             "serviceAccountName": "ceiling-deployer",
@@ -892,6 +892,7 @@ class CnpgDemoRunner(base.CeilingRunner):
             "bindingSecretUid": self.secret_uid,
             "audience": "https://kubernetes.default.svc.cluster.local",
             "lifetimeSeconds": 900,
+            "preview": None,
         })
         self.create({
             "apiVersion": "v1", "kind": "Secret", "type": "Opaque",

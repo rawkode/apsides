@@ -78,9 +78,7 @@ async fn deploy(arguments: &cli::Deploy) -> Result<Value> {
             )
             .await;
         }
-        ExistingTransition::Resume => crate::review::LiveReview::Unavailable {
-            reason: "deployment-identity-preview-not-approved",
-        },
+        ExistingTransition::Resume => crate::review::LiveReview::not_approved(),
         ExistingTransition::Absent => {
             reserve_new_transition(
                 &issued,

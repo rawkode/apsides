@@ -35,7 +35,6 @@ fn audit_does_not_create_a_missing_database() -> Result<(), Box<dyn std::error::
         ])
         .env("KUBECONFIG", &kubeconfig)
         .env("APSIDES_INVENTORY_DATABASE", &database)
-        .env_remove("APSIDES_INVENTORY_TOKEN")
         .output()?;
     assert_eq!(output.status.code(), Some(1));
     let error = std::str::from_utf8(&output.stderr)?;

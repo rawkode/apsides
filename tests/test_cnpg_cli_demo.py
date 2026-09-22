@@ -39,8 +39,7 @@ class CliDemoTests(unittest.TestCase):
             runner.reports = []
             report = self.report()
             runner.command = Mock(return_value=json.dumps(report))
-            with patch.dict(os.environ, {"KUBECONFIG": "/wrong/admin", "APSIDES_INVENTORY_TOKEN": "PRIVATE",
-                                         "APS_PERMISSION_UPGRADE_STEP": "wrong"}):
+            with patch.dict(os.environ, {"KUBECONFIG": "/wrong/admin", "APS_PERMISSION_UPGRADE_STEP": "wrong"}):
                 runner.deploy_cli(Path('/fixture/candidate'), report)
             command = runner.command.call_args
             self.assertEqual(command.args[0], [runner.aps, "deploy", "--artifact", Path('/fixture/candidate'),
@@ -48,7 +47,6 @@ class CliDemoTests(unittest.TestCase):
             env = command.kwargs['environment']
             self.assertEqual(env['KUBECONFIG'], str(runner.issuer))
             self.assertEqual(env['APSIDES_INVENTORY_DATABASE'], str(runner.inventory))
-            self.assertNotIn('APSIDES_INVENTORY_TOKEN', env)
             self.assertNotIn('APS_PERMISSION_UPGRADE_STEP', env)
             runner.refresh_issuer.assert_called_once()
             self.assertEqual(runner.require_inputs_unchanged.call_count, 2)

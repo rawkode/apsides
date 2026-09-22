@@ -3,20 +3,6 @@ use coordination::{ReviewMetadataV1, ReviewPrimitive, ReviewSource};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, Serialize)]
-pub(super) struct Unavailable {
-    status: &'static str,
-    reason: &'static str,
-}
-impl Unavailable {
-    pub(super) const fn live() -> Self {
-        Self {
-            status: "unavailable",
-            reason: "live-server-side-apply-preview-not-executed",
-        }
-    }
-}
-
 #[derive(Serialize)]
 pub(super) struct Changed<'a, T> {
     before: &'a T,

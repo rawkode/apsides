@@ -22,12 +22,7 @@ impl PlatformClient {
         let crate::RequestDrainQualification::IsolatedEnvoy {
             qualification_digest,
             node_image_digest,
-        } = &checkpoint.request_drain_qualification
-        else {
-            return Err(invalid(
-                "previous writer lacks isolated proxy qualification",
-            ));
-        };
+        } = &checkpoint.request_drain_qualification;
         let identity = &checkpoint.proxy_identity;
         let policy = self
             .load_proxy_policy(&checkpoint.runtime_binding.domain_id)
@@ -152,7 +147,6 @@ impl PlatformClient {
         self.verify_runtime_identity(stored).await?;
         self.verify_controller_support(stored).await?;
         match (&stored.request_drain_qualification, &stored.proxy_identity) {
-            (Some(crate::RequestDrainQualification::UnqualifiedDirectApi), None) => Ok(()),
             (
                 Some(crate::RequestDrainQualification::IsolatedEnvoy {
                     qualification_digest,

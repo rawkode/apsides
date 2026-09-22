@@ -1,10 +1,11 @@
 mod live;
 
 use super::*;
+use crate::review::LiveReview;
 use compiler_core::canonical_bytes;
 
 mod projection;
-mod v4;
+mod upgrade;
 
 fn source(line: u32) -> Value {
     json!({"file":"program.tsx","line":line,"column":3})
@@ -58,7 +59,7 @@ fn report(ir: &Value) -> Result<Value> {
 #[test]
 fn initial_review_uses_complete_compiler_fields_and_explicit_empty_baselines() -> Result<()> {
     let report = report(&declaration("private-value-canary")?)?;
-    assert_eq!(report["schemaVersion"], "apsides.dev/deployment-review/v4");
+    assert_eq!(report["schemaVersion"], "apsides.dev/deployment-review/v5");
     for category in [
         "reactions",
         "inputAuthority",
@@ -115,7 +116,7 @@ fn initial_review_uses_complete_compiler_fields_and_explicit_empty_baselines() -
     assert_eq!(report["liveImpact"]["status"], "unavailable");
     assert_eq!(
         report["liveImpact"]["reason"],
-        "live-server-side-apply-preview-not-executed"
+        "deployment-identity-preview-not-approved"
     );
     Ok(())
 }
@@ -190,7 +191,7 @@ fn review_rejects_substituted_derived_fields_and_plan_receipts() -> Result<()> {
 #[test]
 fn review_preserves_canonical_graph_and_separates_permission_requirements() -> Result<()> {
     let (stored, plan) = transition(&declaration("private-value-canary")?)?;
-    crate::review::preflight(&plan, None)?;
+    crate::review::preflight(&plan, None, &LiveReview::not_approved())?;
     let report = crate::review::transition_review_fixture(&stored, &plan, TRANSITION_1, None)?;
     assert_eq!(
         report["dataflow"]["after"],

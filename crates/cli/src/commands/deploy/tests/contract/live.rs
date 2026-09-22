@@ -53,7 +53,7 @@ fn live_report(
 fn render_live(private: &str) -> Result<Value> {
     let (stored, plan) = transition(&declaration(private)?)?;
     let live = crate::review::LiveReview::fresh(&plan, None, live_report(&plan, None)?)?;
-    crate::review::preflight_with_live(&plan, None, &live)?;
+    crate::review::preflight(&plan, None, &live)?;
     crate::review::transition_review_fixture_with_live(&stored, &plan, TRANSITION_1, None, &live)
 }
 
@@ -106,14 +106,14 @@ fn changed_plan_digest_or_predecessor_reference_is_rejected() -> Result<()> {
     wrong_digest.plan_digest = format!("sha256:{}", "f".repeat(64));
     assert!(crate::review::LiveReview::fresh(&initial, None, wrong_digest).is_err());
 
-    let (_, upgrade, previous) = super::v4::upgrade(&ir, &ir)?;
+    let (_, upgrade, previous) = super::upgrade::upgrade(&ir, &ir)?;
     let live = crate::review::LiveReview::fresh(
         &upgrade,
         Some(&previous),
         live_report(&upgrade, Some(&previous))?,
     )?;
     let next = platform::project_review_metadata(&upgrade)?;
-    assert!(crate::review::preflight_with_live(&upgrade, Some(&next), &live).is_err());
+    assert!(crate::review::preflight(&upgrade, Some(&next), &live).is_err());
     let mut substituted = previous;
     substituted
         .resources
@@ -122,7 +122,7 @@ fn changed_plan_digest_or_predecessor_reference_is_rejected() -> Result<()> {
         .source
         .line += 1;
     substituted.validate()?;
-    assert!(crate::review::preflight_with_live(&upgrade, Some(&substituted), &live).is_err());
+    assert!(crate::review::preflight(&upgrade, Some(&substituted), &live).is_err());
     Ok(())
 }
 
@@ -175,7 +175,7 @@ fn amplified_previous(base: &ReviewMetadataV1, names: &[String], count: usize) -
 #[test]
 fn one_global_budget_covers_declaration_and_live_evidence() -> Result<()> {
     let ir = declaration("private-global-budget-canary")?;
-    let (_, plan, base) = super::v4::upgrade(&ir, &ir)?;
+    let (_, plan, base) = super::upgrade::upgrade(&ir, &ir)?;
     let names: Vec<_> = (0..23_000)
         .map(|index| {
             format!(
@@ -189,23 +189,28 @@ fn one_global_budget_covers_declaration_and_live_evidence() -> Result<()> {
     let mut passing = 0usize;
     let mut failing = names.len();
     assert!(
-        crate::review::preflight(&plan, Some(&amplified_previous(&base, &names, failing))).is_err()
+        crate::review::preflight(
+            &plan,
+            Some(&amplified_previous(&base, &names, failing)),
+            &LiveReview::not_approved()
+        )
+        .is_err()
     );
     while passing + 1 < failing {
         let candidate = passing + (failing - passing) / 2;
         let previous = amplified_previous(&base, &names, candidate);
-        if crate::review::preflight(&plan, Some(&previous)).is_ok() {
+        if crate::review::preflight(&plan, Some(&previous), &LiveReview::not_approved()).is_ok() {
             passing = candidate;
         } else {
             failing = candidate;
         }
     }
     let previous = amplified_previous(&base, &names, passing);
-    crate::review::preflight(&plan, Some(&previous))?;
+    crate::review::preflight(&plan, Some(&previous), &LiveReview::not_approved())?;
     let preview = live_report(&plan, Some(&previous))?;
     assert!(serde_json::to_vec(&preview)?.len() < 8 * 1024 * 1024);
     let live = crate::review::LiveReview::fresh(&plan, Some(&previous), preview)?;
-    let Err(error) = crate::review::preflight_with_live(&plan, Some(&previous), &live) else {
+    let Err(error) = crate::review::preflight(&plan, Some(&previous), &live) else {
         return Err("separately bounded live evidence exceeded the global review budget".into());
     };
     assert!(

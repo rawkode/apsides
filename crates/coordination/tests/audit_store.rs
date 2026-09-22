@@ -252,25 +252,13 @@ fn malformed_order_scope_chain_and_sanitized_metadata_are_rejected() -> TestResu
         .event_id = "committed".to_owned();
     assert!(changed.validate().is_err());
 
-    let mut changed = audit(2, Some(first_reference.clone()))?;
+    let mut changed = audit(2, Some(first_reference))?;
     changed
         .previous
         .as_mut()
         .ok_or("previous audit missing")?
         .scope
         .domain_id = "other".to_owned();
-    assert!(changed.validate().is_err());
-
-    let mut changed = audit(2, Some(first_reference))?;
-    changed
-        .ownership
-        .first_mut()
-        .ok_or("ownership fixture missing")?
-        .action = OwnershipAction::Transfer {
-        source_domain_id: "other".to_owned(),
-        source_generation_id: "foreign-generation".to_owned(),
-        source_transition_id: "foreign-transition".to_owned(),
-    };
     assert!(changed.validate().is_err());
 
     let mut changed = audit(1, None)?;

@@ -8,7 +8,6 @@ pub mod deploy;
 pub mod evidence;
 pub mod init;
 pub mod lock;
-pub mod plan;
 pub mod release;
 pub mod test;
 pub mod verify;

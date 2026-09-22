@@ -115,7 +115,7 @@ impl PlatformClient {
                 &data,
             )
             .await?;
-        self.stage_initial_controller_resources(&mut registry, &stored, &binding, Some(&tls_name))
+        self.stage_initial_controller_resources(&mut registry, &stored, &binding, &tls_name)
             .await?;
         let mut next = registry.value.clone();
         let entry = next
@@ -135,7 +135,7 @@ impl PlatformClient {
     /// Read an independent platform admission of the fixed Envoy profile.
     /// # Errors
     /// Rejects mismatched image, profile, environment or boundedness settings.
-    pub async fn load_proxy_policy(&self, domain: &str) -> Result<Versioned<ProxyPolicy>> {
+    pub(crate) async fn load_proxy_policy(&self, domain: &str) -> Result<Versioned<ProxyPolicy>> {
         let state: Versioned<ProxyPolicy> = read_state(
             &self.client,
             &self.control_namespace,

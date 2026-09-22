@@ -295,7 +295,7 @@ fn review_requires_exact_replay_and_predecessor_checkpoint() -> Result<()> {
         TRANSITION_2,
         Some(&previous_review),
     )?;
-    assert_eq!(review["schemaVersion"], "apsides.dev/deployment-review/v4");
+    assert_eq!(review["schemaVersion"], "apsides.dev/deployment-review/v5");
     assert_eq!(
         review["detailAvailability"],
         "authenticated-declaration-metadata"

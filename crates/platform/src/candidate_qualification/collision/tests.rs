@@ -1,7 +1,8 @@
 use super::*;
+use crate::executor_binding::EXECUTOR_BINDING_SCHEMA;
 use crate::{
-    CapacityAdmission, EXECUTOR_BINDING_SCHEMA, ExecutorBinding, NamespaceRegistryState,
-    PolicyState, REGISTRY_SCHEMA_VERSION, SCHEMA_VERSION, StoredTransition, TransitionInputs,
+    CapacityAdmission, ExecutorBinding, NamespaceRegistryState, PolicyState,
+    REGISTRY_SCHEMA_VERSION, SCHEMA_VERSION, StoredTransition, TransitionInputs,
 };
 use compiler_core::{PermissionCeiling, parse_and_validate};
 use coordination::{ClaimScope, ClaimSnapshotV1, ReviewRef, ReviewScope};
