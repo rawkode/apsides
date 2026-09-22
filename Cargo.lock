@@ -2373,6 +2373,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-cluster"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "compiler-core",
+ "hmac",
+ "http",
+ "k8s-openapi",
+ "kube",
+ "platform",
+ "release",
+ "runtime",
+ "serde",
+ "serde-saphyr",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "thiserror"
 version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"

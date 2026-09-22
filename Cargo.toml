@@ -9,6 +9,7 @@ members = [
     "crates/platform",
     "crates/release",
     "crates/runtime",
+    "crates/test-cluster",
 ]
 
 [workspace.package]
