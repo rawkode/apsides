@@ -416,7 +416,7 @@ class CnpgDemoRunner(base.CeilingRunner):
         self.require_inputs_unchanged()
         output = self.command([
             "cargo", "test", "--locked", "--offline", "-p", "platform", "--features", "test-support",
-            "--test", "permission_upgrade", "--test", "live_candidate", "--no-run", "--message-format=json",
+            "--test", "permission_upgrade", "--test", "proxy_profile", "--no-run", "--message-format=json",
         ], timeout=300)
         executables = {}
         for line in output.splitlines():
@@ -425,15 +425,15 @@ class CnpgDemoRunner(base.CeilingRunner):
             except ValueError:
                 continue
             name = row.get("target", {}).get("name")
-            if row.get("reason") == "compiler-artifact" and name in {"permission_upgrade", "live_candidate"} and row.get("executable"):
+            if row.get("reason") == "compiler-artifact" and name in {"permission_upgrade", "proxy_profile"} and row.get("executable"):
                 executables.setdefault(name, []).append(row["executable"])
-        if any(len(executables.get(name, [])) != 1 for name in ["permission_upgrade", "live_candidate"]):
+        if any(len(executables.get(name, [])) != 1 for name in ["permission_upgrade", "proxy_profile"]):
             raise shared.QualificationError("Cargo did not identify the CNPG demo drivers")
         self.require_inputs_unchanged()
         self.driver = self.output / "permission-upgrade-driver"
         self.profile_driver = self.output / "proxy-profile-driver"
         shutil.copy2(executables["permission_upgrade"][0], self.driver)
-        shutil.copy2(executables["live_candidate"][0], self.profile_driver)
+        shutil.copy2(executables["proxy_profile"][0], self.profile_driver)
         self.driver_digest = shared.digest_file(self.driver)
         self.profile_driver_digest = shared.digest_file(self.profile_driver)
         self.freeze_file("executable/permission-upgrade-driver", self.driver)
