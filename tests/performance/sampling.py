@@ -41,8 +41,8 @@ def read(path):
     return path.read_bytes()
 
 
-def collection_window(self, label, controllers, action=None, *, namespaces, bindings, metrics_paths=(),
-                      runtime_status=(), expected_runtime=(), identity_gets=4, label_prefix="cnpg-baseline"):
+def collection_window(self, label, controllers, action=None, *, namespaces, bindings, label_prefix, metrics_paths=(),
+                      runtime_status=(), expected_runtime=(), identity_gets=4):
     """Run the existing collector; all timestamps use the host monotonic clock."""
     require(bindings() == controllers, "performance controller identity changed")
     output = self.output / ("performance-" + label)

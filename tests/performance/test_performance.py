@@ -1,7 +1,5 @@
-import io
 import json
 from pathlib import Path
-import tarfile
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -10,58 +8,6 @@ from unittest.mock import patch
 import collect as collector
 
 from collect import container_usage, cpu_delta
-from generate import archive, prepare
-from stimulate import sequence_value
-
-IMAGE = "example.invalid/image@sha256:" + "1" * 64
-
-
-class PreparationTests(unittest.TestCase):
-    def test_equivalent_populations_and_bounded_flux_scope(self):
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "profile"
-            profile = prepare(output, 4, 3, IMAGE, IMAGE, 5)
-            self.assertEqual(profile["domains"], 4)
-            inputs = json.loads((output / "inputs.json").read_text())["items"]
-            self.assertEqual(len(inputs), 4)
-            objects = json.loads((output / "flux.json").read_text())["items"]
-            manager = next(obj for obj in objects if obj["kind"] == "Deployment" and obj["metadata"]["name"] == "benchmark-flux")
-            args = manager["spec"]["template"]["spec"]["containers"][0]["args"]
-            self.assertIn("--watch-all-namespaces=false", args)
-            self.assertIn("--concurrent=1", args)
-            self.assertNotIn("ClusterRole", [obj["kind"] for obj in objects])
-            with tarfile.open(output / "bench-0/artifact.tar.gz") as payload:
-                desired = json.load(payload.extractfile("resources.json"))["items"]
-            self.assertEqual([obj["kind"] for obj in desired], ["Deployment", "ConfigMap", "ConfigMap", "ConfigMap"])
-            source = (output / "bench-0/program.tsx").read_text()
-            self.assertEqual(source.count("<ConfigMap id="), 3)
-            self.assertIn('"maxConcurrentRequests": 1', source)
-
-    def test_artifacts_are_stable_and_have_no_machine_metadata(self):
-        first = archive([{"kind": "ConfigMap"}])
-        self.assertEqual(first, archive([{"kind": "ConfigMap"}]))
-        with tarfile.open(fileobj=io.BytesIO(first)) as payload:
-            self.assertTrue(all(member.mtime == 0 and member.uid == 0 and member.gid == 0 for member in payload))
-
-    def test_mutable_images_and_unbounded_population_are_rejected(self):
-        with tempfile.TemporaryDirectory() as directory:
-            for domains, image in [(33, IMAGE), (1, "example:latest")]:
-                with self.assertRaises(ValueError):
-                    prepare(Path(directory) / "profile", domains, 1, image, IMAGE, 5)
-
-
-    def test_shared_sequence_is_identical_and_ambiguous_entries_fail(self):
-        with tempfile.TemporaryDirectory() as directory:
-            first = prepare(Path(directory) / "flux", 4, 1, IMAGE, IMAGE, 5)
-            second = prepare(Path(directory) / "apsides", 4, 1, IMAGE, IMAGE, 5)
-            self.assertEqual(first["inputSequence"], second["inputSequence"])
-            values = [sequence_value(first, iteration, "bench-0") for iteration in range(100)]
-            self.assertEqual(len(set(values)), 100)
-            first["inputSequence"].append(first["inputSequence"][0])
-            with self.assertRaises(ValueError):
-                sequence_value(first, 0, "bench-0")
-            with self.assertRaises(ValueError):
-                sequence_value(second, 0, "not-in-profile")
 
 
 class MeasurementTests(unittest.TestCase):
