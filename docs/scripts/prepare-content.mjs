@@ -24,8 +24,6 @@ const references = [
   ["reference/INVENTORY.md", "reference/inventory.md", "Resource inventory"],
   ["reference/IR-CONTRACT.md", "reference/ir-contract.md", "IR contract"],
   ["reference/OCI-PACKAGING.md", "reference/oci-packaging.md", "Native controller OCI packaging"],
-  ["reference/PERFORMANCE.md", "reference/performance.md", "Performance comparison contract"],
-  ["reference/PRODUCTION-EVIDENCE.md", "reference/production-evidence.md", "Production acceptance evidence"],
   ["reference/PLATFORM-CONTRACT.md", "reference/platform-contract.md", "Platform contract"],
   ["reference/REVIEW-CONTRACT.md", "reference/review-contract.md", "Deployment review contract"],
   ["reference/SPEC-v0.2.md", "reference/spec-v0-2.md", "Apsides specification 0.2"],
@@ -38,20 +36,8 @@ const withFrontmatter = (source, title) => {
   const withoutHeading = source
     .replace(/^# .+\n+/, "")
     .replace(
-      /\]\(REVIEW-CONTRACT\.md(#[^)]+)?\)/g,
-      (_, fragment = "") => `](../review-contract/${fragment})`,
-    )
-    .replace(
-      /\]\(STATE-CAPACITY\.md(#[^)]+)?\)/g,
-      (_, fragment = "") => `](../state-capacity/${fragment})`,
-    )
-    .replace(
       /\]\(SPEC-v0\.2\.md(#[^)]+)?\)/g,
       (_, fragment = "") => `](../spec-v0-2/${fragment})`,
-    )
-    .replace(
-      /\]\(AUDIT\.md(#[^)]+)?\)/g,
-      (_, fragment = "") => `](../audit/${fragment})`,
     )
     .replace(
       /\]\(CLI-DISTRIBUTION\.md(#[^)]+)?\)/g,
@@ -64,10 +50,6 @@ const withFrontmatter = (source, title) => {
     .replace(
       /\]\(\.\.\/\.\.\/examples\/cnpg\/cleanup\/README\.md\)/g,
       "](https://github.com/rawkode/apsides/blob/main/examples/cnpg/cleanup/README.md)",
-    )
-    .replace(
-      /\]\(\.\.\/\.\.\/examples\/web-application\/README\.md\)/g,
-      "](https://github.com/rawkode/apsides/blob/main/examples/web-application/README.md)",
     );
   const escapedTitle = JSON.stringify(title);
   return `---\ntitle: ${escapedTitle}\n---\n\n${withoutHeading}`;
