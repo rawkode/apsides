@@ -59,7 +59,9 @@ target/debug/aps test \
 input. `test` executes the compiler's required semantic scenarios into another
 fresh directory. Required cases that need a cluster are reported as
 unsupported, so it returns nonzero for any program with such cases. Neither
-command contacts Kubernetes.
+command contacts Kubernetes. `aps test --cluster` runs those cases too, against
+a fixture build of the controller on a disposable kind cluster; see
+[Build and deploy](/guides/build-and-deploy/#run-the-reactor-tests-on-a-cluster).
 
 ## Read the result honestly
 
