@@ -88,8 +88,8 @@ def capture(sbom_tool, cli):
 
 def public(snapshot):
     if (snapshot.get("schemaVersion") != SCHEMA
-            or sorted(snapshot.get("resolvedPaths", {})) != list(ROLES)
-            or sorted(snapshot.get("invocationPaths", {})) != list(ROLES)):
+            or sorted(snapshot.get("resolvedPaths", {})) != sorted(ROLES)
+            or sorted(snapshot.get("invocationPaths", {})) != sorted(ROLES)):
         raise ValueError("invalid host tool snapshot")
     return snapshot["tools"]
 
