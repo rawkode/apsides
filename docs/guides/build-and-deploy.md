@@ -14,6 +14,7 @@ running the deployment protocol.
 | `aps compile` | validated IR, plan, capabilities and generated controller source | deployable image or signed release |
 | `aps build` | pinned Linux binary, OCI archive, SBOM and compiler closure | approved provenance or deployment authorization |
 | `aps test` | the program's generated semantic scenarios; cases that need a cluster are reported unsupported | cluster behaviour or release trust |
+| `aps test --cluster` | every generated reactor case of a fixture release, run against its controller on a disposable, egress-denied kind cluster | production image behaviour, application behaviour or release trust |
 | `aps verify` | local artifact integrity and recomputed plan | trusted release provenance |
 | `aps verify-release` | release integrity and signed provenance under a trust policy, offline | platform admission or live cluster behaviour |
 | `aps deploy` | the same release checks, then authorized, resumable lifecycle execution | application workload readiness |
@@ -42,6 +43,42 @@ The complete build also requires matching locally cached builder/runtime images,
 offline Cargo inputs, Docker BuildKit and the configured `cargo-cyclonedx` executable. It emits
 `build-result.json`, `image/controller.oci.tar`,
 `linux-binary/apsides-controller`, `sbom/sbom.json` and `build-inputs.json`.
+
+## Run the reactor tests on a cluster
+
+`aps test --cluster` runs every generated reactor case against the program's
+own controller. It takes a fixture release — `aps build --mode fixture`
+assembled with `aps release` — and an OCI archive of the workload fixture image
+built from `scripts/fixture-image`:
+
+```sh
+docker build --pull=false --network=none --tag apsides-fixture:local scripts/fixture-image
+docker image save --output work/fixture-image.tar apsides-fixture:local
+
+target/debug/aps test --cluster \
+  --release path/to/fixture-release \
+  --fixture-image work/fixture-image.tar \
+  --output work/reactor-results
+```
+
+It creates a kind cluster named `aps-test-…` from the pinned Kubernetes v1.34.3
+node image, with its kubeconfig in a private temporary directory, and never
+reads your current context. The node image and
+`nginxinc/nginx-unprivileged:alpine@sha256:d908…` (the controller's loopback
+proxy and the egress sentinel) must already be pulled; nothing is fetched
+during the run. Images are imported into the node by digest, all egress except
+the API server is denied and proven denied by canaries, and the controller runs
+in fixture mode with a short-lived token for its generated `ServiceAccount`.
+Programs that manage custom resources pass their CRD manifests with `--crds`.
+
+`results.json` records each case's reaction, source location, scenario, fixture
+digest, the tested release and overlay identity, and whether it passed,
+failed, was unsupported or was excluded, beside the secret-canary scan and the
+reaction-mutation check; `junit.xml`, controller logs and object diagnostics
+(never Secrets) sit next to it. The cluster is deleted at the end unless `--keep-cluster` is
+given. The command fails if any required case fails or is unsupported.
+`cuenv task reactorClusterTest` runs the whole path on
+`examples/web-application`.
 
 OCI packaging is optional distribution. `aps build` produces an OCI archive
 as part of its current complete artifact, but upgrades do not use historical

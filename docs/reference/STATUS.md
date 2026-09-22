@@ -73,10 +73,14 @@ narrower properties.
   the same checks offline. Both refuse fixture releases, and unit tests confirm
   that a correctly signed fixture release is still refused.
 - Per-program behaviour is checked by `aps test`, which belongs in the signing
-  workflow. It runs the generated semantic scenarios and reports scenarios that
-  need a cluster as unsupported, which fails the command. Live qualification of Apsides itself is moving from the Python
-  harnesses in `tests/` to a Rust acceptance suite that runs in CI on the
-  examples.
+  workflow. On its own it runs the generated semantic scenarios and reports
+  scenarios that need a cluster as unsupported, which fails the command.
+  `aps test --cluster` runs every generated case of a fixture release on a
+  disposable, egress-denied kind cluster (`crates/test-cluster`); on
+  `examples/web-application` all 43 generated cases and the 3 reaction-mutation
+  checks pass locally on linux/arm64. It does not yet run in CI. Live
+  qualification of Apsides itself is moving from the Python harnesses in
+  `tests/` to a Rust acceptance suite that runs in CI on the examples.
 
 ### Deployment and protected state
 

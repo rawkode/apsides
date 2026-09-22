@@ -75,6 +75,22 @@ tasks: {
 	ownershipCollisionTest: {command: "python3", args: ["-m", "unittest", "tests/test_ceiling_observations.py", "tests/test_deployment_ceiling.py", "tests/test_ownership_collision.py"]}
 	testClusterTest: {command: "cargo", args: ["test", "--locked", "-p", "test-cluster"]}
 	testClusterCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "test-cluster", "--all-targets", "--", "-D", "warnings"]}
+	// The fixture release and workload fixture image `aps test --cluster` runs.
+	// Needs Docker, cargo-cyclonedx and the pinned build images already pulled;
+	// see scripts/reactor_fixture.sh. The cluster run also needs kind and the
+	// pinned node and proxy images (docs/guides/build-and-deploy.md).
+	reactorFixture: {
+		dependsOn: [build, install]
+		command: "sh"
+		args: ["scripts/reactor_fixture.sh", "examples/web-application/program.tsx", "work/reactor"]
+	}
+	// Builds the fixture itself rather than depending on reactorFixture: a
+	// dependency chain two tasks deep makes cuenv's module evaluation time out.
+	reactorClusterTest: {
+		dependsOn: [build, install]
+		command: "sh"
+		args: ["-c", "sh scripts/reactor_fixture.sh examples/web-application/program.tsx work/reactor && rm -rf work/reactor/results && target/debug/aps test --cluster --release work/reactor/release --fixture-image work/reactor/fixture-image.tar --output work/reactor/results"]
+	}
 	runtimeTest: {command: "cargo", args: ["test", "--locked", "-p", "runtime"]}
 	runtimeCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "runtime", "--all-targets", "--", "-D", "warnings"]}
 	previewTest: {command: "cargo", args: ["test", "--locked", "-p", "platform", "--features", "test-support", "preview_"]}

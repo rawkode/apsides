@@ -108,7 +108,7 @@ pub enum Command {
     Compile(Compile),
     /// Compile a program and build its native controller image.
     Build(Build),
-    /// Run the generated semantic scenario plan.
+    /// Run the generated reactor tests; `--cluster` adds the Kubernetes cases.
     Test(Test),
     /// Check artifact integrity and recompute its plan.
     Verify(Verify),
@@ -212,8 +212,24 @@ pub enum Mode {
 #[derive(Args, Debug)]
 pub struct Test {
     /// Compiled IR whose scenario plan to run.
+    #[arg(long, required_unless_present = "release", conflicts_with = "release")]
+    pub ir: Option<PathBuf>,
+    /// Fixture release whose scenario plan to run.
     #[arg(long)]
-    pub ir: PathBuf,
+    pub release: Option<PathBuf>,
+    /// Also run the cases that need Kubernetes, on a disposable kind cluster.
+    #[arg(long, requires_all = ["release", "fixture_image"])]
+    pub cluster: bool,
+    /// OCI archive of the workload fixture image, from
+    /// `docker image save apsides-fixture:local`.
+    #[arg(long, requires = "cluster")]
+    pub fixture_image: Option<PathBuf>,
+    /// CRD manifests for custom resources the program manages.
+    #[arg(long, value_delimiter = ',', requires = "cluster")]
+    pub crds: Vec<PathBuf>,
+    /// Leave the cluster running after the run, for inspection.
+    #[arg(long, requires = "cluster")]
+    pub keep_cluster: bool,
     /// Fresh directory for `results.json` and `junit.xml`.
     #[arg(long)]
     pub output: PathBuf,
@@ -429,6 +445,51 @@ mod tests {
         };
         assert_eq!(lock.modules, ["a", "b"]);
         assert_eq!(lock.source, PathBuf::from("program.tsx"));
+        Ok(())
+    }
+
+    #[test]
+    fn cluster_tests_need_a_fixture_release_and_image() -> Result<()> {
+        assert!(parse(&["test", "--ir", "ir.json", "--output", "o"]).is_ok());
+        assert!(parse(&["test", "--release", "r", "--output", "o"]).is_ok());
+        assert!(parse(&["test", "--output", "o"]).is_err(), "no plan");
+        assert!(
+            parse(&["test", "--ir", "i", "--release", "r", "--output", "o"]).is_err(),
+            "two plans"
+        );
+        assert!(
+            parse(&["test", "--ir", "i", "--cluster", "--output", "o"]).is_err(),
+            "raw IR has no controller image to run"
+        );
+        assert!(
+            parse(&["test", "--release", "r", "--cluster", "--output", "o"]).is_err(),
+            "no fixture image"
+        );
+        assert!(
+            parse(&["test", "--release", "r", "--keep-cluster", "--output", "o"]).is_err(),
+            "cluster options need --cluster"
+        );
+        let Some(Command::Test(test)) = parse(&[
+            "test",
+            "--release",
+            "r",
+            "--cluster",
+            "--fixture-image",
+            "f.tar",
+            "--crds",
+            "a.yaml,b.yaml",
+            "--output",
+            "o",
+        ])?
+        .command
+        else {
+            return Err("test did not parse".into());
+        };
+        assert!(test.cluster && !test.keep_cluster);
+        assert_eq!(
+            test.crds,
+            [PathBuf::from("a.yaml"), PathBuf::from("b.yaml")]
+        );
         Ok(())
     }
 

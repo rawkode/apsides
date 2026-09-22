@@ -20,6 +20,7 @@ platform = { path = "../platform", features = ["deployer"] }
 deploy = { path = "../deploy" }
 inventory = { path = "../inventory" }
 coordination = { path = "../coordination" }
+test-cluster = { path = "../test-cluster" }
 kube = { version = "4.2", default-features = false, features = ["client", "rustls-tls", "config"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 serde = { version = "1", features = ["derive"] }

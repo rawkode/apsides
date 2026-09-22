@@ -91,7 +91,9 @@ pub fn run_semantic_tests(plan: &CompiledPlan) -> Result<SemanticReport> {
                 case: case.clone(),
                 status: CaseStatus::Unsupported,
                 fixture_digest: fixture_digest.clone(),
-                detail: "requires a disposable Kubernetes integration runner; not executed by the semantic runner".into(),
+                detail:
+                    "requires a Kubernetes cluster; run `aps test --cluster` on a fixture release"
+                        .into(),
             });
             continue;
         }
