@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qualify local libSQL inventory recovery on an owned kind local PV."""
+"""Qualify local SQLite inventory recovery on an owned kind local PV."""
 import argparse
 import hashlib
 import json
@@ -152,7 +152,7 @@ class StorageRunner:
     PACKAGE = "inventory"
     RESULT_SCHEMA = "apsides.dev/storage-restart-qualification/v1"
     SCOPE = "local-sqlite-on-kind-local-pv-sigkill-reopen"
-    BOUNDARY = "static local PV backed by the owned kind node; no CSI, node-failure, power-loss, Turso, fencing, or interruption-inside-publish claim"
+    BOUNDARY = "local SQLite file on a static local PV backed by the owned kind node; no CSI, node-failure, power-loss, fencing, or interruption-inside-publish claim"
 
     def __init__(self, arguments):
         self.output = arguments.output.resolve()

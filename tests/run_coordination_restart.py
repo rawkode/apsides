@@ -81,7 +81,7 @@ class CoordinationRunner(StorageRunner):
     PACKAGE = "coordination"
     RESULT_SCHEMA = "apsides.dev/coordination-restart-qualification/v1"
     SCOPE = "current-coordination-local-pv-reopen-and-competing-writers"
-    BOUNDARY = "current coordination records and competing processes on a static local PV; no cross-store atomicity, transaction-overlap, backup, crash, CSI, node-failure, Turso, or custody-transfer claim"
+    BOUNDARY = "current coordination records in a local SQLite file and competing processes on a static local PV; no cross-store atomicity, transaction-overlap, backup, crash, CSI, node-failure, or custody-transfer claim"
 
     def pod_object(self, name, phase, *, read_only=False, crash=False, barrier=False):
         if crash or phase not in {"seed", "verify", "race-left", "race-right", "verify-race"}:

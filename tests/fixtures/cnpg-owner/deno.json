@@ -4,7 +4,7 @@
     "jsxImportSource": "@apsides/kubernetes"
   },
   "imports": {
-    "@apsides/kubernetes": "../../../../packages/kubernetes/src/index.ts",
-    "@apsides/kubernetes/jsx-dev-runtime": "../../../../packages/kubernetes/src/jsx-dev-runtime.ts"
+    "@apsides/kubernetes": "../../../packages/kubernetes/src/index.ts",
+    "@apsides/kubernetes/jsx-dev-runtime": "../../../packages/kubernetes/src/jsx-dev-runtime.ts"
   }
 }

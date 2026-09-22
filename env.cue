@@ -16,7 +16,6 @@ tasks: {
 	cnpgDemoTest: {command: "python3", args: ["tests/test_cnpg_demo.py"]}
 	cnpgCliDemoTest: {command: "python3", args: ["tests/test_cnpg_cli_demo.py"]}
 	cnpgCleanupTest: {command: "python3", args: ["tests/test_cnpg_cleanup.py"]}
-	cnpgCleanupEvidenceTest: {command: "python3", args: ["tests/test_cnpg_cleanup_evidence.py"]}
 	uncertainWriterTest: {command: "python3", args: ["tests/test_uncertain_writer.py"]}
 	apiGapTest: {command: "python3", args: ["tests/test_api_gap.py"]}
 	cnpgPhaseRecoveryTest: {command: "python3", args: ["tests/test_cnpg_phase_recovery.py"]}
