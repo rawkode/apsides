@@ -9,6 +9,7 @@ const order = (left: string, right: string): number => left < right ? -1 : left 
 /** Record an explicit source closure; dependency discovery never silently expands it. */
 export const writeSourceLock = async (entryFile: string, moduleFiles: readonly string[] = []): Promise<string> => {
   const entry = await realpath(entryFile);
+  if (!entry.endsWith(".tsx")) throw new Error(`source entry must be a .tsx program: ${entryFile}`);
   const root = dirname(entry);
   const files = [entry, ...await Promise.all(moduleFiles.map(file => realpath(file)))];
   const unique = [...new Set(files)];

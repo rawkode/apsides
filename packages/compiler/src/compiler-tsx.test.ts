@@ -85,13 +85,13 @@ try {
   assert.equal(JSON.parse(await readFile(join(isolatedConfig.output, "ir.json"), "utf8")).domain.id, "tsx", "author deno.json cannot alter the generated isolated typecheck config");
 
   const internal = await fixture({
-    "program.ts": `import { renderExport } from "@apsides/kubernetes/compiler";\nexport default renderExport(null, {provenance:{inputs:[]}});\n`,
-  }, "program.ts", { imports: { "@apsides/kubernetes/compiler": "./escape.ts" } });
+    "program.tsx": `import { renderExport } from "@apsides/kubernetes/compiler";\nexport default renderExport(null, {provenance:{inputs:[]}});\n`,
+  }, "program.tsx", { imports: { "@apsides/kubernetes/compiler": "./escape.ts" } });
   await assert.rejects(compileApsides(internal.sourcePath, internal.output), /deno failed/, "author config cannot expose the compiler-only SDK module");
 
-  const remote = await fixture({ "program.ts": `import "https://deno.land/x/forbidden/mod.ts";\nexport default {};\n` }, "program.ts");
+  const remote = await fixture({ "program.tsx": `import "https://deno.land/x/forbidden/mod.ts";\nexport default {};\n` }, "program.tsx");
   await assert.rejects(compileApsides(remote.sourcePath, remote.output), /deno failed/, "remote imports remain disabled during typecheck");
-  const npm = await fixture({ "program.ts": `import "npm:forbidden-package";\nexport default {};\n` }, "program.ts");
+  const npm = await fixture({ "program.tsx": `import "npm:forbidden-package";\nexport default {};\n` }, "program.tsx");
   await assert.rejects(compileApsides(npm.sourcePath, npm.output), /deno failed/, "npm imports remain disabled during typecheck");
 
   const asyncTsxSource = `import { Controller } from "@apsides/kubernetes";
@@ -102,11 +102,14 @@ export default async () => {
   const asyncTsx = await fixture({ "program.tsx": asyncTsxSource }, "program.tsx");
   await assert.rejects(compileApsides(asyncTsx.sourcePath, asyncTsx.output), "async TSX root factories must be rejected by synchronous rendering");
 
+  const plainTs = await fixture({ "program.ts": `export default {};\n` }, "program.ts");
+  await assert.rejects(compileApsides(plainTs.sourcePath, plainTs.output), /source entry must be a \.tsx program/, "TSX is the only authoring entry");
+
   for (const [name, source] of [
     ["raw IR", `export default {schemaVersion:"apsides.dev/ir/v1"};\n`],
     ["production IR wrapper", `export default {productionIR:{schemaVersion:"apsides.dev/ir/v1"},fixtures:null};\n`],
   ] as const) {
-    const obsolete = await fixture({ "program.ts": source }, "program.ts");
+    const obsolete = await fixture({ "program.tsx": source }, "program.tsx");
     await assert.rejects(compileApsides(obsolete.sourcePath, obsolete.output), `${name} exports must not bypass the TSX renderer`);
   }
 

@@ -5,9 +5,7 @@ import {
   Secret,
   Service,
   defineDomain,
-  generateFixtureBundle,
   fixtureInputData,
-  materializeFixtureIR,
   watch,
   type ContainerDefinition,
   type DomainBudgets,
@@ -166,10 +164,6 @@ throws(() => custom.manage(new NamespacedResource({
   spec: {},
 }), { source }), "already declared");
 
-const generated = generateFixtureBundle(ir, { workloadImage: "apsides-fixture:local" });
-equal(generated.inputs.length, 1, "observed input fixture generated from IR");
-equal(generated.workloadSubstitutions.length, 1, "Deployment fixture generated from IR");
-equal(generated.inputs[0]?.data?.value, "synthetic-secret-observed-secret-credentials", "Secret fixture is synthetic and deterministic");
 const secretConsumers = domain("secret-consumers");
 secretConsumers.observe(Secret, { name: "database-app", namespace: "workload", source, projection: ["data"], missing: "block-dependent-mutations" });
 secretConsumers.manage(new Deployment({
@@ -188,30 +182,11 @@ secretConsumers.manage(new Deployment({
   } },
 }), { source });
 const secretIr = secretConsumers.toIR();
-const secretBefore = JSON.stringify(secretIr);
-const secretFixtures = generateFixtureBundle(secretIr, { workloadImage: "apsides-fixture:local" });
-const secretFixture = secretFixtures.inputs[0]!;
-equal(Object.keys(secretFixture.data ?? {}).sort().join(","), "uri,username,value", "all required Secret keys are seeded once without unrelated refs");
-equal(secretFixture.data?.uri, secretFixture.data?.value, "required keys contain deterministic synthetic data");
-equal(JSON.stringify(secretIr), secretBefore, "fixture completion leaves production IR unchanged");
-throws(() => generateFixtureBundle(secretIr, {
-  workloadImage: "apsides-fixture:local", inputs: [{ ...secretFixture, data: { value: "explicit" } }],
-}), "missing required Secret key");
-const explicitSeeds = generateFixtureBundle(secretIr, {
-  workloadImage: "apsides-fixture:local", inputs: [{ ...secretFixture, data: { uri: "synthetic-uri", username: "synthetic-user" } }],
-});
-equal(explicitSeeds.inputs[0]?.data?.uri, "synthetic-uri", "complete explicit fixtures are preserved");
+const secretSeed = fixtureInputData(secretIr.inputs[0]!, secretIr.resources);
+equal(Object.keys(secretSeed).sort().join(","), "uri,username,value", "all required Secret keys are seeded once without unrelated refs");
+equal(secretSeed.uri, secretSeed.value, "required keys contain deterministic synthetic data");
 const otherNamespace = fixtureInputData(secretIr.inputs[0]!, secretIr.resources.map((resource) => ({ ...resource, namespace: "other" })));
-equal(Object.keys(otherNamespace ?? {}).join(","), "value", "Secret refs in another namespace do not add keys");
-const missingSeed = generateFixtureBundle(secretIr, {
-  workloadImage: "apsides-fixture:local", inputs: [{ inputId: secretFixture.inputId, source, synthetic: true, state: "missing" }],
-});
-equal(missingSeed.inputs[0]?.state, "missing", "explicit missing fixture scenarios stay missing");
-const fixtureIR = materializeFixtureIR(ir, generated);
-equal(fixtureIR.testOnly, true, "fixture IR is test-only");
-const fixtureDeployment = fixtureIR.resources.find((resource) => resource.id === "api")?.desired as unknown as { spec: { template: { spec: { containers: readonly { image: string; imagePullPolicy: string }[] } } } };
-equal(fixtureDeployment.spec.template.spec.containers[0]?.image, "apsides-fixture:local", "fixture IR uses local image");
-equal(fixtureDeployment.spec.template.spec.containers[0]?.imagePullPolicy, "Never", "fixture IR cannot pull externally");
+equal(Object.keys(otherNamespace).join(","), "value", "Secret refs in another namespace do not add keys");
 
 const originalData: Record<string, string> = { key: "before" };
 const snapDomain = domain("snapshot");

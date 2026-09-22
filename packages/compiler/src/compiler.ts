@@ -46,11 +46,6 @@ interface Snapshot {
   sha256: string;
 }
 
-export interface CompileApsidesOptions {
-  readonly lockFile?: string;
-  readonly fixtureImage?: string;
-}
-
 export interface CompilerClosure {
   readonly schemaVersion: typeof COMPILER_CLOSURE_SCHEMA;
   readonly authoringCompiler: { readonly sdk: unknown; readonly toolchain: unknown };
@@ -72,16 +67,17 @@ export const compilerClosureDigest = (closure: CompilerClosure): string => {
 };
 
 /** Compile a digest-locked source closure and evaluate it twice in a locked-down SES Compartment hosted by Deno. */
-export const compileApsides = async (sourceFile: string, output: string, options: CompileApsidesOptions = {}): Promise<void> => {
+export const compileApsides = async (sourceFile: string, output: string): Promise<void> => {
   const source = await realpath(sourceFile);
   const sourceRoot = dirname(source);
   const destination = resolve(output);
   if (await exists(destination)) throw new Error("source output already exists; choose a fresh directory");
-  const lockPath = await realpath(options.lockFile ?? join(sourceRoot, "apsides.lock.json"));
+  const lockPath = await realpath(join(sourceRoot, "apsides.lock.json"));
   if (!within(sourceRoot, lockPath)) throw new Error("source lock must be inside the source root");
   const lockBytes = await readFile(lockPath, "utf8");
   const lock = parseCanonicalLock(lockBytes);
   const entryLogical = normalizeLogical(relative(sourceRoot, source), "source entry");
+  if (!entryLogical.endsWith(".tsx")) throw new Error("source entry must be a .tsx program");
   if (lock.entry !== entryLogical) throw new Error(`source lock entry ${lock.entry} does not match ${entryLogical}`);
 
   // Both builds consume this immutable in-memory snapshot, captured before parsing or evaluation.
@@ -131,7 +127,7 @@ export const compileApsides = async (sourceFile: string, output: string, options
   const ir = evaluated.productionIR;
   ir.provenance = { compiler: "apsides/0.1", inputs: provenanceInputs };
   validateSourceLocations(ir, author);
-  const fixture = buildFixtureOutputs(ir, evaluated.fixtures, options.fixtureImage);
+  const fixture = buildFixtureOutputs(ir);
   validateSourceLocations(fixture.fixtureIr, author);
 
   const bundleMap = firstMap;
@@ -206,10 +202,7 @@ const bundleSnapshot = async (author: Map<string, Snapshot>, sdk: Map<string, Sn
   const loaded = new Set<string>();
   const all = new Map<string, Snapshot>([...author.values(), ...sdk.values()].map(value => [value.virtual, value]));
   const authorEntry = author.get(entry)!;
-  const render = entry.endsWith(".tsx")
-    ? "return renderExport(authored, buildContext);"
-    : "const value = typeof authored === \"function\" ? await authored(buildContext) : authored; return renderExport(value, buildContext);";
-  const wrapper = `import authored from ${JSON.stringify(authorEntry.virtual)};\nimport { renderExport } from ${JSON.stringify(SDK_COMPILER_IMPORT)};\nexport default ${entry.endsWith(".tsx") ? "" : "async "}(buildContext) => { ${render} };\n`;
+  const wrapper = `import authored from ${JSON.stringify(authorEntry.virtual)};\nimport { renderExport } from ${JSON.stringify(SDK_COMPILER_IMPORT)};\nexport default (buildContext) => renderExport(authored, buildContext);\n`;
   const build = await rolldown({
     input: GENERATED_ENTRY,
     treeshake: false,
@@ -302,7 +295,7 @@ const typecheckSnapshot = async (author: Map<string, Snapshot>, sdk: Map<string,
 };
 
 const evaluator = (ses: string, bundle: string, buildContext: unknown): string => {
-  const guest = `${bundle}\n; (async () => {\n  const exported = typeof ApsidesProgram.default === "function" ? await ApsidesProgram.default(buildContext) : ApsidesProgram.default;\n  const payload = exported?.productionIR ? {productionIR: exported.productionIR?.toIR ? exported.productionIR.toIR() : exported.productionIR, fixtures: exported.fixtures ?? null} : {productionIR: exported?.toIR ? exported.toIR() : exported, fixtures: null};\n  if (!payload.productionIR || typeof payload.productionIR !== "object") throw new Error("source must default-export a domain, IR, build function, or {productionIR, fixtures}");\n  return payload;\n})()`;
+  const guest = `${bundle}\n; (async () => {\n  return {productionIR: ApsidesProgram.default(buildContext)};\n})()`;
   return `const emit = console.log.bind(console);
 // Deno exposes a Node-compatible process.env proxy that throws under --deny-env.
 // SES receives no environment options; all lockdown choices below are explicit.
@@ -319,12 +312,12 @@ const denoEvaluationArgs = (): string[] => {
   return ["run", "--no-config", "--no-lock", "--no-npm", "--cached-only", "--no-code-cache", "--no-prompt", "--deny-read", "--deny-write", "--deny-net", "--deny-env", "--deny-run", "--deny-ffi", "--deny-sys", "--deny-import", "--seed=0", "--v8-flags=--max-old-space-size=128", "-"];
 };
 
-const parseEvaluation = (stdout: string): { productionIR: ProductionIr; fixtures: unknown } => {
+const parseEvaluation = (stdout: string): { productionIR: ProductionIr } => {
   const line = stdout.trim();
   if (!line || line.includes("\n")) throw new Error("source evaluation must emit exactly one JSON payload");
   const value = JSON.parse(line) as Record<string, unknown>;
   if (!value || typeof value !== "object" || Array.isArray(value) || !("productionIR" in value)) throw new Error("source evaluation emitted an invalid payload");
-  return { productionIR: value.productionIR as ProductionIr, fixtures: value.fixtures };
+  return { productionIR: value.productionIR as ProductionIr };
 };
 
 const validateSourceLocations = (ir: ProductionIr, author: Map<string, Snapshot>): void => {

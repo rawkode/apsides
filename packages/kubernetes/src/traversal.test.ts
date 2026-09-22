@@ -15,7 +15,7 @@ const deployment = {
 const config = { id: "config", metadata: { name: "config", namespace: "workload" }, data: { level: "info" } };
 const element = (type: unknown, props: unknown, line = 1) => jsxDEV(type, props, undefined, false, { fileName: "apsides:/source/app.tsx", lineNumber: line, columnNumber: 1 });
 const controller = (children: unknown) => element(Controller, { ...domain, children });
-const compile = (node: unknown) => renderExport(node, context).productionIR as ApsidesIR;
+const compile = (node: unknown) => renderExport(node, context) as ApsidesIR;
 const assert: (value: unknown, message: string) => asserts value = (value, message) => { if (!value) throw new Error(message); };
 const throws = (callback: () => unknown, expected: string) => {
   try { callback(); } catch (error) { assert(error instanceof Error && error.message.includes(expected), `expected ${expected}; received ${String(error)}`); return; }

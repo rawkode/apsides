@@ -16,7 +16,7 @@ export type ProductionIr = {
   provenance: { compiler: string; inputs: { path: string; sha256: string }[] };
 };
 
-type InputFixture = { inputId: string; source: Source; synthetic: true; state: "present" | "missing" | "unauthorized" | "unavailable" | "invalid"; data?: Record<string, string> };
+type InputFixture = { inputId: string; source: Source; synthetic: true; state: "present"; data: Record<string, string> };
 type WorkloadFixture = { targetResourceId: string; source: Source; containers: { name: string; image: string; imagePullPolicy: "Never" }[] };
 export type FixtureBundle = {
   schemaVersion: "apsides.dev/fixtures/v1";
@@ -33,9 +33,11 @@ export const canonicalString = (value: unknown): string => {
   return JSON.stringify(canonical(value));
 };
 
-export const buildFixtureOutputs = (ir: ProductionIr, supplied: unknown, workloadImage = "apsides-fixture:local") => {
+const FIXTURE_IMAGE = "apsides-fixture:local";
+
+export const buildFixtureOutputs = (ir: ProductionIr) => {
   validateProductionIrShape(ir);
-  const fixtures = completeFixtures(ir, supplied, workloadImage);
+  const fixtures = completeFixtures(ir);
   const fixtureIr = materialize(ir, fixtures);
   const productionDigest = digest(canonicalString(ir));
   const fixtureDigest = digest(canonicalString(fixtureIr));
@@ -62,7 +64,7 @@ export const buildFixtureOutputs = (ir: ProductionIr, supplied: unknown, workloa
       "The v1 author schema rejects init containers, commands, probes, and mounts. Sidecars are ordinary containers and every declared container is substituted. Service accounts and resource requirements are preserved.",
     ],
   };
-  const catalogue = fixtureCatalogue(workloadImage);
+  const catalogue = fixtureCatalogue(FIXTURE_IMAGE);
   const coverage = fixtureCoverage(ir, fixtures, productionDigest, fixtureDigest, digest(canonicalString(fixtures)));
   return { fixtures, fixtureIr, overlay, catalogue, coverage };
 };
@@ -80,39 +82,13 @@ const validateProductionIrShape = (ir: ProductionIr): void => {
   }
 };
 
-const completeFixtures = (ir: ProductionIr, supplied: unknown, workloadImage: string): FixtureBundle => {
-  if (workloadImage !== "apsides-fixture:local") throw new Error("v1 source builds require the locally imported apsides-fixture:local image");
-  const value = supplied === undefined || supplied === null ? {} : expectRecord(supplied, "fixture bundle");
-  for (const key of Object.keys(value)) if (!["schemaVersion", "testOnly", "productionReady", "inputs", "workloadSubstitutions"].includes(key)) throw new Error(`fixture bundle contains unsupported field ${key}`);
-  if (value.schemaVersion !== undefined && value.schemaVersion !== "apsides.dev/fixtures/v1") throw new Error("unsupported fixture schemaVersion");
-  if (value.testOnly !== undefined && value.testOnly !== true) throw new Error("fixture bundle must be testOnly");
-  if (value.productionReady !== undefined && value.productionReady !== false) throw new Error("fixture bundle must never be productionReady");
-  const suppliedInputs = value.inputs === undefined ? [] : expectArray(value.inputs, "fixture inputs").map(parseInputFixture);
-  const suppliedWorkloads = value.workloadSubstitutions === undefined ? [] : expectArray(value.workloadSubstitutions, "workload substitutions").map(parseWorkloadFixture);
-  unique(suppliedInputs, item => item.inputId, "fixture input");
-  unique(suppliedWorkloads, item => item.targetResourceId, "workload fixture");
-  const inputMap = new Map(suppliedInputs.map(item => [item.inputId, item]));
-  const resourceMap = new Map(ir.resources.map(item => [item.id, item]));
-  for (const item of suppliedInputs) {
-    const input = ir.inputs.find(candidate => candidate.id === item.inputId);
-    if (input?.mode !== "observed") throw new Error(`fixture ${item.inputId} does not reference an observed input`);
-  }
-  const inputs = ir.inputs.filter(input => input.mode === "observed").map(input => {
-    const explicit = inputMap.get(input.id);
-    const data = fixtureInputData(input, ir.resources, explicit);
-    return explicit ?? { inputId: input.id, source: input.source, synthetic: true as const, state: "present" as const, data };
-  });
-  const workloadMap = new Map(suppliedWorkloads.map(item => [item.targetResourceId, item]));
-  for (const item of suppliedWorkloads) if (resourceMap.get(item.targetResourceId)?.kind !== "Deployment") throw new Error(`workload fixture ${item.targetResourceId} does not reference a Deployment`);
-  const workloadSubstitutions = ir.resources.filter(resource => resource.kind === "Deployment").map(resource => {
-    const containers = deploymentContainers(resource);
-    const item = workloadMap.get(resource.id) ?? { targetResourceId: resource.id, source: resource.source, containers: containers.map(container => ({ name: String(container.name), image: workloadImage, imagePullPolicy: "Never" as const })) };
-    const expected = containers.map(container => String(container.name)).sort(order);
-    const actual = item.containers.map(container => container.name).sort(order);
-    if (canonicalString(expected) !== canonicalString(actual)) throw new Error(`workload fixture must cover every container exactly once: ${resource.id}`);
-    if (item.containers.some(container => container.image !== workloadImage || container.imagePullPolicy !== "Never")) throw new Error(`workload fixture ${resource.id} must use ${workloadImage} with imagePullPolicy Never`);
-    return item;
-  });
+const completeFixtures = (ir: ProductionIr): FixtureBundle => {
+  const inputs = ir.inputs.filter(input => input.mode === "observed").map(input => ({ inputId: input.id, source: input.source, synthetic: true as const, state: "present" as const, data: fixtureInputData(input, ir.resources) }));
+  const workloadSubstitutions = ir.resources.filter(resource => resource.kind === "Deployment").map(resource => ({
+    targetResourceId: resource.id,
+    source: resource.source,
+    containers: deploymentContainers(resource).map(container => ({ name: String(container.name), image: FIXTURE_IMAGE, imagePullPolicy: "Never" as const })),
+  }));
   return canonical({ schemaVersion: "apsides.dev/fixtures/v1", testOnly: true, productionReady: false, inputs: inputs.sort((a,b) => order(a.inputId,b.inputId)), workloadSubstitutions: workloadSubstitutions.sort((a,b) => order(a.targetResourceId,b.targetResourceId)) }) as FixtureBundle;
 };
 
@@ -232,34 +208,6 @@ const deploymentContainers = (resource: Resource): Record<string, Json>[] => {
   return expectArray(podSpec.containers, `${resource.id} containers`).map((value, index) => expectRecord(value, `${resource.id} container ${index}`) as Record<string, Json>);
 };
 
-const parseInputFixture = (value: unknown): InputFixture => {
-  const item = expectRecord(value, "input fixture");
-  exactKeys(item, item.state === "present" ? ["inputId", "source", "synthetic", "state", "data"] : ["inputId", "source", "synthetic", "state"], "input fixture");
-  if (typeof item.inputId !== "string" || item.synthetic !== true || !["present", "missing", "unauthorized", "unavailable", "invalid"].includes(String(item.state))) throw new Error("invalid input fixture identity, synthetic marker, or state");
-  const output: InputFixture = { inputId: item.inputId, source: parseSource(item.source), synthetic: true, state: item.state as InputFixture["state"] };
-  if (item.state === "present") output.data = stringRecord(item.data, "input fixture data");
-  return output;
-};
-
-const parseWorkloadFixture = (value: unknown): WorkloadFixture => {
-  const item = expectRecord(value, "workload fixture");
-  exactKeys(item, ["targetResourceId", "source", "containers"], "workload fixture");
-  if (typeof item.targetResourceId !== "string") throw new Error("invalid workload fixture target");
-  const containers = expectArray(item.containers, "fixture containers").map(value => {
-    const container = expectRecord(value, "fixture container"); exactKeys(container, ["name", "image", "imagePullPolicy"], "fixture container");
-    if (typeof container.name !== "string" || typeof container.image !== "string" || container.imagePullPolicy !== "Never") throw new Error("fixture containers require name, image, and imagePullPolicy Never");
-    return { name: container.name, image: container.image, imagePullPolicy: "Never" as const };
-  });
-  unique(containers, item => item.name, "fixture container");
-  return { targetResourceId: item.targetResourceId, source: parseSource(item.source), containers };
-};
-
-const parseSource = (value: unknown): Source => {
-  const item = expectRecord(value, "fixture source"); exactKeys(item, ["file", "line", "column"], "fixture source");
-  if (typeof item.file !== "string" || !Number.isSafeInteger(item.line) || Number(item.line) < 1 || !Number.isSafeInteger(item.column) || Number(item.column) < 1) throw new Error("invalid fixture source location");
-  return { file: item.file, line: Number(item.line), column: Number(item.column) };
-};
-
 const diff = (before: unknown, after: unknown, path = ""): { op: "add" | "remove" | "replace"; path: string; before?: Json; after?: Json }[] => {
   if (canonicalString(before) === canonicalString(after)) return [];
   if (Array.isArray(before) && Array.isArray(after) && before.length === after.length) return before.flatMap((value, index) => diff(value, after[index], `${path}/${index}`));
@@ -283,7 +231,4 @@ const canonical = (value: unknown): Json => {
 const plain = (value: unknown): value is Record<string, unknown> => { return value !== null && typeof value === "object" && !Array.isArray(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null); };
 const expectRecord = (value: unknown, context: string): Record<string, any> => { if (!plain(value)) throw new Error(`${context} must be an object`); return value; };
 const expectArray = (value: unknown, context: string): unknown[] => { if (!Array.isArray(value)) throw new Error(`${context} must be an array`); return value; };
-const exactKeys = (value: Record<string, unknown>, allowed: string[], context: string): void => { for (const key of Object.keys(value)) if (!allowed.includes(key)) throw new Error(`${context} contains unsupported field ${key}`); };
-const stringRecord = (value: unknown, context: string): Record<string, string> => { const item = expectRecord(value, context); const output: Record<string,string> = Object.create(null); for (const [key, entry] of Object.entries(item)) { if (typeof entry !== "string") throw new Error(`${context}.${key} must be a string`); output[key] = entry; } return output; };
-const unique = <T>(values: T[], key: (value: T) => string, context: string): void => { const seen = new Set<string>(); for (const value of values) { const id = key(value); if (seen.has(id)) throw new Error(`duplicate ${context}: ${id}`); seen.add(id); } };
 const escapePointer = (value: string): string => { return value.replaceAll("~", "~0").replaceAll("/", "~1"); };
