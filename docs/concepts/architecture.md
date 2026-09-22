@@ -10,7 +10,7 @@ Kubernetes operations.
 <div class="architecture-flow">
   <div><strong>Authoring</strong><span><code>@apsides/kubernetes</code> builds a domain, resources, observations and reactions.</span></div>
   <div><strong>Compiler</strong><span>Oxc, Rolldown, restricted Deno evaluation and Rust validation emit canonical IR.</span></div>
-  <div><strong>Release</strong><span>A native binary, OCI image, SBOM, compiler closure and evidence are bound together.</span></div>
+  <div><strong>Release</strong><span>A native binary, OCI image, SBOM, compiler closure and signed provenance are bound together.</span></div>
   <div><strong>Runtime</strong><span>A generation-specific controller reconciles only its approved plan through a constrained proxy.</span></div>
 </div>
 
@@ -82,7 +82,7 @@ See
 | `deploy` | provider-neutral lifecycle planning and transition reduction |
 | `platform` | protected Kubernetes state, proxy transport and generation lifecycle |
 | `runtime` | native fixed-plan reconciliation |
-| `release` | signed release, compiler closure, OCI and evidence verification |
+| `release` | release integrity, signed provenance, compiler closure and OCI verification |
 | `inventory` | metadata-only snapshots and SQLite storage |
 | `coordination` | typed immutable stores for claims, transition audits and review metadata |
 | `cli` | `aps` build, verification and deployment commands |

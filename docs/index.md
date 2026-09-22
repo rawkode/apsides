@@ -18,7 +18,7 @@ hero:
 
 <div class="status-strip">
   <strong>Release status</strong>
-  <p>Apsides is under active implementation. Candidate builds and focused lifecycle runs exist, but the production release gates are not complete. Start with the <a href="/reference/status/">implementation status</a> before evaluating it for a cluster.</p>
+  <p>Apsides is under active implementation. Candidate builds and focused lifecycle runs exist, but Apsides is not ready for production use. Start with the <a href="/reference/status/">implementation status</a> before evaluating it for a cluster.</p>
 </div>
 
 ## Names used by the current implementation
@@ -32,7 +32,7 @@ remain active wire names. TypeScript authoring uses `@apsides/kubernetes`.
 <div class="architecture-flow">
   <div><strong>Declare</strong><span>TSX components describe fixed resources, selected observations and rollout reactions.</span></div>
   <div><strong>Compile</strong><span>The source closure is evaluated with denied host permissions and becomes validated IR.</span></div>
-  <div><strong>Review</strong><span>Capabilities, force risks, lifecycle policy, provenance and release evidence are checked.</span></div>
+  <div><strong>Review</strong><span>Capabilities, force risks, lifecycle policy, release integrity and provenance are checked.</span></div>
   <div><strong>Deploy</strong><span>Privileged CI stages a native controller generation, quiesces the old writer and publishes inventory.</span></div>
 </div>
 

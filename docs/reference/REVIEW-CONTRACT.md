@@ -29,14 +29,14 @@ This interpretation satisfies the literal section 25 report categories without p
 
 | Category | Proposed evidence and output |
 | --- | --- |
-| Managed resources and fields | Previous/new identities and declared field-path sets; live-impact field classifications; ownership releases separated from live deletion; explicit adoption or transfer intent linked to protected approval. |
+| Managed resources and fields | Previous/new identities and declared field-path sets; live-impact field classifications; ownership releases separated from live deletion; explicit adoption intent linked to protected approval. |
 | Reactions and dependencies | Added, removed and changed primitive/target/input edges, with previous/new source locations. Source-only changes are distinguishable from computation changes. |
 | Input authority and sensitivity | Previous/new API identity, managed/observed mode, projection, sensitivity, missing-input policy and managed-resource association. No observed input values. |
 | Runtime permissions | Previous active generation's requested capabilities versus the new generation's requested capabilities. |
 | Deployment permissions | Previous deployment's required deployment capabilities versus this deployment's required capabilities, including any approved preview access. Generation-specific identity changes remain visible. |
 | Cleanup permissions | Previous deployment's required cleanup capabilities versus this transition's required cleanup capabilities. This baseline is labelled explicitly; it is not the previous runtime permission set. |
 | Enforcement and policy | Requested profile, enforcement gaps, indirect privileges, independent ceiling decisions and reasons. Required-access analysis does not claim effective RBAC or admission approval. |
-| Lifecycle | Retained, omitted, orphaned, adopted, transferred and delete-planned identities, with prior approved policy and UID evidence. Unsupported transfer remains a rejection, never an invented successful outcome. |
+| Lifecycle | Retained, omitted, orphaned, adopted and delete-planned identities, with prior approved policy and UID evidence. Ownership transfer is not a supported action; the parser rejects it rather than reporting an invented successful outcome. |
 | Compatibility and interruption | Previous/new schema and API requirements, runtime and transition compatibility requirements, relevant qualification assumptions and expected reconciliation pause. A duration estimate is not a completion guarantee. |
 
 An initial installation has an explicit empty declaration baseline. Existing objects still require the normal adoption checks; they do not become managed merely because the declaration baseline is empty.
@@ -118,7 +118,7 @@ Before returning a preview, reobserve target UID/resourceVersion or exact absenc
 
 `IssuedDeployment::preview_fresh` accepts a verified release, a fresh planning request and the inventory store. It requires the exact protected identity approval, registry snapshot, current trust and policy, immutable predecessor inventory and review metadata, and ownership approvals. All managed targets must be covered before workload requests begin. It rechecks authority around target previews and reobserves every target before returning a bounded, ephemeral report. The report describes an observation interval, not an atomic snapshot or execution authorization. The whole operation has a 120-second deadline.
 
-Preview opt-in uses `apsides.dev/deployment-identity/v2` with the exact profile `static-ssa-issued-deployer/v1`. Its target list is sorted, unique and restricted to named ConfigMaps, Services and Deployments in the workload namespace. Approved supersets are allowed. An empty list authorizes zero targets; it is never a wildcard. Existing v1 documents and v2 documents without `preview` remain opted out. RBAC is independently provisioned: the profile itself grants no access, and Kubernetes has no dry-run-only grant.
+Preview opt-in uses `apsides.dev/deployment-identity/v2` with the exact profile `static-ssa-issued-deployer/v1`. Its target list is sorted, unique and restricted to named ConfigMaps, Services and Deployments in the workload namespace. Approved supersets are allowed. An empty list authorizes zero targets; it is never a wildcard. A v1 identity document is rejected outright; a v2 document without `preview` remains opted out of preview only. RBAC is independently provisioned: the profile itself grants no access, and Kubernetes has no dry-run-only grant.
 
 Static composition preserves a current rollout contribution only with exact stable-manager Apply evidence. Missing contributions remain missing and future reaction output stays conditional. Removed final reactions omit the old contribution. Adoption uses the approved non-force payload. No observed input, Secret value or rollout key is read to invent future runtime state.
 

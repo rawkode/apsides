@@ -28,8 +28,8 @@ garbage collection is not implemented.
 ## Read transition status
 
 Use standard Kubernetes authentication with exact GET permission for the registry
-and its authority anchor. Configure a read-only metadata credential for remote
-storage:
+and its authority anchor. Configure a read-only local database path for the
+metadata store:
 
 ```sh
 aps audit \
@@ -40,10 +40,9 @@ aps audit \
   --control-namespace apsides-system
 ```
 
-`APSIDES_INVENTORY_DATABASE` selects the existing absolute local database or TLS
-local database path. The
-command does not initialize or repair tables: local SQLite opens read-only and
-remote access performs SELECTs against an existing validated schema.
+`APSIDES_INVENTORY_DATABASE` selects the existing absolute local database path.
+The command does not initialize or repair tables: it opens the local SQLite
+file read-only and performs SELECTs against an existing validated schema.
 
 A current record returns `status: retained` and its recorded phase. An archived
 record returns `status: retired` and sanitized metadata reached through the

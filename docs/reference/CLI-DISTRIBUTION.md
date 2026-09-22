@@ -37,8 +37,8 @@ entries, depth 64, 128 MiB per file and 512 MiB in total. Restore a damaged
 installation from its original bundle rather than editing its manifest.
 
 Development builds made with `cuenv task build` continue to use the source
-checkout. Neither packaging nor local compilation satisfies the production
-release gate; deployment still requires the complete signed release evidence.
+checkout. Neither packaging nor local compilation produces a deployable release;
+deployment still requires a release with signed provenance.
 
 ## Verification
 

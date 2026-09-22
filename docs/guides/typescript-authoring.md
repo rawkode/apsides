@@ -85,4 +85,4 @@ locations assist diagnostics; they do not confer authority.
 
 See the [IR contract](/reference/ir-contract/) and [toolchain](/reference/toolchain/) for
 the underlying constraints. The [implementation status](/reference/status/) records
-the remaining production release gates.
+the remaining production work.

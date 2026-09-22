@@ -27,9 +27,7 @@ inventory or review data, and a rejected path is never echoed in the error.
 There is no remote endpoint. Publication compares and sets the head revision
 inside one immediate transaction and then reads the committed body back, which
 requires reads to observe the last commit. A local database gives that; an
-eventually consistent replica does not. `APSIDES_INVENTORY_TOKEN` is refused
-rather than ignored, so a configuration written for a remote primary fails
-closed instead of silently opening a local file.
+eventually consistent replica does not.
 
 Writable deployment initialization creates and validates the required tables.
 Inventory and coordination expose read-only openers without DDL or repair.
@@ -96,7 +94,7 @@ The local storage qualification is available through cuenv:
 cuenv task storageProbeTest
 cuenv task storageBuildTest
 cuenv task storageRestartTest
-cuenv exec python3 tests/reference/storage/build.py --output work/storage-image
+cuenv exec python3 tests/storage/build.py --output work/storage-image
 cuenv exec python3 tests/run_storage_restart.py --image-directory work/storage-image --output work/storage-results
 ```
 
@@ -125,7 +123,7 @@ rejection of the losing audit reference. This uses small synthetic fixtures and
 does not prove transaction overlap, cross-store atomicity, crash recovery or backup.
 
 ```sh
-cuenv exec python3 tests/reference/storage/build.py --package coordination --output work/coordination-image
+cuenv exec python3 tests/storage/build.py --package coordination --output work/coordination-image
 cuenv exec python3 tests/run_coordination_restart.py --image-directory work/coordination-image --output work/coordination-results
 ```
 

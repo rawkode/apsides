@@ -10,7 +10,9 @@ Its Pods do not mount Kubernetes API credentials.
 Compile the digest-locked example from the repository root:
 
 ```sh
-scripts/source-build.sh examples/web-application/program.tsx work/apsides-source
+target/debug/aps compile \
+  --source examples/web-application/program.tsx \
+  --output work/apsides-compiled
 ```
 
 Choose a fresh output directory for each build. The compiler supplies source
@@ -21,7 +23,9 @@ TypeScript runtime is deployed into the cluster.
 After editing either source file, refresh the explicit source lock:
 
 ```sh
-scripts/source-lock.sh examples/web-application/program.tsx examples/web-application/api.tsx
+target/debug/aps lock \
+  --source examples/web-application/program.tsx \
+  --modules examples/web-application/api.tsx
 ```
 
 The source build performs a Deno type check, two Oxc/Rolldown builds and two
