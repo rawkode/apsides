@@ -30,7 +30,9 @@ jobs:
           chmod +x "$RUNNER_TEMP/cuenv"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: Prepare Rust toolchain
-        run: rustup show active-toolchain
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
       - name: Build CLI
         run: cuenv task build
       - name: Check authoring types and tests
@@ -38,6 +40,7 @@ jobs:
           cuenv task authorCheck
           cuenv task authorTest
           cuenv task authorCompilerTest
+          cuenv task authorCompilerCheck
       - name: Check CNPG editor completion
         run: cuenv task authoringEditorCheck
       - name: Run Rust tests
@@ -45,6 +48,17 @@ jobs:
           cuenv task registryTest
           cuenv task runtimeTest
           cuenv task releaseTest
+          cuenv task coordinationTest
+          cuenv task inventoryTest
+          cuenv task compilerCoreTest
+      - name: Run Rust lints
+        run: |
+          cuenv task registryCheck
+          cuenv task runtimeCheck
+          cuenv task releaseCheck
+          cuenv task coordinationCheck
+          cuenv task inventoryCheck
+          cuenv task compilerCoreCheck
       - name: Run qualification harness unit tests
         run: |
           cuenv task cnpgDemoTest
@@ -52,5 +66,6 @@ jobs:
           cuenv task cnpgCleanupTest
           cuenv task apiGapProbesTest
           cuenv task performanceTest
+          cuenv task packagingTest
       - name: Build documentation
         run: cuenv task docsBuild
