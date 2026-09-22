@@ -105,7 +105,7 @@ const describe = (): void => {
 };
 
 const run = async (source: string, output: string, probe: Probe): Promise<boolean> => {
-  const { compileApsides } = await import("../../packages/compiler/src/compiler.ts");
+  const { compileApsides } = await import("../packages/compiler/src/compiler.ts");
   try {
     await compileApsides(source, output);
   } catch (error) {

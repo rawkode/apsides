@@ -56,7 +56,7 @@ class BackupRunner(StorageRunner):
     PACKAGE = "coordination"
     RESULT_SCHEMA = "apsides.dev/storage-backup-qualification/v1"
     SCOPE = "four-store-backup-on-distinct-local-pv-mounts"
-    BOUNDARY = "two local PV paths on one owned node; no independent failure domains, power-loss, concurrent snapshot timing, Turso, or restore-authority claim"
+    BOUNDARY = "SQLite store backups on two local PV paths on one owned node; no independent failure domains, power-loss, concurrent snapshot timing, or restore-authority claim"
 
     def __init__(self, arguments):
         self.backup_identity = None

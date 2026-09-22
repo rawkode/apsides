@@ -74,6 +74,8 @@ class CollisionContractTests(unittest.TestCase):
                 collision.result_record("APS_COLLISION_RESULT=" + json.dumps(value), outcome)
 
     def test_sources_include_subclass_and_shared_rust_closure(self):
+        # The runner accepts only outputs inside the repository; work/ is ignored and absent on a fresh checkout.
+        (ROOT / "work").mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=ROOT / "work") as directory:
             args = SimpleNamespace(artifact=Path(directory) / "candidate", trust_policy=Path(directory) / "trust",
                                    owner_artifact=Path(directory) / "owner", owner_trust_policy=Path(directory) / "owner-trust", output=Path(directory) / "run")

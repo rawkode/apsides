@@ -18,7 +18,7 @@ class Fixture:
         self.source.write_text("export default <Controller />;\n")
         self.cli = root / "apsides"
         self.cli.write_text("mock CLI")
-        self.helper = root / "isolation_probe.ts"
+        self.helper = root / "isolation_probe.mts"
         self.helper.write_text("// mock compiler probe helper\n")
         self.output = root / "work" / "isolation"
         self.artifact = root / "artifact"
@@ -143,7 +143,7 @@ class InputIsolationTests(unittest.TestCase):
                 self.assertEqual(receipt[key], value)
             self.assertEqual(receipt["runnerSourceFile"], "evidence/run_input_isolation.py")
             record = receipt["checks"]["declared-input-isolation"]
-            self.assertIn("evidence/isolation_probe.ts", record["evidenceFiles"])
+            self.assertIn("evidence/isolation_probe.mts", record["evidenceFiles"])
             self.assertIn("evidence/run_reproducibility.py", record["evidenceFiles"])
             for name in record["evidenceFiles"]:
                 self.assertTrue(name.startswith("evidence/"))
