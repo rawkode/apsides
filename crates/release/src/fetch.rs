@@ -179,12 +179,32 @@ mod tests {
         );
         Ok(())
     }
+    /// Writes an executable from a child process. On Linux, a script this
+    /// process wrote itself can fail to exec with ETXTBSY when another test
+    /// thread forks while the write handle is open; a child's handle is
+    /// never inherited by those forks.
+    #[cfg(unix)]
+    fn write_executable(path: &Path, script: &str) -> Result<()> {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 700 \"$1\"", "sh"])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(script.as_bytes())?;
+        }
+        if child.wait()?.success() {
+            Ok(())
+        } else {
+            reject("test executable could not be written")
+        }
+    }
+
     #[cfg(unix)]
     fn fake_oras(directory: &Path, script: &str) -> Result<OrasTool> {
-        use std::os::unix::fs::PermissionsExt;
         let executable = directory.join("oras");
-        std::fs::write(&executable, script)?;
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+        write_executable(&executable, script)?;
         Ok(OrasTool {
             ca_file: None,
             sha256: manifest::raw_digest(script.as_bytes()),
@@ -224,7 +244,7 @@ printf '%s' "$7" > "$6/reference"
             reference().oci
         );
         std::fs::remove_file(output.join("reference"))?;
-        std::fs::write(&tool.executable, "#!/bin/sh\nexit 0\n")?;
+        write_executable(&tool.executable, "#!/bin/sh\nexit 0\n")?;
         assert!(pull(&reference(), &tool, &output).await.is_err());
         assert!(!output.join("reference").exists());
         Ok(())
