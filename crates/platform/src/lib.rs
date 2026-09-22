@@ -13,7 +13,7 @@ mod envelope_record;
 mod envelope_writer;
 mod evidence_profile;
 mod executor_binding;
-pub use executor_binding::{EXECUTOR_BINDING_SCHEMA, ExecutorBinding};
+pub use executor_binding::ExecutorBinding;
 #[cfg(all(test, feature = "test-support"))]
 mod pair_phase_interruption_live;
 mod permissions;
@@ -37,7 +37,7 @@ pub use preview_permissions::{
     PreviewPermissionLimitation, PreviewPermissions, PreviewTargetRequest, preview_permissions,
 };
 #[cfg(feature = "deployer")]
-pub mod preview_composition;
+mod preview_composition;
 #[cfg(feature = "deployer")]
 pub mod preview_fields;
 #[cfg(feature = "deployer")]
@@ -61,7 +61,7 @@ mod transition_session;
 #[cfg(feature = "deployer")]
 pub use transition_session::{ResolvedTransition, TransitionSession};
 mod drain_evidence;
-pub use drain_evidence::{ProcessTerminationObservation, ProxyDrainObservation};
+pub(crate) use drain_evidence::{ProcessTerminationObservation, ProxyDrainObservation};
 #[cfg(all(test, feature = "deployer"))]
 mod tests;
 mod writer_checkpoint;
@@ -109,7 +109,7 @@ mod ownership;
 mod registry;
 mod registry_model;
 mod transition_audit;
-pub use ownership::OWNERSHIP_INTENT_NAMESPACE;
+pub(crate) use ownership::OWNERSHIP_INTENT_NAMESPACE;
 mod runtime;
 #[cfg(feature = "deployer")]
 mod staging;
@@ -123,12 +123,14 @@ pub use crypto::install_rustls_ring_provider;
 pub use model::*;
 pub use runtime::RuntimeAuthority;
 pub use store::PlatformClient;
-pub use termination::{ExpectedPod, ExpectedWriters, TERMINATION_FINALIZER};
+pub(crate) use termination::ExpectedWriters;
+#[cfg(feature = "deployer")]
+pub(crate) use termination::{ExpectedPod, TERMINATION_FINALIZER};
 
 /// Return the fixed, bounded name of the separately provisioned incarnation anchor.
 /// # Errors
 /// Rejects invalid or overlapping Kubernetes namespace scopes.
-pub fn registry_authority_name(
+pub(crate) fn registry_authority_name(
     control_namespace: &str,
     workload_namespace: &str,
 ) -> Result<String> {
@@ -145,11 +147,11 @@ pub fn registry_authority_name(
     ))
 }
 
-pub const REGISTRY_AUTHORITY_NAMESPACE: &str = "apsides-platform";
+pub(crate) const REGISTRY_AUTHORITY_NAMESPACE: &str = "apsides-platform";
 pub const REGISTRY_SCHEMA_VERSION: &str = "apsides.dev/namespace-registry/v8";
 pub const REGISTRY_AUTHORITY_SCHEMA_VERSION: &str = "apsides.dev/registry-authority/v1";
 pub const SCHEMA_VERSION: &str = "apsides.dev/platform/v1";
-pub const MAX_STATE_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_STATE_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -231,16 +233,12 @@ mod tls_integrity;
 
 #[cfg(feature = "deployer")]
 mod proxy_stage;
-#[cfg(feature = "deployer")]
-pub use proxy_stage::ProxyPolicy;
 
 #[cfg(feature = "deployer")]
 mod proxy_identity;
 
 #[cfg(feature = "deployer")]
 mod quiescence;
-#[cfg(feature = "deployer")]
-mod retirement;
 #[cfg(feature = "deployer")]
 mod upgrade;
 

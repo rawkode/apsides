@@ -294,10 +294,9 @@ fn validate_ownership(ownership: &[AuditOwnership]) -> Result<()> {
     for item in ownership {
         validate_identity(&item.identity)?;
         if !opaque_identifier(&item.observed_uid)
-            || item.action != OwnershipAction::Adopt
             || previous.is_some_and(|identity| identity >= &item.identity)
         {
-            return Err(Error::Invalid("audit ownership ordering or action"));
+            return Err(Error::Invalid("audit ownership ordering or UID"));
         }
         previous = Some(&item.identity);
     }

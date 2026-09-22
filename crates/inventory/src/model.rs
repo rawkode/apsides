@@ -1,7 +1,6 @@
 use crate::{Error, Result};
 use compiler_core::DeletionPolicy;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 
 pub const INVENTORY_SCHEMA: &str = "apsides.dev/resource-inventory/v1";
 pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
@@ -137,17 +136,6 @@ impl InventorySnapshot {
             return Err(Error::Invalid("snapshot size"));
         }
         Ok(bytes)
-    }
-
-    /// Select omitted resources using identity only. The prior policy is retained.
-    /// Callers still require lifecycle authorization and live UID preconditions.
-    #[must_use]
-    pub fn removed_from<'a>(&'a self, next: &Self) -> Vec<&'a TrackedResource> {
-        let retained: BTreeSet<_> = next.resources.iter().map(|r| &r.identity).collect();
-        self.resources
-            .iter()
-            .filter(|r| !retained.contains(&r.identity))
-            .collect()
     }
 }
 

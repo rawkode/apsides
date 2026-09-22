@@ -83,8 +83,8 @@ pub struct FixtureConfig {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FixtureRolloutKey {
     pub key_id: String,
-    /// Test-only UTF-8 material. Production keys must come from protected
-    /// control storage and are intentionally unsupported by this increment.
+    /// Test-only UTF-8 material. The production runtime never reads this; it
+    /// loads the granted key from the protected control-namespace Secret.
     pub value: String,
 }
 

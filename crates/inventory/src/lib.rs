@@ -23,9 +23,6 @@ pub enum Error {
 }
 
 /// Preserves immutable metadata snapshots and conditionally publishes a head.
-///
-/// SQL transactions are an implementation detail, not a trait requirement. An
-/// object-store backend can publish immutable Parquet files and CAS its head.
 #[async_trait]
 pub trait InventoryStore: Send + Sync {
     /// Read a consistent head and its immutable snapshot.

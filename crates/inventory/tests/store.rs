@@ -58,7 +58,6 @@ async fn large_snapshot_survives_reopen_and_preserves_history() -> TestResult {
         store.read_snapshot(&scope(), &stored.snapshot_id).await?,
         Some(first.clone())
     );
-    assert_eq!(first.removed_from(&second).len(), 11999);
     assert_eq!(store.publish(&scope(), None, &second).await?, next);
     assert!(matches!(
         store

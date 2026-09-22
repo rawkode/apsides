@@ -328,7 +328,7 @@ impl PlatformClient {
         previous: &WriterCheckpoint,
     ) -> Result<Versioned<NamespaceRegistry>> {
         let mut registry = registry.clone();
-        let approved = crate::retirement::identities(previous);
+        let approved = &previous.retirement_identity_uids;
         let mut identities: Vec<_> = approved.iter().collect();
         identities.sort_by_key(|(key, _)| key.starts_with("v1/ServiceAccount/"));
         for (key, uid) in identities {

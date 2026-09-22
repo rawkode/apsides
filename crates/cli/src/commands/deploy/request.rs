@@ -68,16 +68,18 @@ pub(super) async fn reserve_new_transition(
         None
     };
     let plan = deploy::plan_transition(&request)?;
-    crate::review::preflight(&plan, previous_review.as_ref())?;
+    // Refuse an incomplete declaration review before issuing any preview request.
+    let pending = crate::review::LiveReview::Unavailable {
+        reason: "fresh-preview-not-yet-captured",
+    };
+    crate::review::preflight(&plan, previous_review.as_ref(), &pending)?;
     let live = if issued.identity().preview.is_some() {
         let report = issued.preview_fresh(&request, verified, inventory).await?;
         crate::review::LiveReview::fresh(&plan, previous_review.as_ref(), report)?
     } else {
-        crate::review::LiveReview::Unavailable {
-            reason: "deployment-identity-preview-not-approved",
-        }
+        crate::review::LiveReview::not_approved()
     };
-    crate::review::preflight_with_live(&plan, previous_review.as_ref(), &live)?;
+    crate::review::preflight(&plan, previous_review.as_ref(), &live)?;
     platform
         .reserve_transition(&request, executor, verified, inventory)
         .await?;

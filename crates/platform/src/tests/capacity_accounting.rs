@@ -388,7 +388,7 @@ async fn oversized_activation_create_version_stops_before_inventory_creation() -
         &mut protected,
         &stored,
         binding,
-        None,
+        "tls",
     ))
     .await
     .err()

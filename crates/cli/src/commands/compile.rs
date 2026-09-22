@@ -4,7 +4,7 @@
 //! the pinned Linux image, native binary, SBOM and compiler closure. Neither
 //! establishes production readiness.
 
-use crate::{Result, artifact, assets, cli, deno, ir, report, source};
+use crate::{Result, artifact, assets, cli, deno, report, source};
 use compiler_core::CompiledPlan;
 use serde_json::json;
 use std::{
@@ -14,21 +14,13 @@ use std::{
 };
 
 /// # Errors
-/// Returns an error if the input is unreadable or invalid, if the output or its
+/// Returns an error if the source is unreadable or invalid, if the output or its
 /// source staging directory already exists, or if source compilation fails.
 pub fn compile(arguments: &cli::Compile) -> Result<()> {
     let output = &arguments.output;
-    let stage = arguments
-        .source
-        .as_deref()
-        .map(|source| stage_source(source, output))
-        .transpose()?;
-    let plan = match (&stage, &arguments.ir) {
-        (Some(stage), _) => source::plan(stage, cli::Mode::Production)?,
-        (None, Some(path)) => ir::read_plan(path)?,
-        (None, None) => return Err("supply exactly one of --ir or --source".into()),
-    };
-    emit(&plan, output, stage.as_deref())?;
+    let stage = stage_source(&arguments.source, output)?;
+    let plan = source::plan(&stage, cli::Mode::Production)?;
+    emit(&plan, output, &stage)?;
     report::emit(&summary(&plan, output, "compile"))
 }
 
@@ -39,18 +31,15 @@ pub fn build(arguments: &cli::Build) -> Result<()> {
     let output = &arguments.output;
     let stage = stage_source(&arguments.source, output)?;
     let plan = source::plan(&stage, arguments.mode)?;
-    emit(&plan, output, Some(&stage))?;
+    emit(&plan, output, &stage)?;
     build_native(arguments, &stage, output)?;
     report::emit(&summary(&plan, output, "build"))
 }
 
-fn emit(plan: &CompiledPlan, output: &Path, stage: Option<&Path>) -> Result<()> {
+fn emit(plan: &CompiledPlan, output: &Path, stage: &Path) -> Result<()> {
     artifact::emit(plan, output)?;
     artifact::prepare_lock(output)?;
-    if let Some(stage) = stage {
-        artifact::record_source(output, stage)?;
-    }
-    Ok(())
+    artifact::record_source(output, stage)
 }
 
 fn summary(plan: &CompiledPlan, output: &Path, stage: &str) -> serde_json::Value {

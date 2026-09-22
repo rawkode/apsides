@@ -110,7 +110,7 @@ pub(super) fn upgrade_with_ceiling(
 
 fn render(before: &Value, after: &Value) -> Result<Value> {
     let (stored, plan, previous) = upgrade(before, after)?;
-    crate::review::preflight(&plan, Some(&previous))?;
+    crate::review::preflight(&plan, Some(&previous), &LiveReview::not_approved())?;
     crate::review::transition_review_fixture(&stored, &plan, TRANSITION_2, Some(&previous))
 }
 
@@ -142,7 +142,7 @@ fn upgrade_reports_authenticated_resource_graph_source_and_permission_deltas() -
     after["reactions"][0]["inputs"] = json!(["managed", "new-external", "credentials"]);
     after["reactions"][0]["source"] = source(50);
     let report = render(&before, &after)?;
-    assert_eq!(report["schemaVersion"], "apsides.dev/deployment-review/v4");
+    assert_eq!(report["schemaVersion"], "apsides.dev/deployment-review/v5");
     assert_eq!(
         report["detailAvailability"],
         "authenticated-declaration-metadata"
@@ -258,7 +258,7 @@ fn private_only_upgrade_changes_preserve_declarations_and_reject_swapped_metadat
         assert_eq!(report[category]["added"], json!([]), "{category}");
         assert_eq!(report[category]["removed"], json!([]), "{category}");
     }
-    assert!(crate::review::preflight(&plan, None).is_err());
+    assert!(crate::review::preflight(&plan, None, &LiveReview::not_approved()).is_err());
     let mut swapped = previous.clone();
     swapped.resources[0].source.line += 1;
     swapped.validate()?;
@@ -268,7 +268,9 @@ fn private_only_upgrade_changes_preserve_declarations_and_reject_swapped_metadat
     );
     let mut wrong_scope = previous;
     wrong_scope.scope.domain_id = "foreign".into();
-    assert!(crate::review::preflight(&plan, Some(&wrong_scope)).is_err());
+    assert!(
+        crate::review::preflight(&plan, Some(&wrong_scope), &LiveReview::not_approved()).is_err()
+    );
     Ok(())
 }
 
@@ -278,7 +280,8 @@ fn combined_upgrade_catalog_budget_is_enforced() -> Result<()> {
     let (_, plan, previous) = upgrade_with_ceiling(&ir, &ir, 26_000)?;
     previous.validate()?;
     platform::project_review_metadata(&plan)?.validate()?;
-    let Err(error) = crate::review::preflight(&plan, Some(&previous)) else {
+    let Err(error) = crate::review::preflight(&plan, Some(&previous), &LiveReview::not_approved())
+    else {
         return Err("oversized combined catalog accepted".into());
     };
     assert!(
@@ -365,7 +368,8 @@ fn valid_historical_metadata_cannot_amplify_a_report_past_its_byte_budget() -> R
     // Exercise the accepted historical snapshot contract, independently of the
     // current compiler's smaller request limit; no old release is available here.
     previous.validate()?;
-    let Err(error) = crate::review::preflight(&plan, Some(&previous)) else {
+    let Err(error) = crate::review::preflight(&plan, Some(&previous), &LiveReview::not_approved())
+    else {
         return Err("oversized serialized upgrade report accepted".into());
     };
     assert!(
@@ -381,7 +385,7 @@ fn unsupported_historical_deployment_limitations_are_rejected() -> Result<()> {
     let ir = declaration("private")?;
     let (_, plan, mut previous) = upgrade(&ir, &ir)?;
     previous.deployment_permissions.limitations.pop();
-    assert!(crate::review::preflight(&plan, Some(&previous)).is_err());
+    assert!(crate::review::preflight(&plan, Some(&previous), &LiveReview::not_approved()).is_err());
     Ok(())
 }
 

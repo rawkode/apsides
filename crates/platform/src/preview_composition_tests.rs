@@ -148,7 +148,7 @@ fn owned_contribution_is_private_preserved_and_admission_checked() -> Result<()>
     let metadata = rollout_metadata()?;
     let before = live();
     let composition = compose(&metadata, Some(&before))?;
-    assert!(composition.runtime_conditional());
+    assert!(composition.runtime_conditional);
     assert_eq!(annotation(composition.payload())?, annotation(&before)?);
     assert_eq!(
         composition.payload()["spec"]["template"]["metadata"]["annotations"]["declared"],
@@ -182,7 +182,7 @@ fn owned_contribution_is_private_preserved_and_admission_checked() -> Result<()>
 fn absent_contribution_stays_absent_and_removal_has_no_prediction() -> Result<()> {
     let mut metadata = rollout_metadata()?;
     let absent = compose(&metadata, None)?;
-    assert!(absent.runtime_conditional());
+    assert!(absent.runtime_conditional);
     assert!(annotation(absent.payload())?.is_none());
     absent.verify_projected(&desired())?;
     assert!(absent.verify_projected(&live()).is_err());
@@ -192,7 +192,7 @@ fn absent_contribution_stays_absent_and_removal_has_no_prediction() -> Result<()
     assert!(annotation(retained_absence.payload())?.is_none());
     metadata.reactions.clear();
     let removed = compose(&metadata, Some(&live()))?;
-    assert!(!removed.runtime_conditional());
+    assert!(!removed.runtime_conditional);
     assert!(annotation(removed.payload())?.is_none());
     // The dry-run API decides whether omission removes a field; composition does
     // not assert that removal or adoption already happened.

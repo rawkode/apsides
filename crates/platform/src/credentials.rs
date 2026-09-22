@@ -1,6 +1,5 @@
 use crate::{
-    DeploymentCredential, PlatformClient, Result, SCHEMA_VERSION, Versioned, invalid,
-    store::read_state, valid_name,
+    DeploymentCredential, PlatformClient, Result, Versioned, invalid, store::read_state, valid_name,
 };
 use coordination::ReviewIdentity;
 use serde::{Deserialize, Serialize};
@@ -55,15 +54,11 @@ impl DeploymentIdentity {
         expected_cluster: &str,
         expected_workload_namespace: &str,
     ) -> Result<()> {
-        let version_valid = match self.schema_version.as_str() {
-            SCHEMA_VERSION => self.preview.is_none(),
-            DEPLOYMENT_IDENTITY_SCHEMA_V2 => self
+        if self.schema_version != DEPLOYMENT_IDENTITY_SCHEMA_V2
+            || self
                 .preview
                 .as_ref()
-                .is_none_or(|approval| approval.validate(expected_workload_namespace)),
-            _ => false,
-        };
-        if !version_valid
+                .is_some_and(|approval| !approval.validate(expected_workload_namespace))
             || self.domain_id != expected_domain
             || self.cluster_binding != expected_cluster
             || !valid_name(&self.service_account_name)

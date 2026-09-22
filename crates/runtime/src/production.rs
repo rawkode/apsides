@@ -45,7 +45,6 @@ const MAX_MUTATION_INTERVAL_MILLIS: u64 = 60_000;
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ApiAccess {
-    InCluster,
     Proxy,
 }
 
@@ -301,32 +300,26 @@ pub(crate) async fn run_production(
 }
 
 fn production_kube_config(config: &ProductionConfig) -> Result<Config, RuntimeError> {
-    match config.api_access {
-        ApiAccess::InCluster => Config::incluster().map_err(|error| {
-            RuntimeError::Configuration(format!("in-cluster Kubernetes identity: {error}"))
-        }),
-        ApiAccess::Proxy => {
-            let generation = &config.binding.generation_id;
-            if !valid_dns_label(generation) {
-                return Err(RuntimeError::Configuration(
-                    "proxy generation identifier is not a DNS label".into(),
-                ));
-            }
-            let server_name = format!(
-                "apsides-proxy-{generation}.{}.svc",
-                config.control_namespace
-            );
-            let uri = format!("https://{server_name}:8443")
-                .parse()
-                .map_err(|_| RuntimeError::Configuration("invalid fixed proxy API URL".into()))?;
-            let mut kube_config = Config::new(uri);
-            kube_config.root_cert_file = Some(PathBuf::from(PROXY_CA_PATH));
-            kube_config.auth_info.client_certificate = Some(PROXY_CERT_PATH.into());
-            kube_config.auth_info.client_key = Some(PROXY_KEY_PATH.into());
-            kube_config.tls_server_name = Some(server_name);
-            Ok(kube_config)
-        }
+    let ApiAccess::Proxy = config.api_access;
+    let generation = &config.binding.generation_id;
+    if !valid_dns_label(generation) {
+        return Err(RuntimeError::Configuration(
+            "proxy generation identifier is not a DNS label".into(),
+        ));
     }
+    let server_name = format!(
+        "apsides-proxy-{generation}.{}.svc",
+        config.control_namespace
+    );
+    let uri = format!("https://{server_name}:8443")
+        .parse()
+        .map_err(|_| RuntimeError::Configuration("invalid fixed proxy API URL".into()))?;
+    let mut kube_config = Config::new(uri);
+    kube_config.root_cert_file = Some(PathBuf::from(PROXY_CA_PATH));
+    kube_config.auth_info.client_certificate = Some(PROXY_CERT_PATH.into());
+    kube_config.auth_info.client_key = Some(PROXY_KEY_PATH.into());
+    kube_config.tls_server_name = Some(server_name);
+    Ok(kube_config)
 }
 
 fn valid_dns_label(value: &str) -> bool {
@@ -1598,7 +1591,7 @@ mod tests {
         client: Client,
     ) -> TestResult<ProductionController> {
         let config = ProductionConfig {
-            api_access: ApiAccess::InCluster,
+            api_access: ApiAccess::Proxy,
             control_namespace: "control".into(),
             binding: activation.binding.clone(),
             poll_interval_millis: 100,
@@ -1632,8 +1625,8 @@ mod tests {
 
     #[test]
     fn api_access_rejects_ambient_alternatives() {
-        assert!(serde_json::from_str::<ApiAccess>("\"inCluster\"").is_ok());
         assert!(serde_json::from_str::<ApiAccess>("\"proxy\"").is_ok());
+        assert!(serde_json::from_str::<ApiAccess>("\"inCluster\"").is_err());
         assert!(serde_json::from_str::<ApiAccess>("\"kubeconfig\"").is_err());
         assert!(serde_json::from_str::<ApiAccess>("{\"proxy\":\"https://example\"}").is_err());
     }
@@ -1643,8 +1636,7 @@ mod tests {
         let plan = plan()?;
         let policy = policy(&plan);
         let activation = activation(&plan, &policy, None)?;
-        let mut controller = controller(&plan, &activation, wire(vec![]).0)?;
-        controller.config.api_access = ApiAccess::Proxy;
+        let controller = controller(&plan, &activation, wire(vec![]).0)?;
         let config = production_kube_config(&controller.config)?;
         assert_eq!(
             config.cluster_url.to_string(),

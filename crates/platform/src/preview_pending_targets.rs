@@ -3,7 +3,7 @@ use super::PendingPreviewUnavailable;
 use crate::preview_transport::{NamedPreview, PreviewTarget, PreviewTransport};
 use crate::{ResolvedTransition, Result, invalid};
 use coordination::ReviewResource;
-use deploy::{ClaimState, OwnershipAction, ProtectedClaim};
+use deploy::{ClaimState, ProtectedClaim};
 
 pub(super) struct CapturedTarget {
     observation: Observation,
@@ -177,8 +177,7 @@ fn classify(
         .iter()
         .find(|intent| intent.approval.identity == claim.identity);
     if let Some(intent) = intent
-        && (intent.approval.action != OwnershipAction::Adopt
-            || intent.approval.permitted_apply != resource.desired
+        && (intent.approval.permitted_apply != resource.desired
             || claim.uid.as_deref() != Some(intent.approval.observed_uid.as_str()))
     {
         return Err(invalid(

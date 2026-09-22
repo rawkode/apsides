@@ -38,10 +38,6 @@ impl PreviewComposition {
     pub const fn payload(&self) -> &Value {
         &self.payload
     }
-    #[must_use]
-    pub const fn runtime_conditional(&self) -> bool {
-        self.runtime_conditional
-    }
 
     /// Check the bounded dry-run result against the observation identity and any
     /// promised runtime contribution, including promised absence.

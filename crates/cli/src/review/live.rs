@@ -1,14 +1,6 @@
 //! Ephemeral live evidence; never added to durable declaration metadata.
-use super::declarations::Unavailable;
 use coordination::{ReviewMetadataV1, ReviewRef};
 use serde::Serialize;
-
-#[derive(Serialize)]
-#[serde(untagged)]
-pub(super) enum Impact<'a> {
-    Unavailable(Unavailable),
-    Current(&'a LiveReview),
-}
 
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
@@ -45,6 +37,13 @@ pub(crate) struct CaptureBinding {
 }
 
 impl LiveReview {
+    /// The protected deployment identity does not approve a live preview.
+    pub(crate) const fn not_approved() -> Self {
+        Self::Unavailable {
+            reason: "deployment-identity-preview-not-approved",
+        }
+    }
+
     pub(crate) fn fresh(
         plan: &deploy::TransitionPlan,
         previous: Option<&ReviewMetadataV1>,

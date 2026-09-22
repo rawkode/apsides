@@ -1,9 +1,10 @@
 //! Already-staged isolated writer evidence for activation and resume wire tests.
 use super::LifecycleRegistry;
+use crate::proxy_stage::ProxyPolicy;
 use crate::{
-    ADMIN_IMAGE, ENVOY_IMAGE, MAX_PROXY_LEDGER_BYTES, ProxyIdentity, ProxyPolicy,
-    RequestDrainQualification, RuntimeBinding, RuntimeInventory, SCHEMA_VERSION, StoredTransition,
-    envoy_configuration, envoy_token_sds,
+    ADMIN_IMAGE, ENVOY_IMAGE, MAX_PROXY_LEDGER_BYTES, ProxyIdentity, RequestDrainQualification,
+    RuntimeBinding, RuntimeInventory, SCHEMA_VERSION, StoredTransition, envoy_configuration,
+    envoy_token_sds,
 };
 use compiler_core::{canonical_bytes, digest};
 use k8s_openapi::api::core::v1::{ConfigMap, Pod};

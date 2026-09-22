@@ -1,4 +1,5 @@
 use crate as platform;
+use crate::executor_binding::EXECUTOR_BINDING_SCHEMA;
 use crate::*;
 use compiler_core::{CompiledPlan, PermissionCeiling, digest, parse_and_validate};
 use coordination::{ClaimRef, ClaimSnapshotV1, ClaimStore};
@@ -383,7 +384,7 @@ pub(crate) fn platform_client_with_identity(
 
 pub(crate) fn fixture_deployment_identity() -> DeploymentIdentity {
     DeploymentIdentity {
-        schema_version: SCHEMA_VERSION.into(),
+        schema_version: DEPLOYMENT_IDENTITY_SCHEMA_V2.into(),
         domain_id: "example".into(),
         cluster_binding: "cluster-a".into(),
         service_account_name: "deployer".into(),
@@ -1296,7 +1297,10 @@ fn staged_initial_transition(
         runtime_binding: Some(activation.binding.clone()),
         staged_trust_policy_digest: Some(digest(trust)?),
         staged_provenance_digest: Some(digest(&"verified provenance")?),
-        request_drain_qualification: Some(RequestDrainQualification::UnqualifiedDirectApi),
+        request_drain_qualification: Some(RequestDrainQualification::IsolatedEnvoy {
+            qualification_digest: digest(&"qualified-platform-environment")?,
+            node_image_digest: digest(&"qualified-node-image")?,
+        }),
         proxy_identity: None,
         upgrade_drain: None,
         previous_writer_checkpoint: None,

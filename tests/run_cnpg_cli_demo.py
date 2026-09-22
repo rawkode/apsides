@@ -50,8 +50,8 @@ class CliDemoRunner(demo.CnpgDemoRunner):
         self.require_inputs_unchanged()
         environment = dict(os.environ, KUBECONFIG=str(self.issuer),
                            APSIDES_INVENTORY_DATABASE=str(self.inventory))
-        for name in ["APSIDES_INVENTORY_TOKEN", "APS_PERMISSION_UPGRADE_STEP",
-                     "APS_PERMISSION_UPGRADE_COORDINATION_DB", "APS_PERMISSION_UPGRADE_INVENTORY_DB"]:
+        for name in ["APS_PERMISSION_UPGRADE_STEP", "APS_PERMISSION_UPGRADE_COORDINATION_DB",
+                     "APS_PERMISSION_UPGRADE_INVENTORY_DB"]:
             environment.pop(name, None)
         raw = self.command([self.aps, "deploy", "--artifact", artifact,
                             "--executor", "cnpg-cli-demo"], environment=environment, timeout=600)

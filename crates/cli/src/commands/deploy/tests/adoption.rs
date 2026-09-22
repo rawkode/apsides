@@ -146,7 +146,7 @@ fn authenticated_review_links_added_declaration_to_planned_adoption() -> Result<
     let review = crate::review::transition_review_fixture(&stored, &plan, TRANSITION_1, None)?;
     assert_eq!(
         review.get("schemaVersion").and_then(Value::as_str),
-        Some("apsides.dev/deployment-review/v4")
+        Some("apsides.dev/deployment-review/v5")
     );
     assert_eq!(
         review.get("actionSemantics").and_then(Value::as_str),
@@ -241,21 +241,8 @@ fn authenticated_review_links_added_declaration_to_planned_adoption() -> Result<
 }
 
 #[test]
-fn transfer_and_forged_adoption_plan_never_render_as_approved() -> Result<()> {
+fn forged_adoption_plan_never_renders_as_approved() -> Result<()> {
     let (stored, plan) = adoption_fixture()?;
-    let mut transfer = plan.request.clone();
-    transfer
-        .ownership_intents
-        .first_mut()
-        .ok_or("ownership intent missing")?
-        .approval
-        .action = OwnershipAction::Transfer {
-        source_domain_id: "other".into(),
-        source_generation_id: "other-generation".into(),
-        source_transition_id: "other-transition".into(),
-    };
-    assert!(plan_transition(&transfer).is_err());
-
     let mut forged = plan.clone();
     forged
         .request

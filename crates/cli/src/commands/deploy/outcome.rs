@@ -11,7 +11,7 @@ pub(super) async fn review_transition(
 ) -> Result<Value> {
     let resolved = session.resolve().await?;
     crate::connection::require_request(inventory, &resolved.plan().request).await?;
-    let review = crate::review::transition_review_with_live(&resolved, live)?;
+    let review = crate::review::transition_review(&resolved, live)?;
     report::note(&review)?;
     Ok(review)
 }
@@ -31,7 +31,7 @@ pub(super) async fn already_committed_report(
     let live = crate::review::LiveReview::Unavailable {
         reason: "committed-current-state-preview-not-run",
     };
-    let review = crate::review::transition_review_with_live(&session.resolve().await?, &live)?;
+    let review = crate::review::transition_review(&session.resolve().await?, &live)?;
     Ok(json!({
         "status": "already-committed", "transition": transition,
         "artifactTrust": "verified", "releaseQualification": "not-evaluated",

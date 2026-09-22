@@ -56,10 +56,8 @@ fn validate(identity: &DeploymentIdentity) -> Result<()> {
 }
 
 #[test]
-fn v1_cannot_opt_in_and_v2_opt_out_or_known_profile_are_valid() -> Result<()> {
-    assert!(validate(&identity(SCHEMA_VERSION, None)).is_ok());
-    let approval = preview(vec![review_target("configmaps", "workload", "settings")]);
-    assert!(validate(&identity(SCHEMA_VERSION, Some(approval))).is_err());
+fn v2_opt_out_or_known_profile_are_valid_and_other_schemas_are_not() -> Result<()> {
+    assert!(validate(&identity(crate::SCHEMA_VERSION, None)).is_err());
     assert!(validate(&identity(DEPLOYMENT_IDENTITY_SCHEMA_V2, None)).is_ok());
     let empty_approval = identity(DEPLOYMENT_IDENTITY_SCHEMA_V2, Some(preview(Vec::new())));
     assert!(validate(&empty_approval).is_ok());

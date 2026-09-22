@@ -7,8 +7,7 @@
 
 use crate::Result;
 use clap::{
-    ArgGroup, Args, CommandFactory as _, Parser, Subcommand, ValueEnum,
-    builder::NonEmptyStringValueParser,
+    Args, CommandFactory as _, Parser, Subcommand, ValueEnum, builder::NonEmptyStringValueParser,
 };
 use std::{collections::BTreeSet, env, path::PathBuf};
 
@@ -41,11 +40,6 @@ pub fn parse() -> Result<Invocation> {
         Err(error) if error.use_stderr() => Ok(Invocation::Usage(error.render().to_string())),
         Err(error) => Ok(Invocation::Print(error.render().to_string())),
     }
-}
-
-/// The version line printed by both `aps version` and `aps --version`.
-pub fn version() -> String {
-    format!("aps {}\n", env!("CARGO_PKG_VERSION"))
 }
 
 fn arguments() -> Result<Vec<String>> {
@@ -110,9 +104,7 @@ pub enum Command {
     },
     /// Validate compiled IR.
     Check(Check),
-    /// Validate compiled IR against a permission ceiling.
-    Plan(Plan),
-    /// Compile a program or raw IR into a validated artifact.
+    /// Compile a program into a validated artifact.
     Compile(Compile),
     /// Compile a program and build its native controller image.
     Build(Build),
@@ -130,9 +122,6 @@ pub enum Command {
     Deploy(Deploy),
     /// Read transition history. Audit output never grants lifecycle authority.
     Audit(Audit),
-    /// Print the CLI version.
-    #[command(hide = true)]
-    Version,
 }
 
 #[derive(Args, Debug)]
@@ -182,24 +171,10 @@ pub struct Check {
 }
 
 #[derive(Args, Debug)]
-pub struct Plan {
-    /// Compiled IR to validate.
-    #[arg(long)]
-    pub ir: PathBuf,
-    /// Permission ceiling the plan must fit inside.
-    #[arg(long)]
-    pub ceiling: PathBuf,
-}
-
-#[derive(Args, Debug)]
-#[command(group = ArgGroup::new("input").required(true))]
 pub struct Compile {
     /// Authoring entry point to compile.
-    #[arg(long, group = "input")]
-    pub source: Option<PathBuf>,
-    /// Pre-compiled IR to read instead of a source program.
-    #[arg(long, group = "input")]
-    pub ir: Option<PathBuf>,
+    #[arg(long)]
+    pub source: PathBuf,
     /// Fresh artifact directory.
     #[arg(long)]
     pub output: PathBuf,
@@ -396,16 +371,16 @@ mod tests {
         assert!(parse(&["check", "--ir"]).is_err(), "option without a value");
         assert!(parse(&["compile", "--output", "out"]).is_err(), "no input");
         assert!(
-            parse(&["compile", "--ir", "a", "--source", "b", "--output", "out"]).is_err(),
-            "--ir and --source are mutually exclusive"
+            parse(&["compile", "--ir", "a", "--output", "out"]).is_err(),
+            "compiled IR is not an authoring input"
         );
+        assert!(parse(&["plan", "--ir", "a", "--ceiling", "c"]).is_err());
         assert!(parse(&["nonesuch"]).is_err(), "unknown command");
     }
 
     #[test]
     fn compile_and_build_do_not_share_each_others_options() {
         assert!(parse(&["compile", "--source", "a", "--output", "o"]).is_ok());
-        assert!(parse(&["compile", "--ir", "a", "--output", "o"]).is_ok());
         // Image-build options belong to build alone.
         assert!(
             parse(&[

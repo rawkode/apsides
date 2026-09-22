@@ -3,7 +3,7 @@ use coordination::{
     ReviewDeletionPolicy, ReviewIdentity, ReviewLifecycle, ReviewMetadataV1, ReviewOwnershipPlan,
     ReviewResource, ReviewSource,
 };
-use deploy::{OwnershipAction, OwnershipIntent, ResourceIdentity};
+use deploy::{OwnershipIntent, ResourceIdentity};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -274,8 +274,7 @@ fn approval_map<'a>(
     let mut approvals = BTreeMap::new();
     for intent in intents {
         let key = identity(&intent.approval.identity);
-        if !matches!(intent.approval.action, OwnershipAction::Adopt)
-            || !new.contains_key(&key)
+        if !new.contains_key(&key)
             || old.contains_key(&key)
             || approvals.insert(key, intent).is_some()
         {

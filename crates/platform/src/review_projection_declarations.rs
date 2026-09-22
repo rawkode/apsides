@@ -5,7 +5,7 @@ use coordination::{
     ReviewLifecycle, ReviewOwnershipPlan, ReviewPrimitive, ReviewReaction, ReviewResource,
     ReviewSource,
 };
-use deploy::{OwnershipAction, OwnershipIntent, TransitionPlan};
+use deploy::{OwnershipIntent, TransitionPlan};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) struct Declarations {
@@ -35,10 +35,9 @@ pub(super) fn project(plan: &TransitionPlan) -> Result<Declarations> {
         .collect();
     let mut approvals = BTreeMap::new();
     for intent in &plan.request.ownership_intents {
-        if !matches!(intent.approval.action, OwnershipAction::Adopt)
-            || approvals
-                .insert(approval_identity(intent), intent)
-                .is_some()
+        if approvals
+            .insert(approval_identity(intent), intent)
+            .is_some()
         {
             return Err(invalid("review ownership approvals are ambiguous"));
         }

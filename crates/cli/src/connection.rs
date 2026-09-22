@@ -45,24 +45,15 @@ async fn open_coordination(read_only: bool) -> Result<Arc<coordination::SqliteCo
 /// There is no remote endpoint: the compare-and-set publication protocol reads
 /// back what it just committed, which a replica cannot promise.
 fn database_path() -> Result<PathBuf> {
-    configured_path(
-        std::env::var("APSIDES_INVENTORY_DATABASE").ok().as_deref(),
-        std::env::var_os("APSIDES_INVENTORY_TOKEN").is_some(),
-    )
+    configured_path(std::env::var("APSIDES_INVENTORY_DATABASE").ok().as_deref())
 }
 
-fn configured_path(database: Option<&str>, token_present: bool) -> Result<PathBuf> {
+fn configured_path(database: Option<&str>) -> Result<PathBuf> {
     let database =
         database.ok_or("set APSIDES_INVENTORY_DATABASE to a persistent absolute path")?;
     let path = PathBuf::from(database);
     if !path.is_absolute() {
         return Err("APSIDES_INVENTORY_DATABASE must be an absolute path".into());
-    }
-    if token_present {
-        return Err(
-            "APSIDES_INVENTORY_TOKEN is not accepted; the metadata store is a local database"
-                .into(),
-        );
     }
     Ok(path)
 }
@@ -215,21 +206,19 @@ mod tests {
 
     #[test]
     fn configuration_is_local_only_and_never_echoes_its_value() -> Result<()> {
-        // The store is a local database; there is no endpoint and no token.
-        for (database, token) in [
-            (Some("private-relative.db"), false),
-            (Some("libsql://private-host.invalid"), false),
-            (Some("https://private-host.invalid"), true),
-            (Some("/unused-inventory.db"), true),
-            (None, false),
+        // The store is a local database; there is no endpoint.
+        for database in [
+            Some("private-relative.db"),
+            Some("https://private-host.invalid"),
+            None,
         ] {
-            let Err(error) = configured_path(database, token) else {
+            let Err(error) = configured_path(database) else {
                 return Err("invalid configuration accepted".into());
             };
             assert!(!error.to_string().contains("private-"), "{error}");
         }
         assert_eq!(
-            configured_path(Some("/var/lib/apsides/inventory.db"), false)?,
+            configured_path(Some("/var/lib/apsides/inventory.db"))?,
             PathBuf::from("/var/lib/apsides/inventory.db")
         );
         Ok(())

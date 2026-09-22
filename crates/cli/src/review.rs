@@ -8,11 +8,11 @@ mod resources;
 pub(crate) use live::LiveReview;
 
 use coordination::{ReviewMetadataV1, ReviewRef};
-use declarations::{Changes, Declarations, Unavailable};
+use declarations::{Changes, Declarations};
 use serde::Serialize;
 use serde_json::Value;
 
-pub(crate) fn transition_review_with_live(
+pub(crate) fn transition_review(
     resolved: &platform::ResolvedTransition,
     live: &LiveReview,
 ) -> crate::Result<Value> {
@@ -23,11 +23,13 @@ pub(crate) fn transition_review_with_live(
         resolved.transition_id(),
         resolved.next_review_metadata(),
         resolved.previous_review_metadata(),
-        Some(live),
+        live,
     )
 }
 
-pub(crate) fn preflight_with_live(
+/// Refuse an incomplete report before the caller publishes claims or reserves a transition.
+/// The predecessor body must have been loaded through its protected active reference.
+pub(crate) fn preflight(
     plan: &deploy::TransitionPlan,
     previous: Option<&ReviewMetadataV1>,
     live: &LiveReview,
@@ -36,21 +38,7 @@ pub(crate) fn preflight_with_live(
     validate_metadata(plan, previous, &next)?;
     live.validate(plan, previous, &next)?;
     budget::count(plan, previous, &next)?;
-    with_report(plan, previous, &next, Some(live), |report| {
-        budget::check(report)
-    })
-}
-
-/// Refuse an incomplete report before the caller publishes claims or reserves a transition.
-/// The predecessor body must have been loaded through its protected active reference.
-pub(crate) fn preflight(
-    plan: &deploy::TransitionPlan,
-    previous: Option<&ReviewMetadataV1>,
-) -> crate::Result<()> {
-    let next = platform::project_review_metadata(plan)?;
-    validate_metadata(plan, previous, &next)?;
-    budget::count(plan, previous, &next)?;
-    with_report(plan, previous, &next, None, |report| budget::check(report))
+    with_report(plan, previous, &next, live, |report| budget::check(report))
 }
 
 #[cfg(test)]
@@ -60,8 +48,13 @@ pub(crate) fn transition_review_fixture(
     transition: &str,
     previous: Option<&ReviewMetadataV1>,
 ) -> crate::Result<Value> {
-    let next = platform::project_review_metadata(plan)?;
-    render_review(current, plan, transition, &next, previous, None)
+    transition_review_fixture_with_live(
+        current,
+        plan,
+        transition,
+        previous,
+        &LiveReview::not_approved(),
+    )
 }
 
 #[cfg(test)]
@@ -73,7 +66,7 @@ pub(crate) fn transition_review_fixture_with_live(
     live: &LiveReview,
 ) -> crate::Result<Value> {
     let next = platform::project_review_metadata(plan)?;
-    render_review(current, plan, transition, &next, previous, Some(live))
+    render_review(current, plan, transition, &next, previous, live)
 }
 
 fn render_review(
@@ -82,7 +75,7 @@ fn render_review(
     transition: &str,
     next: &ReviewMetadataV1,
     previous: Option<&ReviewMetadataV1>,
-    live: Option<&LiveReview>,
+    live: &LiveReview,
 ) -> crate::Result<Value> {
     if plan.request.transition_id != transition
         || current.record.transition_id != transition
@@ -100,9 +93,7 @@ fn render_review(
     deploy::verify_record(plan, &current.record)?;
     validate_predecessor_checkpoint(current, plan)?;
     budget::count(plan, previous, next)?;
-    if let Some(live) = live {
-        live.validate(plan, previous, next)?;
-    }
+    live.validate(plan, previous, next)?;
     with_report(plan, previous, next, live, |report| {
         budget::check(report)?;
         Ok(serde_json::to_value(report)?)
@@ -251,7 +242,7 @@ struct Report<'a> {
     irreversible_operations: Vec<&'a deploy::CleanupItem>,
     compatibility: Changes<'a, coordination::ReviewCompatibility>,
     expected_interruption: &'static str,
-    live_impact: live::Impact<'a>,
+    live_impact: &'a LiveReview,
     values_omitted: bool,
     limits: Limits,
 }
@@ -294,7 +285,7 @@ fn with_report<T>(
     plan: &deploy::TransitionPlan,
     previous: Option<&ReviewMetadataV1>,
     next: &ReviewMetadataV1,
-    live: Option<&LiveReview>,
+    live: &LiveReview,
     consume: impl FnOnce(&Report<'_>) -> crate::Result<T>,
 ) -> crate::Result<T> {
     let initial = previous.is_none();
@@ -345,11 +336,7 @@ fn with_report<T>(
         "enforcement",
     )?;
     consume(&Report {
-        schema_version: if live.is_some() {
-            "apsides.dev/deployment-review/v5"
-        } else {
-            "apsides.dev/deployment-review/v4"
-        },
+        schema_version: "apsides.dev/deployment-review/v5",
         detail_availability: if initial {
             "initial"
         } else {
@@ -383,10 +370,7 @@ fn with_report<T>(
             .collect(),
         compatibility,
         expected_interruption: expected_interruption(initial),
-        live_impact: live.map_or_else(
-            || live::Impact::Unavailable(Unavailable::live()),
-            live::Impact::Current,
-        ),
+        live_impact: live,
         values_omitted: true,
         limits: Limits {
             projection_source_element_limit: budget::MAX_SOURCE_ELEMENTS,

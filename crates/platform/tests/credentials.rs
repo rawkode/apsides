@@ -1,7 +1,7 @@
 use http::{Request, Response};
 use http_body_util::BodyExt;
 use kube::{Client, client::Body};
-use platform::{PlatformClient, SCHEMA_VERSION};
+use platform::{DEPLOYMENT_IDENTITY_SCHEMA_V2, PlatformClient};
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
@@ -13,7 +13,7 @@ use tower::service_fn;
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 fn identity(revision: &str) -> Value {
-    json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"apsides-deploy-identity-example","namespace":"control","uid":"identity-uid","resourceVersion":revision},"data":{"state.json":json!({"schemaVersion":SCHEMA_VERSION,"domainId":"example","clusterBinding":"cluster-a","serviceAccountName":"deployer","serviceAccountUid":"sa-uid","bindingSecretName":"binding","bindingSecretUid":"secret-uid","audience":"https://kubernetes.default.svc","lifetimeSeconds":600}).to_string()}})
+    json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"apsides-deploy-identity-example","namespace":"control","uid":"identity-uid","resourceVersion":revision},"data":{"state.json":json!({"schemaVersion":DEPLOYMENT_IDENTITY_SCHEMA_V2,"domainId":"example","clusterBinding":"cluster-a","serviceAccountName":"deployer","serviceAccountUid":"sa-uid","bindingSecretName":"binding","bindingSecretUid":"secret-uid","audience":"https://kubernetes.default.svc","lifetimeSeconds":600,"preview":null}).to_string()}})
 }
 
 fn client(replies: Vec<Value>) -> TestResult<(PlatformClient, Arc<Mutex<Vec<Value>>>)> {

@@ -153,10 +153,11 @@ class CollisionRunner(base.CeilingRunner):
         self.secret_uid = secret["uid"]
         for domain in domains:
             self.state("apsides-deploy-identity-" + domain,
-                       {"schemaVersion": "apsides.dev/platform/v1", "domainId": domain, "clusterBinding": self.binding,
+                       {"schemaVersion": "apsides.dev/deployment-identity/v2", "domainId": domain, "clusterBinding": self.binding,
                         "serviceAccountName": "ceiling-deployer", "serviceAccountUid": accounts["ceiling-deployer"]["metadata"]["uid"],
                         "bindingSecretName": "ceiling-binding", "bindingSecretUid": self.secret_uid,
-                        "audience": "https://kubernetes.default.svc.cluster.local", "lifetimeSeconds": 600})
+                        "audience": "https://kubernetes.default.svc.cluster.local", "lifetimeSeconds": 600,
+                        "preview": None})
         self.permissions(domains)
         config = json.loads(self.k("config", "view", "--raw", "--minify", "-o", "json"))
         token = self.k("create", "token", "ceiling-issuer", "-n", self.control, "--duration=10m").strip()

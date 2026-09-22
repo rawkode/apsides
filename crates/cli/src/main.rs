@@ -45,7 +45,6 @@ fn dispatch(command: Command) -> Result<()> {
             command: Crds::Fetch(arguments),
         } => commands::crds::fetch(&arguments),
         Command::Check(arguments) => commands::check::command(&arguments),
-        Command::Plan(arguments) => commands::plan::command(&arguments),
         Command::Compile(arguments) => commands::compile::compile(&arguments),
         Command::Build(arguments) => commands::compile::build(&arguments),
         Command::Test(arguments) => commands::test::command(&arguments),
@@ -55,7 +54,6 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Release(arguments) => commands::release::command(&arguments),
         Command::Deploy(arguments) => commands::deploy::command(&arguments),
         Command::Audit(arguments) => commands::audit::command(&arguments),
-        Command::Version => print(&cli::version()),
     }
 }
 

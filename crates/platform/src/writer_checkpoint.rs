@@ -166,12 +166,7 @@ impl WriterCheckpoint {
         let RequestDrainQualification::IsolatedEnvoy {
             qualification_digest,
             node_image_digest,
-        } = &self.request_drain_qualification
-        else {
-            return Err(invalid(
-                "writer checkpoint requires a qualified isolated proxy",
-            ));
-        };
+        } = &self.request_drain_qualification;
         let proxy = &self.proxy_identity;
         if proxy.deployment_name != format!("apsides-proxy-{}", allocation.generation_id)
             || proxy.config_map_name != format!("apsides-proxy-{}-config", allocation.generation_id)
@@ -247,11 +242,7 @@ fn valid_uid(value: &str) -> bool {
 
 #[cfg(feature = "deployer")]
 pub(crate) fn require_qualified(stored: &crate::StoredTransition) -> Result<()> {
-    if !matches!(
-        stored.request_drain_qualification,
-        Some(RequestDrainQualification::IsolatedEnvoy { .. })
-    ) || stored.proxy_identity.is_none()
-    {
+    if stored.request_drain_qualification.is_none() || stored.proxy_identity.is_none() {
         return Err(invalid(
             "writer checkpoint requires a qualified isolated proxy before activation",
         ));
@@ -387,6 +378,8 @@ fn project_stored(
     Ok(checkpoint)
 }
 
+/// Bind credential retirement to the approved generation rather than arbitrary
+/// objects named by a stored checkpoint.
 #[cfg(feature = "deployer")]
 pub(crate) fn select_retirement_identities<'a>(
     name: &str,
@@ -420,4 +413,76 @@ pub(crate) fn select_retirement_identities<'a>(
             Ok((key, uid.clone()))
         })
         .collect()
+}
+
+#[cfg(all(test, feature = "deployer"))]
+mod retirement_tests {
+    use super::select_retirement_identities as select;
+    use crate::Result;
+    use std::collections::BTreeMap;
+
+    fn staged() -> BTreeMap<String, String> {
+        [
+            ("v1/ServiceAccount/control/generation", "sa-uid"),
+            (
+                "rbac.authorization.k8s.io/v1/RoleBinding/workload/generation",
+                "binding-uid",
+            ),
+            (
+                "v1/ServiceAccount/control/generation-process",
+                "process-uid",
+            ),
+        ]
+        .into_iter()
+        .map(|(key, uid)| (key.into(), uid.into()))
+        .collect()
+    }
+
+    #[test]
+    fn selects_complete_credential_set_excluding_tokenless_process() -> Result<()> {
+        let selected = select(
+            "generation",
+            "control",
+            ["workload", "workload"].into_iter(),
+            &staged(),
+        )?;
+        assert_eq!(selected.len(), 2);
+        assert_eq!(
+            selected.get("v1/ServiceAccount/control/generation"),
+            Some(&"sa-uid".into())
+        );
+        assert!(!selected.contains_key("v1/ServiceAccount/control/generation-process"));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_empty_and_unrelated_identities_reject() {
+        for key in [
+            "v1/ServiceAccount/control/generation",
+            "rbac.authorization.k8s.io/v1/RoleBinding/workload/generation",
+        ] {
+            let mut missing = staged();
+            missing.remove(key);
+            assert!(select("generation", "control", ["workload"].into_iter(), &missing).is_err());
+            missing.insert(key.into(), String::new());
+            assert!(select("generation", "control", ["workload"].into_iter(), &missing).is_err());
+        }
+        for key in [
+            "rbac.authorization.k8s.io/v1/RoleBinding/other/generation",
+            "rbac.authorization.k8s.io/v1/RoleBinding/workload/unrelated",
+            "other/v1/RoleBinding/workload/generation",
+        ] {
+            let mut unrelated = staged();
+            unrelated.insert(key.into(), "uid".into());
+            assert!(
+                select(
+                    "generation",
+                    "control",
+                    ["workload"].into_iter(),
+                    &unrelated
+                )
+                .is_err()
+            );
+        }
+    }
 }

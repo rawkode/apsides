@@ -2,7 +2,7 @@ use crate::{PlatformClient, Result, invalid, store::read_state, valid_name};
 #[cfg(feature = "deployer")]
 use compiler_core::digest;
 #[cfg(feature = "deployer")]
-use deploy::{DeploymentRequest, OwnershipAction};
+use deploy::DeploymentRequest;
 use deploy::{GenerationPlan, OwnershipApproval, OwnershipIntent, validate_ownership_intent};
 #[cfg(feature = "deployer")]
 use kube::{
@@ -90,11 +90,6 @@ impl PlatformClient {
         intent: &OwnershipIntent,
     ) -> Result<()> {
         let approval = &intent.approval;
-        if approval.action != OwnershipAction::Adopt {
-            return Err(invalid(
-                "transfer requires qualified source suspension and held-claim execution",
-            ));
-        }
         let resource = target
             .compiled
             .ir
