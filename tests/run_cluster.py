@@ -7,7 +7,6 @@ an explicit loopback TCP proxy. An unimplemented or unobserved case fails.
 """
 
 import argparse
-import copy
 import base64
 import hashlib
 import hmac
@@ -30,51 +29,6 @@ ROLLOUT_KEY_ID = "fixture-v1"
 ROLLOUT_KEY = b"synthetic-fixture-key-never-production-0123456789"
 CONTROLLER_TAG = "apsides-controller-fixture:local"
 WORKLOAD_TAG = "apsides-fixture:local"
-
-
-def stage_release_evidence(output, receipt, coverage, result):
-    """Publish only successful, bounded diagnostics using release-relative paths."""
-    if result.get("status") != "passed":
-        return
-    receipt = copy.deepcopy(receipt)
-    coverage = copy.deepcopy(coverage)
-    allowed = {"tested-artifact-manifest.json", "cluster-transcript.json",
-               "semantic-results.json", "canary-scan.json"}
-    allowed |= {"fixture-crds.json", *[f"fixture-crd-{index}.yaml" for index in range(16)]}
-    required = {receipt["artifactManifestFile"]}
-    for catalogue in ["cases", "fixtureCases", "checks"]:
-        for record in receipt[catalogue].values():
-            if record["status"] != "passed":
-                raise RuntimeError("failed reactor record cannot be packaged")
-            required.update(record["evidenceFiles"])
-            record["evidenceFiles"] = ["evidence/" + name for name in record["evidenceFiles"]]
-    if not required <= allowed:
-        raise RuntimeError("reactor evidence references an unapproved diagnostic")
-    receipt["artifactManifestFile"] = "evidence/" + receipt["artifactManifestFile"]
-    coverage["irDigest"] = receipt["productionIrDigest"]
-    for record in [*coverage["cases"], *coverage["checks"].values()]:
-        if record["evidenceFiles"] != ["reactor-evidence.json"]:
-            raise RuntimeError("reactor coverage has an unexpected evidence reference")
-        record["evidenceFiles"] = ["evidence/reactor-evidence.json"]
-    files = {}
-    for name in sorted(required):
-        path = output / name
-        if path.is_symlink() or not path.is_file() or path.stat().st_size > 4 * 1024 * 1024:
-            raise RuntimeError("reactor diagnostic is missing, nonregular or oversized")
-        files[name] = path.read_bytes()
-    runner = Path(__file__).resolve()
-    source = runner.read_bytes()
-    if "sha256:" + hashlib.sha256(source).hexdigest() != receipt["runnerIdentity"]["sourceSha256"]:
-        raise RuntimeError("reactor runner changed during measurement")
-    files["run_cluster.py"] = source
-    files["reactor-evidence.json"] = canonical(receipt)
-    if any(len(value) > 4 * 1024 * 1024 for value in files.values()):
-        raise RuntimeError("reactor evidence exceeds the release document limit")
-    destination = output / "evidence"
-    destination.mkdir()
-    for name, value in files.items():
-        (destination / name).write_bytes(value)
-    (output / "release-coverage-fragment.json").write_bytes(canonical(coverage))
 
 
 def canonical(value):
@@ -1150,7 +1104,7 @@ echo APSIDES_INIT_EGRESS_DENIED
                                              "seconds": time.monotonic() - started}
             except Exception as error:
                 self.fixture_results[key] = {"case": case, "caseDigest": digest(case), "status": "failed",
-                                             "assertions": [], "evidenceFiles": ["reactor-evidence.json"], "message": str(error),
+                                             "assertions": [], "evidenceFiles": ["cluster-transcript.json"], "message": str(error),
                                              "seconds": time.monotonic() - started}
 
     def cleanup(self):
@@ -1237,38 +1191,17 @@ echo APSIDES_INIT_EGRESS_DENIED
                     raise RuntimeError("fixture CRD input changed during measurement")
             (self.output / "fixture-crds.json").write_bytes(canonical({"installations": self.crd_installations}))
             checks["offline-reactor-suite"]["evidenceFiles"] += ["fixture-crds.json", *[item["file"] for item in self.crd_snapshots]]
-        reactor_evidence = {
-            "schemaVersion": "apsides.dev/reactor-evidence/v1",
-            "productionIrDigest": getattr(self, "production_ir_digest", None),
-            "fixtureIrDigest": self.plan["irDigest"],
-            "testedArtifactDigest": tested_artifact_digest,
-            "artifactManifestFile": artifact_manifest_file,
-            "overlayDigest": getattr(self, "fixture_overlay_digest", None),
-            "runnerIdentity": {"sourceSha256": getattr(self, "runner_digest", None),
-                               "controllerManifestDigest": getattr(self, "controller_manifest", None),
-                               "controllerArchiveDigest": getattr(self, "controller_archive_digest", None),
-                               "fixtureArchiveDigest": getattr(self, "fixture_archive_digest", None), "nodeImage": NODE_IMAGE},
-            "cases": {row["caseDigest"]: {"status": row["status"], "assertions": row["assertions"],
-                                           "evidenceFiles": row["evidenceFiles"]} for row in ordered},
-            "fixtureCases": {row["caseDigest"]: {"status": row["status"], "assertions": row["assertions"],
-                                                  "evidenceFiles": row["evidenceFiles"]} for row in fixture_ordered},
-            "checks": checks,
-        }
-        (self.output / "reactor-evidence.json").write_text(json.dumps(reactor_evidence, indent=2) + "\n")
+        result["testedArtifactDigest"] = tested_artifact_digest
+        result["checks"] = checks
         (self.output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
         (self.output / "cluster-transcript.json").write_text(json.dumps({"cases": ordered, "fixtureCases": fixture_ordered,
                                                                           "networkIsolation": result["networkIsolation"]}, indent=2) + "\n")
-        coverage = {"schemaVersion": "apsides.dev/reactor-coverage-fragment/v1", "irDigest": self.plan["irDigest"],
-                    "cases": [{"caseDigest": row["caseDigest"], "status": row["status"], "evidenceFiles": ["reactor-evidence.json"]} for row in ordered],
-                    "checks": {name: {"status": value["status"], "evidenceFiles": ["reactor-evidence.json"]} for name, value in checks.items()}}
-        (self.output / "coverage-fragment.json").write_text(json.dumps(coverage, indent=2) + "\n")
         suite = ET.Element("testsuite", name="apsides-containerized-reactor", tests=str(len(ordered)), failures=str(sum(row["status"] != "passed" for row in ordered)))
         for row in ordered:
             item = ET.SubElement(suite, "testcase", classname=row["case"]["reactionId"], name=row["case"]["scenario"], time=str(row["seconds"]))
             if row["status"] != "passed":
                 ET.SubElement(item, "failure", message=row.get("message", "failed"))
         ET.ElementTree(suite).write(self.output / "junit.xml", encoding="utf-8", xml_declaration=True)
-        stage_release_evidence(self.output, reactor_evidence, coverage, result)
         return result
 
     def run(self):

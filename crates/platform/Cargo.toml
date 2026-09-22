@@ -9,7 +9,7 @@ publish = false
 [features]
 default = []
 deployer = ["dep:release", "dep:tokio", "kube/ws", "dep:rcgen", "dep:time", "dep:http", "dep:http-body-util"]
-test-support = ["deployer", "release/test-support", "kube/config", "coordination/sqlite-backend"]
+test-support = ["deployer", "kube/config", "coordination/sqlite-backend"]
 
 [dependencies]
 http = { version = "1", optional = true }

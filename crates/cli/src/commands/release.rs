@@ -41,7 +41,7 @@ pub fn command(arguments: &cli::Release) -> Result<()> {
     );
     let repository = arguments.repository.as_str();
     let commit = arguments.commit.as_str();
-    let manifest = json!({"schemaVersion":"apsides.dev/release/v1","mode":mode,
+    let manifest = json!({"schemaVersion":"apsides.dev/release/v2","mode":mode,
         "irDigest":digest(&ir)?,"binaryDigest":files.get("apsides-controller").ok_or("release is missing its controller binary")?,
         "image":{"reference":arguments.image,"platform":arguments.platform},
         "source":{"repository":repository,"commit":commit,"inputsDigest":digest(&inputs)?},
@@ -123,23 +123,8 @@ fn collect_files(
         (&arguments.oci, "controller.oci.tar"),
         (&arguments.binary, "apsides-controller"),
         (&arguments.sbom, "sbom.json"),
-        (&arguments.coverage, "coverage.json"),
     ] {
         copy(source, output, name, files)?;
-    }
-    let mut entries =
-        fs::read_dir(&arguments.evidence)?.collect::<std::result::Result<Vec<_>, _>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    fs::create_dir(output.join("evidence"))?;
-    for entry in entries {
-        if !entry.file_type()?.is_file() {
-            return Err("release evidence must be regular files in one directory".into());
-        }
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| "evidence name is not UTF-8")?;
-        copy(&entry.path(), output, &format!("evidence/{name}"), files)?;
     }
     Ok(())
 }

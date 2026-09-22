@@ -1,155 +1,26 @@
 use compiler_core::{canonical_bytes, digest, parse_and_validate};
-use release::{SignaturePolicy, TrustPolicy, VerifierTool, verify_candidate, verify_release};
+use release::{SignaturePolicy, TrustPolicy, VerifierTool, verify_candidate};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs, path::Path, process::Command};
 
+/// The one rejection a fixture release gets, whichever marker exposes it.
+const FIXTURE_REJECTED: &str =
+    "release rejected: fixture-substituted artifacts cannot be promoted to production";
+/// The rejection for a production-mode release whose IR is not explicitly
+/// `testOnly: false`; payload validation reaches it before the mode check.
+const MARKER_REQUIRED: &str =
+    "release rejected: production IR must explicitly contain testOnly:false";
+
 fn hash(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
-fn assertion(id: &str, expected: Value, actual: Value) -> Value {
-    let mut value = serde_json::Map::new();
-    value.insert("checkId".into(), Value::String(id.into()));
-    value.insert("expected".into(), expected);
-    value.insert("actual".into(), actual);
-    value.insert("passed".into(), Value::Bool(true));
-    Value::Object(value)
-}
-fn case_assertions(scenario: &str) -> TestResult<Vec<Value>> {
-    let boolean = |id: &str, value: bool| assertion(id, json!(value), json!(value));
-    let zero = |id: &str| assertion(id, json!(0), json!(0));
-    Ok(match scenario {
-        "initial-evaluation" => vec![
-            boolean("revision-present", true),
-            boolean("target-converged", true),
-        ],
-        "projected-change" => vec![
-            boolean("revision-changed", true),
-            boolean("target-converged", true),
-        ],
-        "irrelevant-change" | "same-value-replay" | "accepted-write-restart" => vec![
-            boolean("revision-unchanged", true),
-            zero("template-mutations"),
-        ],
-        "coalesced-inputs" | "restart-and-relist" => vec![
-            boolean("latest-input-set-used", true),
-            boolean("target-converged", true),
-        ],
-        "missing-input" => vec![
-            assertion("block-reason", json!("missing"), json!("missing")),
-            zero("target-mutations"),
-            boolean("target-preserved", true),
-        ],
-        "input-returned" => vec![
-            boolean("dependency-recovered", true),
-            boolean("target-converged", true),
-        ],
-        "unauthorized-input" => vec![
-            assertion("block-reason", json!("unauthorized"), json!("unauthorized")),
-            zero("target-mutations"),
-        ],
-        "credential-read-denial" => vec![
-            assertion("http-status", json!(403), json!(403)),
-            boolean("permission-expanded", false),
-            zero("target-mutations"),
-        ],
-        "unavailable-input" => vec![
-            assertion("block-reason", json!("unavailable"), json!("unavailable")),
-            zero("target-mutations"),
-        ],
-        "invalid-input" => vec![
-            assertion("block-reason", json!("invalid"), json!("invalid")),
-            boolean("sensitive-data-exposed", false),
-            zero("target-mutations"),
-        ],
-        "field-conflict" => vec![
-            boolean("conflict-reported", true),
-            boolean("force-applied", false),
-            boolean("foreign-field-preserved", true),
-        ],
-        "out-of-scope-change" => vec![
-            assertion("http-status", json!(403), json!(403)),
-            zero("out-of-scope-mutations"),
-        ],
-        "rollout-readiness" => vec![
-            assertion("ready-pods", json!(">=1"), json!(1)),
-            boolean("new-template-ready", true),
-        ],
-        other => return Err(format!("missing test assertion fixture for {other}").into()),
-    })
-}
-fn check_assertions(check: &str) -> TestResult<Vec<Value>> {
-    let boolean = |id: &str, value: bool| assertion(id, json!(value), json!(value));
-    let zero = |id: &str| assertion(id, json!(0), json!(0));
-    Ok(match check {
-        "reproducible-payload" => vec![
-            assertion("independent-builds", json!(2), json!(2)),
-            boolean("payload-digests-equal", true),
-        ],
-        "declared-input-isolation" => vec![
-            assertion("sandbox-engine", json!("SES"), json!("SES")),
-            boolean("undeclared-input-rejected", true),
-        ],
-        "offline-reactor-suite" => vec![
-            boolean("external-network-disabled", true),
-            zero("required-cases-failed"),
-            zero("required-cases-unsupported"),
-        ],
-        "secret-canary-scan" => vec![
-            zero("canary-occurrences"),
-            assertion("files-scanned", json!(">=1"), json!(1)),
-        ],
-        "reaction-mutation-check" => vec![boolean("removed-reaction-contribution-detected", true)],
-        "scope-matched-benchmark" => vec![
-            boolean("measurements-present", true),
-            boolean("scope-matched", true),
-        ],
-        "deployment-ceiling-rejection" => vec![
-            boolean("above-ceiling-rejected", true),
-            boolean("next-writer-started", false),
-        ],
-        "ownership-collision" => vec![
-            boolean("claim-collision-rejected", true),
-            boolean("next-writer-started", false),
-        ],
-        "permission-changing-upgrade" => vec![
-            boolean("permission-change-reviewed", true),
-            boolean("unapproved-writer-started", false),
-        ],
-        "phase-interruption-recovery" => vec![
-            boolean("planned-interruption-recovered", true),
-            boolean("staged-interruption-recovered", true),
-            boolean("quiesced-interruption-recovered", true),
-            boolean("activated-interruption-recovered", true),
-            boolean("cleaning-interruption-recovered", true),
-            boolean("committed-interruption-recovered", true),
-            boolean("unsafe-activation", false),
-        ],
-        "last-api-type-cleanup" => vec![
-            boolean("last-api-type-cleanup-complete", true),
-            boolean("wrong-object-deleted", false),
-        ],
-        "uid-replacement-rejection" => vec![
-            boolean("replacement-deleted", false),
-            boolean("uid-mismatch-rejected", true),
-        ],
-        "finalizer-preservation" => vec![
-            boolean("finalizer-block-reported", true),
-            boolean("finalizers-forced", false),
-        ],
-        "uncertain-writer-blocks" => vec![
-            boolean("activation-blocked", true),
-            boolean("unsafe-activation", false),
-        ],
-        "fixture-promotion-rejection" => vec![boolean("fixture-release-rejected", true)],
-        "api-bound-gap-conformance" => vec![
-            boolean("actual-credential-tests-passed", true),
-            boolean("undisclosed-gap", false),
-        ],
-        other => {
-            return Err(format!("missing release-check assertion fixture for {other}").into());
-        }
-    })
+async fn rejection(root: &Path, policy: &TrustPolicy) -> TestResult<String> {
+    Ok(verify_candidate(root, policy)
+        .await
+        .err()
+        .ok_or("expected verification to fail")?
+        .to_string())
 }
 fn write_json(root: &Path, name: &str, value: &Value) -> TestResult<Vec<u8>> {
     let bytes = canonical_bytes(value)?;
@@ -223,7 +94,7 @@ fn write_documents(root: &Path) -> TestResult<Documents> {
     });
     let plan = parse_and_validate(&ir.to_string())?;
     let (inputs, compiler) = compiler_inputs()?;
-    // These are verifier test payloads, not reactor-suite acceptance evidence.
+    // Verifier test payloads only; nothing here is compiled or executed.
     let mut files = BTreeMap::new();
     for (name, value) in [
         ("ir.json", ir),
@@ -234,10 +105,6 @@ fn write_documents(root: &Path) -> TestResult<Documents> {
         ("compatibility.json", json!({})),
         ("graphs.json", json!({})),
         ("test-plan.json", json!([])),
-        (
-            "test-evidence.json",
-            json!({"purpose":"signature verifier test only"}),
-        ),
     ] {
         files.insert(name.to_owned(), hash(&write_json(root, name, &value)?));
     }
@@ -261,10 +128,6 @@ fn write_documents(root: &Path) -> TestResult<Documents> {
 }
 
 fn release(root: &Path) -> TestResult<TrustPolicy> {
-    assert!(
-        fs::create_dir(root.join("evidence")).is_ok(),
-        "test evidence directory creation failed"
-    );
     let Documents {
         plan,
         inputs,
@@ -282,9 +145,7 @@ fn release(root: &Path) -> TestResult<TrustPolicy> {
         "controller.oci.tar".into(),
         hash(&fs::read(root.join("controller.oci.tar"))?),
     );
-    add_evidence(root, &plan, &mut files)?;
-    let mut manifest = json!({"schemaVersion":"apsides.dev/release/v1","mode":"production","irDigest":plan.ir_digest,"image":{"reference":format!("example.invalid/controller@{}",image_digest),"platform":"linux/arm64"},"source":{"repository":"https://github.com/example/apsides","commit":"a".repeat(40),"inputsDigest":digest(&inputs)?},"compilerDigest":compiler,"binaryDigest":hash(&binary),"files":files});
-    add_production_evidence(root, &mut manifest)?;
+    let manifest = json!({"schemaVersion":"apsides.dev/release/v2","mode":"production","irDigest":plan.ir_digest,"image":{"reference":format!("example.invalid/controller@{}",image_digest),"platform":"linux/arm64"},"source":{"repository":"https://github.com/example/apsides","commit":"a".repeat(40),"inputsDigest":digest(&inputs)?},"compilerDigest":compiler,"binaryDigest":hash(&binary),"files":files});
     let bytes = write_json(root, "release.json", &manifest)?;
     write_json(
         root,
@@ -338,21 +199,21 @@ fn release(root: &Path) -> TestResult<TrustPolicy> {
 async fn actual_openssh_signature_is_required_and_policy_bound() -> TestResult {
     let root = tempfile::tempdir()?;
     let policy = release(root.path())?;
-    let verified = verify_release(root.path(), &policy).await?;
+    let verified = verify_candidate(root.path(), &policy).await?;
     assert_eq!(verified.manifest().source.repository, policy.repository);
     let mut wrong = policy.clone();
     if let SignaturePolicy::OpenSsh { principal, .. } = &mut wrong.signature {
         *principal = "intruder@example.invalid".into();
     }
-    assert!(verify_release(root.path(), &wrong).await.is_err());
+    assert!(verify_candidate(root.path(), &wrong).await.is_err());
     wrong = policy.clone();
     wrong.approved_compiler_digests = vec![hash(b"different compiler")];
-    assert!(verify_release(root.path(), &wrong).await.is_err());
+    assert!(verify_candidate(root.path(), &wrong).await.is_err());
     wrong = policy.clone();
     wrong.verifier.sha256 = hash(b"different tool");
-    assert!(verify_release(root.path(), &wrong).await.is_err());
+    assert!(verify_candidate(root.path(), &wrong).await.is_err());
     fs::write(root.path().join("provenance.sig"), b"not a signature")?;
-    assert!(verify_release(root.path(), &policy).await.is_err());
+    assert!(verify_candidate(root.path(), &policy).await.is_err());
     Ok(())
 }
 
@@ -361,13 +222,13 @@ async fn altered_payload_and_unsigned_manifest_cannot_be_promoted() -> TestResul
     let root = tempfile::tempdir()?;
     let policy = release(root.path())?;
     fs::write(root.path().join("sbom.json"), b"{\"changed\":true}")?;
-    assert!(verify_release(root.path(), &policy).await.is_err());
+    assert!(verify_candidate(root.path(), &policy).await.is_err());
     let root = tempfile::tempdir()?;
     let policy = release(root.path())?;
     let mut manifest: Value = serde_json::from_slice(&fs::read(root.path().join("release.json"))?)?;
     manifest["mode"] = json!("fixture");
     write_json(root.path(), "release.json", &manifest)?;
-    assert!(verify_release(root.path(), &policy).await.is_err());
+    assert_eq!(rejection(root.path(), &policy).await?, FIXTURE_REJECTED);
     Ok(())
 }
 
@@ -398,35 +259,6 @@ fn resign(root: &Path) -> TestResult {
 }
 
 #[tokio::test]
-async fn approved_signer_cannot_bypass_required_coverage() -> TestResult {
-    let root = tempfile::tempdir()?;
-    let policy = release(root.path())?;
-    let mut coverage: Value =
-        serde_json::from_slice(&fs::read(root.path().join("coverage.json"))?)?;
-    coverage["checks"]["offline-reactor-suite"]["status"] = json!("unsupported");
-    let bytes = write_json(root.path(), "coverage.json", &coverage)?;
-    let mut manifest: Value = serde_json::from_slice(&fs::read(root.path().join("release.json"))?)?;
-    manifest["files"]["coverage.json"] = json!(hash(&bytes));
-    write_json(root.path(), "release.json", &manifest)?;
-    resign(root.path())?;
-    let candidate = verify_candidate(root.path(), &policy).await?;
-    assert_eq!(candidate.manifest().ir_digest, manifest["irDigest"]);
-    #[cfg(feature = "test-support")]
-    candidate.authorize_test_staging(release::TestStagingScope {
-        cluster_binding: "test-cluster".into(),
-        control_namespace: "apsides-system".into(),
-        workload_namespace: "workload".into(),
-    })?;
-    let error = verify_release(root.path(), &policy)
-        .await
-        .err()
-        .ok_or("expected this call to fail")?
-        .to_string();
-    assert!(error.contains("required release evidence"), "{error}");
-    Ok(())
-}
-
-#[tokio::test]
 async fn embedded_fixture_marker_survives_manifest_mode_changes() -> TestResult {
     let root = tempfile::tempdir()?;
     let policy = release(root.path())?;
@@ -452,12 +284,13 @@ async fn embedded_fixture_marker_survives_manifest_mode_changes() -> TestResult 
 
     write_json(root.path(), "release.json", &manifest)?;
     resign(root.path())?;
-    let error = verify_release(root.path(), &policy)
-        .await
-        .err()
-        .ok_or("expected this call to fail")?
-        .to_string();
-    assert!(error.contains("testOnly:false"), "{error}");
+    assert_eq!(rejection(root.path(), &policy).await?, MARKER_REQUIRED);
+    // Declaring the release a fixture passes payload validation, and the
+    // signed fixture release is still refused.
+    manifest["mode"] = json!("fixture");
+    write_json(root.path(), "release.json", &manifest)?;
+    resign(root.path())?;
+    assert_eq!(rejection(root.path(), &policy).await?, FIXTURE_REJECTED);
     Ok(())
 }
 
@@ -585,396 +418,7 @@ fn compiler_inputs() -> TestResult<(Value, String)> {
     ))
 }
 
-fn add_evidence(
-    root: &Path,
-    plan: &compiler_core::CompiledPlan,
-    files: &mut BTreeMap<String, String>,
-) -> TestResult {
-    let cases: Vec<_> = plan
-        .test_plan
-        .iter()
-        .filter(|c| c.required)
-        .map(|case| {
-            Ok(json!({
-                "caseDigest": digest(&serde_json::to_value(case)?)?,
-                "result": {"status":"passed","evidenceFiles":["test-evidence.json"]}
-            }))
-        })
-        .collect::<TestResult<Vec<_>>>()?;
-    let checks: BTreeMap<_, _> = release::REQUIRED_CHECKS
-        .iter()
-        .map(|name| {
-            (
-                *name,
-                json!({"status":"passed","evidenceFiles":[if fixture_check(name) { "test-evidence.json" } else { "production-evidence.json" }]}),
-            )
-        })
-        .collect();
-    let coverage = json!({"schemaVersion":"apsides.dev/release-coverage/v1","irDigest":plan.ir_digest,"cases":cases,"checks":checks});
-    files.insert(
-        "coverage.json".into(),
-        hash(&write_json(root, "coverage.json", &coverage)?),
-    );
-    let mut fixture = serde_json::to_value(&plan.ir)?;
-    fixture["testOnly"] = json!(true);
-    let fixture_digest = digest(&fixture)?;
-    let overlay = json!({"schemaVersion":"apsides.dev/fixture-overlay/v1","testOnly":true,"productionReady":false,"productionIrSha256":plan.ir_digest.strip_prefix("sha256:"),"fixtureIrSha256":fixture_digest.strip_prefix("sha256:")});
-    let artifact =
-        json!({"schemaVersion":"apsides.dev/local-artifact/v1","irDigest":fixture_digest});
-    let artifact_bytes = write_json(root, "tested-artifact-manifest.json", &artifact)?;
-    for (name, value) in [
-        ("fixture-ir.json", fixture),
-        ("fixture-overlay.json", overlay.clone()),
-    ] {
-        files.insert(name.into(), hash(&write_json(root, name, &value)?));
-    }
-    files.insert(
-        "tested-artifact-manifest.json".into(),
-        hash(&artifact_bytes),
-    );
-    let records: BTreeMap<_, _> = plan.test_plan
-        .iter()
-        .filter(|case| case.required)
-        .map(|case| {
-            Ok((
-                digest(&serde_json::to_value(case)?)?,
-                json!({"status":"passed","assertions":case_assertions(&case.scenario)?,"evidenceFiles":[]}),
-            ))
-        })
-        .collect::<TestResult<BTreeMap<_, _>>>()?;
-    let check_records: BTreeMap<_, _> = release::REQUIRED_CHECKS
-        .iter()
-        .filter(|name| fixture_check(name))
-        .map(|c| {
-            Ok((
-                *c,
-                json!({"status":"passed","assertions":check_assertions(c)?,"evidenceFiles":[]}),
-            ))
-        })
-        .collect::<TestResult<BTreeMap<_, _>>>()?;
-    let runner_bytes = write_json(
-        root,
-        "evidence/run_cluster.py",
-        &json!("synthetic reactor verifier fixture; not executed acceptance evidence"),
-    )?;
-    files.insert("evidence/run_cluster.py".into(), hash(&runner_bytes));
-    let evidence = json!({"schemaVersion":"apsides.dev/reactor-evidence/v1","productionIrDigest":plan.ir_digest,
-        "fixtureIrDigest":fixture_digest,"testedArtifactDigest":hash(&artifact_bytes),"artifactManifestFile":"tested-artifact-manifest.json",
-        "overlayDigest":digest(&overlay)?,"runnerIdentity":{"sourceSha256":hash(&runner_bytes),"controllerManifestDigest":hash(b"test controller"),"controllerArchiveDigest":hash(b"test archive"),"fixtureArchiveDigest":hash(b"test fixture"),"nodeImage":format!("example.invalid/node@{}",hash(b"node"))},
-        "cases":records,"checks":check_records});
-    files.insert(
-        "test-evidence.json".into(),
-        hash(&write_json(root, "test-evidence.json", &evidence)?),
-    );
-    Ok(())
-}
-
-fn fixture_check(name: &str) -> bool {
-    matches!(
-        name,
-        "offline-reactor-suite" | "secret-canary-scan" | "reaction-mutation-check"
-    )
-}
-
-fn add_production_evidence(root: &Path, manifest: &mut Value) -> TestResult {
-    // Synthetic verifier fixtures establish validation behavior, not execution coverage.
-    let source = write_json(
-        root,
-        "runner-source.py",
-        &json!("verifier fixture source only"),
-    )?;
-    manifest["files"]["runner-source.py"] = json!(hash(&source));
-    let checks: BTreeMap<_, _> = release::REQUIRED_CHECKS
-        .iter()
-        .filter(|name| !fixture_check(name))
-        .map(|name| {
-            Ok((
-                *name,
-                json!({"status":"passed", "assertions":check_assertions(name)?,
-            "evidenceFiles":["runner-source.py"]}),
-            ))
-        })
-        .collect::<TestResult<BTreeMap<_, _>>>()?;
-    let payload_files: BTreeMap<_, _> = [
-        "build-inputs.json",
-        "controller.oci.tar",
-        "apsides-controller",
-    ]
-    .into_iter()
-    .map(|name| (name, manifest["files"][name].clone()))
-    .collect();
-    let evidence = json!({
-        "schemaVersion":"apsides.dev/production-evidence/v1",
-        "irDigest":manifest["irDigest"], "compilerDigest":manifest["compilerDigest"],
-        "binaryDigest":manifest["binaryDigest"], "image":manifest["image"],
-        "sourceInputsDigest":manifest["source"]["inputsDigest"], "payloadFiles":payload_files,
-        "runnerSourceFile":"runner-source.py", "runnerSourceDigest":hash(&source), "checks":checks
-    });
-    let bytes = write_json(root, "production-evidence.json", &evidence)?;
-    manifest["files"]["production-evidence.json"] = json!(hash(&bytes));
-    Ok(())
-}
-
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-fn read_fixture(
-    root: &Path,
-    name: &str,
-) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(serde_json::from_slice(&fs::read(root.join(name))?)?)
-}
-
-fn replace_signed_document(root: &Path, name: &str, document: &Value) -> TestResult {
-    let bytes = canonical_bytes(document)?;
-    fs::write(root.join(name), &bytes)?;
-    let mut manifest = read_fixture(root, "release.json")?;
-    manifest["files"][name] = json!(hash(&bytes));
-    fs::write(root.join("release.json"), canonical_bytes(&manifest)?)?;
-    resign(root)?;
-    Ok(())
-}
-
-async fn require_evidence_rejection(
-    root: &Path,
-    policy: &TrustPolicy,
-    expected: &str,
-) -> TestResult {
-    // The envelope and real SSH signature remain valid: failure must come from coverage.
-    verify_candidate(root, policy).await?;
-    match verify_release(root, policy).await {
-        Ok(_) => return Err("signed invalid production evidence was accepted".into()),
-        Err(error) => assert!(
-            error.to_string().contains(expected),
-            "unexpected evidence rejection branch"
-        ),
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn signed_production_evidence_must_match_every_payload_subject() -> TestResult {
-    for (pointer, replacement) in [
-        ("/irDigest", json!(hash(b"another IR"))),
-        ("/compilerDigest", json!(hash(b"another compiler"))),
-        ("/binaryDigest", json!(hash(b"another binary"))),
-        ("/sourceInputsDigest", json!(hash(b"another source"))),
-        (
-            "/image/reference",
-            json!(format!("example.invalid/other@{}", hash(b"another image"))),
-        ),
-        ("/image/platform", json!("linux/amd64")),
-        (
-            "/payloadFiles/build-inputs.json",
-            json!(hash(b"other build inputs")),
-        ),
-        (
-            "/payloadFiles/controller.oci.tar",
-            json!(hash(b"other OCI bytes")),
-        ),
-        (
-            "/payloadFiles/apsides-controller",
-            json!(hash(b"other controller bytes")),
-        ),
-    ] {
-        let root = tempfile::tempdir()?;
-        let policy = release(root.path())?;
-        verify_release(root.path(), &policy).await?;
-        let mut evidence = read_fixture(root.path(), "production-evidence.json")?;
-        *evidence
-            .pointer_mut(pointer)
-            .ok_or("subject fixture path missing")? = replacement;
-        replace_signed_document(root.path(), "production-evidence.json", &evidence)?;
-        let expected = if pointer.starts_with("/payloadFiles/") {
-            "production evidence payload files differ"
-        } else {
-            "production evidence refers to another production payload"
-        };
-        require_evidence_rejection(root.path(), &policy, expected).await?;
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn signed_fixture_evidence_cannot_satisfy_a_production_check() -> TestResult {
-    let root = tempfile::tempdir()?;
-    let policy = release(root.path())?;
-    verify_release(root.path(), &policy).await?;
-    let mut fixture = read_fixture(root.path(), "test-evidence.json")?;
-    fixture["checks"]["reproducible-payload"] = json!({"status":"passed",
-        "assertions":check_assertions("reproducible-payload")?, "evidenceFiles":[]});
-    replace_signed_document(root.path(), "test-evidence.json", &fixture)?;
-    let mut coverage = read_fixture(root.path(), "coverage.json")?;
-    coverage["checks"]["reproducible-payload"]["evidenceFiles"] = json!(["test-evidence.json"]);
-    replace_signed_document(root.path(), "coverage.json", &coverage)?;
-    require_evidence_rejection(root.path(), &policy, "unknown field").await
-}
-
-#[tokio::test]
-async fn signed_production_runner_source_must_be_bound_and_match() -> TestResult {
-    for mutation in ["unbound", "digest", "changed-source"] {
-        let root = tempfile::tempdir()?;
-        let policy = release(root.path())?;
-        verify_release(root.path(), &policy).await?;
-        let mut evidence = read_fixture(root.path(), "production-evidence.json")?;
-        match mutation {
-            "unbound" => {
-                fs::write(root.path().join("unsigned-runner.py"), b"unsigned runner")?;
-                evidence["runnerSourceFile"] = json!("unsigned-runner.py");
-                evidence["runnerSourceDigest"] = json!(hash(b"unsigned runner"));
-            }
-            "digest" => evidence["runnerSourceDigest"] = json!(hash(b"different runner")),
-            _ => {
-                replace_signed_document(root.path(), "runner-source.py", &json!("changed runner"))?;
-            }
-        }
-        replace_signed_document(root.path(), "production-evidence.json", &evidence)?;
-        require_evidence_rejection(
-            root.path(),
-            &policy,
-            "production evidence runner source is not authenticated",
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn signed_production_evidence_rejects_open_schema_and_wrong_check_kinds() -> TestResult {
-    for (field, value, expected) in [
-        ("unexpected", json!(true), "unknown field"),
-        ("cases", json!({}), "unknown field"),
-        (
-            "unknown-check",
-            json!({"status":"passed", "assertions":check_assertions("reproducible-payload")?,
-            "evidenceFiles":[]}),
-            "production evidence contains an unsupported check",
-        ),
-        (
-            "offline-reactor-suite",
-            json!({"status":"passed", "assertions":check_assertions("offline-reactor-suite")?,
-            "evidenceFiles":[]}),
-            "production evidence contains an unsupported check",
-        ),
-    ] {
-        let root = tempfile::tempdir()?;
-        let policy = release(root.path())?;
-        verify_release(root.path(), &policy).await?;
-        let mut evidence = read_fixture(root.path(), "production-evidence.json")?;
-        if matches!(field, "unexpected" | "cases") {
-            evidence[field] = value;
-        } else {
-            evidence["checks"][field] = value;
-        }
-        replace_signed_document(root.path(), "production-evidence.json", &evidence)?;
-        require_evidence_rejection(root.path(), &policy, expected).await?;
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn signed_coverage_cannot_add_an_unknown_release_check() -> TestResult {
-    let root = tempfile::tempdir()?;
-    let policy = release(root.path())?;
-    verify_release(root.path(), &policy).await?;
-    let mut coverage = read_fixture(root.path(), "coverage.json")?;
-    coverage["checks"]["unknown-check"] =
-        json!({"status":"passed", "evidenceFiles":["production-evidence.json"]});
-    replace_signed_document(root.path(), "coverage.json", &coverage)?;
-    require_evidence_rejection(
-        root.path(),
-        &policy,
-        "coverage contains an unsupported release check",
-    )
-    .await
-}
-
-#[tokio::test]
-async fn signed_production_assertions_must_satisfy_the_exact_contract() -> TestResult {
-    for (mutation, expected) in [
-        (
-            "missing",
-            "evidence does not contain the exact required assertion set",
-        ),
-        ("wrong-id", "evidence is missing a required assertion"),
-        (
-            "wrong-actual",
-            "evidence assertion does not satisfy its independent expected contract",
-        ),
-    ] {
-        let root = tempfile::tempdir()?;
-        let policy = release(root.path())?;
-        verify_release(root.path(), &policy).await?;
-        let mut evidence = read_fixture(root.path(), "production-evidence.json")?;
-        let assertions = evidence["checks"]["reproducible-payload"]["assertions"]
-            .as_array_mut()
-            .ok_or("production assertion fixture missing")?;
-        match mutation {
-            "missing" => {
-                assertions
-                    .pop()
-                    .ok_or("production assertion fixture empty")?;
-            }
-            "wrong-id" => {
-                assertions
-                    .first_mut()
-                    .ok_or("production assertion fixture empty")?["checkId"] =
-                    json!("invented-build-count");
-            }
-            _ => {
-                assertions
-                    .first_mut()
-                    .ok_or("production assertion fixture empty")?["actual"] = json!(1);
-            }
-        }
-        replace_signed_document(root.path(), "production-evidence.json", &evidence)?;
-        require_evidence_rejection(root.path(), &policy, expected).await?;
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn signed_reactor_evidence_requires_authenticated_fixed_runner_source() -> TestResult {
-    for mutation in ["missing-entry", "swapped-claim", "changed-signed-source"] {
-        let root = tempfile::tempdir()?;
-        let policy = release(root.path())?;
-        verify_release(root.path(), &policy).await?;
-        match mutation {
-            "missing-entry" => {
-                let mut manifest = read_fixture(root.path(), "release.json")?;
-                manifest["files"]
-                    .as_object_mut()
-                    .ok_or("manifest files missing")?
-                    .remove("evidence/run_cluster.py")
-                    .ok_or("runner source fixture missing")?;
-                fs::write(
-                    root.path().join("release.json"),
-                    canonical_bytes(&manifest)?,
-                )?;
-                resign(root.path())?;
-            }
-            "swapped-claim" => {
-                let mut evidence = read_fixture(root.path(), "test-evidence.json")?;
-                evidence["runnerIdentity"]["sourceSha256"] =
-                    json!(hash(b"unrelated runner source"));
-                replace_signed_document(root.path(), "test-evidence.json", &evidence)?;
-            }
-            _ => {
-                replace_signed_document(
-                    root.path(),
-                    "evidence/run_cluster.py",
-                    &json!("changed signed runner source"),
-                )?;
-            }
-        }
-        require_evidence_rejection(
-            root.path(),
-            &policy,
-            "reactor runner source is not authenticated by the release",
-        )
-        .await?;
-    }
-    Ok(())
-}
 
 #[tokio::test]
 async fn signed_binary_must_be_the_image_entrypoint_payload() -> TestResult {
@@ -989,7 +433,7 @@ async fn signed_binary_must_be_the_image_entrypoint_payload() -> TestResult {
     write_json(root.path(), "release.json", &manifest)?;
     resign(root.path())?;
     assert!(
-        verify_release(root.path(), &policy)
+        verify_candidate(root.path(), &policy)
             .await
             .err()
             .ok_or("expected this call to fail")?
@@ -1018,29 +462,12 @@ async fn signed_image_cannot_add_an_unapproved_runtime_base_layer() -> TestResul
         json!(hash(&fs::read(root.path().join("controller.oci.tar"))?));
     write_json(root.path(), "release.json", &manifest)?;
     resign(root.path())?;
-    let error = verify_release(root.path(), &policy)
+    let error = verify_candidate(root.path(), &policy)
         .await
         .err()
         .ok_or("expected this call to fail")?
         .to_string();
     assert!(error.contains("approved runtime layer chain"), "{error}");
-    Ok(())
-}
-
-#[tokio::test]
-async fn signed_status_strings_and_unrelated_files_are_not_test_evidence() -> TestResult {
-    let root = tempfile::tempdir()?;
-    let policy = release(root.path())?;
-    let bytes = write_json(
-        root.path(),
-        "test-evidence.json",
-        &json!({"purpose":"unrelated file"}),
-    )?;
-    let mut manifest: Value = serde_json::from_slice(&fs::read(root.path().join("release.json"))?)?;
-    manifest["files"]["test-evidence.json"] = json!(hash(&bytes));
-    write_json(root.path(), "release.json", &manifest)?;
-    resign(root.path())?;
-    assert!(verify_release(root.path(), &policy).await.is_err());
     Ok(())
 }
 
@@ -1057,14 +484,7 @@ async fn production_requires_explicit_marker_even_with_valid_signature() -> Test
     manifest["files"]["ir.json"] = json!(hash(&bytes));
     write_json(root.path(), "release.json", &manifest)?;
     resign(root.path())?;
-    assert!(
-        verify_release(root.path(), &policy)
-            .await
-            .err()
-            .ok_or("expected this call to fail")?
-            .to_string()
-            .contains("testOnly:false")
-    );
+    assert_eq!(rejection(root.path(), &policy).await?, MARKER_REQUIRED);
     Ok(())
 }
 
@@ -1127,24 +547,22 @@ async fn signed_oci_release_resolves_after_source_workspace_is_removed()
         executable: oras,
         ca_file: Some(ca),
     };
-    let resolved = release::resolve_release(&reference, &tool, &policy).await?;
-    assert_eq!(
-        resolved.verified().release_digest(),
-        reference.release_digest
-    );
-    assert!(!resolved.path().join("key").exists());
-    assert!(!resolved.path().join("key.pub").exists());
-    let download = resolved.path().to_owned();
-    drop(resolved);
-    assert!(!download.exists());
+    let fetched = release::fetch_release(&reference, &tool).await?;
+    let verified = release::verify_candidate(fetched.path(), &policy).await?;
+    assert_eq!(verified.release_digest(), reference.release_digest);
+    assert!(!fetched.path().join("key").exists());
+    assert!(!fetched.path().join("key.pub").exists());
     let mut wrong_policy = policy;
     if let SignaturePolicy::OpenSsh { principal, .. } = &mut wrong_policy.signature {
         *principal = "unapproved@example.invalid".into();
     }
     assert!(
-        release::resolve_release(&reference, &tool, &wrong_policy)
+        release::verify_candidate(fetched.path(), &wrong_policy)
             .await
             .is_err()
     );
+    let download = fetched.path().to_owned();
+    drop(fetched);
+    assert!(!download.exists());
     Ok(())
 }

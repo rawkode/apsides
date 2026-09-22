@@ -34,7 +34,7 @@ pub(super) async fn already_committed_report(
     let review = crate::review::transition_review(&session.resolve().await?, &live)?;
     Ok(json!({
         "status": "already-committed", "transition": transition,
-        "artifactTrust": "verified", "releaseQualification": "not-evaluated",
+        "artifactTrust": "verified",
         "releaseDigest": verified.release_digest(),
         "review": review,
         "inventory": {"revision": tracking.revision, "snapshotId": tracking.snapshot_id},
@@ -51,7 +51,7 @@ pub(super) fn deployment_report(
 ) -> Value {
     let stored = resolved.stored();
     let transition_id = resolved.transition_id();
-    json!({"status":"committed","artifactTrust":"verified","releaseQualification":"not-evaluated","transition":transition_id,"generation":stored.allocation().generation_id,
+    json!({"status":"committed","artifactTrust":"verified","transition":transition_id,"generation":stored.allocation().generation_id,
         "releaseDigest":verified.release_digest(),"irDigest":verified.compiled().ir_digest,"compatibility":compatibility,
         "inventory":{"revision":tracking.revision,"snapshotId":tracking.snapshot_id},
         "credentialExpiresAt":expires_at,"requestDrainQualification":stored.request_drain_qualification,

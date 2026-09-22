@@ -167,8 +167,7 @@ impl PlatformClient {
     /// Reserve an initial transition for one exact signed production candidate
     /// after reobserving its runner-owned disposable kind target.
     ///
-    /// This capability neither stages nor starts a session and never constructs
-    /// a `VerifiedRelease`. A separate host runner must establish kind/Docker
+    /// This capability neither stages nor starts a session. A separate host runner must establish kind/Docker
     /// ownership and the node-image identity before creating the marker.
     ///
     /// # Errors

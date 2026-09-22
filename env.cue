@@ -20,7 +20,6 @@ tasks: {
 	uncertainWriterTest: {command: "python3", args: ["tests/test_uncertain_writer.py"]}
 	apiGapTest: {command: "python3", args: ["tests/test_api_gap.py"]}
 	cnpgPhaseRecoveryTest: {command: "python3", args: ["tests/test_cnpg_phase_recovery.py"]}
-	cnpgPhaseRecoveryPackagingTest: {command: "python3", args: ["tests/test_cnpg_phase_recovery_packaging.py"]}
 	apiGapProbesTest: {command: "python3", args: ["tests/test_cnpg_credential_probes.py"]}
 	crdReactorTest: {command: "python3", args: ["tests/test_cluster_crds.py"]}
 	cnpgCleanupTypes: [
@@ -44,19 +43,12 @@ tasks: {
 		command: "deno"
 		args: ["run", "--allow-all", "packages/compiler/src/crds.ts", "https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_clusters.yaml", "Cluster", "examples/cnpg/.aps/crds/cnpg.ts", "v1"]
 	}
-	releaseTest: {command: "cargo", args: ["test", "--locked", "-p", "release", "--features", "test-support"]}
-	productionEvidenceLive: {command: "cargo", args: ["test", "--locked", "-p", "release", "--lib", "assembled_reproducibility_evidence", "--", "--ignored"]}
-	inputIsolationEvidenceLive: {command: "cargo", args: ["test", "--locked", "-p", "release", "--lib", "assembled_input_isolation_evidence", "--", "--ignored"]}
-	reactorEvidenceLive: {command: "cargo", args: ["test", "--locked", "-p", "release", "--lib", "reactor_evidence_live::assembled_reactor_evidence_matches_production_contract", "--", "--ignored", "--exact"]}
-	fixturePromotionTest: {command: "python3", args: ["tests/test_fixture_promotion.py"]}
-	fixturePromotionEvidence: {command: "python3", args: ["tests/run_fixture_promotion.py"]}
-	fixturePromotionLive: {command: "cargo", args: ["test", "--locked", "-p", "release", "--test", "fixture_promotion", "fixture_promotion_step", "--", "--ignored", "--exact", "--nocapture"]}
+	releaseTest: {command: "cargo", args: ["test", "--locked", "-p", "release"]}
 	permissionUpgradeStep: {command: "cargo", args: ["test", "--locked", "-p", "platform", "--features", "test-support", "--test", "permission_upgrade", "permission_upgrade_step", "--", "--ignored", "--exact", "--nocapture"]}
-	releaseCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "release", "--features", "test-support", "--all-targets", "--", "-D", "warnings"]}
+	releaseCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "release", "--all-targets", "--", "-D", "warnings"]}
 	reproducibilityTest: {command: "python3", args: ["-m", "unittest", "tests/test_reproducibility.py"]}
 	inputIsolationTest: {command: "python3", args: ["tests/test_input_isolation.py"]}
 	inputIsolationProbeTest: {command: "deno", args: ["test", "--allow-all", "tests/isolation_probe.test.mts"]}
-	reactorPackagingTest: {command: "python3", args: ["tests/test_reactor_packaging.py"]}
 	storageProbeTest: {command: "cargo", args: ["test", "--locked", "-p", "inventory", "--test", "pvc_restart"]}
 	storageBuildTest: {command: "python3", args: ["tests/storage/test_build.py"]}
 	storageRestartTest: {command: "python3", args: ["tests/storage/test_restart.py"]}

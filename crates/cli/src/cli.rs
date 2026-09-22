@@ -112,10 +112,8 @@ pub enum Command {
     Test(Test),
     /// Check artifact integrity and recompute its plan.
     Verify(Verify),
-    /// Verify a release against a supplied trust policy.
+    /// Check release integrity and provenance offline, as `aps deploy` does.
     VerifyRelease(VerifyRelease),
-    /// Merge evidence receipts into a release candidate.
-    MergeEvidence(MergeEvidence),
     /// Assemble an unsigned release from a verified artifact.
     Release(Release),
     /// Deploy a release through the resumable transition protocol.
@@ -239,19 +237,6 @@ pub struct VerifyRelease {
 }
 
 #[derive(Args, Debug)]
-pub struct MergeEvidence {
-    /// Release candidate to merge into.
-    #[arg(long)]
-    pub artifact: PathBuf,
-    /// JSON list of receipt paths, relative to the list itself.
-    #[arg(long)]
-    pub fragments: PathBuf,
-    /// Fresh output directory.
-    #[arg(long)]
-    pub output: PathBuf,
-}
-
-#[derive(Args, Debug)]
 pub struct Release {
     /// Verified artifact directory.
     #[arg(long)]
@@ -280,12 +265,6 @@ pub struct Release {
     /// Software bill of materials.
     #[arg(long)]
     pub sbom: PathBuf,
-    /// Coverage report.
-    #[arg(long)]
-    pub coverage: PathBuf,
-    /// Directory of evidence receipts.
-    #[arg(long)]
-    pub evidence: PathBuf,
     /// Fresh release directory.
     #[arg(long)]
     pub output: PathBuf,

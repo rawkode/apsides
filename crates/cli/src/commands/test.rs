@@ -1,7 +1,8 @@
 //! `aps test` — run the generated semantic scenario plan.
 //!
-//! Semantic checks alone cannot pass the release gate; a failure here is
-//! conclusive, a pass is not.
+//! Required cases that need a cluster are reported as unsupported, and any
+//! unsupported or failed required case fails the command. A semantic failure
+//! is conclusive; a semantic pass covers only the rows the runner executed.
 
 use crate::{Result, cli, ir, report};
 use serde_json::Value;
@@ -28,7 +29,7 @@ pub fn command(arguments: &cli::Test) -> Result<()> {
     report::emit(&results)?;
 
     if rows(&results)?.iter().any(failed) {
-        return Err("required reactor coverage is failed or unsupported; see results.json (semantic checks alone cannot pass the release gate)".into());
+        return Err("required reactor cases failed or need a cluster the semantic runner does not have; see results.json".into());
     }
     Ok(())
 }

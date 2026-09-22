@@ -85,5 +85,25 @@ class FixtureCrds(unittest.TestCase):
         self.assertEqual(instance.crd_installations[0]["sourceDigest"], sha)
 
 
+
+class ReactionMutation(unittest.TestCase):
+    def test_removed_reaction_is_detected_by_the_independent_revision_oracle(self):
+        instance = runner.ReactorRunner.__new__(runner.ReactorRunner)
+        reaction = {"id": "reaction-a"}
+        case = {"reactionId": reaction["id"], "scenario": "reaction-contribution-removed"}
+        instance.ir = {"reactions": [reaction]}
+        instance.fixture_cases = [case]
+        instance.fixture_results = {}
+        instance.target_revision = lambda _: "revision-before"
+        instance.expected_revision = (
+            lambda _, omitted_reaction=None:
+                "revision-before" if omitted_reaction is None else "revision-after-removal"
+        )
+        instance.bind_fixture_coverage()
+        row = instance.fixture_results[(reaction["id"], case["scenario"])]
+        self.assertEqual(row["status"], "passed")
+        self.assertEqual(row["evidenceFiles"], ["cluster-transcript.json"])
+
+
 if __name__ == "__main__":
     unittest.main()

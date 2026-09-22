@@ -5,7 +5,6 @@ pub mod check;
 pub mod compile;
 pub mod crds;
 pub mod deploy;
-pub mod evidence;
 pub mod init;
 pub mod lock;
 pub mod release;

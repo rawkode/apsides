@@ -1,5 +1,5 @@
 //! OCI transport is delegated to ORAS. Transport success never grants release trust.
-use crate::{Result, TrustPolicy, VerifiedRelease, manifest, reject, verify_release};
+use crate::{Result, manifest, reject};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -51,47 +51,6 @@ pub struct OrasTool {
     pub ca_file: Option<PathBuf>,
     pub executable: PathBuf,
     pub sha256: String,
-}
-
-/// Keeps fetched files alive only while the verified result is held.
-pub struct ResolvedRelease {
-    directory: tempfile::TempDir,
-    verified: VerifiedRelease,
-}
-
-impl ResolvedRelease {
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        self.directory.path()
-    }
-    #[must_use]
-    pub const fn verified(&self) -> &VerifiedRelease {
-        &self.verified
-    }
-}
-
-/// Retrieve into a private fresh directory and verify the exact approved release.
-///
-/// Registry credentials use ORAS's normal trusted CI configuration. The caller
-/// supplies policy independently of the fetched artifact.
-/// # Errors
-/// Missing tools/artifacts, timeouts, reference mismatch and failed release
-/// verification reject. Unverified files are discarded on every failure.
-pub async fn resolve_release(
-    reference: &ReleaseReference,
-    tool: &OrasTool,
-    policy: &TrustPolicy,
-) -> Result<ResolvedRelease> {
-    let fetched = fetch_release(reference, tool).await?;
-    let directory = fetched.directory;
-    let verified = verify_release(directory.path(), policy).await?;
-    if verified.release_digest() != reference.release_digest {
-        return reject("resolved release changed during verification");
-    }
-    Ok(ResolvedRelease {
-        directory,
-        verified,
-    })
 }
 
 /// Downloaded content bound to a digest, but not yet approved by any trust policy.
@@ -181,6 +140,7 @@ async fn pull(reference: &ReleaseReference, tool: &OrasTool, destination: &Path)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{TrustPolicy, verify_candidate};
 
     #[test]
     fn immutable_references_reject_ambiguous_transport_and_tags() -> Result<()> {
@@ -309,13 +269,15 @@ printf '%s' "$7" > "$6/reference"
                 allowed_signers: String::new(),
             },
         };
-        let mismatch = resolve_release(&reference(), &tool, &policy).await;
+        let mismatch = fetch_release(&reference(), &tool).await;
         assert!(
             matches!(mismatch, Err(crate::Error::Rejected(message)) if message == "resolved release differs from protected reference")
         );
         let mut matched = reference();
         matched.release_digest = manifest::raw_digest(b"{}");
-        assert!(resolve_release(&matched, &tool, &policy).await.is_err());
+        let fetched = fetch_release(&matched, &tool).await?;
+        assert_eq!(fetched.release_digest(), matched.release_digest);
+        assert!(verify_candidate(fetched.path(), &policy).await.is_err());
         Ok(())
     }
     #[tokio::test]
@@ -350,18 +312,17 @@ printf '%s' "$7" > "$6/reference"
         };
         // JSON schema failure establishes that real transport and both digest
         // checks succeeded, without treating this deliberately invalid release as trusted.
+        let fetched = fetch_release(&reference, &tool).await?;
         assert!(matches!(
-            resolve_release(&reference, &tool, &policy).await,
+            verify_candidate(fetched.path(), &policy).await,
             Err(crate::Error::Json(_))
         ));
         let wrong_release = ReleaseReference {
             release_digest: format!("sha256:{}", "f".repeat(64)),
             ..reference.clone()
         };
-        assert!(
-            matches!(resolve_release(&wrong_release, &tool, &policy).await,
-            Err(crate::Error::Rejected(reason)) if reason == "resolved release differs from protected reference")
-        );
+        assert!(matches!(fetch_release(&wrong_release, &tool).await,
+            Err(crate::Error::Rejected(reason)) if reason == "resolved release differs from protected reference"));
         let repository = reference
             .oci
             .split_once('@')
@@ -371,16 +332,14 @@ printf '%s' "$7" > "$6/reference"
             oci: format!("{repository}@sha256:{}", "0".repeat(64)),
             ..reference.clone()
         };
-        assert!(matches!(resolve_release(&missing, &tool, &policy).await,
+        assert!(matches!(fetch_release(&missing, &tool).await,
             Err(crate::Error::Rejected(reason)) if reason == "OCI release retrieval failed"));
         let untrusted = OrasTool {
             ca_file: None,
             ..tool
         };
-        assert!(
-            matches!(resolve_release(&reference, &untrusted, &policy).await,
-            Err(crate::Error::Rejected(reason)) if reason == "OCI release retrieval failed")
-        );
+        assert!(matches!(fetch_release(&reference, &untrusted).await,
+            Err(crate::Error::Rejected(reason)) if reason == "OCI release retrieval failed"));
         Ok(())
     }
 }

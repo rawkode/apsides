@@ -212,7 +212,7 @@ class ReproducibilityTests(unittest.TestCase):
             receipt["runnerSourceDigest"],
             PRODUCER.digest_file(fixture.output / receipt["runnerSourceFile"]),
         )
-        # The release CLI copies a flat --evidence directory beneath evidence/.
+        # Every file the receipt names sits flat beneath evidence/.
         staged = fixture.output / "evidence"
         published = {"evidence/" + path.name: PRODUCER.digest_file(path)
                      for path in staged.iterdir()}

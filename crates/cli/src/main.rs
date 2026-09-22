@@ -50,7 +50,6 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Test(arguments) => commands::test::command(&arguments),
         Command::Verify(arguments) => commands::verify::command(&arguments),
         Command::VerifyRelease(arguments) => commands::release::verify::command(&arguments),
-        Command::MergeEvidence(arguments) => commands::evidence::command(&arguments),
         Command::Release(arguments) => commands::release::command(&arguments),
         Command::Deploy(arguments) => commands::deploy::command(&arguments),
         Command::Audit(arguments) => commands::audit::command(&arguments),

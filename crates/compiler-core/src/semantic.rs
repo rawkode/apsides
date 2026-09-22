@@ -1,5 +1,5 @@
 //! Independent primitive invariants over synthetic data. API/workload cases
-//! remain explicitly unsupported here and must pass separate release gates.
+//! are reported as unsupported here; they need a cluster to run.
 use crate::{
     BlockReason, CompiledPlan, Error, InputSnapshot, Reaction, Result, RolloutKey, RolloutOutcome,
     TestCase, digest, validate,
@@ -65,8 +65,8 @@ fn ready(outcome: &RolloutOutcome) -> Option<&str> {
     }
 }
 
-/// Runs only semantic cases. This reports all required higher-layer cases as
-/// Unsupported; it cannot turn a local semantic pass into release acceptance.
+/// Runs only semantic cases. Every required higher-layer case is reported as
+/// Unsupported, so a plan with cluster cases never reports a full pass here.
 ///
 /// # Errors
 /// Rejects forged plans or invalid synthetic scenario evaluation.
