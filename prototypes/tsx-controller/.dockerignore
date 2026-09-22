@@ -1,7 +1,0 @@
-node_modules
-dist
-.state
-.demo
-.e2e
-.git
-*.bun-build

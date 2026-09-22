@@ -5,14 +5,6 @@ import "github.com/cuenv/cuenv/schema"
 schema.#Project & {name: "apsides"}
 
 tasks: {
-	tsxPrototypeCheck: {
-		command: "bun"
-		args: ["run", "--cwd", "prototypes/tsx-controller", "ci"]
-	}
-	tsxPrototypeE2e: {
-		command: "bun"
-		args: ["run", "--cwd", "prototypes/tsx-controller", "e2e"]
-	}
 	performanceMetricsTest: {
 		command: "uv"
 		args: ["run", "--cache-dir", "work/uv-cache", "--no-project", "--with-requirements", "tests/performance/requirements.txt", "python3", "tests/performance/test_analyze_metrics.py"]
