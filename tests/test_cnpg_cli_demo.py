@@ -11,7 +11,7 @@ import run_cnpg_cli_demo as cli
 
 class CliDemoTests(unittest.TestCase):
     def report(self):
-        return {"status": "committed", "artifactTrust": "verified", "releaseQualification": "not-evaluated",
+        return {"status": "committed", "artifactTrust": "verified",
                 "releaseDigest": "sha256:" + "a" * 64, "irDigest": "sha256:" + "b" * 64,
                 "transition": "t-example-1", "generation": "g-example-1",
                 "inventory": {"revision": "1", "snapshotId": "sha256:" + "c" * 64},
@@ -22,7 +22,7 @@ class CliDemoTests(unittest.TestCase):
         expected = {key: report[key] for key in ["releaseDigest", "irDigest"]}
         self.assertNotIn("PRIVATE", json.dumps(cli.committed_report(json.dumps(report), expected)))
         for key, value in [("status", "pending"), ("releaseDigest", "wrong"), ("irDigest", "wrong"),
-                           ("artifactTrust", "unchecked"), ("releaseQualification", "passed"),
+                           ("artifactTrust", "unchecked"),
                            ("generation", ""), ("inventory", {"revision": "1", "snapshotId": "bad"})]:
             with self.subTest(key=key), self.assertRaises(cli.demo.shared.QualificationError):
                 cli.committed_report(json.dumps({**report, key: value}), expected)

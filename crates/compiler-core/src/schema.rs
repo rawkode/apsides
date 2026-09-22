@@ -1,6 +1,7 @@
 //! Kubernetes field shapes come from pinned upstream generated types. The
 //! allowlist below defines Apsides's smaller effect vocabulary, not a competing
-//! Kubernetes schema. API admission/defaulting remains a separate release gate.
+//! Kubernetes schema. API admission and defaulting are checked only against a
+//! live API server, never here.
 use crate::{Error, REVISION_ANNOTATION, Resource, Result};
 use k8s_openapi::api::{
     apps::v1::Deployment,

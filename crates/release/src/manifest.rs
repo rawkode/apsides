@@ -48,19 +48,10 @@ pub struct Source {
     pub inputs_digest: String,
 }
 
-/// A trusted release whose required qualification evidence also passed.
-/// Callers cannot manufacture this from serialized receipt strings.
-#[derive(Debug)]
-pub struct VerifiedRelease {
-    pub(crate) manifest: ReleaseManifest,
-    pub(crate) compiled: CompiledPlan,
-    pub(crate) release_digest: String,
-    pub(crate) provenance_digest: String,
-    pub(crate) trust_policy_digest: String,
-}
-
 /// A signed, policy-approved artifact usable by deployment after platform checks.
-/// This establishes integrity and provenance, not full release qualification.
+///
+/// This establishes integrity and provenance; per-program behaviour is covered
+/// by `aps test`, not by anything recorded in the release.
 #[derive(Debug)]
 pub struct IntegrityVerifiedCandidate {
     pub(crate) manifest: ReleaseManifest,
@@ -71,106 +62,6 @@ pub struct IntegrityVerifiedCandidate {
 }
 
 impl IntegrityVerifiedCandidate {
-    #[must_use]
-    pub const fn manifest(&self) -> &ReleaseManifest {
-        &self.manifest
-    }
-    #[must_use]
-    pub const fn compiled(&self) -> &CompiledPlan {
-        &self.compiled
-    }
-    #[must_use]
-    pub fn release_digest(&self) -> &str {
-        &self.release_digest
-    }
-    #[must_use]
-    pub fn provenance_digest(&self) -> &str {
-        &self.provenance_digest
-    }
-    #[must_use]
-    pub fn trust_policy_digest(&self) -> &str {
-        &self.trust_policy_digest
-    }
-    pub(crate) fn into_verified(self) -> VerifiedRelease {
-        VerifiedRelease {
-            manifest: self.manifest,
-            compiled: self.compiled,
-            release_digest: self.release_digest,
-            provenance_digest: self.provenance_digest,
-            trust_policy_digest: self.trust_policy_digest,
-        }
-    }
-
-    /// Bind this unpromoted candidate to an explicit disposable test scope.
-    ///
-    /// # Errors
-    /// Rejects a scope that differs from the candidate's signed IR target.
-    #[cfg(feature = "test-support")]
-    pub fn authorize_test_staging(
-        self,
-        scope: TestStagingScope,
-    ) -> Result<TestStagingAuthorization> {
-        let domain = &self.compiled.ir.domain;
-        if scope.cluster_binding != domain.cluster_binding
-            || scope.control_namespace != domain.control_namespace
-            || scope.workload_namespace != domain.namespace
-        {
-            return reject("test staging scope differs from the signed candidate target");
-        }
-        if !valid_namespace(&scope.control_namespace) || !valid_namespace(&scope.workload_namespace)
-        {
-            return reject("test staging scope contains an invalid namespace");
-        }
-        Ok(TestStagingAuthorization {
-            candidate: self,
-            scope,
-        })
-    }
-}
-
-#[cfg(feature = "test-support")]
-fn valid_namespace(value: &str) -> bool {
-    value.len() <= 63
-        && value
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphanumeric)
-        && value
-            .as_bytes()
-            .last()
-            .is_some_and(u8::is_ascii_alphanumeric)
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-}
-
-#[cfg(feature = "test-support")]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TestStagingScope {
-    pub cluster_binding: String,
-    pub control_namespace: String,
-    pub workload_namespace: String,
-}
-
-#[cfg(feature = "test-support")]
-#[derive(Debug)]
-pub struct TestStagingAuthorization {
-    candidate: IntegrityVerifiedCandidate,
-    scope: TestStagingScope,
-}
-
-#[cfg(feature = "test-support")]
-impl TestStagingAuthorization {
-    #[must_use]
-    pub const fn candidate(&self) -> &IntegrityVerifiedCandidate {
-        &self.candidate
-    }
-    #[must_use]
-    pub const fn scope(&self) -> &TestStagingScope {
-        &self.scope
-    }
-}
-impl VerifiedRelease {
     #[must_use]
     pub const fn manifest(&self) -> &ReleaseManifest {
         &self.manifest
@@ -251,7 +142,7 @@ pub fn read_release(root: &Path) -> Result<(ReleaseManifest, CompiledPlan, Vec<u
         return reject("release.json is not canonical JSON");
     }
     let manifest: ReleaseManifest = serde_json::from_value(value)?;
-    if manifest.schema_version != "apsides.dev/release/v1" {
+    if manifest.schema_version != "apsides.dev/release/v2" {
         return reject("unsupported release schema");
     }
     if !is_digest(&manifest.ir_digest)
@@ -302,7 +193,6 @@ pub fn read_release(root: &Path) -> Result<(ReleaseManifest, CompiledPlan, Vec<u
         "compatibility.json",
         "graphs.json",
         "test-plan.json",
-        "coverage.json",
         "capabilities.json",
         "ir-source-map.json",
         "apsides-controller",

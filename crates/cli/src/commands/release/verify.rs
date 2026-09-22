@@ -1,7 +1,7 @@
-//! `aps verify-release` — verify a release against a supplied trust policy.
+//! `aps verify-release` — run the release checks `aps deploy` runs, offline.
 //!
-//! The result is scoped to the policy the caller supplied; it is not a claim
-//! that the release is approved for production.
+//! Integrity and provenance are checked against the trust policy the caller
+//! supplied. No cluster is contacted, so platform admission is not checked.
 
 use crate::{Result, cli, report};
 use serde_json::json;
@@ -15,7 +15,7 @@ pub fn command(arguments: &cli::VerifyRelease) -> Result<()> {
         &fs::read_to_string(&arguments.trust_policy)?,
     )?)?;
     let runtime = tokio::runtime::Runtime::new()?;
-    let verified = runtime.block_on(release::verify_release(&arguments.artifact, &policy))?;
+    let verified = runtime.block_on(release::verify_candidate(&arguments.artifact, &policy))?;
     report::emit(&json!({
         "status": "verified-against-supplied-policy",
         "releaseDigest": verified.release_digest(),

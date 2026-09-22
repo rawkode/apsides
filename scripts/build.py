@@ -48,7 +48,7 @@ def assemble(artifact, source, profile_path, *, no_cache=False):
               "platform": profile["platform"], "binaryDigest": binary_digest, "sbomDigest": sbom_digest,
               "image": "image/controller.oci.tar", "binary": "linux-binary/apsides-controller", "sbom": "sbom/sbom.json",
               "buildInputs": "build-inputs.json", "releaseVerified": False,
-              "remainingReleaseGates": ["approved-provenance", "reactor-and-security-evidence", "trusted-release-verification"]}
+              "remainingReleaseGates": ["approved-provenance", "trusted-release-verification"]}
     (artifact / "build-result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     return result
 

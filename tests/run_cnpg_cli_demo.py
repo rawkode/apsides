@@ -13,7 +13,6 @@ def committed_report(raw, expected):
     report = json.loads(raw)
     if (not isinstance(report, dict) or report.get("status") != "committed"
             or report.get("artifactTrust") != "verified"
-            or report.get("releaseQualification") != "not-evaluated"
             or report.get("releaseDigest") != expected["releaseDigest"]
             or report.get("irDigest") != expected["irDigest"]
             or any(not isinstance(report.get(key), str) or not report[key]
@@ -23,7 +22,7 @@ def committed_report(raw, expected):
             or not isinstance(report["inventory"].get("revision"), str)
             or not report["inventory"]["revision"].isdigit()):
         raise demo.shared.QualificationError("CLI did not report the exact committed candidate")
-    return {key: report[key] for key in ["status", "artifactTrust", "releaseQualification",
+    return {key: report[key] for key in ["status", "artifactTrust",
             "releaseDigest", "irDigest", "transition", "generation", "inventory"]}
 
 

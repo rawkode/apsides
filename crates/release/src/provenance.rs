@@ -1,6 +1,6 @@
 use crate::{
     Result,
-    manifest::{self, IntegrityVerifiedCandidate, MAX_DOCUMENT, ReleaseMode, VerifiedRelease},
+    manifest::{self, IntegrityVerifiedCandidate, MAX_DOCUMENT, ReleaseMode},
     reject,
 };
 use serde::{Deserialize, Serialize};
@@ -141,7 +141,10 @@ fn check_statement(statement: &Value, release_digest: &str) -> Result<()> {
     Ok(())
 }
 
-/// Verify candidate integrity and platform-approved signature identity before evidence exists.
+/// Verify release integrity and platform-approved signature identity.
+///
+/// `aps deploy` and `aps verify-release` both call this. A release carries no
+/// test results; per-program behaviour is checked by `aps test` before signing.
 ///
 /// # Errors
 /// Rejects untrusted, incomplete, fixture-only, altered candidates and verifier failures.
@@ -204,20 +207,6 @@ pub async fn verify_candidate(
         provenance_digest,
         trust_policy_digest: compiler_core::digest(&serde_json::to_value(policy)?)?,
     })
-}
-
-/// Verify release integrity, trust policy, signature identity, and required evidence.
-///
-/// # Errors
-/// Rejects untrusted, incomplete, fixture-only, altered, or untested releases.
-pub async fn verify_release(root: &Path, policy: &TrustPolicy) -> Result<VerifiedRelease> {
-    let candidate = verify_candidate(root, policy).await?;
-    crate::evidence::validate(root, &candidate.manifest, &candidate.compiled)?;
-    let (_, _, after) = manifest::read_release(root)?;
-    if manifest::raw_digest(&after) != candidate.release_digest {
-        return reject("release changed during evidence verification");
-    }
-    Ok(candidate.into_verified())
 }
 
 async fn verify_signature(
