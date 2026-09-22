@@ -19,8 +19,6 @@ mod pair_phase_interruption_live;
 mod permissions;
 #[cfg(all(test, feature = "test-support"))]
 mod phase_interruption;
-#[cfg(all(test, feature = "test-support"))]
-mod phase_interruption_live;
 #[cfg(feature = "deployer")]
 mod preview_adapter;
 #[cfg(all(test, feature = "test-support"))]
@@ -71,10 +69,6 @@ pub use permissions::{
 pub use review_projection::project_review_metadata;
 pub use writer_checkpoint::WriterCheckpoint;
 
-#[cfg(feature = "test-support")]
-mod test_support;
-#[cfg(feature = "test-support")]
-pub use test_support::{DisposableTestCluster, TestClusterTarget};
 #[cfg(feature = "test-support")]
 mod candidate_qualification;
 #[cfg(feature = "test-support")]

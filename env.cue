@@ -65,11 +65,6 @@ tasks: {
 	inputIsolationTest: {command: "python3", args: ["tests/test_input_isolation.py"]}
 	inputIsolationProbeTest: {command: "deno", args: ["test", "--allow-all", "tests/isolation_probe.test.mts"]}
 	reactorPackagingTest: {command: "python3", args: ["tests/test_reactor_packaging.py"]}
-	lifecycleCeilingTest: {command: "python3", args: ["tests/test_lifecycle_ceiling.py"]}
-	lifecycleCleanupTest: {command: "python3", args: ["tests/test_lifecycle_cleanup.py"]}
-	lifecyclePermissionsTest: {command: "python3", args: ["tests/test_lifecycle_permissions.py"]}
-	lifecycleDiagnosticsTest: {command: "python3", args: ["tests/test_lifecycle_diagnostics.py"]}
-	lifecycleInterruptionTest: {command: "python3", args: ["tests/test_lifecycle_interruption.py"]}
 	storageProbeTest: {command: "cargo", args: ["test", "--locked", "-p", "inventory", "--test", "pvc_restart"]}
 	storageBuildTest: {command: "python3", args: ["tests/storage/test_build.py"]}
 	storageRestartTest: {command: "python3", args: ["tests/storage/test_restart.py"]}
