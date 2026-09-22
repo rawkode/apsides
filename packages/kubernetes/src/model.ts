@@ -623,69 +623,10 @@ export const watch = (input: Watchable): {
   });
 };
 
-export type InputFixtureState =
-  | { readonly state: "present"; readonly data: Readonly<Record<string, string>> }
-  | { readonly state: "missing" | "unauthorized" | "unavailable" | "invalid" };
-
-export interface InputFixture {
-  readonly inputId: string;
-  readonly source: SourceLocation;
-  /** Author assertion checked as part of the test-only fixture contract. */
-  readonly synthetic: true;
-  readonly state: InputFixtureState["state"];
-  readonly data?: Readonly<Record<string, string>>;
-}
-
-export interface WorkloadFixture {
-  readonly targetResourceId: string;
-  readonly source: SourceLocation;
-  readonly containers: readonly {
-    readonly name: string;
-    readonly image: string;
-    readonly imagePullPolicy: "Never";
-  }[];
-}
-
-export interface FixtureBundle {
-  readonly schemaVersion: "apsides.dev/fixtures/v1";
-  readonly testOnly: true;
-  readonly productionReady: false;
-  readonly inputs: readonly InputFixture[];
-  readonly workloadSubstitutions: readonly WorkloadFixture[];
-}
-
-export interface GeneratedFixtureOptions {
-  /** A locally imported image reference. Test compilation always sets Never. */
-  readonly workloadImage: string;
-  readonly inputs?: readonly InputFixture[];
-  readonly workloadSubstitutions?: readonly WorkloadFixture[];
-}
-
-/** Produces a visibly test-only companion artifact; fixture values never enter Domain.toIR(). */
-export const defineFixtureBundle = (options: {
-  readonly inputs?: readonly InputFixture[];
-  readonly workloadSubstitutions?: readonly WorkloadFixture[];
-}): FixtureBundle => {
-  const raw = record(options, "fixture bundle");
-  exact(raw, ["inputs", "workloadSubstitutions"], "fixture bundle");
-  const inputs = raw.inputs === undefined ? [] : array(raw.inputs, "fixture bundle.inputs") as InputFixture[];
-  const workloadSubstitutions = raw.workloadSubstitutions === undefined ? [] : array(raw.workloadSubstitutions, "fixture bundle.workloadSubstitutions") as WorkloadFixture[];
-  uniqueBy(inputs, (input) => input.inputId, "fixture input");
-  uniqueBy(workloadSubstitutions, (fixture) => fixture.targetResourceId, "workload fixture target");
-  return freeze(canonical({
-    schemaVersion: "apsides.dev/fixtures/v1",
-    testOnly: true,
-    productionReady: false,
-    inputs: [...inputs].sort((left, right) => compareText(left.inputId, right.inputId)),
-    workloadSubstitutions: [...workloadSubstitutions].sort((left, right) => compareText(left.targetResourceId, right.targetResourceId)),
-  }) as unknown as FixtureBundle);
-};
-
 /** @internal Shared fixture seed completion for the SDK and source compiler. */
 export const fixtureInputData = (
   input: { readonly id: string; readonly kind: string; readonly name: string; readonly namespace: string },
   resources: readonly { readonly kind: string; readonly namespace: string; readonly desired: unknown }[],
-  explicit?: { readonly state: string; readonly data?: Readonly<Record<string, string>> },
 ): Readonly<Record<string, string>> => {
   const keys = new Set<string>();
   if (input.kind === "Secret") {
@@ -704,102 +645,8 @@ export const fixtureInputData = (
       }
     }
   }
-  if (explicit !== undefined) {
-    if (explicit.state === "present") {
-      for (const key of keys) {
-        if (!Object.hasOwn(explicit.data ?? {}, key) || typeof explicit.data?.[key] !== "string") {
-          throw new Error(`fixture input ${input.id} is missing required Secret key ${key}`);
-        }
-      }
-    }
-    return explicit.data ?? {};
-  }
   const value = input.kind === "Secret" ? `synthetic-secret-${input.id}` : `synthetic-config-${input.id}`;
   return freeze(Object.fromEntries(["value", ...keys].sort(compareText).map((key) => [key, value])));
-};
-
-/**
- * Completes the v1 fixture contract from the production IR. Rollout only needs
- * stable synthetic data, so observed ConfigMaps and Secrets have a supported,
- * deterministic generator. Explicit fixtures override the generated seed.
- */
-export const generateFixtureBundle = (ir: ApsidesIR, options: GeneratedFixtureOptions): FixtureBundle => {
-  const raw = record(options, "generated fixture options");
-  exact(raw, ["workloadImage", "inputs", "workloadSubstitutions"], "generated fixture options");
-  if (ir.testOnly !== false) throw new Error("fixtures must be generated from production IR");
-  const image = text(raw.workloadImage, "generated fixture workloadImage");
-  const explicitInputs = raw.inputs === undefined ? [] : array(raw.inputs, "generated fixture inputs") as InputFixture[];
-  const explicitWorkloads = raw.workloadSubstitutions === undefined ? [] : array(raw.workloadSubstitutions, "generated workload substitutions") as WorkloadFixture[];
-  uniqueBy(explicitInputs, (fixture) => fixture.inputId, "fixture input");
-  uniqueBy(explicitWorkloads, (fixture) => fixture.targetResourceId, "workload fixture target");
-  const byInput = new Map(explicitInputs.map((fixture) => [fixture.inputId, fixture]));
-  const byWorkload = new Map(explicitWorkloads.map((fixture) => [fixture.targetResourceId, fixture]));
-  const inputs = ir.inputs.filter((input) => input.mode === "observed").map((input) => {
-    const explicit = byInput.get(input.id);
-    const data = fixtureInputData(input, ir.resources, explicit);
-    return explicit ?? freeze({ inputId: input.id, source: input.source, synthetic: true as const, state: "present" as const, data });
-  });
-  for (const fixture of explicitInputs) {
-    const input = ir.inputs.find((candidate) => candidate.id === fixture.inputId);
-    if (input === undefined || input.mode !== "observed") throw new Error(`fixture input is not a declared observed input: ${fixture.inputId}`);
-  }
-  const workloads = ir.resources.filter((resource) => resource.kind === "Deployment").map((resource) => {
-    const explicit = byWorkload.get(resource.id);
-    if (explicit !== undefined) return explicit;
-    const desired = resource.desired as DeploymentDesired;
-    return freeze({
-      targetResourceId: resource.id,
-      source: resource.source,
-      containers: desired.spec.template.spec.containers.map((container) => freeze({ name: container.name, image, imagePullPolicy: "Never" as const })),
-    });
-  });
-  for (const fixture of explicitWorkloads) {
-    const resource = ir.resources.find((candidate) => candidate.id === fixture.targetResourceId);
-    if (resource?.kind !== "Deployment") throw new Error(`workload fixture is not a declared Deployment: ${fixture.targetResourceId}`);
-  }
-  return defineFixtureBundle({ inputs, workloadSubstitutions: workloads });
-};
-
-/** Materializes a fixture-substituted IR for a compiler's explicitly test-only path. */
-export const materializeFixtureIR = (ir: ApsidesIR, bundle: FixtureBundle): ApsidesIR => {
-  if (bundle.testOnly !== true || bundle.productionReady !== false || bundle.schemaVersion !== "apsides.dev/fixtures/v1") {
-    throw new Error("fixture IR requires a recognized non-production fixture bundle");
-  }
-  const output = canonical(ir) as unknown as ApsidesIR;
-  const resources = output.resources.map((resource) => {
-    const substitution = bundle.workloadSubstitutions.find((candidate) => candidate.targetResourceId === resource.id);
-    if (substitution === undefined) return resource;
-    if (resource.kind !== "Deployment") throw new Error(`workload substitution target is not a Deployment: ${resource.id}`);
-    const desired = resource.desired as DeploymentDesired;
-    const expected = desired.spec.template.spec.containers.map((container) => container.name).sort();
-    const replacements = substitution.containers.map((container) => container.name).sort();
-    if (JSON.stringify(expected) !== JSON.stringify(replacements)) throw new Error(`workload substitution does not cover every container in ${resource.id}`);
-    const byName = new Map(substitution.containers.map((container) => [container.name, container]));
-    return {
-      ...resource,
-      desired: {
-        ...desired,
-        spec: {
-          ...desired.spec,
-          template: {
-            ...desired.spec.template,
-            spec: {
-              ...desired.spec.template.spec,
-              containers: desired.spec.template.spec.containers.map((container) => {
-                const replacement = byName.get(container.name)!;
-                return { ...container, image: replacement.image, imagePullPolicy: "Never" as const };
-              }),
-            },
-          },
-        },
-      },
-    };
-  });
-  for (const substitution of bundle.workloadSubstitutions) {
-    if (!resources.some((resource) => resource.id === substitution.targetResourceId)) throw new Error(`unresolved workload substitution target: ${substitution.targetResourceId}`);
-  }
-  if (ir.testOnly !== false) throw new Error("fixture materialization requires production IR");
-  return freeze(canonical({ ...output, testOnly: true, resources }) as unknown as ApsidesIR);
 };
 
 const validateDomainOptions = (options: DomainOptions): DomainOptions => {
@@ -1104,15 +951,6 @@ const sorted = <T>(values: Map<string, T>): T[] => {
 
 const compareText = (left: string, right: string): number => {
   return left < right ? -1 : left > right ? 1 : 0;
-};
-
-const uniqueBy = <T>(values: readonly T[], key: (value: T) => string, context: string): void => {
-  const seen = new Set<string>();
-  for (const value of values) {
-    const id = key(value);
-    if (seen.has(id)) throw new Error(`duplicate ${context}: ${id}`);
-    seen.add(id);
-  }
 };
 
 const canonical = (value: unknown, seen = new Set<object>()): Json => {
