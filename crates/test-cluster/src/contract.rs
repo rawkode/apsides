@@ -1,0 +1,382 @@
+//! What a fixture release promises the runner, checked before any cluster
+//! exists.
+//!
+//! `release::read_release` establishes payload integrity, the controller
+//! image's OCI identity and that the plan and test plan are the trusted
+//! derivation of the IR. This module adds the fixture contract on top: the
+//! release must be test-only, every workload must run the local fixture image,
+//! and the compiler's fixture coverage must cover exactly the generated test
+//! plan plus one mutation check per reaction, bound to these fixtures and this
+//! IR.
+
+use crate::{FIXTURE_IMAGE, Result, input};
+use compiler_core::{CompiledPlan, InputMode, TestCase, digest};
+use release::{ReleaseManifest, ReleaseMode};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+};
+
+/// The scenario the compiler adds per reaction to prove the suite notices a
+/// reaction's contribution going missing.
+pub const MUTATION_SCENARIO: &str = "reaction-contribution-removed";
+
+/// Identifies the synthetic rollout key the fixture controller signs
+/// sensitive revisions with. Never a production key.
+pub const ROLLOUT_KEY_ID: &str = "fixture-v1";
+pub const ROLLOUT_KEY: &str = "synthetic-fixture-key-never-production-0123456789";
+
+const FIXTURE_FILES: [&str; 3] = [
+    "fixtures.json",
+    "fixture-overlay.json",
+    "fixture-coverage.json",
+];
+
+/// A fixture release that has passed every offline check.
+#[derive(Debug)]
+pub struct FixtureRelease {
+    pub root: PathBuf,
+    pub manifest: ReleaseManifest,
+    pub plan: CompiledPlan,
+    /// Digest of `release.json`: the tested artifact's identity.
+    pub release_digest: String,
+    pub fixtures: Value,
+    /// Digest of the canonical fixtures document.
+    pub fixture_digest: String,
+    /// Digest of the canonical overlay document.
+    pub overlay_digest: String,
+    pub production_ir_digest: String,
+    /// The compiler's required fixture cases, in coverage order.
+    pub coverage: Vec<CoverageCase>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverageCase {
+    pub reaction_id: String,
+    pub scenario: String,
+    pub status: String,
+    pub fixture_sha256: String,
+    pub overlay_identity: String,
+    #[serde(default)]
+    pub applicability: Applicability,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Applicability {
+    #[serde(default)]
+    pub input_ids: Vec<String>,
+    #[serde(default)]
+    pub input_modes: Vec<String>,
+    #[serde(default)]
+    pub managed_resource_ids: Vec<String>,
+}
+
+impl FixtureRelease {
+    /// Read and check a fixture release directory.
+    ///
+    /// # Errors
+    /// Returns an error if the release fails integrity checks, is not a
+    /// fixture release, or its fixture contract is inconsistent.
+    pub fn load(root: &Path) -> Result<Self> {
+        let (manifest, plan, bytes) = release::read_release(root)?;
+        if manifest.mode != ReleaseMode::Fixture || !plan.ir.test_only {
+            return input(
+                "cluster tests run only a fixture release; build it with `aps build --mode fixture`",
+            );
+        }
+        for name in FIXTURE_FILES {
+            if !manifest.files.contains_key(name) {
+                return input(format!("fixture release is missing {name}"));
+            }
+        }
+        let read = |name: &str| -> Result<Value> {
+            Ok(compiler_core::parse_strict(&std::fs::read_to_string(
+                root.join(name),
+            )?)?)
+        };
+        let fixtures = read("fixtures.json")?;
+        let overlay = read("fixture-overlay.json")?;
+        let coverage = read("fixture-coverage.json")?;
+        require_fixture_workloads(&plan)?;
+        let checked = validate_coverage(&plan, &fixtures, &overlay, &coverage)?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            release_digest: format!("sha256:{:x}", Sha256::digest(&bytes)),
+            fixture_digest: digest(&fixtures)?,
+            overlay_digest: digest(&overlay)?,
+            production_ir_digest: format!(
+                "sha256:{}",
+                coverage["productionIrSha256"].as_str().unwrap_or_default()
+            ),
+            manifest,
+            plan,
+            fixtures,
+            coverage: checked,
+        })
+    }
+
+    /// The generated input fixture for `input_id`.
+    #[must_use]
+    pub fn fixture(&self, input_id: &str) -> Option<&Value> {
+        self.fixtures["inputs"]
+            .as_array()?
+            .iter()
+            .find(|item| item["inputId"] == input_id)
+    }
+
+    /// The reproducible seed the suite starts from: which inputs exist and
+    /// which keys they carry, never their values.
+    #[must_use]
+    pub fn seed(&self) -> Value {
+        let inputs = self.fixtures["inputs"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        let id = item["inputId"].as_str().unwrap_or_default();
+                        let kind = self
+                            .plan
+                            .ir
+                            .inputs
+                            .iter()
+                            .find(|input| input.id == id)
+                            .map(|input| input.kind.clone());
+                        let keys = item["data"]
+                            .as_object()
+                            .map(|data| data.keys().cloned().collect::<BTreeSet<_>>())
+                            .unwrap_or_default();
+                        json!({"id": id, "kind": kind, "state": item["state"], "dataKeys": keys})
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        json!({
+            "schemaVersion": "apsides.dev/reactor-seed/v1",
+            "fixtureIrDigest": self.plan.ir_digest,
+            "rolloutKeyId": ROLLOUT_KEY_ID,
+            "inputs": inputs,
+        })
+    }
+}
+
+/// Every container of every Deployment must run the local fixture image and
+/// never pull.
+fn require_fixture_workloads(plan: &CompiledPlan) -> Result<()> {
+    for resource in plan
+        .ir
+        .resources
+        .iter()
+        .filter(|item| item.kind == "Deployment")
+    {
+        let spec = &resource.desired["spec"]["template"]["spec"];
+        let containers = ["containers", "initContainers"]
+            .iter()
+            .flat_map(|field| spec[field].as_array().cloned().unwrap_or_default());
+        for container in containers {
+            if container["image"] != FIXTURE_IMAGE || container["imagePullPolicy"] != "Never" {
+                return input(format!(
+                    "{} does not run the local fixture image {FIXTURE_IMAGE} with imagePullPolicy Never",
+                    resource.id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The compiler's fixture coverage must be bound to these fixtures and this
+/// IR, and must require exactly the generated test plan plus one mutation
+/// check per reaction.
+fn validate_coverage(
+    plan: &CompiledPlan,
+    fixtures: &Value,
+    overlay: &Value,
+    coverage: &Value,
+) -> Result<Vec<CoverageCase>> {
+    let fixture_hex = hex(&digest(fixtures)?);
+    let ir_hex = hex(&plan.ir_digest);
+    if coverage["schemaVersion"] != "apsides.dev/fixture-coverage/v1"
+        || coverage["testOnly"] != true
+        || coverage["productionReady"] != false
+    {
+        return input("fixture coverage has an invalid safety envelope");
+    }
+    if coverage["fixtureSha256"] != fixture_hex || coverage["fixtureIrSha256"] != ir_hex {
+        return input("fixture coverage is not bound to the release's fixtures and IR");
+    }
+    if overlay["fixtureIrSha256"] != ir_hex
+        || overlay["productionIrSha256"] != coverage["productionIrSha256"]
+        || !coverage["productionIrSha256"].is_string()
+    {
+        return input("fixture overlay and coverage identities differ");
+    }
+    let planned: BTreeMap<(&str, &str), &TestCase> = plan
+        .test_plan
+        .iter()
+        .map(|case| ((case.reaction_id.as_str(), case.scenario.as_str()), case))
+        .collect();
+    let reactions: BTreeSet<&str> = plan
+        .ir
+        .reactions
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect();
+    let mut seen = BTreeSet::new();
+    let mut cases = Vec::new();
+    for entry in coverage["reactions"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+    {
+        let id = entry["id"].as_str().unwrap_or_default();
+        let entry_cases: Vec<CoverageCase> =
+            serde_json::from_value(entry["cases"].clone()).unwrap_or_default();
+        let mut expected: BTreeSet<&str> = planned
+            .keys()
+            .filter(|(reaction, _)| *reaction == id)
+            .map(|(_, scenario)| *scenario)
+            .collect();
+        expected.insert(MUTATION_SCENARIO);
+        let covered: BTreeSet<&str> = entry_cases
+            .iter()
+            .map(|case| case.scenario.as_str())
+            .collect();
+        if !reactions.contains(id) || covered != expected {
+            return input(format!(
+                "fixture coverage for {id} does not cover exactly its generated scenarios"
+            ));
+        }
+        for case in entry_cases {
+            if case.reaction_id != id
+                || !seen.insert((case.reaction_id.clone(), case.scenario.clone()))
+                || case.status != "required"
+                || case.fixture_sha256 != fixture_hex
+                || case.overlay_identity != ir_hex
+            {
+                return input(format!(
+                    "fixture case {id}:{} is duplicated, optional or not bound to this release",
+                    case.scenario
+                ));
+            }
+            if case.scenario != MUTATION_SCENARIO {
+                let key = (case.reaction_id.as_str(), case.scenario.as_str());
+                let matches = planned
+                    .get(&key)
+                    .is_some_and(|planned| case.applicability == applicability(plan, planned));
+                if !matches {
+                    return input(format!(
+                        "fixture applicability for {id}:{} differs from the test plan",
+                        case.scenario
+                    ));
+                }
+            }
+            cases.push(case);
+        }
+    }
+    let covered: BTreeSet<&str> = seen.iter().map(|(reaction, _)| reaction.as_str()).collect();
+    if covered != reactions || seen.len() != planned.len() + reactions.len() {
+        return input("fixture coverage does not cover every reaction");
+    }
+    Ok(cases)
+}
+
+/// The stimulus set a planned case applies to, as the compiler records it.
+fn applicability(plan: &CompiledPlan, case: &TestCase) -> Applicability {
+    let inputs = plan
+        .ir
+        .inputs
+        .iter()
+        .filter(|input| case.input_ids.contains(&input.id))
+        .collect::<Vec<_>>();
+    let modes = inputs
+        .iter()
+        .map(|input| match input.mode {
+            InputMode::Observed => "observed".to_owned(),
+            InputMode::Managed => "managed".to_owned(),
+        })
+        .collect::<BTreeSet<_>>();
+    let managed = inputs
+        .iter()
+        .filter_map(|input| input.managed_resource_id.clone())
+        .collect::<BTreeSet<_>>();
+    Applicability {
+        input_ids: case.input_ids.clone(),
+        input_modes: modes.into_iter().collect(),
+        managed_resource_ids: managed.into_iter().collect(),
+    }
+}
+
+fn hex(digest: &str) -> String {
+    digest.trim_start_matches("sha256:").to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing;
+
+    #[test]
+    fn generated_coverage_is_accepted() -> Result<()> {
+        let plan = testing::plan()?;
+        let (fixtures, overlay, coverage) = testing::fixture_documents(&plan)?;
+        let cases = validate_coverage(&plan, &fixtures, &overlay, &coverage)?;
+        assert_eq!(cases.len(), plan.test_plan.len() + plan.ir.reactions.len());
+        assert_eq!(
+            cases
+                .iter()
+                .filter(|case| case.scenario == MUTATION_SCENARIO)
+                .count(),
+            plan.ir.reactions.len()
+        );
+        require_fixture_workloads(&plan)?;
+        Ok(())
+    }
+
+    #[test]
+    fn coverage_must_match_the_plan_and_identities() -> Result<()> {
+        let plan = testing::plan()?;
+        let (fixtures, overlay, coverage) = testing::fixture_documents(&plan)?;
+
+        let mut dropped = coverage.clone();
+        if let Some(cases) = dropped["reactions"][0]["cases"].as_array_mut() {
+            cases.pop();
+        }
+        assert!(validate_coverage(&plan, &fixtures, &overlay, &dropped).is_err());
+
+        let mut optional = coverage.clone();
+        optional["reactions"][0]["cases"][0]["status"] = json!("optional");
+        assert!(validate_coverage(&plan, &fixtures, &overlay, &optional).is_err());
+
+        let mut rebound = coverage.clone();
+        rebound["reactions"][0]["cases"][0]["applicability"]["inputIds"] = json!([]);
+        assert!(validate_coverage(&plan, &fixtures, &overlay, &rebound).is_err());
+
+        let mut other = fixtures.clone();
+        other["inputs"][0]["data"]["value"] = json!("changed");
+        assert!(validate_coverage(&plan, &other, &overlay, &coverage).is_err());
+
+        let mut unsafe_envelope = coverage.clone();
+        unsafe_envelope["productionReady"] = json!(true);
+        assert!(validate_coverage(&plan, &fixtures, &overlay, &unsafe_envelope).is_err());
+
+        let mut overlay_mismatch = overlay;
+        overlay_mismatch["productionIrSha256"] = json!("0".repeat(64));
+        assert!(validate_coverage(&plan, &fixtures, &overlay_mismatch, &coverage).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn production_workload_images_are_refused() -> Result<()> {
+        let mut ir = testing::ir();
+        ir["resources"][1]["desired"]["spec"]["template"]["spec"]["containers"][0]["image"] =
+            json!("registry.example/api@sha256:abc");
+        let plan = compiler_core::parse_and_validate(&ir.to_string())?;
+        assert!(require_fixture_workloads(&plan).is_err());
+        Ok(())
+    }
+}

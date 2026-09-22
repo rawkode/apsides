@@ -51,6 +51,7 @@ jobs:
           cuenv task coordinationTest
           cuenv task inventoryTest
           cuenv task compilerCoreTest
+          cuenv task testClusterTest
       - name: Run Rust lints
         run: |
           cuenv task registryCheck
@@ -59,6 +60,7 @@ jobs:
           cuenv task coordinationCheck
           cuenv task inventoryCheck
           cuenv task compilerCoreCheck
+          cuenv task testClusterCheck
       - name: Run qualification harness unit tests
         run: |
           cuenv task cnpgDemoTest
