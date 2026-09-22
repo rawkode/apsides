@@ -5,15 +5,7 @@ import "github.com/cuenv/cuenv/schema"
 schema.#Project & {name: "apsides"}
 
 tasks: {
-	performanceMetricsTest: {
-		command: "uv"
-		args: ["run", "--cache-dir", "work/uv-cache", "--no-project", "--with-requirements", "tests/performance/requirements.txt", "python3", "tests/performance/test_analyze_metrics.py"]
-	}
-	performanceResourcesTest: {command: "python3", args: ["tests/performance/test_analyze_resources.py"]}
 	performanceTest: {command: "python3", args: ["tests/performance/test_performance.py"]}
-	cnpgBaselineTest: {command: "python3", args: ["tests/performance/test_cnpg_baseline.py"]}
-	cnpgBaselineLiveTest: {command: "python3", args: ["tests/performance/test_cnpg_baseline_live.py"]}
-	imageSizesTest: {command: "python3", args: ["tests/performance/test_image_sizes.py"]}
 	authoringEditorCheck: {
 		dependsOn: [build, install]
 		command: "python3"

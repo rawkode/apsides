@@ -51,6 +51,6 @@ jobs:
           cuenv task cnpgCliDemoTest
           cuenv task cnpgCleanupTest
           cuenv task apiGapProbesTest
-          cuenv task performanceResourcesTest
+          cuenv task performanceTest
       - name: Build documentation
         run: cuenv task docsBuild
