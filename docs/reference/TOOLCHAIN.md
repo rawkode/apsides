@@ -28,9 +28,8 @@ builds the compiler-emitted fixture through the same native binary and OCI
 pipeline. Production remains the default. The selector validates the explicit
 production/fixture markers, both canonical IR digests in the overlay, and the
 complete allowed substitution before emitting the artifact. Fixture mode is
-available only for source image builds. Its release remains test-only and cannot
-be promoted. This build path alone does not qualify fixture-promotion rejection;
-that evidence must also bind the fixture to the exact production candidate and
-exercise the release verifier.
+available only for source image builds. Its release remains test-only: the
+release verifier used by `aps deploy` and `aps verify-release` refuses any
+release in fixture mode or with a `testOnly: true` IR, signed or not.
 
-CI's interface remains `aps deploy`, independent of the Kubernetes provider. The command integrates trusted release verification, protected Kubernetes state, short-lived issued identity, durable metadata and writer retirement. Deployment still requires every release and platform gate to pass. The disposable lifecycle runner uses signed, unpromoted test candidates; successful fixture runs do not satisfy the complete production release gate. See [implementation status](/reference/status/) for the remaining qualifications.
+CI's interface remains `aps deploy`, independent of the Kubernetes provider. The command integrates trusted release verification, protected Kubernetes state, short-lived issued identity, durable metadata and writer retirement. Deployment requires release integrity, signed provenance and every platform check to pass. The disposable lifecycle runner uses signed, unpromoted test candidates; a successful fixture run says nothing about a production release. See [implementation status](/reference/status/) for the remaining qualifications.

@@ -3,11 +3,11 @@
 This path prepares dependencies with Cargo and delegates image creation to Docker BuildKit. Preparation produces a build context, not an OCI image. The controller requires independently protected activation and policy at startup. Packaging alone does not establish release authenticity or authorization.
 
 ```sh
-bash scripts/package-oci.sh prepare \
+python3 scripts/package_oci.py prepare \
   --artifact work/apsides-native \
   --output work/apsides-oci-context
 
-bash scripts/package-oci.sh verify --context work/apsides-oci-context
+python3 scripts/package_oci.py verify --context work/apsides-oci-context
 ```
 
 Preparation first invokes the existing artifact verifier. It requires the artifact's recorded `controller/Cargo.lock`, preserves its exact bytes, snapshots the current trusted `compiler-core` and `runtime` sources, and relocates the generated manifest's single runtime path into the context. It copies no kubeconfig, credential store, JavaScript source evaluator, Cargo cache, or unrelated workspace source.
@@ -28,7 +28,7 @@ linux/arm64
 Image creation is a separate explicit action:
 
 ```sh
-bash scripts/package-oci.sh build \
+python3 scripts/package_oci.py build \
   --context work/apsides-oci-context \
   --runtime-image 'REGISTRY/COMPATIBLE-RUNTIME@sha256:EXACT_DIGEST' \
   --output work/apsides-oci-image
@@ -48,7 +48,7 @@ Docker rootfs binary extraction, cargo-cyclonedx SBOM generation, and compiler
 closure assembly. It emits `build-result.json`, `image/controller.oci.tar`,
 `linux-binary/apsides-controller`, `sbom/sbom.json`, and `build-inputs.json`.
 The separately prepared context is the sibling `dist/build.oci-context`.
-`aps compile` remains available for inspecting raw IR without producing an image.
+`aps check --ir` remains available for inspecting the compiled IR from `aps compile` without producing an image.
 
 The build profile uses schema `apsides.dev/build-profile/v1` and exactly these fields:
 `builderImage`, `runtimeImage` (both immutable digest references), `platform`
@@ -59,8 +59,8 @@ closure must agree. Missing cached dependencies/images fail without a pull fallb
 The profile defaults to `apsides.build.json` in the invoking directory.
 
 `build-result.json` explicitly remains unsigned and cannot authorize deployment.
-Approved provenance and complete reactor/security evidence must be assembled into
-and verified as a release before `aps deploy` accepts it. Development builds use
+The build must be assembled into a release with `aps release` and signed with
+approved provenance before `aps deploy` accepts it. Development builds use
 the source checkout. The [CLI distribution](CLI-DISTRIBUTION.md) bundles the
 compiler and native packaging source closure and verifies it against a manifest
 digest embedded in its executable.

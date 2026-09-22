@@ -13,9 +13,10 @@ running the deployment protocol.
 | --- | --- | --- |
 | `aps compile` | validated IR, plan, capabilities and generated controller source | deployable image or signed release |
 | `aps build` | pinned Linux binary, OCI archive, SBOM and compiler closure | approved provenance or deployment authorization |
+| `aps test` | the program's generated semantic scenarios; cases that need a cluster are reported unsupported | cluster behaviour or release trust |
 | `aps verify` | local artifact integrity and recomputed plan | trusted release provenance |
-| `aps verify-release` | trusted artifact and full release qualification evidence | live cluster acceptance |
-| `aps deploy` | artifact trust checks and authorized, resumable lifecycle execution | full release qualification or application workload readiness |
+| `aps verify-release` | release integrity and signed provenance under a trust policy, offline | platform admission or live cluster behaviour |
+| `aps deploy` | the same release checks, then authorized, resumable lifecycle execution | application workload readiness |
 
 ## Compile and build
 
@@ -46,10 +47,12 @@ OCI packaging is optional distribution. `aps build` produces an OCI archive
 as part of its current complete artifact, but upgrades do not use historical
 OCI retrieval as their state store.
 
-Full release qualification is separate from deployment. `aps deploy` verifies
-signatures, payload integrity and platform trust before checking live permissions
-and executing the lifecycle. Its report says `releaseQualification: not-evaluated`;
-use `aps verify-release` to require the full qualification evidence bundle.
+`aps deploy` verifies payload integrity and signed provenance against the
+platform trust policy before checking live permissions and executing the
+lifecycle. `aps verify-release` runs the same release checks without a cluster,
+so a signing workflow can check a release before handing it to deployment. A
+release carries no test results: run `aps test` for the program before signing
+it.
 
 ## Deployment inputs
 
@@ -113,11 +116,10 @@ authority on a cluster.
 Focused candidate lifecycle runs have exercised install and upgrade behaviour,
 including writer quiescence, adoption, explicit force and finalizer-delayed
 cleanup. They are not final production-artifact acceptance. Persistent
-volume recovery, the complete six-phase interruption matrix, cross-executor
-recovery, remaining release evidence, and independent final review remain release
-work.
+volume recovery, within-phase interruption, cross-executor recovery, and
+independent final review remain open.
 
-Read the [implementation status](/reference/status/) before repeating any evidence
-claim. The canonical protocols are [Deployment contract](/reference/deployment-contract/),
+Read the [implementation status](/reference/status/) before repeating any
+qualification claim. The canonical protocols are [Deployment contract](/reference/deployment-contract/),
 [Deployment permissions](/reference/deployment-permissions/), and
 [Artifact resolution](/reference/artifact-resolution/).

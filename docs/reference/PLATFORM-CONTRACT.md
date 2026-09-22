@@ -2,7 +2,7 @@
 
 `platform` uses an authenticated `kube::Client` supplied by the trusted deployment environment. It never loads a project kubeconfig, runs a project hook, or accepts an artifact's policy as platform authority. Initial platform bootstrap installs the control objects and permissions; routine execution does not require a permanent Apsides administrator.
 
-All JSON uses `schemaVersion: "apsides.dev/platform/v1"`, camelCase fields, strict unknown-field rejection, and a 512 KiB serialized state limit. Every ConfigMap stores exactly one data entry, `state.json`. Kubernetes metadata UID and resourceVersion are read separately and retained across conditional PUTs. Missing, corrupt, deleting or oversized records block. No expiry grants a stale claim or transition to another executor.
+All JSON uses `schemaVersion: "apsides.dev/platform/v1"`, camelCase fields, strict unknown-field rejection, and a 512 KiB serialized state limit, except the deployment identity policy below, which is versioned separately as `apsides.dev/deployment-identity/v2`. Every ConfigMap stores exactly one data entry, `state.json`. Kubernetes metadata UID and resourceVersion are read separately and retained across conditional PUTs. Missing, corrupt, deleting or oversized records block. No expiry grants a stale claim or transition to another executor.
 
 | Control object in the separate control namespace | Writer | Reader / schema |
 | --- | --- | --- |
@@ -12,6 +12,7 @@ All JSON uses `schemaVersion: "apsides.dev/platform/v1"`, camelCase fields, stri
 | `apsides-registry-{workloadNamespace}` | authorized deployment jobs | deployer only; `NamespaceRegistry` |
 | `apsides-activation-{domain}` | authorized deployment job | runtime; `ActivationState` |
 | `apsides-inventory-{domain}` | runtime updates a preprovisioned object | runtime and deployer; `RuntimeInventory` |
+| `apsides-deploy-identity-{domain}` | platform administration | deployer only; deployment identity policy (`apsides.dev/deployment-identity/v2`) |
 | Secret `apsides-rollout-key-{domain}` | authorized deployment job | runtime only when sensitive inputs require it; exactly `key` (32 bytes) and `keyId` (UTF-8) |
 
 The namespace registry contains an immutable claim reference, one registry-wide monotonic allocation counter, a committed active allocation and writer checkpoint per domain, and compact transition records. Each transition binds frozen planning inputs, review references, capacity admission and issued-executor identity. The selected plan is reconstructed from the freshly verified release. Reservation compares the exact supplied snapshot and independently loaded ceilings, then atomically reserves resource identities, generation identity and transition ownership in one ConfigMap replacement. Kubernetes UID/resourceVersion predicates reject concurrent deployers. Allocation authority is never inferred from active claims. Counters are canonical decimal strings; snapshots and allocations bind the actual registry UID.
@@ -61,15 +62,16 @@ images do not establish that evidence.
 
 ## Initial installation executor
 
-Enable `platform`'s `deployer` feature for `stage_controller(transition_id,
+Enable `platform`'s `deployer` feature for `stage_proxy_controller(transition_id,
 executor_id, &IntegrityVerifiedCandidate)` and `activate_initial(transition_id, executor_id)`.
 The former reloads independent trust and ceilings, checks the non-deserializable
-verified release against the reserved plan, stages exact generation RBAC, an
-immutable runtime configuration, inactive activation, preprovisioned inventory,
-and a zero-replica Deployment. Every successful object creation is followed by
-registry UID/content persistence. An object created before a failed UID-persistence
-CAS remains blocked for explicit platform recovery; matching names or annotations
-alone never authorize adoption.
+verified release against the reserved plan, stages the isolated Envoy proxy
+ahead of exact generation RBAC, an immutable runtime configuration, inactive
+activation, preprovisioned inventory, and a zero-replica Deployment. Every
+successful object creation is followed by registry UID/content persistence. An
+object created before a failed UID-persistence CAS remains blocked for
+explicit platform recovery; matching names or annotations alone never
+authorize adoption.
 
 The runtime receives no source checkout: its configuration names only the compiled
 IR identity, immutable native image, activation bindings, and bounded runtime
@@ -80,11 +82,11 @@ the Deployment. Resume uses the same recorded executor, UID and object resource
 versions. `Committed` records deployment transition completion, not workload
 readiness or an end-to-end behavioral pass.
 
-Initial installations record
-`requestDrainQualification: "unqualifiedDirectApi"`. They use the runtime's
-`inCluster` transport under the admitted API-bound enforcement gaps. This marker
-cannot authorize a later automatic upgrade. An upgrade requires qualified proxy
-transport and complete protected request-ledger evidence.
+Initial installations stage through the same isolated Envoy proxy path as an
+upgrade generation and record the resulting `IsolatedEnvoy` request-drain
+qualification. There is no direct in-cluster runtime transport for any
+generation; see [Isolated generation staging](#isolated-generation-staging)
+below for the proxy staging mechanics.
 
 ## Termination and proxy qualification
 
@@ -122,7 +124,7 @@ and [access logging](https://www.envoyproxy.io/docs/envoy/latest/configuration/o
 
 `stage_proxy_controller(transition_id, executor_id, &IntegrityVerifiedCandidate)` stages the
 fixed Envoy proxy before the zero-replica native controller. A protected
-`apsides-proxy-policy-{domain}` ConfigMap supplies `ProxyPolicy`: schema, domain and
+`apsides-proxy-policy-{domain}` ConfigMap supplies the internal proxy policy record: schema, domain and
 cluster bindings; the fixed Envoy/admin image digests; the digest of
 `envoy_configuration("qualified-template")`; independent environment qualification
 and node image digests; certificate lifetime (one day to one year); and the exact
@@ -181,14 +183,15 @@ the next controller. `commit_upgrade` invokes actual cleanup internally and uses
 one fresh registry CAS to release only completed claims. Caller-supplied cleanup
 receipts cannot commit a transition.
 
-The optional `test-support` build exposes `stage_test_candidate` only for separately
-verified candidate authorization. It verifies the actual `kube-system` Namespace
-UID plus a UID-pinned `apsides-test-support` ConfigMap of schema
-`apsides.dev/disposable-test-cluster/v1`, with exact cluster/control/workload scope.
-The cluster binding must begin `apsides-disposable-`, and namespaces `apsides-test-`.
-This acceptance capability never constructs `VerifiedRelease` and is absent from
-production CLI builds. Ordinary `aps deploy` independently verifies artifact trust and platform
-authorization. Full qualification evidence is checked by `aps verify-release`.
+The optional `test-support` build exposes `reserve_qualification_candidate` only
+for separately verified candidate authorization. It checks the exact signed
+candidate against a UID-pinned `apsides-candidate-qualification` ConfigMap
+marker of schema `apsides.dev/candidate-qualification/v1`, plus pinned
+`kube-system` Namespace, control/workload namespace and Node identities, then
+reserves the initial transition through the existing authenticated reservation
+path. It never stages or activates, and is absent from production CLI builds.
+Ordinary `aps deploy` independently verifies release integrity, signed
+provenance and platform authorization.
 
 Every activation/resume checks the staged service account and exact derived Roles
 and RoleBindings, including their recorded UIDs and current semantic contents.

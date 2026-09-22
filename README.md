@@ -5,9 +5,9 @@ Compiled reactive GitOps for Kubernetes.
 Apsides turns build-time TypeScript declarations into a validated resource and reaction plan and a native Rust controller. The controller reconciles declared resources and reacts to selected configuration changes without executing JavaScript.
 
 The implementation follows [specification 0.2](docs/reference/SPEC-v0.2.md).
-**The production release gates are not complete.** Read the
-[current status](docs/reference/STATUS.md) before interpreting a build or test as
-production evidence.
+**Apsides is not ready for production use.** Read the
+[current status](docs/reference/STATUS.md) before relying on a build or test
+result.
 
 ## Authoring
 
@@ -15,8 +15,19 @@ The [TSX example](examples/web-application/program.tsx) composes a reusable
 [`Api` component](examples/web-application/api.tsx) inside a controller boundary:
 
 ```tsx
-<Controller {...platformOptions}>
-  <Api name="api" namespace="production" image={images.api} />
+<Controller
+  id="team-api-production"
+  namespace="production"
+  controlNamespace="apsides-system"
+  clusterBinding="local-fixture"
+  policyRef="platform/team-api"
+  enforcement="api-bound"
+>
+  <Api
+    name="api"
+    namespace="production"
+    image="docker.io/nginxinc/nginx-unprivileged@sha256:9b87ad3dd9f431c733f19dfb278c7eb3dba9dca381942c79818bb42f1a566a83"
+  />
 </Controller>
 ```
 
@@ -36,33 +47,37 @@ A relocatable CLI bundle is available through `cuenv task packageCli`; see
 ## Local compiler
 
 ```sh
-cargo build -p cli
+cargo build --locked -p cli
+cargo fetch --locked
 target/debug/aps compile --source examples/web-application/program.tsx --output work/apsides-compiled
 target/debug/aps check --ir work/apsides-compiled/ir.json
 target/debug/aps build --source examples/web-application/program.tsx --output work/apsides-native --profile apsides.build.json
 target/debug/aps verify --artifact work/apsides-native
 ```
 
-Use a fresh output directory for each build. The source path uses Oxc and Rolldown for compilation and Deno with denied filesystem, network, environment, subprocess, and remote-import permissions for evaluation. SES compartments constrain ambient JavaScript capabilities, and the compiler compares independent bundle and evaluation runs. Final release reproducibility requires the separate native/image checks. Local compilation emits the validated IR, recomputed effects and capabilities, generated scenario plan, Rust controller source, and an integrity manifest. The complete build uses a pinned [build profile](docs/reference/OCI-PACKAGING.md#complete-cli-build), the prepared Cargo cache, Docker BuildKit, and cargo-cyclonedx to produce a Linux image, binary, SBOM, and compiler closure. `verify` checks local integrity and recomputes the plan; it does not establish approved provenance or production readiness.
+Use a fresh output directory for each build. The source path uses Oxc and Rolldown for compilation and Deno with denied filesystem, network, environment, subprocess, and remote-import permissions for evaluation. SES compartments constrain ambient JavaScript capabilities, and the compiler compares independent bundle and evaluation runs. Final release reproducibility requires the separate native/image checks. Local compilation emits the validated IR, recomputed effects and capabilities, generated scenario plan, Rust controller source, and an integrity manifest. The complete build uses a pinned [build profile](docs/reference/OCI-PACKAGING.md#complete-cli-build) that you write first — `apsides.build.json` is not shipped — plus the prepared Cargo cache, Docker BuildKit, and cargo-cyclonedx to produce a Linux image, binary, SBOM, and compiler closure. `verify` checks local integrity and recomputes the plan; it does not establish approved provenance or production readiness.
 
 The CI interface is `aps deploy`, independent of the Kubernetes provider. CI prepares a short-lived Kubernetes identity through its normal authentication setup; Apsides owns artifact/policy checks and the resumable deployment protocol. The privileged CI deployer creates the next generation’s Roles and RoleBindings, deploys its controller image, and retires the previous writer. The runtime receives only its approved reconciliation capabilities; it does not manage RBAC or upgrade itself. The deployment review lists [required CI access](docs/reference/DEPLOYMENT-PERMISSIONS.md). CI can select an immutable OCI release with `APSIDES_RELEASE_REFERENCE`; see [artifact retrieval](docs/reference/ARTIFACT-RESOLUTION.md#deploy-from-an-immutable-reference). Configure `APSIDES_INVENTORY_DATABASE` with an absolute path for persistent SQLite storage; see [resource inventory](docs/reference/INVENTORY.md#deployment-connection). Deployment requires platform-owned trust, ceiling, identity and proxy qualification records; current live acceptance limits are listed in the implementation status.
 
 ## Implementation and verification
 
 - `packages/kubernetes`: build-time TypeScript authoring.
+- `packages/compiler`: source locking, CRD type generation, and the Oxc/Rolldown/Deno compilation driver.
 - `crates/compiler-core`: strict IR validation, canonical identity, capability derivation, policy ceiling, and rollout primitives.
+- `crates/coordination`: claim, review, and audit records backing the deployment protocol.
 - `crates/deploy`: provider-neutral transition planning and recovery predicates.
 - `crates/cli`: compiler, release assembly/verification, and deployment entrypoint.
+- `crates/inventory`: metadata-only resource inventory for managed identities.
 - `crates/platform`: protected Kubernetes state, per-generation proxy transport and lifecycle execution.
-- `crates/release`: signed artifact, compiler closure, OCI and acceptance verification.
+- `crates/release`: release integrity, signed provenance, compiler closure and OCI verification.
 - `crates/runtime`: native reconciliation and an explicit disposable-cluster fixture boundary.
 
 The [toolchain choices](docs/reference/TOOLCHAIN.md) explain the Oxc/Deno and OSS integrations. The [OCI packaging path](docs/reference/OCI-PACKAGING.md) uses Cargo vendor and BuildKit.
 
 The [current status](docs/reference/STATUS.md) distinguishes implemented behavior,
-observed verification, and outstanding release gates. Full Kubernetes
-authorization, workload readiness, deployment recovery, and enforced offline
-execution require their own evidence.
+observed verification, and outstanding work. Full Kubernetes authorization,
+workload readiness, deployment recovery, and enforced offline execution are not
+yet qualified.
 
 ## Development tasks
 

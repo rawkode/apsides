@@ -25,8 +25,8 @@ are operational metadata and should not contain secrets.
 
 The default implementation is SQLite. A deployment uses a persistent
 absolute database path on application-owned storage; there is no remote
-primary and a token supplied by the trusted job environment. A future backend
-can implement the same immutable-snapshot and conditional-head contract.
+endpoint. A future backend can implement the same immutable-snapshot and
+conditional-head contract.
 
 ## Prune is a compiled lifecycle choice
 

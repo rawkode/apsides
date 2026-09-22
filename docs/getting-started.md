@@ -22,7 +22,7 @@ builder and runtime images, prepared Cargo dependencies, and
 From the repository root:
 
 ```sh
-cargo build -p cli
+cargo build --locked -p cli
 target/debug/aps --help
 ```
 
@@ -31,9 +31,12 @@ The Cargo package is `cli`; its binary is `aps`.
 ## Compile the example
 
 Choose a fresh output directory. The compiler refuses to reuse an existing
-source staging directory.
+source staging directory. On a clean Cargo cache, run `cargo fetch --locked`
+first; without it, `aps compile` fails with "prepared native dependencies are
+incomplete".
 
 ```sh
+cargo fetch --locked
 target/debug/aps compile \
   --source examples/web-application/program.tsx \
   --output work/apsides-compiled
@@ -54,9 +57,9 @@ target/debug/aps test \
 
 `check` reports validation status, IR digest and whether the IR is production
 input. `test` executes the compiler's required semantic scenarios into another
-fresh directory. It can intentionally return nonzero when required reactor
-coverage is unsupported; a passing semantic run does not satisfy the production
-release gate. Neither command contacts Kubernetes.
+fresh directory. Required cases that need a cluster are reported as
+unsupported, so it returns nonzero for any program with such cases. Neither
+command contacts Kubernetes.
 
 ## Read the result honestly
 

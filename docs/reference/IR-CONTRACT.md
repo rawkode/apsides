@@ -1,6 +1,6 @@
 # Apsides IR contract
 
-This is the current implementation boundary for specification 0.2. It is not a claim that the production release gates have passed. Unknown fields and unsupported operations are errors.
+This is the current implementation boundary for specification 0.2. It is not a claim of production readiness. Unknown fields and unsupported operations are errors.
 
 `schemaVersion` is `apsides.dev/ir/v1`. JSON uses camelCase. Every declaration has `source: {file: string, line: positive integer, column: positive integer}`. Resource and input IDs are unique within their category. A reaction references input IDs and a managed resource ID.
 
