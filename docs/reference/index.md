@@ -10,6 +10,7 @@ contracts.
 <div class="contract-grid">
   <a href="/reference/spec-v0-2/">Specification 0.2</a>
   <a href="/reference/status/">Implementation status</a>
+  <a href="/reference/acceptance/">Acceptance suite</a>
   <a href="/reference/ir-contract/">IR contract</a>
   <a href="/reference/platform-contract/">Platform contract</a>
   <a href="/reference/deployment-contract/">Deployment protocol</a>
@@ -30,6 +31,7 @@ contracts.
 | --- | --- |
 | What is the intended v0.2 system? | [Specification 0.2](/reference/spec-v0-2/) |
 | What works today, and what remains open? | [Implementation status](/reference/status/) |
+| How is the implementation accepted against the examples? | [Acceptance suite](/reference/acceptance/) |
 | What TypeScript can compile into IR? | [IR contract](/reference/ir-contract/) |
 | Where are trust and runtime authority enforced? | [Platform contract](/reference/platform-contract/) |
 | How do generation changes and recovery work? | [Deployment protocol](/reference/deployment-contract/) |

@@ -53,6 +53,7 @@ export default defineConfig({
           items: [
             { label: "Reference map", slug: "reference" },
             { label: "Specification 0.2", slug: "reference/spec-v0-2" },
+            { label: "Acceptance suite", slug: "reference/acceptance" },
             { label: "IR contract", slug: "reference/ir-contract" },
             { label: "Platform contract", slug: "reference/platform-contract" },
             { label: "Deployment protocol", slug: "reference/deployment-contract" },

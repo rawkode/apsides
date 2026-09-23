@@ -226,11 +226,11 @@ reconnection, old-writer credential denial before expiry, adoption, conditional
 SSA, finalizer-delayed cleanup, orphan retention, repeated commit, and replacement
 UID refusal. Each harness deletes only its owned cluster and removes its
 credential files. These runs use the test-candidate authorization boundary and
-do not establish the public `aps deploy` path for a complete signed release. A
-separate rehearsal exercises the public `aps deploy` command directly and passed
-at `work/cnpg-cli-demo-a01463e` (see `examples/cnpg/README.md`); that rehearsal
-demonstrates the CLI path for a demo deployment, not full production release
-acceptance.
+do not establish the public `aps deploy` path for a complete signed release. The
+Rust [acceptance suite](/reference/acceptance/), which runs in CI, deploys the
+signed CNPG pair with the public `aps deploy`: ceiling rejection before any
+successor object, upgrade, old-identity retirement, data preservation, input
+rollouts and a secret-canary scan, on single-node kind with a synthetic signer.
 
 A test-only interruption hook can pause after an exact validated registry CAS,
 allow the parent harness to inspect the protected phase, and remain parked until
