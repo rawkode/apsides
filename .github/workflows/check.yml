@@ -9,6 +9,12 @@ permissions:
 concurrency:
   group: checks-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+# Hosted runners have about 14 GB free. Debug info and incremental caches
+# for every crate and feature set filled it before the docs build.
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 jobs:
   check:
     runs-on: ubuntu-24.04
