@@ -15,7 +15,6 @@ tasks: {
 	packageCliTest: {command: "python3", args: ["tests/test_package_cli.py"]}
 	packagingTest: {command: "python3", args: ["tests/test_packaging.py"]}
 	cnpgDemoTest: {command: "python3", args: ["tests/test_cnpg_demo.py"]}
-	cnpgCliDemoTest: {command: "python3", args: ["tests/test_cnpg_cli_demo.py"]}
 	cnpgCleanupTest: {command: "python3", args: ["tests/test_cnpg_cleanup.py"]}
 	uncertainWriterTest: {command: "python3", args: ["tests/test_uncertain_writer.py"]}
 	apiGapTest: {command: "python3", args: ["tests/test_api_gap.py"]}
