@@ -12,6 +12,7 @@ use std::{
     ffi::{OsStr, OsString},
     path::PathBuf,
     process::Stdio,
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncReadExt as _};
@@ -103,12 +104,30 @@ impl Invocation {
         self
     }
 
-    /// Run the command and return its output whether or not it succeeded.
+    /// Start the command with the same environment, stdin and output bounds
+    /// as [`Invocation::output`], and return a handle to it. The deadline is
+    /// not applied: the caller decides when the child is waited for or killed.
     ///
     /// # Errors
-    /// Fails when the program cannot start, its stdin file cannot be opened,
-    /// or it does not finish before the deadline, in which case it is killed.
-    pub async fn output(self) -> Result<Output> {
+    /// Fails when the program cannot start or its stdin file cannot be opened.
+    pub fn spawn(self) -> Result<Running> {
+        let (program, mut child) = self.start()?;
+        let stdout = Arc::new(Mutex::new(Vec::new()));
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let readers = [
+            tokio::spawn(collect(child.stdout.take(), stdout.clone())),
+            tokio::spawn(collect(child.stderr.take(), stderr.clone())),
+        ];
+        Ok(Running {
+            program,
+            child,
+            stdout,
+            stderr,
+            readers,
+        })
+    }
+
+    fn start(self) -> Result<(String, tokio::process::Child)> {
         let program = self.program.to_string_lossy().into_owned();
         let mut command = tokio::process::Command::new(&self.program);
         command
@@ -123,13 +142,24 @@ impl Invocation {
             Some(path) => command.stdin(std::fs::File::open(path)?),
             None => command.stdin(Stdio::null()),
         };
-        let mut child = command.spawn().map_err(|error| Error::Process {
+        let child = command.spawn().map_err(|error| Error::Process {
             program: program.clone(),
             detail: format!("could not start: {error}"),
         })?;
+        Ok((program, child))
+    }
+
+    /// Run the command and return its output whether or not it succeeded.
+    ///
+    /// # Errors
+    /// Fails when the program cannot start, its stdin file cannot be opened,
+    /// or it does not finish before the deadline, in which case it is killed.
+    pub async fn output(self) -> Result<Output> {
+        let timeout = self.timeout;
+        let (program, mut child) = self.start()?;
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let finished = tokio::time::timeout(self.timeout, async {
+        let finished = tokio::time::timeout(timeout, async {
             tokio::try_join!(bounded(stdout), bounded(stderr), child.wait())
         })
         .await;
@@ -137,7 +167,7 @@ impl Invocation {
             // Dropping the child kills it; kill_on_drop is set above.
             return Err(Error::Process {
                 program,
-                detail: format!("did not finish within {}s", self.timeout.as_secs()),
+                detail: format!("did not finish within {}s", timeout.as_secs()),
             });
         };
         let (stdout, stderr, status) = finished?;
@@ -168,6 +198,139 @@ impl Invocation {
             program: format!("{program} {first}"),
             detail: tail(&output.stderr, 2000),
         })
+    }
+}
+
+/// A child started by [`Invocation::spawn`].
+///
+/// Its output is collected in the background, up to the same bound as a
+/// finished invocation's, and can be read while it runs. Dropping the handle
+/// kills the child.
+pub struct Running {
+    program: String,
+    child: tokio::process::Child,
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    readers: [tokio::task::JoinHandle<()>; 2],
+}
+
+/// How a spawned child ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ending {
+    /// It exited by itself, successfully or not, before it was killed.
+    Exited { success: bool },
+    /// It was still running and was terminated by SIGKILL.
+    Killed,
+}
+
+impl Running {
+    /// The operating system's process ID, while the child has one.
+    #[must_use]
+    pub fn id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    /// What the child has written to stderr so far.
+    #[must_use]
+    pub fn stderr(&self) -> String {
+        read(&self.stderr)
+    }
+
+    /// Whether the child has exited, and if so whether successfully.
+    ///
+    /// # Errors
+    /// Fails when the child's status cannot be read.
+    pub fn exited(&mut self) -> Result<Option<bool>> {
+        Ok(self.child.try_wait()?.map(|status| status.success()))
+    }
+
+    /// Kill the child with SIGKILL unless it has already exited, reap it,
+    /// and return how it ended with everything it wrote.
+    ///
+    /// # Errors
+    /// Fails when the child cannot be signalled or reaped, or when it ended
+    /// some other way than exiting or being killed by SIGKILL.
+    pub async fn kill(mut self) -> Result<(Ending, Output)> {
+        let ending = if let Some(status) = self.child.try_wait()? {
+            Ending::Exited {
+                success: status.success(),
+            }
+        } else {
+            self.child.start_kill()?;
+            let status = self.child.wait().await?;
+            if !killed_by_sigkill(status) {
+                return Err(Error::Process {
+                    program: self.program,
+                    detail: format!("did not end by SIGKILL: {status}"),
+                });
+            }
+            Ending::Killed
+        };
+        let output = self
+            .drain(matches!(ending, Ending::Exited { success: true }))
+            .await;
+        Ok((ending, output))
+    }
+
+    /// Wait up to `timeout` for the child to exit by itself.
+    ///
+    /// # Errors
+    /// Fails when the child cannot be reaped or does not exit in time, in
+    /// which case it is killed.
+    pub async fn wait(mut self, timeout: Duration) -> Result<Output> {
+        let Ok(status) = tokio::time::timeout(timeout, self.child.wait()).await else {
+            return Err(Error::Process {
+                program: self.program,
+                detail: format!("did not finish within {}s", timeout.as_secs()),
+            });
+        };
+        let success = status?.success();
+        Ok(self.drain(success).await)
+    }
+
+    async fn drain(self, success: bool) -> Output {
+        for reader in self.readers {
+            let _ = reader.await;
+        }
+        Output {
+            stdout: read(&self.stdout),
+            stderr: read(&self.stderr),
+            success,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn killed_by_sigkill(status: std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt as _;
+    status.signal() == Some(9)
+}
+
+#[cfg(not(unix))]
+fn killed_by_sigkill(status: std::process::ExitStatus) -> bool {
+    !status.success()
+}
+
+fn read(buffer: &Mutex<Vec<u8>>) -> String {
+    let bytes = buffer.lock().unwrap_or_else(PoisonError::into_inner);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Append `stream` to `buffer` until it closes, keeping at most the bound.
+async fn collect(stream: Option<impl AsyncRead + Unpin>, buffer: Arc<Mutex<Vec<u8>>>) {
+    let Some(mut stream) = stream else {
+        return;
+    };
+    let mut chunk = [0; 8192];
+    while let Ok(read) = stream.read(&mut chunk).await {
+        if read == 0 {
+            return;
+        }
+        let mut kept = buffer.lock().unwrap_or_else(PoisonError::into_inner);
+        let room = usize::try_from(MAX_OUTPUT)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(kept.len());
+        kept.extend_from_slice(chunk.get(..read.min(room)).unwrap_or_default());
     }
 }
 
@@ -239,6 +402,41 @@ mod tests {
             .await;
         assert!(matches!(outcome, Err(Error::Process { .. })));
         assert!(started.elapsed() < Duration::from_secs(10));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_spawned_child_is_killed_by_sigkill_with_its_output_so_far() -> Result<()> {
+        let mut running = Invocation::new("sh")
+            .args(["-c", "echo started >&2; exec sleep 30"])
+            .spawn()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !running.stderr().contains("started") && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(running.exited()?, None);
+        let (ending, output) = running.kill().await?;
+        assert_eq!(ending, Ending::Killed);
+        assert_eq!(output.stderr.trim(), "started");
+        assert!(!output.success);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_spawned_child_that_already_exited_is_not_killed() -> Result<()> {
+        let running = Invocation::new("sh")
+            .args(["-c", "echo done; exit 0"])
+            .spawn()?;
+        let output = running.wait(Duration::from_secs(10)).await?;
+        assert!(output.success);
+        assert_eq!(output.stdout.trim(), "done");
+        let mut failed = Invocation::new("sh").args(["-c", "exit 4"]).spawn()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while failed.exited()?.is_none() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (ending, _) = failed.kill().await?;
+        assert_eq!(ending, Ending::Exited { success: false });
         Ok(())
     }
 
