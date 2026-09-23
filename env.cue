@@ -75,6 +75,9 @@ tasks: {
 	ownershipCollisionTest: {command: "python3", args: ["-m", "unittest", "tests/test_ceiling_observations.py", "tests/test_deployment_ceiling.py", "tests/test_ownership_collision.py"]}
 	testClusterTest: {command: "cargo", args: ["test", "--locked", "-p", "test-cluster"]}
 	testClusterCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "test-cluster", "--all-targets", "--", "-D", "warnings"]}
+	// Refreshes scripts/runtime-base from the registry for the digest in
+	// scripts/runtime-base/reference; the only task that fetches image metadata.
+	runtimeBasePin: {command: "python3", args: ["scripts/runtime_base_pin.py"]}
 	// The fixture release and workload fixture image `aps test --cluster` runs.
 	// Needs Docker, cargo-cyclonedx and the pinned build images already pulled;
 	// see scripts/reactor_fixture.sh. The cluster run also needs kind and the
