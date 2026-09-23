@@ -13,17 +13,20 @@
 //! `ServiceAccount`, every case in the release's test plan is driven through
 //! that cluster, and the cluster is deleted unless the caller asked to keep
 //! it, including when the run is interrupted.
+//!
+//! [`cluster`], [`images`] and [`process`] are public so other suites that
+//! need a disposable kind cluster share them rather than copying them.
 
 mod cases;
-mod cluster;
+pub mod cluster;
 mod contract;
 mod crds;
 mod driver;
-mod images;
+pub mod images;
 mod manifests;
 mod offline;
 mod oracle;
-mod process;
+pub mod process;
 mod report;
 mod suite;
 #[cfg(test)]
