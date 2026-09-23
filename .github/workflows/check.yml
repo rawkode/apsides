@@ -83,7 +83,6 @@ jobs:
       - name: Run qualification harness unit tests
         run: |
           bash .github/cuenv-task.sh cnpgDemoTest
-          bash .github/cuenv-task.sh cnpgCliDemoTest
           bash .github/cuenv-task.sh cnpgCleanupTest
           bash .github/cuenv-task.sh apiGapProbesTest
           bash .github/cuenv-task.sh performanceTest

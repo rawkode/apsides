@@ -70,36 +70,28 @@ provides these commands as `aps`.
 
 ## 2. Deploy the database, then upgrade to the API
 
-The rehearsal below runs the public `aps deploy` command for both versions on a
-new kind cluster, then checks workload behavior. Its setup helper installs CNPG
-and provisions the platform trust, permissions and identities. Compilation alone
-does not prepare these deployment inputs.
-
-Reuse the prepared local signed initial and successor candidates with their
-matching trust policy; full production qualification is not required for this
-demo. For preparing new artifacts, see [build and deployment inputs](../../docs/guides/build-and-deploy.md) for the
-artifact and platform requirements. The CNPG 1.30.0 operator manifest must pin
-its operator image and `OPERATOR_IMAGE_NAME` to the same digest. Use absolute
-input paths and a new output directory:
+The acceptance suite's CNPG scenario runs the public `aps deploy` command for
+both versions on a new kind cluster, then checks workload behavior. It builds
+and signs both releases, installs CNPG and provisions the platform trust,
+permissions and identities itself; compilation alone does not prepare these
+deployment inputs. See the [acceptance suite](../../docs/reference/ACCEPTANCE.md)
+for its prerequisites, and [build and deployment inputs](../../docs/guides/build-and-deploy.md)
+for what a real platform must provide.
 
 ```sh
-cuenv exec -- python3 tests/run_cnpg_cli_demo.py \
-  --aps "$PWD/target/debug/aps" \
-  --initial-artifact "$INITIAL_CANDIDATE" \
-  --successor-artifact "$SUCCESSOR_CANDIDATE" \
-  --trust-policy "$TRUST_POLICY" \
-  --operator-manifest "$PINNED_OPERATOR_MANIFEST" \
-  --operator-sha256 "$OPERATOR_MANIFEST_DIGEST" \
-  --output "$PWD/work/cnpg-cli-rehearsal"
+cuenv task acceptancePrepare
+cuenv task acceptanceTest
 ```
 
 Presentation checkpoints:
 
 1. **Database ready:** the initial controller creates the database and seeds two
    `messages` rows. There is no API Deployment yet.
-2. **API upgrade:** the setup helper updates the approved permission policy, then
-   `aps deploy` upgrades to the API version. The database declaration stays
-   unchanged; PostgREST serves the two seeded rows using the CNPG Secret.
+2. **API upgrade:** under the database-only policy `aps deploy` refuses the API
+   version before creating anything. The scenario then widens the approved
+   permission policy and `aps deploy` upgrades to the API version. The database
+   declaration stays unchanged; PostgREST serves the two seeded rows using the
+   CNPG Secret.
 3. **ConfigMap reaction:** `api-settings` changes `PGRST_DB_MAX_ROWS` from `100`
    to `1`. The API gets a new Pod, ReplicaSet and rollout revision while its
    Deployment UID remains stable. HTTP now returns one row: the response limit
@@ -112,18 +104,14 @@ Presentation checkpoints:
    that the original Secret data is restored in memory and waits for the restored
    workload. Secret values are not saved in evidence.
 
-The rehearsal also inserts a public row in a separate `aps_demo_persistence`
+The scenario also inserts a public row in a separate `aps_demo_persistence`
 table before upgrading, then requires that row and the same CNPG resource and
 PVC identities afterward. This leaves the visible `messages` demo unchanged.
-The public CLI rehearsal in `work/cnpg-cli-demo-a01463e` passed both deployments,
-this persistence checkpoint, the input reactions and cleanup. Deployment reports
-verify artifact trust and explicitly leave full release qualification unevaluated.
 
 The example uses `deletionPolicy="orphan"` for its resources. That protects the
-intended resource lifecycle; it is not a database backup. The rehearsal deletes
-its disposable cluster, including its demo data, and removes its
-credentials while preserving existing clusters.
+intended resource lifecycle; it is not a database backup. The scenario deletes
+its disposable cluster, including its demo data, and its credentials.
 
-Read `result.json` and `cli-reports.json` in the output directory for the checks
-and actual CLI commit reports. This runner always cleans up; it has no retain
-option. ConfigMap and Secret reaction checks are included automatically.
+Read `work/acceptance/results/cnpg-upgrade/report.json` for every check and the
+CLI commit reports. The `aps` output and controller logs sit beside it, with
+Secret values, the rollout key and tokens redacted.
