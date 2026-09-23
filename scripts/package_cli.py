@@ -97,7 +97,9 @@ def source_files() -> tuple[str, ...]:
     if tracked != set(expected):
         missing = sorted(set(expected) - tracked)
         raise PackagingError(f"distribution source is not tracked: {missing[0]}")
-    files = sorted({*expected, *recursive})
+    # The runtime base's registry metadata, which `aps build` verifies offline.
+    pins = _git_files(["scripts/runtime-base"])
+    files = sorted({*expected, *recursive, *pins})
     if not recursive or any(not item.startswith(tuple(f"crates/{crate}/src/" for crate in CRATES)) for item in recursive):
         raise PackagingError("invalid tracked Rust source closure")
     return tuple(files)

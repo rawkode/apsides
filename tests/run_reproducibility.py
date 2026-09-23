@@ -189,13 +189,12 @@ def build(cli, source, profile, repository, output, index):
 
 def build_identity(directory, sources, profile_digest):
     result = read_json(directory / "build-result.json")
-    metadata = read_json(directory / "image/buildkit-metadata.json")
     inputs = read_json(directory / "build-inputs.json")
     ir = read_json(directory / "ir.json")
     plan = read_json(directory / "plan.json")
     binary = digest_file(directory / "linux-binary/apsides-controller")
     archive = digest_file(directory / "image/controller.oci.tar")
-    image_digest = metadata.get("containerimage.digest")
+    image_digest = result.get("imageDigest")
     ir_digest = digest_bytes(canonical(ir))
     closure = inputs.get("compilerClosure")
     compiler_digest = inputs.get("compilerClosureDigest")

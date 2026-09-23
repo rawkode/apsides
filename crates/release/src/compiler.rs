@@ -58,6 +58,9 @@ pub struct HostTool {
     pub version: String,
 }
 
+/// The runtime base image: its pinned reference, the registry index and
+/// platform manifest that digest names (committed as source pins, since
+/// Docker's classic image store keeps neither), and the image config.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApprovedRuntime {
@@ -68,7 +71,6 @@ pub struct ApprovedRuntime {
 }
 
 pub(crate) struct ValidatedRuntime {
-    pub manifest: Value,
     pub config: Value,
 }
 
@@ -240,7 +242,7 @@ fn validate_runtime(runtime: &ApprovedRuntime) -> Result<ValidatedRuntime> {
     {
         return reject("approved runtime contains an unsafe or ambiguous environment");
     }
-    Ok(ValidatedRuntime { manifest, config })
+    Ok(ValidatedRuntime { config })
 }
 
 pub(crate) fn validated_compiler_closure(

@@ -36,7 +36,7 @@ python3 scripts/package_oci.py build \
 
 The runtime image must already be cached, match the builder's platform, and supply the compatible GNU/Linux C runtime and CA certificates. A digest-pinned nonroot Debian 12 C/C++ distroless base is the intended deployment profile. Integration preparation cached `gcr.io/distroless/cc-debian12@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f`. Its upstream image family is documented by [Distroless](https://github.com/GoogleContainerTools/distroless). This is a digest pin, not a verified signature. The integration startup result is recorded below.
 
-The two-stage Dockerfile runs `cargo build --frozen --release` with vendored dependencies and `RUN --network=none`. The final image receives only the generated native binary from the build stage, uses UID/GID 65532, and embeds the validated IR in that binary. Runtime fixture configuration must be provided separately at the explicitly configured file path. The script requests BuildKit's standard OCI archive exporter and metadata output; it never pushes an image. The selected BuildKit driver must support that exporter and already have access to the pinned base-image contents.
+The two-stage Dockerfile runs `cargo build --frozen --release` with vendored dependencies and `RUN --network=none`. The final image receives only the generated native binary from the build stage, uses UID/GID 65532, and embeds the validated IR in that binary. Runtime fixture configuration must be provided separately at the explicitly configured file path. The script uses BuildKit's image exporter, which every Docker driver and image store supports, so neither the containerd image store nor a `docker-container` builder is required. It never pushes an image; the built image stays in the local Docker store without a name. The script reads it back with `docker image save`, checks every blob against its digest and every layer against the config's diff IDs, and writes `controller.oci.tar`: an OCI layout holding one manifest that it generates from that config and those layers. The image digest is that manifest's digest, recorded as `imageDigest` in `packaging-inputs.json`. The classic store saves layers uncompressed and the containerd store saves them compressed, so the same build has a different image digest in each store. On the classic store BuildKit does not rewrite file timestamps inside layers, so image digests there are not reproducible; the binary digest does not depend on them.
 
 Both the build invocation and its Cargo RUN steps disable build-step networking. These flags do not by themselves prove that BuildKit's source/metadata resolver made no external requests. Whole-process egress isolation and production deployment authorization require separate evidence. Reproducible image builds, candidate provenance verification, and containerized reconciliation have separate receipts; consult STATUS.md for their current verification boundaries. A prepared context or successful image export must not be reported as satisfying them.
 
@@ -44,8 +44,29 @@ Both the build invocation and its Cargo RUN steps disable build-step networking.
 
 `aps build --source examples/web-application/program.tsx --output dist/build --profile apsides.build.json`
 composes source compilation, offline Cargo vendoring, BuildKit image creation,
-Docker rootfs binary extraction, cargo-cyclonedx SBOM generation, and compiler
-closure assembly. It emits `build-result.json`, `image/controller.oci.tar`,
+binary extraction, cargo-cyclonedx SBOM generation, and compiler
+closure assembly. The binary is read from the image's final layer, which must
+hold only the controller and its parent directories; no container is created.
+The runtime base's registry index and its linux/amd64 and linux/arm64
+manifests are committed as source pins in `scripts/runtime-base`, byte for
+byte and named by their digests, beside the pinned `reference`. Docker's
+classic image store keeps neither document, so the build cannot read them
+locally. `cuenv task runtimeBasePin` refreshes them for a new digest and is
+the only step that contacts a registry. The build verifies offline that the
+pinned index hashes to the pinned digest and lists exactly one manifest for
+the build platform, and that that manifest hashes to its descriptor and names
+the image config held by the local store. It reads that config from
+`docker image save` in either format Docker writes (an OCI layout, or the
+docker-archive of Docker before 25). The saved image must be the one
+`docker image inspect` matched to the pinned digest, and where the store keeps
+compressed layers they must be the manifest's layer blobs. The compiler
+closure records the index, manifest and config, and `aps release` checks the
+same chain offline. It then requires the image's layers to be exactly the base
+config's diff IDs plus the controller layer, decompressing and hashing each
+layer against its diff ID. It does not compare compressed base-layer
+descriptors, because the classic store exports base layers uncompressed.
+
+The build emits `build-result.json`, `image/controller.oci.tar`,
 `linux-binary/apsides-controller`, `sbom/sbom.json`, and `build-inputs.json`.
 The separately prepared context is the sibling `dist/build.oci-context`.
 `aps check --ir` remains available for inspecting the compiled IR from `aps compile` without producing an image.
@@ -54,6 +75,7 @@ The build profile uses schema `apsides.dev/build-profile/v1` and exactly these f
 `builderImage`, `runtimeImage` (both immutable digest references), `platform`
 (`linux/arm64` or `linux/amd64`), `sbomTool` (an executable path relative to the
 profile or absolute), `sbomToolSha256`, and `sourceDateEpoch` (nonnegative integer).
+The `runtimeImage` digest must have registry pins in `scripts/runtime-base`.
 The platform, cached image identities, executable digest, source lock, and compiler
 closure must agree. Missing cached dependencies/images fail without a pull fallback.
 The profile defaults to `apsides.build.json` in the invoking directory.
