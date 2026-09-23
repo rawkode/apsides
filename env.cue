@@ -81,23 +81,37 @@ tasks: {
 		command: "sh"
 		args: ["-c", "sh scripts/reactor_fixture.sh examples/web-application/program.tsx work/reactor && rm -rf work/reactor/results && target/debug/aps test --cluster --release work/reactor/release --fixture-image work/reactor/fixture-image.tar --output work/reactor/results"]
 	}
-	// Builds and signs the CNPG releases the acceptance suite deploys, fetches
-	// the pinned CNPG operator manifest and writes work/acceptance/inputs.json.
-	// Generates the CNPG types itself rather than depending on cnpgTypes: a
-	// dependency chain two tasks deep makes cuenv's module evaluation time out.
-	// Needs Docker, cargo-cyclonedx on PATH and the pinned build images local;
-	// see docs/reference/ACCEPTANCE.md.
+	// Builds and signs the releases the acceptance suite deploys (the CNPG
+	// initial, successor and cleanup examples and the cnpg-owner program),
+	// fetches the pinned CNPG operator manifest and writes
+	// work/acceptance/inputs.json. Generates the CNPG types itself rather than
+	// depending on the types tasks: a dependency chain two tasks deep makes
+	// cuenv's module evaluation time out. Needs Docker, cargo-cyclonedx on
+	// PATH and the pinned build images local; see docs/reference/ACCEPTANCE.md.
 	acceptancePrepare: {
 		dependsOn: [build, install]
 		command: "sh"
-		args: ["-c", "deno run --allow-all packages/compiler/src/crds.ts https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_clusters.yaml Cluster examples/cnpg/.aps/crds/cnpg.ts v1 && deno run --allow-all packages/compiler/src/crds.ts https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_clusters.yaml Cluster examples/cnpg/initial/.aps/crds/cnpg.ts v1 && cargo run --locked -p acceptance --bin acceptance-prepare -- --output work/acceptance"]
+		args: ["-c", "deno run --allow-all packages/compiler/src/crds.ts https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_clusters.yaml Cluster examples/cnpg/.aps/crds/cnpg.ts v1 && deno run --allow-all packages/compiler/src/crds.ts https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_clusters.yaml Cluster examples/cnpg/initial/.aps/crds/cnpg.ts v1 && deno run --allow-all packages/compiler/src/crds.ts https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_clusters.yaml Cluster examples/cnpg/cleanup/.aps/crds/cnpg.ts v1 && deno run --allow-all packages/compiler/src/crds.ts https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_backups.yaml Backup examples/cnpg/cleanup/.aps/crds/backup.ts v1 && cargo run --locked -p acceptance --bin acceptance-prepare -- --output work/acceptance"]
 	}
-	// Runs the acceptance scenarios, each on its own kind cluster, against
+	// Runs every acceptance scenario, each on its own kind cluster, against
 	// what acceptancePrepare wrote. Needs Docker, kind and the pinned kind
-	// node image local.
+	// node image local. CI runs the same scenarios split across the three
+	// tasks after it.
 	acceptanceTest: {
 		command: "sh"
 		args: ["-c", "APSIDES_ACCEPTANCE_INPUTS=\"$PWD/work/acceptance/inputs.json\" cargo test --locked -p acceptance --test kind -- --ignored --test-threads=1 --nocapture"]
+	}
+	acceptanceUpgradeTest: {
+		command: "sh"
+		args: ["-c", "APSIDES_ACCEPTANCE_INPUTS=\"$PWD/work/acceptance/inputs.json\" cargo test --locked -p acceptance --test kind -- --ignored --test-threads=1 --nocapture upgrade:: uncertain:: collision::"]
+	}
+	acceptancePhasesTest: {
+		command: "sh"
+		args: ["-c", "APSIDES_ACCEPTANCE_INPUTS=\"$PWD/work/acceptance/inputs.json\" cargo test --locked -p acceptance --test kind -- --ignored --test-threads=1 --nocapture phases::"]
+	}
+	acceptanceCleanupTest: {
+		command: "sh"
+		args: ["-c", "APSIDES_ACCEPTANCE_INPUTS=\"$PWD/work/acceptance/inputs.json\" cargo test --locked -p acceptance --test kind -- --ignored --test-threads=1 --nocapture cleanup::"]
 	}
 	acceptanceCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "acceptance", "--all-targets", "--", "-D", "warnings"]}
 	runtimeTest: {command: "cargo", args: ["test", "--locked", "-p", "runtime"]}

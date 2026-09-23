@@ -8,7 +8,10 @@
 use crate::{Error, Result, infrastructure};
 use kube::{
     Api, Client,
-    api::{ApiResource, DynamicObject, GroupVersionKind, ListParams, PostParams},
+    api::{
+        ApiResource, DeleteParams, DynamicObject, GroupVersionKind, ListParams, Patch, PatchParams,
+        PostParams, Preconditions,
+    },
 };
 use serde_json::Value;
 
@@ -56,6 +59,19 @@ const KINDS: &[(&str, &str, &str, bool)] = &[
         false,
     ),
     ("postgresql.cnpg.io/v1", "Cluster", "clusters", true),
+    ("postgresql.cnpg.io/v1", "Backup", "backups", true),
+    (
+        "admissionregistration.k8s.io/v1",
+        "ValidatingAdmissionPolicy",
+        "validatingadmissionpolicies",
+        false,
+    ),
+    (
+        "admissionregistration.k8s.io/v1",
+        "ValidatingAdmissionPolicyBinding",
+        "validatingadmissionpolicybindings",
+        false,
+    ),
 ];
 
 /// JSON access to the suite's kinds with one client's identity.
@@ -142,6 +158,84 @@ impl Objects {
         Ok(serde_json::to_value(
             api.replace(&name, &PostParams::default(), &object).await?,
         )?)
+    }
+
+    /// Replace `object` as [`Objects::replace`] would, without persisting
+    /// anything: the request passes validation and admission only.
+    ///
+    /// # Errors
+    /// As [`Objects::replace`], including any admission denial.
+    pub async fn replace_dry_run(&self, object: &Value) -> Result<Value> {
+        let (api, name) = self.api_for(object)?;
+        let object: DynamicObject = serde_json::from_value(object.clone())?;
+        let params = PostParams {
+            dry_run: true,
+            ..PostParams::default()
+        };
+        Ok(serde_json::to_value(
+            api.replace(&name, &params, &object).await?,
+        )?)
+    }
+
+    /// Server-side apply `object` as `manager`, taking ownership of every
+    /// field it names.
+    ///
+    /// # Errors
+    /// Fails for an unhandled kind or when the API server refuses the apply.
+    pub async fn apply(&self, object: &Value, manager: &str) -> Result<Value> {
+        let (api, name) = self.api_for(object)?;
+        let params = PatchParams::apply(manager).force();
+        Ok(serde_json::to_value(
+            api.patch(&name, &params, &Patch::Apply(object)).await?,
+        )?)
+    }
+
+    /// Delete `object` only while it still has the UID and resourceVersion
+    /// it was read with. Returns once the API server accepted the request;
+    /// finalizers may keep the object present.
+    ///
+    /// # Errors
+    /// Fails when either precondition is missing or no longer holds.
+    pub async fn delete(&self, object: &Value) -> Result {
+        let uid = object["metadata"]["uid"].as_str().unwrap_or_default();
+        let version = object["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or_default();
+        if uid.is_empty() || version.is_empty() {
+            return infrastructure("a deletion must carry its UID and resourceVersion");
+        }
+        let (api, name) = self.api_for(object)?;
+        let params = DeleteParams {
+            preconditions: Some(Preconditions {
+                uid: Some(uid.to_owned()),
+                resource_version: Some(version.to_owned()),
+            }),
+            ..DeleteParams::default()
+        };
+        api.delete(&name, &params).await?;
+        Ok(())
+    }
+
+    /// Delete a cluster-scoped or namespaced object by name if it exists.
+    ///
+    /// # Errors
+    /// Fails for an unhandled kind or any API error other than absence.
+    pub async fn remove(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result {
+        match self
+            .api(api_version, kind, namespace)?
+            .delete(name, &DeleteParams::default())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(status)) if status.code == 404 => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// The named object, or `None` when it does not exist.

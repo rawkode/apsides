@@ -105,6 +105,81 @@ impl Pair {
     }
 }
 
+/// The last-type cleanup pair: `examples/cnpg/cleanup`, which adds one
+/// `Backup` to the successor with deletion policy `delete`, then
+/// `examples/cnpg`, which removes it.
+pub struct CleanupPair {
+    pub predecessor: Candidate,
+    pub successor: Candidate,
+    /// The one policy both generations deploy under: the predecessor's
+    /// runtime ceiling, and a cleanup ceiling that also allows reading and
+    /// deleting exactly the `Backup`.
+    pub policy: PolicyState,
+}
+
+/// The `Backup` the cleanup pair removes.
+pub const CLEANUP_GROUP: &str = "postgresql.cnpg.io";
+pub const CLEANUP_RESOURCE: &str = "backups";
+pub const CLEANUP_NAME: &str = "cleanup-backup";
+
+impl CleanupPair {
+    /// Read and check the pair.
+    ///
+    /// # Errors
+    /// Fails when either release is unreadable, or the pair is not exactly
+    /// the removal of the one `Backup` with every other resource unchanged.
+    pub fn load(predecessor: &Path, successor: &Path) -> Result<Self> {
+        let predecessor = Candidate::read(predecessor)?;
+        let successor = Candidate::read(successor)?;
+        let is_target =
+            |resource: &Resource| resource.kind == "Backup" && resource.name == CLEANUP_NAME;
+        let (removed, retained): (Vec<_>, Vec<_>) = predecessor
+            .plan
+            .ir
+            .resources
+            .iter()
+            .partition(|resource| is_target(resource));
+        ensure(
+            matches!(removed.as_slice(), [backup]
+                if backup.lifecycle.deletion_policy == compiler_core::DeletionPolicy::Delete
+                && backup.namespace == WORKLOAD_NAMESPACE)
+                && retained.len() == successor.plan.ir.resources.len()
+                && retained
+                    .iter()
+                    .zip(&successor.plan.ir.resources)
+                    .all(|(before, after)| projection(before) == projection(after))
+                && !successor.plan.capabilities.iter().any(|capability| {
+                    capability.api_group == CLEANUP_GROUP && capability.resource == CLEANUP_RESOURCE
+                }),
+            "cleanup pair is not the bounded CNPG last-type removal",
+        )?;
+        let runtime = ceiling(&predecessor.plan);
+        let mut cleanup = runtime.clone();
+        let mut capabilities = cleanup.capabilities.into_iter().collect::<BTreeSet<_>>();
+        for verb in ["get", "delete"] {
+            capabilities.insert(Capability {
+                namespace: WORKLOAD_NAMESPACE.into(),
+                api_group: CLEANUP_GROUP.into(),
+                resource: CLEANUP_RESOURCE.into(),
+                subresource: None,
+                verb: verb.into(),
+                names: vec![CLEANUP_NAME.into()],
+            });
+        }
+        cleanup.capabilities = capabilities.into_iter().collect();
+        Ok(Self {
+            predecessor,
+            successor,
+            policy: PolicyState {
+                image_pull_secrets: Vec::new(),
+                schema_version: platform::SCHEMA_VERSION.into(),
+                runtime_ceiling: runtime,
+                cleanup_ceiling: cleanup,
+            },
+        })
+    }
+}
+
 /// A runtime ceiling allowing exactly `plan`'s capabilities, gaps and risks.
 #[must_use]
 pub fn ceiling(plan: &CompiledPlan) -> PermissionCeiling {

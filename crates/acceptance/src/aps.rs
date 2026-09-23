@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use test_cluster::process::Invocation;
+use test_cluster::process::{Invocation, Output, Running};
 
 /// Longer than `aps deploy`'s own 300 s protocol deadline plus connection and
 /// verification time.
@@ -46,7 +46,20 @@ impl Aps {
     /// Fails only when the process cannot run or exceeds its deadline; an
     /// unsuccessful deployment is reported in [`Run::success`].
     pub async fn deploy(&self, release: &Path, executor: &str) -> Result<Run> {
-        let output = Invocation::new(&self.executable)
+        Ok(self.invocation(release, executor).output().await?.into())
+    }
+
+    /// Start `aps deploy --artifact <release> --executor <executor>` and
+    /// return at once, for a scenario that stops it part-way.
+    ///
+    /// # Errors
+    /// Fails when the process cannot start.
+    pub fn spawn(&self, release: &Path, executor: &str) -> Result<Running> {
+        Ok(self.invocation(release, executor).spawn()?)
+    }
+
+    fn invocation(&self, release: &Path, executor: &str) -> Invocation {
+        Invocation::new(&self.executable)
             .arg("deploy")
             .arg("--artifact")
             .arg(release)
@@ -54,14 +67,72 @@ impl Aps {
             .env("KUBECONFIG", &self.kubeconfig)
             .env("APSIDES_INVENTORY_DATABASE", &self.database)
             .timeout(DEPLOY_TIMEOUT)
-            .output()
-            .await?;
-        Ok(Run {
+    }
+}
+
+impl From<Output> for Run {
+    fn from(output: Output) -> Self {
+        Self {
             success: output.success,
             stdout: output.stdout,
             stderr: output.stderr,
-        })
+        }
     }
+}
+
+/// Require `run` to have failed with `diagnostic` on stderr.
+///
+/// # Errors
+/// Fails when the run succeeded or reported something else.
+pub fn refused(run: &Run, diagnostic: &str) -> Result {
+    ensure(
+        !run.success && run.stderr.contains(diagnostic),
+        format!(
+            "aps deploy was not refused with `{diagnostic}`: {}",
+            test_cluster::process::tail(&run.stderr, 2000)
+        ),
+    )
+}
+
+/// The fields of an `already-committed` report: a rerun of a deployment
+/// whose transition had committed, which republishes its inventory.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlreadyCommitted {
+    pub status: String,
+    pub transition: String,
+    pub release_digest: String,
+    pub inventory: Inventory,
+}
+
+/// Parse the report of a rerun that found `transition` already committed.
+///
+/// # Errors
+/// Fails when the run failed or reported anything else.
+pub fn already_committed(
+    run: &Run,
+    release_digest: &str,
+    transition: &str,
+) -> Result<AlreadyCommitted> {
+    ensure(
+        run.success,
+        format!(
+            "aps deploy rerun failed: {}",
+            test_cluster::process::tail(&run.stderr, 2000)
+        ),
+    )?;
+    let report: AlreadyCommitted = serde_json::from_str(&run.stdout).map_err(|error| {
+        Error::Check(format!(
+            "aps deploy rerun report is not already-committed: {error}"
+        ))
+    })?;
+    ensure(
+        report.status == "already-committed"
+            && report.release_digest == release_digest
+            && report.transition == transition,
+        "the rerun did not report the committed transition",
+    )?;
+    Ok(report)
 }
 
 /// The fields of a committed deployment report the scenarios assert on.

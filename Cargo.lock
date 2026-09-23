@@ -14,6 +14,7 @@ dependencies = [
  "kube",
  "platform",
  "release",
+ "rusqlite",
  "serde",
  "serde-saphyr",
  "serde_json",

@@ -16,12 +16,15 @@
 pub mod aps;
 pub mod bootstrap;
 pub mod cnpg;
+pub mod hold;
 pub mod inputs;
 pub mod node;
 pub mod objects;
+pub mod observe;
 pub mod pair;
 pub mod prepare;
 pub mod record;
+pub mod scenario;
 pub mod wait;
 pub mod workload;
 

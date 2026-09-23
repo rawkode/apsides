@@ -9,16 +9,20 @@
 //! `APSIDES_INVENTORY_DATABASE`, exactly as a deployment job would find them.
 //!
 //! The permissions mirror what the retired Python harness granted: a fixed
-//! deployer Role in the control namespace, every capability either release
-//! delegates (the deployer must hold what it grants), exact reads of the
-//! registry authority, the target namespaces and the node, and an issuer that
-//! can only read its trust inputs and mint the deployer's token.
+//! deployer Role in the control namespace, every capability any release the
+//! scenario deploys delegates (the deployer must hold what it grants), a read
+//! of every object those releases manage and deletion of those they delete on
+//! cleanup, exact reads of the registry authority, the target namespaces and
+//! the node, and an issuer that can only read its trust inputs and mint the
+//! deployer's token. One deployer serves every domain the registry is
+//! bootstrapped for.
 
 use crate::{
     Error, Result, ensure,
     objects::{Objects, text},
-    pair::Pair,
+    pair::Candidate,
 };
+use compiler_core::{DeletionPolicy, Domain};
 use k8s_openapi::api::{
     authentication::v1::{TokenRequest, TokenRequestSpec},
     core::v1::ServiceAccount,
@@ -26,7 +30,11 @@ use k8s_openapi::api::{
 use kube::{Api, api::PostParams};
 use platform::{DEPLOYMENT_IDENTITY_SCHEMA_V2, DeploymentIdentity, PlatformClient, PolicyState};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::Arc,
+};
 use test_cluster::cluster::Endpoint;
 
 /// The identity `aps` authenticates as: it can only mint the deployer token.
@@ -49,17 +57,24 @@ pub struct Platform {
     objects: Objects,
     admin: PlatformClient,
     control: String,
-    domain: String,
-    policy: Value,
-    /// The 32-byte rollout key, for the secret-canary scan.
-    pub rollout_key: Vec<u8>,
+    /// Each domain's policy `ConfigMap`, as last written.
+    policies: BTreeMap<String, Value>,
+    /// Each domain's 32-byte rollout key, for the secret-canary scan.
+    pub rollout_keys: Vec<Vec<u8>>,
 }
 
-/// What bootstrap needs beyond the cluster: the release pair, the trust
-/// policy, the database `aps` will be given, the node's name and the
+/// What bootstrap needs beyond the cluster.
+///
+/// Every release the scenario deploys, each domain's starting policy, the
+/// trust policy, the database `aps` will be given, the node's name and the
 /// digest recorded as the proxy's environment qualification.
 pub struct Settings<'a> {
-    pub pair: &'a Pair,
+    /// Every release any step deploys. They share one scope: cluster
+    /// binding, control namespace and workload namespace.
+    pub candidates: &'a [&'a Candidate],
+    /// The policy each domain starts with, by domain ID; exactly the domains
+    /// of `candidates`.
+    pub policies: &'a BTreeMap<String, PolicyState>,
     pub trust_policy: &'a Value,
     pub database: &'a Path,
     pub node: &'a str,
@@ -67,14 +82,16 @@ pub struct Settings<'a> {
     pub environment_qualification: &'a str,
 }
 
-/// Install everything `aps deploy` requires, under the initial release's
+/// Install everything `aps deploy` requires, under each domain's starting
 /// policy.
 ///
 /// # Errors
-/// Fails when any object is refused or the registry cannot be initialised.
+/// Fails when the candidates do not share one scope, the policies do not
+/// name exactly their domains, any object is refused or the registry cannot
+/// be initialised.
 pub async fn bootstrap(objects: &Objects, settings: &Settings<'_>) -> Result<Platform> {
-    let domain = &settings.pair.initial.plan.ir.domain;
-    let control = domain.control_namespace.as_str();
+    let scope = settings.scope()?;
+    let control = scope.control_namespace.as_str();
     for namespace in [control, PLATFORM_NAMESPACE] {
         objects
             .create(
@@ -82,47 +99,86 @@ pub async fn bootstrap(objects: &Objects, settings: &Settings<'_>) -> Result<Pla
             )
             .await?;
     }
-    let policy = control_objects(objects, settings).await?;
-    let admin = registry(objects, settings).await?;
-    let rollout_key = identities(objects, settings).await?;
-    permissions(objects, settings).await?;
+    let mut policies = BTreeMap::new();
+    let mut rollout_keys = Vec::new();
+    for (domain, policy) in settings.policies {
+        let written = control_objects(objects, settings, scope, domain, policy).await?;
+        policies.insert(domain.clone(), written);
+    }
+    let admin = registry(objects, settings, scope).await?;
+    let accounts = accounts(objects, control).await?;
+    for domain in settings.policies.keys() {
+        rollout_keys.push(identity(objects, scope, domain, &accounts).await?);
+    }
+    permissions(objects, settings, scope).await?;
     Ok(Platform {
         objects: objects.clone(),
         admin,
         control: control.to_owned(),
-        domain: domain.id.clone(),
-        policy,
-        rollout_key,
+        policies,
+        rollout_keys,
     })
 }
 
-/// The trust policy, the initial policy and the proxy policy; returns the
-/// policy `ConfigMap`.
-async fn control_objects(objects: &Objects, settings: &Settings<'_>) -> Result<Value> {
-    let domain = &settings.pair.initial.plan.ir.domain;
-    let control = domain.control_namespace.as_str();
+impl Settings<'_> {
+    /// The scope every candidate shares, after checking that the policies
+    /// name exactly the candidates' domains.
+    fn scope(&self) -> Result<&Domain> {
+        let [first, ..] = self.candidates else {
+            return Err(Error::Input("bootstrap needs at least one release".into()));
+        };
+        let scope = &first.plan.ir.domain;
+        let mut domains = BTreeSet::new();
+        for candidate in self.candidates {
+            let domain = &candidate.plan.ir.domain;
+            ensure(
+                domain.cluster_binding == scope.cluster_binding
+                    && domain.control_namespace == scope.control_namespace
+                    && domain.namespace == scope.namespace,
+                "the scenario's releases do not share one scope",
+            )?;
+            domains.insert(domain.id.clone());
+        }
+        ensure(
+            self.policies.keys().cloned().collect::<BTreeSet<_>>() == domains,
+            "bootstrap policies do not name exactly the releases' domains",
+        )?;
+        Ok(scope)
+    }
+}
+
+/// One domain's trust policy, policy and proxy policy; returns the policy
+/// `ConfigMap`.
+async fn control_objects(
+    objects: &Objects,
+    settings: &Settings<'_>,
+    scope: &Domain,
+    domain: &str,
+    policy: &PolicyState,
+) -> Result<Value> {
+    let control = scope.control_namespace.as_str();
     state(
         objects,
         control,
-        &format!("apsides-trust-{}", domain.id),
+        &format!("apsides-trust-{domain}"),
         settings.trust_policy,
     )
     .await?;
     let policy = state(
         objects,
         control,
-        &format!("apsides-policy-{}", domain.id),
-        &serde_json::to_value(&settings.pair.initial_policy)?,
+        &format!("apsides-policy-{domain}"),
+        &serde_json::to_value(policy)?,
     )
     .await?;
     state(
         objects,
         control,
-        &format!("apsides-proxy-policy-{}", domain.id),
+        &format!("apsides-proxy-policy-{domain}"),
         &json!({
             "schemaVersion": platform::SCHEMA_VERSION,
-            "domainId": domain.id,
-            "clusterBinding": domain.cluster_binding,
+            "domainId": domain,
+            "clusterBinding": scope.cluster_binding,
             "envoyImage": platform::ENVOY_IMAGE,
             "adminImage": platform::ADMIN_IMAGE,
             "configurationTemplateDigest": compiler_core::digest(&platform::envoy_configuration("qualified-template")?)?,
@@ -136,10 +192,14 @@ async fn control_objects(objects: &Objects, settings: &Settings<'_>) -> Result<V
     Ok(policy)
 }
 
-/// The empty registry, its authority anchor, and its initialisation with
-/// the shared stores; returns the administrator's client over those stores.
-async fn registry(objects: &Objects, settings: &Settings<'_>) -> Result<PlatformClient> {
-    let domain = &settings.pair.initial.plan.ir.domain;
+/// The empty registry, its authority anchor, and its initialisation for
+/// every domain with the shared stores; returns the administrator's client
+/// over those stores.
+async fn registry(
+    objects: &Objects,
+    settings: &Settings<'_>,
+    domain: &Domain,
+) -> Result<PlatformClient> {
     let control = domain.control_namespace.as_str();
     let workload = domain.namespace.as_str();
     let registry = objects
@@ -172,23 +232,27 @@ async fn registry(objects: &Objects, settings: &Settings<'_>) -> Result<Platform
     .with_claim_store(store.clone())
     .with_audit_store(store.clone())
     .with_review_store(store);
+    let domains = settings.policies.keys().cloned().collect::<Vec<_>>();
     admin
         .bootstrap_registry(
             &registry_uid,
             text(&registry, "/metadata/resourceVersion"),
-            std::slice::from_ref(&domain.id),
+            &domains,
         )
         .await?;
     Ok(admin)
 }
 
-/// The issuer and deployer `ServiceAccounts`, the binding Secret, the
-/// deployment identity policy and the rollout key; returns the key.
-async fn identities(objects: &Objects, settings: &Settings<'_>) -> Result<Vec<u8>> {
-    use base64::Engine as _;
-    let domain = &settings.pair.initial.plan.ir.domain;
-    let control = domain.control_namespace.as_str();
-    let mut accounts = BTreeMap::new();
+/// The issuer and deployer `ServiceAccount` UIDs and the binding Secret's.
+struct Accounts {
+    deployer: String,
+    binding: String,
+}
+
+/// The issuer and deployer `ServiceAccounts` and the binding Secret every
+/// domain's deployment identity names.
+async fn accounts(objects: &Objects, control: &str) -> Result<Accounts> {
+    let mut deployer = String::new();
     for name in [ISSUER, DEPLOYER] {
         let account = objects
             .create(&json!({
@@ -196,7 +260,9 @@ async fn identities(objects: &Objects, settings: &Settings<'_>) -> Result<Vec<u8
                 "metadata": {"name": name, "namespace": control},
             }))
             .await?;
-        accounts.insert(name, text(&account, "/metadata/uid").to_owned());
+        if name == DEPLOYER {
+            text(&account, "/metadata/uid").clone_into(&mut deployer);
+        }
     }
     let binding = objects
         .create(&json!({
@@ -204,14 +270,29 @@ async fn identities(objects: &Objects, settings: &Settings<'_>) -> Result<Vec<u8
             "metadata": {"name": BINDING_SECRET, "namespace": control},
         }))
         .await?;
+    Ok(Accounts {
+        deployer,
+        binding: text(&binding, "/metadata/uid").to_owned(),
+    })
+}
+
+/// One domain's deployment identity policy and rollout key; returns the key.
+async fn identity(
+    objects: &Objects,
+    scope: &Domain,
+    domain: &str,
+    accounts: &Accounts,
+) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    let control = scope.control_namespace.as_str();
     let identity = DeploymentIdentity {
         schema_version: DEPLOYMENT_IDENTITY_SCHEMA_V2.into(),
-        domain_id: domain.id.clone(),
-        cluster_binding: domain.cluster_binding.clone(),
+        domain_id: domain.to_owned(),
+        cluster_binding: scope.cluster_binding.clone(),
         service_account_name: DEPLOYER.into(),
-        service_account_uid: accounts.get(DEPLOYER).cloned().unwrap_or_default(),
+        service_account_uid: accounts.deployer.clone(),
         binding_secret_name: BINDING_SECRET.into(),
-        binding_secret_uid: text(&binding, "/metadata/uid").to_owned(),
+        binding_secret_uid: accounts.binding.clone(),
         audience: "https://kubernetes.default.svc.cluster.local".into(),
         lifetime_seconds: 900,
         preview: None,
@@ -219,7 +300,7 @@ async fn identities(objects: &Objects, settings: &Settings<'_>) -> Result<Vec<u8
     state(
         objects,
         control,
-        &format!("apsides-deploy-identity-{}", domain.id),
+        &format!("apsides-deploy-identity-{domain}"),
         &serde_json::to_value(&identity)?,
     )
     .await?;
@@ -228,7 +309,7 @@ async fn identities(objects: &Objects, settings: &Settings<'_>) -> Result<Vec<u8
     objects
         .create(&json!({
             "apiVersion": "v1", "kind": "Secret", "type": "Opaque",
-            "metadata": {"name": format!("apsides-rollout-key-{}", domain.id), "namespace": control},
+            "metadata": {"name": format!("apsides-rollout-key-{domain}"), "namespace": control},
             "data": {"keyId": encode(ROLLOUT_KEY_ID.as_bytes()), "key": encode(&rollout_key)},
         }))
         .await?;
@@ -288,21 +369,22 @@ async fn role(
     Ok(())
 }
 
-async fn permissions(objects: &Objects, settings: &Settings<'_>) -> Result {
-    let domain = &settings.pair.initial.plan.ir.domain;
-    let control = domain.control_namespace.as_str();
-    let workload = domain.namespace.as_str();
-    let registry = format!("apsides-registry-{workload}");
-    let activation = format!("apsides-activation-{}", domain.id);
-    let inventory = format!("apsides-inventory-{}", domain.id);
+async fn permissions(objects: &Objects, settings: &Settings<'_>, scope: &Domain) -> Result {
+    let control = scope.control_namespace.as_str();
+    let workload = scope.namespace.as_str();
+    let mut updated = vec![format!("apsides-registry-{workload}")];
+    let mut trust_inputs = Vec::new();
+    for domain in settings.policies.keys() {
+        updated.push(format!("apsides-activation-{domain}"));
+        updated.push(format!("apsides-inventory-{domain}"));
+        trust_inputs.push(format!("apsides-trust-{domain}"));
+        trust_inputs.push(format!("apsides-deploy-identity-{domain}"));
+    }
+    let updated = updated.iter().map(String::as_str).collect::<Vec<_>>();
+    let trust_inputs = trust_inputs.iter().map(String::as_str).collect::<Vec<_>>();
     let control_rules = [
         rule("", &["configmaps"], &["get", "create"], &[]),
-        rule(
-            "",
-            &["configmaps"],
-            &["update"],
-            &[&registry, &activation, &inventory],
-        ),
+        rule("", &["configmaps"], &["update"], &updated),
         rule("", &["secrets"], &["get", "create"], &[]),
         rule("", &["serviceaccounts"], &["get", "create", "delete"], &[]),
         rule("", &["pods"], &["get", "list"], &[]),
@@ -332,7 +414,7 @@ async fn permissions(objects: &Objects, settings: &Settings<'_>) -> Result {
         control,
     )
     .await?;
-    delegated_roles(objects, settings).await?;
+    delegated_roles(objects, settings, scope).await?;
     let authority = format!("apsides-registry-authority.{control}.{workload}");
     role(
         objects,
@@ -343,14 +425,12 @@ async fn permissions(objects: &Objects, settings: &Settings<'_>) -> Result {
         control,
     )
     .await?;
-    let trust = format!("apsides-trust-{}", domain.id);
-    let identity = format!("apsides-deploy-identity-{}", domain.id);
     role(
         objects,
         Some(control),
         ISSUER,
         &[
-            rule("", &["configmaps"], &["get"], &[&trust, &identity]),
+            rule("", &["configmaps"], &["get"], &trust_inputs),
             rule("", &["serviceaccounts"], &["get"], &[DEPLOYER]),
             rule("", &["serviceaccounts/token"], &["create"], &[DEPLOYER]),
             rule("", &["secrets"], &["get"], &[BINDING_SECRET]),
@@ -378,21 +458,19 @@ async fn permissions(objects: &Objects, settings: &Settings<'_>) -> Result {
     .await
 }
 
-/// Every capability either release grants its runtime, per namespace: the
-/// deployer can only create a Role holding permissions it has itself.
-async fn delegated_roles(objects: &Objects, settings: &Settings<'_>) -> Result {
-    let pair = settings.pair;
-    let domain = &pair.initial.plan.ir.domain;
-    let control = domain.control_namespace.as_str();
-    let workload = domain.namespace.as_str();
+/// Every capability any release grants its runtime, per namespace (the
+/// deployer can only create a Role holding permissions it has itself), a read
+/// of every object a release manages, which inventory capture needs, and
+/// deletion of every object a release deletes when an upgrade removes it.
+async fn delegated_roles(objects: &Objects, settings: &Settings<'_>, scope: &Domain) -> Result {
+    let control = scope.control_namespace.as_str();
+    let workload = scope.namespace.as_str();
     let mut delegated: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     let mut seen = Vec::new();
-    for capability in pair
-        .initial
-        .plan
-        .capabilities
+    for capability in settings
+        .candidates
         .iter()
-        .chain(&pair.successor.plan.capabilities)
+        .flat_map(|candidate| &candidate.plan.capabilities)
     {
         if seen.contains(&capability) {
             continue;
@@ -421,9 +499,32 @@ async fn delegated_roles(objects: &Objects, settings: &Settings<'_>) -> Result {
                 &names,
             ));
     }
+    let mut managed = BTreeSet::new();
+    for resource in settings
+        .candidates
+        .iter()
+        .flat_map(|candidate| &candidate.plan.ir.resources)
+    {
+        let identity = deploy::resource_identity(resource)?;
+        let verbs: &[&str] = if resource.lifecycle.deletion_policy == DeletionPolicy::Delete {
+            &["get", "delete"]
+        } else {
+            &["get"]
+        };
+        managed.insert((identity, verbs));
+    }
+    for (identity, verbs) in managed {
+        delegated
+            .entry(identity.namespace.clone())
+            .or_default()
+            .push(rule(
+                &identity.api_group,
+                &[&identity.resource],
+                verbs,
+                &[&identity.name],
+            ));
+    }
     delegated.entry(workload.to_owned()).or_default().extend([
-        rule("", &["configmaps"], &["get"], &["api-config"]),
-        rule("postgresql.cnpg.io", &["clusters"], &["get"], &["database"]),
         rule(
             "rbac.authorization.k8s.io",
             &["roles", "rolebindings"],
@@ -489,18 +590,22 @@ impl Platform {
         Ok(self.admin.load_registry().await?)
     }
 
-    /// Widen the platform policy to `policy`, replacing the policy `ConfigMap`
-    /// under its UID and resourceVersion.
+    /// Replace `domain`'s platform policy with `policy`, replacing the policy
+    /// `ConfigMap` under its UID and resourceVersion.
     ///
     /// # Errors
-    /// Fails when the replacement is refused or is not exactly `policy`.
-    pub async fn replace_policy(&mut self, policy: &PolicyState) -> Result<Value> {
+    /// Fails when the domain was not bootstrapped, or the replacement is
+    /// refused or is not exactly `policy`.
+    pub async fn replace_policy(&mut self, domain: &str, policy: &PolicyState) -> Result<Value> {
         let data = String::from_utf8(compiler_core::canonical_bytes(policy)?)
             .map_err(|_| Error::Infrastructure("policy is not UTF-8".into()))?;
-        let mut replacement = self.policy.clone();
+        let Some(current) = self.policies.get_mut(domain) else {
+            return Err(Error::Input(format!("{domain} was not bootstrapped")));
+        };
+        let mut replacement = current.clone();
         replacement["data"]["state.json"] = json!(data);
         let written = self.objects.replace(&replacement).await?;
-        let before = &self.policy["metadata"];
+        let before = &current["metadata"];
         let after = &written["metadata"];
         ensure(
             after["uid"] == before["uid"]
@@ -515,14 +620,8 @@ impl Platform {
             "afterResourceVersion": after["resourceVersion"],
             "policyDigest": compiler_core::digest(policy)?,
         });
-        self.policy = written;
+        *current = written;
         Ok(change)
-    }
-
-    /// The domain the platform was bootstrapped for.
-    #[must_use]
-    pub fn domain(&self) -> &str {
-        &self.domain
     }
 }
 

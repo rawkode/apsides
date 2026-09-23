@@ -28,6 +28,12 @@ pub struct Inputs {
     pub initial_release: PathBuf,
     /// Signed release of `examples/cnpg` (the database plus its API).
     pub successor_release: PathBuf,
+    /// Signed release of `examples/cnpg/cleanup`: the successor plus one
+    /// `Backup` that upgrading to the successor deletes.
+    pub cleanup_release: PathBuf,
+    /// Signed release of `crates/acceptance/programs/cnpg-owner`: another
+    /// domain that declares the `ConfigMap` the initial release declares.
+    pub owner_release: PathBuf,
     /// The trust policy the releases verify against: the ephemeral signer's
     /// public key, the approved compiler digests and the pinned verifier.
     pub trust_policy: PathBuf,
@@ -83,6 +89,8 @@ impl Inputs {
             &self.aps,
             &self.initial_release,
             &self.successor_release,
+            &self.cleanup_release,
+            &self.owner_release,
             &self.trust_policy,
             &self.operator_manifest,
         ] {
@@ -119,6 +127,8 @@ mod tests {
             aps: file.clone(),
             initial_release: file.clone(),
             successor_release: file.clone(),
+            cleanup_release: file.clone(),
+            owner_release: file.clone(),
             trust_policy: file.clone(),
             operator_manifest: file,
             results: directory.join("results"),
