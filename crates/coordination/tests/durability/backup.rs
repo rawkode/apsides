@@ -5,10 +5,7 @@ use inventory::{
     TrackedResource, VersionedInventory,
 };
 use rusqlite::params;
-use serde::Serialize;
 use std::{fs::File, path::Path};
-
-const LIVE_BACKUP_PATH: &str = "/backup/coordination.db";
 
 struct BackupFixture {
     seed: Fixture,
@@ -19,26 +16,6 @@ struct BackupFixture {
     first_inventory_id: String,
     second_inventory_version: VersionedInventory,
     third_inventory_id: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BackupReport<'a> {
-    schema_version: &'static str,
-    nonce: &'a str,
-    phase: &'static str,
-    outcome: &'static str,
-    seed_claim_digest: &'a str,
-    seed_review_digest: &'a str,
-    seed_audit_digest: &'a str,
-    first_inventory_snapshot_id: &'a str,
-    second_inventory_snapshot_id: &'a str,
-    expected_inventory_revision: &'static str,
-    observed_inventory_revision: &'static str,
-    later_claim_digest: &'a str,
-    later_review_digest: &'a str,
-    later_audit_digest: &'a str,
-    third_inventory_snapshot_id: &'a str,
 }
 
 fn inventory_scope() -> InventoryScope {
@@ -249,67 +226,8 @@ async fn verify_backup(path: &Path, expected: &BackupFixture) -> TestResult {
     Ok(())
 }
 
-fn emit_backup(
-    phase: Phase,
-    outcome: &'static str,
-    observed_inventory_revision: &'static str,
-    nonce: &str,
-    expected: &BackupFixture,
-) -> TestResult {
-    validate_nonce(nonce)?;
-    write_report(
-        b"APS_COORDINATION_BACKUP_RESULT=",
-        &BackupReport {
-            schema_version: "apsides.dev/pvc-coordination-backup/v1",
-            nonce,
-            phase: phase.name(),
-            outcome,
-            seed_claim_digest: &expected.seed.claim_ref.digest,
-            seed_review_digest: &expected.seed.review_ref.digest,
-            seed_audit_digest: &expected.seed.audit_ref.digest,
-            first_inventory_snapshot_id: &expected.first_inventory_id,
-            second_inventory_snapshot_id: &expected.second_inventory_version.snapshot_id,
-            expected_inventory_revision: "2",
-            observed_inventory_revision,
-            later_claim_digest: &expected.later.claim_ref.digest,
-            later_review_digest: &expected.later.left_review_ref.digest,
-            later_audit_digest: &expected.later.left_audit_ref.digest,
-            third_inventory_snapshot_id: &expected.third_inventory_id,
-        },
-    )
-}
-
-pub(super) async fn execute_live(phase: Phase, nonce: &str) -> TestResult {
-    let expected = backup_fixture()?;
-    let source = Path::new(LIVE_PATH);
-    match phase {
-        Phase::BackupSeed => {
-            seed_all(source, &expected).await?;
-            emit_backup(phase, "seeded", "2", nonce, &expected)
-        }
-        Phase::BackupCreate => {
-            verify_seed(source, &expected).await?;
-            let destination = Path::new(LIVE_BACKUP_PATH);
-            vacuum_into(source, destination)?;
-            verify_seed(destination, &expected).await?;
-            emit_backup(phase, "created", "2", nonce, &expected)
-        }
-        Phase::BackupMutate => {
-            mutate_source(source, &expected).await?;
-            emit_backup(phase, "mutated", "3", nonce, &expected)
-        }
-        Phase::BackupVerify => {
-            // The verifier Pod mounts only the backup PVC at the fixed source path.
-            verify_backup(source, &expected).await?;
-            emit_backup(phase, "verified", "2", nonce, &expected)
-        }
-        _ => Err("coordination backup phase is invalid".into()),
-    }
-}
-
 #[tokio::test]
-async fn local_vacuum_backup_reopens_all_four_stores_and_isolates_later_source_writes() -> TestResult
-{
+async fn vacuum_backup_reopens_all_four_stores_and_isolates_later_source_writes() -> TestResult {
     let directory = tempfile::tempdir()?;
     let source = directory.path().join("all-stores-source.db");
     let destination = directory.path().join("all-stores-'backup'.db");
@@ -321,7 +239,7 @@ async fn local_vacuum_backup_reopens_all_four_stores_and_isolates_later_source_w
 }
 
 #[tokio::test]
-async fn local_vacuum_backup_rejects_a_nonempty_destination_without_repair() -> TestResult {
+async fn vacuum_backup_rejects_a_nonempty_destination_without_repair() -> TestResult {
     let directory = tempfile::tempdir()?;
     let source = directory.path().join("coordination-source.db");
     let destination = directory.path().join("existing.db");

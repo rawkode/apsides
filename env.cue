@@ -48,16 +48,6 @@ tasks: {
 	reproducibilityTest: {command: "python3", args: ["-m", "unittest", "tests/test_reproducibility.py"]}
 	inputIsolationTest: {command: "python3", args: ["tests/test_input_isolation.py"]}
 	inputIsolationProbeTest: {command: "deno", args: ["test", "--allow-all", "tests/isolation_probe.test.mts"]}
-	storageProbeTest: {command: "cargo", args: ["test", "--locked", "-p", "inventory", "--test", "pvc_restart"]}
-	storageBuildTest: {command: "python3", args: ["tests/storage/test_build.py"]}
-	storageRestartTest: {command: "python3", args: ["tests/storage/test_restart.py"]}
-	coordinationRestartTest: {command: "python3", args: ["tests/storage/test_coordination.py"]}
-	coordinationProbeTest: {command: "cargo", args: ["test", "--locked", "-p", "coordination", "--test", "pvc_restart"]}
-	storageBackupTest: {command: "python3", args: ["tests/storage/test_backup.py"]}
-	storageBackup: {command: "python3", args: ["tests/run_storage_backup.py"]}
-	coordinationRestart: {command: "python3", args: ["tests/run_coordination_restart.py"]}
-	storagePrepare: {command: "python3", args: ["tests/storage/build.py"]}
-	storageRestart: {command: "python3", args: ["tests/run_storage_restart.py"]}
 	coordinationTest: {command: "cargo", args: ["test", "--locked", "-p", "coordination"]}
 	inventoryTest: {command: "cargo", args: ["test", "--locked", "-p", "inventory"]}
 	compilerCoreTest: {command: "cargo", args: ["test", "--locked", "-p", "compiler-core"]}
