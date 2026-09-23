@@ -14,7 +14,7 @@ import time
 
 import run_reproducibility as shared
 import ceiling_observations as observations
-import run_cluster as crds
+import crds
 
 ROOT = Path(__file__).resolve().parents[1]
 NODE = "kindest/node:v1.34.3@sha256:08497ee19eace7b4b5348db5c6a1591d7752b164530a36f855cb0f2bdcbadd48"
