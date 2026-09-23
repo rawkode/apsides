@@ -249,9 +249,13 @@ pub fn sentinel(image: &str) -> [Value; 2] {
     ]
 }
 
-/// The sentinel's in-cluster DNS name.
+/// The sentinel's in-cluster DNS name, fully qualified with a trailing dot.
+/// Without it the resolver tries the Pod's search domains first, and a
+/// search domain inherited from the host (GitHub runners add an Azure one)
+/// is forwarded upstream, where the offline gate blocks it; the lookup then
+/// outlasts the probe's timeout although the Service itself is reachable.
 pub fn sentinel_host() -> String {
-    format!("{SENTINEL}.{OUTSIDE}.svc.cluster.local")
+    format!("{SENTINEL}.{OUTSIDE}.svc.cluster.local.")
 }
 
 /// A Pod that runs the offline gate's probes once and exits. It has no
