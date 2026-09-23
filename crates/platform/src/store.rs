@@ -123,8 +123,6 @@ pub(crate) async fn replace_state_at<T: Serialize + DeserializeOwned + Sync>(
 
 #[derive(Clone)]
 pub struct PlatformClient {
-    #[cfg(all(test, feature = "test-support"))]
-    pub(crate) phase_pause: Option<std::sync::Arc<crate::phase_interruption::PhasePause>>,
     #[cfg(feature = "deployer")]
     pub(crate) selection: Option<std::sync::Arc<crate::transition_session::Selection>>,
     #[cfg(feature = "deployer")]
@@ -162,8 +160,6 @@ impl PlatformClient {
             ));
         }
         Ok(Self {
-            #[cfg(all(test, feature = "test-support"))]
-            phase_pause: None,
             #[cfg(feature = "deployer")]
             selection: None,
             #[cfg(feature = "deployer")]
