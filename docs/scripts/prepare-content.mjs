@@ -16,6 +16,7 @@ const pages = [
 ];
 
 const references = [
+  ["reference/ACCEPTANCE.md", "reference/acceptance.md", "Acceptance suite"],
   ["reference/ARTIFACT-RESOLUTION.md", "reference/artifact-resolution.md", "Optional OCI release retrieval"],
   ["reference/AUDIT.md", "reference/audit.md", "Transition audit history"],
   ["reference/CLI-DISTRIBUTION.md", "reference/cli-distribution.md", "CLI distribution"],
