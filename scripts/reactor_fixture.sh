@@ -4,19 +4,22 @@
 #
 #   sh scripts/reactor_fixture.sh <program.tsx> <work directory>
 #
-# `aps build` never pulls, so the builder and runtime images below, and the
-# fixture base in scripts/fixture-image, must already be in the local Docker
-# image store. It also needs cargo-cyclonedx on PATH and a BuildKit that can
-# export OCI archives: the containerd image store, or a docker-container
-# builder selected with BUILDX_BUILDER. The release is unsigned; cluster tests
-# check its integrity, not its provenance.
+# `aps build` never pulls, so the builder image below, the runtime base in
+# scripts/runtime-base/reference and the fixture base in scripts/fixture-image
+# must already be in the local Docker image store. It also needs
+# cargo-cyclonedx on PATH. Any Docker image store and BuildKit driver will do. The release is unsigned; cluster tests check
+# its integrity, not its provenance.
 set -eu
 
-source=$1
-work=$2
+source=${1:-}
+work=${2:-}
+if [ -z "$source" ] || [ -z "$work" ]; then
+  echo "usage: sh scripts/reactor_fixture.sh <program.tsx> <work directory>" >&2
+  exit 2
+fi
 aps=${APSIDES_CLI:-target/debug/aps}
 builder=rust@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922
-runtime=gcr.io/distroless/cc-debian12@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
+runtime=$(cat scripts/runtime-base/reference)
 
 case "$(uname -m)" in
   arm64 | aarch64) platform=linux/arm64 ;;
@@ -42,7 +45,7 @@ printf '{"schemaVersion":"apsides.dev/build-profile/v1","builderImage":"%s","run
   "$builder" "$runtime" "$platform" "$tool" "$tool_sha" >"$profile"
 
 "$aps" build --source "$source" --output "$work/build" --profile "$profile" --mode fixture
-digest=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' "$work/build/image/buildkit-metadata.json")
+digest=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["imageDigest"])' "$work/build/build-result.json")
 "$aps" release \
   --artifact "$work/build" \
   --binary "$work/build/linux-binary/apsides-controller" \
