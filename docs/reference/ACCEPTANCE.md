@@ -18,21 +18,28 @@ on `PATH` and these images in the local Docker image store, because neither
   the only Kubernetes version `aps deploy` accepts.
 
 ```sh
-cuenv task acceptancePrepare   # build, release and sign both CNPG releases
+cuenv task acceptancePrepare   # build, release and sign the four releases
 cuenv task acceptanceTest      # run every scenario, one kind cluster each
 cuenv task acceptanceCheck     # Clippy for the suite
 ```
 
 `acceptancePrepare` generates the CloudNativePG types, builds releases of
-`examples/cnpg/initial` and `examples/cnpg` with `aps build` and `aps release`,
+`examples/cnpg/initial`, `examples/cnpg`, `examples/cnpg/cleanup` and
+`crates/acceptance/programs/cnpg-owner` with `aps build` and `aps release`,
 signs each release's provenance with an OpenSSH key generated for that run
-(the private key is deleted once both are signed), and writes a trust policy
+(the private key is deleted once all are signed), and writes a trust policy
 approving only that key, the releases' compiler digests and `/usr/bin/ssh-keygen`.
-It verifies both releases with `aps verify-release`, fetches the CloudNativePG
+It verifies every release with `aps verify-release`, fetches the CloudNativePG
 1.30.0 operator manifest and accepts it only with its pinned SHA-256. It writes
 `work/acceptance/inputs.json`, which `acceptanceTest` passes to the scenarios as
 `APSIDES_ACCEPTANCE_INPUTS`. A scenario fails, and never skips, when that file is
 missing.
+
+CI prepares once in the `acceptance-prepare` job and hands the releases, with
+the `aps` that built them, to three `acceptance` matrix jobs, each running one
+cuenv task with `--test-threads=1`: `acceptanceUpgradeTest` (P0, uncertain
+writer, ownership collision), `acceptancePhasesTest` and
+`acceptanceCleanupTest`.
 
 Each scenario creates its own cluster named `aps-acc-…` with a kubeconfig in a
 private temporary directory, and deletes it when it ends, including on failure.
@@ -50,9 +57,9 @@ files before they are written. CI uploads only this directory.
 
 ## Scenarios and §28 rows
 
-| Scenario (`tests/kind.rs`) | Check | §28 row |
+| Scenario (`tests/kind/`) | Check | §28 row |
 | --- | --- | --- |
-| `cnpg_upgrade_through_the_public_cli` | (a) under a ceiling allowing only the initial release, `aps deploy` of it commits | Upgrade to a build with different permissions |
+| `upgrade::cnpg_upgrade_through_the_public_cli` | (a) under a ceiling allowing only the initial release, `aps deploy` of it commits | Upgrade to a build with different permissions |
 | | (b) `aps deploy` of the successor fails with the ceiling diagnostic for the capability it adds; no successor or next-generation object exists, and the registry's UID, resourceVersion and state, the reserved sequence and the running initial writer are unchanged | Add a capability above the ceiling |
 | | (c) after the platform widens the ceiling, `aps deploy` of the successor commits a new transition and generation | Upgrade to a build with different permissions |
 | | (d) every RoleBinding and the `ServiceAccount` the old generation recorded for retirement are gone, no RoleBinding names the old identity, and the new `ServiceAccount` has another name and UID | Upgrade to a build with different permissions |
@@ -60,14 +67,51 @@ files before they are written. CI uploads only this directory.
 | | (f) a ConfigMap change rolls `PostgREST` out to a new revision, an equal-data write causes no rollout for 30 s, and a Secret change rolls it out and back under the same rollout key | Reconcile unchanged ConfigMap/Secret input repeatedly |
 | | (g) no Secret value, rollout key or issuer token appears in `aps` output, the inventory database files or any control-namespace container log | Inspect artifacts, logs, metrics, and inventory |
 
+| Scenario | Check | §28 row |
+| --- | --- | --- |
+| `phases::every_interrupted_phase_resumes_to_commit` | Upgrades alternate between the initial release and the successor on one cluster. Each `aps deploy` is stopped right after its registry write into one phase (Planned, Staged, Quiesced, Activated, Cleaning, in turn). Rerunning `aps deploy` of the same release with the same executor commits that transition: no new allocation, no unfinished transition, and the same inventory when repeated. Afterwards the new generation's controller and proxy are ready, no Pod of the old runtime account runs, the CNPG Cluster is Ready and, for the successor, the API rolls out | Interrupt deployment after each phase |
+| `uncertain::lost_writer_evidence_blocks_activation` | `aps deploy` of the successor is stopped right after its write into Quiesced, before activation transfers any claim. The predecessor controller's retained terminal Pod is then deleted and its `apsides.dev/termination-evidence` finalizer removed. Rerunning `aps deploy` fails with `live writer set differs from complete protected Pod history`. The transition stays Quiesced, the successor runtime stays at zero replicas with no Pod, activation still names the draining predecessor, and the registry, activation and inventory `ConfigMap`s and every metadata database row are unchanged | Lose certainty about old writer termination |
+| `cleanup::cleanup_waits_for_a_finalizer_then_commits` | From `examples/cnpg/cleanup` to `examples/cnpg`, with a test-owned finalizer on the claimed `Backup`: `aps deploy` deletes it and reports `cleanup remains pending` while the finalizer stays, and is killed. Once the finalizer is removed, the rerun commits the same transition and the `Backup` and its claim are gone | Remove the last managed resource of an API type; Leave a finalizer unresolved |
+| `cleanup::cleanup_refuses_a_replacement_uid` | A policy denying the deployer's DELETE of the `Backup` stops cleanup with the original UID pinned in Cleaning. The `Backup` is then deleted and recreated under the same field manager. Rerunning `aps deploy` fails with `cleanup refuses to delete a replacement UID`. The replacement is untouched, the registry is unchanged, and the claim stays Releasing for the original UID | Replace a pending-delete object with a new UID |
+| both cleanup scenarios | an unclaimed `Backup` of the same type is untouched, and no workload Role bound to the successor's runtime account grants anything on `Backup`s | Remove the last managed resource of an API type |
+| `collision::a_claimed_object_cannot_be_claimed_by_another_domain` | The registry is bootstrapped for two domains. `aps deploy` of `cnpg-owner` commits and claims `default/api-config`. `aps deploy` of the CNPG initial release, another domain declaring the same `ConfigMap`, then fails with `new target collides with a protected claim`. The registry object, every object in the control and workload namespaces, the owner's `ConfigMap` and every metadata database row are unchanged. The contender has no transition and no writer | Deploy a second domain claiming the same object |
+
+### Which interruption points are proven
+
+A hold is a `ValidatingAdmissionPolicy` that denies every update of the
+namespace registry by the deployer `ServiceAccount` while the stored registry
+(`oldObject`) records the transition at phase P. The write into P is admitted,
+because its old object is still at the previous phase. Every later registry
+write of that run is denied, so the run cannot persist anything past P. The
+scenario polls the registry every 200 ms and sends SIGKILL to `aps` as soon as P
+is stored. If the next registry write comes first, the denial makes `aps` exit
+with the hold's message, and the scenario records which of the two happened.
+Either way, the stop falls somewhere between the write into P and `aps`'s next
+registry write. It covers Kubernetes objects `aps` may have created or changed
+in between, and any claim rows it published before its denied write. It is not
+one fixed instruction. The scenario then requires the registry to stay
+unchanged for 5 s before it lifts the hold.
+
+| Stop after the registry write into | Proven by |
+| --- | --- |
+| Planned, Staged, Quiesced, Activated, Cleaning | `phases::every_interrupted_phase_resumes_to_commit`, live |
+| Quiesced, then lost termination evidence | `uncertain::lost_writer_evidence_blocks_activation`, live |
+| Cleaning, with cleanup pending on a finalizer | `cleanup::cleanup_waits_for_a_finalizer_then_commits`, live (SIGKILL while `aps` retries) |
+| Cleaning, with the cleanup DELETE denied | `cleanup::cleanup_refuses_a_replacement_uid`, live (a separate DELETE hold; `aps` exits on the denial) |
+| Committed, before the inventory is published | In process only. No registry write follows Committed, and the inventory is written to the local metadata database, so no admission policy can hold this gap. `deploy::tests::reruns_resume_every_stored_phase_and_republish_a_commit` (`crates/cli`) shows a rerun after every stored phase resumes the transition, and after Committed routes to the report that republishes the inventory. `committed_inventory_persists_metadata_and_retries_after_reopen` (`crates/platform`) shows that inventory publication for a Committed registry with no head succeeds from a freshly opened store, and that repeating it returns the same head |
+
+No scenario stops `aps` in the middle of a phase's Kubernetes writes at a
+chosen instruction, and none has another executor take over a stalled
+transition.
+
 The reactor rows (generated tests, fixture images, offline execution,
 reaction-mutation checks) are covered by `aps test --cluster` in the `reactor`
-CI job. The remaining rows (reproducibility, undeclared input, credential
-scope, field-patch coverage, downtime recovery, watch expiry, input denial,
-out-of-band edits, field-manager conflicts, claim collision, phase
-interruption, last-type cleanup, replacement UIDs, finalizers, uncertain
-writer termination and fixture promotion) are still qualified by the Python
-harnesses in `tests/` until each is ported here.
+CI job. Undeclared evaluation input is covered by `cuenv task
+authorCompilerTest` (`packages/compiler/src/compiler.test.ts`). The remaining
+rows (reproducibility, credential scope, field-patch coverage, downtime
+recovery, watch expiry, input denial, out-of-band edits, field-manager
+conflicts and fixture promotion) are still qualified by the Python harnesses in
+`tests/` until each is ported here.
 
 ## Limits
 
@@ -85,6 +129,15 @@ harnesses in `tests/` until each is ported here.
   registries during the run, so the run needs registry access. A classic
   (overlay2) Docker image store rewrites manifests on `docker image save`, so a
   host-side copy could not stand in for the pinned digests.
+- A hold identifies its transition's phase by matching the phase and the
+  transition ID in the stored registry's JSON text. That is exact only because
+  a domain has at most one unfinished transition and the registry records a
+  phase nowhere else, so each scenario reads the phase back after every stop.
+- A downgrade to the initial release orphans the successor's API Deployment
+  and Service (their deletion policy is `orphan`). The phase scenario deletes
+  them before the next upgrade recreates them.
+- The cleanup scenarios check the successor's workload Role rules, not
+  cluster-wide effective authorization.
 - The platform permissions are the fixed grants the scenario installs; they
   show the deployment works with those grants, not that they are minimal.
 - The canary scan covers `aps` output, the inventory database and controller

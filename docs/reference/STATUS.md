@@ -165,26 +165,12 @@ with their own diagnostic, raised inside the program's default export. These
 tests do not check operating-system syscall or network isolation.
 
 Fresh reservation qualification passed in
-`work/cnpg-deployment-ceiling-35187dd` and `work/cnpg-ownership-35187dd`.
-Removing a required capability rejected the exact candidate without changing
-protected state; restoring the ceiling allowed the same reservation. A distinct
-signed owner reserved `default/api-config`, and the corrected contender was
-rejected without state changes or a new runtime writer. The existing owner
-artifact was verified under its own trust policy; its binary was not executed.
-Both harnesses deleted their owned clusters, removed both kubeconfigs, and
-confirmed exact preservation of the prior cluster and container inventories.
-These checks qualify reservation-time enforcement, not full deployment or
-production release trust.
-
-Fresh cleanup runs at `work/cnpg-finalizer-64f2b39` and
-`work/cnpg-replacement-64f2b39` upgraded the signed cleanup predecessor to the
-corrected successor. The finalizer run retained the original claim in Cleaning
-while deletion was blocked, then committed after removal of the finalizer and
-the pinned Backup. The replacement run rejected the new UID and retained the
-original claim in Cleaning. Both preserved an unclaimed same-type Backup and
-checked that the successor workload Role omitted Backup access. That Role
-inspection does not establish cluster-wide effective authorization. Both runs
-removed their clusters and credentials and restored prior host inventories.
+`work/cnpg-deployment-ceiling-35187dd`. Removing a required capability rejected
+the exact candidate without changing protected state; restoring the ceiling
+allowed the same reservation. The harness deleted its owned cluster, removed
+both kubeconfigs, and confirmed exact preservation of the prior cluster and
+container inventories. This qualifies reservation-time enforcement, not full
+deployment or production release trust.
 
 Fresh API-gap qualification at `work/cnpg-api-gap-dab27db` passed all 42
 requests for the corrected successor, with no undeclared gaps, unsupported
@@ -196,28 +182,6 @@ Secret-key experiment also passed and removed its probe key. The run was bound
 to all 16 producer sources and the exact signed pair; cleanup restored prior host
 inventories and removed credentials. This measures direct Kubernetes API access
 with a runtime credential, not proxy-path enforcement or GitHub release trust.
-
-Fresh uncertain-writer qualification at `work/cnpg-uncertain-writer-5e63857`
-removed the exact retained terminal predecessor Pod record after Quiesced.
-Activation returned the expected protected-writer-history rejection and remained
-Quiesced, with identical registry, activation, inventory, and metadata-store
-observations before injection and after refusal. The successor runtime stayed
-at zero replicas with no runtime Pod; its recorded staged proxy was permitted.
-The run removed its cluster and credentials and restored prior host inventories. This
-qualifies lost termination evidence, not a real network partition or uncertain
-stalled-executor takeover.
-
-The fresh six-phase recovery matrix at producer `b4f0238` passed for Planned,
-Staged, Quiesced, Activated, Cleaning, and Committed. Each run interrupted after
-an exact persisted phase change, killed and reaped its owned deploy process,
-and used a fresh issued session under the same logical owner to recover.
-Planned, Staged, and Quiesced used authenticated checkpoint resolution; the later
-phases replayed their applicable operation. All six reached Committed, preserved
-inventory under repeated publication and commit, passed five workload checks,
-and confirmed old active writers were absent. Independent review verified each
-run's 16 sources and 69 frozen inputs. Every run removed its cluster and
-credentials and restored prior host inventories. This qualifies post-CAS interruption at those boundaries,
-not within-phase interruption or takeover of an uncertain stalled executor.
 
 Automated suites cover strict schema and canonical replay, claim and metadata
 store immutability, registry concurrency, capacity accounting, review privacy,
@@ -236,10 +200,13 @@ Rust [acceptance suite](/reference/acceptance/), which runs in CI, deploys the
 signed CNPG pair with the public `aps deploy`: ceiling rejection before any
 successor object, upgrade, old-identity retirement, data preservation, input
 rollouts and a secret-canary scan, on single-node kind with a synthetic signer.
-
-A test-only interruption hook can pause after an exact validated registry CAS,
-allow the parent harness to inspect the protected phase, and remain parked until
-the owned child is killed and reaped. It is excluded from production builds.
+The same suite stops `aps deploy` after each phase an upgrade stores before it
+commits and resumes it to commit, blocks activation after the predecessor's
+termination evidence is lost, runs last-type cleanup through an unresolved
+finalizer and refuses a replacement UID, and refuses a second domain's claim on
+an owned object. It stops runs with admission-policy holds and SIGKILL rather
+than a hook in the product. The acceptance reference lists exactly which
+interruption points each scenario proves.
 
 The local SQLite durability tests for inventory, claim, review and audit
 records are described in [resource inventory](/reference/inventory/#current-limits).
