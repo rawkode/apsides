@@ -1,9 +1,9 @@
 # Apsides implementation status
 
 Apsides targets specification 0.2. Existing `apsides.dev` identifiers are its active wire names.
-Apsides is **not ready for production use**. Local compilation, unit tests,
-signed disposable candidates, and individual cluster qualifications establish
-narrower properties.
+Apsides is **not ready for production use**. Unit tests, the reactor cases of
+`aps test --cluster` and the acceptance suite on disposable kind clusters
+establish narrower properties.
 
 ## Implemented
 
@@ -39,16 +39,10 @@ narrower properties.
 - Protected platform policy can supply registry Secret references for controller
   and proxy image pulls, without granting runtime Secret access. References bind
   to the policy and staged Pod templates; credentials remain platform-owned.
-  `work/private-pull-live-9e6896d` qualified an uncached controller pull on a fresh
-  kind node: a missing credential rejection, a fresh HTTP 401 while invalid
-  credentials existed, then readiness after a guarded update to valid credentials.
-  The Pod UID, Deployment template and protected policy stayed unchanged.
-  The same run passed CNPG deployment, permission-change rejection, approved
-  upgrade, Secret consumption and a ConfigMap-triggered rollout. Cluster,
-  container and registry-volume inventories were restored. This is local
-  qualification of the native `5afce8a` pair, not production qualification;
-  the invalid-phase event does not establish precisely when kubelet consumed
-  the changed Secret bytes.
+  The acceptance suite's runtime credential scenario deploys under a policy
+  naming a pull secret and checks that the staged controller and proxy
+  Deployments and the proxy Pod carry exactly that reference. Registry
+  authentication itself is the kubelet's and is not tested.
 - Runtime diagnostics retain completed-cycle blocked counts and specific reasons
   throughout reconciliation backoff. `/status` includes up to 256 `conditions`
   containing only `resourceId` and `reasonCode`, plus a `fieldOrVersionConflicts`
@@ -57,11 +51,9 @@ narrower properties.
   their own reason, clearing the per-target list and conflict count. `/readyz` stays unavailable while
   degraded; a clean cycle restores readiness. These probes describe the
   controller, not application workload health.
-- A signed disposable-candidate live check observed two distinct SSA conflict
-  cycles with advancing reconciliation/error counters, `/readyz` returning 503
-  and `/livez` returning 200. Relinquishing the foreign field manager restored
-  exact data and readiness while preserving resource UID and controller identity.
-  This qualifies controller diagnostics for that fixture, not workload health.
+- The field-manager conflict cases `aps test --cluster` generates check that
+  a competing manager's field is reported as a conflict and not forcibly taken
+  over. They check controller diagnostics for the fixture, not workload health.
 
 ### Releases
 
@@ -82,9 +74,9 @@ narrower properties.
   API server still work. The reaction-mutation check mutates the revision
   oracle's model, not the controller. On `examples/web-application` all 43
   generated cases and the 3 reaction-mutation checks pass locally on
-  linux/arm64. It does not yet run in CI. Live
-  qualification of Apsides itself is moving from the Python harnesses in
-  `tests/` to a Rust acceptance suite that runs in CI on the examples.
+  linux/arm64, and the `reactor` job of the checks workflow runs them on every
+  change. Apsides itself is accepted by the Rust
+  [acceptance suite](/reference/acceptance/), which runs in CI on the examples.
 
 ### Deployment and protected state
 
@@ -135,25 +127,42 @@ narrower properties.
 
 ## Verified boundaries
 
-The current signed CNPG candidate is `work/cnpg-signed-candidate-9b5097a`,
-which includes the observed-input watch correction. Local qualification signers
-do not establish GitHub Actions identity or production release trust.
+The [acceptance suite](/reference/acceptance/) runs in CI and deploys signed
+releases of the CNPG examples with the public `aps deploy` on single-node kind
+clusters with a synthetic signer. Its reference lists each check and the §28
+row it answers. In summary:
 
-The rebuilt fixture at `work/cnpg-reactor-native-820dd7c` passed all 43 required
-cases and all 46 fixture cases in `work/cnpg-reactor-820dd7c-retry-results`.
-Its compiler closure matches the corrected production build except for the
-expected fixture IR overlay. The harness installed the imported CNPG CRD schema;
-this proves fixture reactor behavior, not execution of the exact production
-binary. The current candidate separately passed first deploy, privileged
-permission-changing upgrade, ConfigMap reaction, equal-data no-rollout, and
-synthetic Secret-key reaction and restoration in
-`work/cnpg-input-reactions-89ceec4`. Both fresh runs removed their clusters and
-credentials; external inventory comparisons confirmed the pre-existing clusters
-and containers were preserved.
+- the upgrade scenario rejects a successor above the ceiling before any
+  successor object exists and with the registry unchanged, commits it once the
+  ceiling is widened, retires the old identity, preserves the database, rolls
+  the API out on ConfigMap and Secret changes but not on equal data, and finds
+  no Secret value, rollout key or token in output, logs or the inventory
+  database;
+- the runtime credential scenario reads the proxy's projected token into memory,
+  has `TokenReview` bind it to the proxy Pod and runtime `ServiceAccount`, and
+  shows that every declared capability succeeds, each disclosed RBAC gap behaves
+  as disclosed, out-of-scope requests are denied, `SubjectAccessReview` agrees,
+  and a synthetic Secret-key change rolls the API out and back. It measures
+  direct Kubernetes API access with the runtime credential, not proxy-path
+  enforcement;
+- the collision scenario refuses a second domain's claim with no state change,
+  and shows that a live preview approved by the deployment identity changes no
+  Kubernetes state before the reservation and is carried in the committed
+  report;
+- the phase, uncertain-writer and cleanup scenarios stop `aps deploy` after each
+  stored phase and resume it, block activation after the predecessor's
+  termination evidence is lost, run last-type cleanup through an unresolved
+  finalizer and refuse a replacement UID. They stop runs with admission-policy
+  holds and SIGKILL rather than a hook in the product. The acceptance reference
+  lists exactly which interruption points each scenario proves.
 
-Two fresh cache-disabled builds in `work/cnpg-reproducibility-968224c` matched
-one another and the corrected signed candidate's binary, OCI image, compiler
-closure, and payload identities.
+Reproducibility is checked twice: two `aps compile` runs of
+`examples/web-application` must give identical trees in the CLI tests on every
+change, and two cache-disabled `aps build` runs must give identical files,
+including the binary and OCI archive, in the nightly workflow. The compile check
+passes. The native check does not: the binary, SBOM, IR, plan and build inputs
+match, but the final image layer keeps build-time file modification times, so
+the OCI archive and image digest differ between builds.
 
 `cuenv task authorCompilerTest` checks the declared-input and SES capability
 boundary on every CI run. A program importing a declared module compiles. An
@@ -164,73 +173,30 @@ constructor-escape and prototype-mutation attempts each fail during evaluation
 with their own diagnostic, raised inside the program's default export. These
 tests do not check operating-system syscall or network isolation.
 
-Fresh reservation qualification passed in
-`work/cnpg-deployment-ceiling-35187dd`. Removing a required capability rejected
-the exact candidate without changing protected state; restoring the ceiling
-allowed the same reservation. The harness deleted its owned cluster, removed
-both kubeconfigs, and confirmed exact preservation of the prior cluster and
-container inventories. This qualifies reservation-time enforcement, not full
-deployment or production release trust.
-
-Fresh API-gap qualification at `work/cnpg-api-gap-dab27db` passed all 42
-requests for the corrected successor, with no undeclared gaps, unsupported
-operations, or outstanding observations. TokenReview authenticated the actual
-projected proxy token and its exact Pod and ServiceAccount binding. Required
-operations succeeded, out-of-scope operations were denied, and the declared
-create/field-scope limitations matched observed behavior. The guarded synthetic
-Secret-key experiment also passed and removed its probe key. The run was bound
-to all 16 producer sources and the exact signed pair; cleanup restored prior host
-inventories and removed credentials. This measures direct Kubernetes API access
-with a runtime credential, not proxy-path enforcement or GitHub release trust.
-
 Automated suites cover strict schema and canonical replay, claim and metadata
 store immutability, registry concurrency, capacity accounting, review privacy,
 issued-client binding, preview request shape, UID-safe cleanup, finalizer retry,
 audit retention, and release integrity/signature rejection. Strict Clippy checks
 apply the repository's production-source error-handling rules.
 
-Fresh disposable-cluster qualifications have exercised signed-candidate install
-and upgrade, permission-ceiling rejection before reservation, issued credential
-reconnection, old-writer credential denial before expiry, adoption, conditional
-SSA, finalizer-delayed cleanup, orphan retention, repeated commit, and replacement
-UID refusal. Each harness deletes only its owned cluster and removes its
-credential files. These runs use the test-candidate authorization boundary and
-do not establish the public `aps deploy` path for a complete signed release. The
-Rust [acceptance suite](/reference/acceptance/), which runs in CI, deploys the
-signed CNPG pair with the public `aps deploy`: ceiling rejection before any
-successor object, upgrade, old-identity retirement, data preservation, input
-rollouts and a secret-canary scan, on single-node kind with a synthetic signer.
-The same suite stops `aps deploy` after each phase an upgrade stores before it
-commits and resumes it to commit, blocks activation after the predecessor's
-termination evidence is lost, runs last-type cleanup through an unresolved
-finalizer and refuses a replacement UID, and refuses a second domain's claim on
-an owned object. It stops runs with admission-policy holds and SIGKILL rather
-than a hook in the product. The acceptance reference lists exactly which
-interruption points each scenario proves.
-
 The local SQLite durability tests for inventory, claim, review and audit
 records are described in [resource inventory](/reference/inventory/#current-limits).
 
 ## Remaining production work
 
-- The GitHub Actions checks workflow runs existing cuenv build, authoring,
-  editor, Rust, harness and documentation tasks with read-only repository
-  permissions. Actionlint, independent review and the hosted Linux checks passed
-  at `07b5041`. Release signing and external OIDC-to-Kubernetes identity
-  configuration and claim qualification remain separate unfinished work.
-- Finish live qualification of the corrected native candidate. The runtime
-  watches only observed inputs, matching compiled permissions; managed inputs
-  retain periodic reconciliation. `work/cnpg-input-reactions-89ceec4` passed the
-  local signed-pair deployment, permission-changing upgrade, Secret consumption,
-  ConfigMap-triggered rollout and idle/active sampling. All 26 runtime health
-  samples were ready and synchronized with zero errors. Additional checks passed
-  for 30-second equal-value suppression and a synthetic Secret-key update with
-  restoration of the original data and workload revision. Database credential
-  rotation and the full performance gate remain unqualified.
-- Port the live qualifications above to the Rust acceptance suite, run it in
-  CI on the examples, and delete each Python harness once its scenarios pass there.
+- The GitHub Actions checks workflow runs the cuenv build, authoring, editor,
+  Rust, packaging-script and documentation tasks, the reactor cases and the
+  acceptance suite with read-only repository permissions; the nightly workflow
+  runs the native double build. Release signing and external
+  OIDC-to-Kubernetes identity configuration remain separate unfinished work.
+- The runtime watches only observed inputs, matching compiled permissions;
+  managed inputs retain periodic reconciliation. Database credential rotation
+  is not tested.
 - Add a release workflow for the `aps` distribution that signs only after the
   acceptance suite passes.
+- Make the controller image reproducible again: clamp the final layer's file
+  modification times to the build profile's `sourceDateEpoch` so the nightly
+  native double build passes.
 - Keep uncertain stalled-job takeover blocked. A lease, expired token or changed
   executor label alone does not establish that the previous executor cannot
   proceed. The spec includes the trusted deployment job in its trusted computing
@@ -240,9 +206,8 @@ records are described in [resource inventory](/reference/inventory/#current-limi
 - Complete production API authorization and admission qualification for the
   supported Kubernetes versions, including the declared preview permissions and
   request-drain profile.
-- Complete the performance gate.
-  Current-candidate workload readiness, last-resource-type cleanup,
-  UID replacement and finalizer measurements have passed their stated scopes.
+- Complete the performance gate. No scoped performance comparison runs; the
+  Python sampling that measured earlier candidates has been removed.
 - Define operator recovery for incompatible or corrupt protected state. Current
   schemas fail closed and do not infer missing authority or perform automatic
   conversion.

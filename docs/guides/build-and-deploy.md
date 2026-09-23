@@ -211,7 +211,7 @@ The review lists supplemental preview permissions separately and keeps observed
 values out of its output. The final result retains the captured review, and an
 already-committed retry performs no live preview. See the
 [deployment review contract](/reference/review-contract/) for evidence limits;
-actual issued-token SSA qualification remains outstanding.
+the acceptance suite runs a live preview of one absent `ConfigMap`.
 
 ## What privileged CI owns
 
@@ -223,11 +223,13 @@ authority on a cluster.
 
 ## Current deployment boundary
 
-Focused candidate lifecycle runs have exercised install and upgrade behaviour,
-including writer quiescence, adoption, explicit force and finalizer-delayed
-cleanup. They are not final production-artifact acceptance. Persistent
-volume recovery, within-phase interruption, cross-executor recovery, and
-independent final review remain open.
+The [acceptance suite](/reference/acceptance/) deploys signed releases of the
+examples with `aps deploy` on disposable kind clusters: install, ceiling
+rejection, upgrade with writer quiescence and identity retirement, resume after
+each stored phase, finalizer-delayed cleanup and replacement-UID refusal. It is
+not production acceptance. Persistent volume recovery, within-phase
+interruption, cross-executor recovery, and independent final review remain
+open.
 
 Read the [implementation status](/reference/status/) before repeating any
 qualification claim. The canonical protocols are [Deployment contract](/reference/deployment-contract/),
