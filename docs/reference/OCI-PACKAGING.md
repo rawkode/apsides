@@ -16,7 +16,7 @@ Preparation first invokes the existing artifact verifier. It requires the artifa
 
 `context.json` hashes the exact prepared files and records the input artifact manifest, controller lock, IR identity, and builder image. These hashes provide local integrity evidence only. Runtime sources are the current checkout snapshot; they were not embedded in earlier local artifacts. Preparation therefore establishes a new packaging-input snapshot and does not claim those sources produced a pre-existing host binary. Keep the trusted workspace stable during preparation.
 
-Context verification also runs the existing trusted `aps check` against the embedded IR and requires its recomputed digest to match the context's declared IR identity. The build captures the initial context metadata, verifies the files and IR before dispatch, and verifies them again after BuildKit finishes. Changed files or metadata prevent publication of `packaging-inputs.json`; any already exported archive then remains an unaccepted output. The output directory must be outside the context. These checks detect persistent accidental changes during a build; they do not provide filesystem isolation against a malicious concurrent writer that changes files and restores them before verification.
+Context verification also runs the existing trusted `aps check` against the embedded IR and requires its recomputed digest to match the context's declared IR identity. The build captures the initial context metadata, verifies the files and IR before dispatch, and verifies them again after BuildKit finishes. Changed files or metadata prevent writing `controller.oci.tar` and `packaging-inputs.json`. The output directory must be outside the context. These checks detect persistent accidental changes during a build; they do not provide filesystem isolation against a malicious concurrent writer that changes files and restores them before verification.
 
 The locally inspected builder is:
 
@@ -28,23 +28,33 @@ linux/arm64
 Image creation is a separate explicit action:
 
 ```sh
+docker image save --output work/runtime-base.tar 'REGISTRY/COMPATIBLE-RUNTIME@sha256:EXACT_DIGEST'
 python3 scripts/package_oci.py build \
   --context work/apsides-oci-context \
   --runtime-image 'REGISTRY/COMPATIBLE-RUNTIME@sha256:EXACT_DIGEST' \
+  --runtime-base work/runtime-base.tar \
   --output work/apsides-oci-image
 ```
 
 The runtime image must already be cached, match the builder's platform, and supply the compatible GNU/Linux C runtime and CA certificates. A digest-pinned nonroot Debian 12 C/C++ distroless base is the intended deployment profile. Integration preparation cached `gcr.io/distroless/cc-debian12@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f`. Its upstream image family is documented by [Distroless](https://github.com/GoogleContainerTools/distroless). This is a digest pin, not a verified signature. The integration startup result is recorded below.
 
-The two-stage Dockerfile runs `cargo build --frozen --release` with vendored dependencies and `RUN --network=none`. The final image receives only the generated native binary from the build stage, uses UID/GID 65532, and embeds the validated IR in that binary. Runtime fixture configuration must be provided separately at the explicitly configured file path. The script uses BuildKit's image exporter, which every Docker driver and image store supports, so neither the containerd image store nor a `docker-container` builder is required. It never pushes an image; the built image stays in the local Docker store without a name. The script reads it back with `docker image save`, checks every blob against its digest and every layer against the config's diff IDs, and writes `controller.oci.tar`: an OCI layout holding one manifest that it generates from that config and those layers. The image digest is that manifest's digest, recorded as `imageDigest` in `packaging-inputs.json`. The classic store saves layers uncompressed and the containerd store saves them compressed, so the same build has a different image digest in each store. On the classic store BuildKit does not rewrite file timestamps inside layers, so image digests there are not reproducible; the binary digest does not depend on them.
+The Dockerfile runs `cargo build --frozen --release` with vendored dependencies and `RUN --network=none`, then copies only the binary into an empty stage. BuildKit's local exporter, which works on every Docker driver and image store, writes that stage to a temporary directory, so BuildKit compiles the controller and hands over the binary and nothing else. It builds no image and leaves nothing in the local image store. The export must hold exactly the binary.
+
+The script then assembles the image itself, so its bytes follow from the inputs alone:
+
+- **Base layers.** `--runtime-base` is a `docker image save` of the runtime image. Before BuildKit runs, the script verifies the pinned index, platform manifest and saved config chain described under [Complete CLI build](#complete-cli-build), and it checks every saved layer against the config's diff IDs.
+- **Controller layer.** The final layer is a USTAR tar of `usr`, `usr/local`, `usr/local/bin` and `usr/local/bin/apsides-controller`, in that order. Every entry has the profile's `sourceDateEpoch` as its modification time, owner `root:root` (0:0), and mode 0755. There are no PAX headers, so no sub-second or access timestamps. The layer depends only on the binary and the epoch.
+- **Config.** The image config is the pinned base config with the controller layer's diff ID appended to `rootfs.diff_ids` and one history entry appended. `created` is the epoch. The runtime configuration keeps the base's settings except that user is `65532:65532`, the working directory is `/`, the entrypoint is `/usr/local/bin/apsides-controller`, `Cmd` is removed and three labels are added: `dev.apsides.ir-digest`, `dev.apsides.release-status=blocked` and `org.opencontainers.image.title`. This is the configuration `aps release` requires. The binary embeds the validated IR. Runtime fixture configuration must be provided separately at the explicitly configured file path.
+
+`controller.oci.tar` is an OCI layout holding one manifest. Every layer, base layers included, is stored uncompressed, so each layer's blob digest is its diff ID. The archive's entries have fixed metadata and a fixed order. The image digest is the manifest's digest, recorded as `imageDigest` in `packaging-inputs.json` beside the binary's `binaryDigest`. Two builds from the same context, runtime base and epoch give a byte-identical archive and the same image digest. That holds on the classic (overlay2) store and the containerd store alike, because the containerd store's compressed base layers are decompressed and hashed against their diff IDs before they are written. Binary extraction requires the image's controller to equal `binaryDigest`.
 
 Both the build invocation and its Cargo RUN steps disable build-step networking. These flags do not by themselves prove that BuildKit's source/metadata resolver made no external requests. Whole-process egress isolation and production deployment authorization require separate evidence. Reproducible image builds, candidate provenance verification, and containerized reconciliation have separate receipts; consult STATUS.md for their current verification boundaries. A prepared context or successful image export must not be reported as satisfying them.
 
 ## Complete CLI build
 
 `aps build --source examples/web-application/program.tsx --output dist/build --profile apsides.build.json`
-composes source compilation, offline Cargo vendoring, BuildKit image creation,
-binary extraction, cargo-cyclonedx SBOM generation, and compiler
+composes source compilation, offline Cargo vendoring, BuildKit compilation,
+image assembly, binary extraction, cargo-cyclonedx SBOM generation, and compiler
 closure assembly. The binary is read from the image's final layer, which must
 hold only the controller and its parent directories; no container is created.
 The runtime base's registry index and its linux/amd64 and linux/arm64
@@ -64,7 +74,7 @@ closure records the index, manifest and config, and `aps release` checks the
 same chain offline. It then requires the image's layers to be exactly the base
 config's diff IDs plus the controller layer, decompressing and hashing each
 layer against its diff ID. It does not compare compressed base-layer
-descriptors, because the classic store exports base layers uncompressed.
+descriptors, because the build stores every layer uncompressed.
 
 The build emits `build-result.json`, `image/controller.oci.tar`,
 `linux-binary/apsides-controller`, `sbom/sbom.json`, and `build-inputs.json`.

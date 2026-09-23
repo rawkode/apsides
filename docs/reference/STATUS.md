@@ -159,10 +159,11 @@ row it answers. In summary:
 Reproducibility is checked twice: two `aps compile` runs of
 `examples/web-application` must give identical trees in the CLI tests on every
 change, and two cache-disabled `aps build` runs must give identical files,
-including the binary and OCI archive, in the nightly workflow. The compile check
-passes. The native check does not: the binary, SBOM, IR, plan and build inputs
-match, but the final image layer keeps build-time file modification times, so
-the OCI archive and image digest differ between builds.
+including the binary and OCI archive, in the nightly workflow. Both pass. The
+packaging writes the final image layer and config itself, with every timestamp
+set to the build profile's `sourceDateEpoch`, so the OCI archive and image
+digest do not depend on the image store or on when the build ran. The native
+check was last run on Docker's classic (overlay2) image store.
 
 `cuenv task authorCompilerTest` checks the declared-input and SES capability
 boundary on every CI run. A program importing a declared module compiles. An
@@ -194,9 +195,6 @@ records are described in [resource inventory](/reference/inventory/#current-limi
   is not tested.
 - Add a release workflow for the `aps` distribution that signs only after the
   acceptance suite passes.
-- Make the controller image reproducible again: clamp the final layer's file
-  modification times to the build profile's `sourceDateEpoch` so the nightly
-  native double build passes.
 - Keep uncertain stalled-job takeover blocked. A lease, expired token or changed
   executor label alone does not establish that the previous executor cannot
   proceed. The spec includes the trusted deployment job in its trusted computing
