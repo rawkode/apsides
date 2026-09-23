@@ -142,13 +142,10 @@ refused by the same verification `aps deploy` runs.
   pinned builder and runtime images; it does not compare builds across machines
   or architectures.
 
-The native check currently fails. Two builds on the default Docker driver give
-the same controller binary, SBOM, IR, plan and build inputs, but different OCI
-archives: the image exporter `aps build` uses keeps each build's wall-clock
-modification times on the files of the final image layer instead of clamping
-them to the profile's `sourceDateEpoch`, so the layer, the image configuration
-and the image digest differ. The nightly workflow stays red until the packaging
-clamps those times.
+BuildKit only compiles the controller; `aps build` assembles the image itself
+from the binary, the pinned runtime base and the profile's `sourceDateEpoch`
+(see [OCI packaging](/reference/oci-packaging/)), so the archive does not
+depend on the Docker driver, the image store or the wall clock.
 
 ## Limits
 
