@@ -1,6 +1,8 @@
 //! Deployment connection configuration never enters resource inventory records.
 use crate::Result;
-use inventory::{InventoryScope, InventoryStore, SqliteInventory, VersionedInventory};
+use inventory::{
+    InventoryScope, InventorySnapshot, InventoryStore, SqliteInventory, VersionedInventory,
+};
 use platform::{NamespaceRegistry, PlatformClient};
 use std::{
     path::{Path, PathBuf},
@@ -118,16 +120,23 @@ pub async fn require_request(
     Ok(())
 }
 
-pub async fn capture_active(
+/// Capture the active claims' live UIDs into the registry and inventory only
+/// after `admit` accepts the plan built from them; a rejection writes nothing.
+pub async fn capture_active<F, Fut>(
     platform: &PlatformClient,
     store: &dyn InventoryStore,
     domain: &compiler_core::Domain,
-) -> Result<platform::Versioned<NamespaceRegistry>> {
+    admit: F,
+) -> Result<platform::Versioned<NamespaceRegistry>>
+where
+    F: FnOnce(platform::Versioned<NamespaceRegistry>, InventorySnapshot) -> Fut + Send,
+    Fut: Future<Output = Result<()>> + Send,
+{
     let head = load(store, domain)
         .await?
         .ok_or("active inventory is missing; recovery required")?;
     let registry = platform
-        .capture_active_claim_uids(&domain.id, &head.snapshot)
+        .capture_active_claim_uids(&domain.id, &head.snapshot, admit)
         .await?;
     tokio::time::timeout(
         TIMEOUT,
@@ -141,7 +150,7 @@ pub async fn capture_active(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use inventory::{INVENTORY_SCHEMA, InventorySnapshot};
+    use inventory::INVENTORY_SCHEMA;
 
     fn domain() -> compiler_core::Domain {
         compiler_core::Domain {

@@ -140,6 +140,8 @@ impl LifecycleRegistry {
 mod audit_retention;
 #[path = "../../tests/support/audit.rs"]
 mod audit_support;
+#[cfg(feature = "deployer")]
+mod capture_admission;
 mod compact_state;
 #[cfg(feature = "deployer")]
 mod qualified_writer;
@@ -2639,6 +2641,15 @@ fn upgrade_ci_permissions_cover_retirement_and_actual_exec_method()
     Ok(())
 }
 
+/// Admit every capture; the tests using it exercise capture itself.
+#[cfg(feature = "deployer")]
+fn admit_all(
+    _: Versioned<NamespaceRegistry>,
+    _: inventory::InventorySnapshot,
+) -> std::future::Ready<platform::Result<()>> {
+    std::future::ready(Ok(()))
+}
+
 #[cfg(feature = "deployer")]
 #[tokio::test]
 async fn active_uid_capture_uses_inventory_and_rejects_missing_records()
@@ -2666,7 +2677,7 @@ async fn active_uid_capture_uses_inventory_and_rejects_missing_records()
             json!("echo-put"),
         ])?;
         let captured = platform_client(client, "control", "workload", "cluster-a")?
-            .capture_active_claim_uids("example", &snapshot)
+            .capture_active_claim_uids("example", &snapshot, admit_all)
             .await?;
         assert_eq!(
             captured
@@ -2682,7 +2693,7 @@ async fn active_uid_capture_uses_inventory_and_rejects_missing_records()
         let (client, calls) = wire(vec![control])?;
         assert!(
             platform_client(client, "control", "workload", "cluster-a")?
-                .capture_active_claim_uids("example", &missing)
+                .capture_active_claim_uids("example", &missing, admit_all)
                 .await
                 .is_err()
         );
@@ -2837,7 +2848,7 @@ async fn inventory_checkpoint_rejects_tampered_policy_and_missing_commitment_bef
         let (client, calls) = wire(vec![control.clone()])?;
         assert!(
             platform_client(client, "control", "workload", "cluster-a")?
-                .capture_active_claim_uids("example", &snapshot)
+                .capture_active_claim_uids("example", &snapshot, admit_all)
                 .await
                 .is_err(),
             "{corruption}"

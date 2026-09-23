@@ -67,7 +67,7 @@ impl PlatformClient {
     }
 }
 
-fn complete_uids(
+pub(crate) fn complete_uids(
     scope: &InventoryScope,
     snapshot: &InventorySnapshot,
     claims: &[ProtectedClaim],

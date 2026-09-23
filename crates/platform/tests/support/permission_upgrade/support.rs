@@ -179,7 +179,9 @@ async fn prepare_predecessor(
         .any(|resource| resource.uid.is_none());
     let snapshot = if preparation == RequestPreparation::CapturePredecessor && missing_uids {
         *registry = platform
-            .capture_active_claim_uids(&domain.id, &head.snapshot)
+            .capture_active_claim_uids(&domain.id, &head.snapshot, |_, _| async {
+                Ok::<(), platform_api::Error>(())
+            })
             .await
             .map_err(claim_capture_error)?;
         platform

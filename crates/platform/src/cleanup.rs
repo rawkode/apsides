@@ -9,16 +9,60 @@ use kube::{
 };
 
 impl PlatformClient {
-    /// Narrow existing protected claims to independently observed object UIDs.
+    /// Narrow existing protected claims to independently observed object UIDs,
+    /// persisting them only once `admit` accepts the plan they produce.
+    ///
+    /// `admit` receives the registry as the capture would persist it, at the
+    /// observed resourceVersion, and the active inventory with the same UIDs
+    /// completed. Everything before persistence only reads, so a policy
+    /// rejection from `admit` leaves the registry, claim and audit stores and
+    /// the inventory unchanged.
+    ///
     /// This is a planning snapshot, not writer termination or deletion proof.
     /// Runtime-written inventory never supplies a UID to this operation.
     /// # Errors
-    /// Rejects incomplete ownership, replacements, concurrent transitions or CAS changes.
-    pub async fn capture_active_claim_uids(
+    /// Rejects incomplete ownership, replacements, concurrent transitions, CAS
+    /// changes, or whatever `admit` rejects.
+    pub async fn capture_active_claim_uids<E, F, Fut>(
         &self,
         domain_id: &str,
         inventory: &inventory::InventorySnapshot,
-    ) -> Result<Versioned<NamespaceRegistry>> {
+        admit: F,
+    ) -> std::result::Result<Versioned<NamespaceRegistry>, E>
+    where
+        E: From<crate::Error>,
+        F: FnOnce(Versioned<NamespaceRegistry>, inventory::InventorySnapshot) -> Fut + Send,
+        Fut: Future<Output = std::result::Result<(), E>> + Send,
+    {
+        let (current, captured, transition_id) =
+            self.observe_active_claim_uids(domain_id, inventory).await?;
+        let scope = inventory::InventoryScope {
+            cluster: self.cluster_binding.clone(),
+            namespace: self.workload_namespace.clone(),
+            controller: domain_id.into(),
+        };
+        let planned_inventory = crate::inventory_capture::complete_uids(
+            &scope,
+            inventory,
+            &captured.claims,
+            &transition_id,
+        )?;
+        let planned = Versioned {
+            value: captured.clone(),
+            uid: current.uid.clone(),
+            resource_version: current.resource_version.clone(),
+        };
+        admit(planned, planned_inventory).await?;
+        Ok(self.persist_registry(&current, &captured).await?)
+    }
+
+    /// Read the active claims' live UIDs without writing anything. Returns the
+    /// loaded registry, the registry with those UIDs, and the active transition.
+    async fn observe_active_claim_uids(
+        &self,
+        domain_id: &str,
+        inventory: &inventory::InventorySnapshot,
+    ) -> Result<(Versioned<NamespaceRegistry>, NamespaceRegistry, String)> {
         let current = self.load_registry().await?;
         if current
             .value
@@ -100,7 +144,8 @@ impl PlatformClient {
                 claim.uid = Some(uid);
             }
         }
-        self.persist_registry(&current, &next).await
+        let transition_id = allocation.transition_id.clone();
+        Ok((current, next, transition_id))
     }
 }
 
