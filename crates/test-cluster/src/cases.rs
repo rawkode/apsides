@@ -1478,13 +1478,20 @@ impl Live<'_> {
         reopened?;
         self.wait_expected(reaction, "managed source transport restored")
             .await?;
-        // Every input is unreachable, so the reason may name any of them.
+        // Every input is unreachable, so the reason may name any input of any
+        // reaction on this target, not only this reaction's.
         let (input, kind) = reason.rsplit_once(':').unwrap_or_default();
-        let inputs = reaction
-            .inputs
+        let mut inputs = self
+            .release
+            .plan
+            .ir
+            .reactions
             .iter()
-            .map(String::as_str)
+            .filter(|other| other.target == reaction.target)
+            .flat_map(|other| other.inputs.iter().map(String::as_str))
             .collect::<Vec<_>>();
+        inputs.sort_unstable();
+        inputs.dedup();
         let mut assertions = vec![
             Assertion::new("block-reason", "unavailable", kind),
             Assertion::one_of("blocked-input", &inputs, Some(input)),
