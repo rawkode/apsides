@@ -53,7 +53,7 @@ files before they are written. CI uploads only this directory.
 | Scenario (`tests/kind.rs`) | Check | §28 row |
 | --- | --- | --- |
 | `cnpg_upgrade_through_the_public_cli` | (a) under a ceiling allowing only the initial release, `aps deploy` of it commits | Upgrade to a build with different permissions |
-| | (b) `aps deploy` of the successor fails with the ceiling diagnostic for the capability it adds; no successor or next-generation object exists, the registry's UID and resourceVersion, the reserved sequence and the running initial writer are unchanged | Add a capability above the ceiling |
+| | (b) `aps deploy` of the successor fails with the ceiling diagnostic for the capability it adds; no successor or next-generation object exists, and the registry's UID, resourceVersion and state, the reserved sequence and the running initial writer are unchanged | Add a capability above the ceiling |
 | | (c) after the platform widens the ceiling, `aps deploy` of the successor commits a new transition and generation | Upgrade to a build with different permissions |
 | | (d) every RoleBinding and the `ServiceAccount` the old generation recorded for retirement are gone, no RoleBinding names the old identity, and the new `ServiceAccount` has another name and UID | Upgrade to a build with different permissions |
 | | (e) a row written before the upgrade reads back afterwards; the CNPG Cluster and every volume claim keep their UIDs | (example data preservation) |
