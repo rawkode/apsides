@@ -42,29 +42,16 @@ deployment still requires a release with signed provenance.
 
 ## Verification
 
-The macOS development-profile bundle passed an external-directory rehearsal
-after two moves. A sandbox denied reads of the source checkout for every CLI
-command: `init`, CNPG `crds fetch`, `lock`, `compile`, and `verify`. The generated
-SDK matched the packaged SDK, compiler receipts retained their closed contract,
-and generated artifacts contained no checkout paths. Six separate asset changes
-or removals were rejected without publishing an initialized project, and each
-asset was restored. The local summary is `work/cli-distribution-acceptance.json`; it binds the tested
-CLI binary and retained asset manifest.
+Unit tests in `crates/cli/src/assets.rs` build an asset tree and its manifest in
+a temporary directory. They check that verification fails when a file is
+added, changed or removed, when a symlink escapes the installation, and when
+the tree exceeds its entry, size or depth limits. One test removes or extends
+each of the compiler, SDK, `deno.lock`, a dependency reached through an
+internal link, the runtime crate and the native builder in turn, and checks
+that the restored tree passes again. `cuenv task packageCliTest` covers the
+packaging script.
 
-Repeat this authoring acceptance on macOS with a fresh output outside both the
-checkout and the installed prefix:
-
-```sh
-cuenv exec -- python3 tests/run_cli_distribution.py \
-  --prefix /absolute/path/to/aps-distribution \
-  --output /absolute/path/to/acceptance
-```
-
-A separate checkout-denied `aps build` also produced a Linux/arm64 native
-controller, OCI image and SBOM using the existing pinned build profile. Its
-summary is `work/cli-distribution-native-build.json`. This was a local build;
-approved provenance and full production release acceptance remain pending.
-
-Linux-host isolation acceptance and signed package delivery remain separate work.
+No test runs a relocated bundle with the source checkout unreadable, and no
+test runs a bundle on a Linux host. Signed package delivery is separate work.
 The embedded manifest checks asset integrity relative to the executable; it does
 not authenticate the executable's publisher.
