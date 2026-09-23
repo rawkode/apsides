@@ -51,9 +51,6 @@ suspicious_operation_groupings = "allow"
 # `pub(crate)` records the reach an item is meant to have. Collapsing it to
 # `pub` wherever the enclosing module happens to be private would drop that.
 redundant_pub_crate = "allow"
-# `test-support` is named in env.cue tasks, CI and the Python harnesses; the
-# suffix is meaningful at those call sites.
-redundant_feature_names = "allow"
 # Fires on guards whose last use is the final statement of their scope, where
 # an explicit `drop` adds nothing. Several of its suggestions place that `drop`
 # before a later `&mut` use of the guard and do not compile.

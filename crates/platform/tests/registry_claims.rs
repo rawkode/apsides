@@ -235,7 +235,6 @@ async fn unsupported_registry_schema_is_rejected_before_claim_access() -> Result
     Ok(())
 }
 
-#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn protected_reference_survives_real_local_database_reopen() -> Result {
     let directory = tempfile::tempdir()?;
