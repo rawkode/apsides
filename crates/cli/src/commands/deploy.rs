@@ -60,7 +60,7 @@ async fn deploy(arguments: &cli::Deploy) -> Result<Value> {
     let existing = check_existing(
         &registry.value,
         &transition_id,
-        &verified,
+        &(&verified).into(),
         &executor,
         &policy_digest,
     )?;
