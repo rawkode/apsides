@@ -36,10 +36,10 @@ It verifies every release with `aps verify-release`, fetches the CloudNativePG
 missing.
 
 CI prepares once in the `acceptance-prepare` job and hands the releases, with
-the `aps` that built them, to three `acceptance` matrix jobs, each running one
+the `aps` that built them, to four `acceptance` matrix jobs, each running one
 cuenv task with `--test-threads=1`: `acceptanceUpgradeTest` (P0, uncertain
-writer, ownership collision), `acceptancePhasesTest` and
-`acceptanceCleanupTest`.
+writer, ownership collision with live preview), `acceptancePhasesTest`,
+`acceptanceCleanupTest` and `acceptanceCredentialsTest`.
 
 Each scenario creates its own cluster named `aps-acc-…` with a kubeconfig in a
 private temporary directory, and deletes it when it ends, including on failure.
@@ -75,6 +75,13 @@ files before they are written. CI uploads only this directory.
 | `cleanup::cleanup_refuses_a_replacement_uid` | A policy denying the deployer's DELETE of the `Backup` stops cleanup with the original UID pinned in Cleaning. The `Backup` is then deleted and recreated under the same field manager. Rerunning `aps deploy` fails with `cleanup refuses to delete a replacement UID`. The replacement is untouched, the registry is unchanged, and the claim stays Releasing for the original UID | Replace a pending-delete object with a new UID |
 | both cleanup scenarios | an unclaimed `Backup` of the same type is untouched, and no workload Role bound to the successor's runtime account grants anything on `Backup`s | Remove the last managed resource of an API type |
 | `collision::a_claimed_object_cannot_be_claimed_by_another_domain` | The registry is bootstrapped for two domains. `aps deploy` of `cnpg-owner` commits and claims `default/api-config`. `aps deploy` of the CNPG initial release, another domain declaring the same `ConfigMap`, then fails with `new target collides with a protected claim`. The registry object, every object in the control and workload namespaces, the owner's `ConfigMap` and every metadata database row are unchanged. The contender has no transition and no writer | Deploy a second domain claiming the same object |
+| `collision::a_claimed_object_cannot_be_claimed_by_another_domain` (preview) | The owner's deployment identity approves live preview of its one `ConfigMap`. Under a hold that denies every registry update by the deployer, `aps deploy` of the owner runs the preview and is refused at its reservation. The registry state and every `ServiceAccount`, `ConfigMap`, Secret, Service, Deployment, Role and RoleBinding in the control and workload namespaces keep their UID and resourceVersion, and `api-config` does not exist. The report records which metadata database tables the reservation wrote before its denied registry write. Without the hold, the committed report's `review.liveImpact` is `available`, observed `fresh-pre-reservation`, for exactly the approved target | (live preview is read-only; no §28 row) |
+| `credentials::the_runtime_credential_holds_exactly_its_declared_capabilities` | (a) Under a policy naming an image pull secret, `aps deploy` of the successor commits, and the controller and proxy Deployments it staged, and the proxy Pod, carry exactly that `imagePullSecrets` list | (platform image pull credentials) |
+| | (b) The token the kubelet projected into the running proxy's envoy container is read through the API server into memory only. A `TokenReview` authenticates it as the generation's runtime `ServiceAccount` with the proxy Pod's name and UID, and its claims name the same Pod and expire within the projection's lifetime | Exercise the runtime credential outside scope |
+| | (c) With that token, every capability the compiled plan declares succeeds (named get, filtered list and watch, dry-run patch, update and create). Unfiltered lists and watches are denied. Each disclosed RBAC gap behaves as the compiler reports it: a dry-run create under another name, and a dry-run patch and update of a field the program never sets, are allowed. A dry-run apply of every desired object succeeds. Reads in another namespace or of another name, RBAC reads, deletion, patches of the platform's trust and policy objects and token requests are denied. The run requires the demonstrated gaps to equal the declared ones | Exercise the runtime credential outside scope; Attempt a broader field patch within an allowed Deployment |
+| | (d) A `SubjectAccessReview` of every distinct request, for the user and groups the `TokenReview` returned, gives the same answer | Exercise the runtime credential outside scope |
+| | (e) The disclosed `sensitive-revision-change-observable` gap holds: adding a key to the observed Secret rolls the API out to a new revision and removing it restores the original one | Exercise the runtime credential outside scope (the disclosed profile) |
+| | (f), (g) The proxy Pod and `ServiceAccount` are unchanged throughout, and the token, the pull secret and every other Secret value or rollout key appear nowhere in `aps` output, controller logs or the inventory database | Inspect artifacts, logs, metrics, and inventory |
 
 ### Which interruption points are proven
 
@@ -105,13 +112,43 @@ chosen instruction, and none has another executor take over a stalled
 transition.
 
 The reactor rows (generated tests, fixture images, offline execution,
-reaction-mutation checks) are covered by `aps test --cluster` in the `reactor`
-CI job. Undeclared evaluation input is covered by `cuenv task
-authorCompilerTest` (`packages/compiler/src/compiler.test.ts`). The remaining
-rows (reproducibility, credential scope, field-patch coverage, downtime
-recovery, watch expiry, input denial, out-of-band edits, field-manager
-conflicts and fixture promotion) are still qualified by the Python harnesses in
-`tests/` until each is ported here.
+reaction-mutation checks, downtime recovery, watch replay and relist, input
+denial, out-of-band edits and field-manager conflicts) are covered by
+`aps test --cluster` in the `reactor` CI job. Undeclared evaluation input is
+covered by `cuenv task authorCompilerTest`
+(`packages/compiler/src/compiler.test.ts`). Fixture promotion is covered by
+`crates/release/tests/signatures.rs`: a correctly signed fixture release is
+refused by the same verification `aps deploy` runs.
+
+## Reproducibility
+
+"Build the same declared inputs twice" is checked in two halves.
+
+- `compiling_a_program_twice_gives_identical_artifacts`
+  (`crates/cli/tests/reproducible_compile.rs`) runs `aps compile` of
+  `examples/web-application` into two fresh directories and requires the two
+  trees to be identical byte for byte: the IR, the compiled plan, the build
+  inputs the native build binds, the generated controller source and lockfile,
+  and the manifest of file digests. It runs with the CLI tests on every change.
+  It proves the compiler's output does not depend on the output path, the time
+  or anything else that differs between two runs on one machine.
+- `cuenv task reproducibleBuild` (`acceptance-reproduce`) runs `aps build` of
+  the same program twice with `--cache disabled` from one build profile and
+  requires every output file to have the same digest, including the controller
+  binary, the OCI archive and so the image digest, and the SBOM. It writes the
+  digests to `work/reproducible-build/report.json`. The `Nightly` workflow runs
+  it once a day and on demand, because two native builds take too long for every
+  change. It proves the native build is reproducible on one runner with the
+  pinned builder and runtime images; it does not compare builds across machines
+  or architectures.
+
+The native check currently fails. Two builds on the default Docker driver give
+the same controller binary, SBOM, IR, plan and build inputs, but different OCI
+archives: the image exporter `aps build` uses keeps each build's wall-clock
+modification times on the files of the final image layer instead of clamping
+them to the profile's `sourceDateEpoch`, so the layer, the image configuration
+and the image digest differ. The nightly workflow stays red until the packaging
+clamps those times.
 
 ## Limits
 
@@ -121,6 +158,15 @@ conflicts and fixture promotion) are still qualified by the Python harnesses in
   is not exercised.
 - The issuer credential is a TokenRequest token minted with the cluster's admin
   kubeconfig, not a Pod-bound token or an external OIDC identity.
+- The runtime credential scenario sweeps only the CNPG successor's plan. It
+  checks the requests the plan implies and a fixed list of out-of-scope ones,
+  not every request the credential could make. Its writes are dry runs.
+- The pull-secret check covers the references on the staged writers. The
+  kubelet's registry authentication is Kubernetes' job and is not exercised:
+  the images are already on the node.
+- The preview check stops `aps` at its reservation's registry write. Local
+  metadata database writes the reservation makes before that write are
+  reported, not held.
 - The Envoy environment canary (`crates/platform/tests/envoy/canary.py`) is not
   run. The proxy policy's environment qualification digest names that fact
   rather than a canary result.

@@ -122,7 +122,7 @@ Preview opt-in uses `apsides.dev/deployment-identity/v2` with the exact profile 
 
 Static composition preserves a current rollout contribution only with exact stable-manager Apply evidence. Missing contributions remain missing and future reaction output stays conditional. Removed final reactions omit the old contribution. Adoption uses the approved non-force payload. No observed input, Secret value or rollout key is read to invent future runtime state.
 
-The CLI invokes this adapter when the protected identity explicitly approves preview and includes the captured result in v5 deployment review. Actual issued-credential SSA qualification remains required. The fresh adapter rejects server versions other than v1.34.3, matching the existing CLI absent-only SSA qualification. No server version is yet live-qualified for the adapter itself; the OrbStack read-only probe does not establish that qualification.
+The CLI invokes this adapter when the protected identity explicitly approves preview and includes the captured result in v5 deployment review. The fresh adapter rejects server versions other than v1.34.3. The acceptance suite's collision scenario runs it live on that version with the issued deployer credential: under an admission hold that denies the reservation's registry write, `aps deploy` with preview approved for one absent `ConfigMap` leaves the registry and every control and workload namespace object unchanged and does not create the target, and without the hold the committed report carries the `available` fresh preview of exactly that target. It covers one absent ConfigMap target only. Existing targets, adoption, pending-transition preview and missing preview permissions are not exercised live.
 
 ### CLI capture and resume
 

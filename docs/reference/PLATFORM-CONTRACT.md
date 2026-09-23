@@ -55,10 +55,14 @@ the existing policy-drift checks to reject resume. Credential rotation under an
 unchanged name remains a platform operation and does not bind Secret contents or
 resource versions into Apsides state.
 
-Manifest tests establish reference propagation, not successful registry access.
-Private-registry qualification requires a fresh node pull of the exact image
-digest and a failure case with missing or invalid credentials. Preloaded demo
-images do not establish that evidence.
+Unit tests establish reference propagation and policy validation. The
+acceptance suite's runtime credential scenario
+(`credentials::the_runtime_credential_holds_exactly_its_declared_capabilities`)
+deploys under a policy naming one pull secret and checks that the staged
+controller and proxy Deployments, found by the UIDs the writer checkpoint
+records, and the running proxy Pod carry exactly that list. It does not
+exercise registry authentication: the images are already on the node, and
+authenticating a pull is the kubelet's job.
 
 ## Initial installation executor
 
@@ -183,16 +187,6 @@ the next controller. `commit_upgrade` invokes actual cleanup internally and uses
 one fresh registry CAS to release only completed claims. Caller-supplied cleanup
 receipts cannot commit a transition.
 
-The optional `test-support` build exposes `reserve_qualification_candidate` only
-for separately verified candidate authorization. It checks the exact signed
-candidate against a UID-pinned `apsides-candidate-qualification` ConfigMap
-marker of schema `apsides.dev/candidate-qualification/v1`, plus pinned
-`kube-system` Namespace, control/workload namespace and Node identities, then
-reserves the initial transition through the existing authenticated reservation
-path. It never stages or activates, and is absent from production CLI builds.
-Ordinary `aps deploy` independently verifies release integrity, signed
-provenance and platform authorization.
-
 Every activation/resume checks the staged service account and exact derived Roles
 and RoleBindings, including their recorded UIDs and current semantic contents.
 It also rereads immutable runtime configuration and generation TLS identities.
@@ -200,8 +194,12 @@ These checks establish that Apsides' own grants have not drifted. Kubernetes RBA
 is additive: independently administered bindings can grant the same service account
 additional authority. Preventing that is a platform authorization/admission trust
 assumption; this adapter does not claim to prove the complete effective ceiling
-by inspecting only its own objects. Actual short-lived credential tests establish
-permissions in the tested cluster at the test time.
+by inspecting only its own objects. The acceptance suite's runtime credential
+scenario establishes the generation's permissions in its kind cluster at the
+time it runs: with the token projected into the proxy, bound by `TokenReview` to
+that Pod and `ServiceAccount`, every declared capability succeeds, each
+disclosed RBAC gap behaves as disclosed, out-of-scope requests are denied, and
+`SubjectAccessReview` agrees.
 
 `Error::Pending` reports ordinary readiness and observed scale-down convergence.
 Invalid quiescence identity, terminal epoch or request-ledger evidence produces a
