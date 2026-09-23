@@ -36,6 +36,19 @@ pub async fn registry_metadata(objects: &Objects) -> Result<Value> {
 /// # Errors
 /// Fails when a kind cannot be listed.
 pub async fn object_inventory(objects: &Objects) -> Result<BTreeSet<String>> {
+    inventory(objects, false).await
+}
+
+/// [`object_inventory`] with each object's resourceVersion appended, so any
+/// write to an object shows as a difference.
+///
+/// # Errors
+/// Fails when a kind cannot be listed.
+pub async fn object_versions(objects: &Objects) -> Result<BTreeSet<String>> {
+    inventory(objects, true).await
+}
+
+async fn inventory(objects: &Objects, versions: bool) -> Result<BTreeSet<String>> {
     let mut entries = BTreeSet::new();
     for namespace in [CONTROL_NAMESPACE, WORKLOAD_NAMESPACE] {
         for (api_version, kind) in [
@@ -51,11 +64,16 @@ pub async fn object_inventory(objects: &Objects) -> Result<BTreeSet<String>> {
                 .list(api_version, kind, Some(namespace), None)
                 .await?
             {
-                entries.insert(format!(
+                let mut entry = format!(
                     "{kind}/{namespace}/{}/{}",
                     text(&item, "/metadata/name"),
                     text(&item, "/metadata/uid")
-                ));
+                );
+                if versions {
+                    entry.push('@');
+                    entry.push_str(text(&item, "/metadata/resourceVersion"));
+                }
+                entries.insert(entry);
             }
         }
     }

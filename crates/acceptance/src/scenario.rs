@@ -243,6 +243,16 @@ impl<'a> Scenario<'a> {
         self.aps.spawn(release, &self.executor)
     }
 
+    /// A client of the cluster that authenticates with `token` alone.
+    ///
+    /// # Errors
+    /// Fails when the client cannot be configured.
+    pub async fn token_client(&self, token: &str) -> Result<kube::Client> {
+        const CONTEXT: &str = "acceptance-token";
+        let kubeconfig = serde_json::from_value(self.endpoint.token_kubeconfig(CONTEXT, token))?;
+        Ok(test_cluster::cluster::client(kubeconfig, CONTEXT).await?)
+    }
+
     /// Record a spawned run's output as `label`.
     pub fn document(&mut self, label: &str, output: &Output) {
         self.recorder

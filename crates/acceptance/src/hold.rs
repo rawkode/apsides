@@ -6,8 +6,9 @@
 //! one transition at one phase. The write that moves the transition into that
 //! phase is admitted, because its old object is still at the phase before;
 //! every later registry write of that run is denied, so the run cannot move
-//! past the phase however it is scheduled. A deletion hold denies the
-//! deployer's DELETE of one named object.
+//! past the phase however it is scheduled. A reservation hold denies every
+//! registry update by the deployer. A deletion hold denies the deployer's
+//! DELETE of one named object.
 //!
 //! Admission policies take effect asynchronously. Each hold therefore also
 //! matches a probe `ConfigMap` that nothing else writes, denied for everyone:
@@ -48,6 +49,20 @@ impl Hold {
         phase: Phase,
     ) -> Self {
         let (policy, message) = registry_policy(control, workload, transition, phase);
+        Self {
+            objects: objects.clone(),
+            control: control.to_owned(),
+            message,
+            policy,
+        }
+    }
+
+    /// Deny every registry update by the deployer. A fresh `aps deploy`
+    /// stops at its reservation, the first registry write it makes, after
+    /// planning and any live preview.
+    #[must_use]
+    pub fn reservation(objects: &Objects, control: &str, workload: &str) -> Self {
+        let (policy, message) = reservation_policy(control, workload);
         Self {
             objects: objects.clone(),
             control: control.to_owned(),
@@ -189,6 +204,22 @@ fn registry_policy(
     (policy, message)
 }
 
+/// The reservation hold's policy and denial message.
+fn reservation_policy(control: &str, workload: &str) -> (Value, String) {
+    let message = format!("acceptance hold: apsides-registry-{workload} is not updated");
+    let target = format!(
+        "request.userInfo.username == '{}' && request.namespace == '{control}' && request.name == 'apsides-registry-{workload}'",
+        deployer(control)
+    );
+    let policy = policy(
+        &[rule("", "configmaps", "UPDATE")],
+        &format!("{} || ({target})", probe(control)),
+        "false",
+        &message,
+    );
+    (policy, message)
+}
+
 /// The deletion hold's policy and denial message.
 fn deletion_policy(control: &str, target: &Target<'_>) -> (Value, String) {
     let Target {
@@ -268,6 +299,21 @@ mod tests {
             json!(["UPDATE"])
         );
         assert_eq!(message, "acceptance hold: t-2 stays Quiesced");
+    }
+
+    #[test]
+    fn reservation_holds_deny_every_deployer_registry_update() {
+        let (policy, message) = reservation_policy("apsides-system", "default");
+        let spec = &policy["spec"];
+        assert_eq!(text(spec, "/validations/0/expression"), "false");
+        let matches = text(spec, "/matchConditions/0/expression");
+        assert!(matches.contains("system:serviceaccount:apsides-system:ceiling-deployer"));
+        assert!(matches.contains("request.name == 'apsides-registry-default'"));
+        assert!(matches.contains(PROBE));
+        assert_eq!(
+            message,
+            "acceptance hold: apsides-registry-default is not updated"
+        );
     }
 
     #[test]
