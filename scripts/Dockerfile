@@ -1,5 +1,4 @@
 ARG BUILDER_IMAGE
-ARG RUNTIME_IMAGE
 
 FROM ${BUILDER_IMAGE} AS build
 WORKDIR /build
@@ -12,12 +11,7 @@ COPY workspace workspace
 COPY controller controller
 RUN --network=none cargo build --frozen --release --manifest-path controller/Cargo.toml
 
-FROM ${RUNTIME_IMAGE} AS runtime
-ARG IR_DIGEST
-LABEL org.opencontainers.image.title="Apsides generated controller"
-LABEL dev.apsides.ir-digest=${IR_DIGEST}
-LABEL dev.apsides.release-status="blocked"
-COPY --from=build /build/target/release/controller /usr/local/bin/apsides-controller
-USER 65532:65532
-WORKDIR /
-ENTRYPOINT ["/usr/local/bin/apsides-controller"]
+# The local exporter hands over only the binary; scripts/package_oci.py puts it
+# on the pinned runtime base.
+FROM scratch AS controller
+COPY --from=build /build/target/release/controller /apsides-controller

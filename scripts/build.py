@@ -34,11 +34,11 @@ def assemble(artifact, source, profile_path, *, no_cache=False):
     metadata = prepare(artifact, context, builder_image=profile["builderImage"], source_date_epoch=profile["sourceDateEpoch"])
     if metadata["builder"]["platform"] != profile["platform"]:
         raise ValueError("cached builder platform differs from build profile")
-    image_digest = build(context, profile["runtimeImage"], image, no_cache=no_cache)
-    binary_digest = extract(image, artifact / "linux-binary")
-    sbom_digest = generate(context, tool, profile["sbomToolSha256"], targets[profile["platform"]], artifact / "sbom")
     base = artifact / "runtime-base.tar"
     subprocess.run(["docker", "image", "save", "-o", str(base), profile["runtimeImage"]], check=True)
+    image_digest = build(context, profile["runtimeImage"], base, image, no_cache=no_cache)
+    binary_digest = extract(image, artifact / "linux-binary")
+    sbom_digest = generate(context, tool, profile["sbomToolSha256"], targets[profile["platform"]], artifact / "sbom")
     verify_tools(tools, tool, cli)
     finalize(source / "build-inputs.json", context, base, image / "packaging-inputs.json", profile_path, tools, artifact / "build-inputs.json")
     verify_tools(tools, tool, cli)

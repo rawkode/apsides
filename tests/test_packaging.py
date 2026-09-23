@@ -20,7 +20,6 @@ packaging = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(packaging)
 sys.path.insert(0, str(ROOT / "scripts"))
 import extract_binary  # noqa: E402
-import finalize_inputs  # noqa: E402
 
 
 class PackagingTests(unittest.TestCase):
@@ -49,9 +48,18 @@ class PackagingTests(unittest.TestCase):
             (self.repo / f"crates/{crate}/Cargo.toml").write_text('[package]\nname="test"\nversion="0.1.0"\n')
             (self.repo / f"crates/{crate}/src/lib.rs").write_text("// trusted runtime snapshot\n")
         self.calls = []
+        # A pinned runtime base, saved as the classic store writes it.
+        self.base_config = image_config([BASE_LAYER])
+        self.base_archive, _ = classic_save(self.root / "runtime-base.tar", self.base_config, [BASE_LAYER])
+        self.pins, self.runtime_image, _, _ = write_pins(self.root / "pins", self.base_config, [BASE_LAYER])
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def build(self, destination, run, no_cache=False):
+        with patch.object(packaging, "command", self.fake_command), patch.object(packaging.subprocess, "run", run):
+            return packaging.build(self.output, self.runtime_image, self.base_archive, destination,
+                                   no_cache=no_cache, pins=self.pins)
 
     def test_current_runtime_dependency_closure_includes_coordination(self):
         closure = packaging.local_crates(ROOT)
@@ -63,14 +71,17 @@ class PackagingTests(unittest.TestCase):
         for blob in (pins / "blobs/sha256").iterdir():
             self.assertEqual(packaging.sha256(blob.read_bytes()), "sha256:" + blob.name)
         reference = (pins / "reference").read_text().strip()
-        index = json.loads(finalize_inputs.pinned_blob(pins, reference.rsplit("@", 1)[1]))
+        index = json.loads(packaging.pinned_blob(pins, reference.rsplit("@", 1)[1]))
         for architecture in ["amd64", "arm64"]:
             [entry] = [item for item in index["manifests"]
                        if (item["platform"]["os"], item["platform"]["architecture"]) == ("linux", architecture)]
-            finalize_inputs.pinned_blob(pins, entry["digest"], entry["size"])
+            packaging.pinned_blob(pins, entry["digest"], entry["size"])
 
     def fake_command(self, argv, cwd=None, timeout=180):
         self.calls.append(argv)
+        if argv[:3] == ["docker", "image", "inspect"] and argv[3] != packaging.BUILDER:
+            return json.dumps([{"Os": "linux", "Architecture": "arm64", "Id": packaging.sha256(self.base_config),
+                                "RepoDigests": [argv[3]]}])
         if argv[:3] == ["docker", "image", "inspect"]:
             return json.dumps([{"Os": "linux", "Architecture": "arm64", "Id": "sha256:" + "b" * 64,
                                 "RepoDigests": [packaging.BUILDER]}])
@@ -139,9 +150,8 @@ class PackagingTests(unittest.TestCase):
                         path.write_text(json.dumps(metadata))
                     else:
                         path.write_text("// source changed during image build\n")
-                with patch.object(packaging, "command", self.fake_command), patch.object(packaging.subprocess, "run", fake_build):
-                    with self.assertRaisesRegex(ValueError, "changed"):
-                        packaging.build(self.output, packaging.BUILDER, destination)
+                with self.assertRaisesRegex(ValueError, "changed"):
+                    self.build(destination, fake_build)
                 self.assertFalse((destination / "packaging-inputs.json").exists())
 
     def test_build_receipt_uses_initial_verified_snapshot_and_external_output(self):
@@ -149,29 +159,46 @@ class PackagingTests(unittest.TestCase):
         initial = packaging.read_regular(self.output / "context.json")
         destination = self.root / "image"
         with self.assertRaisesRegex(ValueError, "outside"):
-            packaging.build(self.output, packaging.BUILDER, self.output / "image")
-        config = image_config([BASE_LAYER, CONTROLLER_LAYER])
+            packaging.build(self.output, self.runtime_image, self.base_archive, self.output / "image")
         def fake_build(argv, check):
             self.assertIn("--network=none", argv)
             self.assertIn("--pull=false", argv)
             self.assertIn("--no-cache", argv)
-            self.assertIn("type=image,oci-mediatypes=true,rewrite-timestamp=true", argv)
-            (destination / "buildkit-metadata.json").write_text(json.dumps(
-                {"containerimage.digest": "sha256:" + "c" * 64, "containerimage.config.digest": packaging.sha256(config)}))
-        def fake_command(argv, cwd=None, timeout=180):
-            if argv[:3] == ["docker", "image", "save"]:
-                self.assertEqual(argv[5:], ["sha256:" + "c" * 64])
-                classic_save(Path(argv[4]), config, [BASE_LAYER, CONTROLLER_LAYER])
-                return ""
-            return self.fake_command(argv, cwd, timeout)
-        with patch.object(packaging, "command", fake_command), patch.object(packaging.subprocess, "run", fake_build):
-            digest = packaging.build(self.output, packaging.BUILDER, destination, no_cache=True)
+            self.assertFalse(any("RUNTIME_IMAGE" in argument for argument in argv))
+            [output] = [argument for argument in argv if argument.startswith("type=local,dest=")]
+            exported = Path(output.removeprefix("type=local,dest="))
+            exported.mkdir(parents=True)
+            (exported / "apsides-controller").write_bytes(ELF)
+        digest = self.build(destination, fake_build, no_cache=True)
         receipt = json.loads((destination / "packaging-inputs.json").read_text())
         self.assertEqual(receipt["contextDigest"], packaging.sha256(initial))
         self.assertEqual(receipt["releaseStatus"], "blocked")
         self.assertEqual(receipt["imageDigest"], digest)
-        self.assertEqual(sorted(path.name for path in destination.iterdir()),
-                         ["buildkit-metadata.json", "controller.oci.tar", "packaging-inputs.json"])
+        self.assertEqual(receipt["binaryDigest"], packaging.sha256(ELF))
+        self.assertEqual(sorted(path.name for path in destination.iterdir()), ["controller.oci.tar", "packaging-inputs.json"])
+        self.assertEqual(extract_binary.extract(destination, self.root / "binary"), packaging.sha256(ELF))
+
+    def test_build_rejects_an_unpinned_runtime_base_before_compiling(self):
+        self.prepare()
+        self.base_config = image_config([CONTROLLER_LAYER])
+        self.base_archive.unlink()
+        classic_save(self.base_archive, self.base_config, [CONTROLLER_LAYER])
+        def compile_(argv, check):
+            raise AssertionError("BuildKit must not run for an unpinned base")
+        with self.assertRaisesRegex(ValueError, "pinned manifest"):
+            self.build(self.root / "image", compile_)
+        self.assertFalse((self.root / "image").exists())
+
+    def test_build_rejects_anything_but_the_binary_from_the_exporter(self):
+        self.prepare()
+        def fake_build(argv, check):
+            [output] = [argument for argument in argv if argument.startswith("type=local,dest=")]
+            exported = Path(output.removeprefix("type=local,dest="))
+            (exported / "etc").mkdir(parents=True)
+            (exported / "apsides-controller").write_bytes(ELF)
+        with self.assertRaisesRegex(ValueError, "more or less than the controller"):
+            self.build(self.root / "image", fake_build)
+        self.assertFalse((self.root / "image/packaging-inputs.json").exists())
 
     def test_mutated_lock_during_vendor_never_publishes_a_context(self):
         def mutate(argv, cwd=None, timeout=180):
@@ -249,6 +276,22 @@ def image_config(layers, architecture="arm64"):
                        "rootfs": {"type": "layers", "diff_ids": [packaging.sha256(layer) for layer in layers]}}).encode()
 
 
+def write_pins(pins, config, layers, compressed=None):
+    """Registry pins for an image: an OCI index and its arm64 manifest."""
+    compressed = [gzip.compress(layer, mtime=0) for layer in layers] if compressed is None else compressed
+    manifest = json.dumps({"schemaVersion": 2, "mediaType": packaging.OCI_MANIFEST,
+        "config": {"mediaType": packaging.OCI_CONFIG, "digest": packaging.sha256(config), "size": len(config)},
+        "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "digest": packaging.sha256(layer), "size": len(layer)} for layer in compressed]}).encode()
+    index = json.dumps({"schemaVersion": 2, "mediaType": packaging.OCI_INDEX, "manifests": [
+        {"mediaType": packaging.OCI_MANIFEST, "digest": packaging.sha256(manifest), "size": len(manifest), "platform": {"os": "linux", "architecture": "arm64"}},
+        {"mediaType": packaging.OCI_MANIFEST, "digest": "sha256:" + "0" * 64, "size": 1, "platform": {"os": "linux", "architecture": "amd64"}}]}).encode()
+    shutil.rmtree(pins, ignore_errors=True)
+    (pins / "blobs/sha256").mkdir(parents=True)
+    for data in [index, manifest]:
+        (pins / "blobs/sha256" / packaging.sha256(data)[7:]).write_bytes(data)
+    return pins, "example.invalid/runtime@" + packaging.sha256(index), index, manifest
+
+
 def classic_save(path, config, layers):
     """Docker 25+ with the classic store: OCI layout of uncompressed layers plus manifest.json."""
     manifest = json.dumps({"schemaVersion": 2, "mediaType": packaging.OCI_MANIFEST,
@@ -315,7 +358,7 @@ class SavedImageTests(unittest.TestCase):
                 image = packaging.saved_image(path, "linux/arm64")
                 self.assertEqual(image["config"], self.config)
                 self.assertEqual(image["root"], root)
-                self.assertEqual(len(image["layers"]), 2)
+                self.assertEqual([layer["diffSize"] for layer in image["layers"]], [len(layer) for layer in self.layers])
         self.assertEqual([layer["mediaType"] for layer in packaging.saved_image(containerd, "linux/arm64")["layers"]],
                          ["application/vnd.oci.image.layer.v1.tar+gzip"] * 2)
 
@@ -334,34 +377,76 @@ class SavedImageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "symlink"):
             packaging.saved_image(escaping, "linux/arm64")
 
-    def test_layout_is_canonical_and_independent_of_the_save_format(self):
+    def controller_image(self, base, binary=ELF, epoch=0, name="controller.oci.tar"):
+        """Package `binary` on the base saved in `base`, as `aps build` does."""
+        output = self.root / name
+        base_image = packaging.saved_image(base, "linux/arm64")
+        return output, packaging.package(base, base_image, binary, "sha256:" + "a" * 64, epoch, output)
+
+    def test_identical_inputs_give_a_byte_identical_layout_from_any_store(self):
+        self.layers = [BASE_LAYER]
+        self.config = image_config(self.layers)
         classic, _ = self.classic_store()
-        first, second = self.root / "first.oci.tar", self.root / "second.oci.tar"
-        digest = packaging.write_layout(packaging.saved_image(classic, "linux/arm64"), classic, first)
-        self.assertEqual(digest, packaging.write_layout(packaging.saved_image(self.legacy_archive(), "linux/arm64"), self.legacy_archive(), second))
-        self.assertEqual(first.read_bytes(), second.read_bytes())
+        containerd, _ = self.containerd_store()
+        first, digest = self.controller_image(classic, name="first.oci.tar")
+        again, repeated = self.controller_image(classic, name="again.oci.tar")
+        other, from_containerd = self.controller_image(containerd, name="containerd.oci.tar")
+        self.assertEqual(first.read_bytes(), again.read_bytes())
+        self.assertEqual(first.read_bytes(), other.read_bytes())
+        self.assertEqual({digest, repeated, from_containerd}, {digest})
         with tarfile.open(first) as archive:
             names = archive.getnames()
             index = json.loads(archive.extractfile("index.json").read())
+            manifest = json.loads(archive.extractfile("blobs/sha256/" + digest[7:]).read())
+            config = json.loads(archive.extractfile("blobs/sha256/" + manifest["config"]["digest"][7:]).read())
         self.assertEqual(sorted(name for name in names if not name.startswith("blobs/sha256/")), ["index.json", "oci-layout"])
         self.assertEqual([entry["digest"] for entry in index["manifests"]], [digest])
+        # Every layer is stored uncompressed, so its blob is its diff ID.
+        self.assertEqual([layer["digest"] for layer in manifest["layers"]], config["rootfs"]["diff_ids"])
+        self.assertEqual({layer["mediaType"] for layer in manifest["layers"]}, {packaging.OCI_LAYER})
+        _, changed = self.controller_image(classic, binary=ELF + b"\0", name="changed.oci.tar")
+        _, later = self.controller_image(classic, epoch=1, name="later.oci.tar")
+        self.assertEqual(len({digest, changed, later}), 3)
+
+    def test_controller_layer_depends_only_on_the_binary_and_epoch(self):
+        layer = packaging.controller_layer(ELF, 1700000000)
+        self.assertEqual(layer, packaging.controller_layer(ELF, 1700000000))
+        with tarfile.open(fileobj=io.BytesIO(layer)) as entries:
+            members = entries.getmembers()
+            self.assertEqual(entries.extractfile(members[-1]).read(), ELF)
+        self.assertEqual([member.name for member in members], ["usr", "usr/local", "usr/local/bin", "usr/local/bin/apsides-controller"])
+        for member in members:
+            self.assertEqual((member.mtime, member.mode, member.uid, member.gid, member.uname, member.gname, member.pax_headers),
+                             (1700000000, 0o755, 0, 0, "root", "root", {}))
+        self.assertEqual([member.isdir() for member in members], [True, True, True, False])
+
+    def test_image_config_extends_the_base_as_the_release_contract_requires(self):
+        base = json.dumps({"architecture": "arm64", "os": "linux", "variant": "v8", "created": "2020-01-01T00:00:00Z",
+                           "config": {"Env": ["PATH=/bin"], "User": "65532", "WorkingDir": "/home/nonroot", "Cmd": ["sh"],
+                                      "Labels": {"base": "kept"}},
+                           "history": [{"created_by": "base"}],
+                           "rootfs": {"type": "layers", "diff_ids": [packaging.sha256(BASE_LAYER)]}}).encode()
+        config = json.loads(packaging.image_config(base, packaging.sha256(CONTROLLER_LAYER), "sha256:" + "a" * 64, 86400))
+        self.assertEqual(config["config"], {
+            "Env": ["PATH=/bin"], "User": "65532:65532", "WorkingDir": "/", "Entrypoint": ["/usr/local/bin/apsides-controller"],
+            "Labels": {"base": "kept", "dev.apsides.ir-digest": "sha256:" + "a" * 64, "dev.apsides.release-status": "blocked",
+                       "org.opencontainers.image.title": "Apsides generated controller"}})
+        self.assertEqual(config["rootfs"]["diff_ids"], [packaging.sha256(BASE_LAYER), packaging.sha256(CONTROLLER_LAYER)])
+        self.assertEqual(config["created"], "1970-01-02T00:00:00Z")
+        self.assertEqual([entry.get("created") for entry in config["history"]], [None, "1970-01-02T00:00:00Z"])
+        self.assertEqual((config["os"], config["architecture"], config["variant"]), ("linux", "arm64", "v8"))
+
+    def test_a_layer_changed_while_it_is_written_is_rejected(self):
+        output = self.root / "changed.oci.tar"
+        config = image_config([BASE_LAYER])
+        with self.assertRaisesRegex(ValueError, "changed while it was written"):
+            packaging.write_layout(output, "linux/arm64", config, [{
+                "digest": packaging.sha256(BASE_LAYER), "size": len(BASE_LAYER),
+                "open": lambda: io.BytesIO(BASE_LAYER[:-1] + b"x")}])
+        self.assertFalse(output.exists())
 
     def pins(self, config=None, compressed=None):
-        """Registry pins for the image: an OCI index and its arm64 manifest."""
-        config = self.config if config is None else config
-        compressed = [gzip.compress(layer, mtime=0) for layer in self.layers] if compressed is None else compressed
-        manifest = json.dumps({"schemaVersion": 2, "mediaType": packaging.OCI_MANIFEST,
-            "config": {"mediaType": packaging.OCI_CONFIG, "digest": packaging.sha256(config), "size": len(config)},
-            "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "digest": packaging.sha256(layer), "size": len(layer)} for layer in compressed]}).encode()
-        index = json.dumps({"schemaVersion": 2, "mediaType": packaging.OCI_INDEX, "manifests": [
-            {"mediaType": packaging.OCI_MANIFEST, "digest": packaging.sha256(manifest), "size": len(manifest), "platform": {"os": "linux", "architecture": "arm64"}},
-            {"mediaType": packaging.OCI_MANIFEST, "digest": "sha256:" + "0" * 64, "size": 1, "platform": {"os": "linux", "architecture": "amd64"}}]}).encode()
-        pins = self.root / "pins"
-        shutil.rmtree(pins, ignore_errors=True)
-        (pins / "blobs/sha256").mkdir(parents=True)
-        for data in [index, manifest]:
-            (pins / "blobs/sha256" / packaging.sha256(data)[7:]).write_bytes(data)
-        return pins, "example.invalid/runtime@" + packaging.sha256(index), index, manifest
+        return write_pins(self.root / "pins", self.config if config is None else config, self.layers, compressed)
 
     def test_runtime_closure_verifies_the_pinned_chain_offline_for_either_store(self):
         classic, _ = self.classic_store()
@@ -372,38 +457,39 @@ class SavedImageTests(unittest.TestCase):
             with self.subTest(archive=path.name):
                 runtime = {"reference": reference, "platform": "linux/arm64", "localImageId": identity}
                 with patch.object(subprocess, "run", side_effect=AssertionError("the chain is verified offline")):
-                    closure = finalize_inputs.runtime_closure(path, runtime, pins)
+                    closure = packaging.runtime_closure(path, runtime, pins)
                 self.assertEqual(closure, {"baseImage": {"reference": reference, "platform": "linux/arm64"},
                                            "indexJson": index.decode(), "manifestJson": manifest.decode(), "configJson": self.config.decode()})
         with self.assertRaisesRegex(ValueError, "inspected pinned image"):
-            finalize_inputs.runtime_closure(classic, {"reference": reference, "platform": "linux/arm64", "localImageId": "sha256:" + "f" * 64}, pins)
+            packaging.runtime_closure(classic, {"reference": reference, "platform": "linux/arm64", "localImageId": "sha256:" + "f" * 64}, pins)
 
     def test_runtime_closure_rejects_unpinned_tampered_or_disconnected_bases(self):
         classic, _ = self.classic_store()
         runtime = {"platform": "linux/arm64", "localImageId": packaging.sha256(self.config)}
         pins, reference, index, _ = self.pins()
         with self.assertRaisesRegex(ValueError, "not pinned"):
-            finalize_inputs.runtime_closure(classic, {**runtime, "reference": "example.invalid/runtime@sha256:" + "e" * 64}, pins)
+            packaging.runtime_closure(classic, {**runtime, "reference": "example.invalid/runtime@sha256:" + "e" * 64}, pins)
         (pins / "blobs/sha256" / packaging.sha256(index)[7:]).write_bytes(index + b" ")
         with self.assertRaisesRegex(ValueError, "differs from its digest"):
-            finalize_inputs.runtime_closure(classic, {**runtime, "reference": reference}, pins)
+            packaging.runtime_closure(classic, {**runtime, "reference": reference}, pins)
         pins, reference, _, _ = self.pins(config=image_config(self.layers, architecture="arm64") + b" ")
         with self.assertRaisesRegex(ValueError, "config differs from the pinned manifest"):
-            finalize_inputs.runtime_closure(classic, {**runtime, "reference": reference}, pins)
+            packaging.runtime_closure(classic, {**runtime, "reference": reference}, pins)
         containerd, pulled = self.containerd_store()
         pins, reference, _, _ = self.pins(compressed=[gzip.compress(layer, mtime=1) for layer in self.layers])
         with self.assertRaisesRegex(ValueError, "layer differs from the pinned manifest"):
-            finalize_inputs.runtime_closure(containerd, {**runtime, "localImageId": pulled, "reference": reference}, pins)
+            packaging.runtime_closure(containerd, {**runtime, "localImageId": pulled, "reference": reference}, pins)
 
-    def packaged(self, layers):
-        """An `aps build` image directory holding a canonical layout of `layers`."""
+    def packaged(self, layers, binary=ELF):
+        """An `aps build` image directory holding a layout of `layers`."""
         self.config = image_config(layers)
-        save, _ = self.classic_store("controller-save.tar", layers)
         image = self.root / "image"
+        shutil.rmtree(image, ignore_errors=True)
         image.mkdir()
-        digest = packaging.write_layout(packaging.saved_image(save, "linux/arm64"), save, image / "controller.oci.tar")
-        (image / "packaging-inputs.json").write_text(json.dumps({"imageDigest": digest, "builder": {"platform": "linux/arm64"}}))
-        (image / "buildkit-metadata.json").write_text(json.dumps({"containerimage.config.digest": packaging.sha256(self.config)}))
+        digest = packaging.write_layout(image / "controller.oci.tar", "linux/arm64", self.config, [
+            {"digest": packaging.sha256(layer), "size": len(layer), "open": lambda layer=layer: io.BytesIO(layer)} for layer in layers])
+        (image / "packaging-inputs.json").write_text(json.dumps({
+            "imageDigest": digest, "binaryDigest": packaging.sha256(binary), "builder": {"platform": "linux/arm64"}}))
         return image, digest
 
     def test_binary_is_extracted_from_the_final_layer_without_docker(self):
@@ -414,13 +500,13 @@ class SavedImageTests(unittest.TestCase):
         self.assertEqual((output / "apsides-controller").read_bytes(), ELF)
         self.assertEqual(json.loads((output / "binary-extraction.json").read_text())["imageDigest"], digest)
 
-    def test_extraction_rejects_extra_final_layer_entries_and_unbuilt_configs(self):
+    def test_extraction_rejects_extra_final_layer_entries_and_unbuilt_binaries(self):
         extra = layer_tar([("usr", None), ("usr/local", None), ("usr/local/bin", None),
                            ("usr/local/bin/apsides-controller", ELF), ("etc/ld.so.preload", b"x")])
         image, _ = self.packaged([BASE_LAYER, extra])
         with self.assertRaisesRegex(ValueError, "more than the controller"):
             extract_binary.extract(image, self.root / "extra")
-        (image / "buildkit-metadata.json").write_text(json.dumps({"containerimage.config.digest": "sha256:" + "0" * 64}))
+        image, _ = self.packaged(self.layers, binary=ELF + b"\0")
         with self.assertRaisesRegex(ValueError, "BuildKit built"):
             extract_binary.extract(image, self.root / "unbuilt")
 

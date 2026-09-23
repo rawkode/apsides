@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Glue around Cargo vendor and Docker BuildKit; never pulls images or publishes."""
 import argparse
+from datetime import datetime, timezone
 import gzip
 import hashlib
 import io
@@ -17,6 +18,10 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[1]
 BUILDER = "rust@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922"
 CONTEXT_SCHEMA = "apsides.dev/oci-context/v1"
+RUNTIME_PINS = ROOT / "scripts/runtime-base"
+# The final layer holds exactly the controller and its parent directories.
+TARGET = "usr/local/bin/apsides-controller"
+ANCESTORS = ("usr", "usr/local", "usr/local/bin")
 
 
 def command(argv, cwd=None, timeout=180):
@@ -65,6 +70,7 @@ def pinned_image(image):
 OCI_INDEX = "application/vnd.oci.image.index.v1+json"
 OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 OCI_CONFIG = "application/vnd.oci.image.config.v1+json"
+OCI_LAYER = "application/vnd.oci.image.layer.v1.tar"
 INDEX_TYPES = {OCI_INDEX, "application/vnd.docker.distribution.manifest.list.v2+json"}
 MANIFEST_TYPES = {OCI_MANIFEST, "application/vnd.docker.distribution.manifest.v2+json"}
 # Saved layer media types and their OCI equivalent. Docker's classic store saves
@@ -114,17 +120,18 @@ def _read(contents, member, limit=MAX_IMAGE_METADATA):
 
 
 def _layer_digests(contents, member, media_type):
-    """One layer's blob digest and its uncompressed (diff ID) digest."""
+    """One layer's blob digest, its uncompressed (diff ID) digest and uncompressed size."""
     def digest_of(reader):
-        value = hashlib.sha256()
+        value, size = hashlib.sha256(), 0
         while chunk := reader.read(1024 * 1024):
             value.update(chunk)
-        return "sha256:" + value.hexdigest()
-    blob = digest_of(contents.extractfile(member))
+            size += len(chunk)
+        return "sha256:" + value.hexdigest(), size
+    blob, size = digest_of(contents.extractfile(member))
     if not media_type.endswith("+gzip"):
-        return blob, blob
+        return blob, blob, size
     with gzip.GzipFile(fileobj=contents.extractfile(member)) as uncompressed:
-        return blob, digest_of(uncompressed)
+        return (blob, *digest_of(uncompressed))
 
 
 def saved_image(archive, platform):
@@ -133,7 +140,8 @@ def saved_image(archive, platform):
     Docker writes an OCI layout (index.json, from Docker 25) or, before that, a
     legacy docker-archive (manifest.json only); the classic and containerd image
     stores fill the OCI layout differently. Every blob read is checked against
-    its digest and every layer against the config's diff IDs.
+    its digest and every layer against the config's diff IDs. Each layer
+    records its stored form and its uncompressed size.
     """
     os_name, architecture = platform.split("/")
     with tarfile.open(archive) as contents:
@@ -201,27 +209,151 @@ def saved_image(archive, platform):
                 or len(diff_ids) != len(layers) or len(layers) > MAX_IMAGE_LAYERS):
             raise ValueError("saved image config does not describe its layers")
         for layer, diff_id in zip(layers, diff_ids):
-            blob_digest, uncompressed = _layer_digests(contents, layer["member"], layer["mediaType"])
+            blob_digest, uncompressed, diff_size = _layer_digests(contents, layer["member"], layer["mediaType"])
             if uncompressed != diff_id or (layer["digest"] is not None and blob_digest != layer["digest"]):
                 raise ValueError("saved image layer differs from its recorded digest")
-            layer["digest"], layer["size"] = blob_digest, layer["member"].size
+            layer["digest"], layer["size"], layer["diffSize"] = blob_digest, layer["member"].size, diff_size
             layer["member"] = layer["member"].name
     return {"root": root, "config": config, "platform": platform, "layers": layers}
 
 
-def write_layout(image, archive, output):
-    """Write `image` from `archive` as a single-manifest OCI layout archive.
+def pinned_blob(pins, value, size=None):
+    """Exact registry bytes committed under scripts/runtime-base, by digest."""
+    if not isinstance(value, str) or not re.fullmatch("sha256:[0-9a-f]{64}", value):
+        raise ValueError("runtime base pins require SHA-256 descriptors")
+    path = pins / "blobs/sha256" / value[7:]
+    if not path.is_file():
+        raise ValueError("the runtime base is not pinned; run `cuenv task runtimeBasePin`")
+    data = read_regular(path)
+    if sha256(data) != value or (size is not None and len(data) != size):
+        raise ValueError("runtime base pin differs from its digest")
+    return data
 
-    The manifest is regenerated from the verified config and layer blobs, so
-    the image identity does not depend on how the local store serialises it.
+
+def runtime_closure(archive, runtime, pins=RUNTIME_PINS):
+    """Verify, offline, the pinned base index -> platform manifest -> saved config chain.
+
+    The index and manifest are the registry bytes committed as pins; the
+    config is what `docker image save` of the pinned base holds, in whichever
+    format the local image store writes. The saved image must be the one
+    `docker image inspect` matched to the pinned digest: the classic store
+    names an image by its config digest, the containerd store by the index it
+    pulled.
     """
-    config = image["config"]
+    reference, platform = runtime["reference"], runtime["platform"]
+    index_raw = pinned_blob(pins, reference.rsplit("@", 1)[1])
+    index = json.loads(index_raw)
+    if index.get("mediaType") != OCI_INDEX:
+        raise ValueError("pinned runtime base must be an OCI image index")
+    os_name, architecture = platform.split("/")
+    matches = [item for item in index.get("manifests", [])
+               if item.get("platform", {}).get("os") == os_name and item.get("platform", {}).get("architecture") == architecture]
+    if len(matches) != 1:
+        raise ValueError("pinned runtime base index must select exactly one platform manifest")
+    manifest_raw = pinned_blob(pins, matches[0]["digest"], matches[0]["size"])
+    manifest = json.loads(manifest_raw)
+    if manifest.get("mediaType") != OCI_MANIFEST:
+        raise ValueError("pinned runtime base platform entry must be an OCI manifest")
+    image = saved_image(archive, platform)
+    if runtime["localImageId"] not in {image["root"], sha256(image["config"])}:
+        raise ValueError("saved runtime base differs from the inspected pinned image")
+    if (manifest["config"]["digest"] != sha256(image["config"])
+            or manifest["config"]["size"] != len(image["config"])):
+        raise ValueError("saved runtime base config differs from the pinned manifest")
+    layers = manifest.get("layers", [])
+    if len(layers) != len(image["layers"]):
+        raise ValueError("saved runtime base layers differ from the pinned manifest")
+    for pinned, saved in zip(layers, image["layers"]):
+        # An uncompressed saved layer is named by its diff ID, already checked
+        # against the config; a compressed one must be the registry blob.
+        if saved["mediaType"] == pinned["mediaType"] and saved["digest"] != pinned["digest"]:
+            raise ValueError("saved runtime base layer differs from the pinned manifest")
+    return {"baseImage": {"reference": reference, "platform": platform},
+            "indexJson": index_raw.decode("utf-8"), "manifestJson": manifest_raw.decode("utf-8"),
+            "configJson": image["config"].decode("utf-8")}
+
+
+def timestamp(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def controller_layer(binary, epoch):
+    """The final layer: the controller and its parent directories, nothing else.
+
+    Its bytes depend only on the binary and the source date epoch: entries in
+    a fixed order, every mtime the epoch, root ownership, fixed modes, and a
+    USTAR header with no PAX timestamps.
+    """
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as layer:
+        for name in [*ANCESTORS, TARGET]:
+            info = tarfile.TarInfo(name)
+            info.mtime, info.mode = epoch, 0o755
+            info.uid, info.gid, info.uname, info.gname = 0, 0, "root", "root"
+            if name == TARGET:
+                info.size = len(binary)
+                layer.addfile(info, io.BytesIO(binary))
+            else:
+                info.type = tarfile.DIRTYPE
+                layer.addfile(info)
+    return buffer.getvalue()
+
+
+def image_config(base, layer_diff_id, ir_digest, epoch):
+    """The controller image config: the pinned base config with the controller
+    layer appended and the runtime settings `aps release` requires."""
+    config = json.loads(base)
+    runtime = config.get("config")
+    diff_ids = config.get("rootfs", {}).get("diff_ids")
+    if not isinstance(runtime, dict) or not isinstance(diff_ids, list):
+        raise ValueError("runtime base config lacks a runtime configuration or layers")
+    labels = dict(runtime.get("Labels") or {})
+    labels.update({"dev.apsides.ir-digest": ir_digest, "dev.apsides.release-status": "blocked",
+                   "org.opencontainers.image.title": "Apsides generated controller"})
+    runtime = {**runtime, "User": "65532:65532", "WorkingDir": "/",
+               "Entrypoint": ["/" + TARGET], "Labels": labels}
+    runtime.pop("Cmd", None)
+    created = timestamp(epoch)
+    config.update({
+        "config": runtime, "created": created,
+        "history": [*config.get("history", []), {
+            "created": created, "comment": "apsides.dev/oci-packaging",
+            "created_by": f"COPY controller /{TARGET}; USER 65532:65532; WORKDIR /; ENTRYPOINT [\"/{TARGET}\"]"}],
+        "rootfs": {"type": "layers", "diff_ids": [*diff_ids, layer_diff_id]},
+    })
+    return canonical_json(config)
+
+
+class _Verified:
+    """A reader that hashes what it yields, so a written blob is checked against its digest."""
+
+    def __init__(self, reader, digest):
+        self.reader, self.digest, self.hash = reader, digest, hashlib.sha256()
+
+    def read(self, size=-1):
+        data = self.reader.read(size)
+        self.hash.update(data)
+        return data
+
+    def check(self):
+        if "sha256:" + self.hash.hexdigest() != self.digest:
+            raise ValueError("layer changed while it was written")
+
+
+def write_layout(output, platform, config, layers):
+    """Write a single-manifest OCI layout archive and return the manifest digest.
+
+    Every layer is stored uncompressed, so its blob digest is its diff ID and
+    the archive does not depend on how any image store keeps layers. `layers`
+    holds each layer's diff ID, uncompressed size and a callable opening its
+    uncompressed bytes.
+    """
     manifest = canonical_json({
         "schemaVersion": 2, "mediaType": OCI_MANIFEST,
         "config": {"mediaType": OCI_CONFIG, "digest": sha256(config), "size": len(config)},
-        "layers": [{key: layer[key] for key in ["mediaType", "digest", "size"]} for layer in image["layers"]],
+        "layers": [{"mediaType": OCI_LAYER, "digest": layer["digest"], "size": layer["size"]} for layer in layers],
     })
-    os_name, architecture = image["platform"].split("/")
+    os_name, architecture = platform.split("/")
     index = canonical_json({"schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": [{
         "mediaType": OCI_MANIFEST, "digest": sha256(manifest), "size": len(manifest),
         "platform": {"architecture": architecture, "os": os_name}}]})
@@ -229,17 +361,49 @@ def write_layout(image, archive, output):
         info = tarfile.TarInfo(name)
         info.size, info.mode, info.mtime = size, 0o644, 0
         target.addfile(info, reader)
-    with tarfile.open(archive) as contents, tarfile.open(output, "x", format=tarfile.USTAR_FORMAT) as target:
-        entry(target, "oci-layout", 30, io.BytesIO(b'{"imageLayoutVersion":"1.0.0"}'))
-        entry(target, "index.json", len(index), io.BytesIO(index))
-        entry(target, "blobs/sha256/" + sha256(manifest)[7:], len(manifest), io.BytesIO(manifest))
-        entry(target, "blobs/sha256/" + sha256(config)[7:], len(config), io.BytesIO(config))
-        written = {sha256(manifest), sha256(config)}
-        for layer in image["layers"]:
-            if layer["digest"] not in written:
-                written.add(layer["digest"])
-                entry(target, "blobs/sha256/" + layer["digest"][7:], layer["size"], contents.extractfile(layer["member"]))
+    with open(output, "xb") as file:
+        try:
+            with tarfile.open(fileobj=file, mode="w", format=tarfile.USTAR_FORMAT) as target:
+                entry(target, "oci-layout", 30, io.BytesIO(b'{"imageLayoutVersion":"1.0.0"}'))
+                entry(target, "index.json", len(index), io.BytesIO(index))
+                entry(target, "blobs/sha256/" + sha256(manifest)[7:], len(manifest), io.BytesIO(manifest))
+                entry(target, "blobs/sha256/" + sha256(config)[7:], len(config), io.BytesIO(config))
+                written = {sha256(manifest), sha256(config)}
+                for layer in layers:
+                    if layer["digest"] not in written:
+                        written.add(layer["digest"])
+                        reader = _Verified(layer["open"](), layer["digest"])
+                        entry(target, "blobs/sha256/" + layer["digest"][7:], layer["size"], reader)
+                        reader.check()
+        except BaseException:
+            Path(output).unlink()
+            raise
     return sha256(manifest)
+
+
+def package(base_archive, base, binary, ir_digest, epoch, output):
+    """Write the controller image: the verified base layers, uncompressed, and
+    a controller layer and config generated from the binary and the epoch."""
+    layer = controller_layer(binary, epoch)
+    config = image_config(base["config"], sha256(layer), ir_digest, epoch)
+    diff_ids = json.loads(base["config"])["rootfs"]["diff_ids"]
+    with tarfile.open(base_archive) as contents:
+        def opener(saved):
+            if saved["mediaType"].endswith("+gzip"):
+                return lambda: gzip.GzipFile(fileobj=contents.extractfile(saved["member"]))
+            return lambda: contents.extractfile(saved["member"])
+        layers = [{"digest": diff_id, "size": saved["diffSize"], "open": opener(saved)}
+                  for saved, diff_id in zip(base["layers"], diff_ids)]
+        layers.append({"digest": sha256(layer), "size": len(layer), "open": lambda: io.BytesIO(layer)})
+        return write_layout(output, base["platform"], config, layers)
+
+
+def exported_binary(directory):
+    """The controller BuildKit's local exporter wrote: the export's only entry."""
+    entries = sorted(path.name for path in directory.iterdir())
+    if entries != ["apsides-controller"]:
+        raise ValueError("BuildKit exported more or less than the controller binary")
+    return read_regular(directory / "apsides-controller")
 
 
 def file_manifest(root):
@@ -371,7 +535,14 @@ def verify_context(context):
     return metadata
 
 
-def build(context, runtime_image, output, no_cache=False):
+def build(context, runtime_image, runtime_base, output, no_cache=False, pins=RUNTIME_PINS):
+    """Compile the controller with BuildKit and package it on the pinned runtime base.
+
+    BuildKit only compiles: its local exporter hands over the binary. The
+    image is assembled here from `runtime_base`, a `docker image save` of the
+    runtime image, so its bytes follow from the inputs on any Docker driver
+    and image store.
+    """
     context, output = context.resolve(), output.resolve()
     if output == context or context in output.parents:
         raise ValueError("OCI output must be outside the prepared context")
@@ -383,46 +554,37 @@ def build(context, runtime_image, output, no_cache=False):
     runtime = pinned_image(runtime_image)
     if builder != metadata["builder"] or builder["platform"] != runtime["platform"]:
         raise ValueError("cached builder changed or runtime platform differs from the prepared builder")
+    closure = runtime_closure(runtime_base, runtime, pins)
     if output.exists():
         raise ValueError("OCI output directory already exists")
     output.mkdir(parents=True)
-    metadata_file = output / "buildkit-metadata.json"
-    # --network none disables RUN networking. This is not an assertion about
-    # BuildKit's own metadata resolution; whole-process egress needs an external gate.
-    # The image exporter is the one every Docker driver and image store offers;
-    # the image is then read back with `docker image save` and rewritten as an
-    # OCI layout, so no step depends on the containerd image store.
-    argv = ["docker", "buildx", "build", "--pull=false", "--network=none", "--provenance=false", "--sbom=false", "--platform", builder["platform"],
-            "--build-arg", f"SOURCE_DATE_EPOCH={metadata['sourceDateEpoch']}",
-            "--build-arg", f"BUILDER_IMAGE={builder['reference']}",
-            "--build-arg", f"RUNTIME_IMAGE={runtime['reference']}",
-            "--build-arg", f"IR_DIGEST={metadata['irDigest']}",
-            "--metadata-file", str(metadata_file),
-            "--output", "type=image,oci-mediatypes=true,rewrite-timestamp=true", str(context)]
-    if no_cache:
-        argv.insert(3, "--no-cache")
-    # Build logs remain visible; callers explicitly request this potentially long step.
-    subprocess.run(argv, check=True)
-    verify_context(context)
-    if read_regular(context / "context.json") != context_snapshot:
-        raise ValueError("context metadata changed during the build; no packaging receipt published")
-    if not metadata_file.is_file():
-        raise ValueError("BuildKit did not report the built image")
-    reported = json.loads(read_regular(metadata_file))
-    image_id, config_digest = reported.get("containerimage.digest"), reported.get("containerimage.config.digest")
-    if not all(isinstance(value, str) and re.fullmatch("sha256:[0-9a-f]{64}", value) for value in [image_id, config_digest]):
-        raise ValueError("BuildKit did not report an exact image identity")
-    saved = output / "controller.docker-save.tar"
-    command(["docker", "image", "save", "--output", str(saved), image_id], timeout=600)
-    image = saved_image(saved, builder["platform"])
-    if sha256(image["config"]) != config_digest:
-        raise ValueError("saved image differs from the image BuildKit built")
-    image_digest = write_layout(image, saved, output / "controller.oci.tar")
-    saved.unlink()
+    with tempfile.TemporaryDirectory(prefix="apsides-controller-") as exported:
+        destination = Path(exported) / "controller"
+        if "," in str(destination):
+            raise ValueError("BuildKit export directory must not contain a comma")
+        # --network none disables RUN networking. This is not an assertion about
+        # BuildKit's own metadata resolution; whole-process egress needs an external gate.
+        # The local exporter works on every Docker driver and image store.
+        argv = ["docker", "buildx", "build", "--pull=false", "--network=none", "--provenance=false", "--sbom=false", "--platform", builder["platform"],
+                "--build-arg", f"SOURCE_DATE_EPOCH={metadata['sourceDateEpoch']}",
+                "--build-arg", f"BUILDER_IMAGE={builder['reference']}",
+                "--output", f"type=local,dest={destination}", str(context)]
+        if no_cache:
+            argv.insert(3, "--no-cache")
+        # Build logs remain visible; callers explicitly request this potentially long step.
+        subprocess.run(argv, check=True)
+        verify_context(context)
+        if read_regular(context / "context.json") != context_snapshot:
+            raise ValueError("context metadata changed during the build; no packaging receipt published")
+        binary = exported_binary(destination)
+    base = saved_image(runtime_base, builder["platform"])
+    if base["config"].decode("utf-8") != closure["configJson"]:
+        raise ValueError("saved runtime base changed during the build")
+    image_digest = package(runtime_base, base, binary, metadata["irDigest"], metadata["sourceDateEpoch"], output / "controller.oci.tar")
     (output / "packaging-inputs.json").write_text(json.dumps({
         "contextDigest": sha256(context_snapshot),
         "builder": builder, "runtime": runtime, "irDigest": metadata["irDigest"],
-        "sourceDateEpoch": metadata["sourceDateEpoch"], "imageDigest": image_digest,
+        "sourceDateEpoch": metadata["sourceDateEpoch"], "binaryDigest": sha256(binary), "imageDigest": image_digest,
         "releaseStatus": "blocked", "verification": "build-output-not-authenticated",
     }, sort_keys=True, indent=2) + "\n")
     return image_digest
@@ -441,6 +603,7 @@ def main():
     image = subcommands.add_parser("build")
     image.add_argument("--context", type=Path, required=True)
     image.add_argument("--runtime-image", required=True)
+    image.add_argument("--runtime-base", type=Path, required=True)
     image.add_argument("--output", type=Path, required=True)
     image.add_argument("--no-cache", action="store_true")
     args = parser.parse_args()
@@ -451,7 +614,7 @@ def main():
         result = verify_context(args.context)
         print(json.dumps({"status": "integrity-verified", "irDigest": result["irDigest"], "releaseStatus": result["releaseStatus"]}))
     else:
-        build(args.context, args.runtime_image, args.output, no_cache=args.no_cache)
+        build(args.context, args.runtime_image, args.runtime_base, args.output, no_cache=args.no_cache)
 
 
 if __name__ == "__main__":
