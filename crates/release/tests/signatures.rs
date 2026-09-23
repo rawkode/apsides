@@ -295,16 +295,46 @@ async fn embedded_fixture_marker_survives_manifest_mode_changes() -> TestResult 
 }
 
 fn write_oci(root: &Path, binary: &[u8], ir_digest: &str) -> TestResult<String> {
-    write_oci_with_extra_base(root, binary, ir_digest, false)
+    write_oci_with_base(root, binary, ir_digest, Base::Approved)
 }
 
-fn write_oci_with_extra_base(
+/// How a test image carries the approved runtime base.
+#[derive(Clone, Copy, PartialEq)]
+enum Base {
+    /// The base layer exactly as the approved config's diff ID names it.
+    Approved,
+    /// The same base content, stored gzip-compressed as a registry would.
+    Compressed,
+    /// An unapproved layer beneath the approved base.
+    ExtraLayer,
+}
+
+fn gzip(bytes: &[u8]) -> TestResult<Vec<u8>> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes)?;
+    Ok(encoder.finish()?)
+}
+
+fn write_oci_with_base(
     root: &Path,
     binary: &[u8],
     ir_digest: &str,
-    extra_base: bool,
+    variant: Base,
 ) -> TestResult<String> {
-    let base = tar(vec![])?;
+    let extra_base = variant == Base::ExtraLayer;
+    let uncompressed = tar(vec![])?;
+    let (base, base_type) = if variant == Base::Compressed {
+        (
+            gzip(&uncompressed)?,
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+        )
+    } else {
+        (
+            uncompressed.clone(),
+            "application/vnd.oci.image.layer.v1.tar",
+        )
+    };
     let foreign = tar(vec![("etc/foreign-runtime", b"unapproved", false)])?;
     let layer = tar(vec![
         ("usr", b"", true),
@@ -312,10 +342,8 @@ fn write_oci_with_extra_base(
         ("usr/local/bin", b"", true),
         ("usr/local/bin/apsides-controller", binary, false),
     ])?;
-    let mut diff_ids = vec![hash(&base)];
-    let mut layers = vec![
-        json!({"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":hash(&base),"size":base.len()}),
-    ];
+    let mut diff_ids = vec![hash(&uncompressed)];
+    let mut layers = vec![json!({"mediaType":base_type,"digest":hash(&base),"size":base.len()})];
     if extra_base {
         diff_ids.insert(0, hash(&foreign));
         layers.insert(0, json!({"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":hash(&foreign),"size":foreign.len()}));
@@ -449,13 +477,13 @@ async fn signed_image_cannot_add_an_unapproved_runtime_base_layer() -> TestResul
     let policy = release(root.path())?;
     let binary = fs::read(root.path().join("apsides-controller"))?;
     let mut manifest: Value = serde_json::from_slice(&fs::read(root.path().join("release.json"))?)?;
-    let image = write_oci_with_extra_base(
+    let image = write_oci_with_base(
         root.path(),
         &binary,
         manifest["irDigest"]
             .as_str()
             .ok_or("expected a JSON string")?,
-        true,
+        Base::ExtraLayer,
     )?;
     manifest["image"]["reference"] = json!(format!("example.invalid/controller@{image}"));
     manifest["files"]["controller.oci.tar"] =
@@ -468,6 +496,32 @@ async fn signed_image_cannot_add_an_unapproved_runtime_base_layer() -> TestResul
         .ok_or("expected this call to fail")?
         .to_string();
     assert!(error.contains("approved runtime layer chain"), "{error}");
+    Ok(())
+}
+
+/// Base layers are identified by diff ID, so an image whose base layer is
+/// stored compressed (the containerd store) verifies like one whose base is
+/// stored uncompressed (the classic store).
+#[tokio::test]
+async fn approved_base_may_be_stored_compressed() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let policy = release(root.path())?;
+    let binary = fs::read(root.path().join("apsides-controller"))?;
+    let mut manifest: Value = serde_json::from_slice(&fs::read(root.path().join("release.json"))?)?;
+    let image = write_oci_with_base(
+        root.path(),
+        &binary,
+        manifest["irDigest"]
+            .as_str()
+            .ok_or("expected a JSON string")?,
+        Base::Compressed,
+    )?;
+    manifest["image"]["reference"] = json!(format!("example.invalid/controller@{image}"));
+    manifest["files"]["controller.oci.tar"] =
+        json!(hash(&fs::read(root.path().join("controller.oci.tar"))?));
+    write_json(root.path(), "release.json", &manifest)?;
+    resign(root.path())?;
+    verify_candidate(root.path(), &policy).await?;
     Ok(())
 }
 

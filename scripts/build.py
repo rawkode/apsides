@@ -34,10 +34,10 @@ def assemble(artifact, source, profile_path, *, no_cache=False):
     metadata = prepare(artifact, context, builder_image=profile["builderImage"], source_date_epoch=profile["sourceDateEpoch"])
     if metadata["builder"]["platform"] != profile["platform"]:
         raise ValueError("cached builder platform differs from build profile")
-    build(context, profile["runtimeImage"], image, no_cache=no_cache)
+    image_digest = build(context, profile["runtimeImage"], image, no_cache=no_cache)
     binary_digest = extract(image, artifact / "linux-binary")
     sbom_digest = generate(context, tool, profile["sbomToolSha256"], targets[profile["platform"]], artifact / "sbom")
-    base = artifact / "runtime-base.oci.tar"
+    base = artifact / "runtime-base.tar"
     subprocess.run(["docker", "image", "save", "-o", str(base), profile["runtimeImage"]], check=True)
     verify_tools(tools, tool, cli)
     finalize(source / "build-inputs.json", context, base, image / "packaging-inputs.json", profile_path, tools, artifact / "build-inputs.json")
@@ -45,7 +45,7 @@ def assemble(artifact, source, profile_path, *, no_cache=False):
     if profile_path.read_bytes() != profile_bytes or verify_context(context) != metadata:
         raise ValueError("build profile or context changed during assembly")
     result = {"schemaVersion": "apsides.dev/build-result/v1", "irDigest": metadata["irDigest"],
-              "platform": profile["platform"], "binaryDigest": binary_digest, "sbomDigest": sbom_digest,
+              "platform": profile["platform"], "imageDigest": image_digest, "binaryDigest": binary_digest, "sbomDigest": sbom_digest,
               "image": "image/controller.oci.tar", "binary": "linux-binary/apsides-controller", "sbom": "sbom/sbom.json",
               "buildInputs": "build-inputs.json", "releaseVerified": False,
               "remainingReleaseGates": ["approved-provenance", "trusted-release-verification"]}

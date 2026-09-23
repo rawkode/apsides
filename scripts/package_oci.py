@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Glue around Cargo vendor and Docker BuildKit; never pulls images or publishes."""
 import argparse
+import gzip
 import hashlib
+import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import tomllib
 
@@ -57,6 +60,186 @@ def pinned_image(image):
     if not any(ref.rsplit("@", 1)[-1] == image.rsplit("@", 1)[-1] for ref in detail.get("RepoDigests", [])):
         raise ValueError("local image inspection does not confirm the requested repository digest")
     return {"reference": image, "platform": f"linux/{detail['Architecture']}", "localImageId": detail["Id"]}
+
+
+OCI_INDEX = "application/vnd.oci.image.index.v1+json"
+OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
+OCI_CONFIG = "application/vnd.oci.image.config.v1+json"
+INDEX_TYPES = {OCI_INDEX, "application/vnd.docker.distribution.manifest.list.v2+json"}
+MANIFEST_TYPES = {OCI_MANIFEST, "application/vnd.docker.distribution.manifest.v2+json"}
+# Saved layer media types and their OCI equivalent. Docker's classic store saves
+# uncompressed layers; the containerd store saves the compressed blobs it holds.
+LAYER_TYPES = {
+    "application/vnd.oci.image.layer.v1.tar": "application/vnd.oci.image.layer.v1.tar",
+    "application/vnd.oci.image.layer.v1.tar+gzip": "application/vnd.oci.image.layer.v1.tar+gzip",
+    "application/vnd.docker.image.rootfs.diff.tar": "application/vnd.oci.image.layer.v1.tar",
+    "application/vnd.docker.image.rootfs.diff.tar.gzip": "application/vnd.oci.image.layer.v1.tar+gzip",
+}
+MAX_IMAGE_METADATA = 1024 * 1024
+MAX_IMAGE_LAYERS = 64
+
+
+def canonical_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _members(contents):
+    """Regular files of an image archive, with in-archive symlinks resolved."""
+    files, links = {}, {}
+    for member in contents:
+        name = PurePosixPath(member.name.removeprefix("./")).as_posix()
+        if member.isdir():
+            continue
+        if name in files or name in links:
+            raise ValueError("duplicate image archive member")
+        if member.isfile():
+            files[name] = member
+        elif member.issym():
+            # Legacy docker-archive saves share identical layers through
+            # relative symlinks; nothing outside the archive is followed.
+            links[name] = os.path.normpath(str(PurePosixPath(name).parent / member.linkname))
+        else:
+            raise ValueError("image archive contains a non-regular entry")
+    for name, target in links.items():
+        if target not in files:
+            raise ValueError("image archive symlink does not name an archived file")
+        files[name] = files[target]
+    return files
+
+
+def _read(contents, member, limit=MAX_IMAGE_METADATA):
+    if member.size > limit:
+        raise ValueError("image metadata is oversized")
+    return contents.extractfile(member).read()
+
+
+def _layer_digests(contents, member, media_type):
+    """One layer's blob digest and its uncompressed (diff ID) digest."""
+    def digest_of(reader):
+        value = hashlib.sha256()
+        while chunk := reader.read(1024 * 1024):
+            value.update(chunk)
+        return "sha256:" + value.hexdigest()
+    blob = digest_of(contents.extractfile(member))
+    if not media_type.endswith("+gzip"):
+        return blob, blob
+    with gzip.GzipFile(fileobj=contents.extractfile(member)) as uncompressed:
+        return blob, digest_of(uncompressed)
+
+
+def saved_image(archive, platform):
+    """Read the one `platform` image of a `docker image save` archive.
+
+    Docker writes an OCI layout (index.json, from Docker 25) or, before that, a
+    legacy docker-archive (manifest.json only); the classic and containerd image
+    stores fill the OCI layout differently. Every blob read is checked against
+    its digest and every layer against the config's diff IDs.
+    """
+    os_name, architecture = platform.split("/")
+    with tarfile.open(archive) as contents:
+        members = _members(contents)
+        def blob(digest, size=None):
+            if not re.fullmatch("sha256:[0-9a-f]{64}", str(digest)):
+                raise ValueError("image archive requires SHA-256 descriptors")
+            member = members.get("blobs/sha256/" + digest[7:])
+            if member is None:
+                raise ValueError("image archive lacks a referenced blob")
+            data = _read(contents, member)
+            if sha256(data) != digest or (size is not None and len(data) != size):
+                raise ValueError("image archive blob digest mismatch")
+            return data
+        if "index.json" in members:
+            entries = json.loads(_read(contents, members["index.json"])).get("manifests", [])
+            if len(entries) != 1:
+                raise ValueError("image archive must hold exactly one image")
+            root = entries[0]["digest"]
+            descriptor = entries[0]
+            for _ in range(3):
+                raw = blob(descriptor["digest"], descriptor.get("size"))
+                document = json.loads(raw)
+                kind = document.get("mediaType", descriptor.get("mediaType"))
+                if kind not in INDEX_TYPES:
+                    break
+                matches = [item for item in document.get("manifests", [])
+                           if item.get("platform", {}).get("os") == os_name
+                           and item.get("platform", {}).get("architecture") == architecture]
+                if len(matches) != 1:
+                    raise ValueError("saved image index must select exactly one platform manifest")
+                descriptor = matches[0]
+            if kind not in MANIFEST_TYPES:
+                raise ValueError("saved image does not resolve to a single-platform manifest")
+            config = blob(document["config"]["digest"], document["config"]["size"])
+            layers = []
+            for layer in document["layers"]:
+                if layer.get("mediaType") not in LAYER_TYPES:
+                    raise ValueError("saved image uses an unsupported layer media type")
+                member = members.get("blobs/sha256/" + str(layer["digest"]).removeprefix("sha256:"))
+                if member is None or member.size != layer["size"]:
+                    raise ValueError("image archive lacks a layer blob")
+                layers.append({"mediaType": LAYER_TYPES[layer["mediaType"]], "digest": layer["digest"], "member": member})
+        elif "manifest.json" in members:
+            entries = json.loads(_read(contents, members["manifest.json"]))
+            if not isinstance(entries, list) or len(entries) != 1:
+                raise ValueError("image archive must hold exactly one image")
+            root = None
+            member = members.get(entries[0]["Config"])
+            if member is None:
+                raise ValueError("legacy image archive lacks its config")
+            config = _read(contents, member)
+            layers = []
+            for name in entries[0]["Layers"]:
+                if name not in members:
+                    raise ValueError("legacy image archive lacks a layer")
+                layers.append({"mediaType": LAYER_TYPES["application/vnd.oci.image.layer.v1.tar"], "digest": None, "member": members[name]})
+        else:
+            raise ValueError("unrecognised docker image save archive")
+        details = json.loads(config)
+        diff_ids = details.get("rootfs", {}).get("diff_ids")
+        if details.get("os") != os_name or details.get("architecture") != architecture:
+            raise ValueError("saved image platform differs from the requested platform")
+        if (details.get("rootfs", {}).get("type") != "layers" or not isinstance(diff_ids, list)
+                or len(diff_ids) != len(layers) or len(layers) > MAX_IMAGE_LAYERS):
+            raise ValueError("saved image config does not describe its layers")
+        for layer, diff_id in zip(layers, diff_ids):
+            blob_digest, uncompressed = _layer_digests(contents, layer["member"], layer["mediaType"])
+            if uncompressed != diff_id or (layer["digest"] is not None and blob_digest != layer["digest"]):
+                raise ValueError("saved image layer differs from its recorded digest")
+            layer["digest"], layer["size"] = blob_digest, layer["member"].size
+            layer["member"] = layer["member"].name
+    return {"root": root, "config": config, "platform": platform, "layers": layers}
+
+
+def write_layout(image, archive, output):
+    """Write `image` from `archive` as a single-manifest OCI layout archive.
+
+    The manifest is regenerated from the verified config and layer blobs, so
+    the image identity does not depend on how the local store serialises it.
+    """
+    config = image["config"]
+    manifest = canonical_json({
+        "schemaVersion": 2, "mediaType": OCI_MANIFEST,
+        "config": {"mediaType": OCI_CONFIG, "digest": sha256(config), "size": len(config)},
+        "layers": [{key: layer[key] for key in ["mediaType", "digest", "size"]} for layer in image["layers"]],
+    })
+    os_name, architecture = image["platform"].split("/")
+    index = canonical_json({"schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": [{
+        "mediaType": OCI_MANIFEST, "digest": sha256(manifest), "size": len(manifest),
+        "platform": {"architecture": architecture, "os": os_name}}]})
+    def entry(target, name, size, reader):
+        info = tarfile.TarInfo(name)
+        info.size, info.mode, info.mtime = size, 0o644, 0
+        target.addfile(info, reader)
+    with tarfile.open(archive) as contents, tarfile.open(output, "x", format=tarfile.USTAR_FORMAT) as target:
+        entry(target, "oci-layout", 30, io.BytesIO(b'{"imageLayoutVersion":"1.0.0"}'))
+        entry(target, "index.json", len(index), io.BytesIO(index))
+        entry(target, "blobs/sha256/" + sha256(manifest)[7:], len(manifest), io.BytesIO(manifest))
+        entry(target, "blobs/sha256/" + sha256(config)[7:], len(config), io.BytesIO(config))
+        written = {sha256(manifest), sha256(config)}
+        for layer in image["layers"]:
+            if layer["digest"] not in written:
+                written.add(layer["digest"])
+                entry(target, "blobs/sha256/" + layer["digest"][7:], layer["size"], contents.extractfile(layer["member"]))
+    return sha256(manifest)
 
 
 def file_manifest(root):
@@ -203,15 +386,19 @@ def build(context, runtime_image, output, no_cache=False):
     if output.exists():
         raise ValueError("OCI output directory already exists")
     output.mkdir(parents=True)
+    metadata_file = output / "buildkit-metadata.json"
     # --network none disables RUN networking. This is not an assertion about
     # BuildKit's own metadata resolution; whole-process egress needs an external gate.
+    # The image exporter is the one every Docker driver and image store offers;
+    # the image is then read back with `docker image save` and rewritten as an
+    # OCI layout, so no step depends on the containerd image store.
     argv = ["docker", "buildx", "build", "--pull=false", "--network=none", "--provenance=false", "--sbom=false", "--platform", builder["platform"],
             "--build-arg", f"SOURCE_DATE_EPOCH={metadata['sourceDateEpoch']}",
             "--build-arg", f"BUILDER_IMAGE={builder['reference']}",
             "--build-arg", f"RUNTIME_IMAGE={runtime['reference']}",
             "--build-arg", f"IR_DIGEST={metadata['irDigest']}",
-            "--metadata-file", str(output / "buildkit-metadata.json"),
-            "--output", f"type=oci,rewrite-timestamp=true,dest={output / 'controller.oci.tar'}", str(context)]
+            "--metadata-file", str(metadata_file),
+            "--output", "type=image,oci-mediatypes=true,rewrite-timestamp=true", str(context)]
     if no_cache:
         argv.insert(3, "--no-cache")
     # Build logs remain visible; callers explicitly request this potentially long step.
@@ -219,14 +406,26 @@ def build(context, runtime_image, output, no_cache=False):
     verify_context(context)
     if read_regular(context / "context.json") != context_snapshot:
         raise ValueError("context metadata changed during the build; no packaging receipt published")
-    if not (output / "controller.oci.tar").is_file() or not (output / "buildkit-metadata.json").is_file():
-        raise ValueError("BuildKit did not produce the requested OCI archive and metadata")
+    if not metadata_file.is_file():
+        raise ValueError("BuildKit did not report the built image")
+    reported = json.loads(read_regular(metadata_file))
+    image_id, config_digest = reported.get("containerimage.digest"), reported.get("containerimage.config.digest")
+    if not all(isinstance(value, str) and re.fullmatch("sha256:[0-9a-f]{64}", value) for value in [image_id, config_digest]):
+        raise ValueError("BuildKit did not report an exact image identity")
+    saved = output / "controller.docker-save.tar"
+    command(["docker", "image", "save", "--output", str(saved), image_id], timeout=600)
+    image = saved_image(saved, builder["platform"])
+    if sha256(image["config"]) != config_digest:
+        raise ValueError("saved image differs from the image BuildKit built")
+    image_digest = write_layout(image, saved, output / "controller.oci.tar")
+    saved.unlink()
     (output / "packaging-inputs.json").write_text(json.dumps({
         "contextDigest": sha256(context_snapshot),
         "builder": builder, "runtime": runtime, "irDigest": metadata["irDigest"],
-        "sourceDateEpoch": metadata["sourceDateEpoch"],
+        "sourceDateEpoch": metadata["sourceDateEpoch"], "imageDigest": image_digest,
         "releaseStatus": "blocked", "verification": "build-output-not-authenticated",
     }, sort_keys=True, indent=2) + "\n")
+    return image_digest
 
 
 def main():

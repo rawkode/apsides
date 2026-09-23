@@ -163,3 +163,25 @@ fn rejects_runtime_documents_disconnected_from_the_approved_base() -> TestResult
     );
     Ok(())
 }
+
+/// Re-seal the closure after a change, so only the changed field can reject it.
+fn resealed(mut inputs: Value) -> TestResult<(Value, String)> {
+    let identity = digest(&inputs["compilerClosure"])?;
+    inputs["compilerClosureDigest"] = json!(identity);
+    Ok((inputs, identity))
+}
+
+#[test]
+fn rejects_runtimes_without_a_pinned_reference_or_with_unknown_fields() -> TestResult {
+    let (mut inputs, _) = valid_inputs()?;
+    inputs["compilerClosure"]["nativeCompiler"]["approvedRuntime"]["baseImage"]["reference"] =
+        json!("example.invalid/runtime:latest");
+    let (inputs, identity) = resealed(inputs)?;
+    assert!(validate_compiler_closure(&inputs, &identity).is_err());
+
+    let (mut inputs, _) = valid_inputs()?;
+    inputs["compilerClosure"]["nativeCompiler"]["approvedRuntime"]["registryToken"] = json!("{}");
+    let (inputs, identity) = resealed(inputs)?;
+    assert!(validate_compiler_closure(&inputs, &identity).is_err());
+    Ok(())
+}

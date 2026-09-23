@@ -121,7 +121,6 @@ pub(crate) fn verify(root: &Path, release: &ReleaseManifest) -> Result<()> {
         &files,
         &value,
         &config,
-        &runtime.manifest,
         &runtime.config,
         &release.binary_digest,
     )
@@ -161,7 +160,6 @@ fn verify_layers(
     files: &BTreeMap<String, Vec<u8>>,
     value: &Value,
     config: &Value,
-    base_manifest: &Value,
     base_config: &Value,
     binary_digest: &str,
 ) -> Result<()> {
@@ -171,15 +169,15 @@ fn verify_layers(
     let diff_ids = config["rootfs"]["diff_ids"]
         .as_array()
         .ok_or_else(|| crate::Error::Rejected("OCI diff IDs missing".into()))?;
-    let base_layers = base_manifest["layers"]
-        .as_array()
-        .ok_or_else(|| crate::Error::Rejected("approved base layers missing".into()))?;
     let base_diff_ids = base_config["rootfs"]["diff_ids"]
         .as_array()
         .ok_or_else(|| crate::Error::Rejected("approved base diff IDs missing".into()))?;
-    if layers.len() != base_layers.len() + 1
+    // Base layers are compared by diff ID, not by the approved manifest's
+    // compressed descriptors: Docker's classic store exports them
+    // uncompressed. Every layer below is decompressed and hashed against its
+    // diff ID, so compression cannot substitute content.
+    if layers.len() != diff_ids.len()
         || diff_ids.len() != base_diff_ids.len() + 1
-        || layers.get(..base_layers.len()) != Some(base_layers.as_slice())
         || diff_ids.get(..base_diff_ids.len()) != Some(base_diff_ids.as_slice())
         || layers.len() > 64
     {

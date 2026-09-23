@@ -154,6 +154,7 @@ class Fixture:
             "binaryDigest": binary_digest,
             "irDigest": ir_digest,
             "platform": "linux/arm64",
+            "imageDigest": image_digest,
         }
         (output / "ir.json").write_text(json.dumps(ir))
         (output / "plan.json").write_text(json.dumps(plan))
@@ -161,9 +162,6 @@ class Fixture:
         # Different formatting proves the payload identity follows release assembly's canonical JSON.
         (output / "build-inputs.json").write_text(
             json.dumps(inputs, indent=2 if index == 1 else None)
-        )
-        (output / "image/buildkit-metadata.json").write_text(
-            json.dumps({"containerimage.digest": image_digest})
         )
         (output / "image/controller.oci.tar").write_bytes(archive)
         (output / "linux-binary/apsides-controller").write_bytes(binary)
