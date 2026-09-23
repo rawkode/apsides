@@ -5,7 +5,6 @@ import "github.com/cuenv/cuenv/schema"
 schema.#Project & {name: "apsides"}
 
 tasks: {
-	performanceTest: {command: "python3", args: ["tests/performance/test_performance.py"]}
 	authoringEditorCheck: {
 		dependsOn: [build, install]
 		command: "python3"
@@ -14,10 +13,6 @@ tasks: {
 	packageCli: {command: "python3", args: ["scripts/package_cli.py", "--output", "work/aps-distribution", "--target-dir", "work/cli-package-target"]}
 	packageCliTest: {command: "python3", args: ["tests/test_package_cli.py"]}
 	packagingTest: {command: "python3", args: ["tests/test_packaging.py"]}
-	cnpgDemoTest: {command: "python3", args: ["tests/test_cnpg_demo.py"]}
-	apiGapTest: {command: "python3", args: ["tests/test_api_gap.py"]}
-	apiGapProbesTest: {command: "python3", args: ["tests/test_cnpg_credential_probes.py"]}
-	crdReactorTest: {command: "python3", args: ["tests/test_cluster_crds.py"]}
 	cnpgCleanupTypes: [
 		{
 			dependsOn: [install]
@@ -40,9 +35,7 @@ tasks: {
 		args: ["run", "--allow-all", "packages/compiler/src/crds.ts", "https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_clusters.yaml", "Cluster", "examples/cnpg/.aps/crds/cnpg.ts", "v1"]
 	}
 	releaseTest: {command: "cargo", args: ["test", "--locked", "-p", "release"]}
-	permissionUpgradeStep: {command: "cargo", args: ["test", "--locked", "-p", "platform", "--features", "test-support", "--test", "permission_upgrade", "permission_upgrade_step", "--", "--ignored", "--exact", "--nocapture"]}
 	releaseCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "release", "--all-targets", "--", "-D", "warnings"]}
-	reproducibilityTest: {command: "python3", args: ["-m", "unittest", "tests/test_reproducibility.py"]}
 	coordinationTest: {command: "cargo", args: ["test", "--locked", "-p", "coordination"]}
 	inventoryTest: {command: "cargo", args: ["test", "--locked", "-p", "inventory"]}
 	compilerCoreTest: {command: "cargo", args: ["test", "--locked", "-p", "compiler-core"]}
@@ -53,9 +46,6 @@ tasks: {
 		{command: "cargo", args: ["check", "--locked", "-p", "coordination", "--no-default-features"]},
 	]
 	registryRuntimeCheck: {command: "cargo", args: ["check", "--locked", "-p", "platform", "--no-default-features"]}
-	candidateQualificationTest: {command: "cargo", args: ["test", "--locked", "-p", "platform", "--features", "test-support", "--lib", "candidate_qualification::"]}
-	candidateQualificationArchivedTest: {command: "cargo", args: ["test", "--locked", "-p", "platform", "--features", "test-support", "--lib", "tests::candidate_qualification::public_candidate_qualification_rejects_drift_and_reserves_exact_candidate", "--", "--exact", "--ignored"]}
-	deploymentCeilingTest: {command: "python3", args: ["-m", "unittest", "tests/test_ceiling_observations.py", "tests/test_deployment_ceiling.py"]}
 	testClusterTest: {command: "cargo", args: ["test", "--locked", "-p", "test-cluster"]}
 	testClusterCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "test-cluster", "--all-targets", "--", "-D", "warnings"]}
 	// Refreshes scripts/runtime-base from the registry for the digest in
@@ -126,13 +116,9 @@ tasks: {
 	acceptanceCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "acceptance", "--all-targets", "--", "-D", "warnings"]}
 	runtimeTest: {command: "cargo", args: ["test", "--locked", "-p", "runtime"]}
 	runtimeCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "runtime", "--all-targets", "--", "-D", "warnings"]}
-	previewTest: {command: "cargo", args: ["test", "--locked", "-p", "platform", "--features", "test-support", "preview_"]}
-	previewIssuedLive: {command: "cargo", args: ["test", "--locked", "-p", "platform", "--features", "test-support", "--lib", "preview_issued_live", "--", "--ignored"]}
-	previewQualification: {command: "python3", args: ["tests/run_preview_qualification.py"]}
-	previewQualificationTest: {command: "python3", args: ["-m", "unittest", "tests/test_preview_qualification.py"]}
-	previewReadOnlyLive: {command: "cargo", args: ["test", "--locked", "-p", "platform", "--features", "test-support", "--test", "preview_readonly", "--", "--ignored"]}
-	registryTest: {command: "cargo", args: ["test", "--locked", "-p", "deploy", "-p", "platform", "-p", "cli", "--features", "platform/test-support"]}
-	registryCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "deploy", "-p", "platform", "-p", "cli", "--features", "platform/test-support", "--all-targets", "--", "-D", "warnings"]}
+	previewTest: {command: "cargo", args: ["test", "--locked", "-p", "platform", "--features", "deployer", "preview_"]}
+	registryTest: {command: "cargo", args: ["test", "--locked", "-p", "deploy", "-p", "platform", "-p", "cli", "--features", "platform/deployer"]}
+	registryCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "deploy", "-p", "platform", "-p", "cli", "--features", "platform/deployer", "--all-targets", "--", "-D", "warnings"]}
 	authorCompilerTest: {
 		dependsOn: [install]
 		command: "deno"

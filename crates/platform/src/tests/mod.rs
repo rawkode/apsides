@@ -20,8 +20,6 @@ use tower::service_fn;
 // multi-threaded runtime needs of them.
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-#[cfg(feature = "test-support")]
-mod candidate_qualification;
 #[cfg(feature = "deployer")]
 mod capacity_accounting;
 #[cfg(feature = "deployer")]

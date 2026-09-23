@@ -80,12 +80,8 @@ jobs:
           bash .github/cuenv-task.sh compilerCoreCheck
           bash .github/cuenv-task.sh testClusterCheck
           bash .github/cuenv-task.sh acceptanceCheck
-      - name: Run qualification harness unit tests
-        run: |
-          bash .github/cuenv-task.sh cnpgDemoTest
-          bash .github/cuenv-task.sh apiGapProbesTest
-          bash .github/cuenv-task.sh performanceTest
-          bash .github/cuenv-task.sh packagingTest
+      - name: Run packaging script tests
+        run: bash .github/cuenv-task.sh packagingTest
       - name: Build documentation
         run: bash .github/cuenv-task.sh docsBuild
   reactor:

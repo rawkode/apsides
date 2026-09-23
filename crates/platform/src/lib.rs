@@ -17,8 +17,6 @@ pub use executor_binding::ExecutorBinding;
 mod permissions;
 #[cfg(feature = "deployer")]
 mod preview_adapter;
-#[cfg(all(test, feature = "test-support"))]
-mod preview_issued_live;
 #[cfg(feature = "deployer")]
 mod preview_permissions;
 #[cfg(feature = "deployer")]
@@ -65,17 +63,6 @@ pub use permissions::{
 pub use review_projection::project_review_metadata;
 pub use writer_checkpoint::WriterCheckpoint;
 
-#[cfg(feature = "test-support")]
-mod candidate_qualification;
-#[cfg(feature = "test-support")]
-pub use candidate_qualification::{
-    CANDIDATE_PAIR_QUALIFICATION_MARKER_NAME, CANDIDATE_PAIR_QUALIFICATION_SCHEMA,
-    CANDIDATE_QUALIFICATION_MARKER_NAME, CANDIDATE_QUALIFICATION_SCHEMA,
-    CandidatePairLifecycleOperation, CandidatePairPurpose, CandidatePairQualificationMarker,
-    CandidatePairQualificationTarget, CandidatePairRole, CandidateQualificationMarker,
-    CandidateQualificationPair, CandidateQualificationTarget,
-    candidate_pair_qualification_executor,
-};
 #[cfg(feature = "deployer")]
 mod activation;
 #[cfg(feature = "deployer")]

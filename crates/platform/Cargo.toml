@@ -9,7 +9,6 @@ publish = false
 [features]
 default = []
 deployer = ["dep:release", "dep:tokio", "kube/ws", "dep:rcgen", "dep:time", "dep:http", "dep:http-body-util"]
-test-support = ["deployer", "kube/config", "coordination/sqlite-backend"]
 
 [dependencies]
 http = { version = "1", optional = true }
@@ -33,6 +32,7 @@ thiserror = "2"
 [dev-dependencies]
 async-trait = "0.1"
 bytes = "1"
+coordination = { path = "../coordination" }
 http-body = "1"
 inventory = { path = "../inventory" }
 tempfile = "3"
