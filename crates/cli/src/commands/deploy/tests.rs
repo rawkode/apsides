@@ -217,6 +217,60 @@ fn pending_same_build_precedes_old_active_transition_and_rollback_is_fresh() -> 
     Ok(())
 }
 
+/// A rerun after a process stopped at any stored phase resumes that
+/// transition with the same executor, and after the Committed write (before
+/// or after inventory publication) routes to the report that republishes the
+/// committed inventory. The acceptance suite's phase interruption scenario
+/// covers the stored phases live; this is the only coverage of a stop
+/// between the Committed write and the inventory publication.
+#[test]
+fn reruns_resume_every_stored_phase_and_republish_a_commit() -> Result<()> {
+    let (mut registry, plan) = registry()?;
+    let artifact = transition::Artifact {
+        domain: "example",
+        release_digest: BUILD,
+        ir_digest: &plan.request.next.compiled.ir_digest,
+    };
+    assert_eq!(
+        default_transition(&registry, "example", BUILD, "policy-1")?,
+        TRANSITION_1
+    );
+    assert_eq!(
+        check_existing(&registry, TRANSITION_1, &artifact, "job-1", "policy-1")?,
+        ExistingTransition::Committed
+    );
+    for phase in [
+        Phase::Planned,
+        Phase::Staged,
+        Phase::Quiesced,
+        Phase::Activated,
+        Phase::Cleaning,
+    ] {
+        registry
+            .transitions
+            .get_mut(TRANSITION_1)
+            .ok_or("fixture transition missing")?
+            .record
+            .phase = phase;
+        assert_eq!(
+            default_transition(&registry, "example", BUILD, "policy-1")?,
+            TRANSITION_1
+        );
+        assert_eq!(
+            check_existing(&registry, TRANSITION_1, &artifact, "job-1", "policy-1")?,
+            ExistingTransition::Resume
+        );
+        assert!(check_existing(&registry, TRANSITION_1, &artifact, "job-2", "policy-1").is_err());
+        let other = transition::Artifact {
+            domain: "example",
+            release_digest: OTHER,
+            ir_digest: artifact.ir_digest,
+        };
+        assert!(check_existing(&registry, TRANSITION_2, &other, "job-1", "policy-1").is_err());
+    }
+    Ok(())
+}
+
 fn frozen_inputs(plan: &deploy::TransitionPlan) -> Result<platform::TransitionInputs> {
     let request = &plan.request;
     let domain = &request.next.compiled.ir.domain;

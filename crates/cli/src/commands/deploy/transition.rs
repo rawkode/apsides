@@ -55,24 +55,48 @@ pub(super) fn default_transition(
     Ok(deploy::allocation_names(&registry.registry_uid, registry.next_sequence)?.transition_id)
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum ExistingTransition {
     Absent,
     Resume,
     Committed,
 }
 
+/// The verified release a deployment routes by.
+pub(super) struct Artifact<'a> {
+    pub(super) domain: &'a str,
+    pub(super) release_digest: &'a str,
+    pub(super) ir_digest: &'a str,
+}
+
+impl<'a> From<&'a release::IntegrityVerifiedCandidate> for Artifact<'a> {
+    fn from(verified: &'a release::IntegrityVerifiedCandidate) -> Self {
+        Self {
+            domain: &verified.compiled().ir.domain.id,
+            release_digest: verified.release_digest(),
+            ir_digest: &verified.compiled().ir_digest,
+        }
+    }
+}
+
+/// Whether `transition` is new, an unfinished run of `artifact` this
+/// executor resumes from whatever phase its registry write last stored, or
+/// already committed and active, in which case the rerun only republishes
+/// its inventory. A process stopped after any registry write therefore
+/// resumes, including between the Committed write and the inventory
+/// publication.
 pub(super) fn check_existing(
     registry: &platform::NamespaceRegistry,
     transition: &str,
-    verified: &release::IntegrityVerifiedCandidate,
+    artifact: &Artifact<'_>,
     executor: &str,
     policy: &str,
 ) -> Result<ExistingTransition> {
-    let domain = &verified.compiled().ir.domain.id;
+    let domain = artifact.domain;
     if registry.transitions.values().any(|s| {
-        s.domain_id() == *domain
+        s.domain_id() == domain
             && s.record.phase != Phase::Committed
-            && s.allocation().artifact_digest != verified.release_digest()
+            && s.allocation().artifact_digest != artifact.release_digest
     }) {
         return Err(
             "domain has an unfinished transition for another artifact; finish or recover it first"
@@ -82,8 +106,8 @@ pub(super) fn check_existing(
     let Some(stored) = registry.transitions.get(transition) else {
         return Ok(ExistingTransition::Absent);
     };
-    if stored.allocation().artifact_digest != verified.release_digest()
-        || stored.allocation().ir_digest != verified.compiled().ir_digest
+    if stored.allocation().artifact_digest != artifact.release_digest
+        || stored.allocation().ir_digest != artifact.ir_digest
     {
         return Err("transition belongs to another artifact".into());
     }
