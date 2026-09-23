@@ -1,8 +1,8 @@
 //! Building and signing what the scenarios deploy.
 //!
-//! `acceptance-prepare` builds releases of `examples/cnpg/initial` and
-//! `examples/cnpg` with `aps build` and `aps release`, exactly as a user's
-//! pipeline would, from a build profile written per run from the repository's
+//! `acceptance-prepare` builds releases of `examples/cnpg/initial`,
+//! `examples/cnpg`, `examples/cnpg/cleanup` and the `cnpg-owner` program with
+//! `aps build` and `aps release`, exactly as a user's pipeline would, from a build profile written per run from the repository's
 //! pins. It signs each release's provenance with an OpenSSH key generated for
 //! this run alone, deletes the private key, and writes the trust policy that
 //! approves only that key's public half, the releases' compiler digests and
@@ -36,6 +36,14 @@ const SIGNATURE_NAMESPACE: &str = "apsides.provenance.v1";
 /// The repository of the controller images the releases record.
 const IMAGE_REPOSITORY: &str = "localhost/apsides/cnpg-controller";
 const BUILD_TIMEOUT: Duration = Duration::from_mins(45);
+/// Every program the scenarios deploy, by the directory prepare writes its
+/// release to, in the order `inputs.json` names them.
+const RELEASES: [(&str, &str); 4] = [
+    ("initial", "examples/cnpg/initial/program.tsx"),
+    ("successor", "examples/cnpg/program.tsx"),
+    ("cleanup", "examples/cnpg/cleanup/program.tsx"),
+    ("owner", "crates/acceptance/programs/cnpg-owner/program.tsx"),
+];
 
 /// Where prepare reads from and writes to.
 pub struct Options {
@@ -49,7 +57,8 @@ pub struct Options {
     pub sbom_tool: PathBuf,
 }
 
-/// Build, release and sign both example releases and write `inputs.json`.
+/// Build, release and sign every program in [`RELEASES`] and write
+/// `inputs.json`.
 ///
 /// # Errors
 /// Fails when any tool is missing or any build, release, signature,
@@ -82,10 +91,7 @@ pub async fn prepare(options: &Options) -> Result<Inputs> {
     let public = std::fs::read_to_string(key.with_extension("pub"))?;
 
     let mut releases = Vec::new();
-    for (name, source) in [
-        ("initial", "examples/cnpg/initial/program.tsx"),
-        ("successor", "examples/cnpg/program.tsx"),
-    ] {
+    for (name, source) in RELEASES {
         let directory = output.join(name);
         if directory.exists() {
             std::fs::remove_dir_all(&directory)?;
@@ -124,14 +130,22 @@ pub async fn prepare(options: &Options) -> Result<Inputs> {
     let operator_manifest = output.join("cnpg-operator.yaml");
     fetch_operator(&operator_manifest).await?;
 
-    let [initial_release, successor_release] = releases.as_slice() else {
-        return infrastructure("expected two releases");
+    let [
+        initial_release,
+        successor_release,
+        cleanup_release,
+        owner_release,
+    ] = releases.as_slice()
+    else {
+        return infrastructure("expected one release per program");
     };
     let inputs = Inputs {
         schema_version: SCHEMA.into(),
         aps,
         initial_release: initial_release.clone(),
         successor_release: successor_release.clone(),
+        cleanup_release: cleanup_release.clone(),
+        owner_release: owner_release.clone(),
         trust_policy,
         operator_manifest,
         results: output.join("results"),

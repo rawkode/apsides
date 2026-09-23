@@ -26,36 +26,17 @@ target/debug/aps compile \
 Use a fresh compile output directory. Generated CRD modules stay under ignored
 `.aps/`; their pinned generator task and source lock are tracked.
 
-The signed-pair qualification uses `last-type-cleanup` for the exact
-`postgresql.cnpg.io/backups/default/cleanup-backup` identity. Both generations
-use one stable policy: the predecessor runtime ceiling and a cleanup ceiling
-that additionally authorizes named `get` and `delete` for this Backup. The
-successor runtime Role still derives from its own compiled capabilities.
-
-Both separate live scenarios passed at runner revision `64f2b39`: preserving a
-test-owned finalizer until its owner removed it, then completing cleanup; and
-refusing a replacement UID while retaining the original protected claim.
-Both preserved an unclaimed Backup and verified that the successor's workload
-Role omitted Backup access. Each cluster and its credentials were deleted.
-
-The local runner accepts this signed predecessor and the signed parent
-successor, verified together under one external trust policy:
+The acceptance suite deploys this program and then the parent example with
+`aps deploy`, under one policy for both generations: this program's runtime
+ceiling, and a cleanup ceiling that also allows reading and deleting exactly
+`postgresql.cnpg.io/backups/default/cleanup-backup`. The successor's runtime
+Role still derives from its own compiled capabilities. One scenario holds the
+deletion with a test-owned finalizer until its owner removes it, then commits.
+The other replaces the Backup's UID and requires cleanup to refuse it. Both
+check that an unclaimed Backup survives and that the successor's workload Role
+grants no Backup access. See [the acceptance suite](/reference/acceptance/):
 
 ```sh
-cuenv exec -- python3 tests/run_cnpg_cleanup.py \
-  --initial-artifact "$CLEANUP_PREDECESSOR" \
-  --successor-artifact "$SUCCESSOR_CANDIDATE" \
-  --trust-policy "$JOINT_TRUST_POLICY" \
-  --operator-manifest "$PINNED_OPERATOR_MANIFEST" \
-  --operator-sha256 "$OPERATOR_MANIFEST_DIGEST" \
-  --scenario finalizer \
-  --output "$PWD/work/cnpg-finalizer"
+cuenv task acceptancePrepare
+cuenv task acceptanceCleanupTest
 ```
-
-Use absolute input paths, a clean committed checkout, and a fresh ignored output
-directory. Run again with `--scenario replacement` and a separate fresh output
-directory. Each run creates and deletes its own kind cluster through the
-existing Docker context; existing clusters remain untouched.
-
-The runner writes its measurement only after cluster and credential cleanup and
-repeated input verification. Offline runner checks use `cuenv task cnpgCleanupTest`.
