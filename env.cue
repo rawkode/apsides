@@ -140,5 +140,8 @@ tasks: {
 		args: ["task", "--cwd", "docs", "dev"]
 	}
 	install: {command: "deno", args: ["install", "--frozen"], env: {CI: "1"}}
-	build: {command: "cargo", args: ["build", "--locked", "-p", "cli"]}
+	// aps compile locks the generated controller offline against the workspace
+	// Cargo.lock, so every crate for every platform must be fetched, not only
+	// those this host builds.
+	build: {command: "sh", args: ["-c", "cargo fetch --locked && cargo build --locked -p cli"]}
 }
