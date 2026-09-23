@@ -224,8 +224,9 @@ pub struct Test {
     /// `docker image save apsides-fixture:local`.
     #[arg(long, requires = "cluster")]
     pub fixture_image: Option<PathBuf>,
-    /// CRD manifests for custom resources the program manages.
-    #[arg(long, value_delimiter = ',', requires = "cluster")]
+    /// A CRD manifest for a custom resource the program manages; repeat for
+    /// each manifest.
+    #[arg(long = "crd", value_name = "PATH", requires = "cluster")]
     pub crds: Vec<PathBuf>,
     /// Leave the cluster running after the run, for inspection.
     #[arg(long, requires = "cluster")]
@@ -476,8 +477,10 @@ mod tests {
             "--cluster",
             "--fixture-image",
             "f.tar",
-            "--crds",
-            "a.yaml,b.yaml",
+            "--crd",
+            "a,1.yaml",
+            "--crd",
+            "b.yaml",
             "--output",
             "o",
         ])?
@@ -488,7 +491,7 @@ mod tests {
         assert!(test.cluster && !test.keep_cluster);
         assert_eq!(
             test.crds,
-            [PathBuf::from("a.yaml"), PathBuf::from("b.yaml")]
+            [PathBuf::from("a,1.yaml"), PathBuf::from("b.yaml")]
         );
         Ok(())
     }

@@ -65,20 +65,93 @@ It creates a kind cluster named `aps-test-…` from the pinned Kubernetes v1.34.
 node image, with its kubeconfig in a private temporary directory, and never
 reads your current context. The node image and
 `nginxinc/nginx-unprivileged:alpine@sha256:d908…` (the controller's loopback
-proxy and the egress sentinel) must already be pulled; nothing is fetched
-during the run. Images are imported into the node by digest, all egress except
-the API server is denied and proven denied by canaries, and the controller runs
-in fixture mode with a short-lived token for its generated `ServiceAccount`.
-Programs that manage custom resources pass their CRD manifests with `--crds`.
+proxy, the egress sentinel and the probe Pods) must already be pulled; nothing
+is fetched during the run. Images are imported into the node by digest, and the
+controller runs in fixture mode with a token for its generated `ServiceAccount`
+that expires shortly after the run's own deadline. Programs that manage custom
+resources pass each CRD manifest with its own `--crd` flag.
 
-`results.json` records each case's reaction, source location, scenario, fixture
-digest, the tested release and overlay identity, and whether it passed,
-failed, was unsupported or was excluded, beside the secret-canary scan and the
-reaction-mutation check; `junit.xml`, controller logs and object diagnostics
-(never Secrets) sit next to it. The cluster is deleted at the end unless `--keep-cluster` is
-given. The command fails if any required case fails or is unsupported.
-`cuenv task reactorClusterTest` runs the whole path on
-`examples/web-application`.
+### The offline gate
+
+After the images are imported, the runner blocks egress inside every kind node
+container with an `iptables` chain placed first in `OUTPUT` and `FORWARD`. It
+lets through loopback, the node's own addresses, established connections and
+the cluster's Pod (`10.244.0.0/16`) and Service (`10.96.0.0/16`) ranges, and
+rejects everything else. It also refuses Docker's embedded DNS resolver, so
+external names do not resolve. This applies to the node's containerd and
+kubelet and to every Pod. Deny-all `NetworkPolicy` then isolates the workload
+and control namespaces, and the controller may reach only the API server.
+
+Each claim is a named probe in `results.json`. A probe that must fail has a
+positive control that uses the same method and must succeed:
+
+| Probe | From | Expected |
+| --- | --- | --- |
+| `node-external-tcp` | node | blocked, and the chain's `REJECT` counter must move |
+| `node-external-dns` | node | blocked |
+| `node-registry-pull` | node, `crictl pull` of an image it lacks | blocked |
+| `node-api-server-service` | node, same TCP method | reachable |
+| `pod-sentinel-before-policies` | Pod, before any policy | reachable |
+| `pod-sentinel-by-dns`, `pod-api-server-service` | Pod without a policy, after policies apply | reachable |
+| `pod-external-tcp`, `pod-external-dns` | Pod without a policy | blocked |
+| `workload-pod-sentinel` | Pod in the workload namespace | blocked, retried for up to a minute because the CNI applies a `NetworkPolicy` to a new Pod only after it sees that Pod; the result records the attempts |
+| `workload-pod-external-tcp` | Pod in the workload namespace | blocked |
+| `controller-sentinel`, `controller-external-tcp` | the controller Pod's proxy | blocked |
+| `node-external-tcp-after-cases` | node, after the last case | blocked |
+
+The gate fails if any probe is missing or does not match. It isolates the
+cluster from the network; it does not isolate the Docker host.
+
+### Results and exit status
+
+The output directory holds:
+
+- `results.json`: the report (`apsides.dev/reactor-report/v1`), described below.
+- `junit.xml`: one test case per generated case.
+- `controller.log`, `egress-canary.log` and `diagnostics/`: controller logs,
+  including restarted containers, and object state (never Secrets).
+- `semantic-results.json`, `test-seed.json` (input keys, never values) and
+  `canary-scan.json`.
+- `kubeconfig`: with `--keep-cluster` only, the kept cluster's admin
+  kubeconfig, readable only by you.
+
+Before anything is written, every file is scanned for the synthetic secret
+values and the fixture rollout key, and any occurrence is replaced by
+`[REDACTED]`. The scan counts occurrences and any canary too short to search
+for, and fails the run if it finds a leak.
+
+`results.json` records:
+
+| Field | Contents |
+| --- | --- |
+| `status`, `clean`, `failure` | `passed`, `failed` or `interrupted`; `clean` only when it passed and the cluster was deleted; `failure` is `cases`, `infrastructure` or `interrupted` |
+| `runner` | `aps` version, kind version, Docker server version, the pinned node image and its local image ID, the proxy image and its config digest |
+| `artifact` | release, fixture IR, production IR and overlay digests, the controller image and its config, and the workload fixture image config |
+| `cluster` | name, disposition (`deleted`, `kept`, `delete-failed` or `not-created`), Pod and Service ranges, and the exported kubeconfig when kept |
+| `isolation` | whether the node rules are installed, every network probe, the controller credential check, image import and the token lifetime |
+| `checks` | `offline-gate`, `controller-credential`, `cluster-cleanup`, `reactor-cases`, `secret-canary-scan` and `reaction-mutation-check`, each with typed assertions |
+| `summary` | case counts by status |
+| `cases` | per generated case: reaction, source location, scenario, layer, inputs, fixture, release and overlay digests, status, evidence, typed assertions and duration |
+| `error`, `limitations` | the run-level error, if any, and what the run does not establish |
+
+The reaction-mutation check applies each mutation to the independent revision
+oracle's model: the reaction's contribution removed, and each input only that
+reaction selects ignored. The live revision must differ from every mutated
+expectation. The controller itself is not mutated.
+
+`aps test --cluster` prints progress to stderr and exits with:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | every check passed; with `--keep-cluster` the run is reported as not clean |
+| 1 | a reactor case, the canary scan or the mutation check failed |
+| 2 | the command line was invalid |
+| 3 | infrastructure: Docker, kind, images, isolation, credentials or cleanup failed, so the cases prove nothing |
+| 130 | interrupted by SIGINT or SIGTERM; the cluster is still deleted and the report written |
+
+The cluster is deleted at the end, including after an interruption, unless
+`--keep-cluster` is given. `cuenv task reactorClusterTest` runs the whole path
+on `examples/web-application`.
 
 OCI packaging is optional distribution. `aps build` produces an OCI archive
 as part of its current complete artifact, but upgrades do not use historical

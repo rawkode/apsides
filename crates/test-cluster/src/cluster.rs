@@ -25,6 +25,14 @@ pub const NAME_PREFIX: &str = "aps-test-";
 
 const MAX_KUBECONFIG_BYTES: u64 = 1024 * 1024;
 
+/// The cluster's Pod and Service ranges, set explicitly so the node egress
+/// rules can allow exactly them.
+pub const POD_SUBNET: &str = "10.244.0.0/16";
+pub const SERVICE_SUBNET: &str = "10.96.0.0/16";
+
+/// How long the synchronous fallback deletion may take before it is abandoned.
+const DROP_DELETE_SECONDS: u64 = 120;
+
 /// What happened to the cluster at the end of the run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -35,6 +43,48 @@ pub enum Disposition {
     DeleteFailed,
 }
 
+/// The local tools the run depends on, recorded in the report.
+pub struct Toolchain {
+    pub kind_version: String,
+    pub docker_server_version: String,
+    pub node_image_id: String,
+}
+
+/// Check the Docker daemon, kind and the pinned node image before anything is
+/// created, so each missing prerequisite is reported as itself.
+pub async fn preflight() -> Result<Toolchain> {
+    let docker = Invocation::new("docker")
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .timeout(Duration::from_secs(30))
+        .output()
+        .await?;
+    if !docker.success || docker.stdout.trim().is_empty() {
+        return infrastructure(format!(
+            "the Docker daemon is not reachable; start Docker and retry: {}",
+            tail(&docker.stderr, 500)
+        ));
+    }
+    let kind = Invocation::new("kind")
+        .arg("version")
+        .timeout(Duration::from_secs(30))
+        .run()
+        .await?;
+    let image = Invocation::new("docker")
+        .args(["image", "inspect", "--format", "{{.Id}}", NODE_IMAGE])
+        .output()
+        .await?;
+    if !image.success || image.stdout.trim().is_empty() {
+        return infrastructure(format!(
+            "the kind node image {NODE_IMAGE} is not in the local Docker image store; pull it before running the suite"
+        ));
+    }
+    Ok(Toolchain {
+        kind_version: kind.trim().to_owned(),
+        docker_server_version: docker.stdout.trim().to_owned(),
+        node_image_id: image.stdout.trim().to_owned(),
+    })
+}
+
 pub struct Cluster {
     name: String,
     directory: tempfile::TempDir,
@@ -43,66 +93,54 @@ pub struct Cluster {
 }
 
 impl Cluster {
-    /// Create a new cluster from the pinned node image.
-    ///
-    /// The node image must already be in the local Docker image store: the
-    /// runner never lets kind pull it. An existing cluster with the chosen
-    /// name is refused rather than reused.
-    pub async fn create(keep: bool) -> Result<Self> {
-        let name = unique_name()?;
-        if Invocation::new("docker")
-            .args(["image", "inspect", "--format", "{{.Id}}", NODE_IMAGE])
-            .output()
-            .await?
-            .stdout
-            .trim()
-            .is_empty()
-        {
-            return infrastructure(format!(
-                "the kind node image {NODE_IMAGE} is not in the local Docker image store; pull it before running the suite"
-            ));
-        }
-        let existing = Invocation::new("kind")
-            .args(["get", "clusters"])
-            .run()
-            .await?;
-        if existing.lines().any(|line| line.trim() == name) {
-            return infrastructure(format!("a kind cluster named {name} already exists"));
-        }
+    /// Choose a fresh name and a private directory for the kubeconfig. Nothing
+    /// exists in Docker until [`Cluster::create`].
+    pub fn new(keep: bool) -> Result<Self> {
         let directory = tempfile::Builder::new()
             .prefix("aps-test-cluster-")
             .tempdir()?;
         restrict(directory.path())?;
-        let cluster = Self {
-            name,
+        Ok(Self {
+            name: unique_name()?,
             directory,
             keep,
             finished: false,
-        };
+        })
+    }
+
+    /// Create the cluster from the pinned node image. The image must already
+    /// be local: kind is never allowed to pull it. An existing cluster with
+    /// the chosen name is refused rather than reused.
+    pub async fn create(&self) -> Result<()> {
+        let existing = Invocation::new("kind")
+            .args(["get", "clusters"])
+            .run()
+            .await?;
+        if existing.lines().any(|line| line.trim() == self.name) {
+            return infrastructure(format!("a kind cluster named {} already exists", self.name));
+        }
+        let config = self.directory.path().join("kind.yaml");
+        std::fs::write(&config, kind_config())?;
         let created = Invocation::new("kind")
             .args([
-                "create",
-                "cluster",
-                "--name",
-                &cluster.name,
-                "--image",
-                NODE_IMAGE,
+                "create", "cluster", "--name", &self.name, "--image", NODE_IMAGE,
             ])
+            .arg("--config")
+            .arg(&config)
             .arg("--kubeconfig")
-            .arg(cluster.admin_kubeconfig())
+            .arg(self.admin_kubeconfig())
             .args(["--wait", "120s"])
             .timeout(Duration::from_secs(420))
             .output()
             .await?;
         if !created.success {
-            // Dropping `cluster` removes whatever kind managed to create.
             return infrastructure(format!(
                 "kind could not create {}: {}",
-                cluster.name,
+                self.name,
                 tail(&created.stderr, 2000)
             ));
         }
-        Ok(cluster)
+        Ok(())
     }
 
     pub fn name(&self) -> &str {
@@ -118,12 +156,37 @@ impl Cluster {
         format!("{}-control-plane", self.name)
     }
 
+    /// Every node container of the cluster.
+    pub async fn nodes(&self) -> Result<Vec<String>> {
+        let listed = Invocation::new("kind")
+            .args(["get", "nodes", "--name", &self.name])
+            .run()
+            .await?;
+        let nodes = listed
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if nodes.is_empty() {
+            return infrastructure(format!("kind reports no nodes for {}", self.name));
+        }
+        Ok(nodes)
+    }
+
     pub fn directory(&self) -> &Path {
         self.directory.path()
     }
 
     fn admin_kubeconfig(&self) -> PathBuf {
         self.directory.path().join("admin.kubeconfig")
+    }
+
+    /// Copy the admin kubeconfig to `destination`, readable only by the
+    /// owner, so a kept cluster can be inspected.
+    pub fn export_kubeconfig(&self, destination: &Path) -> Result<()> {
+        let bytes = bounded(&self.admin_kubeconfig())?;
+        write_private(destination, &bytes)
     }
 
     /// The admin kubeconfig kind wrote, parsed.
@@ -164,7 +227,8 @@ impl Cluster {
         Ok(Endpoint { server, authority })
     }
 
-    /// Delete the cluster unless the caller asked to keep it.
+    /// Delete the cluster unless the caller asked to keep it. Deleting a
+    /// cluster kind never finished creating removes whatever it left.
     pub async fn finish(mut self) -> Disposition {
         self.finished = true;
         if self.keep {
@@ -186,20 +250,42 @@ impl Cluster {
 
 impl Drop for Cluster {
     /// The fallback for an early return or a panic in a caller: the cluster is
-    /// still removed, synchronously, before the temporary kubeconfig goes.
+    /// still removed, synchronously and within a bound, before the temporary
+    /// kubeconfig goes.
     fn drop(&mut self) {
         if self.finished || self.keep {
             return;
         }
-        let _ = std::process::Command::new("kind")
+        let Ok(mut child) = std::process::Command::new("kind")
             .args(["delete", "cluster", "--name", &self.name])
             .arg("--kubeconfig")
             .arg(self.admin_kubeconfig())
             .env_remove("KUBECONFIG")
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status();
+            .spawn()
+        else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(DROP_DELETE_SECONDS);
+        while std::time::Instant::now() < deadline {
+            if !matches!(child.try_wait(), Ok(None)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
+}
+
+/// The kind configuration: one node, IPv4 only, and the Pod and Service
+/// ranges the egress rules allow.
+fn kind_config() -> String {
+    format!(
+        "kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnetworking:\n  ipFamily: ipv4\n  podSubnet: \"{POD_SUBNET}\"\n  serviceSubnet: \"{SERVICE_SUBNET}\"\nnodes:\n  - role: control-plane\n"
+    )
 }
 
 pub struct Endpoint {
@@ -289,6 +375,24 @@ fn bounded(path: &Path) -> Result<Vec<u8>> {
 }
 
 #[cfg(unix)]
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _};
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(bytes)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+#[cfg(unix)]
 fn restrict(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
@@ -312,6 +416,29 @@ mod tests {
         assert!(!valid_name("aps-test-UPPER"));
         assert!(!valid_name("aps-test-"));
         assert!(!valid_name(&format!("{NAME_PREFIX}{}", "9".repeat(60))));
+        Ok(())
+    }
+
+    #[test]
+    fn the_kind_config_pins_the_ranges_the_egress_rules_allow() {
+        let config = kind_config();
+        assert!(config.contains(&format!("podSubnet: \"{POD_SUBNET}\"")));
+        assert!(config.contains(&format!("serviceSubnet: \"{SERVICE_SUBNET}\"")));
+        assert!(config.contains("ipFamily: ipv4"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exported_kubeconfigs_are_private() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("kubeconfig");
+        write_private(&path, b"apiVersion: v1")?;
+        assert_eq!(
+            std::fs::metadata(&path)?.permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(write_private(&path, b"again").is_err(), "never overwrites");
         Ok(())
     }
 

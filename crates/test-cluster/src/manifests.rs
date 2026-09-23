@@ -28,18 +28,19 @@ pub const FOREIGN_MANAGER: &str = "fixture-foreign-manager";
 const LOOPBACK_SERVER: &str = "https://127.0.0.1:8443";
 
 /// Checks the loopback proxy runs before it starts forwarding: the sentinel in
-/// another namespace and an external address must both be unreachable.
+/// another namespace and an external address must both be unreachable. The
+/// result lines are the offline gate's controller probes.
 const PROXY_SH: &str = r#"#!/bin/sh
 if nc -z -w 2 "$DENIED_SENTINEL_HOST" 8080; then
-  echo APSIDES_NETWORK_POLICY_CANARY_UNEXPECTEDLY_CONNECTED
+  echo 'APSIDES_PROBE controller-sentinel reachable'
   exit 41
 fi
-echo APSIDES_NETWORK_POLICY_CANARY_DENIED
+echo 'APSIDES_PROBE controller-sentinel blocked'
 if nc -z -w 2 1.1.1.1 443; then
-  echo APSIDES_EGRESS_CANARY_UNEXPECTEDLY_CONNECTED
+  echo 'APSIDES_PROBE controller-external-tcp reachable'
   exit 42
 fi
-echo APSIDES_EGRESS_CANARY_DENIED
+echo 'APSIDES_PROBE controller-external-tcp blocked'
 cat >/tmp/apsides-nginx.conf <<EOF
 pid /tmp/apsides-nginx.pid;
 error_log stderr notice;
@@ -248,13 +249,20 @@ pub fn sentinel(image: &str) -> [Value; 2] {
     ]
 }
 
-/// A Pod beside the sentinel that proves it is reachable at all, so a denied
-/// connection later means the policy denied it.
-pub fn sentinel_preflight(image: &str, sentinel_ip: &str) -> Value {
+/// The sentinel's in-cluster DNS name.
+pub fn sentinel_host() -> String {
+    format!("{SENTINEL}.{OUTSIDE}.svc.cluster.local")
+}
+
+/// A Pod that runs the offline gate's probes once and exits. It has no
+/// credential and never pulls.
+pub fn probe_pod(namespace: &str, name: &str, image: &str, script: &str) -> Value {
     json!({"apiVersion": "v1", "kind": "Pod",
-        "metadata": {"name": SENTINEL_PREFLIGHT, "namespace": OUTSIDE},
-        "spec": {"restartPolicy": "Never", "containers": [{"name": "probe", "image": image,
-            "imagePullPolicy": "Never", "command": ["sh", "-c", format!("nc -z -w 5 {sentinel_ip} 8080")]}]}})
+        "metadata": {"name": name, "namespace": namespace, "labels": {"app": "apsides-offline-probe"}},
+        "spec": {"restartPolicy": "Never", "automountServiceAccountToken": false,
+            "terminationGracePeriodSeconds": 0,
+            "containers": [{"name": "probe", "image": image, "imagePullPolicy": "Never",
+                "command": ["sh", "-c", script]}]}})
 }
 
 pub fn deny_all_egress(namespace: &str) -> Value {
