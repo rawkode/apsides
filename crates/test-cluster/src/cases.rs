@@ -346,6 +346,17 @@ impl Live<'_> {
         .await
     }
 
+    /// Whether the target finishes rolling out before the case deadline. The
+    /// revision can match while new Pods are still starting, so an immediate
+    /// readiness check fails on a slower cluster.
+    async fn converged(&self, reaction: &Reaction) -> Result<bool> {
+        match self.wait_ready(reaction, "target convergence").await {
+            Ok(()) => Ok(true),
+            Err(Error::Deadline(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     // --- inputs -------------------------------------------------------------
 
     fn managed_resource(&self, input: &Input) -> Result<&Resource> {
@@ -902,7 +913,7 @@ impl Live<'_> {
                 true,
                 self.revision(reaction).await? == expected,
             ),
-            Assertion::new("target-converged", true, self.ready(reaction).await?),
+            Assertion::new("target-converged", true, self.converged(reaction).await?),
         ])
     }
 
@@ -963,7 +974,7 @@ impl Live<'_> {
                     true,
                     self.revision(reaction).await? == expected,
                 ),
-                Assertion::new("target-converged", true, self.ready(reaction).await?),
+                Assertion::new("target-converged", true, self.converged(reaction).await?),
             ])
         }
         .await;
@@ -997,7 +1008,7 @@ impl Live<'_> {
                 true,
                 self.revision(reaction).await? == expected,
             ),
-            Assertion::new("target-converged", true, self.ready(reaction).await?),
+            Assertion::new("target-converged", true, self.converged(reaction).await?),
         ])
     }
 
@@ -1044,14 +1055,22 @@ impl Live<'_> {
             input.name
         );
         let checked = async {
-            let status = self.runtime_api("GET", &path, None).await?;
-            if status != 403 {
-                return Err(Error::Case(format!(
-                    "the controller's credential read the denied input with HTTP {status}, expected 403"
-                )));
-            }
+            // The API server's authorizer learns of RBAC changes through a
+            // watch, so the read can still succeed briefly after the grant
+            // is removed.
+            let status = wait_for("denied input read to be refused", WAIT, async || {
+                let status = self.runtime_api("GET", &path, None).await?;
+                Ok((status == 403).then_some(status))
+            })
+            .await
+            .map_err(|error| match error {
+                Error::Deadline(_) => Error::Case(
+                    "the controller's credential could still read the denied input after its grant was removed, expected 403".into(),
+                ),
+                other => other,
+            })?;
             self.stable(reaction, &before).await?;
-            Ok(status)
+            Ok::<_, Error>(status)
         }
         .await;
         let restored = self.restore_rules().await;
