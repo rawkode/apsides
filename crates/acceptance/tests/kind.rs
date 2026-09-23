@@ -288,13 +288,9 @@ impl Context<'_> {
     }
 
     /// (b)
-    /// `aps deploy` of the successor runs twice under the initial policy. The
-    /// first run captures the active claims' live UIDs into the registry (the
-    /// public CLI does this before planning any upgrade) and is then rejected;
-    /// the check allows exactly that registry change. The second run has
-    /// nothing left to capture, so its rejection must leave the registry's
-    /// resourceVersion identical. Both leave every object and the initial
-    /// writer untouched.
+    /// One `aps deploy` of the successor under the initial policy is rejected
+    /// and leaves the registry's state and resourceVersion, every object and
+    /// the initial writer untouched.
     async fn successor_rejected(
         &self,
         objects: &Objects,
@@ -321,6 +317,7 @@ impl Context<'_> {
         let before = inventory(objects).await?;
         self.require_successor_absent(objects, &next).await?;
 
+        let registry_object = registry_metadata(objects).await?;
         self.rejected(
             platform,
             endpoint,
@@ -329,20 +326,10 @@ impl Context<'_> {
             recorder,
         )
         .await?;
-        let captured = platform.registry().await?;
-        let uids = only_uid_capture(objects, &registry.value, &captured.value, initial).await?;
-        let registry_object = registry_metadata(objects).await?;
-        self.rejected(
-            platform,
-            endpoint,
-            aps,
-            "deploy-successor-rejected-again",
-            recorder,
-        )
-        .await?;
+        let after_rejection = platform.registry().await?;
         ensure(
             registry_metadata(objects).await? == registry_object
-                && platform.registry().await?.value == captured.value,
+                && after_rejection.value == registry.value,
             "the rejected deployment changed the registry",
         )?;
         let after = inventory(objects).await?;
@@ -361,9 +348,12 @@ impl Context<'_> {
             "permission rejection changed the active initial writer",
         )?;
         ensure(
-            !captured.value.transitions.contains_key(&next.transition_id)
-                && captured.value.next_sequence == sequence
-                && captured
+            !after_rejection
+                .value
+                .transitions
+                .contains_key(&next.transition_id)
+                && after_rejection.value.next_sequence == sequence
+                && after_rejection
                     .value
                     .histories
                     .get(platform.domain())
@@ -376,7 +366,6 @@ impl Context<'_> {
             "b-successor-rejected-before-successor-objects",
             &json!({
                 "diagnostic": pair::rejection(&self.pair.missing),
-                "capturedClaimUids": uids,
                 "registryUnchangedByRejection": registry_object,
                 "unallocatedServiceAccount": next.service_account_name,
                 "initialWriters": writers,
@@ -775,64 +764,6 @@ fn postgres_image(pair: &Pair) -> Result<String> {
         "the CNPG Cluster does not pin its image",
     )?;
     Ok(image.to_owned())
-}
-
-/// Require `after` to differ from `before` only by the live UIDs of the
-/// initial generation's active claims, and return those UIDs.
-async fn only_uid_capture(
-    objects: &Objects,
-    before: &platform::NamespaceRegistry,
-    after: &platform::NamespaceRegistry,
-    initial: &Initial,
-) -> Result<Vec<Value>> {
-    let mut expected = before.clone();
-    let mut captured = Vec::new();
-    ensure(
-        before.claims.len() == after.claims.len(),
-        "the rejected deployment changed the protected claims",
-    )?;
-    for (claim, observed) in expected.claims.iter_mut().zip(&after.claims) {
-        if claim.uid.is_some() || claim.identity != observed.identity {
-            continue;
-        }
-        let Some(uid) = observed.uid.clone() else {
-            continue;
-        };
-        let (api_version, kind) = match (
-            claim.identity.api_group.as_str(),
-            claim.identity.resource.as_str(),
-        ) {
-            ("", "configmaps") => ("v1", "ConfigMap"),
-            ("postgresql.cnpg.io", "clusters") => ("postgresql.cnpg.io/v1", "Cluster"),
-            _ => {
-                return Err(acceptance::Error::Check(format!(
-                    "unexpected captured claim {:?}",
-                    claim.identity
-                )));
-            }
-        };
-        let live = objects
-            .require(
-                api_version,
-                kind,
-                Some(&claim.identity.namespace),
-                &claim.identity.name,
-            )
-            .await?;
-        ensure(
-            claim.state == deploy::ClaimState::Active
-                && claim.generation_id == initial.committed.generation
-                && text(&live, "/metadata/uid") == uid,
-            "a captured claim UID is not the live object of the active generation",
-        )?;
-        captured.push(json!({"kind": kind, "name": claim.identity.name, "uid": uid}));
-        claim.uid = Some(uid);
-    }
-    ensure(
-        &expected == after,
-        "the rejected deployment changed the registry beyond capturing active claim UIDs",
-    )?;
-    Ok(captured)
 }
 
 /// The registry `ConfigMap`'s UID and resourceVersion.
