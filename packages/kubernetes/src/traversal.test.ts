@@ -148,3 +148,30 @@ throws(() => compile(element(Controller, { ...domain, provenance: context.proven
 throws(() => compile(controller(element(() => { throw new Error("component failed"); }, {}))), "component failed");
 throws(() => useConfigMap({ name: "after-error" }), "synchronous component");
 assert(compile(controller(element(ConfigMap, config))).resources.length === 1, "failed render leaves no active frame or graph");
+
+const waddleDeployment = {
+  metadata: { name: "waddle-server", namespace: "workload" },
+  spec: { selector: { matchLabels: { app: "waddle-server" } }, template: { metadata: { labels: { app: "waddle-server" } }, spec: { containers: [{ name: "server", image: "test/waddle:v1" }] } } },
+};
+const Waddle = () => {
+  const keypool = useSecret({ name: "waddle-clustering-keypool" });
+  const serverConfig = useResourceRef("ConfigMap");
+  return element(Fragment, { children: [
+    element(ConfigMap, { metadata: { name: "waddle-server-config", namespace: "workload" }, data: { level: "info" }, ref: serverConfig }, 50),
+    element(Deployment, { ...waddleDeployment, rolloutOn: [keypool.data, serverConfig.data] }, 60),
+  ] });
+};
+const waddleIR = compile(controller(element(Waddle, {}, 45)));
+const waddleRollouts = waddleIR.reactions.map((reaction) => reaction.id).sort();
+assert(
+  JSON.stringify(waddleRollouts) === JSON.stringify([
+    "rollout-managed-configmap-waddle-server-config-deplo-56bc032ca9",
+    "rollout-observed-secret-waddle-clustering-keypool-de-cb182e11f4",
+  ]),
+  `over-long derived rollout ids are bounded with a hash suffix; received ${waddleRollouts.join(",")}`,
+);
+assert(waddleRollouts.every((id) => id.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(id)), "bounded derived ids are DNS labels");
+assert(JSON.stringify(waddleIR.resources.map((resource) => resource.id).sort()) === JSON.stringify(["configmap-waddle-server-config", "deployment-waddle-server"]), "short derived resource ids are unchanged");
+assert(JSON.stringify(waddleIR.inputs.map((input) => input.id).sort()) === JSON.stringify(["managed-configmap-waddle-server-config", "observed-secret-waddle-clustering-keypool"]), "short derived input ids are unchanged");
+assert(waddleIR.reactions.every((reaction) => waddleIR.inputs.some((input) => input.id === reaction.inputs[0]) && reaction.target === "deployment-waddle-server"), "bounded reactions reference their inputs and target");
+assert(JSON.stringify(waddleIR) === JSON.stringify(compile(controller(element(Waddle, {}, 45)))), "bounded derived ids are deterministic");

@@ -427,7 +427,7 @@ export class Domain {
     const name = kubernetesName(definition.desired.metadata.name, `${definition.kind}.metadata.name`);
     const namespace = dnsLabel(definition.desired.metadata.namespace, 63, `${definition.kind}.metadata.namespace`);
     this.#requireNamespace(namespace, `${definition.kind} ${name}`);
-    const id = dnsLabel(optionalId(rawOptions.id, "manage.id") ?? definition.id ?? `${definition.kind.toLowerCase()}-${name}`, 63, "manage.id");
+    const id = dnsLabel(optionalId(rawOptions.id, "manage.id") ?? definition.id ?? derivedId(`${definition.kind.toLowerCase()}-${name}`), 63, "manage.id");
     const deletionPolicy = rawOptions.deletionPolicy === undefined ? (this.#state.options.prune ? "delete" : "orphan") : enumValue(rawOptions.deletionPolicy, ["orphan", "delete"] as const, "manage.deletionPolicy");
     const force = optionalBoolean(rawOptions.force, "manage.force") ?? this.#state.options.force ?? false;
     if (this.#state.resources.has(id)) throw new Error(`duplicate managed resource id: ${id}`);
@@ -472,7 +472,7 @@ export class Domain {
     this.#requireNamespace(namespace, `${kind.kind} ${name}`);
     projection(raw.projection, "observe.projection");
     enumValue(raw.missing, ["block-dependent-mutations"] as const, "observe.missing");
-    const id = dnsLabel(optionalId(raw.id, "observe.id") ?? `observed-${kind.kind.toLowerCase()}-${name}`, 63, "observe.id");
+    const id = dnsLabel(optionalId(raw.id, "observe.id") ?? derivedId(`observed-${kind.kind.toLowerCase()}-${name}`), 63, "observe.id");
     const declaration = this.#addInput({
       id,
       apiVersion: "v1",
@@ -515,7 +515,7 @@ export class Domain {
     if (state.domain !== this) throw new Error("cross-domain watch is unsupported");
     const managed = state.declaration;
     if (managed.kind !== "ConfigMap") throw new Error("only ConfigMap data can be watched in this release");
-    const id = dnsLabel(`managed-${managed.id}`, 63, "managed input id");
+    const id = dnsLabel(derivedId(`managed-${managed.id}`), 63, "managed input id");
     const existing = this.#state.inputs.get(id);
     if (existing !== undefined) return existing;
     return this.#addInput({
@@ -539,7 +539,7 @@ export class Domain {
     if (targetState.declaration.kind !== "Deployment") throw new Error("rollout target must be a managed Deployment");
     const raw = options === undefined ? {} : record(options, "rollout options");
     exact(raw, ["id", "source"], "rollout options");
-    const id = dnsLabel(optionalId(raw.id, "rollout.id") ?? `rollout-${input.id}-${target.id}`, 63, "rollout.id");
+    const id = dnsLabel(optionalId(raw.id, "rollout.id") ?? derivedId(`rollout-${input.id}-${target.id}`), 63, "rollout.id");
     if (this.#state.reactions.has(id)) throw new Error(`duplicate reaction id: ${id}`);
     if (this.#state.reactions.size >= this.#state.options.budgets.maxReactions) throw new Error("domain maxReactions budget exceeded");
     const source = raw.source === undefined ? input.source : validateSource(raw.source, "rollout.source");
@@ -890,10 +890,34 @@ const boundedText = (value: unknown, maximum: number, context: string): string =
   return result;
 };
 
+const dnsLabelPattern = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
+
 const dnsLabel = (value: unknown, maximum: number, context: string): string => {
   const result = boundedText(value, maximum, context);
-  if (!/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(result)) throw new Error(`${context} must be a lowercase DNS label`);
+  if (!dnsLabelPattern.test(result)) throw new Error(`${context} must be a lowercase DNS label`);
   return result;
+};
+
+const derivedIdLimit = 63;
+const derivedIdHashLength = 10;
+
+/**
+ * Bound an SDK-derived ID to a DNS label. IDs that already fit are returned unchanged; others become a
+ * readable sanitized prefix plus 10 hex characters of a 64-bit FNV-1a hash of the full derived string.
+ * A collision is reported by the existing duplicate-ID checks. Author-supplied IDs never pass through here.
+ */
+const derivedId = (value: string): string => {
+  if (value.length <= derivedIdLimit && dnsLabelPattern.test(value)) return value;
+  const prefix = value
+    .slice(0, derivedIdLimit - derivedIdHashLength - 1)
+    .replace(/[^a-z0-9-]/g, "-")
+    .replace(/^-+|-+$/g, "");
+  let hash = 0xcbf29ce484222325n;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = ((hash ^ BigInt(value.charCodeAt(index))) * 0x100000001b3n) & 0xffffffffffffffffn;
+  }
+  const suffix = hash.toString(16).padStart(16, "0").slice(0, derivedIdHashLength);
+  return prefix.length === 0 ? suffix : `${prefix}-${suffix}`;
 };
 
 const kubernetesName = (value: unknown, context: string): string => {

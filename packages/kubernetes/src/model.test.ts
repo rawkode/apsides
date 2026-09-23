@@ -316,3 +316,33 @@ throws(() => constrained.manage(new ConfigMap({ metadata: { name: "two", namespa
   equal("force" in output.domain, false, "force default is not ambient runtime configuration");
   equal("prune" in output.domain, false, "prune default is not retroactive cleanup authority");
 }
+
+{
+  const labelPattern = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
+  const value = domain("derived-ids");
+  const longName = `${"a".repeat(60)}.example.test`;
+  const shared = "x".repeat(70);
+  const target = value.manage(deployment("api"), { source });
+  const first = value.observe(ConfigMap, { name: `${shared}-first`, namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  const second = value.observe(ConfigMap, { name: `${shared}-second`, namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  const dotted = value.manage(new ConfigMap({ metadata: { name: longName, namespace: "workload" } }), { source });
+  const short = value.observe(Secret, { name: "short", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  watch(first).project("data").rollout(target, { source });
+  watch(dotted).project("data").rollout(target, { source });
+  watch(short).project("data").rollout(target, { source });
+  const output = value.toIR();
+  const ids = [...output.resources, ...output.inputs, ...output.reactions].map((declaration) => declaration.id);
+  assert(ids.every((id) => id.length <= 63 && labelPattern.test(id)), `derived ids must be bounded DNS labels: ${ids.join(",")}`);
+  assert(first.id !== second.id, "long derivations sharing a prefix remain distinct");
+  equal(second.id, "observed-configmap-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-5474b7ed12", "bounded ids keep the readable derived prefix");
+  equal(first.id, "observed-configmap-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-2d719c957c", "bounded observed id carries a hash of the full derivation");
+  equal(dotted.id, "configmap-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-b045bae0c1", "dotted derived resource id is bounded");
+  equal(short.id, "observed-secret-short", "short derived id is unchanged");
+  equal(output.reactions.find((reaction) => reaction.inputs[0] === short.id)?.id, "rollout-observed-secret-short-api", "short derived rollout id is unchanged");
+  equal(output.inputs.find((input) => input.mode === "managed")?.id, "managed-configmap-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-b9487f1d3e", "derived managed input id is bounded");
+  throws(() => value.observe(ConfigMap, { id: "x".repeat(64), name: "explicit", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source }), "observe.id exceeds 63 characters");
+  throws(() => value.manage(new ConfigMap({ id: "c".repeat(64), metadata: { name: "explicit", namespace: "workload" } }), { source }), "manage.id exceeds 63 characters");
+  throws(() => watch(short).project("data").rollout(target, { id: `rollout-${"r".repeat(60)}`, source }), "rollout.id exceeds 63 characters");
+  throws(() => watch(short).project("data").rollout(target, { id: "Rollout.Bad", source }), "rollout.id must be a lowercase DNS label");
+  throws(() => watch(short).project("data").rollout(target, { source }), "duplicate reaction id: rollout-observed-secret-short-api");
+}
