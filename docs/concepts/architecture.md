@@ -86,6 +86,8 @@ See
 | `inventory` | metadata-only snapshots and SQLite storage |
 | `coordination` | typed immutable stores for claims, transition audits and review metadata |
 | `cli` | `aps` build, verification and deployment commands |
+| `test-cluster` | `aps test --cluster`: generated reactor cases on a disposable kind cluster |
+| `acceptance` | the acceptance suite: the CNPG examples deployed with `aps deploy` on kind |
 
 Internal packages use role names without product prefixes. The current executable
 is `aps`, and the authoring package is `@apsides/kubernetes`.
