@@ -6,7 +6,6 @@ use release::IntegrityVerifiedCandidate;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 
-mod collision;
 mod pair;
 pub use pair::{
     CANDIDATE_PAIR_QUALIFICATION_MARKER_NAME, CANDIDATE_PAIR_QUALIFICATION_SCHEMA,
@@ -75,44 +74,6 @@ fn same_version<T: PartialEq>(observed: &Versioned<T>, expected: &Versioned<T>) 
     observed.uid == expected.uid
         && observed.resource_version == expected.resource_version
         && observed.value == expected.value
-}
-
-fn collision_owner_plan(
-    stored: &crate::StoredTransition,
-    owner: &compiler_core::CompiledPlan,
-    release_digest: &str,
-    policy: &crate::PolicyState,
-) -> Result<deploy::TransitionPlan> {
-    let inputs = &stored.inputs;
-    let request = deploy::DeploymentRequest {
-        transition_id: inputs.allocation.transition_id.clone(),
-        previous: None,
-        next: deploy::GenerationPlan {
-            generation_id: inputs.allocation.generation_id.clone(),
-            artifact_digest: release_digest.into(),
-            compiled: owner.clone(),
-        },
-        registry: deploy::RegistrySnapshot {
-            registry_uid: inputs.allocation.registry_uid.clone(),
-            next_sequence: inputs.registry.next_sequence,
-            revision: inputs.registry.revision.clone(),
-            claims: vec![],
-            generation_history: inputs.registry.generation_history.clone(),
-        },
-        runtime_ceiling: policy.runtime_ceiling.clone(),
-        cleanup_ceiling: policy.cleanup_ceiling.clone(),
-        observations: vec![],
-        ownership_intents: vec![],
-    };
-    let plan = deploy::plan_transition(&request)?;
-    if crate::TransitionInputs::freeze(&plan, inputs.registry.claim_snapshot.clone(), policy)?
-        != *inputs
-    {
-        return Err(invalid(
-            "collision qualification owner plan differs from exact candidate",
-        ));
-    }
-    Ok(plan)
 }
 
 fn validate_fresh_qualification_request(request: &deploy::DeploymentRequest) -> Result<()> {
@@ -197,118 +158,6 @@ impl PlatformClient {
             ))
         })
         .await
-    }
-
-    /// Confirm that an exact candidate is rejected by authenticated reservation
-    /// because another exact candidate already reserved its resource identity.
-    /// This negative-only test capability never admits a successful plan.
-    ///
-    /// # Errors
-    /// Rejects any candidate, disposable target, protected-state or trust drift,
-    /// and any outcome other than the expected protected-claim collision.
-    pub async fn qualify_candidate_collision(
-        &self,
-        request: &deploy::DeploymentRequest,
-        executor: &str,
-        owner: &IntegrityVerifiedCandidate,
-        contender: &IntegrityVerifiedCandidate,
-        target: &CandidateQualificationTarget,
-        inventory: &dyn inventory::InventoryStore,
-    ) -> Result<()> {
-        let binding = self.candidate_binding(request, contender)?;
-        let current = self.load_registry().await?;
-        collision::validate_collision_state(&current, request, owner, contender)?;
-        let owner_record = current
-            .value
-            .transitions
-            .values()
-            .next()
-            .ok_or_else(|| invalid("collision qualification owner transition is absent"))?;
-        let owner_review = self
-            .read_review_metadata(&owner_record.next_review_metadata)
-            .await?;
-        let owner_policy = self.load_policy(&owner.compiled().ir.domain.id).await?;
-        let plan = collision_owner_plan(
-            owner_record,
-            owner.compiled(),
-            owner.release_digest(),
-            &owner_policy.value,
-        )?;
-        if crate::project_review_metadata(&plan)? != owner_review {
-            return Err(invalid(
-                "collision qualification owner review differs from exact candidate",
-            ));
-        }
-        let policy = self.load_policy(binding.domain_id).await?;
-        self.validate_reservation_snapshot(&current, request)?;
-        let owner_trust = self
-            .load_trust_policy(&owner.compiled().ir.domain.id)
-            .await?;
-        let contender_trust = self.load_trust_policy(binding.domain_id).await?;
-        if compiler_core::digest(&owner_trust.value)? != owner.trust_policy_digest()
-            || compiler_core::digest(&contender_trust.value)? != contender.trust_policy_digest()
-        {
-            return Err(invalid(
-                "collision qualification trust differs from verified candidates",
-            ));
-        }
-        self.verify_candidate_qualification_target(&binding, target)
-            .await?;
-        if !matches!(deploy::plan_transition(request), Err(error) if collision::is_claim_collision(&error))
-        {
-            return Err(invalid(
-                "collision qualification requires a rejecting protected claim plan",
-            ));
-        }
-        match Box::pin(self.reserve_authenticated(
-            request,
-            executor,
-            inventory,
-            Some(contender.trust_policy_digest()),
-        ))
-        .await
-        {
-            Err(crate::Error::Deploy(error)) if collision::is_claim_collision(&error) => {}
-            Err(error) => return Err(error),
-            Ok(_) => {
-                return Err(invalid(
-                    "collision qualification unexpectedly reserved a transition",
-                ));
-            }
-        }
-        if self
-            .read_review_metadata(&owner_record.next_review_metadata)
-            .await?
-            != owner_review
-        {
-            return Err(invalid("collision qualification owner review changed"));
-        }
-        if !same_version(&self.load_registry().await?, &current)
-            || !same_version(&self.load_policy(binding.domain_id).await?, &policy)
-            || !same_version(
-                &self.load_policy(&owner.compiled().ir.domain.id).await?,
-                &owner_policy,
-            )
-        {
-            return Err(invalid(
-                "collision qualification changed protected registry or policy state",
-            ));
-        }
-        if !same_version(
-            &self
-                .load_trust_policy(&owner.compiled().ir.domain.id)
-                .await?,
-            &owner_trust,
-        ) || !same_version(
-            &self.load_trust_policy(binding.domain_id).await?,
-            &contender_trust,
-        ) {
-            return Err(invalid(
-                "collision qualification trust changed during reservation",
-            ));
-        }
-        self.verify_candidate_qualification_target(&binding, target)
-            .await
     }
 
     fn candidate_binding<'a>(

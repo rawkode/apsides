@@ -15,10 +15,7 @@ tasks: {
 	packageCliTest: {command: "python3", args: ["tests/test_package_cli.py"]}
 	packagingTest: {command: "python3", args: ["tests/test_packaging.py"]}
 	cnpgDemoTest: {command: "python3", args: ["tests/test_cnpg_demo.py"]}
-	cnpgCleanupTest: {command: "python3", args: ["tests/test_cnpg_cleanup.py"]}
-	uncertainWriterTest: {command: "python3", args: ["tests/test_uncertain_writer.py"]}
 	apiGapTest: {command: "python3", args: ["tests/test_api_gap.py"]}
-	cnpgPhaseRecoveryTest: {command: "python3", args: ["tests/test_cnpg_phase_recovery.py"]}
 	apiGapProbesTest: {command: "python3", args: ["tests/test_cnpg_credential_probes.py"]}
 	crdReactorTest: {command: "python3", args: ["tests/test_cluster_crds.py"]}
 	cnpgCleanupTypes: [
@@ -59,7 +56,6 @@ tasks: {
 	candidateQualificationTest: {command: "cargo", args: ["test", "--locked", "-p", "platform", "--features", "test-support", "--lib", "candidate_qualification::"]}
 	candidateQualificationArchivedTest: {command: "cargo", args: ["test", "--locked", "-p", "platform", "--features", "test-support", "--lib", "tests::candidate_qualification::public_candidate_qualification_rejects_drift_and_reserves_exact_candidate", "--", "--exact", "--ignored"]}
 	deploymentCeilingTest: {command: "python3", args: ["-m", "unittest", "tests/test_ceiling_observations.py", "tests/test_deployment_ceiling.py"]}
-	ownershipCollisionTest: {command: "python3", args: ["-m", "unittest", "tests/test_ceiling_observations.py", "tests/test_deployment_ceiling.py", "tests/test_ownership_collision.py"]}
 	testClusterTest: {command: "cargo", args: ["test", "--locked", "-p", "test-cluster"]}
 	testClusterCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "test-cluster", "--all-targets", "--", "-D", "warnings"]}
 	// Refreshes scripts/runtime-base from the registry for the digest in

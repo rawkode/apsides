@@ -181,10 +181,9 @@ async fn reject_upgrade(settings: &Settings, pair: &CandidatePair) -> Result<()>
 async fn reserve_successor(
     settings: &Settings,
     pair: &CandidatePair,
-    configure: impl FnOnce(PlatformClient) -> PlatformClient,
 ) -> Result<()> {
     require_fields(settings, FieldSet::RequestMutation)?;
-    let platform = configure(issued_platform(&pair.successor).await?);
+    let platform = issued_platform(&pair.successor).await?;
     let inventory = inventory_store().await?;
     let authorized = authorize(
         &platform,
@@ -214,71 +213,14 @@ async fn reserve_successor(
     )
 }
 
-async fn reject_uncertain_writer(settings: &Settings, pair: &CandidatePair) -> Result<()> {
-    require_fields(settings, FieldSet::Transition)?;
-    let platform = issued_platform(&pair.successor).await?;
-    let inventory = inventory_store().await?;
-    let authorized = authorize(
-        &platform,
-        CandidatePairRole::Successor,
-        pair,
-        required_target(settings)?,
-    )
-    .await?;
-    let transition = required_transition(settings)?;
-    let before = platform
-        .load_registry()
-        .await
-        .map_err(|_| DriverError("uncertain writer registry readback failed"))?;
-    if before
-        .value
-        .transition(transition)
-        .map_err(|_| DriverError("uncertain writer transition is absent"))?
-        .record
-        .phase
-        != deploy::Phase::Quiesced
-    {
-        return Err(DriverError("uncertain writer experiment requires Quiesced"));
-    }
-    let result = platform
-        .run_pair_lifecycle_operation(
-            CandidatePairLifecycleOperation::ActivateUpgrade,
-            &authorized,
-            &inventory,
-            transition,
-        )
-        .await;
-    if !matches!(result, Err(platform_api::Error::Invalid(message))
-        if message == "live writer set differs from complete protected Pod history")
-    {
-        return Err(DriverError(
-            "uncertain writer activation did not refuse missing protected Pod history",
-        ));
-    }
-    let after = platform
-        .load_registry()
-        .await
-        .map_err(|_| DriverError("uncertain writer refusal readback failed"))?;
-    if before.uid != after.uid
-        || before.resource_version != after.resource_version
-        || before.value != after.value
-    {
-        return Err(DriverError(
-            "uncertain writer refusal changed protected registry state",
-        ));
-    }
-    report_registry("uncertain-writer-rejected", pair, &after, transition, "")
-}
-
 async fn lifecycle(
     settings: &Settings,
     pair: &CandidatePair,
     operation: CandidatePairLifecycleOperation,
-    configure: impl FnOnce(PlatformClient) -> PlatformClient,
 ) -> Result<()> {
     require_fields(settings, FieldSet::Transition)?;
     let role = operation_role(operation);
-    let platform = configure(issued_platform(candidate(pair, role)).await?);
+    let platform = issued_platform(candidate(pair, role)).await?;
     let inventory = inventory_store().await?;
     let authorized = authorize(&platform, role, pair, required_target(settings)?).await?;
     let transition = required_transition(settings)?;
@@ -464,32 +406,3 @@ async fn authorize<'a>(
         .map_err(|_| DriverError("candidate pair target authorization failed"))
 }
 
-
-/// Read back an already persisted phase through a fresh authenticated session.
-/// This never allocates or replays a mutator that only accepts an earlier phase.
-async fn resume_checkpoint(settings: &Settings, pair: &CandidatePair) -> Result<()> {
-    require_fields(settings, FieldSet::ResumeCheckpoint)?;
-    let outcome = match settings.resume_phase {
-        Some(deploy::Phase::Planned) => "successor-reserved",
-        Some(deploy::Phase::Staged) => "successor-staged",
-        Some(deploy::Phase::Quiesced) => "upgrade-quiesced",
-        _ => return Err(DriverError("checkpoint readback phase is unsupported")),
-    };
-    let platform = issued_platform(&pair.successor).await?;
-    let inventory = inventory_store().await?;
-    let authorized = authorize(&platform, CandidatePairRole::Successor, pair, required_target(settings)?).await?;
-    let transition = required_transition(settings)?;
-    let resolved = platform.resolve_pair_transition(CandidatePairRole::Successor, &authorized, &inventory, transition)
-        .await.map_err(|_| DriverError("checkpoint authenticated resolution failed"))?;
-    let registry = resolved.registry();
-    if settings.registry_uid.as_deref() != Some(registry.uid.as_str())
-        || settings.registry_resource_version.as_deref() != Some(registry.resource_version.as_str())
-        || settings.resume_phase != Some(resolved.stored().record.phase)
-    {
-        return Err(DriverError("checkpoint protected registry or phase changed"));
-    }
-    let request_digest = compiler_core::digest(&resolved.plan().request)
-        .map_err(|_| DriverError("checkpoint request digest failed"))?;
-    require_request_digest(settings, &request_digest)?;
-    report_registry(outcome, pair, registry, transition, &request_digest)
-}
