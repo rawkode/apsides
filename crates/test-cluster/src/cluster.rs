@@ -21,6 +21,8 @@ use std::{
 
 /// Every cluster the runner creates is named with this prefix, so a leaked
 /// cluster is recognisable and can be removed with `kind delete cluster`.
+///
+/// Other suites choose their own prefix with [`Cluster::with_prefix`].
 pub const NAME_PREFIX: &str = "aps-test-";
 
 const MAX_KUBECONFIG_BYTES: u64 = 1024 * 1024;
@@ -52,6 +54,9 @@ pub struct Toolchain {
 
 /// Check the Docker daemon, kind and the pinned node image before anything is
 /// created, so each missing prerequisite is reported as itself.
+///
+/// # Errors
+/// Names the first prerequisite that is missing.
 pub async fn preflight() -> Result<Toolchain> {
     let docker = Invocation::new("docker")
         .args(["version", "--format", "{{.Server.Version}}"])
@@ -85,6 +90,7 @@ pub async fn preflight() -> Result<Toolchain> {
     })
 }
 
+/// A kind cluster this process owns, deleted when finished or dropped.
 pub struct Cluster {
     name: String,
     directory: tempfile::TempDir,
@@ -95,13 +101,26 @@ pub struct Cluster {
 impl Cluster {
     /// Choose a fresh name and a private directory for the kubeconfig. Nothing
     /// exists in Docker until [`Cluster::create`].
+    ///
+    /// # Errors
+    /// Fails when the private directory cannot be created.
     pub fn new(keep: bool) -> Result<Self> {
+        Self::with_prefix(NAME_PREFIX, keep)
+    }
+
+    /// As [`Cluster::new`], naming the cluster with `prefix`, which must be a
+    /// lowercase DNS label ending in `-`.
+    ///
+    /// # Errors
+    /// Fails when the prefix is invalid or the private directory cannot be
+    /// created.
+    pub fn with_prefix(prefix: &str, keep: bool) -> Result<Self> {
         let directory = tempfile::Builder::new()
             .prefix("aps-test-cluster-")
             .tempdir()?;
         restrict(directory.path())?;
         Ok(Self {
-            name: unique_name()?,
+            name: unique_name(prefix)?,
             directory,
             keep,
             finished: false,
@@ -111,6 +130,9 @@ impl Cluster {
     /// Create the cluster from the pinned node image. The image must already
     /// be local: kind is never allowed to pull it. An existing cluster with
     /// the chosen name is refused rather than reused.
+    ///
+    /// # Errors
+    /// Fails when the name is taken or kind cannot create the cluster.
     pub async fn create(&self) -> Result<()> {
         let existing = Invocation::new("kind")
             .args(["get", "clusters"])
@@ -143,20 +165,26 @@ impl Cluster {
         Ok(())
     }
 
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    #[must_use]
     pub fn context(&self) -> String {
         format!("kind-{}", self.name)
     }
 
     /// The container kind runs the single control-plane node in.
+    #[must_use]
     pub fn node(&self) -> String {
         format!("{}-control-plane", self.name)
     }
 
     /// Every node container of the cluster.
+    ///
+    /// # Errors
+    /// Fails when kind cannot list the cluster's nodes or lists none.
     pub async fn nodes(&self) -> Result<Vec<String>> {
         let listed = Invocation::new("kind")
             .args(["get", "nodes", "--name", &self.name])
@@ -174,6 +202,9 @@ impl Cluster {
         Ok(nodes)
     }
 
+    /// The private directory holding the cluster's kubeconfig; callers may
+    /// keep other private files here for the cluster's lifetime.
+    #[must_use]
     pub fn directory(&self) -> &Path {
         self.directory.path()
     }
@@ -184,23 +215,35 @@ impl Cluster {
 
     /// Copy the admin kubeconfig to `destination`, readable only by the
     /// owner, so a kept cluster can be inspected.
+    ///
+    /// # Errors
+    /// Fails when the kubeconfig cannot be read or `destination` exists.
     pub fn export_kubeconfig(&self, destination: &Path) -> Result<()> {
         let bytes = bounded(&self.admin_kubeconfig())?;
         write_private(destination, &bytes)
     }
 
     /// The admin kubeconfig kind wrote, parsed.
+    ///
+    /// # Errors
+    /// Fails when the kubeconfig is missing, oversized or invalid.
     pub fn kubeconfig(&self) -> Result<Kubeconfig> {
         let bytes = bounded(&self.admin_kubeconfig())?;
         Ok(Kubeconfig::from_yaml(&String::from_utf8_lossy(&bytes))?)
     }
 
     /// A client with the fixture driver's (cluster admin) identity.
+    ///
+    /// # Errors
+    /// Fails when the kubeconfig cannot be read or names no usable context.
     pub async fn admin_client(&self) -> Result<Client> {
         client(self.kubeconfig()?, &self.context()).await
     }
 
     /// The API server URL and CA the admin kubeconfig names.
+    ///
+    /// # Errors
+    /// Fails when the kubeconfig lacks the cluster, its server or an inline CA.
     pub fn endpoint(&self) -> Result<Endpoint> {
         let kubeconfig = self.kubeconfig()?;
         let context = self.context();
@@ -288,6 +331,7 @@ fn kind_config() -> String {
     )
 }
 
+/// Where the API server is and the CA that signs its certificate.
 pub struct Endpoint {
     pub server: String,
     /// Base64 PEM, as it appears in a kubeconfig.
@@ -296,6 +340,7 @@ pub struct Endpoint {
 
 impl Endpoint {
     /// A kubeconfig that authenticates with `token` alone.
+    #[must_use]
     pub fn token_kubeconfig(&self, context: &str, token: &str) -> Value {
         token_kubeconfig(&self.server, &self.authority, context, token, None)
     }
@@ -303,6 +348,7 @@ impl Endpoint {
 
 /// A single-context kubeconfig whose only credential is a bearer token. The
 /// fixture-mode runtime accepts nothing else.
+#[must_use]
 pub fn token_kubeconfig(
     server: &str,
     authority: &str,
@@ -325,6 +371,9 @@ pub fn token_kubeconfig(
 }
 
 /// Build a client from an explicit kubeconfig and context.
+///
+/// # Errors
+/// Fails when the context is absent or the configuration is unusable.
 pub async fn client(kubeconfig: Kubeconfig, context: &str) -> Result<Client> {
     platform::install_rustls_ring_provider()
         .map_err(|error| crate::Error::Infrastructure(error.to_string()))?;
@@ -339,13 +388,13 @@ pub async fn client(kubeconfig: Kubeconfig, context: &str) -> Result<Client> {
 
 /// A name no earlier run can have used: the prefix, this process and the
 /// current time.
-fn unique_name() -> Result<String> {
+fn unique_name(prefix: &str) -> Result<String> {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| crate::Error::Infrastructure(error.to_string()))?
         .as_secs();
-    let name = format!("{NAME_PREFIX}{}-{seconds}", std::process::id());
-    if !valid_name(&name) {
+    let name = format!("{prefix}{}-{seconds}", std::process::id());
+    if !valid_name(&name, prefix) {
         return infrastructure(format!("generated cluster name {name} is invalid"));
     }
     Ok(name)
@@ -353,8 +402,11 @@ fn unique_name() -> Result<String> {
 
 /// Kind names become Docker container names and kubeconfig context names, so
 /// they are held to a lowercase DNS label.
-fn valid_name(name: &str) -> bool {
-    name.starts_with(NAME_PREFIX)
+fn valid_name(name: &str, prefix: &str) -> bool {
+    prefix.ends_with('-')
+        && prefix.len() > 1
+        && name.starts_with(prefix)
+        && name.len() > prefix.len()
         && name.len() <= 50
         && name
             .bytes()
@@ -410,12 +462,19 @@ mod tests {
 
     #[test]
     fn generated_names_are_prefixed_dns_labels() -> Result<()> {
-        let name = unique_name()?;
-        assert!(valid_name(&name), "{name}");
-        assert!(!valid_name("kind"));
-        assert!(!valid_name("aps-test-UPPER"));
-        assert!(!valid_name("aps-test-"));
-        assert!(!valid_name(&format!("{NAME_PREFIX}{}", "9".repeat(60))));
+        let name = unique_name(NAME_PREFIX)?;
+        assert!(valid_name(&name, NAME_PREFIX), "{name}");
+        assert!(!valid_name("kind", NAME_PREFIX));
+        assert!(!valid_name("aps-test-UPPER", NAME_PREFIX));
+        assert!(!valid_name("aps-test-", NAME_PREFIX));
+        assert!(!valid_name(
+            &format!("{NAME_PREFIX}{}", "9".repeat(60)),
+            NAME_PREFIX
+        ));
+        let other = unique_name("aps-acc-")?;
+        assert!(valid_name(&other, "aps-acc-"), "{other}");
+        assert!(!valid_name(&other, NAME_PREFIX));
+        assert!(unique_name("Bad_").is_err());
         Ok(())
     }
 

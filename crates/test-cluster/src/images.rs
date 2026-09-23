@@ -41,6 +41,10 @@ pub struct ArchiveImage {
 
 /// Read the identity of the `platform` image out of an OCI-layout archive
 /// without unpacking it.
+///
+/// # Errors
+/// Rejects archives that are oversized, not OCI layout, hold other than one
+/// image for `platform`, or whose metadata does not match its digests.
 pub fn inspect(path: &Path, platform: &str) -> Result<ArchiveImage> {
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.len() > MAX_ARCHIVE_BYTES {
@@ -111,6 +115,9 @@ fn blob(path: &Path, digest: &str) -> Result<Value> {
 /// `{repository}@{manifest}`; a named one keeps the name the archive gives it.
 /// Either way the caller confirms the reference it will use with
 /// [`require_resolves`].
+///
+/// # Errors
+/// Fails when the archive cannot be read or containerd rejects it.
 pub async fn import(node: &str, archive: &Path, repository: &str, platform: &str) -> Result<()> {
     Invocation::new("docker")
         .args([
@@ -132,6 +139,9 @@ pub async fn import(node: &str, archive: &Path, repository: &str, platform: &str
 }
 
 /// Fail unless the node's CRI resolves `reference` to the image `config`.
+///
+/// # Errors
+/// Fails when the reference is unknown to the node or names another image.
 pub async fn require_resolves(node: &str, reference: &str, config: &str) -> Result<()> {
     let output = Invocation::new("docker")
         .args(["exec", node, "crictl", "inspecti", "-o", "json", reference])
@@ -150,6 +160,9 @@ pub async fn require_resolves(node: &str, reference: &str, config: &str) -> Resu
 
 /// The fully qualified repository containerd records for `reference`, which
 /// may be a short Docker Hub name, carry a tag, or carry a digest.
+///
+/// # Errors
+/// Rejects an empty reference or one containing whitespace.
 pub fn repository(reference: &str) -> Result<String> {
     let name = reference.split('@').next().unwrap_or_default();
     let (prefix, last) = name
@@ -171,6 +184,9 @@ pub fn repository(reference: &str) -> Result<String> {
 
 /// A `docker image save` archive of a locally cached image, written into
 /// `directory`. The image must already be present: nothing is pulled.
+///
+/// # Errors
+/// Fails when the image is not local or Docker cannot save it.
 pub async fn save(reference: &str, directory: &Path, file: &str) -> Result<std::path::PathBuf> {
     let present = Invocation::new("docker")
         .args(["image", "inspect", "--format", "{{.Id}}", reference])
