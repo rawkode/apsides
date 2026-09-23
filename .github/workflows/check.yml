@@ -30,60 +30,48 @@ jobs:
         shell: bash
         run: |
           curl --fail --silent --show-error --location \
-            https://github.com/cuenv/cuenv/releases/download/0.55.0/cuenv-linux-x64 \
+            https://github.com/cuenv/cuenv/releases/download/0.56.1/cuenv-linux-x64 \
             --output "$RUNNER_TEMP/cuenv"
-          echo '8a80ea159e4da110be292e2bb1d17ef110ee9036fa28e969d07065e652086164  '"$RUNNER_TEMP/cuenv" | sha256sum --check
+          echo 'afb1d712a2a405f25804b60c30c418144c195dc157f70bb9aa5b73c95dd461bf  '"$RUNNER_TEMP/cuenv" | sha256sum --check
           chmod +x "$RUNNER_TEMP/cuenv"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-      # cuenv's fixed 10 second evaluation limit also covers downloading the
-      # cuenv schema module into an empty cache. Fetch it first with the cue
-      # CLI, which has no such limit.
-      - name: Fetch CUE module dependencies
-        shell: bash
-        run: |
-          curl --fail --silent --show-error --location \
-            https://github.com/cue-lang/cue/releases/download/v0.17.1/cue_v0.17.1_linux_amd64.tar.gz \
-            --output "$RUNNER_TEMP/cue.tar.gz"
-          echo 'a39b0c97695069d95d276d99be0f5dbabb081d801bfdc9ba49b76efaf94e2369  '"$RUNNER_TEMP/cue.tar.gz" | sha256sum --check
-          tar -xzf "$RUNNER_TEMP/cue.tar.gz" -C "$RUNNER_TEMP" cue
-          "$RUNNER_TEMP/cue" mod tidy --check
       - name: Prepare Rust toolchain
         run: |
           rustup toolchain install
           rustup show active-toolchain
       - name: Build CLI
-        run: bash .github/cuenv-task.sh build
+        run: cuenv task build
       - name: Check authoring types and tests
         run: |
-          bash .github/cuenv-task.sh authorCheck
-          bash .github/cuenv-task.sh authorTest
-          bash .github/cuenv-task.sh authorCompilerTest
-          bash .github/cuenv-task.sh authorCompilerCheck
+          cuenv task authorCheck
+          cuenv task authorTest
+          cuenv task authorCompilerTest
+          cuenv task authorCompilerCheck
       - name: Check CNPG editor completion
-        run: bash .github/cuenv-task.sh authoringEditorCheck
+        run: cuenv task authoringEditorCheck
       - name: Run Rust tests
         run: |
-          bash .github/cuenv-task.sh registryTest
-          bash .github/cuenv-task.sh runtimeTest
-          bash .github/cuenv-task.sh releaseTest
-          bash .github/cuenv-task.sh coordinationTest
-          bash .github/cuenv-task.sh inventoryTest
-          bash .github/cuenv-task.sh compilerCoreTest
-          bash .github/cuenv-task.sh testClusterTest
+          cuenv task registryTest
+          cuenv task runtimeTest
+          cuenv task releaseTest
+          cuenv task coordinationTest
+          cuenv task inventoryTest
+          cuenv task compilerCoreTest
+          cuenv task testClusterTest
       - name: Run Rust lints
         run: |
-          bash .github/cuenv-task.sh registryCheck
-          bash .github/cuenv-task.sh runtimeCheck
-          bash .github/cuenv-task.sh releaseCheck
-          bash .github/cuenv-task.sh coordinationCheck
-          bash .github/cuenv-task.sh inventoryCheck
-          bash .github/cuenv-task.sh compilerCoreCheck
-          bash .github/cuenv-task.sh testClusterCheck
-          bash .github/cuenv-task.sh acceptanceCheck
+          cuenv task registryCheck
+          cuenv task runtimeCheck
+          cuenv task releaseCheck
+          cuenv task coordinationCheck
+          cuenv task inventoryCheck
+          cuenv task compilerCoreCheck
+          cuenv task testClusterCheck
+          cuenv task acceptanceCheck
       - name: Run packaging script tests
-        run: bash .github/cuenv-task.sh packagingTest
+        run: cuenv task packagingTest
       - name: Build documentation
-        run: bash .github/cuenv-task.sh docsBuild
+        run: cuenv task docsBuild
   reactor:
     # Builds the web-application fixture release with `aps build` and runs
     # every generated reactor case on a disposable kind cluster.
@@ -100,23 +88,11 @@ jobs:
         shell: bash
         run: |
           curl --fail --silent --show-error --location \
-            https://github.com/cuenv/cuenv/releases/download/0.55.0/cuenv-linux-x64 \
+            https://github.com/cuenv/cuenv/releases/download/0.56.1/cuenv-linux-x64 \
             --output "$RUNNER_TEMP/cuenv"
-          echo '8a80ea159e4da110be292e2bb1d17ef110ee9036fa28e969d07065e652086164  '"$RUNNER_TEMP/cuenv" | sha256sum --check
+          echo 'afb1d712a2a405f25804b60c30c418144c195dc157f70bb9aa5b73c95dd461bf  '"$RUNNER_TEMP/cuenv" | sha256sum --check
           chmod +x "$RUNNER_TEMP/cuenv"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-      # cuenv's fixed 10 second evaluation limit also covers downloading the
-      # cuenv schema module into an empty cache. Fetch it first with the cue
-      # CLI, which has no such limit.
-      - name: Fetch CUE module dependencies
-        shell: bash
-        run: |
-          curl --fail --silent --show-error --location \
-            https://github.com/cue-lang/cue/releases/download/v0.17.1/cue_v0.17.1_linux_amd64.tar.gz \
-            --output "$RUNNER_TEMP/cue.tar.gz"
-          echo 'a39b0c97695069d95d276d99be0f5dbabb081d801bfdc9ba49b76efaf94e2369  '"$RUNNER_TEMP/cue.tar.gz" | sha256sum --check
-          tar -xzf "$RUNNER_TEMP/cue.tar.gz" -C "$RUNNER_TEMP" cue
-          "$RUNNER_TEMP/cue" mod tidy --check
       - name: Prepare Rust toolchain
         run: |
           rustup toolchain install
@@ -145,7 +121,7 @@ jobs:
             docker pull --quiet "$image"
           done
       - name: Run reactor cases on a kind cluster
-        run: bash .github/cuenv-task.sh reactorClusterTest
+        run: cuenv task reactorClusterTest
       # Results, JUnit, controller logs and object diagnostics only; the
       # cluster's kubeconfig lives in a private temporary directory.
       - name: Upload reactor results
@@ -172,23 +148,11 @@ jobs:
         shell: bash
         run: |
           curl --fail --silent --show-error --location \
-            https://github.com/cuenv/cuenv/releases/download/0.55.0/cuenv-linux-x64 \
+            https://github.com/cuenv/cuenv/releases/download/0.56.1/cuenv-linux-x64 \
             --output "$RUNNER_TEMP/cuenv"
-          echo '8a80ea159e4da110be292e2bb1d17ef110ee9036fa28e969d07065e652086164  '"$RUNNER_TEMP/cuenv" | sha256sum --check
+          echo 'afb1d712a2a405f25804b60c30c418144c195dc157f70bb9aa5b73c95dd461bf  '"$RUNNER_TEMP/cuenv" | sha256sum --check
           chmod +x "$RUNNER_TEMP/cuenv"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-      # cuenv's fixed 10 second evaluation limit also covers downloading the
-      # cuenv schema module into an empty cache. Fetch it first with the cue
-      # CLI, which has no such limit.
-      - name: Fetch CUE module dependencies
-        shell: bash
-        run: |
-          curl --fail --silent --show-error --location \
-            https://github.com/cue-lang/cue/releases/download/v0.17.1/cue_v0.17.1_linux_amd64.tar.gz \
-            --output "$RUNNER_TEMP/cue.tar.gz"
-          echo 'a39b0c97695069d95d276d99be0f5dbabb081d801bfdc9ba49b76efaf94e2369  '"$RUNNER_TEMP/cue.tar.gz" | sha256sum --check
-          tar -xzf "$RUNNER_TEMP/cue.tar.gz" -C "$RUNNER_TEMP" cue
-          "$RUNNER_TEMP/cue" mod tidy --check
       - name: Prepare Rust toolchain
         run: |
           rustup toolchain install
@@ -206,7 +170,7 @@ jobs:
             docker pull --quiet "$image"
           done
       - name: Build and sign the releases
-        run: bash .github/cuenv-task.sh acceptancePrepare
+        run: cuenv task acceptancePrepare
       # Only what the scenarios read: inputs.json names these paths, and a tar
       # keeps the executable bit an artifact upload would drop. No private
       # key is left: prepare deletes it once the releases are signed.
@@ -246,23 +210,11 @@ jobs:
         shell: bash
         run: |
           curl --fail --silent --show-error --location \
-            https://github.com/cuenv/cuenv/releases/download/0.55.0/cuenv-linux-x64 \
+            https://github.com/cuenv/cuenv/releases/download/0.56.1/cuenv-linux-x64 \
             --output "$RUNNER_TEMP/cuenv"
-          echo '8a80ea159e4da110be292e2bb1d17ef110ee9036fa28e969d07065e652086164  '"$RUNNER_TEMP/cuenv" | sha256sum --check
+          echo 'afb1d712a2a405f25804b60c30c418144c195dc157f70bb9aa5b73c95dd461bf  '"$RUNNER_TEMP/cuenv" | sha256sum --check
           chmod +x "$RUNNER_TEMP/cuenv"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-      # cuenv's fixed 10 second evaluation limit also covers downloading the
-      # cuenv schema module into an empty cache. Fetch it first with the cue
-      # CLI, which has no such limit.
-      - name: Fetch CUE module dependencies
-        shell: bash
-        run: |
-          curl --fail --silent --show-error --location \
-            https://github.com/cue-lang/cue/releases/download/v0.17.1/cue_v0.17.1_linux_amd64.tar.gz \
-            --output "$RUNNER_TEMP/cue.tar.gz"
-          echo 'a39b0c97695069d95d276d99be0f5dbabb081d801bfdc9ba49b76efaf94e2369  '"$RUNNER_TEMP/cue.tar.gz" | sha256sum --check
-          tar -xzf "$RUNNER_TEMP/cue.tar.gz" -C "$RUNNER_TEMP" cue
-          "$RUNNER_TEMP/cue" mod tidy --check
       - name: Prepare Rust toolchain
         run: |
           rustup toolchain install
@@ -289,7 +241,7 @@ jobs:
       - name: Unpack the prepared inputs
         run: tar -xf "$RUNNER_TEMP/acceptance-inputs.tar"
       - name: Run the acceptance scenarios on kind
-        run: bash .github/cuenv-task.sh acceptance${{ matrix.scenarios }}Test
+        run: cuenv task acceptance${{ matrix.scenarios }}Test
       # Scenarios delete their clusters; this removes any a cancelled run
       # left behind.
       - name: Delete leftover acceptance clusters
