@@ -35,6 +35,18 @@ jobs:
           echo '8a80ea159e4da110be292e2bb1d17ef110ee9036fa28e969d07065e652086164  '"$RUNNER_TEMP/cuenv" | sha256sum --check
           chmod +x "$RUNNER_TEMP/cuenv"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      # cuenv's fixed 10 second evaluation limit also covers downloading the
+      # cuenv schema module into an empty cache. Fetch it first with the cue
+      # CLI, which has no such limit.
+      - name: Fetch CUE module dependencies
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --location \
+            https://github.com/cue-lang/cue/releases/download/v0.17.1/cue_v0.17.1_linux_amd64.tar.gz \
+            --output "$RUNNER_TEMP/cue.tar.gz"
+          echo 'a39b0c97695069d95d276d99be0f5dbabb081d801bfdc9ba49b76efaf94e2369  '"$RUNNER_TEMP/cue.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/cue.tar.gz" -C "$RUNNER_TEMP" cue
+          "$RUNNER_TEMP/cue" mod tidy --check
       - name: Prepare Rust toolchain
         run: |
           rustup toolchain install
@@ -98,6 +110,18 @@ jobs:
           echo '8a80ea159e4da110be292e2bb1d17ef110ee9036fa28e969d07065e652086164  '"$RUNNER_TEMP/cuenv" | sha256sum --check
           chmod +x "$RUNNER_TEMP/cuenv"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      # cuenv's fixed 10 second evaluation limit also covers downloading the
+      # cuenv schema module into an empty cache. Fetch it first with the cue
+      # CLI, which has no such limit.
+      - name: Fetch CUE module dependencies
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --location \
+            https://github.com/cue-lang/cue/releases/download/v0.17.1/cue_v0.17.1_linux_amd64.tar.gz \
+            --output "$RUNNER_TEMP/cue.tar.gz"
+          echo 'a39b0c97695069d95d276d99be0f5dbabb081d801bfdc9ba49b76efaf94e2369  '"$RUNNER_TEMP/cue.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/cue.tar.gz" -C "$RUNNER_TEMP" cue
+          "$RUNNER_TEMP/cue" mod tidy --check
       - name: Prepare Rust toolchain
         run: |
           rustup toolchain install
