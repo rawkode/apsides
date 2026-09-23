@@ -29,56 +29,48 @@ jobs:
           echo '8a80ea159e4da110be292e2bb1d17ef110ee9036fa28e969d07065e652086164  '"$RUNNER_TEMP/cuenv" | sha256sum --check
           chmod +x "$RUNNER_TEMP/cuenv"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-      # cuenv's first, uncached evaluation of env.cue can exceed its fixed 10 s
-      # limit on a 2-vCPU runner; later evaluations read the cache. Warm it
-      # with a bounded retry before the first task.
-      - name: Warm cuenv evaluation cache
-        shell: bash
-        run: |
-          for attempt in 1 2 3; do cuenv task >/dev/null && exit 0; echo "cuenv evaluation attempt $attempt timed out" >&2; done
-          exit 1
       - name: Prepare Rust toolchain
         run: |
           rustup toolchain install
           rustup show active-toolchain
       - name: Build CLI
-        run: cuenv task build
+        run: bash .github/cuenv-task.sh build
       - name: Check authoring types and tests
         run: |
-          cuenv task authorCheck
-          cuenv task authorTest
-          cuenv task authorCompilerTest
-          cuenv task authorCompilerCheck
+          bash .github/cuenv-task.sh authorCheck
+          bash .github/cuenv-task.sh authorTest
+          bash .github/cuenv-task.sh authorCompilerTest
+          bash .github/cuenv-task.sh authorCompilerCheck
       - name: Check CNPG editor completion
-        run: cuenv task authoringEditorCheck
+        run: bash .github/cuenv-task.sh authoringEditorCheck
       - name: Run Rust tests
         run: |
-          cuenv task registryTest
-          cuenv task runtimeTest
-          cuenv task releaseTest
-          cuenv task coordinationTest
-          cuenv task inventoryTest
-          cuenv task compilerCoreTest
-          cuenv task testClusterTest
+          bash .github/cuenv-task.sh registryTest
+          bash .github/cuenv-task.sh runtimeTest
+          bash .github/cuenv-task.sh releaseTest
+          bash .github/cuenv-task.sh coordinationTest
+          bash .github/cuenv-task.sh inventoryTest
+          bash .github/cuenv-task.sh compilerCoreTest
+          bash .github/cuenv-task.sh testClusterTest
       - name: Run Rust lints
         run: |
-          cuenv task registryCheck
-          cuenv task runtimeCheck
-          cuenv task releaseCheck
-          cuenv task coordinationCheck
-          cuenv task inventoryCheck
-          cuenv task compilerCoreCheck
-          cuenv task testClusterCheck
+          bash .github/cuenv-task.sh registryCheck
+          bash .github/cuenv-task.sh runtimeCheck
+          bash .github/cuenv-task.sh releaseCheck
+          bash .github/cuenv-task.sh coordinationCheck
+          bash .github/cuenv-task.sh inventoryCheck
+          bash .github/cuenv-task.sh compilerCoreCheck
+          bash .github/cuenv-task.sh testClusterCheck
       - name: Run qualification harness unit tests
         run: |
-          cuenv task cnpgDemoTest
-          cuenv task cnpgCliDemoTest
-          cuenv task cnpgCleanupTest
-          cuenv task apiGapProbesTest
-          cuenv task performanceTest
-          cuenv task packagingTest
+          bash .github/cuenv-task.sh cnpgDemoTest
+          bash .github/cuenv-task.sh cnpgCliDemoTest
+          bash .github/cuenv-task.sh cnpgCleanupTest
+          bash .github/cuenv-task.sh apiGapProbesTest
+          bash .github/cuenv-task.sh performanceTest
+          bash .github/cuenv-task.sh packagingTest
       - name: Build documentation
-        run: cuenv task docsBuild
+        run: bash .github/cuenv-task.sh docsBuild
   reactor:
     # Builds the web-application fixture release with `aps build` and runs
     # every generated reactor case on a disposable kind cluster.
@@ -100,14 +92,6 @@ jobs:
           echo '8a80ea159e4da110be292e2bb1d17ef110ee9036fa28e969d07065e652086164  '"$RUNNER_TEMP/cuenv" | sha256sum --check
           chmod +x "$RUNNER_TEMP/cuenv"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-      # cuenv's first, uncached evaluation of env.cue can exceed its fixed 10 s
-      # limit on a 2-vCPU runner; later evaluations read the cache. Warm it
-      # with a bounded retry before the first task.
-      - name: Warm cuenv evaluation cache
-        shell: bash
-        run: |
-          for attempt in 1 2 3; do cuenv task >/dev/null && exit 0; echo "cuenv evaluation attempt $attempt timed out" >&2; done
-          exit 1
       - name: Prepare Rust toolchain
         run: |
           rustup toolchain install
@@ -136,7 +120,7 @@ jobs:
             docker pull --quiet "$image"
           done
       - name: Run reactor cases on a kind cluster
-        run: cuenv task reactorClusterTest
+        run: bash .github/cuenv-task.sh reactorClusterTest
       # Results, JUnit, controller logs and object diagnostics only; the
       # cluster's kubeconfig lives in a private temporary directory.
       - name: Upload reactor results
