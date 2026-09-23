@@ -29,6 +29,14 @@ jobs:
           echo '8a80ea159e4da110be292e2bb1d17ef110ee9036fa28e969d07065e652086164  '"$RUNNER_TEMP/cuenv" | sha256sum --check
           chmod +x "$RUNNER_TEMP/cuenv"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      # cuenv's first, uncached evaluation of env.cue can exceed its fixed 10 s
+      # limit on a 2-vCPU runner; later evaluations read the cache. Warm it
+      # with a bounded retry before the first task.
+      - name: Warm cuenv evaluation cache
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do cuenv task >/dev/null && exit 0; echo "cuenv evaluation attempt $attempt timed out" >&2; done
+          exit 1
       - name: Prepare Rust toolchain
         run: |
           rustup toolchain install
@@ -71,3 +79,71 @@ jobs:
           cuenv task packagingTest
       - name: Build documentation
         run: cuenv task docsBuild
+  reactor:
+    # Builds the web-application fixture release with `aps build` and runs
+    # every generated reactor case on a disposable kind cluster.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: v2.9.5
+      - name: Install cuenv
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --location \
+            https://github.com/cuenv/cuenv/releases/download/0.55.0/cuenv-linux-x64 \
+            --output "$RUNNER_TEMP/cuenv"
+          echo '8a80ea159e4da110be292e2bb1d17ef110ee9036fa28e969d07065e652086164  '"$RUNNER_TEMP/cuenv" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/cuenv"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      # cuenv's first, uncached evaluation of env.cue can exceed its fixed 10 s
+      # limit on a 2-vCPU runner; later evaluations read the cache. Warm it
+      # with a bounded retry before the first task.
+      - name: Warm cuenv evaluation cache
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do cuenv task >/dev/null && exit 0; echo "cuenv evaluation attempt $attempt timed out" >&2; done
+          exit 1
+      - name: Prepare Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+      - name: Install cargo-cyclonedx
+        run: cargo install --locked --version 0.5.9 cargo-cyclonedx
+      - name: Install kind
+        shell: bash
+        run: |
+          curl --fail --silent --show-error --location \
+            https://github.com/kubernetes-sigs/kind/releases/download/v0.31.0/kind-linux-amd64 \
+            --output "$RUNNER_TEMP/kind"
+          echo 'eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa  '"$RUNNER_TEMP/kind" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/kind"
+      # `aps build` and `aps test --cluster` never pull: the builder, runtime
+      # base, fixture base, kind node and proxy images must already be local.
+      - name: Pull pinned images
+        run: |
+          for image in \
+            rust@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 \
+            "$(cat scripts/runtime-base/reference)" \
+            bash:5.2.37@sha256:3bee76a96d86d5d2d5efc7c1c570e5a7c95db22348a26944e0e546fa174e3324 \
+            kindest/node:v1.34.3@sha256:08497ee19eace7b4b5348db5c6a1591d7752b164530a36f855cb0f2bdcbadd48 \
+            nginxinc/nginx-unprivileged:alpine@sha256:d9083fe47768377ef55dedafd67d4da7c2f2bc2bece7554954f29359deb0dce9
+          do
+            docker pull --quiet "$image"
+          done
+      - name: Run reactor cases on a kind cluster
+        run: cuenv task reactorClusterTest
+      # Results, JUnit, controller logs and object diagnostics only; the
+      # cluster's kubeconfig lives in a private temporary directory.
+      - name: Upload reactor results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reactor-results
+          path: work/reactor/results
+          if-no-files-found: ignore
+          retention-days: 7
