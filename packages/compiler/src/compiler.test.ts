@@ -24,13 +24,23 @@ export default () => {
 };
 `;
 
-const fixture = async (source: string, lockDigest = digest(source)): Promise<{sourcePath:string;output:string}> => {
+type Dependency = {path:string;source:string;declared:boolean};
+const plain = (message: string): string => message.replaceAll(/\x1b\[[0-9;]*m/g, "");
+const rejectsWith = (operation: Promise<unknown>, diagnostic: RegExp, label: string, forbidden?: RegExp): Promise<void> => assert.rejects(operation, (error: unknown) => {
+  assert.ok(error instanceof Error, `${label} must reject with an Error`);
+  assert.match(plain(error.message), diagnostic, `${label} must be rejected with its diagnostic`);
+  if (forbidden) assert.doesNotMatch(plain(error.message), forbidden, `${label} diagnostic must not match ${forbidden}`);
+  return true;
+});
+const fixture = async (source: string, lockDigest = digest(source), dependencies: readonly Dependency[] = []): Promise<{sourcePath:string;output:string}> => {
   const id = sequence++;
   const directory = join(root, `case-${id}`);
   await import("node:fs/promises").then(fs => fs.mkdir(directory));
   const sourcePath = join(directory, "source.tsx");
   await writeFile(sourcePath, source);
-  const lock = { entry: "source.tsx", inputs: [{path:"source.tsx",sha256:lockDigest}], schemaVersion: "apsides.dev/source-lock/v1" };
+  for (const dependency of dependencies) await writeFile(join(directory, dependency.path), dependency.source);
+  const inputs = [{path:"source.tsx",sha256:lockDigest}, ...dependencies.filter(dependency => dependency.declared).map(dependency => ({path:dependency.path,sha256:digest(dependency.source)}))].sort((left, right) => left.path < right.path ? -1 : 1);
+  const lock = { entry: "source.tsx", inputs, schemaVersion: "apsides.dev/source-lock/v1" };
   await writeFile(join(directory, "apsides.lock.json"), `${JSON.stringify(lock,null,2)}\n`);
   return {sourcePath,output:join(directory,"out")};
 };
@@ -124,25 +134,41 @@ try {
   assert.notEqual(overlay.productionIrSha256, overlay.fixtureIrSha256);
 
   const badLock = await fixture(valid, "0".repeat(64));
-  await assert.rejects(compileApsides(badLock.sourcePath,badLock.output), /lock digest mismatch/);
+  await rejectsWith(compileApsides(badLock.sourcePath,badLock.output), /lock digest mismatch/, "lock digest mismatch");
   const typeError = await fixture(valid.replace("const Workload = () => {", "const Workload = () => {\n  const broken: string = 1;"));
-  await assert.rejects(compileApsides(typeError.sourcePath,typeError.output), /deno failed/);
-  for (const [_name, needle, replacement] of [
-    ["clock", "return <Controller", "Date.now(); return <Controller"],
-    ["random", "return <Controller", "Math.random(); return <Controller"],
-    ["Deno ambient authority", "return <Controller", "Deno.env.get('HOME'); return <Controller"],
-    ["dynamic module loading", "return <Controller", "await import('./other.ts'); return <Controller"],
-    ["WebAssembly", "return <Controller", "await WebAssembly.compile(new Uint8Array()); return <Controller"],
-    ["CompressionStream", "return <Controller", "new CompressionStream('gzip'); return <Controller"],
-    ["ReadableStream", "return <Controller", "new ReadableStream(); return <Controller"],
-    ["constructor escape", "return <Controller", "({}).constructor.constructor('return globalThis')(); return <Controller"],
-    ["prototype mutation", "return <Controller", "Array.prototype.push = () => 0; return <Controller"],
+  await rejectsWith(compileApsides(typeError.sourcePath,typeError.output), /TS2322 \[ERROR\]: Type 'number' is not assignable to type 'string'\.[\s\S]*source\.tsx:3:\d+/, "type error");
+  // Spec section 28: undeclared evaluation input is rejected with a
+  // source-related diagnostic. Evaluation-time denials name the capability
+  // and fail inside the program's default export (source_default).
+  const program = String.raw`at source_default \(`;
+  const evaluation = (message: string): RegExp => new RegExp(String.raw`error: Uncaught \(in promise\) TypeError: ${message}\n(?:\s+at [^\n]*\n)*?\s+${program}`);
+  for (const [name, needle, replacement, diagnostic] of [
+    ["clock", "return <Controller", "Date.now(); return <Controller", evaluation(String.raw`secure mode Calling %SharedDate%\.now\(\) throws`)],
+    ["random", "return <Controller", "Math.random(); return <Controller", evaluation(String.raw`secure mode %SharedMath%\.random\(\) throws`)],
+    ["Deno ambient authority", "return <Controller", "Deno.env.get('HOME'); return <Controller", evaluation(String.raw`Cannot read properties of undefined \(reading 'env'\)`)],
+    ["filesystem read", "return <Controller", "await Deno.readTextFile('/etc/hosts'); return <Controller", evaluation(String.raw`Cannot read properties of undefined \(reading 'readTextFile'\)`)],
+    ["network access", "return <Controller", "await fetch('https://example.invalid/'); return <Controller", evaluation(String.raw`fetch is not a function`)],
+    ["network socket", "return <Controller", "await Deno.connect({hostname:'127.0.0.1',port:9}); return <Controller", evaluation(String.raw`Cannot read properties of undefined \(reading 'connect'\)`)],
+    ["dynamic module loading", "return <Controller", "await import('./other.ts'); return <Controller", /\[plugin apsides-locked-source-closure\]\nError: runtime imports are not declared build inputs/],
+    ["WebAssembly", "return <Controller", "await WebAssembly.compile(new Uint8Array()); return <Controller", evaluation(String.raw`Cannot read properties of undefined \(reading 'compile'\)`)],
+    ["CompressionStream", "return <Controller", "new CompressionStream('gzip'); return <Controller", evaluation(String.raw`CompressionStream is not a constructor`)],
+    ["ReadableStream", "return <Controller", "new ReadableStream(); return <Controller", evaluation(String.raw`ReadableStream is not a constructor`)],
+    ["constructor escape", "return <Controller", "({}).constructor.constructor('return globalThis')(); return <Controller", evaluation(String.raw`Function\.prototype\.constructor is not a valid constructor\.`)],
+    ["prototype mutation", "return <Controller", "Array.prototype.push = () => 0; return <Controller", evaluation(String.raw`Cannot assign to read only property 'push' of 'root\.%ArrayPrototype%\.push'`)],
   ] as const) {
     const source = valid.replace("export default (", replacement.includes("await") ? "export default async (" : "export default (").replace(needle,replacement);
     const item = await fixture(source);
-    await assert.rejects(compileApsides(item.sourcePath,item.output));
+    await rejectsWith(compileApsides(item.sourcePath,item.output), diagnostic, name);
   }
+  const dependency = {path:"dependency.ts",source:'export const declared = "present";\n'};
+  const importsDependency = `import { declared } from "./dependency.ts";\nif (declared !== "present") throw new Error("dependency differs");\n${valid}`;
+  const declared = await fixture(importsDependency, digest(importsDependency), [{...dependency,declared:true}]);
+  await compileApsides(declared.sourcePath,declared.output);
+  const undeclared = await fixture(importsDependency, digest(importsDependency), [{...dependency,declared:false}]);
+  // The diagnostic names the missing module and the importing source line,
+  // and the build stops at typecheck, before evaluation.
+  await rejectsWith(compileApsides(undeclared.sourcePath,undeclared.output), /TS2307 \[ERROR\]: Cannot find module '[^'\n]*\/dependency\.ts'\.\n\s+at [^\n]*\/source\.tsx:1:\d+/, "undeclared import", /error: Uncaught/);
   const tamed = await fixture(valid.replace("return <Controller", "if ('b'.localeCompare('a') <= 0 || new Error().stack !== '') throw new Error('unsafe SES taming'); return <Controller"));
   await compileApsides(tamed.sourcePath,tamed.output);
-  console.log("Apsides source build passed: locked snapshots, Deno typecheck and denied capabilities, two-build/two-evaluation equality, source maps, generated fixtures, preservation diff, and scenario coverage.");
+  console.log("Apsides source build passed: locked snapshots, Deno typecheck, declared-input closure and denied capabilities with their diagnostics, two-build/two-evaluation equality, source maps, generated fixtures, preservation diff, and scenario coverage.");
 } finally { await rm(root,{recursive:true,force:true}); }

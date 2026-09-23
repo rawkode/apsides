@@ -46,8 +46,6 @@ tasks: {
 	permissionUpgradeStep: {command: "cargo", args: ["test", "--locked", "-p", "platform", "--features", "test-support", "--test", "permission_upgrade", "permission_upgrade_step", "--", "--ignored", "--exact", "--nocapture"]}
 	releaseCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "release", "--all-targets", "--", "-D", "warnings"]}
 	reproducibilityTest: {command: "python3", args: ["-m", "unittest", "tests/test_reproducibility.py"]}
-	inputIsolationTest: {command: "python3", args: ["tests/test_input_isolation.py"]}
-	inputIsolationProbeTest: {command: "deno", args: ["test", "--allow-all", "tests/isolation_probe.test.mts"]}
 	coordinationTest: {command: "cargo", args: ["test", "--locked", "-p", "coordination"]}
 	inventoryTest: {command: "cargo", args: ["test", "--locked", "-p", "inventory"]}
 	compilerCoreTest: {command: "cargo", args: ["test", "--locked", "-p", "compiler-core"]}
