@@ -308,3 +308,35 @@ pub async fn writers_healthy(
     .await?;
     Ok(json!({"writers": writers, "cnpgClusterUid": cluster["metadata"]["uid"]}))
 }
+
+/// No Secret value, rollout key or token the scenario knows appears in `aps`
+/// output, the controllers' logs collected so far or the inventory database
+/// files; recorded as `check`.
+pub async fn nothing_leaks(scenario: &mut Scenario<'_>, check: &str) -> Result {
+    scenario.secret_canaries().await?;
+    let mut stores = Vec::new();
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut path = scenario.database.clone().into_os_string();
+        path.push(suffix);
+        if let Ok(bytes) = std::fs::read(&path) {
+            stores.push((format!("inventory.db{suffix}"), bytes));
+        }
+    }
+    ensure(!stores.is_empty(), "the inventory database was not written")?;
+    let leaks = scenario.recorder.leaks(&stores);
+    let (searched, too_short) = scenario.recorder.canary_counts();
+    ensure(
+        leaks.is_empty(),
+        format!("a Secret value, rollout key or token appears in {leaks:?}"),
+    )?;
+    scenario.recorder.check(
+        check,
+        &json!({
+            "canariesSearched": searched,
+            "canariesTooShort": too_short,
+            "inventoryFiles": stores.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            "occurrences": 0,
+        }),
+    );
+    Ok(())
+}

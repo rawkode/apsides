@@ -35,7 +35,7 @@ pub const VERIFIER: &str = "/usr/bin/ssh-keygen";
 const SIGNATURE_NAMESPACE: &str = "apsides.provenance.v1";
 /// The repository of the controller images the releases record.
 const IMAGE_REPOSITORY: &str = "localhost/apsides/cnpg-controller";
-const BUILD_TIMEOUT: Duration = Duration::from_mins(45);
+pub(crate) const BUILD_TIMEOUT: Duration = Duration::from_mins(45);
 /// Every program the scenarios deploy, by the directory prepare writes its
 /// release to, in the order `inputs.json` names them.
 const RELEASES: [(&str, &str); 4] = [
@@ -167,7 +167,16 @@ struct Build<'a> {
 }
 
 /// The build profile, written from the repository's pins; never committed.
-fn write_profile(root: &Path, output: &Path, sbom_tool: &Path, platform: &str) -> Result<PathBuf> {
+///
+/// # Errors
+/// Fails when the runtime base is not pinned or a file cannot be read or
+/// written.
+pub fn write_profile(
+    root: &Path,
+    output: &Path,
+    sbom_tool: &Path,
+    platform: &str,
+) -> Result<PathBuf> {
     let runtime = std::fs::read_to_string(root.join("scripts/runtime-base/reference"))?
         .trim()
         .to_owned();
@@ -319,14 +328,22 @@ pub fn host_platform() -> Result<String> {
     }
 }
 
-fn absolute(path: &Path) -> Result<PathBuf> {
+/// The first `program` on `PATH`.
+#[must_use]
+pub fn on_path(program: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|directory| directory.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+pub(crate) fn absolute(path: &Path) -> Result<PathBuf> {
     path.canonicalize()
         .map_err(|error| Error::Input(format!("{}: {error}", path.display())))
 }
 
 /// Variables `aps build` needs beyond the inherited allowlist: where Cargo,
 /// rustup and Deno keep their caches.
-trait BuildEnvironment {
+pub(crate) trait BuildEnvironment {
     fn envs_for_build(self) -> Self;
 }
 

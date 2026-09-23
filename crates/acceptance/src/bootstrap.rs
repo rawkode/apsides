@@ -23,12 +23,16 @@ use crate::{
     pair::Candidate,
 };
 use compiler_core::{DeletionPolicy, Domain};
+use coordination::ReviewIdentity;
 use k8s_openapi::api::{
     authentication::v1::{TokenRequest, TokenRequestSpec},
     core::v1::ServiceAccount,
 };
 use kube::{Api, api::PostParams};
-use platform::{DEPLOYMENT_IDENTITY_SCHEMA_V2, DeploymentIdentity, PlatformClient, PolicyState};
+use platform::{
+    DEPLOYMENT_IDENTITY_SCHEMA_V2, DeploymentIdentity, DeploymentPreviewApproval,
+    DeploymentPreviewProfile, PlatformClient, PolicyState,
+};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -59,6 +63,8 @@ pub struct Platform {
     control: String,
     /// Each domain's policy `ConfigMap`, as last written.
     policies: BTreeMap<String, Value>,
+    /// Each domain's deployment identity `ConfigMap`, as last written.
+    identities: BTreeMap<String, Value>,
     /// Each domain's 32-byte rollout key, for the secret-canary scan.
     pub rollout_keys: Vec<Vec<u8>>,
 }
@@ -107,8 +113,11 @@ pub async fn bootstrap(objects: &Objects, settings: &Settings<'_>) -> Result<Pla
     }
     let admin = registry(objects, settings, scope).await?;
     let accounts = accounts(objects, control).await?;
+    let mut identities = BTreeMap::new();
     for domain in settings.policies.keys() {
-        rollout_keys.push(identity(objects, scope, domain, &accounts).await?);
+        let (written, rollout_key) = identity(objects, scope, domain, &accounts).await?;
+        identities.insert(domain.clone(), written);
+        rollout_keys.push(rollout_key);
     }
     permissions(objects, settings, scope).await?;
     Ok(Platform {
@@ -116,6 +125,7 @@ pub async fn bootstrap(objects: &Objects, settings: &Settings<'_>) -> Result<Pla
         admin,
         control: control.to_owned(),
         policies,
+        identities,
         rollout_keys,
     })
 }
@@ -276,13 +286,14 @@ async fn accounts(objects: &Objects, control: &str) -> Result<Accounts> {
     })
 }
 
-/// One domain's deployment identity policy and rollout key; returns the key.
+/// One domain's deployment identity policy and rollout key; returns the
+/// identity `ConfigMap` and the key.
 async fn identity(
     objects: &Objects,
     scope: &Domain,
     domain: &str,
     accounts: &Accounts,
-) -> Result<Vec<u8>> {
+) -> Result<(Value, Vec<u8>)> {
     use base64::Engine as _;
     let control = scope.control_namespace.as_str();
     let identity = DeploymentIdentity {
@@ -297,7 +308,7 @@ async fn identity(
         lifetime_seconds: 900,
         preview: None,
     };
-    state(
+    let written = state(
         objects,
         control,
         &format!("apsides-deploy-identity-{domain}"),
@@ -313,7 +324,7 @@ async fn identity(
             "data": {"keyId": encode(ROLLOUT_KEY_ID.as_bytes()), "key": encode(&rollout_key)},
         }))
         .await?;
-    Ok(rollout_key)
+    Ok((written, rollout_key))
 }
 
 /// Create a protected state `ConfigMap` holding canonical `value`.
@@ -622,6 +633,47 @@ impl Platform {
         });
         *current = written;
         Ok(change)
+    }
+}
+
+impl Platform {
+    /// Approve live preview in `domain`'s deployment identity for exactly
+    /// `targets`, replacing the identity `ConfigMap` under its UID and
+    /// resourceVersion. The deployer already holds what the preview requests
+    /// need when the release's own capabilities cover LIST, PATCH and CREATE
+    /// of each target.
+    ///
+    /// # Errors
+    /// Fails when the domain was not bootstrapped or the replacement is
+    /// refused.
+    pub async fn approve_preview(
+        &mut self,
+        domain: &str,
+        mut targets: Vec<ReviewIdentity>,
+    ) -> Result<Value> {
+        let Some(current) = self.identities.get_mut(domain) else {
+            return Err(Error::Input(format!("{domain} was not bootstrapped")));
+        };
+        let mut identity: DeploymentIdentity =
+            serde_json::from_str(text(current, "/data/state.json"))?;
+        targets.sort();
+        targets.dedup();
+        identity.preview = Some(DeploymentPreviewApproval {
+            profile: DeploymentPreviewProfile::StaticSsaIssuedDeployerV1,
+            targets,
+        });
+        let data = String::from_utf8(compiler_core::canonical_bytes(&identity)?)
+            .map_err(|_| Error::Infrastructure("identity is not UTF-8".into()))?;
+        let mut replacement = current.clone();
+        replacement["data"]["state.json"] = json!(data);
+        let written = self.objects.replace(&replacement).await?;
+        ensure(
+            written["metadata"]["uid"] == current["metadata"]["uid"]
+                && written["data"]["state.json"] == data,
+            "the preview approval was not written exactly",
+        )?;
+        *current = written;
+        Ok(serde_json::to_value(&identity.preview)?)
     }
 }
 

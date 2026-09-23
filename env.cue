@@ -91,7 +91,7 @@ tasks: {
 	}
 	// Runs every acceptance scenario, each on its own kind cluster, against
 	// what acceptancePrepare wrote. Needs Docker, kind and the pinned kind
-	// node image local. CI runs the same scenarios split across the three
+	// node image local. CI runs the same scenarios split across the four
 	// tasks after it.
 	acceptanceTest: {
 		command: "sh"
@@ -108,6 +108,20 @@ tasks: {
 	acceptanceCleanupTest: {
 		command: "sh"
 		args: ["-c", "APSIDES_ACCEPTANCE_INPUTS=\"$PWD/work/acceptance/inputs.json\" cargo test --locked -p acceptance --test kind -- --ignored --test-threads=1 --nocapture cleanup::"]
+	}
+	acceptanceCredentialsTest: {
+		command: "sh"
+		args: ["-c", "APSIDES_ACCEPTANCE_INPUTS=\"$PWD/work/acceptance/inputs.json\" cargo test --locked -p acceptance --test kind -- --ignored --test-threads=1 --nocapture credentials::"]
+	}
+	// Builds examples/web-application twice with `aps build --cache disabled`
+	// and requires identical outputs, file for file (spec §28
+	// reproducibility). Needs Docker, cargo-cyclonedx on PATH and the pinned
+	// build images local. CI runs it nightly; the compile half runs in the CLI
+	// tests on every change.
+	reproducibleBuild: {
+		dependsOn: [build, install]
+		command: "cargo"
+		args: ["run", "--locked", "-p", "acceptance", "--bin", "acceptance-reproduce", "--", "--output", "work/reproducible-build"]
 	}
 	acceptanceCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "acceptance", "--all-targets", "--", "-D", "warnings"]}
 	runtimeTest: {command: "cargo", args: ["test", "--locked", "-p", "runtime"]}

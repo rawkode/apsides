@@ -10,6 +10,7 @@
 
 mod cleanup;
 mod collision;
+mod credentials;
 mod phases;
 mod support;
 mod uncertain;

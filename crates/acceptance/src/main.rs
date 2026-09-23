@@ -45,7 +45,7 @@ fn run() -> Result<PathBuf, String> {
     let output = output.ok_or("--output is required")?;
     let sbom_tool = match sbom_tool {
         Some(path) => path,
-        None => on_path("cargo-cyclonedx")
+        None => acceptance::prepare::on_path("cargo-cyclonedx")
             .ok_or("cargo-cyclonedx is not on PATH; install it or pass --sbom-tool")?,
     };
     let options = Options {
@@ -62,10 +62,4 @@ fn run() -> Result<PathBuf, String> {
         || PathBuf::from("inputs.json"),
         |directory| directory.join("inputs.json"),
     ))
-}
-
-fn on_path(program: &str) -> Option<PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|directory| directory.join(program))
-        .find(|candidate| candidate.is_file())
 }

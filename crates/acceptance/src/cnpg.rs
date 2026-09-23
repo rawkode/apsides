@@ -419,7 +419,7 @@ pub async fn persistence(
 
 /// Run `command` in a container and return its stdout, failing unless it
 /// exits zero.
-async fn exec(
+pub(crate) async fn exec(
     client: &Client,
     namespace: &str,
     pod: &str,

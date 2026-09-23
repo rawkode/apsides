@@ -231,16 +231,17 @@ jobs:
   acceptance:
     # Deploys the prepared releases with the public `aps deploy`, each
     # scenario on its own disposable kind cluster: the CNPG upgrade and
-    # ceiling (P0), uncertain writer termination and ownership collision;
-    # every interrupted upgrade phase; and last-type cleanup with a finalizer
-    # and a replaced UID (docs/reference/ACCEPTANCE.md).
+    # ceiling (P0), uncertain writer termination, ownership collision and
+    # live preview; every interrupted upgrade phase; last-type cleanup with a
+    # finalizer and a replaced UID; and the runtime credential with platform
+    # image pull secrets (docs/reference/ACCEPTANCE.md).
     needs: acceptance-prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        scenarios: [Upgrade, Phases, Cleanup]
+        scenarios: [Upgrade, Phases, Cleanup, Credentials]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
