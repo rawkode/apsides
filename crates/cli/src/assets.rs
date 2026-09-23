@@ -194,6 +194,61 @@ mod verified {
             Ok(())
         }
 
+        /// Mirrors a packaged installation: compiler, SDK, lockfile, a
+        /// dependency reached through an internal link, runtime crate and
+        /// native builder. Each file is removed or extended in turn; the
+        /// tree must fail verification and pass again once restored.
+        #[cfg(unix)]
+        #[test]
+        fn rejects_each_removed_or_extended_asset_until_restored() -> Result<()> {
+            let prefix = tempfile::tempdir()?;
+            let assets = prefix.path().join("share/apsides");
+            let targets = [
+                ("packages/compiler/src/compiler.ts", false),
+                ("packages/kubernetes/src/model.ts", true),
+                ("deno.lock", false),
+                (
+                    "node_modules/.deno/ses@2.3.0/node_modules/ses/package.json",
+                    true,
+                ),
+                ("crates/runtime/src/lib.rs", false),
+                ("scripts/build.py", true),
+            ];
+            for (path, _) in targets {
+                let file = assets.join(path);
+                fs::create_dir_all(file.parent().ok_or("asset path has no parent")?)?;
+                fs::write(file, format!("{path}\n"))?;
+            }
+            std::os::unix::fs::symlink(
+                ".deno/ses@2.3.0/node_modules/ses",
+                assets.join("node_modules/ses"),
+            )?;
+            let assets = assets.canonicalize()?;
+            let mut files = BTreeMap::new();
+            visit(&assets, &assets, &mut files)?;
+            let manifest = serde_json::to_vec(&files)?;
+            let digest = format!("{:x}", Sha256::digest(&manifest));
+            fs::write(prefix.path().join("asset-manifest.json"), manifest)?;
+            root(prefix.path(), &digest)?;
+            for (path, remove) in targets {
+                let file = assets.join(path);
+                let original = fs::read(&file)?;
+                if remove {
+                    fs::remove_file(&file)?;
+                } else {
+                    let mut extended = original.clone();
+                    extended.push(b'\n');
+                    fs::write(&file, extended)?;
+                }
+                if root(prefix.path(), &digest).is_ok() {
+                    return Err(format!("damaged asset {path} passed verification").into());
+                }
+                fs::write(&file, original)?;
+                root(prefix.path(), &digest)?;
+            }
+            Ok(())
+        }
+
         #[cfg(unix)]
         #[test]
         fn permits_internal_links_and_rejects_external_targets() -> Result<()> {
