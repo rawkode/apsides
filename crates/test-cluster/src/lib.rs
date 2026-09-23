@@ -3,13 +3,16 @@
 //! cluster.
 //!
 //! The runner never reads the caller's Kubernetes configuration. It creates a
-//! kind cluster whose kubeconfig lives in a private temporary directory,
+//! kind cluster whose kubeconfig lives in a private temporary directory and
 //! imports the release's controller image and the fixture images into the
-//! node's containerd by digest, denies all egress except the API server, and
-//! starts the release's controller in fixture mode with a short-lived
-//! credential for its generated `ServiceAccount`. Every case in the release's
-//! test plan is then driven through that cluster, and the cluster is deleted
-//! unless the caller asked to keep it.
+//! node's containerd by digest. It then blocks egress at the node itself and
+//! in the test namespaces, and shows with named probes that external
+//! addresses, names and registries are unreachable while cluster DNS,
+//! Services and the API server still work. The release's controller starts in
+//! fixture mode with a short-lived credential for its generated
+//! `ServiceAccount`, every case in the release's test plan is driven through
+//! that cluster, and the cluster is deleted unless the caller asked to keep
+//! it, including when the run is interrupted.
 
 mod cases;
 mod cluster;
@@ -18,6 +21,7 @@ mod crds;
 mod driver;
 mod images;
 mod manifests;
+mod offline;
 mod oracle;
 mod process;
 mod report;
@@ -25,9 +29,12 @@ mod suite;
 #[cfg(test)]
 mod testing;
 
+pub use cluster::Disposition;
 pub use contract::FixtureRelease;
 pub use report::{
-    ArtifactIdentity, Assertion, CanaryScan, CaseRow, CaseStatus, Evidence, Isolation, Report,
+    ArtifactIdentity, Assertion, CanaryScan, CaseRow, CaseStatus, Check, CheckStatus,
+    ClusterReport, Evidence, Failure, Isolation, NetworkProbe, Reach, Report, RunStatus, Runner,
+    Summary,
 };
 pub use suite::{Options, run};
 
@@ -36,8 +43,8 @@ pub use suite::{Options, run};
 pub const NODE_IMAGE: &str =
     "kindest/node:v1.34.3@sha256:08497ee19eace7b4b5348db5c6a1591d7752b164530a36f855cb0f2bdcbadd48";
 
-/// The image behind the controller's loopback API proxy and the egress
-/// sentinel. It must already be in the local Docker image store.
+/// The image behind the controller's loopback API proxy, the egress sentinel
+/// and the offline gate's probe Pods. It must already be in the local Docker image store.
 pub const PROXY_IMAGE: &str = "nginxinc/nginx-unprivileged:alpine@sha256:d9083fe47768377ef55dedafd67d4da7c2f2bc2bece7554954f29359deb0dce9";
 
 /// The workload image every fixture IR substitutes for production images.
@@ -70,6 +77,29 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Completes with the signal's name on the first SIGINT or, on Unix, SIGTERM.
+/// If a handler cannot be installed it never completes, and the signal keeps
+/// its default behaviour.
+pub async fn termination() -> String {
+    async fn interrupt() {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            return tokio::select! {
+                () = interrupt() => "SIGINT".to_owned(),
+                _ = terminate.recv() => "SIGTERM".to_owned(),
+            };
+        }
+    }
+    interrupt().await;
+    "SIGINT".to_owned()
+}
 
 fn input<T>(message: impl Into<String>) -> Result<T> {
     Err(Error::Input(message.into()))

@@ -5,8 +5,12 @@
 //! canonical JSON of the domain, target, contributing reactions and their
 //! input projections, hashed with SHA-256, or HMAC-SHA-256 under the fixture
 //! rollout key when any contributing input is sensitive — rather than calling
-//! the compiler's rollout evaluator the controller itself runs. Omitting one
-//! reaction's contribution must change the result; that is the mutation check.
+//! the compiler's rollout evaluator the controller itself runs.
+//!
+//! The mutation check applies a [`Mutation`] to this model: a reaction's
+//! contribution removed, or one of its selected inputs ignored. The live
+//! revision the controller stamped must differ from every mutated expectation.
+//! The controller binary itself is never mutated.
 
 use crate::{
     Result,
@@ -19,14 +23,57 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// A deliberate defect applied to the oracle's model of a reaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mutation<'a> {
+    None,
+    /// The reaction's contribution is removed entirely.
+    OmitReaction(&'a str),
+    /// The reaction is kept but its selected `input` is ignored: that input's
+    /// projection leaves the revision payload.
+    IgnoreInput {
+        reaction: &'a str,
+        input: &'a str,
+    },
+}
+
+/// Inputs of `reaction` that no other reaction on the same target selects.
+/// Ignoring a shared input would leave the payload unchanged, so only these
+/// can be mutated observably.
+pub fn exclusive_inputs<'a>(plan: &'a CompiledPlan, reaction: &str) -> Vec<&'a str> {
+    let Some(selected) = plan.ir.reactions.iter().find(|item| item.id == reaction) else {
+        return Vec::new();
+    };
+    selected
+        .inputs
+        .iter()
+        .filter(|input| {
+            !plan.ir.reactions.iter().any(|other| {
+                other.id != selected.id
+                    && other.target == selected.target
+                    && other.inputs.contains(input)
+            })
+        })
+        .map(String::as_str)
+        .collect()
+}
+
 /// The revision the controller must stamp on `target`, given the live data of
-/// its observed inputs. `omitted` drops one reaction's contribution.
+/// its observed inputs, with `mutation` applied to the model.
 pub fn expected_revision(
     plan: &CompiledPlan,
     target: &str,
-    omitted: Option<&str>,
+    mutation: Mutation<'_>,
     observed: &BTreeMap<String, Value>,
 ) -> Result<String> {
+    let omitted = match mutation {
+        Mutation::OmitReaction(reaction) => Some(reaction),
+        Mutation::None | Mutation::IgnoreInput { .. } => None,
+    };
+    let ignored = match mutation {
+        Mutation::IgnoreInput { input, .. } => Some(input),
+        Mutation::None | Mutation::OmitReaction(_) => None,
+    };
     let mut reactions = plan
         .ir
         .reactions
@@ -37,6 +84,7 @@ pub fn expected_revision(
     let input_ids = reactions
         .iter()
         .flat_map(|reaction| reaction.inputs.iter())
+        .filter(|id| Some(id.as_str()) != ignored)
         .collect::<BTreeSet<_>>();
     let mut projections = Map::new();
     let mut sensitive = false;
@@ -113,7 +161,7 @@ mod tests {
     #[test]
     fn a_sensitive_contribution_signs_the_revision_with_the_fixture_key() -> Result<()> {
         let plan = testing::plan()?;
-        let revision = expected_revision(&plan, "deployment-api", None, &observed())?;
+        let revision = expected_revision(&plan, "deployment-api", Mutation::None, &observed())?;
         assert!(
             revision.starts_with("hmac-sha256:fixture-v1:"),
             "{revision}"
@@ -121,7 +169,7 @@ mod tests {
         let unsigned = expected_revision(
             &plan,
             "deployment-api",
-            Some("rollout-credentials"),
+            Mutation::OmitReaction("rollout-credentials"),
             &observed(),
         )?;
         assert!(unsigned.starts_with("sha256:"), "{unsigned}");
@@ -131,25 +179,64 @@ mod tests {
     #[test]
     fn the_revision_tracks_projected_data_and_every_contribution() -> Result<()> {
         let plan = testing::plan()?;
-        let baseline = expected_revision(&plan, "deployment-api", None, &observed())?;
+        let baseline = expected_revision(&plan, "deployment-api", Mutation::None, &observed())?;
         assert_eq!(
             baseline,
-            expected_revision(&plan, "deployment-api", None, &observed())?
+            expected_revision(&plan, "deployment-api", Mutation::None, &observed())?
         );
         let mut changed = observed();
         changed.insert("observed-external".into(), json!({"value": "b"}));
         assert_ne!(
             baseline,
-            expected_revision(&plan, "deployment-api", None, &changed)?
+            expected_revision(&plan, "deployment-api", Mutation::None, &changed)?
         );
         for reaction in &plan.ir.reactions {
             assert_ne!(
                 baseline,
-                expected_revision(&plan, "deployment-api", Some(&reaction.id), &observed())?,
+                expected_revision(
+                    &plan,
+                    "deployment-api",
+                    Mutation::OmitReaction(&reaction.id),
+                    &observed()
+                )?,
                 "omitting {} must change the revision",
                 reaction.id
             );
+            let inputs = exclusive_inputs(&plan, &reaction.id);
+            assert_eq!(inputs.len(), reaction.inputs.len());
+            for input in inputs {
+                let ignored = expected_revision(
+                    &plan,
+                    "deployment-api",
+                    Mutation::IgnoreInput {
+                        reaction: &reaction.id,
+                        input,
+                    },
+                    &observed(),
+                )?;
+                assert_ne!(
+                    baseline, ignored,
+                    "ignoring {input} must change the revision"
+                );
+            }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_shared_input_cannot_be_ignored_observably() -> Result<()> {
+        let mut ir = testing::ir();
+        let first = ir["reactions"][0]["inputs"][0].clone();
+        if let Some(inputs) = ir["reactions"][1]["inputs"].as_array_mut() {
+            inputs.push(first.clone());
+        }
+        let plan = compiler_core::parse_and_validate(&ir.to_string())?;
+        let reaction = plan.ir.reactions[0].id.clone();
+        assert!(
+            !exclusive_inputs(&plan, &reaction)
+                .iter()
+                .any(|input| json!(input) == first)
+        );
         Ok(())
     }
 
@@ -189,7 +276,7 @@ mod tests {
         };
         assert_eq!(
             revision,
-            expected_revision(&plan, "deployment-api", None, &observed())?
+            expected_revision(&plan, "deployment-api", Mutation::None, &observed())?
         );
         Ok(())
     }

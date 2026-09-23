@@ -76,9 +76,13 @@ narrower properties.
   workflow. On its own it runs the generated semantic scenarios and reports
   scenarios that need a cluster as unsupported, which fails the command.
   `aps test --cluster` runs every generated case of a fixture release on a
-  disposable, egress-denied kind cluster (`crates/test-cluster`); on
-  `examples/web-application` all 43 generated cases and the 3 reaction-mutation
-  checks pass locally on linux/arm64. It does not yet run in CI. Live
+  disposable kind cluster (`crates/test-cluster`). Egress is blocked inside the
+  kind node as well as by `NetworkPolicy`, and named probes show external
+  addresses, names and registry pulls fail while cluster DNS, Services and the
+  API server still work. The reaction-mutation check mutates the revision
+  oracle's model, not the controller. On `examples/web-application` all 43
+  generated cases and the 3 reaction-mutation checks pass locally on
+  linux/arm64. It does not yet run in CI. Live
   qualification of Apsides itself is moving from the Python harnesses in
   `tests/` to a Rust acceptance suite that runs in CI on the examples.
 

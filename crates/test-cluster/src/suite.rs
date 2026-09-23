@@ -1,21 +1,25 @@
 //! One cluster run, from offline checks to the written report.
 //!
 //! Everything that can be checked without a cluster is checked first. Once
-//! the cluster exists, any failure still ends with its logs and diagnostics
-//! collected, the cluster deleted and a report written; the error is recorded
-//! in that report.
+//! the cluster exists, any failure or interruption still ends with its logs
+//! and diagnostics collected, the cluster deleted and a report written; the
+//! error is recorded in that report.
 
 use crate::{
     Error, FIXTURE_IMAGE, NODE_IMAGE, PROXY_IMAGE, Result,
-    cases::{Live, mutation_cases},
-    cluster::{self, Cluster, Disposition},
+    cases::{Live, Record, mutation_cases},
+    cluster::{self, Cluster, Disposition, POD_SUBNET, SERVICE_SUBNET},
     contract::{FixtureRelease, ROLLOUT_KEY},
     crds::{self, CrdManifest},
     driver::{Driver, wait_for},
     images::{self, ArchiveImage},
     input, manifests,
     manifests::{CONTROLLER, OUTSIDE, SENTINEL, SENTINEL_PREFLIGHT},
-    report::{self, ArtifactIdentity, CanaryScan, CaseRow, Isolation, Outcome, Report},
+    offline::{self, PodProbe},
+    report::{
+        self, ArtifactIdentity, CanaryScan, CaseRow, CaseStatus, ClusterReport, Isolation,
+        NetworkProbe, Outcome, Reach, Report, Runner,
+    },
 };
 use compiler_core::{InputMode, SemanticReport};
 use k8s_openapi::api::{
@@ -28,14 +32,23 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
     fs,
+    future::Future,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 const SETUP: Duration = Duration::from_secs(120);
-/// The controller's token outlives the longest expected run.
-const TOKEN_SECONDS: i64 = 3600;
+/// Bounds of the controller's token lifetime. The API server refuses less
+/// than ten minutes.
+const MIN_TOKEN_SECONDS: i64 = 600;
+const MAX_TOKEN_SECONDS: i64 = 3600;
+/// Token lifetime granted per case, beyond the minimum.
+const TOKEN_SECONDS_PER_CASE: i64 = 30;
+/// The run must end this long before the controller's token expires.
+const TOKEN_MARGIN_SECONDS: i64 = 60;
+/// How long an interrupted run spends collecting logs before cleanup.
+const SALVAGE: Duration = Duration::from_secs(20);
 
 /// What to test and where to write the results.
 #[derive(Clone, Debug)]
@@ -52,35 +65,200 @@ pub struct Options {
     pub output: PathBuf,
     /// Leave the cluster running for inspection.
     pub keep_cluster: bool,
+    /// Receives one line per step and per case as the run proceeds.
+    pub progress: Option<fn(&str)>,
+}
+
+impl Options {
+    fn note(&self, line: &str) {
+        if let Some(progress) = self.progress {
+            progress(line);
+        }
+    }
 }
 
 /// Everything collected while the cluster exists.
 #[derive(Default)]
 struct Progress {
+    runner: Runner,
     artifact: ArtifactIdentity,
     isolation: Isolation,
+    cluster_created: bool,
     cases: Vec<CaseRow>,
-    controller_log: String,
-    egress_log: String,
+    /// Logs, canaries and egress output the cases recorded.
+    record: Arc<Record>,
+    /// Controller logs read after an interruption, beyond what was recorded.
+    salvaged_log: String,
     canaries: BTreeSet<String>,
     diagnostics: Vec<(String, Value)>,
     crd_installations: Vec<Value>,
+    /// Documents written before the cluster, scanned and redacted with the
+    /// rest.
+    semantic_results: String,
+    seed: String,
+}
+
+impl Progress {
+    /// What is known before the cluster exists.
+    fn new(
+        release: &FixtureRelease,
+        semantic: &SemanticReport,
+        controller: &ArchiveImage,
+        fixture: &ArchiveImage,
+    ) -> Result<Self> {
+        let cases = release.plan.test_plan.len() + mutation_cases(release).len();
+        Ok(Self {
+            runner: Runner {
+                aps_version: env!("CARGO_PKG_VERSION").into(),
+                node_image: NODE_IMAGE.into(),
+                proxy_image: PROXY_IMAGE.into(),
+                ..Runner::default()
+            },
+            artifact: ArtifactIdentity {
+                mode: "fixture-substituted".into(),
+                release_digest: release.release_digest.clone(),
+                ir_digest: release.plan.ir_digest.clone(),
+                production_ir_digest: release.production_ir_digest.clone(),
+                overlay_digest: release.overlay_digest.clone(),
+                controller_image: release.manifest.image.reference.clone(),
+                controller_config_digest: controller.config.clone(),
+                fixture_image_config_digest: fixture.config.clone(),
+            },
+            isolation: Isolation {
+                controller_token_seconds: token_seconds(cases),
+                ..Isolation::default()
+            },
+            canaries: initial_canaries(release),
+            semantic_results: pretty(&serde_json::to_value(semantic)?)?,
+            seed: pretty(&release.seed())?,
+            ..Self::default()
+        })
+    }
+}
+
+/// The checked inputs of one run.
+struct Run<'a> {
+    release: &'a FixtureRelease,
+    semantic: &'a SemanticReport,
+    crds: &'a [CrdManifest],
+    options: &'a Options,
+    controller: &'a ArchiveImage,
+    fixture: &'a ArchiveImage,
+}
+
+/// How the cluster phase ended.
+struct Ending {
+    name: Option<String>,
+    disposition: Disposition,
+    kubeconfig: Option<PathBuf>,
+    error: Option<String>,
+    interrupted: bool,
 }
 
 /// Run every generated case of a fixture release on a disposable cluster and
 /// write the report into `options.output`.
 ///
+/// When `interrupt` completes, with the name of what interrupted the run, the
+/// cases stop, logs are collected briefly, the cluster is deleted (unless
+/// kept) and the report records the interruption.
+///
 /// # Errors
 /// Returns an error when the inputs are rejected before a cluster is created
 /// or the output cannot be written. Failures on the cluster are recorded in
 /// the returned report instead.
-pub async fn run(options: &Options) -> Result<Report> {
+pub async fn run(options: &Options, interrupt: impl Future<Output = String>) -> Result<Report> {
     if options.output.exists() {
         return input("test output already exists; choose a fresh directory");
     }
     let release = FixtureRelease::load(&options.release)?;
     let crds = crds::snapshot(&options.crds, &release.plan)?;
     let semantic = compiler_core::run_semantic_tests(&release.plan)?;
+    let (controller, fixture) = inspect_images(&release, &options.fixture_image)?;
+
+    fs::create_dir_all(&options.output)?;
+    for manifest in &crds {
+        fs::write(options.output.join(&manifest.file), &manifest.raw)?;
+    }
+    let mut progress = Progress::new(&release, &semantic, &controller, &fixture)?;
+
+    options.note("checking Docker, kind and the node image");
+    let toolchain = match cluster::preflight().await {
+        Ok(toolchain) => toolchain,
+        Err(error) => {
+            let ending = Ending {
+                name: None,
+                disposition: Disposition::NotCreated,
+                kubeconfig: None,
+                error: Some(error.to_string()),
+                interrupted: false,
+            };
+            return finish(options, progress, ending);
+        }
+    };
+    progress.runner.kind_version = toolchain.kind_version;
+    progress.runner.docker_server_version = toolchain.docker_server_version;
+    progress.runner.node_image_id = toolchain.node_image_id;
+
+    let cluster = Cluster::new(options.keep_cluster)?;
+    let name = cluster.name().to_owned();
+    options.note(&format!("creating kind cluster {name}"));
+    let budget = Duration::from_secs(
+        u64::try_from(progress.isolation.controller_token_seconds - TOKEN_MARGIN_SECONDS)
+            .unwrap_or_default(),
+    );
+    let mut interrupt = std::pin::pin!(interrupt);
+    let finished: std::result::Result<Result<()>, String> = tokio::select! {
+        biased;
+        signal = &mut interrupt => Err(signal),
+        outcome = async {
+            cluster.create().await?;
+            progress.cluster_created = true;
+            let run = Run {
+                release: &release,
+                semantic: &semantic,
+                crds: &crds,
+                options,
+                controller: &controller,
+                fixture: &fixture,
+            };
+            let exercised = exercise(&cluster, &run, &mut progress);
+            tokio::time::timeout(budget, exercised).await.map_err(|_| {
+                Error::Deadline(format!(
+                    "the run exceeded {}s, the bound set by the controller's token lifetime",
+                    budget.as_secs()
+                ))
+            })?
+        } => Ok(outcome),
+    };
+    let (error, interrupted) = match finished {
+        Ok(Ok(())) => (None, false),
+        Ok(Err(error)) => (Some(error.to_string()), false),
+        Err(signal) => (Some(format!("interrupted by {signal}")), true),
+    };
+    if interrupted {
+        options.note("interrupted; collecting logs, then cleaning up the cluster");
+        if progress.cluster_created {
+            let _ = tokio::time::timeout(SALVAGE, salvage(&cluster, &release, &mut progress)).await;
+        }
+    }
+    let (disposition, kubeconfig) = dispose(cluster, options, progress.cluster_created).await?;
+    let error = error.or_else(|| crds_unchanged(&crds).err().map(|error| error.to_string()));
+    let ending = Ending {
+        name: Some(name),
+        disposition,
+        kubeconfig,
+        error,
+        interrupted,
+    };
+    finish(options, progress, ending)
+}
+
+/// The controller and workload fixture images, each checked against what the
+/// release and the fixture IR name.
+fn inspect_images(
+    release: &FixtureRelease,
+    fixture_archive: &Path,
+) -> Result<(ArchiveImage, ArchiveImage)> {
     let platform = release.manifest.image.platform.as_str();
     let controller = images::inspect(&release.root.join("controller.oci.tar"), platform)?;
     if release
@@ -93,89 +271,53 @@ pub async fn run(options: &Options) -> Result<Report> {
     {
         return input("the controller archive does not hold the release's image");
     }
-    let fixture = images::inspect(&options.fixture_image, platform)?;
+    let fixture = images::inspect(fixture_archive, platform)?;
     let fixture_name = format!("{}:local", images::repository(FIXTURE_IMAGE)?);
     if !fixture.names.contains(&fixture_name) {
         return input(format!(
             "the fixture image archive must be a `docker image save` of {FIXTURE_IMAGE}"
         ));
     }
+    Ok((controller, fixture))
+}
 
-    fs::create_dir_all(&options.output)?;
-    write_json(
-        &options.output.join("semantic-results.json"),
-        &serde_json::to_value(&semantic)?,
-    )?;
-    write_json(&options.output.join("test-seed.json"), &release.seed())?;
-    for manifest in &crds {
-        fs::write(options.output.join(&manifest.file), &manifest.raw)?;
-    }
+/// Keep the cluster, with its kubeconfig copied into the output, or delete
+/// it.
+async fn dispose(
+    cluster: Cluster,
+    options: &Options,
+    created: bool,
+) -> Result<(Disposition, Option<PathBuf>)> {
+    let kubeconfig = if options.keep_cluster && created {
+        let path = options.output.join("kubeconfig");
+        cluster.export_kubeconfig(&path)?;
+        Some(path)
+    } else {
+        None
+    };
+    options.note(if options.keep_cluster {
+        "keeping the cluster"
+    } else {
+        "deleting the cluster"
+    });
+    Ok((cluster.finish().await, kubeconfig))
+}
 
-    let mut progress = Progress {
-        artifact: ArtifactIdentity {
-            mode: "fixture-substituted".into(),
-            release_digest: release.release_digest.clone(),
-            ir_digest: release.plan.ir_digest.clone(),
-            production_ir_digest: release.production_ir_digest.clone(),
-            overlay_digest: release.overlay_digest.clone(),
-            controller_image: release.manifest.image.reference.clone(),
-            controller_config_digest: controller.config.clone(),
-            fixture_image_config_digest: fixture.config.clone(),
-            proxy_image_config_digest: String::new(),
-            node_image: NODE_IMAGE.into(),
-        },
-        canaries: initial_canaries(&release),
-        ..Progress::default()
-    };
-    let (name, disposition, error) = match Cluster::create(options.keep_cluster).await {
-        Ok(cluster) => {
-            let name = cluster.name().to_owned();
-            let outcome = exercise(
-                &cluster,
-                &release,
-                &semantic,
-                &crds,
-                options,
-                (&controller, &fixture),
-                &mut progress,
-            )
-            .await;
-            (Some(name), cluster.finish().await, outcome.err())
-        }
-        Err(error) => (None, Disposition::NotCreated, Some(error)),
-    };
-    let error = error.or_else(|| crds_unchanged(&crds).err());
-    finish(
-        options,
-        progress,
-        name,
-        disposition,
-        error.map(|error| error.to_string()),
-    )
+/// The controller's token lifetime: enough for every case, within the API
+/// server's bounds.
+fn token_seconds(cases: usize) -> i64 {
+    let cases = i64::try_from(cases).unwrap_or(i64::MAX);
+    MIN_TOKEN_SECONDS
+        .saturating_add(cases.saturating_mul(TOKEN_SECONDS_PER_CASE))
+        .clamp(MIN_TOKEN_SECONDS, MAX_TOKEN_SECONDS)
 }
 
 /// Everything that happens while the cluster exists.
-async fn exercise(
-    cluster: &Cluster,
-    release: &FixtureRelease,
-    semantic: &SemanticReport,
-    crds: &[CrdManifest],
-    options: &Options,
-    (controller, fixture): (&ArchiveImage, &ArchiveImage),
-    progress: &mut Progress,
-) -> Result<()> {
+async fn exercise(cluster: &Cluster, run: &Run<'_>, progress: &mut Progress) -> Result<()> {
+    let (release, options) = (run.release, run.options);
     let driver = Driver::new(cluster.admin_client().await?);
-    let prepared = prepare(
-        cluster,
-        release,
-        semantic,
-        crds,
-        &driver,
-        (controller, (fixture, &options.fixture_image)),
-        progress,
-    )
-    .await;
-    let (live, images) = match prepared {
+    let prepared = prepare(cluster, run, &driver, progress).await;
+    let (live, images, nodes) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             collect_diagnostics(&driver, release, progress).await;
@@ -183,32 +325,54 @@ async fn exercise(
         }
     };
     let outcome = async {
+        options.note("starting the controller");
         start_controller(&live, &images, progress).await?;
-        for case in &release.plan.test_plan {
-            progress.cases.push(live.run_case(case).await);
+        let mutations = mutation_cases(release);
+        let total = release.plan.test_plan.len() + mutations.len();
+        for (index, case) in release.plan.test_plan.iter().enumerate() {
+            note_case(options, index, total, &case.reaction_id, &case.scenario);
+            let row = live.run_case(case).await;
+            note_result(options, &row);
+            progress.cases.push(row);
         }
-        for case in mutation_cases(release) {
-            progress.cases.push(live.mutation_case(&case).await);
+        for (index, case) in mutations.iter().enumerate() {
+            let index = release.plan.test_plan.len() + index;
+            note_case(options, index, total, &case.reaction_id, &case.scenario);
+            let row = live.mutation_case(case).await;
+            note_result(options, &row);
+            progress.cases.push(row);
+        }
+        options.note("re-checking node egress after the cases");
+        for node in &nodes {
+            offline::installed(node).await?;
+            progress
+                .isolation
+                .probes
+                .push(offline::external_tcp("node-external-tcp-after-cases", node).await?);
         }
         Ok::<_, Error>(())
     }
     .await;
     live.preserve_logs().await;
-    progress.controller_log = live
-        .logs
-        .lock()
-        .map(|logs| logs.join("\n"))
-        .unwrap_or_default();
-    progress.egress_log = live
-        .egress_logs
-        .lock()
-        .map(|logs| logs.join("\n"))
-        .unwrap_or_default();
-    if let Ok(canaries) = live.canaries.lock() {
-        progress.canaries.extend(canaries.iter().cloned());
-    }
     collect_diagnostics(&driver, release, progress).await;
     outcome
+}
+
+fn note_case(options: &Options, index: usize, total: usize, reaction: &str, scenario: &str) {
+    options.note(&format!("[{}/{total}] {reaction} {scenario}", index + 1));
+}
+
+fn note_result(options: &Options, row: &CaseRow) {
+    if row.status != CaseStatus::Passed {
+        options.note(&format!(
+            "  {}: {}",
+            serde_json::to_value(row.status)
+                .ok()
+                .and_then(|status| status.as_str().map(str::to_owned))
+                .unwrap_or_default(),
+            row.detail
+        ));
+    }
 }
 
 /// Image references the Pods use, after import.
@@ -219,23 +383,19 @@ struct Images {
 
 async fn prepare<'a>(
     cluster: &Cluster,
-    release: &'a FixtureRelease,
-    semantic: &SemanticReport,
-    crds: &[CrdManifest],
+    run: &Run<'a>,
     driver: &Driver,
-    (controller, (fixture, fixture_archive)): (&ArchiveImage, (&ArchiveImage, &Path)),
     progress: &mut Progress,
-) -> Result<(Live<'a>, Images)> {
+) -> Result<(Live<'a>, Images, Vec<String>)> {
+    let (release, options) = (run.release, run.options);
     let domain = &release.plan.ir.domain;
     require_node_platform(driver, &release.manifest.image.platform).await?;
-    let images = import_images(
-        cluster,
-        release,
-        controller,
-        (fixture, fixture_archive),
-        progress,
-    )
-    .await?;
+    options.note("importing images into the node");
+    let images = import_images(cluster, run, progress).await?;
+
+    options.note("blocking egress at the node");
+    let api_address = api_address(driver).await?;
+    let nodes = block_node_egress(cluster, &api_address, progress).await?;
 
     for namespace in [
         &domain.namespace,
@@ -244,7 +404,7 @@ async fn prepare<'a>(
     ] {
         driver.put(&manifests::namespace(namespace)).await?;
     }
-    install_crds(driver, crds, progress).await?;
+    install_crds(driver, run.crds, progress).await?;
 
     driver
         .put(&manifests::service_account(
@@ -273,7 +433,11 @@ async fn prepare<'a>(
 
     let context = cluster.context();
     let token = driver
-        .token(&domain.control_namespace, CONTROLLER, TOKEN_SECONDS)
+        .token(
+            &domain.control_namespace,
+            CONTROLLER,
+            progress.isolation.controller_token_seconds,
+        )
         .await?;
     progress.canaries.insert(token.clone());
     let endpoint = cluster.endpoint()?;
@@ -292,11 +456,13 @@ async fn prepare<'a>(
         ))
         .await?;
 
+    options.note("isolating the namespaces and probing egress from Pods");
     let api_cidr = isolate_network(
         driver,
-        &domain.namespace,
-        &domain.control_namespace,
+        (&domain.namespace, &domain.control_namespace),
         &images.proxy,
+        &api_address,
+        progress,
     )
     .await?;
 
@@ -309,7 +475,8 @@ async fn prepare<'a>(
         domain_manager: format!("apsides-{}", domain.id),
         original_rules: rules.get(&domain.namespace).cloned().unwrap_or_default(),
         api_cidr,
-        semantic: semantic
+        semantic: run
+            .semantic
             .results
             .iter()
             .map(|row| {
@@ -319,22 +486,51 @@ async fn prepare<'a>(
                 )
             })
             .collect(),
-        logs: Mutex::default(),
-        egress_logs: Mutex::default(),
-        canaries: Mutex::default(),
+        record: Arc::clone(&progress.record),
     };
-    Ok((live, images))
+    Ok((live, images, nodes))
+}
+
+/// Install the egress rules in every node, then run the node canaries and
+/// positive controls. Returns the nodes.
+async fn block_node_egress(
+    cluster: &Cluster,
+    api_address: &str,
+    progress: &mut Progress,
+) -> Result<Vec<String>> {
+    let nodes = cluster.nodes().await?;
+    for node in &nodes {
+        offline::block(node).await?;
+    }
+    progress.isolation.node_egress_blocked = true;
+    for node in &nodes {
+        let probes = offline::canaries(node, api_address).await?;
+        progress.isolation.probes.extend(probes);
+    }
+    Ok(nodes)
+}
+
+/// The API server's Service address.
+async fn api_address(driver: &Driver) -> Result<String> {
+    let api = driver
+        .require("v1", "Service", Some("default"), "kubernetes")
+        .await?;
+    api["spec"]["clusterIP"]
+        .as_str()
+        .filter(|address| !address.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| Error::Infrastructure("the kubernetes Service has no address".into()))
 }
 
 /// Import the controller, workload fixture and proxy images into the node
 /// and confirm the CRI resolves each to the archived image.
 async fn import_images(
     cluster: &Cluster,
-    release: &FixtureRelease,
-    controller: &ArchiveImage,
-    (fixture, fixture_archive): (&ArchiveImage, &Path),
+    run: &Run<'_>,
     progress: &mut Progress,
 ) -> Result<Images> {
+    let (release, controller, fixture) = (run.release, run.controller, run.fixture);
+    let fixture_archive = run.options.fixture_image.as_path();
     let node = cluster.node();
     let platform = release.manifest.image.platform.as_str();
     let repository = images::repository(&release.manifest.image.reference)?;
@@ -354,7 +550,7 @@ async fn import_images(
     images::import(&node, &archive, &repository, platform).await?;
     let proxy_reference = format!("{repository}@{}", proxy.manifest);
     images::require_resolves(&node, &proxy_reference, &proxy.config).await?;
-    progress.artifact.proxy_image_config_digest = proxy.config;
+    progress.runner.proxy_image_config_digest = proxy.config;
     progress.isolation.images_imported = true;
     Ok(Images {
         controller: controller_reference,
@@ -475,14 +671,18 @@ async fn install_crds(
     Ok(())
 }
 
-/// Deny all egress from the workload and control namespaces, allow the
-/// controller only the API server, and prove the sentinel the canaries probe
-/// is reachable when no policy applies. Returns the API server's CIDR.
+/// Deny all egress from the workload and control namespaces and allow the
+/// controller only the API server. Probe Pods show the sentinel the
+/// controller's canaries aim at is reachable without a policy, that DNS and
+/// Services still work under the node's egress rules, and that external
+/// addresses and names are unreachable from Pods with and without a policy.
+/// Returns the API server's CIDR.
 async fn isolate_network(
     driver: &Driver,
-    workload: &str,
-    control: &str,
+    (workload, control): (&str, &str),
     proxy: &str,
+    api_address: &str,
+    progress: &mut Progress,
 ) -> Result<String> {
     for object in manifests::sentinel(proxy) {
         driver.put(&object).await?;
@@ -499,30 +699,19 @@ async fn isolate_network(
     })
     .await?;
     let sentinel_ip = sentinel_ip(driver).await?;
-    driver
-        .put(&manifests::sentinel_preflight(proxy, &sentinel_ip))
-        .await?;
-    wait_for("sentinel reachable without a policy", SETUP, async || {
-        let pod = driver
-            .require("v1", "Pod", Some(OUTSIDE), SENTINEL_PREFLIGHT)
-            .await?;
-        match pod["status"]["phase"].as_str() {
-            Some("Succeeded") => Ok(Some(())),
-            Some("Failed") => Err(Error::Infrastructure(
-                "the sentinel is unreachable even without a policy".into(),
-            )),
-            _ => Ok(None),
-        }
-    })
-    .await?;
-    let api = driver
-        .require("v1", "Service", Some("default"), "kubernetes")
-        .await?;
-    let address = api["spec"]["clusterIP"].as_str().unwrap_or_default();
-    let api_cidr = if address.contains(':') {
-        format!("{address}/128")
+    let before = [PodProbe::tcp(
+        "pod-sentinel-before-policies",
+        &sentinel_ip,
+        8080,
+        Reach::Reachable,
+    )];
+    let probes = probe_pod(driver, OUTSIDE, SENTINEL_PREFLIGHT, proxy, &before).await?;
+    progress.isolation.probes.extend(probes);
+
+    let api_cidr = if api_address.contains(':') {
+        format!("{api_address}/128")
     } else {
-        format!("{address}/32")
+        format!("{api_address}/32")
     };
     for namespace in [workload, control] {
         driver.put(&manifests::deny_all_egress(namespace)).await?;
@@ -531,17 +720,75 @@ async fn isolate_network(
         .put(&manifests::controller_api_egress(control, &api_cidr, true))
         .await?;
     driver.put(&manifests::proxy_script(control)).await?;
+
+    let outside = [
+        PodProbe::tcp(
+            "pod-sentinel-by-dns",
+            &manifests::sentinel_host(),
+            8080,
+            Reach::Reachable,
+        ),
+        PodProbe::tcp("pod-api-server-service", api_address, 443, Reach::Reachable),
+        PodProbe::tcp(
+            "pod-external-tcp",
+            offline::EXTERNAL_ADDRESS,
+            443,
+            Reach::Blocked,
+        ),
+        PodProbe::dns("pod-external-dns", offline::EXTERNAL_NAME, Reach::Blocked),
+    ];
+    let probes = probe_pod(driver, OUTSIDE, "offline-probe", proxy, &outside).await?;
+    progress.isolation.probes.extend(probes);
+    let isolated = [
+        // kindnet applies a NetworkPolicy to a new Pod only once it has seen
+        // it, so the denial is awaited; the node rules have no such gap.
+        PodProbe::tcp("workload-pod-sentinel", &sentinel_ip, 8080, Reach::Blocked).settling(),
+        PodProbe::tcp(
+            "workload-pod-external-tcp",
+            offline::EXTERNAL_ADDRESS,
+            443,
+            Reach::Blocked,
+        ),
+    ];
+    let probes = probe_pod(driver, workload, "offline-probe", proxy, &isolated).await?;
+    progress.isolation.probes.extend(probes);
     Ok(api_cidr)
 }
 
-async fn sentinel_ip(driver: &Driver) -> Result<String> {
-    let service = driver
-        .require("v1", "Service", Some(OUTSIDE), SENTINEL)
+/// Run `probes` from a one-shot Pod in `namespace`, then remove it.
+async fn probe_pod(
+    driver: &Driver,
+    namespace: &str,
+    name: &str,
+    image: &str,
+    probes: &[PodProbe],
+) -> Result<Vec<NetworkProbe>> {
+    let script = offline::pod_script(probes);
+    driver
+        .put(&manifests::probe_pod(namespace, name, image, &script))
         .await?;
-    service["spec"]["clusterIP"]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| Error::Infrastructure("the sentinel Service has no address".into()))
+    wait_for(
+        &format!("probe Pod {namespace}/{name}"),
+        SETUP,
+        async || {
+            let pod = driver.require("v1", "Pod", Some(namespace), name).await?;
+            match pod["status"]["phase"].as_str() {
+                Some("Succeeded") => Ok(Some(())),
+                Some("Failed") => Err(Error::Infrastructure(format!(
+                    "probe Pod {namespace}/{name} failed"
+                ))),
+                _ => Ok(None),
+            }
+        },
+    )
+    .await?;
+    let logs = driver.logs(namespace, name, "probe", false).await;
+    let _ = driver.delete("v1", "Pod", Some(namespace), name).await;
+    Ok(offline::pod_results(
+        &logs,
+        &format!("Pod {namespace}/{name}"),
+        probes,
+    ))
 }
 
 async fn start_controller(live: &Live<'_>, images: &Images, progress: &mut Progress) -> Result<()> {
@@ -558,9 +805,31 @@ async fn start_controller(live: &Live<'_>, images: &Images, progress: &mut Progr
         Ok(live.controller_pod().await?.map(|_| ()))
     })
     .await?;
-    live.assert_proxy_canaries().await?;
-    progress.isolation.egress_denied = true;
+    let probes = live.assert_proxy_canaries().await?;
+    progress.isolation.probes.extend(probes);
     live.establish_baseline().await
+}
+
+/// After an interruption: whatever controller logs and object state can be
+/// read quickly, with a fresh client.
+async fn salvage(cluster: &Cluster, release: &FixtureRelease, progress: &mut Progress) {
+    let Ok(client) = cluster.admin_client().await else {
+        return;
+    };
+    let driver = Driver::new(client);
+    let control = &release.plan.ir.domain.control_namespace;
+    if let Ok(pods) = driver.pods(control, &format!("app={CONTROLLER}")).await {
+        for pod in pods.iter().filter_map(|pod| pod.metadata.name.as_deref()) {
+            for previous in [true, false] {
+                let log = driver.logs(control, pod, "controller", previous).await;
+                if !log.trim().is_empty() {
+                    progress.salvaged_log.push_str(&log);
+                    progress.salvaged_log.push('\n');
+                }
+            }
+        }
+    }
+    collect_diagnostics(&driver, release, progress).await;
 }
 
 /// Object state from both namespaces, never Secrets.
@@ -583,9 +852,21 @@ async fn collect_diagnostics(driver: &Driver, release: &FixtureRelease, progress
     }
 }
 
-/// The rollout key and every synthetic Secret value the fixtures seed.
+/// The rollout key, every synthetic Secret value the fixtures seed, and
+/// every value a managed Secret declares, in plain and stored form.
 fn initial_canaries(release: &FixtureRelease) -> BTreeSet<String> {
+    use base64::Engine as _;
     let mut canaries = BTreeSet::from([ROLLOUT_KEY.to_owned()]);
+    let strings = |data: &Value| {
+        data.as_object()
+            .map(|data| {
+                data.values()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
     for input in release
         .plan
         .ir
@@ -595,20 +876,45 @@ fn initial_canaries(release: &FixtureRelease) -> BTreeSet<String> {
     {
         let values = release
             .fixture(&input.id)
-            .and_then(|fixture| fixture["data"].as_object())
-            .map(|data| {
-                data.values()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
+            .map(|fixture| strings(&fixture["data"]))
             .unwrap_or_default();
         for value in values {
             canaries.insert(manifests::encode("Secret", &value));
             canaries.insert(value);
         }
     }
+    for resource in release
+        .plan
+        .ir
+        .resources
+        .iter()
+        .filter(|resource| resource.kind == "Secret")
+    {
+        for value in strings(&resource.desired["stringData"]) {
+            canaries.insert(manifests::encode("Secret", &value));
+            canaries.insert(value);
+        }
+        for value in strings(&resource.desired["data"]) {
+            if let Ok(plain) = base64::engine::general_purpose::STANDARD.decode(&value)
+                && let Ok(plain) = String::from_utf8(plain)
+            {
+                canaries.insert(plain);
+            }
+            canaries.insert(value);
+        }
+    }
+    canaries.retain(|canary| !canary.is_empty());
     canaries
+}
+
+async fn sentinel_ip(driver: &Driver) -> Result<String> {
+    let service = driver
+        .require("v1", "Service", Some(OUTSIDE), SENTINEL)
+        .await?;
+    service["spec"]["clusterIP"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| Error::Infrastructure("the sentinel Service has no address".into()))
 }
 
 fn crds_unchanged(crds: &[CrdManifest]) -> Result<()> {
@@ -622,64 +928,119 @@ fn crds_unchanged(crds: &[CrdManifest]) -> Result<()> {
     Ok(())
 }
 
-fn finish(
-    options: &Options,
-    progress: Progress,
-    cluster_name: Option<String>,
-    disposition: Disposition,
-    error: Option<String>,
-) -> Result<Report> {
+/// Scan everything the run wrote or reports for canaries, redact any found,
+/// and write the report.
+fn finish(options: &Options, mut progress: Progress, ending: Ending) -> Result<Report> {
     let output = &options.output;
     let diagnostics = output.join("diagnostics");
     fs::create_dir_all(&diagnostics)?;
-    let mut documents = vec![progress.controller_log.clone(), progress.egress_log.clone()];
-    for (name, items) in &progress.diagnostics {
-        let text = serde_json::to_string_pretty(items)?;
-        fs::write(diagnostics.join(format!("{name}.json")), &text)?;
-        documents.push(text);
+    let record = std::mem::take(&mut progress.record);
+    let joined =
+        |logs: &Mutex<Vec<String>>| logs.lock().map(|logs| logs.join("\n")).unwrap_or_default();
+    let controller_log = format!("{}\n{}", joined(&record.logs), progress.salvaged_log)
+        .trim()
+        .to_owned();
+    let egress_log = joined(&record.egress_logs);
+    if let Ok(canaries) = record.canaries.lock() {
+        progress.canaries.extend(canaries.iter().cloned());
     }
-    documents.push(serde_json::to_string(&progress.cases)?);
-    let borrowed = documents.iter().map(String::as_str).collect::<Vec<_>>();
-    let occurrences = report::canary_occurrences(&borrowed, &progress.canaries);
+    let (canaries, too_short) = report::searchable(&progress.canaries);
+
+    let mut files = vec![
+        (output.join("controller.log"), controller_log.clone()),
+        (output.join("egress-canary.log"), egress_log),
+        (
+            output.join("semantic-results.json"),
+            progress.semantic_results.clone(),
+        ),
+        (output.join("test-seed.json"), progress.seed.clone()),
+    ];
+    for (name, items) in &progress.diagnostics {
+        files.push((diagnostics.join(format!("{name}.json")), pretty(items)?));
+    }
+    if !progress.crd_installations.is_empty() {
+        files.push((
+            output.join("fixture-crds.json"),
+            pretty(&json!({"installations": progress.crd_installations}))?,
+        ));
+    }
+    let reported = [
+        serde_json::to_string(&progress.cases)?,
+        serde_json::to_string(&progress.isolation)?,
+        ending.error.clone().unwrap_or_default(),
+    ];
+    let documents = files
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .chain(reported.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    let occurrences = report::canary_occurrences(&documents, &canaries);
     let scan = CanaryScan {
-        canaries: progress.canaries.len(),
+        canaries: canaries.len(),
+        canaries_too_short: too_short,
         documents_scanned: documents.len(),
         occurrences,
-        controller_log_bytes: progress.controller_log.len(),
-        passed: occurrences == 0 && !progress.controller_log.trim().is_empty(),
+        controller_log_bytes: controller_log.len(),
+        passed: occurrences == 0 && !controller_log.is_empty(),
     };
-    fs::write(output.join("controller.log"), &progress.controller_log)?;
-    fs::write(output.join("egress-canary.log"), &progress.egress_log)?;
+    for (path, text) in &files {
+        fs::write(path, report::redact(text, &canaries))?;
+    }
     write_json(
         &output.join("canary-scan.json"),
         &serde_json::to_value(&scan)?,
     )?;
-    if !progress.crd_installations.is_empty() {
-        write_json(
-            &output.join("fixture-crds.json"),
-            &json!({"installations": progress.crd_installations}),
-        )?;
+
+    for row in &mut progress.cases {
+        row.detail = report::redact(&row.detail, &canaries);
     }
     let report = report::shape(Outcome {
+        runner: progress.runner,
         artifact: progress.artifact,
-        cluster_name,
-        disposition,
+        cluster: ClusterReport {
+            name: ending.name,
+            disposition: ending.disposition,
+            pod_subnet: POD_SUBNET,
+            service_subnet: SERVICE_SUBNET,
+            kubeconfig: ending.kubeconfig,
+        },
         isolation: progress.isolation,
         scan,
         cases: progress.cases,
-        error,
+        error: ending.error.map(|error| report::redact(&error, &canaries)),
+        interrupted: ending.interrupted,
     });
-    write_json(
-        &output.join("results.json"),
-        &serde_json::to_value(&report)?,
+    fs::write(
+        output.join("results.json"),
+        report::redact(&pretty(&serde_json::to_value(&report)?)?, &canaries),
     )?;
-    fs::write(output.join("junit.xml"), report::junit(&report))?;
+    fs::write(
+        output.join("junit.xml"),
+        report::redact(&report::junit(&report), &canaries),
+    )?;
     Ok(report)
 }
 
+fn pretty(value: &Value) -> Result<String> {
+    let mut text = serde_json::to_string_pretty(value)?;
+    text.push('\n');
+    Ok(text)
+}
+
 fn write_json(path: &Path, value: &Value) -> Result<()> {
-    let mut bytes = serde_json::to_vec_pretty(value)?;
-    bytes.push(b'\n');
-    fs::write(path, bytes)?;
+    fs::write(path, pretty(value)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_token_outlives_the_cases_within_the_api_server_bounds() {
+        assert_eq!(token_seconds(0), MIN_TOKEN_SECONDS);
+        assert_eq!(token_seconds(46), 600 + 46 * 30);
+        assert_eq!(token_seconds(10_000), MAX_TOKEN_SECONDS);
+        assert!(token_seconds(1) > TOKEN_MARGIN_SECONDS);
+    }
 }

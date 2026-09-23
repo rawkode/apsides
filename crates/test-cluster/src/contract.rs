@@ -29,11 +29,8 @@ pub const MUTATION_SCENARIO: &str = "reaction-contribution-removed";
 pub const ROLLOUT_KEY_ID: &str = "fixture-v1";
 pub const ROLLOUT_KEY: &str = "synthetic-fixture-key-never-production-0123456789";
 
-const FIXTURE_FILES: [&str; 3] = [
-    "fixtures.json",
-    "fixture-overlay.json",
-    "fixture-coverage.json",
-];
+/// The largest fixture document the runner reads.
+const MAX_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// A fixture release that has passed every offline check.
 #[derive(Debug)]
@@ -89,15 +86,11 @@ impl FixtureRelease {
                 "cluster tests run only a fixture release; build it with `aps build --mode fixture`",
             );
         }
-        for name in FIXTURE_FILES {
-            if !manifest.files.contains_key(name) {
-                return input(format!("fixture release is missing {name}"));
-            }
-        }
-        let read = |name: &str| -> Result<Value> {
-            Ok(compiler_core::parse_strict(&std::fs::read_to_string(
-                root.join(name),
-            )?)?)
+        let read = |name: &str| {
+            manifest.files.get(name).map_or_else(
+                || input(format!("fixture release is missing {name}")),
+                |expected| verified_document(root, name, expected),
+            )
         };
         let fixtures = read("fixtures.json")?;
         let overlay = read("fixture-overlay.json")?;
@@ -163,6 +156,28 @@ impl FixtureRelease {
             "inputs": inputs,
         })
     }
+}
+
+/// A fixture document, parsed from the same bytes whose digest is checked
+/// against the release manifest, so a file swapped after `read_release`
+/// verified it is refused rather than used.
+fn verified_document(root: &Path, name: &str, expected: &str) -> Result<Value> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    std::fs::File::open(root.join(name))?
+        .take(MAX_DOCUMENT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+        return input(format!("fixture release document {name} is oversized"));
+    }
+    if format!("sha256:{:x}", Sha256::digest(&bytes)) != expected {
+        return input(format!(
+            "fixture release document {name} differs from its manifest digest"
+        ));
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| crate::Error::Input(format!("{name} is not UTF-8")))?;
+    Ok(compiler_core::parse_strict(text)?)
 }
 
 /// Every container of every Deployment must run the local fixture image and
@@ -367,6 +382,21 @@ mod tests {
         let mut overlay_mismatch = overlay;
         overlay_mismatch["productionIrSha256"] = json!("0".repeat(64));
         assert!(validate_coverage(&plan, &fixtures, &overlay_mismatch, &coverage).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn fixture_documents_are_parsed_from_the_bytes_that_were_verified() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("fixtures.json");
+        std::fs::write(&path, br#"{"inputs":[]}"#)?;
+        let digest = format!("sha256:{:x}", Sha256::digest(br#"{"inputs":[]}"#));
+        assert_eq!(
+            verified_document(directory.path(), "fixtures.json", &digest)?,
+            json!({"inputs": []})
+        );
+        std::fs::write(&path, br#"{"inputs":[1]}"#)?;
+        assert!(verified_document(directory.path(), "fixtures.json", &digest).is_err());
         Ok(())
     }
 

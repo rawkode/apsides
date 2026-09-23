@@ -14,8 +14,9 @@ use crate::{
         self, CONTROLLER, FOREIGN_MANAGER, OUTSIDE, encode, grants_read, plural, without_create,
         without_input,
     },
-    oracle,
-    report::{Assertion, CaseRow, CaseStatus, Evidence},
+    offline::{self, PodProbe},
+    oracle::{self, Mutation},
+    report::{Assertion, CaseRow, CaseStatus, Evidence, NetworkProbe, Reach},
 };
 use base64::Engine as _;
 use compiler_core::{
@@ -27,7 +28,7 @@ use kube::Client;
 use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -51,6 +52,28 @@ const NEEDS_OBSERVED: [&str; 6] = [
     "credential-read-denial",
 ];
 
+/// Scenarios that need a managed input to act on.
+const NEEDS_MANAGED: [&str; 4] = [
+    "managed-drift-repair",
+    "managed-missing",
+    "managed-read-denial",
+    "managed-unavailable",
+];
+
+/// Reasons the controller reports for a write another field manager blocks.
+const CONFLICT_REASONS: [&str; 2] = ["field-or-version-conflict", "ownership-conflict"];
+
+/// What the cases record as they run. The suite holds it too, so an
+/// interrupted run still scans and writes what was recorded.
+#[derive(Debug, Default)]
+pub struct Record {
+    /// Controller logs from Pods that have since gone.
+    pub logs: Mutex<Vec<String>>,
+    pub egress_logs: Mutex<Vec<String>>,
+    /// Every synthetic secret value written, for the canary scan.
+    pub canaries: Mutex<BTreeSet<String>>,
+}
+
 /// The running suite: the release, the driver's and the controller's
 /// clients, and what has been observed so far.
 pub struct Live<'a> {
@@ -66,11 +89,8 @@ pub struct Live<'a> {
     pub original_rules: Vec<Value>,
     pub api_cidr: String,
     pub semantic: BTreeMap<(String, String), CaseResult>,
-    /// Controller logs from Pods that have since gone.
-    pub logs: Mutex<Vec<String>>,
-    pub egress_logs: Mutex<Vec<String>>,
-    /// Every synthetic secret value written, for the canary scan.
-    pub canaries: Mutex<BTreeSet<String>>,
+    /// What the cases have recorded, shared with the suite.
+    pub record: Arc<Record>,
 }
 
 impl Live<'_> {
@@ -116,46 +136,61 @@ impl Live<'_> {
         pods.last().and_then(|pod| pod.metadata.name.clone())
     }
 
-    pub async fn container_logs(&self, container: &str, previous: bool) -> String {
-        match self.newest_pod().await {
-            Some(pod) => {
-                self.driver
-                    .logs(&self.control, &pod, container, previous)
-                    .await
-            }
-            None => String::new(),
-        }
+    /// A container's log in the newest controller Pod, preceded by its
+    /// previous instance's log when the container restarted.
+    pub async fn container_logs(&self, container: &str) -> String {
+        let Some(pod) = self.newest_pod().await else {
+            return String::new();
+        };
+        let previous = self.driver.logs(&self.control, &pod, container, true).await;
+        let current = self
+            .driver
+            .logs(&self.control, &pod, container, false)
+            .await;
+        [previous, current]
+            .into_iter()
+            .filter(|log| !log.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
-    pub async fn proxy_logs(&self) -> String {
-        format!(
-            "{}\n{}",
-            self.container_logs("loopback-proxy", false).await,
-            self.container_logs("loopback-proxy", true).await
-        )
-    }
-
-    /// The loopback proxy's canaries: before forwarding, it must have failed
-    /// to reach both the sentinel and an external address.
-    pub async fn assert_proxy_canaries(&self) -> Result<()> {
-        wait_for("egress canaries", WAIT, async || {
-            let logs = self.proxy_logs().await;
-            Ok((logs.contains("APSIDES_EGRESS_CANARY_DENIED")
-                && logs.contains("APSIDES_NETWORK_POLICY_CANARY_DENIED"))
-            .then_some(()))
+    /// The loopback proxy's probes: before forwarding, it must have failed to
+    /// reach both the sentinel and an external address.
+    pub async fn assert_proxy_canaries(&self) -> Result<Vec<NetworkProbe>> {
+        let probes = [
+            PodProbe::tcp("controller-sentinel", "sentinel", 8080, Reach::Blocked),
+            PodProbe::tcp(
+                "controller-external-tcp",
+                offline::EXTERNAL_ADDRESS,
+                443,
+                Reach::Blocked,
+            ),
+        ];
+        let origin = format!("controller Pod in {}", self.control);
+        let results = wait_for("controller egress probes", WAIT, async || {
+            let results = offline::pod_results(
+                &self.container_logs("loopback-proxy").await,
+                &origin,
+                &probes,
+            );
+            Ok(results
+                .iter()
+                .all(|probe| probe.observed != Reach::NotRun)
+                .then_some(results))
         })
         .await?;
-        if self.proxy_logs().await.contains("UNEXPECTEDLY_CONNECTED") {
-            return Err(Error::Case(
+        if results.iter().any(|probe| !probe.passed()) {
+            return Err(Error::Infrastructure(
                 "the controller's proxy reached the network before isolation".into(),
             ));
         }
-        Ok(())
+        Ok(results)
     }
 
     pub async fn controller_logs(&self) -> String {
-        let current = self.container_logs("controller", false).await;
+        let current = self.container_logs("controller").await;
         let mut logs = self
+            .record
             .logs
             .lock()
             .map(|logs| logs.clone())
@@ -166,18 +201,18 @@ impl Live<'_> {
 
     /// Keep the current Pod's logs before it is replaced.
     pub async fn preserve_logs(&self) {
-        let controller = self.container_logs("controller", false).await;
+        let controller = self.container_logs("controller").await;
         let egress = format!(
             "{}\n{}",
-            self.container_logs("egress-preflight", false).await,
-            self.proxy_logs().await
+            self.container_logs("egress-preflight").await,
+            self.container_logs("loopback-proxy").await
         );
-        if let Ok(mut logs) = self.logs.lock()
+        if let Ok(mut logs) = self.record.logs.lock()
             && !controller.is_empty()
         {
             logs.push(controller);
         }
-        if let Ok(mut logs) = self.egress_logs.lock()
+        if let Ok(mut logs) = self.record.egress_logs.lock()
             && !egress.trim().is_empty()
         {
             logs.push(egress);
@@ -213,35 +248,25 @@ impl Live<'_> {
         Ok(())
     }
 
-    /// Status lines the controller logged that report a blocked target.
-    async fn degraded_events(&self) -> usize {
-        self.controller_logs()
-            .await
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|line| {
-                let status = &line["status"];
-                status == "degraded"
-                    || status["blocked"]
-                        .as_array()
-                        .is_some_and(|blocked| !blocked.is_empty())
-            })
-            .count()
+    /// A position in the controller's log; later reasons are read after it.
+    async fn log_mark(&self) -> usize {
+        self.controller_logs().await.lines().count()
     }
 
-    /// The most recent reason the controller logged for blocking `target`.
-    async fn blocked_reason(&self, target: &str) -> Option<String> {
+    /// The most recent reason the controller logged, after `mark`, for
+    /// blocking `target`.
+    async fn blocked_reason_since(&self, mark: usize, target: &str) -> Option<String> {
         let logs = self.controller_logs().await;
-        logs.lines()
-            .rev()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .find_map(|line| {
-                line["status"]["blocked"]
-                    .as_array()?
-                    .iter()
-                    .find(|blocked| blocked["target"] == target)
-                    .and_then(|blocked| blocked["reason"].as_str().map(str::to_owned))
-            })
+        let lines = logs.lines().collect::<Vec<_>>();
+        blocked_reason(lines.get(mark..).unwrap_or_default(), target)
+    }
+
+    /// Wait for the controller to report `target` blocked after `mark`.
+    async fn wait_blocked(&self, mark: usize, target: &str, label: &str) -> Result<String> {
+        wait_for(label, WAIT, async || {
+            Ok(self.blocked_reason_since(mark, target).await)
+        })
+        .await
     }
 
     // --- the reaction target ------------------------------------------------
@@ -309,15 +334,9 @@ impl Live<'_> {
         )
     }
 
-    async fn has_manager(&self, reaction: &Reaction, manager: &str) -> Result<bool> {
-        let object = self.target_object(reaction).await?;
-        Ok(object["metadata"]["managedFields"]
-            .as_array()
-            .is_some_and(|fields| {
-                fields
-                    .iter()
-                    .any(|field| field["manager"] == manager && field["operation"] == "Apply")
-            }))
+    /// Whether `manager` owns the target's revision annotation.
+    async fn owns_revision(&self, reaction: &Reaction, manager: &str) -> Result<bool> {
+        Ok(owns_revision(&self.target_object(reaction).await?, manager))
     }
 
     async fn wait_ready(&self, reaction: &Reaction, label: &str) -> Result<()> {
@@ -359,7 +378,7 @@ impl Live<'_> {
 
     fn remember(&self, kind: &str, value: &str) {
         if kind == "Secret"
-            && let Ok(mut canaries) = self.canaries.lock()
+            && let Ok(mut canaries) = self.record.canaries.lock()
         {
             canaries.insert(value.to_owned());
             canaries.insert(encode(kind, value));
@@ -413,7 +432,7 @@ impl Live<'_> {
     async fn expected_revision(
         &self,
         reaction: &Reaction,
-        omitted: Option<&str>,
+        mutation: Mutation<'_>,
     ) -> Result<String> {
         let plan = &self.release.plan;
         let mut observed = BTreeMap::new();
@@ -430,11 +449,11 @@ impl Live<'_> {
                 Value::Object(self.input_data(input).await?),
             );
         }
-        oracle::expected_revision(plan, &reaction.target, omitted, &observed)
+        oracle::expected_revision(plan, &reaction.target, mutation, &observed)
     }
 
     async fn wait_expected(&self, reaction: &Reaction, label: &str) -> Result<String> {
-        let expected = self.expected_revision(reaction, None).await?;
+        let expected = self.expected_revision(reaction, Mutation::None).await?;
         wait_for(label, WAIT, async || {
             Ok((self.revision(reaction).await? == expected).then_some(()))
         })
@@ -442,16 +461,24 @@ impl Live<'_> {
         Ok(expected)
     }
 
-    /// The target's revision holds at `expected` for the quiet window.
-    async fn stable(&self, reaction: &Reaction, expected: &str) -> Result<()> {
+    /// Whether the target's revision holds at `expected` for the quiet window.
+    async fn holds(&self, reaction: &Reaction, expected: &str) -> Result<bool> {
         let deadline = Instant::now() + QUIET;
         while Instant::now() < deadline {
             if self.revision(reaction).await? != expected {
-                return Err(Error::Case("unexpected target revision change".into()));
+                return Ok(false);
             }
             tokio::time::sleep(POLL).await;
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// The target's revision holds at `expected` for the quiet window.
+    async fn stable(&self, reaction: &Reaction, expected: &str) -> Result<()> {
+        if self.holds(reaction, expected).await? {
+            return Ok(());
+        }
+        Err(Error::Case("unexpected target revision change".into()))
     }
 
     // --- authorization ------------------------------------------------------
@@ -574,38 +601,64 @@ impl Live<'_> {
         row
     }
 
-    /// Check that the independent oracle notices the reaction's contribution
-    /// going missing, against the converged live target.
+    /// Check that the converged live revision differs from the oracle's
+    /// revision under each mutation of this reaction: its contribution
+    /// removed, and each input only it selects ignored. The mutations are
+    /// applied to the oracle's model, not to the controller.
     pub async fn mutation_case(&self, case: &TestCase) -> CaseRow {
         let started = Instant::now();
         let mut row = self.row(case, vec![Evidence::Cluster]);
         let outcome = async {
             let reaction = self.reaction(&case.reaction_id)?;
-            let actual = self.revision(reaction).await?;
-            let expected = self.expected_revision(reaction, None).await?;
-            let mutated = self.expected_revision(reaction, Some(&reaction.id)).await?;
-            Ok::<_, Error>(vec![
-                Assertion::new("baseline-revision", expected.clone(), actual),
-                Assertion::new(
-                    "omitted-reaction-changes-revision",
+            let live = self.revision(reaction).await?;
+            let expected = self.expected_revision(reaction, Mutation::None).await?;
+            let omitted = self
+                .expected_revision(reaction, Mutation::OmitReaction(&reaction.id))
+                .await?;
+            let mut assertions = vec![
+                Assertion::new("baseline-revision", expected, live.clone()),
+                Assertion::new("live-differs-from-omitted-reaction", true, omitted != live),
+            ];
+            let inputs = oracle::exclusive_inputs(&self.release.plan, &reaction.id);
+            for input in &inputs {
+                let ignored = self
+                    .expected_revision(
+                        reaction,
+                        Mutation::IgnoreInput {
+                            reaction: &reaction.id,
+                            input,
+                        },
+                    )
+                    .await?;
+                assertions.push(Assertion::new(
+                    &format!("live-differs-from-ignored-input:{input}"),
                     true,
-                    mutated != expected,
-                ),
-            ])
+                    ignored != live,
+                ));
+            }
+            Ok::<_, Error>((assertions, inputs.len()))
         }
         .await;
         row.seconds = started.elapsed().as_secs_f64();
         match outcome {
-            Ok(assertions) if assertions.iter().all(|item| item.passed) => {
-                row.status = CaseStatus::Passed;
-                row.detail = case.assertion.clone();
-                row.assertions = assertions;
-            }
-            Ok(assertions) => {
-                row.status = CaseStatus::Failed;
-                row.detail =
-                    "removing the reaction's contribution was not detected by the revision oracle"
-                        .into();
+            Ok((assertions, inputs)) => {
+                let failed = assertions
+                    .iter()
+                    .filter(|item| !item.passed)
+                    .map(|item| item.check_id.clone())
+                    .collect::<Vec<_>>();
+                row.status = if failed.is_empty() {
+                    CaseStatus::Passed
+                } else {
+                    CaseStatus::Failed
+                };
+                row.detail = if failed.is_empty() {
+                    format!(
+                        "the live revision differs from the oracle model with the reaction removed and with each of its {inputs} exclusive input(s) ignored; mutations are applied to the oracle model"
+                    )
+                } else {
+                    format!("mutation not distinguished: {}", failed.join(", "))
+                };
                 row.assertions = assertions;
             }
             Err(error) => {
@@ -636,6 +689,8 @@ impl Live<'_> {
             status: CaseStatus::Failed,
             evidence,
             fixture_digest: self.release.fixture_digest.clone(),
+            release_digest: self.release.release_digest.clone(),
+            overlay_digest: self.release.overlay_digest.clone(),
             case_digest,
             assertions: Vec::new(),
             detail: String::new(),
@@ -689,6 +744,12 @@ impl Live<'_> {
                 reaction.id
             )));
         }
+        if NEEDS_MANAGED.contains(&scenario) && managed.is_empty() {
+            return Err(Error::Case(format!(
+                "reaction {} has no managed input for {scenario}",
+                reaction.id
+            )));
+        }
         let selected = observed
             .first()
             .or_else(|| stimulus.first())
@@ -700,7 +761,7 @@ impl Live<'_> {
             "irrelevant-change" => self.irrelevant(reaction, selected?).await?,
             "same-value-replay" => self.replay(reaction, selected?).await?,
             "coalesced-inputs" => self.coalesced(reaction, &observed).await?,
-            "missing-input" => self.missing(case, reaction, selected?).await?,
+            "missing-input" => self.missing(reaction, selected?).await?,
             "input-returned" => self.returned(reaction, selected?).await?,
             "restart-and-relist" => self.relist(reaction, selected?).await?,
             "accepted-write-restart" => self.accepted_restart(reaction).await?,
@@ -718,15 +779,15 @@ impl Live<'_> {
         Ok(Some(assertions))
     }
 
+    /// The semantic runner's typed primitive result is the evidence: it
+    /// checked the block reason for every input of the case.
     fn semantic_only(&self, case: &TestCase) -> Result<Vec<Assertion>> {
-        self.semantic_passed(case)?;
-        let reason = case.scenario.trim_end_matches("-input");
-        let mut assertions = vec![Assertion::new("block-reason", reason, reason)];
-        if case.scenario == "invalid-input" {
-            assertions.push(Assertion::new("sensitive-data-exposed", false, false));
-        }
-        assertions.push(Assertion::new("target-mutations", 0, 0));
-        Ok(assertions)
+        let row = self.semantic_row(case)?;
+        Ok(vec![Assertion::new(
+            "semantic-status",
+            "passed",
+            serde_json::to_value(&row.status)?,
+        )])
     }
 
     async fn initial(&self, reaction: &Reaction) -> Result<Vec<Assertion>> {
@@ -845,26 +906,20 @@ impl Live<'_> {
         ])
     }
 
-    async fn missing(
-        &self,
-        case: &TestCase,
-        reaction: &Reaction,
-        input: &Input,
-    ) -> Result<Vec<Assertion>> {
+    async fn missing(&self, reaction: &Reaction, input: &Input) -> Result<Vec<Assertion>> {
         let before = self.revision(reaction).await?;
         let generation = self.generation(reaction).await?;
         let saved = self.input_data(input).await?;
+        let mark = self.log_mark().await;
         let observed = async {
             self.delete_input(input).await?;
+            let reason = self
+                .wait_blocked(mark, &reaction.target, "missing input reported")
+                .await?;
             self.stable(reaction, &before).await?;
             let preserved = self.ready(reaction).await? && self.revision(reaction).await? == before;
             let mutations = self.generation(reaction).await? - generation;
-            if !preserved {
-                return Err(Error::Case(
-                    "missing input disrupted the retained target".into(),
-                ));
-            }
-            Ok((preserved, mutations))
+            Ok::<_, Error>((reason, preserved, mutations))
         }
         .await;
         let recovered = async {
@@ -875,15 +930,10 @@ impl Live<'_> {
                 .await
         }
         .await;
-        let (preserved, mutations) = observed?;
+        let (reason, preserved, mutations) = observed?;
         recovered?;
-        let semantic = self.semantic_row(case)?.status == SemanticStatus::Passed;
         Ok(vec![
-            Assertion::new(
-                "block-reason",
-                "missing",
-                if semantic { "missing" } else { "failed" },
-            ),
+            Assertion::new("block-reason", format!("{}:missing", input.id), reason),
             Assertion::new("target-mutations", 0, mutations),
             Assertion::new("target-preserved", true, preserved),
         ])
@@ -1037,6 +1087,8 @@ impl Live<'_> {
         Ok(desired)
     }
 
+    /// With force approved, the controller takes the revision annotation back
+    /// from a foreign field manager.
     async fn forced_conflict(&self, reaction: &Reaction) -> Result<Vec<Assertion>> {
         let uid = |object: &Value| object["metadata"]["uid"].as_str().map(str::to_owned);
         let original = uid(&self.target_object(reaction).await?);
@@ -1047,21 +1099,24 @@ impl Live<'_> {
                 true,
             )
             .await?;
-        let expected = self.expected_revision(reaction, None).await?;
+        let expected = self.expected_revision(reaction, Mutation::None).await?;
         wait_for("approved force reconciles conflict", WAIT, async || {
-            Ok(
-                (self.revision(reaction).await? == expected && self.ready(reaction).await?)
-                    .then_some(()),
-            )
+            Ok((self.revision(reaction).await? == expected).then_some(()))
         })
         .await?;
+        self.wait_ready(reaction, "forced conflict readiness")
+            .await?;
         Ok(vec![
             Assertion::new(
-                "force-applied",
+                "controller-owns-revision",
                 true,
-                self.revision(reaction).await? == expected,
+                self.owns_revision(reaction, &self.domain_manager).await?,
             ),
-            Assertion::new("target-converged", true, self.ready(reaction).await?),
+            Assertion::new(
+                "foreign-manager-displaced",
+                true,
+                !self.owns_revision(reaction, FOREIGN_MANAGER).await?,
+            ),
             Assertion::new(
                 "uid-preserved",
                 true,
@@ -1070,25 +1125,24 @@ impl Live<'_> {
         ])
     }
 
+    /// Without force, a foreign field manager's value stays and the controller
+    /// reports the conflict.
     async fn conflict(&self, reaction: &Reaction) -> Result<Vec<Assertion>> {
-        let degraded = self.degraded_events().await;
         let foreign_value = format!("foreign-{}", reaction.id);
         let foreign = self.with_revision(reaction, &foreign_value)?;
-        let repaired =
-            self.with_revision(reaction, &self.expected_revision(reaction, None).await?)?;
+        let repaired = self.with_revision(
+            reaction,
+            &self.expected_revision(reaction, Mutation::None).await?,
+        )?;
+        let mark = self.log_mark().await;
         let observed = async {
             self.driver.apply(&foreign, FOREIGN_MANAGER, true).await?;
-            wait_for("field conflict reported", WAIT, async || {
-                Ok((self.degraded_events().await > degraded).then_some(()))
-            })
-            .await?;
-            let forced = self.revision(reaction).await? != foreign_value;
-            if forced {
-                return Err(Error::Case(
-                    "the controller forced ownership through a conflict".into(),
-                ));
-            }
-            Ok((forced, self.has_manager(reaction, FOREIGN_MANAGER).await?))
+            let reason = self
+                .wait_blocked(mark, &reaction.target, "field conflict reported")
+                .await?;
+            let held = self.holds(reaction, &foreign_value).await?;
+            let owned = self.owns_revision(reaction, FOREIGN_MANAGER).await?;
+            Ok::<_, Error>((reason, held, owned))
         }
         .await;
         let repair = async {
@@ -1099,16 +1153,12 @@ impl Live<'_> {
                 .await
         }
         .await;
-        let (forced, foreign_preserved) = observed?;
+        let (reason, held, owned) = observed?;
         repair?;
         Ok(vec![
-            Assertion::new(
-                "conflict-reported",
-                true,
-                self.degraded_events().await > degraded,
-            ),
-            Assertion::new("force-applied", false, forced),
-            Assertion::new("foreign-field-preserved", true, foreign_preserved),
+            Assertion::one_of("conflict-reported", &CONFLICT_REASONS, Some(&reason)),
+            Assertion::new("force-applied", false, !held),
+            Assertion::new("foreign-field-preserved", true, held && owned),
         ])
     }
 
@@ -1237,6 +1287,9 @@ impl Live<'_> {
         Ok(assertions)
     }
 
+    /// The managed source is deleted while the controller may not create it:
+    /// the controller must report its write blocked and the dependent target
+    /// blocked on that managed input, and change nothing.
     async fn managed_missing(
         &self,
         reaction: &Reaction,
@@ -1244,7 +1297,7 @@ impl Live<'_> {
     ) -> Result<Vec<Assertion>> {
         let before = self.revision(reaction).await?;
         let generation = self.generation(reaction).await?;
-        let (mut all_missing, mut all_denied) = (true, true);
+        let mut assertions = Vec::new();
         for input in managed {
             let resource = self.managed_resource(input)?;
             let absent = async || {
@@ -1260,6 +1313,7 @@ impl Live<'_> {
                         .is_none(),
                 )
             };
+            let mark = self.log_mark().await;
             let checked = async {
                 self.scale_controller(0).await?;
                 self.set_rules(&without_create(&self.original_rules, &input.kind))
@@ -1273,12 +1327,12 @@ impl Live<'_> {
                     )
                     .await?;
                 self.scale_controller(1).await?;
-                wait_for(
-                    &format!("managed source remains absent: {}", input.id),
-                    WAIT,
-                    async || Ok(absent().await?.then_some(())),
-                )
-                .await?;
+                let dependent = self
+                    .wait_blocked(mark, &reaction.target, "dependent target blocked")
+                    .await?;
+                let source = self
+                    .wait_blocked(mark, &resource.id, "managed source write blocked")
+                    .await?;
                 let repair = self
                     .runtime_api(
                         "POST",
@@ -1292,7 +1346,7 @@ impl Live<'_> {
                     .await?;
                 let missing = absent().await?;
                 self.stable(reaction, &before).await?;
-                Ok::<_, Error>((missing, repair))
+                Ok::<_, Error>((dependent, source, missing, repair))
             }
             .await;
             let restored = async {
@@ -1309,19 +1363,25 @@ impl Live<'_> {
                 .await
             }
             .await;
-            let (missing, repair) = checked?;
+            let (dependent, source, missing, repair) = checked?;
             restored?;
-            all_missing &= missing;
-            all_denied &= repair == 403;
+            assertions.extend([
+                // A managed source the controller could not apply is not
+                // authoritative, which the runtime reports as unavailable.
+                Assertion::new(
+                    "block-reason",
+                    format!("{}:unavailable", input.id),
+                    dependent,
+                ),
+                Assertion::new(
+                    "managed-source-write",
+                    "kubernetes-write-unavailable",
+                    source,
+                ),
+                Assertion::new("managed-source-absent", true, missing),
+                Assertion::new("repair-http-status", 403, repair),
+            ]);
         }
-        let mut assertions = vec![
-            Assertion::new(
-                "block-reason",
-                "missing",
-                if all_missing { "missing" } else { "present" },
-            ),
-            Assertion::new("repair-denied", true, all_denied),
-        ];
         assertions.extend(
             self.unchanged(reaction, &before, generation, "target-mutations")
                 .await?,
@@ -1383,7 +1443,7 @@ impl Live<'_> {
     async fn managed_unavailable(&self, reaction: &Reaction) -> Result<Vec<Assertion>> {
         let before = self.revision(reaction).await?;
         let generation = self.generation(reaction).await?;
-        let degraded = self.degraded_events().await;
+        let mark = self.log_mark().await;
         self.set_api_egress(false).await?;
         let observed = async {
             let pod = self.controller_pod().await?.ok_or_else(|| {
@@ -1397,14 +1457,15 @@ impl Live<'_> {
                     &["nginx", "-c", "/tmp/apsides-nginx.conf", "-s", "stop"],
                 )
                 .await?;
-            wait_for("managed source transport unavailable", WAIT, async || {
-                Ok((self.degraded_events().await > degraded).then_some(()))
-            })
-            .await?;
-            let failure = self.degraded_events().await > degraded;
-            let reason = self.blocked_reason(&reaction.target).await;
+            let reason = self
+                .wait_blocked(
+                    mark,
+                    &reaction.target,
+                    "managed source transport unavailable",
+                )
+                .await?;
             self.stable(reaction, &before).await?;
-            Ok::<_, Error>((failure, reason))
+            Ok::<_, Error>(reason)
         }
         .await;
         let reopened = async {
@@ -1413,20 +1474,20 @@ impl Live<'_> {
             self.scale_controller(1).await
         }
         .await;
-        let (failure, reason) = observed?;
+        let reason = observed?;
         reopened?;
         self.wait_expected(reaction, "managed source transport restored")
             .await?;
-        let reason = reason.map(|reason| {
-            if reason.ends_with("unavailable") {
-                "unavailable".to_owned()
-            } else {
-                reason
-            }
-        });
+        // Every input is unreachable, so the reason may name any of them.
+        let (input, kind) = reason.rsplit_once(':').unwrap_or_default();
+        let inputs = reaction
+            .inputs
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         let mut assertions = vec![
-            Assertion::new("transport-failure-observed", true, failure),
-            Assertion::new("block-reason", "unavailable", reason),
+            Assertion::new("block-reason", "unavailable", kind),
+            Assertion::one_of("blocked-input", &inputs, Some(input)),
         ];
         assertions.extend(
             self.unchanged(reaction, &before, generation, "target-mutations")
@@ -1434,6 +1495,37 @@ impl Live<'_> {
         );
         Ok(assertions)
     }
+}
+
+/// The last reason in `lines` the controller gave for blocking `target`.
+fn blocked_reason(lines: &[&str], target: &str) -> Option<String> {
+    lines
+        .iter()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|line| {
+            line["status"]["blocked"]
+                .as_array()?
+                .iter()
+                .find(|blocked| blocked["target"] == target)
+                .and_then(|blocked| blocked["reason"].as_str().map(str::to_owned))
+        })
+}
+
+/// Whether `manager`'s managed-fields entry on `object` covers the Pod
+/// template's revision annotation.
+fn owns_revision(object: &Value, manager: &str) -> bool {
+    let annotation = format!("f:{REVISION_ANNOTATION}");
+    object["metadata"]["managedFields"]
+        .as_array()
+        .is_some_and(|fields| {
+            fields.iter().any(|field| {
+                field["manager"] == manager
+                    && field["fieldsV1"]["f:spec"]["f:template"]["f:metadata"]["f:annotations"]
+                        .get(&annotation)
+                        .is_some()
+            })
+        })
 }
 
 fn phase(pod: &Pod) -> &str {
@@ -1468,4 +1560,39 @@ pub fn mutation_cases(release: &FixtureRelease) -> Vec<TestCase> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_latest_blocked_reason_for_a_target_is_read_after_a_mark() {
+        let log = [
+            r#"{"status":{"applied":[],"blocked":[{"target":"deployment-api","reason":"a:missing"}]}}"#,
+            "not json",
+            r#"{"status":{"applied":["deployment-api"],"blocked":[{"target":"configmap","reason":"kubernetes-write-unavailable"}]}}"#,
+        ];
+        assert_eq!(
+            blocked_reason(&log, "deployment-api").as_deref(),
+            Some("a:missing")
+        );
+        assert_eq!(blocked_reason(&log[1..], "deployment-api"), None);
+        assert_eq!(
+            blocked_reason(&log, "configmap").as_deref(),
+            Some("kubernetes-write-unavailable")
+        );
+    }
+
+    #[test]
+    fn revision_ownership_is_read_from_managed_fields() {
+        let annotation = format!("f:{REVISION_ANNOTATION}");
+        let object = json!({"metadata": {"managedFields": [
+            {"manager": "apsides-unit", "operation": "Apply", "fieldsV1": {"f:spec": {"f:template":
+                {"f:metadata": {"f:annotations": {annotation: {}}}}}}},
+            {"manager": FOREIGN_MANAGER, "operation": "Apply", "fieldsV1": {"f:spec": {"f:replicas": {}}}},
+        ]}});
+        assert!(owns_revision(&object, "apsides-unit"));
+        assert!(!owns_revision(&object, FOREIGN_MANAGER));
+    }
 }

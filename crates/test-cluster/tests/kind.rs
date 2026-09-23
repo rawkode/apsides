@@ -29,8 +29,9 @@ async fn every_generated_case_passes_on_a_disposable_cluster() -> Result {
         crds: Vec::new(),
         output: output.path().join("results"),
         keep_cluster: false,
+        progress: None,
     };
-    let report = test_cluster::run(&options).await?;
+    let report = test_cluster::run(&options, std::future::pending()).await?;
     let failed = report
         .cases
         .iter()
