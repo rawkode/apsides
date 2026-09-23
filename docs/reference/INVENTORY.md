@@ -88,70 +88,35 @@ successor archives them.
 
 ## Current limits
 
-The local storage qualification is available through cuenv:
+`cuenv task inventoryTest` and `cuenv task coordinationTest` run the durability
+tests in `crates/inventory/tests/durability.rs` and
+`crates/coordination/tests/durability/`. Each test uses a SQLite file in a
+temporary directory.
 
-```sh
-cuenv task storageProbeTest
-cuenv task storageBuildTest
-cuenv task storageRestartTest
-cuenv exec python3 tests/storage/build.py --output work/storage-image
-cuenv exec python3 tests/run_storage_restart.py --image-directory work/storage-image --output work/storage-results
-```
+- Inventory: a canonical snapshot larger than 1 MiB holds only metadata. History
+  survives reopening. Two conditional publishers against one revision produce
+  one success and one conflict. Rolling back an uncommitted head change with a
+  populated rollback journal leaves the committed head in place. A database
+  under a missing directory fails to open.
+- Claim, review and audit records: a seeded database reopens read-only with
+  exact records, and each write through the read-only handle is rejected. Two
+  concurrent writers both keep their content-addressed reviews. Of two audits
+  for one transition, exactly one is stored and the other gets an exact
+  conflict.
+- Backup: the test copies all four stores into one standalone file with
+  parameterized SQLite `VACUUM INTO`, then syncs the file and its directory. The
+  copy reopens through both read-only backends with exact records and inventory
+  history, and later source writes do not appear in it. An existing destination
+  is refused. Missing or truncated backups fail without repair.
 
-Use fresh output directories. The live harness creates and removes its own kind
-cluster and isolated kubeconfig. Its static local PV uses the disposable node's
-filesystem. It checks inventory larger than 1 MiB, retained snapshots across Pods,
-concurrent conditional publication, rollback after a writer SIGKILL, and read-only
-storage refusal. This does not qualify CSI storage, node or power failure, remote
-writer fencing, or interruption inside inventory publication. Build outputs
-and results remain ignored; the image is a test artifact, not a production release.
-
-The local-PV qualification passed with a 2,220,976-byte canonical inventory,
-separate-Pod history reads, one successful and one conflicting publisher, and
-recovery after SIGKILL with an observed populated rollback journal. Read-only
-refusal and subsequent healthy reopen also passed. These results cover the
-inventory store on the tested local PV, not the other durable stores.
-
-Current-format claim, review and audit records separately passed a writable
-seed followed by exact reference/body verification in a second Pod on the same
-local PV. The second Pod mounted the volume read-only, and all three store write
-methods rejected writes. Competing writer Pods also passed: identical claims
-were idempotent, distinct reviews at one scope both persisted, and two audit
-candidates for one immutable transition produced one winner and one exact
-conflict. A fresh read-only Pod verified both seed and race records, including
-rejection of the losing audit reference. This uses small synthetic fixtures and
-does not prove transaction overlap, cross-store atomicity, crash recovery or backup.
-
-```sh
-cuenv exec python3 tests/storage/build.py --package coordination --output work/coordination-image
-cuenv exec python3 tests/run_coordination_restart.py --image-directory work/coordination-image --output work/coordination-results
-```
-
-Local backup tests (`cuenv task coordinationProbeTest`) seed all four stores in
-one database and use parameterized SQLite `VACUUM INTO` to create one standalone
-backup. They synchronize the completed file and its parent directory, reopen it
-through both read-only backends, verify exact records and inventory history, and
-check that later source writes are absent. Existing destinations are refused;
-missing or truncated backups fail without repair. This is local filesystem test
-evidence, not power-loss durability or authority to resume a deploy.
-
-The live backup qualification also passed on two distinct local PVCs. A backup
-Pod mounted the source read-only and the destination writable; a later Pod
-changed all four source stores. The verifier mounted only the backup PVC,
-read-only, and recovered the original records and inventory revision 2 while
-excluding the later source revision 3 and its metadata. The two volumes share
-one node, so this does not establish independent failure domains, node-loss
-recovery, or a production restore procedure.
-
-```sh
-cuenv exec python3 tests/run_storage_backup.py --image-directory work/coordination-image --output work/backup-results
-```
+The write-failure and process-crash tests are described above. None of these
+tests covers persistent volumes, CSI storage, node or power loss, remote writer
+fencing, interruption inside inventory publication, cross-store atomicity or a
+production restore procedure.
 
 Canonical state and completion-envelope budgets reject oversized records before
 publication. The implementation does not provide snapshot garbage collection,
-cross-executor takeover, automatic recovery for missing authority, or completed
-live qualification of persistent-volume recovery for
-claim, review and audit stores after interrupted writes.
+cross-executor takeover or automatic recovery for missing authority.
 
 See [Inventory, prune and upgrades](/concepts/inventory-prune-upgrades/),
 [Transition audit history](/reference/audit/), [State capacity](/reference/state-capacity/),

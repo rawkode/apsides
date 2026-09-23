@@ -17,11 +17,11 @@ narrower properties.
 - `cuenv task packageCli` builds a relocatable macOS/Linux CLI prefix with
   compiler dependencies and the native build source closure. Distribution builds
   verify the exact asset tree against a manifest digest embedded in the executable.
-  A relocated macOS development-profile bundle passed init, CNPG import, locking,
-  compilation and artifact verification with checkout reads denied; six asset
-  tamper/removal checks failed without publishing projects. A separate checkout-denied
-  build produced the Linux/arm64 controller, OCI image and SBOM. Linux-host execution
-  remains unqualified.
+  Unit tests in `crates/cli/src/assets.rs` check that an added, changed or
+  removed asset fails verification, including the compiler, SDK, lockfile, a
+  linked dependency, the runtime crate and the native builder, and that the
+  restored tree passes again. `cuenv task packageCliTest` covers the packaging
+  script. No test runs a relocated bundle with checkout reads denied.
 - Imported namespaced resources retain their explicit plural, scope and schema
   digest through compilation and deployment review. Force apply remains a
   per-resource choice requiring explicit policy acceptance, including custom
@@ -153,11 +153,16 @@ and containers were preserved.
 
 Two fresh cache-disabled builds in `work/cnpg-reproducibility-968224c` matched
 one another and the corrected signed candidate's binary, OCI image, compiler
-closure, and payload identities. `work/cnpg-input-isolation-968224c` compiled the
-declared-input control and rejected undeclared imports, clock, random,
-environment, filesystem, and network access with the expected reasons. This
-measures the declared-module and SES capability boundary, not independent OS
-syscall or network isolation.
+closure, and payload identities.
+
+`cuenv task authorCompilerTest` checks the declared-input and SES capability
+boundary on every CI run. A program importing a declared module compiles. An
+undeclared import fails at typecheck with a diagnostic that names the module and
+the importing source line. A dynamic import fails while bundling. Clock,
+random, environment, filesystem read, network, WebAssembly, stream,
+constructor-escape and prototype-mutation attempts each fail during evaluation
+with their own diagnostic, raised inside the program's default export. These
+tests do not check operating-system syscall or network isolation.
 
 Fresh reservation qualification passed in
 `work/cnpg-deployment-ceiling-35187dd` and `work/cnpg-ownership-35187dd`.
@@ -236,9 +241,8 @@ A test-only interruption hook can pause after an exact validated registry CAS,
 allow the parent harness to inspect the protected phase, and remain parked until
 the owned child is killed and reaped. It is excluded from production builds.
 
-Local storage, coordination-write and backup qualification detail lives in
-[resource inventory](/reference/inventory/#current-limits) and is not
-duplicated here.
+The local SQLite durability tests for inventory, claim, review and audit
+records are described in [resource inventory](/reference/inventory/#current-limits).
 
 ## Remaining production work
 
@@ -264,9 +268,8 @@ duplicated here.
   executor label alone does not establish that the previous executor cannot
   proceed. The spec includes the trusted deployment job in its trusted computing
   base and forbids requiring a new broadly privileged coordinator.
-- Complete claim, review and audit persistent-volume interrupted-write
-  qualification, and qualify unavailable-storage, conflict and recovery
-  behavior for the local SQLite metadata store.
+- The SQLite metadata store is tested on the local filesystem only. Persistent
+  volumes, node loss, power loss and remote storage are not tested.
 - Complete production API authorization and admission qualification for the
   supported Kubernetes versions, including the declared preview permissions and
   request-drain profile.

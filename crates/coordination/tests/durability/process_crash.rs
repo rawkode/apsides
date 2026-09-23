@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const CHILD_TEST: &str = "process_crash::local_coordination_sigkill_child";
+const CHILD_TEST: &str = "process_crash::sigkill_child";
 const CHILD_NONCE_ENV: &str = "APSIDES_COORDINATION_CRASH_CHILD_NONCE";
 const CHILD_PATH_ENV: &str = "APSIDES_COORDINATION_CRASH_CHILD_PATH";
 const CHILD_READY_ENV: &str = "APSIDES_COORDINATION_CRASH_CHILD_READY";
@@ -124,6 +124,17 @@ impl Drop for OwnedChild {
             }
         }
     }
+}
+
+fn validate_nonce(value: &str) -> TestResult {
+    if value.len() != 32
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("coordination crash child requires a lowercase 32-hex nonce".into());
+    }
+    Ok(())
 }
 
 fn pragma_integer(connection: &Connection, query: &'static str) -> TestResult<i64> {
@@ -610,13 +621,13 @@ async fn run_crash_case(kind: StoreKind) -> TestResult {
 
 #[tokio::test]
 #[ignore = "invoked only as the bounded SIGKILL recovery child"]
-async fn local_coordination_sigkill_child() -> TestResult {
+async fn sigkill_child() -> TestResult {
     let (path, ready, nonce, kind) = child_configuration()?;
     hold_uncommitted_candidate(&path, &ready, &nonce, kind)
 }
 
 #[tokio::test]
-async fn local_sigkill_recovery_rolls_back_each_current_coordination_store() -> TestResult {
+async fn sigkill_recovery_rolls_back_each_current_coordination_store() -> TestResult {
     for kind in StoreKind::ALL {
         run_crash_case(kind).await?;
     }
