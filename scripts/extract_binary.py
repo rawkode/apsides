@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 """Extract the native binary from the final layer of a built OCI layout archive."""
 import argparse
-import gzip
-import hashlib
 import io
 import json
 from pathlib import Path, PurePosixPath
 import re
 import tarfile
 
-from package_oci import MAX_IMAGE_METADATA, read_regular, sha256
+from package_oci import ANCESTORS, MAX_IMAGE_METADATA, OCI_LAYER, TARGET, read_regular, sha256
 
-TARGET = "usr/local/bin/apsides-controller"
-ANCESTORS = {"usr", "usr/local", "usr/local/bin"}
 MAX_LAYER_BYTES = 512 * 1024 * 1024
 
 
@@ -53,7 +49,7 @@ def _controller(layer):
                 found = entries.extractfile(entry).read()
             else:
                 raise ValueError("final image layer holds more than the controller")
-    if found is None or directories != ANCESTORS:
+    if found is None or directories != set(ANCESTORS):
         raise ValueError("final image layer does not hold the controller")
     return found
 
@@ -63,7 +59,6 @@ def extract(image, output):
     if output.exists():
         raise ValueError("binary output already exists")
     packaging = json.loads(read_regular(image / "packaging-inputs.json"))
-    reported = json.loads(read_regular(image / "buildkit-metadata.json"))
     image_digest = packaging["imageDigest"]
     if not re.fullmatch("sha256:[0-9a-f]{64}", image_digest):
         raise ValueError("invalid packaged image digest")
@@ -75,28 +70,26 @@ def extract(image, output):
         if len(manifests) != 1 or manifests[0]["digest"] != image_digest:
             raise ValueError("OCI archive does not select the packaged image")
         manifest = json.loads(_blob(contents, files, manifests[0]))
-        if manifest["config"]["digest"] != reported.get("containerimage.config.digest"):
-            raise ValueError("OCI archive config differs from the image BuildKit built")
         config = json.loads(_blob(contents, files, manifest["config"]))
         final = manifest["layers"][-1]
         layer = _blob(contents, files, final, MAX_LAYER_BYTES)
     platform = f"{config.get('os')}/{config.get('architecture')}"
     if platform != packaging["builder"]["platform"]:
         raise ValueError("OCI image platform differs from the build platform")
-    if final["mediaType"] == "application/vnd.oci.image.layer.v1.tar+gzip":
-        layer = gzip.decompress(layer)
-    elif final["mediaType"] != "application/vnd.oci.image.layer.v1.tar":
-        raise ValueError("unsupported final layer media type")
+    if final["mediaType"] != OCI_LAYER:
+        raise ValueError("the final layer must be stored uncompressed")
     if sha256(layer) != config["rootfs"]["diff_ids"][-1]:
         raise ValueError("final layer differs from its diff ID")
     binary = _controller(layer)
     machine = {"linux/arm64": 183, "linux/amd64": 62}.get(platform)
     if len(binary) < 64 or binary[:6] != b"\x7fELF\x02\x01" or int.from_bytes(binary[18:20], "little") != machine:
         raise ValueError("image does not contain the expected native Linux controller")
+    binary_digest = sha256(binary)
+    if binary_digest != packaging["binaryDigest"]:
+        raise ValueError("image controller differs from the binary BuildKit built")
     output.mkdir(parents=True)
     (output / "apsides-controller").write_bytes(binary)
     (output / "apsides-controller").chmod(0o755)
-    binary_digest = "sha256:" + hashlib.sha256(binary).hexdigest()
     (output / "binary-extraction.json").write_text(json.dumps({
         "schemaVersion": "apsides.dev/binary-extraction/v1", "imageDigest": image_digest,
         "binaryDigest": binary_digest, "platform": platform,

@@ -173,9 +173,9 @@ fn verify_layers(
         .as_array()
         .ok_or_else(|| crate::Error::Rejected("approved base diff IDs missing".into()))?;
     // Base layers are compared by diff ID, not by the approved manifest's
-    // compressed descriptors: Docker's classic store exports them
-    // uncompressed. Every layer below is decompressed and hashed against its
-    // diff ID, so compression cannot substitute content.
+    // compressed descriptors: the build stores every layer uncompressed.
+    // Every layer below is decompressed and hashed against its diff ID, so
+    // compression cannot substitute content.
     if layers.len() != diff_ids.len()
         || diff_ids.len() != base_diff_ids.len() + 1
         || diff_ids.get(..base_diff_ids.len()) != Some(base_diff_ids.as_slice())

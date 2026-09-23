@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-from package_oci import ROOT, read_regular, saved_image, verify_context
+from package_oci import ROOT, read_regular, runtime_closure, verify_context
 from toolchain_snapshot import public as public_tools, verify as verify_tools
 
 
@@ -14,65 +14,6 @@ def canonical(value):
 
 def digest(data):
     return "sha256:" + hashlib.sha256(data).hexdigest()
-
-
-RUNTIME_PINS = ROOT / "scripts/runtime-base"
-
-
-def pinned_blob(pins, value, size=None):
-    """Exact registry bytes committed under scripts/runtime-base, by digest."""
-    if not isinstance(value, str) or not value.startswith("sha256:") or len(value) != 71:
-        raise ValueError("runtime base pins require SHA-256 descriptors")
-    path = pins / "blobs/sha256" / value[7:]
-    if not path.is_file():
-        raise ValueError("the runtime base is not pinned; run `cuenv task runtimeBasePin`")
-    data = read_regular(path)
-    if digest(data) != value or (size is not None and len(data) != size):
-        raise ValueError("runtime base pin differs from its digest")
-    return data
-
-
-def runtime_closure(archive, runtime, pins=RUNTIME_PINS):
-    """Verify, offline, the pinned base index -> platform manifest -> saved config chain.
-
-    The index and manifest are the registry bytes committed as pins; the
-    config is what `docker image save` of the pinned base holds, in whichever
-    format the local image store writes. The saved image must be the one
-    `docker image inspect` matched to the pinned digest: the classic store
-    names an image by its config digest, the containerd store by the index it
-    pulled.
-    """
-    reference, platform = runtime["reference"], runtime["platform"]
-    index_raw = pinned_blob(pins, reference.rsplit("@", 1)[1])
-    index = json.loads(index_raw)
-    if index.get("mediaType") != "application/vnd.oci.image.index.v1+json":
-        raise ValueError("pinned runtime base must be an OCI image index")
-    os_name, architecture = platform.split("/")
-    matches = [item for item in index.get("manifests", [])
-               if item.get("platform", {}).get("os") == os_name and item.get("platform", {}).get("architecture") == architecture]
-    if len(matches) != 1:
-        raise ValueError("pinned runtime base index must select exactly one platform manifest")
-    manifest_raw = pinned_blob(pins, matches[0]["digest"], matches[0]["size"])
-    manifest = json.loads(manifest_raw)
-    if manifest.get("mediaType") != "application/vnd.oci.image.manifest.v1+json":
-        raise ValueError("pinned runtime base platform entry must be an OCI manifest")
-    image = saved_image(archive, platform)
-    if runtime["localImageId"] not in {image["root"], digest(image["config"])}:
-        raise ValueError("saved runtime base differs from the inspected pinned image")
-    if (manifest["config"]["digest"] != digest(image["config"])
-            or manifest["config"]["size"] != len(image["config"])):
-        raise ValueError("saved runtime base config differs from the pinned manifest")
-    layers = manifest.get("layers", [])
-    if len(layers) != len(image["layers"]):
-        raise ValueError("saved runtime base layers differ from the pinned manifest")
-    for pinned, saved in zip(layers, image["layers"]):
-        # An uncompressed saved layer is named by its diff ID, already checked
-        # against the config; a compressed one must be the registry blob.
-        if saved["mediaType"] == pinned["mediaType"] and saved["digest"] != pinned["digest"]:
-            raise ValueError("saved runtime base layer differs from the pinned manifest")
-    return {"baseImage": {"reference": reference, "platform": platform},
-            "indexJson": index_raw.decode("utf-8"), "manifestJson": manifest_raw.decode("utf-8"),
-            "configJson": image["config"].decode("utf-8")}
 
 
 PACKAGING_SOURCES = [
