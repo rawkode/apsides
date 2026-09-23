@@ -81,7 +81,7 @@ yet qualified.
 
 ## Development tasks
 
-Use cuenv 0.55.0 with the pinned schema in `cue.mod/module.cue`:
+Use cuenv 0.56.1 with the pinned schema in `cue.mod/module.cue`:
 
 ```sh
 cuenv task build           # Build the CLI and its generated prerequisites

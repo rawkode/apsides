@@ -4,6 +4,11 @@ import "github.com/cuenv/cuenv/schema"
 
 schema.#Project & {name: "apsides"}
 
+// cuenv runs tasks hermetically by default, in a directory holding only
+// their declared inputs. Every task here reads the whole checkout (the Cargo
+// workspace, Deno packages, docs and examples), so they run in the workspace.
+tasks: [_]: hermetic: false
+
 tasks: {
 	authoringEditorCheck: {
 		dependsOn: [build, install]
@@ -13,17 +18,11 @@ tasks: {
 	packageCli: {command: "python3", args: ["scripts/package_cli.py", "--output", "work/aps-distribution", "--target-dir", "work/cli-package-target"]}
 	packageCliTest: {command: "python3", args: ["tests/test_package_cli.py"]}
 	packagingTest: {command: "python3", args: ["tests/test_packaging.py"]}
-	cnpgCleanupTypes: [
-		{
-			dependsOn: [install]
-			command: "deno"
-			args: ["run", "--allow-all", "packages/compiler/src/crds.ts", "https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_clusters.yaml", "Cluster", "examples/cnpg/cleanup/.aps/crds/cnpg.ts", "v1"]
-		},
-		{
-			command: "deno"
-			args: ["run", "--allow-all", "packages/compiler/src/crds.ts", "https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_backups.yaml", "Backup", "examples/cnpg/cleanup/.aps/crds/backup.ts", "v1"]
-		},
-	]
+	cnpgCleanupTypes: {
+		dependsOn: [install]
+		command: "sh"
+		args: ["-c", "deno run --allow-all packages/compiler/src/crds.ts https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_clusters.yaml Cluster examples/cnpg/cleanup/.aps/crds/cnpg.ts v1 && deno run --allow-all packages/compiler/src/crds.ts https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_backups.yaml Backup examples/cnpg/cleanup/.aps/crds/backup.ts v1"]
+	}
 	cnpgInitialTypes: {
 		dependsOn: [install]
 		command: "deno"
@@ -41,10 +40,7 @@ tasks: {
 	compilerCoreTest: {command: "cargo", args: ["test", "--locked", "-p", "compiler-core"]}
 	inventoryCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "inventory", "--all-targets", "--", "-D", "warnings"]}
 	compilerCoreCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "compiler-core", "--all-targets", "--", "-D", "warnings"]}
-	coordinationCheck: [
-		{command: "cargo", args: ["clippy", "--locked", "-p", "coordination", "--all-targets", "--", "-D", "warnings"]},
-		{command: "cargo", args: ["check", "--locked", "-p", "coordination", "--no-default-features"]},
-	]
+	coordinationCheck: {command: "sh", args: ["-c", "cargo clippy --locked -p coordination --all-targets -- -D warnings && cargo check --locked -p coordination --no-default-features"]}
 	registryRuntimeCheck: {command: "cargo", args: ["check", "--locked", "-p", "platform", "--no-default-features"]}
 	testClusterTest: {command: "cargo", args: ["test", "--locked", "-p", "test-cluster"]}
 	testClusterCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "test-cluster", "--all-targets", "--", "-D", "warnings"]}

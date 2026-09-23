@@ -4,7 +4,7 @@ This directory is a self-contained [Astro Starlight](https://starlight.astro.bui
 existing files under `reference/` are the detailed implementation and contract
 references; the other pages provide a guided path through them.
 
-Requires cuenv 0.55.0 and Deno 2.9.5 or newer. Run these tasks from the repository root.
+Requires cuenv 0.56.1 and Deno 2.9.5 or newer. Run these tasks from the repository root.
 
 ```sh
 cuenv task docsDev
