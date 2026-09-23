@@ -3,6 +3,28 @@
 version = 4
 
 [[package]]
+name = "acceptance"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "compiler-core",
+ "coordination",
+ "deploy",
+ "k8s-openapi",
+ "kube",
+ "platform",
+ "release",
+ "serde",
+ "serde-saphyr",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "test-cluster",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
