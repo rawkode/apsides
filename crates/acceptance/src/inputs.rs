@@ -34,6 +34,10 @@ pub struct Inputs {
     /// Signed release of `crates/acceptance/programs/cnpg-owner`: another
     /// domain that declares the `ConfigMap` the initial release declares.
     pub owner_release: PathBuf,
+    /// Signed release of `crates/acceptance/programs/handler-output`: one
+    /// domain, one observed `ConfigMap` input, one handler with no egress
+    /// that copies the input's keys into its declared output.
+    pub handler_output_release: PathBuf,
     /// The trust policy the releases verify against: the ephemeral signer's
     /// public key, the approved compiler digests and the pinned verifier.
     pub trust_policy: PathBuf,
@@ -91,6 +95,7 @@ impl Inputs {
             &self.successor_release,
             &self.cleanup_release,
             &self.owner_release,
+            &self.handler_output_release,
             &self.trust_policy,
             &self.operator_manifest,
         ] {
@@ -129,6 +134,7 @@ mod tests {
             successor_release: file.clone(),
             cleanup_release: file.clone(),
             owner_release: file.clone(),
+            handler_output_release: file.clone(),
             trust_policy: file.clone(),
             operator_manifest: file,
             results: directory.join("results"),
