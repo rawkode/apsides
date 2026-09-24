@@ -189,6 +189,18 @@ fn egress_host_rejects_localhost_and_other_single_label_hosts() -> TestResult {
     Ok(())
 }
 
+/// RFC 6761 reserves the `.localhost` TLD for loopback; any host under it
+/// must be rejected exactly like bare `localhost`.
+#[test]
+fn egress_host_rejects_the_dot_localhost_suffix() -> TestResult {
+    for host in ["foo.localhost", "bar.foo.localhost"] {
+        let mut value = fixture();
+        value["handlers"][0]["egress"] = json!([{"host": host, "port": 443}]);
+        expect_err(&value, "lowercase DNS name")?;
+    }
+    Ok(())
+}
+
 /// A host whose last label is a real (non-numeric) TLD is still accepted
 /// even when an earlier label happens to be all digits — only the *last*
 /// label decides "ends in a number".
@@ -459,6 +471,58 @@ fn output_rollout_test_plan_excludes_inapplicable_observed_scenarios() -> TestRe
             "did not expect {excluded} in {scenarios:?}"
         );
     }
+    Ok(())
+}
+
+// --- B3 residual: a reaction reading both an Observed and an Output-mode
+// input must not produce two rows for the same scenario name. ---
+
+#[test]
+fn mixed_observed_and_output_reaction_has_one_row_per_scenario_covering_every_live_input()
+-> TestResult {
+    let mut value = fixture();
+    value["reactions"] = json!([{
+        "id": "rollout-mixed", "op": "rollout", "inputs": ["settings", "output-flags-input"], "target": "api", "source": source(),
+    }]);
+    let compiled = plan(&value)?;
+    let cases: Vec<_> = compiled
+        .test_plan
+        .iter()
+        .filter(|case| case.reaction_id == "rollout-mixed")
+        .collect();
+
+    // (reactionId, scenario) must be unique: no two cases share a scenario name.
+    let scenarios: Vec<&str> = cases.iter().map(|case| case.scenario.as_str()).collect();
+    let unique: std::collections::BTreeSet<&str> = scenarios.iter().copied().collect();
+    assert_eq!(
+        scenarios.len(),
+        unique.len(),
+        "duplicate scenario rows for one reaction: {scenarios:?}"
+    );
+
+    // The two scenarios shared between Observed and Output ("projected-change",
+    // "restart-and-relist") each get exactly one row, covering both live inputs.
+    for shared in ["projected-change", "restart-and-relist"] {
+        let case = cases
+            .iter()
+            .find(|case| case.scenario == shared)
+            .ok_or_else(|| format!("expected exactly one {shared} row"))?;
+        assert_eq!(
+            case.input_ids,
+            ["output-flags-input", "settings"],
+            "{shared} must cover every live input"
+        );
+    }
+
+    // An Observed-only scenario still applies, but only to the Observed input.
+    let coalesced = cases
+        .iter()
+        .find(|case| case.scenario == "coalesced-inputs")
+        .ok_or("expected a coalesced-inputs row")?;
+    assert_eq!(coalesced.input_ids, ["settings"]);
+
+    // 7 COMMON + 2 shared (projected-change, restart-and-relist) + 7 Observed-only.
+    assert_eq!(cases.len(), 16, "unexpected case count: {cases:?}");
     Ok(())
 }
 

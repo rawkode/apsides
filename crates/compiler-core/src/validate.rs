@@ -557,14 +557,16 @@ fn ends_in_a_number(host: &str) -> bool {
 /// A lowercase DNS name suitable for a handler's egress allowlist: never an
 /// IP literal (v4 or v6, including decimal/hex/octal IPv4 shorthand — see
 /// [`ends_in_a_number`]), never `localhost` or another single-label host
-/// (an egress host always has at least one dot), never containing a
-/// wildcard, at most 253 bytes.
+/// (an egress host always has at least one dot), never under the
+/// `.localhost` TLD RFC 6761 reserves for loopback (`foo.localhost`,
+/// `bar.foo.localhost`, …), never containing a wildcard, at most 253 bytes.
 fn is_egress_host(host: &str) -> bool {
     host.parse::<std::net::IpAddr>().is_err()
         && !host.is_empty()
         && host.len() <= 253
         && host.contains('.')
         && host != "localhost"
+        && !host.ends_with(".localhost")
         && !ends_in_a_number(host)
         && host.split('.').all(|part| dns_label(part, 63))
 }

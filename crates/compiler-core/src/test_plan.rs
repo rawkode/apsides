@@ -38,12 +38,51 @@ const COMMON: &[Scenario] = &[
         "real new-template Pods reach fixture readiness",
     ),
 ];
-const OBSERVED: &[Scenario] = &[
+/// Scenarios that apply identically to `Observed` and `Output`-mode inputs:
+/// both are observed live (see `model::InputMode::Output`), so both a
+/// foreign writer's change and a handler's own write change the revision the
+/// same way, and a controller restart relists and converges on either one's
+/// latest live value the same way. For a reaction whose inputs span both
+/// modes, one row is generated per scenario here, covering every relevant
+/// input (`Observed` and `Output` together) so `(reactionId, scenario)`
+/// stays unique -- see `OBSERVED_ONLY` below for scenarios that cannot be
+/// merged this way.
+const LIVE_SHARED: &[Scenario] = &[
     (
         "projected-change",
         "semantic",
         "changed projected data changes the revision",
     ),
+    (
+        "restart-and-relist",
+        "workload",
+        "controller restart converges from changes made while stopped",
+    ),
+];
+/// Scenarios that apply only to `Observed`-mode inputs, never to `Output`
+/// ones, because each models a failure mode specific to an *external*
+/// writer's input:
+///
+/// - `missing-input`/`input-returned` (the missing/recovery pair): a handler
+///   output is a managed resource the reconciler itself recreates
+///   absent-only every cycle, so its metadata is never durably missing the
+///   way an external `ConfigMap` can be; there is nothing for these to exercise.
+/// - `unauthorized-input`/`credential-read-denial`: the reconciler's own
+///   in-domain credentials always hold the get/list/watch capability an
+///   output's Output-mode input adds (see `validate_output_wiring`), unlike
+///   an external input whose access an operator could plausibly deny.
+/// - `unavailable-input`/`invalid-input`: modeled failure injection points
+///   for an external transport/projection this increment has no handler
+///   runtime to trigger for an output specifically.
+/// - `coalesced-inputs`: exercises batching several *independent* external
+///   writers' changes together; an output has exactly one writer (its
+///   handler, `validate_handlers`'s one-writer-per-output rule), so there is
+///   only ever one change to coalesce.
+///
+/// Applicability here is always the reaction's `Observed`-mode inputs alone,
+/// even for a mixed reaction, since none of these can involve an `Output`
+/// one.
+const OBSERVED_ONLY: &[Scenario] = &[
     (
         "coalesced-inputs",
         "semantic",
@@ -78,49 +117,6 @@ const OBSERVED: &[Scenario] = &[
         "invalid-input",
         "semantic",
         "invalid projection blocks without exposing contents",
-    ),
-    (
-        "restart-and-relist",
-        "workload",
-        "controller restart converges from changes made while stopped",
-    ),
-];
-/// Scenarios for an `InputMode::Output` input: a deliberately smaller subset
-/// of [`OBSERVED`]'s. An output is observed live the same way an Observed
-/// input is (see `model::InputMode::Output`), but most of `OBSERVED`'s
-/// scenarios model failure modes of an *external* writer's input that never
-/// apply to a handler output:
-///
-/// - `missing-input`/`input-returned` (the missing/recovery pair): a handler
-///   output is a managed resource the reconciler itself recreates
-///   absent-only every cycle, so its metadata is never durably missing the
-///   way an external `ConfigMap` can be; there is nothing for these to exercise.
-/// - `unauthorized-input`/`credential-read-denial`: the reconciler's own
-///   in-domain credentials always hold the get/list/watch capability an
-///   output's Output-mode input adds (see `validate_output_wiring`), unlike
-///   an external input whose access an operator could plausibly deny.
-/// - `unavailable-input`/`invalid-input`: modeled failure injection points
-///   for an external transport/projection this increment has no handler
-///   runtime to trigger for an output specifically.
-/// - `coalesced-inputs`: exercises batching several *independent* external
-///   writers' changes together; an output has exactly one writer (its
-///   handler, `validate_handlers`'s one-writer-per-output rule), so there is
-///   only ever one change to coalesce.
-///
-/// `projected-change` and `restart-and-relist` both still apply exactly as
-/// they do for an Observed input: a handler's write changes the revision,
-/// and a controller restart still relists and converges on the output's
-/// latest live value.
-const OUTPUT: &[Scenario] = &[
-    (
-        "projected-change",
-        "semantic",
-        "a handler's written output data changes the revision",
-    ),
-    (
-        "restart-and-relist",
-        "workload",
-        "controller restart converges from an output change made while stopped",
     ),
 ];
 const MANAGED: &[Scenario] = &[
@@ -177,13 +173,17 @@ pub(crate) fn generate(ir: &Ir) -> Vec<TestCase> {
             };
             append(&mut cases, reaction, std::slice::from_ref(selected), &all);
         }
-        append(
-            &mut cases,
-            reaction,
-            OBSERVED,
-            &mode_ids(InputMode::Observed),
-        );
-        append(&mut cases, reaction, OUTPUT, &mode_ids(InputMode::Output));
+        let observed = mode_ids(InputMode::Observed);
+        let output = mode_ids(InputMode::Output);
+        // Observed and Output ids never overlap (disjoint modes), so a plain
+        // concatenation is already the union; re-sorted so the row's
+        // `input_ids` stay in canonical order regardless of which mode
+        // contributed them.
+        let mut live = observed.clone();
+        live.extend(output);
+        live.sort();
+        append(&mut cases, reaction, LIVE_SHARED, &live);
+        append(&mut cases, reaction, OBSERVED_ONLY, &observed);
         let managed = mode_ids(InputMode::Managed);
         for scenario in MANAGED {
             let applicable = if scenario.0 == "managed-drift-repair" {
