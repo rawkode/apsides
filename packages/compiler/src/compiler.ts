@@ -341,7 +341,7 @@ const bundleHandlers = async (author: Map<string, Snapshot>, ir: ProductionIr): 
   const handlers: ProductionIr["handlers"] = [];
   const loaded = new Set<string>();
   for (const handler of ir.handlers) {
-    if (!author.has(handler.module)) throw new Error(`handler module is absent from the source lock: ${handler.module}`);
+    if (!author.has(handler.module)) throw new Error(`handler module is absent from the source lock (resolved from the lock root, apsides.lock.json's own directory): ${handler.module}`);
     const first = await bundleHandlerModule(author, handler.module);
     const second = await bundleHandlerModule(author, handler.module);
     if (first.code !== second.code) throw new Error(`independent handler bundles for ${handler.id} were not byte-identical`);

@@ -105,9 +105,13 @@ export default async () => {
   const plainTs = await fixture({ "program.ts": `export default {};\n` }, "program.ts");
   await assert.rejects(compileApsides(plainTs.sourcePath, plainTs.output), /source entry must be a \.tsx program/, "TSX is the only authoring entry");
 
+  // Neither case is about the schema version itself (both use the current
+  // schema, "apsides.dev/ir/v2"): a plain-object export of already-compiled
+  // IR, or an already-wrapped production-IR payload, must still be rejected
+  // for bypassing the TSX renderer, regardless of the schema version it names.
   for (const [name, source] of [
-    ["raw IR", `export default {schemaVersion:"apsides.dev/ir/v1"};\n`],
-    ["production IR wrapper", `export default {productionIR:{schemaVersion:"apsides.dev/ir/v1"},fixtures:null};\n`],
+    ["raw IR", `export default {schemaVersion:"apsides.dev/ir/v2"};\n`],
+    ["production IR wrapper", `export default {productionIR:{schemaVersion:"apsides.dev/ir/v2"},fixtures:null};\n`],
   ] as const) {
     const obsolete = await fixture({ "program.tsx": source }, "program.tsx");
     await assert.rejects(compileApsides(obsolete.sourcePath, obsolete.output), `${name} exports must not bypass the TSX renderer`);
@@ -167,7 +171,11 @@ export default (
     // never bundled from the filesystem outside the locked closure.
     const unlockedProgram = handlerProgram.replace("./handlers/sync-flags.ts", "./handlers/unlocked.ts");
     const unlocked = await fixture({ "program.tsx": unlockedProgram, "handlers/sync-flags.ts": handlerModule }, "program.tsx");
-    await assert.rejects(compileApsides(unlocked.sourcePath, unlocked.output), "an unlocked handler module must be rejected before bundling");
+    await assert.rejects(
+      compileApsides(unlocked.sourcePath, unlocked.output),
+      /handler module is absent from the source lock/,
+      "an unlocked handler module must be rejected before bundling",
+    );
   }
 
   console.log("Apsides TSX source build passed: development JSX lowering, multi-source reproducibility, source provenance, SDK closure, isolated Deno config, and synchronous rendering.");

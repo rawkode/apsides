@@ -411,6 +411,10 @@ interface DomainState {
   readonly reactions: Map<string, ReactionDeclaration>;
   readonly handlers: Map<string, HandlerDeclaration>;
   readonly outputs: Map<string, OutputDeclaration>;
+  /** Output ids already claimed by a writer handler: each output has
+   * exactly one writer, since two handlers applying `data` under the same
+   * field manager would drop each other's keys. */
+  readonly claimedOutputs: Set<string>;
 }
 
 export class ManagedResource<R extends ManageableResource = ManageableResource> {
@@ -493,6 +497,7 @@ export class Domain {
       reactions: new Map(),
       handlers: new Map(),
       outputs: new Map(),
+      claimedOutputs: new Set(),
     };
   }
 
@@ -704,6 +709,7 @@ export class Domain {
     if (outputs.length !== options.outputs.length) throw new Error(`handler ${id} outputs must be distinct`);
     for (const outputId of outputs) {
       if (!this.#state.outputs.has(outputId)) throw new Error(`handler ${id} has unresolved output ${outputId}`);
+      if (this.#state.claimedOutputs.has(outputId)) throw new Error(`output ${outputId} already has a writer handler`);
     }
     for (const inputId of inputs) {
       const input = this.#state.inputs.get(inputId)!;
@@ -737,6 +743,7 @@ export class Domain {
       source,
     }) as unknown as HandlerDeclaration);
     this.#state.handlers.set(id, declaration);
+    for (const outputId of outputs) this.#state.claimedOutputs.add(outputId);
   }
 
   #addInput(input: InputDeclaration): InputDeclaration {
@@ -1197,8 +1204,30 @@ const isIpLiteral = (value: string): boolean => {
   return /^[0-9]{1,3}(?:\.[0-9]{1,3}){3}$/.test(value) || value.includes(":");
 };
 
-/** Parse and validate one `<On egress>` entry: a lowercase DNS name (never an
- * IP literal or wildcard), with an optional `:port` suffix defaulting to 443. */
+/**
+ * True when `host`'s last dot-separated label — ignoring one trailing empty
+ * label from a trailing dot — is either `0x`/`0X` followed by one or more
+ * hex digits, or entirely ASCII digits. This is the WHATWG URL "ends in a
+ * number" host check: the signal used to decide whether a domain-shaped
+ * string is actually a numeric (decimal, hex or octal) IPv4 shorthand, since
+ * no real DNS label — and certainly no TLD — is ever purely numeric.
+ */
+const endsInANumber = (host: string): boolean => {
+  const parts = host.split(".");
+  if (parts.length > 1 && parts[parts.length - 1] === "") parts.pop();
+  const last = parts[parts.length - 1];
+  if (last === undefined || last.length === 0) return false;
+  if (/^0x[0-9a-f]+$/i.test(last)) return true;
+  return /^[0-9]+$/.test(last);
+};
+
+/**
+ * Parse and validate one `<On egress>` entry: a lowercase DNS name — never
+ * an IP literal (v4 or v6), never a numeric IPv4 shorthand (decimal, hex or
+ * octal — see {@link endsInANumber}), never `localhost` or another
+ * single-label host (an egress host always has at least one dot), never
+ * containing a wildcard — with an optional `:port` suffix defaulting to 443.
+ */
 const egressHost = (value: unknown, context: string): EgressHost => {
   const raw = text(value, context);
   const separator = raw.lastIndexOf(":");
@@ -1211,10 +1240,13 @@ const egressHost = (value: unknown, context: string): EgressHost => {
     host.length === 0 ||
     host.length > 253 ||
     host.includes("*") ||
+    host === "localhost" ||
+    !host.includes(".") ||
     isIpLiteral(host) ||
+    endsInANumber(host) ||
     !host.split(".").every((part) => dnsLabelPattern.test(part) && part.length <= 63)
   ) {
-    throw new Error(`${context} host must be a lowercase DNS name (never an IP literal or wildcard)`);
+    throw new Error(`${context} host must be a lowercase DNS name (never an IP literal, a numeric shorthand, localhost, or a wildcard)`);
   }
   return freeze({ host, port });
 };

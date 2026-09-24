@@ -421,6 +421,17 @@ throws(() => constrained.manage(new ConfigMap({ metadata: { name: "two", namespa
     outputs: [],
     source,
   }), "duplicate handler id");
+
+  // Each output has exactly one writer handler.
+  throws(() => defineHandler(value, {
+    module: "./handlers/other.ts",
+    export: "other",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id],
+    egress: [],
+    outputs: [flags.outputId],
+    source,
+  }), "already has a writer handler");
 }
 
 {
@@ -468,6 +479,30 @@ throws(() => constrained.manage(new ConfigMap({ metadata: { name: "two", namespa
     outputs: [],
     source,
   }), "wildcard");
+  for (const host of ["127.1", "2130706433", "0x7f.1", "0177.0.0.1", "1.2.3.04", "example.123", "localhost", "internal"]) {
+    throws(() => defineHandler(value, {
+      module: "./handlers/bad.ts",
+      export: "bad",
+      trigger: { kind: "input-changed", input: settings.id },
+      inputs: [settings.id],
+      egress: [host],
+      outputs: [],
+      source,
+    }), "lowercase DNS name");
+  }
+  // A host whose last label is a real TLD is accepted even when an earlier
+  // label happens to be all digits: only the *last* label decides "ends in
+  // a number".
+  defineHandler(value, {
+    id: "numeric-label-ok",
+    module: "./handlers/ok.ts",
+    export: "ok",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id],
+    egress: ["203.example.com"],
+    outputs: [],
+    source,
+  });
 
   const selfOutput = defineHandlerOutput(value, { name: "self-flags", source });
   throws(() => defineHandler(value, {

@@ -38,7 +38,13 @@ export interface HandlerOutputProps { readonly id?: string; readonly name: strin
  *
  * `handler` MUST be a module reference string (`"./handlers/sync.ts#exportName"`,
  * split here as `handler` + `export`) — never a function: handlers run in a
- * separate execution context and cannot capture author closures.
+ * separate execution context and cannot capture author closures. The module
+ * path is resolved relative to the *source lock root* (the directory
+ * holding `apsides.lock.json`), the same root every path in
+ * `apsides.lock.json` itself is relative to — not relative to the file the
+ * `<On>` element appears in. It must name one of `apsides.lock.json`'s
+ * locked modules exactly, and that module may in turn import only other
+ * locked modules: never an npm or remote specifier, never the authoring SDK.
  */
 export interface HandlerProps {
   readonly id?: string;
