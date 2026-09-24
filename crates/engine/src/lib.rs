@@ -623,6 +623,23 @@ const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
 
 static PLATFORM_INIT: Once = Once::new();
 
+/// How many times V8 has actually invoked the entropy source
+/// [`ensure_platform_initialized`] installs. Exists only so a test can
+/// assert V8 genuinely called it (see `tests/entropy_source.rs`) --
+/// production code never reads this.
+static ENTROPY_SOURCE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many times V8 has invoked the entropy source installed by
+/// [`ensure_platform_initialized`].
+///
+/// `0` before that function has ever run (or if V8 never actually asked
+/// for entropy, which would itself be surprising -- every isolate seeds
+/// its own RNG at creation).
+#[must_use]
+pub fn entropy_source_invocation_count() -> usize {
+    ENTROPY_SOURCE_CALLS.load(Ordering::Relaxed)
+}
+
 /// Sets the spike's V8 flags and initializes the V8 platform, exactly once
 /// per process.
 ///
@@ -642,6 +659,27 @@ pub fn ensure_platform_initialized() {
         // first thing in `deno_core` that can trigger that, so this call
         // must come strictly first, which the `Once` above guarantees.
         v8::V8::set_flags_from_string(SPIKE_V8_FLAGS);
+        // Under a Landlock lockdown (see the Apsides v0.3 plan, Phase 5c),
+        // `/dev/urandom` is denied like every other path. Without an
+        // explicit entropy source, V8 silently falls back to a time-based
+        // seed for the platform RNG (used for, among other things, mmap/ASLR
+        // hints) and for each isolate's own RNG (`Math.random` and the
+        // internal string-hash seed -- a predictable hash seed reopens hash
+        // flooding through attacker-influenced input, e.g. an
+        // `apsides.fetch` response header/body the handler then indexes
+        // into an object). `getrandom::fill` on Linux uses the
+        // `getrandom(2)` syscall directly (confirmed against this pinned
+        // version's own backend selection: `x86_64`/`aarch64`-class targets
+        // route through `linux_android_with_fallback`, which calls the
+        // syscall first and only touches `/dev/urandom` if the syscall
+        // itself is unavailable -- ENOSYS on a pre-3.17 kernel, or EPERM
+        // under a seccomp filter that blocks it; Landlock is neither), so
+        // this needs no file access under lockdown. Set before platform
+        // init, per `v8::V8::set_entropy_source`'s own contract.
+        v8::V8::set_entropy_source(|buffer| {
+            ENTROPY_SOURCE_CALLS.fetch_add(1, Ordering::Relaxed);
+            getrandom::fill(buffer).is_ok()
+        });
         JsRuntime::init_platform(None);
     });
 }

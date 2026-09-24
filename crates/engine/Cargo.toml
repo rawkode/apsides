@@ -28,6 +28,18 @@ deno_core = "=0.412.0"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `ensure_platform_initialized` installs this as V8's entropy source
+# (`v8::V8::set_entropy_source`), so `Math.random`/the internal
+# string-hash seed/the platform RNG never fall back to a time-based seed
+# under Landlock lockdown, which denies `/dev/urandom` like every other
+# path (see the Apsides v0.3 plan, Phase 5c). On this pinned version's
+# Linux backend for `x86_64`/`aarch64`-class targets
+# (`linux_android_with_fallback`), `getrandom::fill` calls the
+# `getrandom(2)` syscall directly and only touches `/dev/urandom` if that
+# syscall itself is unavailable, which Landlock does not make it -- so
+# this needs no file access under lockdown. No non-default features:
+# the syscall backend is already the default for these targets.
+getrandom = "0.3"
 # Phase 5b `op_apsides_fetch`: promoted from dev-dependencies (Phase 5a used
 # these only in tests/common/mod.rs's `https_get_via_hickory` spike helper).
 # hickory-resolver: explicit-nameserver DNS resolution (no glibc
@@ -104,6 +116,18 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"]
 [[test]]
 name = "landlock_order"
 path = "tests/landlock_order.rs"
+harness = false
+
+# `harness = false`: this binary's `fn main()` re-execs itself as a child
+# process that applies a real Landlock lockdown on its own main thread --
+# see the file for why two separate processes, not just two isolates in
+# one, and why that rules out mutating this process's own environment
+# (`std::env::set_var` is `unsafe` as of the 2024 edition, which the
+# workspace's `unsafe_code = "deny"` lint applies to every target of this
+# crate with no exception).
+[[test]]
+name = "entropy_source"
+path = "tests/entropy_source.rs"
 harness = false
 
 [lints]
