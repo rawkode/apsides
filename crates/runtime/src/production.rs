@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -14,7 +14,7 @@ use compiler_core::{
     CompiledPlan, InputMode, InputSnapshot, Resource, RolloutKey, RolloutOutcome, evaluate_rollout,
 };
 use deploy::{ResourceIdentity, RuntimeObservation};
-use hickory_resolver::config::ResolverConfig;
+use hickory_resolver::config::{NameServerConfig, ResolverConfig};
 use http_body_util::Full;
 use hyper::{Request, Response, StatusCode, body::Bytes, service::service_fn};
 use hyper_util::rt::TokioIo;
@@ -95,8 +95,9 @@ struct DiagnosticSnapshot {
     /// The effective filesystem-lockdown state established at startup
     /// (`startup::start`, before this controller's diagnostics server ever
     /// binds) -- see the Apsides v0.3 plan, Phase 5c. Always
-    /// `LockdownState::Landlock` in practice: `start` fails closed before
-    /// reaching `run_production` at all for every other case, since
+    /// `LockdownState::Landlock` or `LockdownState::LandlockPartial` in
+    /// practice, never `NoneFixture`: `start` fails closed before reaching
+    /// `run_production` at all when the kernel enforces nothing, since
     /// production mode never accepts the fixture-only `allowNoLandlock`
     /// escape hatch. Exposed anyway so the fail-closed contract is directly
     /// observable, not merely asserted by tests elsewhere.
@@ -357,27 +358,41 @@ pub(crate) struct ProductionStartupFiles {
     /// `PROXY_KEY_PATH`'s PEM bytes, base64-encoded, the same way as
     /// `client_certificate_data` above.
     client_key_data: SecretString,
-    /// The proxy's certificate SAN / mTLS SNI
-    /// (`apsides-proxy-<generation>.<namespace>.svc`) -- unchanged from
-    /// before Phase 5c, and unrelated to DNS resolution: `cluster_url`
-    /// below is the resolvable FQDN, but the TLS handshake still presents
-    /// (and must still validate against) this exact short name, since
-    /// that's what `platform::tls`'s proxy certificate issuance signs.
+    /// The proxy's certificate SAN / mTLS SNI, and (unlike the brief
+    /// Phase 5c revision this replaces) `cluster_url`'s host too --
+    /// `apsides-proxy-<generation>.<namespace>.svc`, unchanged from before
+    /// Phase 5c. This is not itself a resolvable DNS record; real cluster
+    /// DNS only serves the fully-qualified `<name>.<namespace>.svc.<cluster-domain>`
+    /// form, reached the same way glibc's `getaddrinfo` always reached it
+    /// here: `resolv.conf`'s `search`-list expansion, gated by `ndots` --
+    /// see `kube_resolver_config`/`kube_resolver_ndots` and
+    /// `kube_connector::build_resolver`. Deriving the cluster domain
+    /// ourselves from a single assumed `resolv.conf` line (the previous
+    /// revision's approach) broke wherever the node's search list carries
+    /// extra, cloud-injected suffixes after the three standard Kubernetes
+    /// ones (EKS appends `ec2.internal`, GKE appends `c.<project>.internal
+    /// google.internal`, GitHub Actions runners append an Azure suffix --
+    /// see `crates/test-cluster/src/manifests.rs`'s `sentinel_host`, which
+    /// works around the identical problem for an unrelated probe): the
+    /// *real* cluster domain is not reliably the search list's last entry
+    /// once another suffix follows it. Replicating full search-list
+    /// expansion has no such assumption to get wrong.
     server_name: String,
-    /// `https://<server_name>.<cluster_domain>:8443` -- the FQDN this
-    /// process can actually resolve without search-list expansion.
-    /// `<server_name>` alone (e.g. `apsides-proxy-x.ns.svc`) is not itself a
-    /// resolvable record; real cluster DNS only serves the fully-qualified
-    /// `<name>.<namespace>.svc.<cluster-domain>` form, and a plain DNS
-    /// client normally reaches it by trying `resolv.conf`'s `search`
-    /// suffixes in turn (glibc's `ndots`-gated expansion). This process
-    /// builds the FQDN itself instead of relying on that expansion (see
-    /// `cluster_domain_from_resolv_conf`), so `kube_connector`'s resolver
-    /// only ever needs a single, unambiguous lookup.
+    /// `https://<server_name>:8443` -- the same short, non-FQDN host
+    /// `server_name` names. Resolved through `kube_resolver_config`'s
+    /// search list, exactly as glibc resolved it before Phase 5c.
     cluster_url: http::Uri,
-    /// `RESOLV_CONF_PATH`'s `nameserver` lines, for
-    /// `kube_connector::build_client`'s own hickory resolver.
+    /// `RESOLV_CONF_PATH`'s `nameserver` *and* `search` lines, for
+    /// `kube_connector::build_client`'s own hickory resolver --
+    /// deliberately including the search list (unlike
+    /// `engine::resolver_config_from_resolv_conf`, used only for
+    /// already-FQDN handler egress hosts, which must never have a search
+    /// list applied to them).
     kube_resolver_config: ResolverConfig,
+    /// `RESOLV_CONF_PATH`'s `options ndots:N` value (glibc/hickory's
+    /// shared default, 1, if absent or malformed) -- see
+    /// `kube_connector::build_resolver`.
+    kube_resolver_ndots: usize,
     /// `RESOLV_CONF_PATH`'s raw contents, for `HandlerRuntime::new`'s own
     /// (separately built, handler-egress-only) resolver config -- see the
     /// Apsides v0.3 plan, Phase 5b.
@@ -395,8 +410,7 @@ pub(crate) struct ProductionStartupFiles {
 /// Returns an error if the generation identifier is not a DNS label, if
 /// any required file is missing, oversized or not UTF-8 (`resolv.conf`
 /// only) or not valid PEM (the CA bundle only), or if `resolv.conf` has no
-/// `nameserver` line or no `search` domain to derive the cluster domain
-/// from.
+/// `nameserver` line.
 pub(crate) fn read_production_startup_files(
     config: &ProductionConfig,
 ) -> Result<ProductionStartupFiles, RuntimeError> {
@@ -440,15 +454,8 @@ pub(crate) fn read_production_startup_files(
     let client_key_data =
         SecretString::from(base64::engine::general_purpose::STANDARD.encode(&key_pem));
 
-    let kube_resolver_config = engine::resolver_config_from_resolv_conf(&resolv_conf_contents)
-        .map_err(|error| RuntimeError::Configuration(format!("resolv.conf: {error}")))?;
-    let cluster_domain =
-        cluster_domain_from_resolv_conf(&resolv_conf_contents).ok_or_else(|| {
-            RuntimeError::Configuration(
-                "resolv.conf has no search domain to derive the cluster domain from".into(),
-            )
-        })?;
-    let cluster_url = format!("https://{server_name}.{cluster_domain}:8443")
+    let (kube_resolver_config, kube_resolver_ndots) = proxy_resolver_config(&resolv_conf_contents)?;
+    let cluster_url = format!("https://{server_name}:8443")
         .parse()
         .map_err(|_| RuntimeError::Configuration("invalid fixed proxy API URL".into()))?;
 
@@ -459,6 +466,7 @@ pub(crate) fn read_production_startup_files(
         server_name,
         cluster_url,
         kube_resolver_config,
+        kube_resolver_ndots,
         resolv_conf_contents,
     })
 }
@@ -488,26 +496,75 @@ fn parse_ca_der(pem_bytes: &[u8]) -> Result<Vec<Vec<u8>>, RuntimeError> {
     Ok(der)
 }
 
-/// The cluster's DNS domain suffix (e.g. `cluster.local`), read from
-/// `resolv.conf`'s `search` line. Kubelet always writes the search list as
-/// `<pod-namespace>.svc.<cluster-domain> svc.<cluster-domain>
-/// <cluster-domain>`, in that order, so the *last* entry is the bare
-/// cluster domain regardless of what it is actually named -- this makes no
-/// assumption that it equals the literal string `cluster.local`.
+/// Parses `nameserver`, `search`, and `options ndots:N` directives out of
+/// `resolv.conf`-shaped `contents` into a hickory [`ResolverConfig`]
+/// (nameservers *and* the search list) and the `ndots` value -- together,
+/// the exact glibc `getaddrinfo` search-list-expansion inputs the proxy's
+/// short, non-FQDN hostname (`apsides-proxy-<generation>.<namespace>.svc`)
+/// depended on before Phase 5c (see [`ProductionStartupFiles::server_name`]'s
+/// doc comment for why deriving a single assumed "cluster domain" instead
+/// is not equivalent). `ndots` defaults to `1` -- glibc's and hickory's
+/// shared default -- if `resolv.conf` sets no `options ndots:N` at all;
+/// Kubernetes pods normally set `ndots:5`.
+///
+/// Deliberately separate from `engine::resolver_config_from_resolv_conf`
+/// (used only for already-FQDN handler egress hosts, which must never
+/// have this search list applied to them -- see that function's own doc
+/// comment on why a handler-egress lookup has nothing for `ndots`/search
+/// expansion to usefully do). Only the *last* `search` line counts, the
+/// same way `resolv.conf(5)` documents for `search`/`domain` (kubelet
+/// only ever writes one, but a hand-edited or multi-source file could
+/// have more).
 ///
 /// This function performs no I/O: the caller reads `resolv.conf` and hands
 /// the contents in (see `read_production_startup_files`), the same
 /// discipline `engine::resolver_config_from_resolv_conf` documents for the
 /// same reason.
-fn cluster_domain_from_resolv_conf(contents: &str) -> Option<String> {
-    contents.lines().find_map(|line| {
+///
+/// # Errors
+///
+/// Returns `Err` if no `nameserver` line yields a parseable IP address.
+fn proxy_resolver_config(contents: &str) -> Result<(ResolverConfig, usize), RuntimeError> {
+    let mut ips: Vec<IpAddr> = Vec::new();
+    let mut search: Vec<hickory_proto::rr::Name> = Vec::new();
+    let mut ndots: usize = 1;
+    for line in contents.lines() {
         let uncommented = line.split(['#', ';']).next().unwrap_or("");
         let mut tokens = uncommented.split_whitespace();
-        if tokens.next() != Some("search") {
-            return None;
+        match tokens.next() {
+            Some("nameserver") => {
+                if let Some(ip) = tokens.next().and_then(|token| token.parse::<IpAddr>().ok()) {
+                    ips.push(ip);
+                }
+            }
+            Some("search") => {
+                search = tokens
+                    .filter_map(|domain| hickory_proto::rr::Name::from_ascii(domain).ok())
+                    .collect();
+            }
+            Some("options") => {
+                for option in tokens {
+                    if let Some(value) = option
+                        .strip_prefix("ndots:")
+                        .and_then(|value| value.parse::<usize>().ok())
+                    {
+                        ndots = value;
+                    }
+                }
+            }
+            _ => {}
         }
-        tokens.last().map(str::to_owned)
-    })
+    }
+    if ips.is_empty() {
+        return Err(RuntimeError::Configuration(
+            "resolv.conf has no nameserver line".into(),
+        ));
+    }
+    let name_servers = ips.into_iter().map(NameServerConfig::udp_and_tcp).collect();
+    Ok((
+        ResolverConfig::from_parts(None, search, name_servers),
+        ndots,
+    ))
 }
 
 pub(crate) async fn run_production(
@@ -524,8 +581,11 @@ pub(crate) async fn run_production(
     kube_config.read_timeout = Some(Duration::from_secs(15));
     kube_config.write_timeout = Some(Duration::from_secs(15));
     kube_config.default_retry = false;
-    let client =
-        crate::kube_connector::build_client(&kube_config, files.kube_resolver_config.clone())?;
+    let client = crate::kube_connector::build_client(
+        &kube_config,
+        files.kube_resolver_config.clone(),
+        files.kube_resolver_ndots,
+    )?;
     run_production_with_client(
         plan,
         config,
@@ -2163,18 +2223,22 @@ mod tests {
                 base64::engine::general_purpose::STANDARD.encode(b"fake-key-pem"),
             ),
             server_name: "apsides-proxy-generation-a.control.svc".into(),
-            cluster_url: "https://apsides-proxy-generation-a.control.svc.cluster.local:8443"
+            cluster_url: "https://apsides-proxy-generation-a.control.svc:8443"
                 .parse()
                 .map_err(|error| format!("{error}"))?,
             kube_resolver_config: ResolverConfig::from_parts(
                 None,
-                vec![],
+                vec![
+                    hickory_proto::rr::Name::from_ascii("control.svc.cluster.local")
+                        .map_err(|error| error.to_string())?,
+                ],
                 vec![hickory_resolver::config::NameServerConfig::udp_and_tcp(
                     "127.0.0.1"
                         .parse::<std::net::IpAddr>()
                         .map_err(|e| e.to_string())?,
                 )],
             ),
+            kube_resolver_ndots: 5,
             resolv_conf_contents: "nameserver 127.0.0.1\n".into(),
         })
     }
@@ -2192,7 +2256,7 @@ mod tests {
         let config = production_kube_config(&files);
         assert_eq!(
             config.cluster_url.to_string(),
-            "https://apsides-proxy-generation-a.control.svc.cluster.local:8443/"
+            "https://apsides-proxy-generation-a.control.svc:8443/"
         );
         assert_eq!(
             config.tls_server_name.as_deref(),
@@ -2240,21 +2304,119 @@ mod tests {
         assert!(parse_ca_der(key_only.as_bytes()).is_err());
     }
 
+    /// A plain Kubernetes-standard resolv.conf: no cloud-injected search
+    /// suffixes, `ndots:5`.
     #[test]
-    fn cluster_domain_is_the_last_search_entry() {
+    fn proxy_resolver_config_reads_plain_kubernetes_search_and_ndots() -> TestResult {
         let contents = "nameserver 10.0.0.10\nsearch control.svc.cluster.local svc.cluster.local cluster.local\noptions ndots:5\n";
+        let (config, ndots) = proxy_resolver_config(contents)?;
+        assert_eq!(ndots, 5);
         assert_eq!(
-            cluster_domain_from_resolv_conf(contents).as_deref(),
-            Some("cluster.local")
+            search_strings(&config),
+            vec![
+                "control.svc.cluster.local",
+                "svc.cluster.local",
+                "cluster.local"
+            ]
         );
+        Ok(())
+    }
+
+    /// EKS appends `ec2.internal` after the three standard Kubernetes
+    /// search domains.
+    #[test]
+    fn proxy_resolver_config_keeps_the_eks_search_suffix() -> TestResult {
+        let contents = "nameserver 10.0.0.10\nsearch control.svc.cluster.local svc.cluster.local cluster.local ec2.internal\noptions ndots:5\n";
+        let (config, ndots) = proxy_resolver_config(contents)?;
+        assert_eq!(ndots, 5);
+        assert_eq!(
+            search_strings(&config),
+            vec![
+                "control.svc.cluster.local",
+                "svc.cluster.local",
+                "cluster.local",
+                "ec2.internal",
+            ]
+        );
+        Ok(())
+    }
+
+    /// GKE appends two extra search domains.
+    #[test]
+    fn proxy_resolver_config_keeps_the_gke_search_suffixes() -> TestResult {
+        let contents = "nameserver 10.0.0.10\nsearch control.svc.cluster.local svc.cluster.local cluster.local c.my-project.internal google.internal\noptions ndots:5\n";
+        let (config, ndots) = proxy_resolver_config(contents)?;
+        assert_eq!(ndots, 5);
+        assert_eq!(
+            search_strings(&config),
+            vec![
+                "control.svc.cluster.local",
+                "svc.cluster.local",
+                "cluster.local",
+                "c.my-project.internal",
+                "google.internal",
+            ]
+        );
+        Ok(())
+    }
+
+    /// GitHub Actions runners (and other Azure-hosted nodes) append an
+    /// Azure-assigned search suffix -- see
+    /// `crates/test-cluster/src/manifests.rs`'s `sentinel_host`, which
+    /// works around this exact same shape for an unrelated probe.
+    #[test]
+    fn proxy_resolver_config_keeps_the_azure_search_suffix() -> TestResult {
+        let contents = "nameserver 10.0.0.10\nsearch control.svc.cluster.local svc.cluster.local cluster.local xy0123456789abcdefghijklmnop.bx.internal.cloudapp.net\noptions ndots:5\n";
+        let (config, ndots) = proxy_resolver_config(contents)?;
+        assert_eq!(ndots, 5);
+        assert_eq!(
+            search_strings(&config),
+            vec![
+                "control.svc.cluster.local",
+                "svc.cluster.local",
+                "cluster.local",
+                "xy0123456789abcdefghijklmnop.bx.internal.cloudapp.net",
+            ]
+        );
+        Ok(())
     }
 
     #[test]
-    fn cluster_domain_is_none_without_a_search_line() {
-        assert_eq!(
-            cluster_domain_from_resolv_conf("nameserver 10.0.0.10\n"),
-            None
-        );
+    fn proxy_resolver_config_defaults_ndots_to_one_without_an_options_line() -> TestResult {
+        let (_, ndots) = proxy_resolver_config("nameserver 10.0.0.10\nsearch example.\n")?;
+        assert_eq!(ndots, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_resolver_config_fails_closed_with_no_nameserver_line() {
+        assert!(proxy_resolver_config("search example.\noptions ndots:5\n").is_err());
+    }
+
+    /// The handler-egress resolver config (`engine::resolver_config_from_resolv_conf`,
+    /// built separately by `HandlerRuntime::new` from the same
+    /// `resolv_conf_contents` this struct also carries) must never see a
+    /// search list -- handler hosts are always already-FQDN. Proves the
+    /// two configs built from one `resolv.conf` genuinely differ, not just
+    /// that each looks right read in isolation.
+    #[test]
+    fn proxy_resolver_config_has_a_search_list_the_handler_egress_config_must_not() -> TestResult {
+        let contents = "nameserver 10.0.0.10\nsearch control.svc.cluster.local svc.cluster.local cluster.local\noptions ndots:5\n";
+        let (proxy_config, _) = proxy_resolver_config(contents)?;
+        assert!(!search_strings(&proxy_config).is_empty());
+        let handler_config = engine::resolver_config_from_resolv_conf(contents)
+            .map_err(|error| error.to_string())?;
+        assert!(handler_config.search().is_empty());
+        assert!(handler_config.domain().is_none());
+        Ok(())
+    }
+
+    fn search_strings(config: &ResolverConfig) -> Vec<String> {
+        config
+            .search()
+            .iter()
+            .map(|name| name.to_ascii().trim_end_matches('.').to_owned())
+            .collect()
     }
 
     /// `startup_reads_before_lock` (see the Apsides v0.3 plan, Phase 5c):

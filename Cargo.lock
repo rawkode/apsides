@@ -1036,6 +1036,7 @@ dependencies = [
  "bytes",
  "deno_core",
  "engine",
+ "getrandom 0.3.4",
  "hickory-resolver",
  "http",
  "http-body-util",

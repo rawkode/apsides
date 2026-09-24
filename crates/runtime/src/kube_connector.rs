@@ -97,9 +97,14 @@ impl Service<Name> for HickoryResolve {
     }
 }
 
-/// Builds a `TokioResolver` from `resolver_config`. Pinned the same way
-/// `engine::EgressResolver::build` pins the handler-egress resolver:
-/// IPv4-first, and `/etc/hosts` never consulted (`ResolveHosts::Never`).
+/// Builds a `TokioResolver` from `resolver_config`/`ndots`. Pinned the same
+/// way `engine::EgressResolver::build` pins the handler-egress resolver:
+/// IPv4-first, and `/etc/hosts` never consulted (`ResolveHosts::Never`) --
+/// but, unlike that resolver, `resolver_config`'s search list is left
+/// enabled and `ndots` is set from `resolv.conf`'s own `options ndots:N`
+/// (see `production::proxy_resolver_config`): the proxy's hostname is a
+/// short, non-FQDN name that only resolves through the same search-list
+/// expansion glibc's `getaddrinfo` used before Phase 5c.
 ///
 /// Must be called from inside the tokio runtime that will drive it (see
 /// `hickory_resolver`'s own `TokioRuntimeProvider` docs, and
@@ -109,21 +114,26 @@ impl Service<Name> for HickoryResolve {
 /// `engine::EgressResolver`'s per-invocation one, lives for that one
 /// long-running runtime's whole lifetime, so there is no cross-runtime
 /// affinity hazard here.
-fn build_resolver(resolver_config: ResolverConfig) -> Result<TokioResolver, RuntimeError> {
+fn build_resolver(
+    resolver_config: ResolverConfig,
+    ndots: usize,
+) -> Result<TokioResolver, RuntimeError> {
     let mut builder =
         TokioResolver::builder_with_config(resolver_config, TokioRuntimeProvider::default());
     builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4thenIpv6;
     builder.options_mut().use_hosts_file = ResolveHosts::Never;
+    builder.options_mut().ndots = ndots;
     builder
         .build()
         .map_err(|error| RuntimeError::Configuration(format!("proxy DNS resolver: {error}")))
 }
 
 /// Builds the production `kube::Client`. `resolver_config`'s nameservers
-/// must already have been read from `/etc/resolv.conf` before Landlock
-/// lockdown (see `production::read_production_startup_files`); this
-/// function performs no filesystem access at all -- and, once built,
-/// nothing this client does (reconnects included) does either.
+/// and search list, and `ndots`, must already have been read from
+/// `/etc/resolv.conf` before Landlock lockdown (see
+/// `production::proxy_resolver_config`); this function performs no
+/// filesystem access at all -- and, once built, nothing this client does
+/// (reconnects included) does either.
 ///
 /// # Errors
 ///
@@ -132,8 +142,9 @@ fn build_resolver(resolver_config: ResolverConfig) -> Result<TokioResolver, Runt
 pub(crate) fn build_client(
     kube_config: &Config,
     resolver_config: ResolverConfig,
+    ndots: usize,
 ) -> Result<Client, RuntimeError> {
-    let resolver = Arc::new(build_resolver(resolver_config)?);
+    let resolver = Arc::new(build_resolver(resolver_config, ndots)?);
     let mut base_connector = HttpConnector::new_with_resolver(HickoryResolve { resolver });
     base_connector.enforce_http(false);
 
@@ -271,6 +282,96 @@ mod tests {
         Ok(addr)
     }
 
+    /// Like [`spawn_dns_stub`], but only answers an `A` query for exactly
+    /// `expected_fqdn` (a trailing-dot FQDN, matching `Name`'s own wire
+    /// form) -- every other query, including a syntactically-valid `A`
+    /// query for any other name, gets an empty `NOERROR` answer (no
+    /// records), i.e. what a real authoritative nameserver returns for a
+    /// name it does not serve. Used to prove search-list expansion is
+    /// genuinely exercised: a short (non-FQDN) name can only ever resolve
+    /// through this stub by way of one of the resolver's own
+    /// search-suffixed forms actually matching `expected_fqdn`, not merely
+    /// because the stub accepts anything.
+    fn spawn_dns_stub_for_exact_name(
+        expected_fqdn: &str,
+        answer_ip: Ipv4Addr,
+    ) -> TestResult<SocketAddr> {
+        let socket = UdpSocket::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
+        let addr = socket.local_addr().map_err(|error| error.to_string())?;
+        let expected = hickory_proto::rr::Name::from_ascii(expected_fqdn)
+            .map_err(|error| error.to_string())?;
+        std::thread::spawn(move || {
+            let mut buf = [0_u8; 512];
+            while let Ok((len, from)) = socket.recv_from(&mut buf) {
+                let Ok(request) = Message::from_vec(&buf[..len]) else {
+                    continue;
+                };
+                let mut response = Message::response(request.metadata.id, request.metadata.op_code);
+                response.metadata = Metadata::response_from_request(&request.metadata);
+                response.metadata.recursion_available = true;
+                response.add_queries(request.queries.iter().cloned());
+                if let Some(query) = request.queries.first()
+                    && query.query_type() == RecordType::A
+                    && query.name() == &expected
+                {
+                    response.add_answer(Record::from_rdata(
+                        query.name().clone(),
+                        60,
+                        RData::A(A(answer_ip)),
+                    ));
+                }
+                let Ok(bytes) = response.to_bytes() else {
+                    continue;
+                };
+                let _ignored = socket.send_to(&bytes, from);
+            }
+        });
+        Ok(addr)
+    }
+
+    /// See the Apsides v0.3 plan, Phase 5c review: the proxy's hostname
+    /// (`apsides-proxy-<generation>.<namespace>.svc`) is short, not
+    /// itself a resolvable FQDN -- it only resolves through
+    /// `resolv.conf`'s `search`-list expansion, the same way glibc's
+    /// `getaddrinfo` resolved it before Phase 5c. This proves
+    /// `build_resolver`'s `ndots`/search-list wiring genuinely drives that
+    /// expansion: the stub answers *only* for the fully search-suffixed
+    /// name, never the bare short name, so a successful lookup can only
+    /// mean the resolver actually appended the search domain.
+    #[test]
+    fn build_resolver_applies_the_search_list_to_a_short_name() -> TestResult {
+        let short_name = "apsides-proxy-test.workload.svc";
+        let expected_fqdn = "apsides-proxy-test.workload.svc.cluster.local.";
+        let dns_addr = spawn_dns_stub_for_exact_name(expected_fqdn, Ipv4Addr::LOCALHOST)?;
+        let resolver_config = hickory_resolver::config::ResolverConfig::from_parts(
+            None,
+            vec![
+                hickory_proto::rr::Name::from_ascii("cluster.local")
+                    .map_err(|error| error.to_string())?,
+            ],
+            vec![ns_config(dns_addr)],
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("failed to build tokio runtime: {error}"))?;
+        rt.block_on(async move {
+            let resolver = super::build_resolver(resolver_config, 5)
+                .map_err(|error| format!("failed to build the resolver: {error}"))?;
+            let lookup = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                resolver.lookup_ip(short_name),
+            )
+            .await
+            .map_err(|_elapsed| "search-list lookup timed out".to_owned())?
+            .map_err(|error| format!("search-list lookup failed: {error}"))?;
+            let addrs: Vec<_> = lookup.iter().collect();
+            assert_eq!(addrs, vec![std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+            Ok(())
+        })
+    }
+
     #[test]
     fn kube_client_performs_a_request_through_the_hickory_connector_after_lockdown() -> TestResult {
         // Both fixture servers start their own background thread now,
@@ -285,7 +386,7 @@ mod tests {
 
         let status =
             engine::apply_deny_all_or_fail_closed(true).map_err(|error| error.to_string())?;
-        let enforced = status == engine::LockdownOutcome::Enforced;
+        let enforced = status != engine::LockdownOutcome::NotEnforced;
         eprintln!("[kube-client-hickory] lockdown status: {status:?} (enforced={enforced})");
 
         let mut kube_config = Config::new(
@@ -316,7 +417,7 @@ mod tests {
             .map_err(|error| format!("failed to build tokio runtime: {error}"))?;
 
         rt.block_on(async move {
-            let client = super::build_client(&kube_config, resolver_config)
+            let client = super::build_client(&kube_config, resolver_config, 1)
                 .map_err(|error| format!("failed to build the kube client: {error}"))?;
             let request = Request::builder()
                 .uri("/")
