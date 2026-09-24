@@ -49,19 +49,29 @@ Privileged CI owns Roles, RoleBindings, the controller image, activation and
 retirement of the previous writer. A generation-specific proxy and protected
 coordination records form the writer-quiescence boundary.
 
-The generated controller touches the filesystem only during a short,
-synchronous startup: it reads its startup config, the proxy client identity
-(or the fixture kubeconfig), and `/etc/resolv.conf`, converts them into
+The generated controller intentionally reads the filesystem only during a
+short, synchronous startup: it reads its startup config, the proxy client
+identity (or the fixture kubeconfig), `/etc/resolv.conf`, and
+`available_parallelism()`'s cgroup-aware CPU count, converts them into
 in-memory values, then applies a deny-all Landlock ruleset to the process's
 main thread before any other thread exists and before the V8 platform or the
 tokio runtime is initialised. Threads created afterward -- V8's worker pool,
 the tokio runtime's own workers -- inherit that restriction. The production
-kube client reaches the proxy Service by hostname through a dedicated
-`hickory-resolver`-backed connector rather than glibc's `getaddrinfo`, so a
-proxy reconnect never needs a file again. An unenforced Landlock lockdown
-fails startup closed in production; a fixture-only `allowNoLandlock` escape
-hatch exists for disposable-cluster testing and is structurally unavailable
-in production mode.
+kube client reaches the proxy Service by its original hostname (resolved
+through `resolv.conf`'s own `search`/`ndots` directives, read before
+lockdown) through a dedicated `hickory-resolver`-backed connector rather than
+glibc's `getaddrinfo`, so a proxy reconnect never needs a file again, and V8's
+platform and per-isolate RNGs are seeded from `getrandom(2)` directly rather
+than a `/dev/urandom` read Landlock would deny. `strace` against the locked
+down process still shows two glibc/V8-internal reads after lockdown (V8's own
+CPU-count path, and a new thread's stack-bounds probe); both are denied and
+both already fall back to a working, file-free alternative (the process's CPU
+affinity mask, and `__libc_stack_end`, respectively) with no code here
+involved. An unenforced Landlock lockdown fails startup closed in production;
+a `PartiallyEnforced` kernel (an older Landlock ABI missing some requested
+rights) still counts as enforced, reported distinctly at `/status`. A
+fixture-only `allowNoLandlock` escape hatch exists for disposable-cluster
+testing and is structurally unavailable in production mode.
 
 ## Policy and force
 
