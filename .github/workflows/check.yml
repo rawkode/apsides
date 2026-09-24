@@ -83,6 +83,18 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
+      # This job's `aps build` recompiles crates/engine's deno_core/v8 from
+      # scratch, then runs a kind cluster on top; headroom matters. Hosted
+      # runners preinstall toolchains this workflow never uses -- .NET,
+      # Android, GHC, CodeQL -- that otherwise stay on disk for the whole
+      # job.
+      - name: Free preinstalled toolchains this job does not use
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go \
+            /opt/hostedtoolcache/Ruby /usr/local/.ghcup /opt/az
+          df -h /
       # scripts/rusty_v8.py never caches under the checkout (that would be
       # gitignored `work/`, but also wrong in principle: an installed CLI
       # distribution's equivalent path is the asset tree
@@ -162,6 +174,18 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
+      # This job builds five full release-mode controllers, each recompiling
+      # crates/engine's deno_core/v8 from scratch (see acceptance-prepare's
+      # own per-release cleanup below); headroom matters. Hosted runners
+      # preinstall toolchains this workflow never uses -- .NET, Android,
+      # GHC, CodeQL -- that otherwise stay on disk for the whole job.
+      - name: Free preinstalled toolchains this job does not use
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go \
+            /opt/hostedtoolcache/Ruby /usr/local/.ghcup /opt/az
+          df -h /
       # scripts/rusty_v8.py never caches under the checkout (that would be
       # gitignored `work/`, but also wrong in principle: an installed CLI
       # distribution's equivalent path is the asset tree
