@@ -1265,8 +1265,17 @@ pub(crate) async fn commit_handler_outputs(
                 ))
             })?;
         let api = controller.kube.resource_api(resource)?;
-        let existing = api.get(&output.name).await.map_err(|error| {
-            RuntimeError::Kubernetes(format!("handler output read failed: {error}"))
+        // The raw `kube::Error` is discarded, not interpolated: an API
+        // error body can echo back request/response content, and this
+        // reason ends up in the world-readable diagnostics conditions
+        // list -- the same discipline `write_api_error` and the
+        // reconciler's own ownership-preflight GET/LIST calls already
+        // apply to every other Kubernetes error this crate surfaces.
+        let existing = api.get(&output.name).await.map_err(|_error| {
+            RuntimeError::Kubernetes(format!(
+                "handler-output-read-failed:{}/{}",
+                resource.kind, resource.name
+            ))
         })?;
         let uid = existing
             .metadata
