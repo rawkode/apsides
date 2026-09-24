@@ -1,8 +1,13 @@
 //! Phase 5b tests for `op_apsides_fetch`, `op_apsides_output_write`, and
 //! `op_apsides_log` (see the Apsides v0.3 plan, "Phase 5 -> 5b", and
 //! review round 5's B1-B8), driven entirely through the public
-//! `apsides.*` JS surface via `invoke_handler_blocking`, matching how a
-//! real handler would observe these ops.
+//! `apsides.*` JS surface via `invoke_handler_with_watchdog`, the crate's
+//! one production entry point -- not `invoke_handler_blocking`, matching
+//! how a real caller would observe these ops (review round 6, X1: a bug
+//! that only manifested through the production entry point's own
+//! runtime/isolate build order was invisible to this suite while it used
+//! `invoke_handler_blocking`, which runs inside an already-built
+//! `rt.block_on`).
 //!
 //! Every `#[test]` here returns `Result<(), String>` and propagates
 //! failures with `?`/explicit `Err(...)` returns, matching this crate's
@@ -22,7 +27,7 @@ use common::{handler_invocation, wrap_as_handler};
 use engine::{
     EgressPolicy, FIXTURE_ACKNOWLEDGEMENT, FixtureEgressOverride, HandlerInvocation,
     InvocationReport, LogWriter, OutputDeclaration, OutputSink, OutputSinkError,
-    invoke_handler_blocking,
+    invoke_handler_with_watchdog,
 };
 
 fn no_usage() -> Arc<AtomicUsize> {
@@ -37,7 +42,7 @@ fn run(body: &str, configure: impl FnOnce(&mut HandlerInvocation<'_>)) -> Invoca
     let bundle = wrap_as_handler(body);
     let mut invocation = handler_invocation(&bundle);
     configure(&mut invocation);
-    invoke_handler_blocking(invocation, &no_usage())
+    invoke_handler_with_watchdog(invocation, &no_usage())
 }
 
 /// A handler body that attempts `js_call` (an `apsides.*` call expression,
@@ -529,7 +534,7 @@ fn output_write_allowed_reaches_the_sink() -> Result<(), String> {
     invocation.outputs = one_declared_output(1024);
     invocation.sink = Arc::clone(&recording) as Arc<dyn OutputSink>;
 
-    invoke_handler_blocking(invocation, &no_usage())
+    invoke_handler_with_watchdog(invocation, &no_usage())
         .result
         .map_err(|err| format!("expected the write to succeed, got Err: {err}"))?;
 
@@ -1035,7 +1040,7 @@ fn log_emission_is_capped_and_reports_a_dropped_count() -> Result<(), String> {
     let mut invocation = handler_invocation(&bundle);
     invocation.log_writer = Arc::clone(&recording) as Arc<dyn LogWriter>;
 
-    invoke_handler_blocking(invocation, &no_usage())
+    invoke_handler_with_watchdog(invocation, &no_usage())
         .result
         .map_err(|err| format!("expected the handler to succeed, got Err: {err}"))?;
 
@@ -1155,7 +1160,7 @@ fn apsides_wrappers_are_robust_to_prototype_and_symbol_hijacking() -> Result<(),
     invocation.outputs = one_declared_output(1024);
     invocation.sink = Arc::clone(&recording) as Arc<dyn OutputSink>;
 
-    let report = invoke_handler_blocking(invocation, &no_usage());
+    let report = invoke_handler_with_watchdog(invocation, &no_usage());
     let value = report.result.map_err(|err| {
         format!("expected the handler to succeed despite the hijacks, got Err: {err}")
     })?;

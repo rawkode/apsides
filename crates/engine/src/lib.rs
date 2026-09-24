@@ -30,7 +30,15 @@
 //! `JsRuntime`, and it always calls [`ensure_platform_initialized`] first —
 //! so there is no path through this crate that can build an isolate without
 //! the V8 flags, capped allocator, in-memory-only module loader, and
-//! bootstrap guard script all being applied.
+//! bootstrap guard script all being applied. It also always requires a
+//! `&tokio::runtime::Handle` and enters it before constructing the
+//! isolate (review round 6, X1): `deno_core` needs a tokio runtime
+//! already present to register the isolate against, not merely one built
+//! later, or a V8-internal foreground task posted during real execution
+//! (e.g. the GC memory reducer, under allocation churn) has nothing to
+//! post itself onto and aborts the whole process. Every `invoke_handler*`
+//! entry point therefore builds (or obtains) its runtime *before* calling
+//! [`begin_invocation`], never after.
 
 mod net;
 mod ops;
@@ -980,8 +988,23 @@ struct PreparedIsolate {
 /// with `egress`/`outputs`/`sink`/`deadline` as its per-invocation
 /// `OpState` (see `ops::EngineOpState`), and runs
 /// [`BOOTSTRAP_GUARD_SCRIPT`] before returning.
+///
+/// Takes `handle: &tokio::runtime::Handle` and enters it for the whole
+/// function body as structural, not just documented, proof that a tokio
+/// runtime exists at `JsRuntime::new` time (review round 6, X1): without
+/// an entered runtime, `deno_core` registers the isolate with no `Handle`
+/// to post tasks onto, and a *later* V8-internal foreground task (e.g. the
+/// GC memory reducer, under real allocation churn) reaching
+/// `spawn_delayed_task` with nothing to spawn *onto* is documented to call
+/// `abort()`, killing the whole controller process -- not a catchable JS
+/// exception, not an isolate termination this crate could recover from.
+/// Requiring the handle here, rather than leaving "call this only from
+/// inside an entered runtime" as a doc-comment convention, means no future
+/// call site can silently reintroduce the bug: there is no `Handle` to
+/// pass without first having a runtime to get one from.
 #[allow(clippy::too_many_arguments, reason = "each argument is a distinct, independently-owned piece of one invocation's isolate configuration; bundling them into a struct here would only move the same field list one level up")]
 fn prepare_isolate(
+    handle: &tokio::runtime::Handle,
     limits: Limits,
     bundle: &str,
     usage: Arc<AtomicUsize>,
@@ -995,6 +1018,9 @@ fn prepare_isolate(
     log_writer: Arc<dyn LogWriter>,
 ) -> Result<PreparedIsolate, EngineError> {
     ensure_platform_initialized();
+    // See the doc comment above: entered for the rest of this function,
+    // covering `JsRuntime::new` and the bootstrap script it then runs.
+    let _runtime_guard = handle.enter();
 
     let fetch_budget = ops::FetchBudget {
         deadline,
@@ -1301,10 +1327,17 @@ struct BegunInvocation<'a> {
 /// callback -- shared by every `invoke_handler*` entry point so each only
 /// has to add its own runtime/watchdog concerns on top.
 ///
+/// Takes `handle: &tokio::runtime::Handle`, forwarded to
+/// [`prepare_isolate`] -- see that function's doc comment (review round 6,
+/// X1). Every caller must obtain this from a runtime it has *already
+/// built* (`Runtime::handle()`) or is *already running on*
+/// (`Handle::current()`), never build one after calling this.
+///
 /// On any failure before an isolate exists at all (an invalid
 /// `egress.allowed` entry, or a missing/wrong fixture acknowledgement),
 /// returns `Err` directly, with no logs to collect.
 fn begin_invocation<'a>(
+    handle: &tokio::runtime::Handle,
     invocation: HandlerInvocation<'a>,
     usage: &Arc<AtomicUsize>,
 ) -> Result<BegunInvocation<'a>, InvokeError> {
@@ -1319,6 +1352,7 @@ fn begin_invocation<'a>(
         isolate_handle,
         specifier,
     } = prepare_isolate(
+        handle,
         invocation.limits,
         invocation.bundle,
         Arc::clone(usage),
@@ -1382,7 +1416,13 @@ pub async fn invoke_handler(
     invocation: HandlerInvocation<'_>,
     usage: &Arc<AtomicUsize>,
 ) -> InvocationReport {
-    let mut begun = match begin_invocation(invocation, usage) {
+    // `Handle::current()`, not a freshly built runtime: this function's own
+    // contract is "run on whatever runtime is already driving the caller",
+    // and by the time an `async fn` is actually being polled, that runtime
+    // is necessarily already entered -- see `begin_invocation`/
+    // `prepare_isolate`'s doc comments (review round 6, X1).
+    let handle = tokio::runtime::Handle::current();
+    let mut begun = match begin_invocation(&handle, invocation, usage) {
         Ok(begun) => begun,
         Err(err) => {
             return InvocationReport {
@@ -1442,24 +1482,29 @@ pub async fn invoke_handler(
 /// `result` carries the handler's resolved value or why the invocation
 /// failed, and `logs` carries every `apsides.log` line captured either
 /// way -- see that type's doc comment.
+///
+/// Builds its tokio runtime **before** doing anything else, including
+/// before [`begin_invocation`] (and therefore before `JsRuntime::new`) --
+/// review round 6, X1. A prior version built the isolate first and the
+/// runtime second, so `deno_core` registered the isolate with no tokio
+/// `Handle` to post tasks onto at all (not merely "not currently
+/// entered"). That was invisible to this crate's own test suite, which
+/// drives everything through `invoke_handler`/`invoke_handler_blocking`
+/// inside an already-built `rt.block_on`, but under real allocation churn
+/// in production it let V8's own GC memory reducer reach
+/// `deno_core`'s `spawn_delayed_task` with nothing to spawn onto, which
+/// calls `abort()` and kills the whole controller process outright --
+/// not a catchable JS exception, not an isolate termination this crate
+/// could turn into an `InvokeError`. See
+/// `allocation_churn_survives_through_the_watchdog_entry_point` in
+/// `tests/spike.rs` for the regression test.
 pub fn invoke_handler_with_watchdog(
     invocation: HandlerInvocation<'_>,
     usage: &Arc<AtomicUsize>,
 ) -> InvocationReport {
-    let mut begun = match begin_invocation(invocation, usage) {
-        Ok(begun) => begun,
-        Err(err) => {
-            return InvocationReport {
-                result: Err(err),
-                logs: Vec::new(),
-            };
-        }
-    };
-
     // `enable_io()`: a handler that calls `apsides.fetch` needs the tokio
-    // net driver, not just timers. Built *before* the watchdog thread is
-    // spawned below: if this fails, it returns before any thread but the
-    // caller's own exists, so there is nothing to join.
+    // net driver, not just timers. Built *first*, before the isolate
+    // exists at all -- see the doc comment above.
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .enable_io()
@@ -1469,6 +1514,16 @@ pub fn invoke_handler_with_watchdog(
         Err(err) => {
             return InvocationReport {
                 result: Err(InvokeError::Runtime(err)),
+                logs: Vec::new(),
+            };
+        }
+    };
+
+    let mut begun = match begin_invocation(rt.handle(), invocation, usage) {
+        Ok(begun) => begun,
+        Err(err) => {
+            return InvocationReport {
+                result: Err(err),
                 logs: Vec::new(),
             };
         }

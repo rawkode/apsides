@@ -18,22 +18,29 @@ use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use common::{GENEROUS_LIMITS, handler_invocation, wrap_as_handler};
-use engine::{HandlerInvocation, InvocationReport, Limits, invoke_handler_blocking, invoke_handler_with_watchdog};
+use engine::{InvocationReport, Limits, invoke_handler_with_watchdog};
 
 fn no_usage() -> Arc<AtomicUsize> {
     Arc::new(AtomicUsize::new(0))
 }
 
+/// Runs `body` through [`invoke_handler_with_watchdog`], the crate's one
+/// production entry point, not the test-only `invoke_handler_blocking` --
+/// review round 6, X1 was invisible to this suite specifically because it
+/// drove everything through an entry point that runs inside an
+/// already-built `rt.block_on`, sidestepping the exact ordering bug the
+/// production entry point had. Every test in this file goes through the
+/// real entry point now, so none of it needs the `test-util` feature.
 fn run(body: &str) -> InvocationReport {
     let bundle = wrap_as_handler(body);
-    invoke_handler_blocking(handler_invocation(&bundle), &no_usage())
+    invoke_handler_with_watchdog(handler_invocation(&bundle), &no_usage())
 }
 
 fn run_with_limits(limits: Limits, body: &str) -> InvocationReport {
     let bundle = wrap_as_handler(body);
     let mut invocation = handler_invocation(&bundle);
     invocation.limits = limits;
-    invoke_handler_blocking(invocation, &no_usage())
+    invoke_handler_with_watchdog(invocation, &no_usage())
 }
 
 /// Proves the pinned `deno_core` + prebuilt V8 actually links, boots an
@@ -575,11 +582,8 @@ fn heap_limit_terminates_the_isolate_without_aborting_the_process() {
 fn watchdog_thread_terminates_a_synchronous_infinite_loop() {
     let mut limits = GENEROUS_LIMITS;
     limits.timeout = Duration::from_millis(200);
-    let bundle = wrap_as_handler("while (true) {}");
-    let mut invocation: HandlerInvocation<'_> = handler_invocation(&bundle);
-    invocation.limits = limits;
 
-    let result = invoke_handler_with_watchdog(invocation, &no_usage());
+    let result = run_with_limits(limits, "while (true) {}");
 
     let terminated = matches!(&result.result, Err(err) if err.is_isolate_termination());
     assert!(
@@ -596,6 +600,67 @@ fn watchdog_thread_terminates_a_synchronous_infinite_loop() {
         followup.result.is_ok(),
         "process must still be able to run further isolates after a \
          watchdog timeout termination, got {followup:?}"
+    );
+}
+
+/// Regression test for review round 6, X1: `invoke_handler_with_watchdog`
+/// used to build its isolate (`JsRuntime::new`, inside `begin_invocation`)
+/// *before* building its own tokio runtime, so `deno_core` registered the
+/// isolate with no `Handle` to post tasks onto at all. Sustained
+/// allocation churn -- batches of plain-object arrays allocated and
+/// dropped in a loop, with an `await` between batches so the event loop
+/// actually gets turns, for around 3 real seconds -- reliably drives V8's
+/// GC hard enough that its background memory reducer schedules a delayed
+/// foreground task, which is exactly the path that used to call `abort()`
+/// and kill this whole test process outright (not a catchable Rust
+/// `Result`, not an isolate-termination error -- the process itself dying
+/// is the failure mode this test exists to catch). This goes through
+/// `run`, i.e. `invoke_handler_with_watchdog` directly, unlike the
+/// original bug report's repro, which needed the production entry point
+/// specifically because the test suite's prior use of
+/// `invoke_handler_blocking` (inside an already-built `rt.block_on`)
+/// could never have reproduced this.
+#[test]
+fn allocation_churn_survives_through_the_watchdog_entry_point() {
+    let mut limits = GENEROUS_LIMITS;
+    limits.timeout = Duration::from_secs(30);
+
+    let result = run_with_limits(
+        limits,
+        r#"
+        const deadline = Date.now() + 3000;
+        let n = 0;
+        while (Date.now() < deadline) {
+            for (let i = 0; i < 50; i++) {
+                const churn = new Array(10000).fill(n);
+                n = (n + churn.length) % 1000;
+            }
+            // Yields back to the event loop between batches, so this
+            // exercises the same "isolate driven across multiple event
+            // loop turns while GC does real background work" shape as
+            // the original repro, not one uninterrupted synchronous call.
+            await Promise.resolve();
+        }
+        return "survived";
+    "#,
+    );
+
+    assert!(
+        matches!(&result.result, Ok(value) if *value == serde_json::json!("survived")),
+        "expected the allocation-churn handler to return Ok(\"survived\"), got {result:?} -- \
+         if this test process itself died (SIGABRT) instead of reporting a failed assertion, \
+         that is X1 regressing: deno_core posted a delayed task with no tokio Handle to post it \
+         onto"
+    );
+
+    // The whole point: this process must still be alive and able to run
+    // a further isolate afterward, i.e. the allocation churn above did
+    // not abort it.
+    let followup = run(r#"apsides.log("info", "still alive");"#);
+    assert!(
+        followup.result.is_ok(),
+        "process must still be able to run further isolates after sustained allocation churn, \
+         got {followup:?}"
     );
 }
 

@@ -163,6 +163,15 @@ fn main() -> Result<(), String> {
 /// across many rounds (forcing V8's GC, including its background worker
 /// threads, to do real work), then calls the spike op once more to confirm
 /// the isolate is still healthy afterward.
+///
+/// Goes through `invoke_handler_with_watchdog`, the production entry
+/// point, not the test-only `invoke_handler_blocking` -- this is exactly
+/// the GC-under-allocation-pressure shape review round 6's X1 finding
+/// needed the production entry point to reproduce (see
+/// `tests/spike.rs`'s `allocation_churn_survives_through_the_watchdog_entry_point`),
+/// and this binary's whole reason to exist is proving production-shaped
+/// behavior (V8 + Landlock ordering) under a real lockdown, so it should
+/// not itself lean on a test-only shortcut.
 fn run_gc_heavy_handler() -> Result<(), String> {
     let usage = Arc::new(AtomicUsize::new(0));
     let bundle = wrap_as_handler(
@@ -179,7 +188,7 @@ fn run_gc_heavy_handler() -> Result<(), String> {
     );
     let mut invocation = handler_invocation(&bundle);
     invocation.limits.timeout = Duration::from_secs(30);
-    engine::invoke_handler_blocking(invocation, &usage)
+    engine::invoke_handler_with_watchdog(invocation, &usage)
         .result
         .map(|_value| ())
         .map_err(|err| format!("GC-heavy handler failed under lockdown: {err}"))

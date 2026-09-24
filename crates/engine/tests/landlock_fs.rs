@@ -121,6 +121,17 @@ fn handler_and_hickory_https_work_after_v8_init_and_landlock_lockdown() -> Resul
 // `deno_core::JsRuntime` (and its `invoke_handler`) is deliberately
 // !Send; see the matching `#[allow]` and doc comment on `invoke_handler`
 // in `src/lib.rs`.
+//
+// This is one of the few places this crate's own tests still reach for
+// the test-only `invoke_handler` rather than the production
+// `invoke_handler_with_watchdog` (review round 6: prefer the production
+// entry point unless a test genuinely needs the test-only one). This one
+// does: the caller above (`handler_and_hickory_https_work_after_v8_init_and_landlock_lockdown`)
+// needs the handler invocation and the raw `https_get_via_hickory` probe
+// to run back-to-back on the *same* already-built, already-entered tokio
+// runtime, inside one `rt.block_on` -- `invoke_handler_with_watchdog`
+// builds and owns its own separate runtime internally, which cannot be
+// composed into an existing async chain like that.
 #[allow(
     clippy::future_not_send,
     reason = "awaits engine::invoke_handler, which is itself !Send by design"
