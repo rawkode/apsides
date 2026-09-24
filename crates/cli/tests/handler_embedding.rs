@@ -33,18 +33,45 @@ fn write_source(root: &Path) -> Result {
     fs::create_dir_all(root.join("handlers"))?;
     fs::write(root.join("program.tsx"), PROGRAM)?;
     fs::write(root.join("handlers/sync-flags.ts"), HANDLER_MODULE)?;
-    let inputs = serde_json::json!([
-        {"path": "handlers/sync-flags.ts", "sha256": digest(HANDLER_MODULE.as_bytes())},
-        {"path": "program.tsx", "sha256": digest(PROGRAM.as_bytes())},
+    // `packages/compiler/src/compiler.ts`'s `parseCanonicalLock` requires the
+    // lock's own on-disk bytes to already be its canonical (alphabetically
+    // key-sorted) pretty-printed form. `serde_json::json!`/`Value::Object`
+    // only produces that ordering when compiled without the `preserve_order`
+    // feature; this workspace's `deno_core` dependency (the Apsides v0.3
+    // plan's Phase 5b engine) enables `serde_json/preserve_order`, and Cargo
+    // unifies that feature across every crate using this `serde_json`
+    // version in the same build -- so this fixture, unlike production's own
+    // `source-lock.ts` generator (which always sorts explicitly), must build
+    // its object with keys inserted in already-sorted order to stay
+    // byte-canonical regardless of which `Map` backend is active. Compare
+    // `compiler_core::json::canonical_bytes`'s own explicit sort, guarded by
+    // the identical comment.
+    let sorted_input = |path: &str, bytes: &[u8]| -> serde_json::Value {
+        let mut object = serde_json::Map::new();
+        object.insert("path".into(), serde_json::Value::String(path.into()));
+        object.insert("sha256".into(), serde_json::Value::String(digest(bytes)));
+        serde_json::Value::Object(object)
+    };
+    let inputs = serde_json::Value::Array(vec![
+        sorted_input("handlers/sync-flags.ts", HANDLER_MODULE.as_bytes()),
+        sorted_input("program.tsx", PROGRAM.as_bytes()),
     ]);
-    let lock = serde_json::json!({
-        "schemaVersion": "apsides.dev/source-lock/v1",
-        "entry": "program.tsx",
-        "inputs": inputs,
-    });
+    let mut lock = serde_json::Map::new();
+    lock.insert(
+        "entry".into(),
+        serde_json::Value::String("program.tsx".into()),
+    );
+    lock.insert("inputs".into(), inputs);
+    lock.insert(
+        "schemaVersion".into(),
+        serde_json::Value::String("apsides.dev/source-lock/v1".into()),
+    );
     fs::write(
         root.join("apsides.lock.json"),
-        format!("{}\n", serde_json::to_string_pretty(&lock)?),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&serde_json::Value::Object(lock))?
+        ),
     )?;
     Ok(())
 }
