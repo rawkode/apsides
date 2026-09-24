@@ -40,6 +40,17 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"
+# Review round 5 (B2): replaces the hand-rolled HTTP/1.1 parser, whose
+# manual request assembly (format!/push_str, no method/header validation)
+# allowed CRLF/request-line injection. hyper/hyper-util/http/http-body-util
+# are already in Cargo.lock (pulled in transitively through `kube` in other
+# workspace crates), so this only adds feature requests, not new crates to
+# the dependency graph -- versions pinned to match what is already locked.
+bytes = "1"
+http = "=1.5.0"
+http-body-util = "=0.1.5"
+hyper = { version = "=1.11.1", features = ["client", "http1"] }
+hyper-util = { version = "=0.1.20", features = ["tokio"] }
 
 [dev-dependencies]
 landlock = "0.4"

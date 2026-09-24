@@ -1032,8 +1032,13 @@ dependencies = [
 name = "engine"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "deno_core",
  "hickory-resolver",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "landlock",
  "rcgen",
  "rustls",
