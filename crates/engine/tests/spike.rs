@@ -39,7 +39,7 @@ fn run_with_limits(limits: Limits, body: &str) -> InvocationReport {
 /// Proves the pinned `deno_core` + prebuilt V8 actually links, boots an
 /// isolate, loads a tiny ES module, calls its exported async handler
 /// function with an event, and dispatches an `apsides.log` op round trip
-/// (Rust -> V8 -> Rust, observed via `HandlerOutput::logs`).
+/// (Rust -> V8 -> Rust, observed via `InvocationReport::logs`).
 #[test]
 fn apsides_log_is_callable_from_the_handler_export() -> Result<(), String> {
     let report = run(
