@@ -24,9 +24,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use common::{
-    SPIKE_HTTPS_HOST, apply_deny_all_or_fail_closed, assert_file_open_denied, https_get_via_hickory,
+    SPIKE_HTTPS_HOST, apply_deny_all_or_fail_closed, assert_file_open_denied,
+    handler_invocation, https_get_via_hickory, wrap_as_handler,
 };
-use engine::EngineLimits;
 use landlock::RulesetStatus;
 
 /// The plan's "if Landlock is unavailable here, ... run the test anyway to
@@ -118,26 +118,22 @@ fn handler_and_hickory_https_work_after_v8_init_and_landlock_lockdown() -> Resul
     })
 }
 
-// `deno_core::JsRuntime` (and its `run_spike_module`) is deliberately
-// !Send; see the matching `#[allow]` and doc comment on `run_spike_module`
+// `deno_core::JsRuntime` (and its `invoke_handler`) is deliberately
+// !Send; see the matching `#[allow]` and doc comment on `invoke_handler`
 // in `src/lib.rs`.
 #[allow(
     clippy::future_not_send,
-    reason = "awaits engine::run_spike_module, which is itself !Send by design"
+    reason = "awaits engine::invoke_handler, which is itself !Send by design"
 )]
 async fn run_handler_module_under_lockdown() -> Result<(), String> {
-    let module = r#"
-        const pong = __apsidesOps.ping();
-        if (pong !== "pong-from-rust") {
-            throw new Error("op broken under Landlock lockdown");
-        }
-    "#;
-    let limits = EngineLimits {
-        max_array_buffer_bytes: 16 * 1024 * 1024,
-        max_heap_bytes: 64 * 1024 * 1024,
-    };
+    let bundle = wrap_as_handler(
+        r#"
+        apsides.log("pong-from-rust");
+    "#,
+    );
     let usage = Arc::new(AtomicUsize::new(0));
-    engine::run_spike_module(limits, module, &usage)
+    engine::invoke_handler(handler_invocation(&bundle), &usage)
         .await
-        .map_err(|err| format!("handler module failed under lockdown: {err}"))
+        .map_err(|err| format!("handler module failed under lockdown: {err}"))?;
+    Ok(())
 }

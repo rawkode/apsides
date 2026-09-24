@@ -38,8 +38,8 @@ use std::time::Duration;
 
 use common::{
     SPIKE_HTTPS_HOST, apply_deny_all_or_fail_closed, assert_file_open_denied, count_process_threads,
+    handler_invocation, wrap_as_handler,
 };
-use engine::EngineLimits;
 use landlock::RulesetStatus;
 
 fn main() -> Result<(), String> {
@@ -165,11 +165,8 @@ fn main() -> Result<(), String> {
 /// the isolate is still healthy afterward.
 fn run_gc_heavy_handler() -> Result<(), String> {
     let usage = Arc::new(AtomicUsize::new(0));
-    let limits = EngineLimits {
-        max_array_buffer_bytes: 16 * 1024 * 1024,
-        max_heap_bytes: 64 * 1024 * 1024,
-    };
-    let module = r#"
+    let bundle = wrap_as_handler(
+        r#"
         for (let round = 0; round < 200; round++) {
             let chunks = [];
             for (let i = 0; i < 2000; i++) {
@@ -177,11 +174,12 @@ fn run_gc_heavy_handler() -> Result<(), String> {
             }
             chunks = null;
         }
-        const pong = __apsidesOps.ping();
-        if (pong !== "pong-from-rust") {
-            throw new Error("op broken after GC-heavy work under lockdown");
-        }
-    "#;
-    engine::run_spike_module_blocking(limits, module, &usage, Duration::from_secs(30))
+        apsides.log("pong-from-rust");
+    "#,
+    );
+    let mut invocation = handler_invocation(&bundle);
+    invocation.limits.timeout = Duration::from_secs(30);
+    engine::invoke_handler_blocking(invocation, &usage)
+        .map(|_output| ())
         .map_err(|err| format!("GC-heavy handler failed under lockdown: {err}"))
 }
