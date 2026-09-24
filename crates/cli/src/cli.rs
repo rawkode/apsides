@@ -120,6 +120,8 @@ pub enum Command {
     Deploy(Deploy),
     /// Read transition history. Audit output never grants lifecycle authority.
     Audit(Audit),
+    /// Compare two deployment surfaces and evaluate an optional review policy.
+    Diff(Diff),
 }
 
 #[derive(Args, Debug)]
@@ -334,6 +336,28 @@ pub struct Audit {
     pub control_namespace: String,
 }
 
+#[derive(Args, Debug)]
+pub struct Diff {
+    /// Base deployment surface: an artifact directory or a `surface.json` file.
+    #[arg(long)]
+    pub base: PathBuf,
+    /// Head deployment surface: an artifact directory or a `surface.json` file.
+    #[arg(long)]
+    pub head: PathBuf,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = DiffFormat::Markdown)]
+    pub format: DiffFormat,
+    /// Review policy naming the diff conditions that require approval.
+    #[arg(long)]
+    pub policy: Option<PathBuf>,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffFormat {
+    Markdown,
+    Json,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,5 +530,33 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn diff_needs_base_and_head_and_defaults_to_markdown() -> Result<()> {
+        assert!(parse(&["diff", "--base", "b"]).is_err(), "no head");
+        assert!(parse(&["diff", "--head", "h"]).is_err(), "no base");
+        let Some(Command::Diff(diff)) = parse(&["diff", "--base", "b", "--head", "h"])?.command
+        else {
+            return Err("diff did not parse".into());
+        };
+        assert_eq!(diff.format, DiffFormat::Markdown);
+        assert!(diff.policy.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn diff_accepts_an_explicit_format_and_policy() -> Result<()> {
+        let Some(Command::Diff(diff)) = parse(&[
+            "diff", "--base", "b", "--head", "h", "--format", "json", "--policy", "p",
+        ])?
+        .command
+        else {
+            return Err("diff did not parse".into());
+        };
+        assert_eq!(diff.format, DiffFormat::Json);
+        assert_eq!(diff.policy.as_deref(), Some(std::path::Path::new("p")));
+        assert!(parse(&["diff", "--base", "b", "--head", "h", "--format", "yaml"]).is_err());
+        Ok(())
     }
 }
