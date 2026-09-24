@@ -484,6 +484,95 @@ fn native_array_buffer_constructor_is_unreachable_via_prototype_chain() {
     );
 }
 
+/// Regression test, route 5 (found by a fourth review round, via source
+/// audit rather than a repro): `Guarded` and the `transfer` wrapper in
+/// `BOOTSTRAP_GUARD_SCRIPT` used to call `Reflect.construct`/`Reflect.apply`
+/// *at call time* -- i.e. every time user code did `new ArrayBuffer(...)`
+/// or `.transfer()`, not once at bootstrap. Since `Reflect.construct`/
+/// `Reflect.apply` are ordinary, reassignable global properties, user code
+/// could replace either with a hook that records its `target` argument
+/// (the native, unguarded constructor or native `transfer` function,
+/// respectively) before forwarding the call on normally -- fully stealthy,
+/// and handing user code exactly the reference every other layer of this
+/// guard exists to keep unreachable. Fixed by capturing both (`construct`/
+/// `apply`) into local `const`s at the very top of the script, before any
+/// other statement runs, so the guard's own machinery never performs a
+/// fresh `Reflect.*` lookup that user code could have already replaced.
+///
+/// Installs exactly that hook (recording `target` and forwarding to a
+/// separately-captured, un-hijacked native `Reflect.construct`/`apply`, so
+/// the buffer operations below still succeed normally either way -- this
+/// test needs to observe whether the hook *fires*, not merely whether
+/// construction still works), then performs the two operations the guard's
+/// internal code actually calls `Reflect.*` for (an ordinary construction
+/// and a `.transfer()`) plus the full resizable-buffer repro, and asserts
+/// the hooks recorded zero calls: with the fix, the guard's own code never
+/// touches the (now hijacked) `Reflect.construct`/`Reflect.apply` at all,
+/// so there is nothing for the hooks to ever record.
+#[test]
+fn reflect_construct_and_apply_are_captured_before_hijack() {
+    let cap_bytes = 1024 * 1024;
+    let limits = EngineLimits {
+        max_array_buffer_bytes: cap_bytes,
+        max_heap_bytes: 64 * 1024 * 1024,
+    };
+    let module = r#"
+        const nativeConstruct = Reflect.construct;
+        const nativeApply = Reflect.apply;
+        const constructCalls = [];
+        const applyCalls = [];
+        Reflect.construct = function (target, args, newTarget) {
+            constructCalls.push(target);
+            return nativeConstruct(target, args, newTarget);
+        };
+        Reflect.apply = function (target, thisArg, args) {
+            applyCalls.push(target);
+            return nativeApply(target, thisArg, args);
+        };
+
+        // The two operations the guard's own internal code performs on
+        // every call: an ordinary construction (Guarded) and a transfer.
+        const buf = new ArrayBuffer(4);
+        const transferred = buf.transfer();
+
+        // The exact exploit repro, attempted again with the hooks live.
+        const attempt = new ArrayBuffer(0, { maxByteLength: 256 * 1024 * 1024 });
+
+        if (constructCalls.length !== 0) {
+            throw new Error(
+                "the guard must never call Reflect.construct at call time (would " +
+                "leak the native constructor to a hijacked Reflect.construct); " +
+                "recorded " + constructCalls.length + " call(s)",
+            );
+        }
+        if (applyCalls.length !== 0) {
+            throw new Error(
+                "the guard must never call Reflect.apply at call time (would " +
+                "leak the native transfer function to a hijacked Reflect.apply); " +
+                "recorded " + applyCalls.length + " call(s)",
+            );
+        }
+        if (buf.resizable || transferred.resizable || attempt.resizable) {
+            throw new Error("a resizable buffer was constructed with Reflect hijacked");
+        }
+    "#;
+    let usage = no_usage();
+
+    let result = run_spike_module_blocking(limits, module, &usage, Duration::from_secs(10));
+
+    assert!(
+        result.is_ok(),
+        "expected the Reflect-hijack checks to pass, got {result:?}"
+    );
+    let observed_usage = usage.load(Ordering::SeqCst);
+    assert!(
+        observed_usage <= cap_bytes,
+        "the capped allocator's own usage counter reported {observed_usage} bytes, \
+         over the {cap_bytes} byte cap -- this test only ever constructs \
+         small, fixed-length buffers, so it should stay far under it"
+    );
+}
+
 /// Static methods/properties user code depends on -- `ArrayBuffer.isView`,
 /// `ArrayBuffer[Symbol.species]` -- must keep working even though
 /// `BOOTSTRAP_GUARD_SCRIPT` no longer makes the native constructor reachable

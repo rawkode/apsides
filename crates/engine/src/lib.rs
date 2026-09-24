@@ -156,12 +156,87 @@ const SPIKE_V8_FLAGS: &str = "--jitless --enable-sharedarraybuffer-per-context";
 ///     `Native` is not stored anywhere reachable from `globalThis` once this
 ///     script returns (it lives only in `guardResizable`'s closure, captured
 ///     by the handful of functions defined inside it).
+///   - **Never looks up `Reflect`, `TypeError`, or any other global/built-in
+///     by name inside a function that can run after bootstrap** (a fourth
+///     review round's finding: `Guarded` called `Reflect.construct(Native,
+///     ...)` *at call time* -- i.e. every time user code did `new
+///     ArrayBuffer(...)`, not once at bootstrap -- so user code could
+///     replace `Reflect.construct` with a function that records and returns
+///     its `target` argument, then call `new ArrayBuffer(0)` to receive
+///     `Native` itself out of that recorded argument, fully bypassing every
+///     guard above; `Reflect.apply` in the `transfer` wrapper leaked
+///     `nativeTransfer`, the same way, whenever `.transfer()` was called).
+///     `Reflect.construct`, `Reflect.apply`, and `TypeError` are captured
+///     into local `const`s at the very top of this script, before any other
+///     statement runs, and every later reference inside `guardResizable`'s
+///     nested functions uses those captured bindings, never the bare
+///     identifiers. **This is the general invariant, not just a fix for
+///     this one instance**: any function defined in this script that is
+///     still callable after bootstrap finishes (`Guarded`, its `isView`
+///     wrapper, the `[Symbol.species]` getter, `resize`, `transfer`) may
+///     only ever use values already captured in a closure by the time this
+///     IIFE returns control to `deno_core` -- never a fresh lookup of a
+///     global variable or a built-in's static/prototype method, however
+///     deep (`Object.freeze`, `Object.defineProperty`, etc. are fine to
+///     call directly in `guardResizable`'s own top-level body, which runs
+///     exactly once, synchronously, before user code exists to have
+///     replaced anything -- but never inside a closure that persists past
+///     that point). Every future addition to this script must be checked
+///     against that invariant, not just against the specific bypasses this
+///     review found.
+///
+/// **Audited list of V8 sites that can create a resizable/growable backing
+/// store**, and why each is closed (re-check this list, not just this
+/// script, before bumping the pinned `deno_core`/`v8` versions):
+///   - The `ArrayBuffer`/`SharedArrayBuffer` constructor: closed by
+///     `guardResizable` above (never forwards `options`, and the native
+///     constructor is unreachable per the invariant above).
+///   - `ArrayBuffer.prototype.transfer`: closed by the wrapper above.
+///     Needs an existing resizable buffer to begin with, which cannot exist
+///     (`.transferToFixedLength()`, which can never produce a resizable
+///     result regardless of its receiver, is left unwrapped).
+///   - V8's structured-clone `ValueDeserializer` (`Deno.core.deserialize`/
+///     `structuredClone`, which can decode a resizable buffer directly from
+///     a serialized tag, entirely bypassing the JS-visible constructor):
+///     only reachable via `Deno.core`, deleted by Layer 1 above.
+///   - WebAssembly (a growable `WebAssembly.Memory` is backed by the same
+///     kind of resizable allocation): `WebAssembly` itself is not exposed
+///     at all under `--jitless` on this non-`DrumBrake` build (see
+///     `SPIKE_V8_FLAGS`'s doc comment).
+///   - V8's C++-only `ArrayBuffer::Allocator::NewResizableBackingStore`-style
+///     embedder API: has no JS-reachable caller; this crate's own Rust code
+///     (`v8_alloc.rs`) never calls it either.
+///   - The V8 snapshot deserializer (which can restore heap objects,
+///     including resizable buffers, from a startup snapshot blob): this
+///     crate never builds or loads a startup snapshot (`RuntimeOptions::startup_snapshot`
+///     is left `None` in `prepare_isolate`), and even if it did, a snapshot
+///     blob is embedder-supplied, never user input.
+///   - `%_TheHole()`-style runtime-test intrinsics (`%ArrayBufferMaxByteLength()`
+///     and friends, which can construct engine-internal objects directly):
+///     require the `--allow-natives-syntax` V8 flag, which
+///     `SPIKE_V8_FLAGS` never sets, so `%`-prefixed syntax is a plain
+///     `SyntaxError` in every isolate this crate builds.
 ///
 /// See `tests/spike.rs` for the regression tests: one per bypass route the
-/// three review rounds found, plus the static-preservation, prototype-chain,
+/// four review rounds found, plus the static-preservation, prototype-chain,
 /// and Deno-unreachability checks.
 const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
 (() => {
+  // Captured before any other statement runs, so nothing below this point
+  // ever performs a fresh lookup of a global/built-in that user code could
+  // have replaced by the time these values are actually used (see the
+  // invariant in this constant's doc comment). `construct`/`apply` are the
+  // fourth review round's fix: `Guarded`/`transfer` used to call
+  // `Reflect.construct`/`Reflect.apply` *at call time* -- i.e. every time
+  // user code did `new ArrayBuffer(...)`/`.transfer()`, not once here --
+  // so user code could replace `Reflect.construct` with a function that
+  // records and returns its `target` argument, then trigger a call to
+  // receive `Native` (or `nativeTransfer`) directly out of that recorded
+  // argument, bypassing every guard below.
+  const construct = Reflect.construct;
+  const apply = Reflect.apply;
+  const NativeTypeError = TypeError;
+
   // Layer 1: hide deno_core's own internals. Captures only the one op
   // function this spike needs before deleting every other route to it.
   const opPing = globalThis.Deno.core.ops.op_apsides_spike_ping;
@@ -180,13 +255,14 @@ const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
     }
     function Guarded(length) {
       if (new.target === undefined) {
-        throw new TypeError(`Constructor ${name} requires 'new'`);
+        throw new NativeTypeError(`Constructor ${name} requires 'new'`);
       }
       // Never forwards a second argument: the native constructor is only
       // ever invoked with `length`, so there is no `options` value --
       // plain or a hostile getter -- for it to ever read a
-      // `maxByteLength` from.
-      return Reflect.construct(Native, [length], new.target);
+      // `maxByteLength` from. Uses the captured `construct`, not
+      // `Reflect.construct` (see the top of this script).
+      return construct(Native, [length], new.target);
     }
     Guarded.prototype = Native.prototype;
     Object.defineProperty(Guarded, "name", { value: name, configurable: true });
@@ -223,7 +299,7 @@ const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
 
     Object.defineProperty(Native.prototype, "resize", {
       value: function resize() {
-        throw new TypeError(`${name}.prototype.resize is disabled in this sandbox`);
+        throw new NativeTypeError(`${name}.prototype.resize is disabled in this sandbox`);
       },
       writable: false,
       configurable: false,
@@ -233,11 +309,15 @@ const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
       Object.defineProperty(Native.prototype, "transfer", {
         value: function transfer(...args) {
           if (this.resizable) {
-            throw new TypeError(
+            throw new NativeTypeError(
               `${name}.prototype.transfer of a resizable buffer is disabled in this sandbox`,
             );
           }
-          return Reflect.apply(nativeTransfer, this, args);
+          // Uses the captured `apply`, not `Reflect.apply` (see the top of
+          // this script): `Reflect.apply` at call time would hand
+          // `nativeTransfer` to whatever function user code had replaced
+          // `Reflect.apply` with.
+          return apply(nativeTransfer, this, args);
         },
         writable: false,
         configurable: false,
