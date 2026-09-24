@@ -135,11 +135,21 @@ async fn describe_deadline(objects: &Objects, error: Error) -> Error {
 }
 
 /// The revision annotation of `output`.
+///
+/// Indexes directly, never through `text`'s RFC 6901 JSON Pointer:
+/// `REVISION_ANNOTATION` contains `/` (`apsides.dev/handler-input-
+/// revision`), which a pointer reads as nested segments
+/// (`annotations["apsides.dev"]["handler-input-revision"]`, always
+/// absent) unless escaped as `~1` -- see
+/// `workload.rs`'s own `apsides.dev~1revision` for the same escape.
+/// Unescaped, this always returns `""`, so the assertions that depend on
+/// a non-empty revision can never pass -- the actual root cause of a
+/// CI-only `Deadline` this test previously misattributed to the
+/// controller.
 fn revision_of(output: &Value) -> &str {
-    text(
-        output,
-        &format!("/metadata/annotations/{REVISION_ANNOTATION}"),
-    )
+    output["metadata"]["annotations"][REVISION_ANNOTATION]
+        .as_str()
+        .unwrap_or_default()
 }
 
 /// (1) The first invocation's written keys land exactly, with the revision
@@ -421,4 +431,38 @@ fn manager_owns(object: &Value, manager: &str, path: &[&str]) -> bool {
             }
             !cursor.is_null()
         })
+}
+
+/// Plain, non-`#[ignore]`d: runs under `cargo test -p acceptance` without a
+/// kind cluster. Regression test for the actual cause of a CI-only
+/// `Deadline` this scenario hit: `revision_of` used to read the revision
+/// annotation through `text`, an RFC 6901 JSON Pointer, with the raw
+/// (unescaped) annotation key `apsides.dev/handler-input-revision` --
+/// since that key itself contains `/`, the pointer read it as the nested
+/// path `annotations["apsides.dev"]["handler-input-revision"]`, always
+/// absent, so `revision_of` always returned `""` and assertions (1)-(3)
+/// could never pass no matter what the controller actually did. This
+/// confirms `revision_of` reads the real, dotted-and-slashed key
+/// directly, and that assertion (1)'s own predicate holds once it does.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revision_of_reads_the_dotted_and_slashed_annotation_key() {
+        let output = json!({
+            "metadata": {"annotations": {"apsides.dev/handler-input-revision": "sha256:x"}},
+            "data": {"a": "1", "b": "2"},
+        });
+        assert_eq!(revision_of(&output), "sha256:x");
+        assert!(
+            data_of(&output)
+                == BTreeMap::from([
+                    ("a".to_owned(), "1".to_owned()),
+                    ("b".to_owned(), "2".to_owned())
+                ])
+                && !revision_of(&output).is_empty(),
+            "assertion (1)'s own predicate must hold for a correctly-observed output"
+        );
+    }
 }
