@@ -5,6 +5,7 @@
 //! a fixed in-cluster identity and protected platform activation; fixture
 //! execution remains a separately acknowledged disposable-cluster mode.
 
+mod handlers;
 mod production;
 
 pub use production::{ApiAccess, ProductionConfig};
@@ -135,9 +136,11 @@ pub trait RuntimeClient: Send + Sync {
 ///
 /// `handlers` is the `(id, bundle source)` pair for every declared event
 /// handler, embedded by the generated controller via `include_str!` next to
-/// its `ir.json`. This increment records that the bundles are compiled into
-/// the image; it does not execute them (the V8 event-plane engine is a later
-/// phase, in a separate crate).
+/// its `ir.json`. In production mode these are wired into the `engine`
+/// crate's V8 isolate and actually run (see `handlers.rs` and the Apsides
+/// v0.3 plan, Phase 5b); fixture mode still only records that the embedded
+/// bundles match the validated IR (`verify_embedded_handlers`, above) and
+/// does not execute them.
 ///
 /// # Errors
 ///
@@ -154,7 +157,7 @@ pub async fn run(
     let startup = read_startup(Path::new(&path))?;
     match startup {
         StartupConfig::Production(config) => {
-            production::run_production(&plan, config).await?;
+            production::run_production(&plan, config, handlers).await?;
             Ok(())
         }
         StartupConfig::Fixture(config) => {

@@ -78,6 +78,7 @@ struct DiagnosticSnapshot {
     cache: CacheState,
     blocked_targets: usize,
     conditions: Vec<DiagnosticCondition>,
+    handlers: Vec<HandlerDiagnostic>,
     field_or_version_conflicts: usize,
     last_reason_code: Option<String>,
     reconciliations: u64,
@@ -97,6 +98,19 @@ struct DiagnosticSnapshot {
 struct DiagnosticCondition {
     reason_code: String,
     resource_id: Option<String>,
+}
+
+/// One declared handler's dispatch status -- see the Apsides v0.3 plan,
+/// Phase 5b, "Conditions and observability". `queue_depth` is 0 or 1: the
+/// queue coalesces per handler (see `handlers::HandlerRuntime::enqueue`),
+/// so at most one event is ever pending for a given handler at once.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HandlerDiagnostic {
+    id: String,
+    last_run_millis_ago: Option<u64>,
+    last_error_code: Option<String>,
+    queue_depth: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
@@ -142,6 +156,7 @@ impl Diagnostics {
                 cache: CacheState::Pending,
                 blocked_targets: 0,
                 conditions: Vec::new(),
+                handlers: Vec::new(),
                 field_or_version_conflicts: 0,
                 last_reason_code: None,
                 reconciliations: 0,
@@ -218,6 +233,10 @@ impl Diagnostics {
             self.trigger_to_cycle_micros_max.load(Ordering::Relaxed);
     }
 
+    async fn set_handlers(&self, handlers: Vec<HandlerDiagnostic>) {
+        self.snapshot.write().await.handlers = handlers;
+    }
+
     async fn current_snapshot(&self) -> DiagnosticSnapshot {
         let mut snapshot = self.snapshot.read().await.clone();
         self.copy_counters(&mut snapshot);
@@ -270,6 +289,13 @@ struct ProductionController {
     terminating: Arc<AtomicBool>,
     last_mutation: Mutex<Option<Instant>>,
     last_successful_apply: Mutex<BTreeMap<ResourceIdentity, (String, String)>>,
+    /// `None` for a domain with no declared handlers (no isolate, no
+    /// background writer task, no DNS resolver ever built). `Some` is
+    /// behind a `Mutex` for interior mutability -- every `&self` reconcile
+    /// method needs `&mut` access to run one dispatch cycle, and handler
+    /// dispatch is itself serialized to global concurrency 1 (see the
+    /// Apsides v0.3 plan, Phase 5b), so the lock is never contended.
+    handler_runtime: Option<Mutex<crate::handlers::HandlerRuntime>>,
 }
 
 struct CycleResult {
@@ -286,6 +312,7 @@ enum CycleControl {
 pub(crate) async fn run_production(
     plan: &CompiledPlan,
     config: ProductionConfig,
+    handlers: &'static [(&'static str, &'static str)],
 ) -> Result<(), RuntimeError> {
     validate_production_config(plan, &config)?;
     crate::install_rustls_provider()?;
@@ -296,7 +323,7 @@ pub(crate) async fn run_production(
     kube_config.default_retry = false;
     let client = Client::try_from(kube_config)
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-    run_production_with_client(plan, config, client).await
+    run_production_with_client(plan, config, client, handlers).await
 }
 
 fn production_kube_config(config: &ProductionConfig) -> Result<Config, RuntimeError> {
@@ -342,6 +369,7 @@ async fn run_production_with_client(
     plan: &CompiledPlan,
     config: ProductionConfig,
     client: Client,
+    handlers: &'static [(&'static str, &'static str)],
 ) -> Result<(), RuntimeError> {
     let authority = RuntimeAuthority::new(
         client.clone(),
@@ -357,6 +385,22 @@ async fn run_production_with_client(
     let terminating = Arc::new(AtomicBool::new(false));
     spawn_shutdown_listener(shutdown_tx.clone(), terminating.clone());
 
+    let handler_runtime = if plan.ir.handlers.is_empty() {
+        None
+    } else {
+        let mut runtime = crate::handlers::HandlerRuntime::new(
+            plan,
+            handlers,
+            client.clone(),
+            crate::handlers::handler_field_manager(&plan.ir.domain.id),
+            Duration::from_millis(config.min_mutation_interval_millis),
+            Duration::from_millis(config.base_backoff_millis),
+            Duration::from_millis(config.max_backoff_millis),
+        )?;
+        runtime.seed_from_annotations(plan, &client).await;
+        Some(Mutex::new(runtime))
+    };
+
     let controller = ProductionController {
         plan: plan.clone(),
         kube: KubeRuntimeClient::from_client(
@@ -369,6 +413,7 @@ async fn run_production_with_client(
         terminating,
         last_mutation: Mutex::new(None),
         last_successful_apply: Mutex::new(BTreeMap::new()),
+        handler_runtime,
         config,
     };
     let result = controller.run(shutdown_rx).await;
@@ -549,6 +594,22 @@ impl ProductionController {
                 reason.as_deref(),
             )
             .await;
+        if let Some(handler_runtime) = &self.handler_runtime {
+            let statuses = handler_runtime.lock().await.statuses();
+            self.diagnostics
+                .set_handlers(
+                    statuses
+                        .into_iter()
+                        .map(|status| HandlerDiagnostic {
+                            id: status.id,
+                            last_run_millis_ago: status.last_run_millis_ago,
+                            last_error_code: status.last_error_code,
+                            queue_depth: status.queue_depth,
+                        })
+                        .collect(),
+                )
+                .await;
+        }
         if reason != *last_reason {
             let _ = writeln!(
                 std::io::stderr().lock(),
@@ -651,6 +712,14 @@ impl ProductionController {
         }
 
         let current = crate::collect_observations(&self.plan, &applied, &self.kube).await?;
+        if let Some(handler_runtime) = &self.handler_runtime {
+            let mut handler_runtime = handler_runtime.lock().await;
+            conditions.extend(
+                handler_runtime
+                    .run_cycle(&self.plan, &current, &applied)
+                    .await,
+            );
+        }
         for resource in self
             .plan
             .ir
@@ -1444,6 +1513,7 @@ mod tests {
                 capability_digest: digest(&plan.capabilities)?,
                 service_account_name: "apsides-example-generation-a".into(),
                 controller_image: format!("example.invalid/controller@sha256:{}", "b".repeat(64)),
+                max_handler_heap_bytes: 0,
             },
             status: ActivationStatus::Active,
             approved_claims: vec![ApprovedClaim {
@@ -1612,6 +1682,7 @@ mod tests {
             terminating: Arc::new(AtomicBool::new(false)),
             last_mutation: Mutex::new(None),
             last_successful_apply: Mutex::new(BTreeMap::new()),
+            handler_runtime: None,
             config,
         })
     }
@@ -1665,6 +1736,7 @@ mod tests {
             capability_digest: format!("sha256:{}", "4".repeat(64)),
             service_account_name: "controller".into(),
             controller_image: format!("example/controller@sha256:{}", "5".repeat(64)),
+            max_handler_heap_bytes: 0,
         }));
         diagnostics
             .update(
@@ -1893,6 +1965,188 @@ mod tests {
             {
                 return Err("inactive diagnostic state retained old conditions".into());
             }
+        }
+        Ok(())
+    }
+
+    fn handler_output_plan() -> TestResult<CompiledPlan> {
+        Ok(parse_and_validate(&json!({
+            "schemaVersion": compiler_core::IR_SCHEMA, "testOnly": false,
+            "domain": {"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound","minKubernetesVersion":"1.34","budgets":{"maxResources":8,"maxInputs":8,"maxReactions":8,"maxObjectBytes":262_144,"maxQueueDepth":8,"maxConcurrentRequests":2}},
+            "resources":[{"id":"flags","apiVersion":"v1","kind":"ConfigMap","name":"flags","namespace":"workload","handlerOutput":true,"desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"flags","namespace":"workload","labels":{"apsides.dev/handler-output":"flags"}}},"lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"program.ts","line":1,"column":1}}],
+            "inputs":[{"id":"flags-output","apiVersion":"v1","kind":"ConfigMap","name":"flags","namespace":"workload","mode":"output","managedResourceId":"flags","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}}],
+            "reactions":[],"handlers":[],"outputs":[{"id":"flags","name":"flags","namespace":"workload"}],
+            "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.ts","sha256":"0".repeat(64)}]},
+        }).to_string())?)
+    }
+
+    fn handler_output_activation(
+        plan: &CompiledPlan,
+        policy: &PolicyState,
+    ) -> TestResult<ActivationState> {
+        Ok(ActivationState {
+            schema_version: SCHEMA_VERSION.into(),
+            binding: RuntimeBinding {
+                domain_id: "example".into(),
+                cluster_binding: "cluster-a".into(),
+                generation_id: "generation-a".into(),
+                build_digest: format!("sha256:{}", "a".repeat(64)),
+                ir_digest: plan.ir_digest.clone(),
+                policy_digest: digest(policy)?,
+                capability_digest: digest(&plan.capabilities)?,
+                service_account_name: "apsides-example-generation-a".into(),
+                controller_image: format!("example.invalid/controller@sha256:{}", "b".repeat(64)),
+                max_handler_heap_bytes: 0,
+            },
+            status: ActivationStatus::Active,
+            approved_claims: vec![ApprovedClaim {
+                claim: ProtectedClaim {
+                    identity: ResourceIdentity {
+                        api_group: String::new(),
+                        resource: "configmaps".into(),
+                        namespace: "workload".into(),
+                        name: "flags".into(),
+                    },
+                    domain_id: "example".into(),
+                    generation_id: "generation-a".into(),
+                    transition_id: "transition-a".into(),
+                    state: ClaimState::Active,
+                    uid: None,
+                },
+                deletion_policy: compiler_core::DeletionPolicy::Orphan,
+                allow_create: true,
+            }],
+            rollout_key_id: None,
+        })
+    }
+
+    fn handler_output_object(uid: &str, rv: &str) -> Value {
+        json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"flags","namespace":"workload","uid":uid,"resourceVersion":rv,
+            "labels":{"apsides.dev/handler-output":"flags"},
+            "managedFields":[{"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:metadata":{"f:labels":{}}},"manager":"apsides-example","operation":"Apply"}]}})
+    }
+
+    fn handler_output_inventory(
+        binding: &RuntimeBinding,
+        activation_uid: &str,
+        activation_rv: &str,
+        observations: Vec<RuntimeObservation>,
+    ) -> RuntimeInventory {
+        RuntimeInventory {
+            schema_version: SCHEMA_VERSION.into(),
+            binding: binding.clone(),
+            activation_uid: activation_uid.into(),
+            activation_resource_version: activation_rv.into(),
+            observations,
+            conditions: vec![],
+            drained: false,
+        }
+    }
+
+    /// The Apsides v0.3 plan, Phase 5b: "The reconciler's own SSA of
+    /// outputs must still never claim `data`." Drives `apply()` -- the
+    /// reconciler's real apply path, the same one `reconcile()`'s
+    /// `ConfigMap` loop uses for every handler-output resource -- against a
+    /// handler-output resource whose `desired` carries only `metadata`
+    /// (as the compiler always emits for one; see `validate.rs`'s
+    /// `validate_handler_output_label`), and asserts every request body
+    /// this crate ever sends for it lacks a `data` key, using field
+    /// manager `apsides-<domainId>` (the reconciler's own), never
+    /// `apsides-handler-<domainId>`.
+    #[tokio::test]
+    async fn reconcilers_own_apply_of_a_handler_output_never_claims_data() -> TestResult {
+        let plan = handler_output_plan()?;
+        let policy = policy(&plan);
+        let activation = handler_output_activation(&plan, &policy)?;
+        let previous_value =
+            handler_output_inventory(&activation.binding, "activation-uid", "19", vec![]);
+        let mut previous = versioned_inventory(previous_value.clone(), "18");
+        let observation = RuntimeObservation {
+            identity: ResourceIdentity {
+                api_group: String::new(),
+                resource: "configmaps".into(),
+                namespace: "workload".into(),
+                name: "flags".into(),
+            },
+            uid: "flags-uid".into(),
+        };
+        let next_value = handler_output_inventory(
+            &activation.binding,
+            "activation-uid",
+            "20",
+            vec![observation],
+        );
+        let responses = vec![
+            control_object(
+                "apsides-activation-example",
+                &activation,
+                "activation-uid",
+                "20",
+            )?,
+            control_object("apsides-policy-example", &policy, "policy-uid", "19")?,
+            target_list(&[], "30"),
+            handler_output_object("flags-uid", "31"),
+            control_object(
+                "apsides-activation-example",
+                &activation,
+                "activation-uid",
+                "20",
+            )?,
+            control_object("apsides-policy-example", &policy, "policy-uid", "19")?,
+            handler_output_object("flags-uid", "32"),
+            control_object(
+                "apsides-activation-example",
+                &activation,
+                "activation-uid",
+                "20",
+            )?,
+            control_object(
+                "apsides-inventory-example",
+                &previous_value,
+                "inventory-uid",
+                "18",
+            )?,
+            control_object(
+                "apsides-inventory-example",
+                &next_value,
+                "inventory-uid",
+                "21",
+            )?,
+        ];
+        let (client, calls) = wire(responses);
+        let controller = controller(&plan, &activation, client)?;
+        let observed = controller
+            .apply(
+                &plan.ir.resources[0],
+                &plan.ir.resources[0].desired,
+                &mut previous,
+            )
+            .await?;
+        assert_eq!(observed.uid, "flags-uid");
+        let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
+        let patches: Vec<_> = calls
+            .iter()
+            .filter(|call| call.0 == Method::PATCH)
+            .collect();
+        assert_eq!(
+            patches.len(),
+            2,
+            "expected exactly the dry-run and real create PATCH"
+        );
+        for (method, query, body) in &patches {
+            let _ = method;
+            assert!(
+                query.contains("fieldManager=apsides-example"),
+                "handler-output resources are still owned by the reconciler's own field manager, query={query}"
+            );
+            assert!(
+                !query.contains("apsides-handler"),
+                "the reconciler's own apply must never use the handler field manager, query={query}"
+            );
+            assert!(
+                body.get("data").is_none(),
+                "the reconciler's own SSA of a handler output must never claim data, body={body}"
+            );
         }
         Ok(())
     }
