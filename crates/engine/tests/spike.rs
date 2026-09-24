@@ -575,6 +575,16 @@ fn watchdog_thread_terminates_a_synchronous_infinite_loop() {
         "expected the watchdog thread to terminate the synchronous infinite \
          loop with an isolate-termination error, got {result:?}"
     );
+
+    // The watchdog thread terminates *the isolate*; this process (standing
+    // in for the controller process) must still be alive and able to run
+    // further isolates afterward, i.e. it did not abort.
+    let followup = run(r#"apsides.log("still alive");"#);
+    assert!(
+        followup.is_ok(),
+        "process must still be able to run further isolates after a \
+         watchdog timeout termination, got {followup:?}"
+    );
 }
 
 /// The isolate is not reused across invocations: a global a handler sets
