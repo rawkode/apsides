@@ -79,17 +79,19 @@ jobs:
     # every generated reactor case on a disposable kind cluster.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    # scripts/rusty_v8.py never caches under the checkout (that would be
-    # gitignored `work/`, but also wrong in principle: an installed CLI
-    # distribution's equivalent path is the asset tree
-    # crates/cli/src/assets.rs hash-verifies in full); this names the same
-    # directory the cache step below persists.
-    env:
-      APSIDES_RUSTY_V8_CACHE: ${{ runner.temp }}/rusty-v8-cache
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
+      # scripts/rusty_v8.py never caches under the checkout (that would be
+      # gitignored `work/`, but also wrong in principle: an installed CLI
+      # distribution's equivalent path is the asset tree
+      # crates/cli/src/assets.rs hash-verifies in full); this names the same
+      # directory the cache step below persists. `runner.temp` is not
+      # available in a job-level `env:` (only in `steps.*.with`/`run`), so it
+      # is written to GITHUB_ENV here instead.
+      - name: Set the pinned rusty_v8 archive cache directory
+        run: echo "APSIDES_RUSTY_V8_CACHE=$RUNNER_TEMP/rusty-v8-cache" >> "$GITHUB_ENV"
       - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
         with:
           deno-version: v2.9.5
@@ -156,17 +158,19 @@ jobs:
     # and hands them with the `aps` that built them to the scenario jobs.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    # scripts/rusty_v8.py never caches under the checkout (that would be
-    # gitignored `work/`, but also wrong in principle: an installed CLI
-    # distribution's equivalent path is the asset tree
-    # crates/cli/src/assets.rs hash-verifies in full); this names the same
-    # directory the cache step below persists.
-    env:
-      APSIDES_RUSTY_V8_CACHE: ${{ runner.temp }}/rusty-v8-cache
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
+      # scripts/rusty_v8.py never caches under the checkout (that would be
+      # gitignored `work/`, but also wrong in principle: an installed CLI
+      # distribution's equivalent path is the asset tree
+      # crates/cli/src/assets.rs hash-verifies in full); this names the same
+      # directory the cache step below persists. `runner.temp` is not
+      # available in a job-level `env:` (only in `steps.*.with`/`run`), so it
+      # is written to GITHUB_ENV here instead.
+      - name: Set the pinned rusty_v8 archive cache directory
+        run: echo "APSIDES_RUSTY_V8_CACHE=$RUNNER_TEMP/rusty-v8-cache" >> "$GITHUB_ENV"
       - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
         with:
           deno-version: v2.9.5
