@@ -294,6 +294,28 @@ async fn embedded_fixture_marker_survives_manifest_mode_changes() -> TestResult 
     Ok(())
 }
 
+/// A `surface.json` edited to claim a risk the compiler never derived is
+/// rejected even when the tamperer keeps `release.json`'s recorded digest
+/// and the outer signature self-consistent: `read_release` recomputes the
+/// surface from the trusted IR rather than trusting whatever is on disk.
+#[tokio::test]
+async fn tampered_surface_document_is_rejected_even_when_resigned() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let policy = release(root.path())?;
+    let mut surface: Value = serde_json::from_slice(&fs::read(root.path().join("surface.json"))?)?;
+    surface["risks"] = json!(["fabricated-risk-not-derived-by-the-compiler"]);
+    let bytes = write_json(root.path(), "surface.json", &surface)?;
+    let mut manifest: Value = serde_json::from_slice(&fs::read(root.path().join("release.json"))?)?;
+    manifest["files"]["surface.json"] = json!(hash(&bytes));
+    write_json(root.path(), "release.json", &manifest)?;
+    resign(root.path())?;
+    assert_eq!(
+        rejection(root.path(), &policy).await?,
+        "release rejected: release review document differs from trusted derivation: surface.json"
+    );
+    Ok(())
+}
+
 fn write_oci(root: &Path, binary: &[u8], ir_digest: &str) -> TestResult<String> {
     write_oci_with_base(root, binary, ir_digest, Base::Approved)
 }

@@ -106,6 +106,7 @@ fn collect_files(
         "capabilities.json",
         "compatibility.json",
         "ir-source-map.json",
+        "surface.json",
     ] {
         copy(&artifact.join(name), output, name, files)?;
     }

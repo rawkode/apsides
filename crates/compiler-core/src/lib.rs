@@ -6,6 +6,7 @@ mod review;
 mod rollout;
 mod schema;
 mod semantic;
+mod surface;
 mod test_plan;
 mod validate;
 
@@ -15,6 +16,11 @@ pub use resource_api::{ResolvedApiResource, resolve_namespaced_api, resolve_reso
 pub use review::review_documents;
 pub use rollout::*;
 pub use semantic::*;
+pub use surface::{
+    SURFACE_SCHEMA, Surface, SurfaceDomain, SurfaceImage, SurfaceInput, SurfaceKubernetes,
+    SurfacePermission, SurfaceReaction, SurfaceResource, SurfaceSecretRead, SurfaceVerb,
+    derive_surface,
+};
 pub use validate::{validate, validate_ceiling};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

@@ -82,5 +82,6 @@ pub fn review_documents(plan: &CompiledPlan) -> BTreeMap<&'static str, Value> {
             "inputs":ir.inputs.iter().map(|i| (&i.id,&i.source)).collect::<BTreeMap<_,_>>(),
             "reactions":ir.reactions.iter().map(|r| (&r.id,&r.source)).collect::<BTreeMap<_,_>>()}),
         ),
+        ("surface.json", json!(crate::surface::derive_surface(plan))),
     ])
 }

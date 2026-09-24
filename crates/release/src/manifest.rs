@@ -195,6 +195,7 @@ pub fn read_release(root: &Path) -> Result<(ReleaseManifest, CompiledPlan, Vec<u
         "test-plan.json",
         "capabilities.json",
         "ir-source-map.json",
+        "surface.json",
         "apsides-controller",
         "controller.oci.tar",
     ] {
