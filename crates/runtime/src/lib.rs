@@ -35,6 +35,7 @@ use kube::{
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const CONFIG_PATH_ENV: &str = "APSIDES_RUNTIME_CONFIG_PATH";
@@ -147,15 +148,7 @@ pub async fn run(
     handlers: &'static [(&'static str, &'static str)],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let plan = parse_and_validate(ir_json)?;
-    if handlers.len() != plan.ir.handlers.len()
-        || !handlers
-            .iter()
-            .all(|(id, _)| plan.ir.handlers.iter().any(|handler| handler.id == *id))
-    {
-        return Err(Box::new(RuntimeError::Plan(
-            "embedded handler bundles do not match the validated IR's declared handlers".into(),
-        )));
-    }
+    verify_embedded_handlers(&plan, handlers)?;
     let path = env::var(CONFIG_PATH_ENV)
         .map_err(|_| RuntimeError::Configuration(format!("{CONFIG_PATH_ENV} is required")))?;
     let startup = read_startup(Path::new(&path))?;
@@ -183,6 +176,50 @@ pub async fn run(
             Ok(())
         }
     }
+}
+
+/// Cross-check the embedded `(id, bundle source)` pairs against the
+/// validated IR's own declared handlers: no duplicate id, the id sets match
+/// exactly, and each bundle's actual sha256 matches the IR's own recorded
+/// `bundleSha256`. Cheap (one hash per handler, at most `MAX_HANDLERS` of
+/// them), and it makes the image self-checking: a build that embedded the
+/// wrong bundle, dropped one, or duplicated an id fails closed at startup
+/// rather than silently running mismatched code once a later phase adds
+/// execution.
+fn verify_embedded_handlers(
+    plan: &CompiledPlan,
+    handlers: &[(&'static str, &'static str)],
+) -> Result<(), RuntimeError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for (id, source) in handlers {
+        if !seen.insert(*id) {
+            return Err(RuntimeError::Plan(format!(
+                "embedded handler bundles contain a duplicate id: {id}"
+            )));
+        }
+        let declared = plan
+            .ir
+            .handlers
+            .iter()
+            .find(|handler| handler.id == *id)
+            .ok_or_else(|| {
+                RuntimeError::Plan(format!(
+                    "embedded handler bundle {id} is not declared in the validated IR"
+                ))
+            })?;
+        let actual = format!("{:x}", Sha256::digest(source.as_bytes()));
+        if actual != declared.bundle_sha256 {
+            return Err(RuntimeError::Plan(format!(
+                "embedded handler bundle {id} does not match its declared bundleSha256"
+            )));
+        }
+    }
+    if seen.len() != plan.ir.handlers.len() {
+        return Err(RuntimeError::Plan(
+            "embedded handler bundles do not match the validated IR's declared handlers".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn install_rustls_provider() -> Result<(), RuntimeError> {
@@ -1297,7 +1334,8 @@ mod tests {
             name: name.into(),
             namespace: "workload".into(),
             mode,
-            managed_resource_id: (mode == InputMode::Managed).then(|| name.into()),
+            managed_resource_id: matches!(mode, InputMode::Managed | InputMode::Output)
+                .then(|| name.into()),
             projection: vec!["data".into()],
             sensitive: false,
             missing: "block-dependent-mutations".into(),
@@ -1332,6 +1370,44 @@ mod tests {
         for call in calls.iter() {
             assert_eq!(call.method, Method::GET);
             assert!(call.uri.contains("fieldSelector=metadata.name%3Dobserved"));
+            assert!(!call.uri.contains("managed"));
+        }
+        assert!(!calls[0].uri.contains("watch=true"));
+        assert!(calls[1].uri.contains("watch=true"));
+        assert!(calls[1].uri.contains("resourceVersion=10"));
+        Ok(())
+    }
+
+    /// A handler output's `Output`-mode input is observed live exactly like
+    /// an `Observed` one (see `InputMode::Output`): it is named-listed and
+    /// joins the watch group, never treated as the reconciler's own
+    /// authoritative desired state the way a `Managed` input is.
+    #[tokio::test]
+    async fn named_watch_scopes_list_and_watch_to_output_inputs_too()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut changed = object("changed", "11", "handler-example");
+        changed["metadata"]["name"] = Value::String("output-flags".into());
+        let (client, calls) = wire_client(vec![
+            object_list(&[], "10"),
+            serde_json::json!({"type":"ADDED","object":changed}),
+        ]);
+        client
+            .wait_for_named_change(
+                &[
+                    watch_input("managed", InputMode::Managed),
+                    watch_input("output-flags", InputMode::Output),
+                ],
+                Duration::from_secs(1),
+            )
+            .await?;
+        let calls = calls.lock().map_err(|_| "wire calls lock poisoned")?;
+        assert_eq!(calls.len(), 2);
+        for call in calls.iter() {
+            assert_eq!(call.method, Method::GET);
+            assert!(
+                call.uri
+                    .contains("fieldSelector=metadata.name%3Doutput-flags")
+            );
             assert!(!call.uri.contains("managed"));
         }
         assert!(!calls[0].uri.contains("watch=true"));
@@ -1716,6 +1792,92 @@ mod tests {
     fn rustls_ring_provider_is_explicitly_available() -> TestResult {
         install_rustls_provider()?;
         install_rustls_provider()?;
+        Ok(())
+    }
+
+    fn handler_source() -> Value {
+        json!({"file": "program.tsx", "line": 1, "column": 1})
+    }
+
+    /// A validated plan with one declared handler `sync-flags`, bundle sha256
+    /// of the fixed literal `"const bundle = 1;"`.
+    fn plan_with_one_handler() -> TestResult<compiler_core::CompiledPlan> {
+        let bundle = "const bundle = 1;";
+        let bundle_sha256 = format!("{:x}", Sha256::digest(bundle.as_bytes()));
+        let ir = json!({
+            "schemaVersion": compiler_core::IR_SCHEMA,
+            "domain": {
+                "id": "example", "namespace": "workload", "controlNamespace": "apsides-system",
+                "clusterBinding": "test-cluster", "policyRef": "platform/example", "enforcement": "api-bound",
+                "minKubernetesVersion": "1.34",
+                "budgets": {"maxResources": 8, "maxInputs": 8, "maxReactions": 8, "maxObjectBytes": 262_144, "maxQueueDepth": 8, "maxConcurrentRequests": 2},
+            },
+            "resources": [],
+            "inputs": [{"id": "settings", "apiVersion": "v1", "kind": "ConfigMap", "name": "settings", "namespace": "workload", "mode": "observed", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": handler_source()}],
+            "reactions": [],
+            "handlers": [{
+                "id": "sync-flags", "module": "handlers/sync-flags.ts", "export": "syncFlags",
+                "trigger": {"kind": "input-changed", "input": "settings"},
+                "inputs": ["settings"], "egress": [], "outputs": [],
+                "timeoutMillis": 30_000, "maxHeapBytes": 67_108_864,
+                "bundleSha256": bundle_sha256, "source": handler_source(),
+            }],
+            "outputs": [],
+            "provenance": {"compiler": "apsides/0.1", "inputs": [{"path": "program.tsx", "sha256": "0".repeat(64)}, {"path": "handlers/sync-flags.ts", "sha256": "1".repeat(64)}]},
+        });
+        Ok(parse_and_validate(&ir.to_string())?)
+    }
+
+    #[test]
+    fn verify_embedded_handlers_accepts_a_matching_bundle() -> TestResult {
+        let plan = plan_with_one_handler()?;
+        verify_embedded_handlers(&plan, &[("sync-flags", "const bundle = 1;")])?;
+        Ok(())
+    }
+
+    #[test]
+    fn verify_embedded_handlers_rejects_a_tampered_bundle() -> TestResult {
+        let plan = plan_with_one_handler()?;
+        let error = verify_embedded_handlers(&plan, &[("sync-flags", "const bundle = 2;")])
+            .err()
+            .ok_or("tampered bundle was accepted")?;
+        assert!(error.to_string().contains("bundleSha256"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn verify_embedded_handlers_rejects_a_duplicate_id() -> TestResult {
+        let plan = plan_with_one_handler()?;
+        let error = verify_embedded_handlers(
+            &plan,
+            &[
+                ("sync-flags", "const bundle = 1;"),
+                ("sync-flags", "const bundle = 1;"),
+            ],
+        )
+        .err()
+        .ok_or("duplicate embedded id was accepted")?;
+        assert!(error.to_string().contains("duplicate id"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn verify_embedded_handlers_rejects_a_missing_or_extra_bundle() -> TestResult {
+        let plan = plan_with_one_handler()?;
+        let missing = verify_embedded_handlers(&plan, &[])
+            .err()
+            .ok_or("missing embedded bundle was accepted")?;
+        assert!(missing.to_string().contains("do not match"), "{missing}");
+        let extra = verify_embedded_handlers(
+            &plan,
+            &[
+                ("sync-flags", "const bundle = 1;"),
+                ("other", "const bundle = 1;"),
+            ],
+        )
+        .err()
+        .ok_or("undeclared embedded bundle was accepted")?;
+        assert!(extra.to_string().contains("not declared"), "{extra}");
         Ok(())
     }
 }
