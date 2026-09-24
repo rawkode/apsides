@@ -237,16 +237,28 @@ async fn assert_restart_seeds_and_rewrites_nothing(
         .await?;
     let before_version = text(&before_restart, "/metadata/resourceVersion").to_owned();
     let checkpoint = writer_checkpoint(&platform.registry().await?)?.clone();
-    let account = checkpoint.runtime_binding.service_account_name.clone();
+    // The controller Pod's own service account, `{runtime}-process` (see
+    // `platform::controller::controller_deployment`) -- NOT
+    // `runtime_binding.service_account_name` alone, which is the Envoy
+    // proxy Pod's account (`platform::proxy_stage`). Deleting the proxy
+    // Pod instead would never exercise a controller restart at all.
+    let account = format!(
+        "{}-process",
+        checkpoint.runtime_binding.service_account_name
+    );
     let controller_pod = objects
         .list("v1", "Pod", Some(CONTROL_NAMESPACE), None)
         .await?
         .into_iter()
         .find(|pod| text(pod, "/spec/serviceAccountName") == account)
         .ok_or_else(|| Error::Check("the controller Pod is absent".into()))?;
+    ensure(
+        has_container(&controller_pod, "controller"),
+        "the selected Pod must run the controller container, not the proxy",
+    )?;
     let old_uid = text(&controller_pod, "/metadata/uid").to_owned();
     objects.delete(&controller_pod).await?;
-    wait::until(
+    let replacement = wait::until(
         "a replacement controller Pod to become ready",
         DISPATCH,
         async || {
@@ -261,6 +273,10 @@ async fn assert_restart_seeds_and_rewrites_nothing(
         },
     )
     .await?;
+    ensure(
+        has_container(&replacement, "controller"),
+        "the restarted Pod must still run the controller container",
+    )?;
     // No new revision to react to and the previous invocation's revision
     // is already seeded from the stamped annotation -- give the restarted
     // controller several reconcile cycles to prove it stays idle, then
@@ -307,6 +323,15 @@ async fn add_foreign_key(objects: &Objects, output: &Value, key: &str, value: &s
     current["data"][key] = json!(value);
     objects.replace(&current).await?;
     Ok(())
+}
+
+/// Whether `pod` declares a container named `name`.
+fn has_container(pod: &Value, name: &str) -> bool {
+    pod["spec"]["containers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|container| container["name"] == name)
 }
 
 /// `object`'s `data` map as owned strings, for exact comparison.

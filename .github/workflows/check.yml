@@ -220,7 +220,8 @@ jobs:
             work/acceptance/inputs.json work/acceptance/trust-policy.json \
             work/acceptance/cnpg-operator.yaml \
             work/acceptance/initial/release work/acceptance/successor/release \
-            work/acceptance/cleanup/release work/acceptance/owner/release
+            work/acceptance/cleanup/release work/acceptance/owner/release \
+            work/acceptance/handlers/release
       - name: Upload the prepared inputs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

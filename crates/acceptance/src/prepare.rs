@@ -419,7 +419,8 @@ mod tests {
             .args(["-c", "printf '%s' \"$APSIDES_RUSTY_V8_CACHE\""])
             .timeout(Duration::from_secs(10));
         let output = envs_for_build_via(invocation, |name| {
-            (name == "APSIDES_RUSTY_V8_CACHE").then(|| std::ffi::OsString::from("/example/rusty-v8-cache"))
+            (name == "APSIDES_RUSTY_V8_CACHE")
+                .then(|| std::ffi::OsString::from("/example/rusty-v8-cache"))
         })
         .output()
         .await?;

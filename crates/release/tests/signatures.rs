@@ -498,7 +498,8 @@ fn compiler_inputs(padding_entries: usize) -> TestResult<(Value, String)> {
             "sha256": format!("sha256:{index:064x}"),
         }));
     }
-    build_context_files.push(json!({"path":"workspace/Cargo.toml","sha256":format!("sha256:{}", "8".repeat(64))}));
+    build_context_files
+        .push(json!({"path":"workspace/Cargo.toml","sha256":format!("sha256:{}", "8".repeat(64))}));
     let build_context_files = Value::Array(build_context_files);
     let packaging_files = json!([
         {"path":"crates/cli/Cargo.toml","sha256":format!("sha256:{}", "1".repeat(64))},
