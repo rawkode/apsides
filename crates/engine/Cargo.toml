@@ -6,8 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
-# Phase 5a spike gate (see /home/user/apsides-PLAN.md "5a. Spike gate"): this
-# crate exists separately from `runtime` because `runtime/src/lib.rs` carries
+# Phase 5a spike gate (see the Apsides v0.3 plan, "Phase 5 -> 5a. Spike
+# gate"): this crate exists separately from `runtime` because
+# `runtime/src/lib.rs` carries
 # `#![forbid(unsafe_code)]` (forbid, not deny — it cannot be locally
 # re-allowed by any module) and documents "This crate deliberately has no
 # JavaScript engine." Embedding deno_core/V8 requires one unavoidable unsafe
@@ -34,6 +35,15 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"
+
+# `harness = false`: this binary's `fn main()` controls thread creation
+# order itself (Landlock deny-all on the main thread, *then* V8 platform
+# init, *then* the tokio runtime -- see the file for why), which libtest's
+# default per-`#[test]`-thread harness would not let it guarantee.
+[[test]]
+name = "landlock_order"
+path = "tests/landlock_order.rs"
+harness = false
 
 [lints]
 workspace = true

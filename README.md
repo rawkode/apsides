@@ -71,6 +71,7 @@ The CI interface is `aps deploy`, independent of the Kubernetes provider. CI pre
 - `crates/platform`: protected Kubernetes state, per-generation proxy transport and lifecycle execution.
 - `crates/release`: release integrity, signed provenance, compiler closure and OCI verification.
 - `crates/runtime`: native reconciliation and an explicit disposable-cluster fixture boundary.
+- `crates/engine`: Phase 5a spike gate for the embedded `deno_core`/V8 handler engine — feasibility evidence only, not yet wired into `runtime` or `aps build`.
 - `crates/test-cluster`: `aps test --cluster`, which runs a program's generated reactor cases on a disposable kind cluster.
 - `crates/acceptance`: the acceptance suite, which deploys the CNPG examples with `aps deploy` on kind.
 

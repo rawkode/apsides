@@ -7,8 +7,29 @@
 // (capped) V8 ArrayBuffer allocator anywhere in the `v8`/`deno_core` public
 // API; `v8::array_buffer::new_default_allocator()` is safe but is a bare
 // malloc/free allocator with no cap. Confined here per the workspace hard
-// rule (see crates/engine/Cargo.toml header comment and
-// /home/user/apsides-PLAN.md "5a. Spike gate").
+// rule (see crates/engine/Cargo.toml header comment and the Apsides v0.3
+// plan, "Phase 5 -> 5a. Spike gate").
+//
+// IMPORTANT SCOPE LIMIT, found during review: this allocator only governs
+// memory V8 itself requests through `v8::ArrayBuffer::Allocator` -- i.e.
+// ordinary `new ArrayBuffer(n)` / `new Uint8Array(n)` allocations. It does
+// **not** cover:
+//   - Resizable/growable `ArrayBuffer`s (`new ArrayBuffer(0, {maxByteLength})`):
+//     V8 reserves/commits their backing memory through its own page
+//     allocator, bypassing this vtable entirely, and `.resize()` can then
+//     grow one past this cap with zero calls into `allocate`. That JS-level
+//     construction path is closed separately, in `lib.rs`'s bootstrap guard
+//     script (`ARRAY_BUFFER_GUARD_SCRIPT`), before user code runs; see
+//     `tests/spike.rs`'s `resizable_array_buffer_construction_is_rejected`
+//     for the regression test.
+//   - Backing stores an op builds directly from a Rust `Box<[u8]>` (e.g. via
+//     `serde_v8`'s buffer conversions) and hands to V8 as an already-owned
+//     buffer. Those never call into this allocator's `allocate`/
+//     `allocate_uninitialized` at all -- V8 just takes ownership of Rust
+//     memory that was already sized and allocated on the Rust side. Any
+//     future op that returns data to JS (e.g. Phase 5b's `op_apsides_fetch`)
+//     must therefore bound its own response size itself (the plan's
+//     `RESPONSE_TOO_LARGE`/`maxObjectBytes` caps), not rely on this cap.
 #![allow(
     unsafe_code,
     reason = "v8::new_rust_allocator is FFI; see module doc comment above"
@@ -41,8 +62,17 @@ struct CappedAllocatorState {
 impl CappedAllocatorState {
     /// Reserves `len` bytes against the cap. Returns `false` (reservation
     /// refused) if it would exceed `cap_bytes`; the allocator vtable must
-    /// then return a null pointer, which V8 treats as allocation failure
-    /// (surfaced to JS as a catchable `RangeError`, not a crash).
+    /// then return a null pointer, which V8 treats as allocation failure.
+    ///
+    /// On this pinned V8 build that does *not* reliably surface to JS as a
+    /// catchable `RangeError` the way V8's own allocator-failure contract
+    /// describes: `tests/spike.rs`'s
+    /// `array_buffer_allocation_over_the_cap_terminates_the_isolate...`
+    /// found that a failed allocation here instead invokes the isolate's
+    /// near-heap-limit callback (`lib.rs`), which terminates the whole
+    /// isolate. This function's own job -- refuse the allocation and update
+    /// `used` correctly -- is unaffected either way; only the caller-visible
+    /// failure shape differs from what the allocator's own contract implies.
     fn try_reserve(&self, len: usize) -> bool {
         let mut current = self.used.load(Ordering::Relaxed);
         loop {
@@ -136,15 +166,21 @@ const VTABLE: v8::RustAllocatorVtable<CappedAllocatorState> = v8::RustAllocatorV
 
 /// Builds a V8 `ArrayBuffer` allocator that refuses any allocation once the
 /// isolate's outstanding `ArrayBuffer` backing-store bytes would exceed
-/// `cap_bytes`. Returns the allocator (to install via
-/// `v8::CreateParams::array_buffer_allocator`) plus a live byte-usage
-/// counter for tests/observability.
+/// `cap_bytes`. Returns the allocator, to install via
+/// `v8::CreateParams::array_buffer_allocator`.
+///
+/// `usage` is the live byte-usage counter this allocator updates on every
+/// `allocate`/`allocate_uninitialized`/`free` call. It is caller-supplied
+/// (rather than created here) so the caller can keep its own `Arc` clone and
+/// inspect it during and after the isolate's run -- see
+/// `tests/spike.rs`'s over-cap tests, which assert usage never exceeded the
+/// cap even when the isolate itself was terminated.
 pub fn capped_array_buffer_allocator(
     cap_bytes: usize,
-) -> (v8::UniqueRef<v8::Allocator>, Arc<AtomicUsize>) {
-    let usage = Arc::new(AtomicUsize::new(0));
+    usage: Arc<AtomicUsize>,
+) -> v8::UniqueRef<v8::Allocator> {
     let state = Arc::new(CappedAllocatorState {
-        used: Arc::clone(&usage),
+        used: usage,
         cap_bytes,
     });
     let handle = Arc::into_raw(state);
@@ -152,6 +188,5 @@ pub fn capped_array_buffer_allocator(
     // produced above by `Arc::into_raw`, kept alive until `drop_handle`
     // reclaims it (V8 owns that call), and `VTABLE`'s function pointers all
     // match the `T = CappedAllocatorState` type of `handle`.
-    let allocator = unsafe { v8::new_rust_allocator(handle, &VTABLE) };
-    (allocator, usage)
+    unsafe { v8::new_rust_allocator(handle, &VTABLE) }
 }

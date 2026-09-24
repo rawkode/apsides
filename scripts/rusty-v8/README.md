@@ -10,7 +10,7 @@ spike (see the Phase 5a report).
 This is spike-gate evidence, like `runtime-base/`'s pins are for the base
 image, not yet wired into `scripts/build.py`'s `--network=none` build — that
 wiring, plus a `RUSTY_V8_ARCHIVE`-setting build step and an SBOM entry, is
-Phase 5d ("Build pipeline") in `/home/user/apsides-PLAN.md`. Follow
+Phase 5d ("Build pipeline") in the Apsides v0.3 plan. Follow
 `runtime-base/README.md`'s model when that lands: commit the archive bytes
 content-addressed (or fetch-and-verify against `pins.json` in the build
 script) so the packaging build never contacts the network, and re-verify
