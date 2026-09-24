@@ -192,6 +192,7 @@ pub fn op_apsides_output_write(
 pub enum FetchErrorCode {
     SchemeNotHttps,
     InvalidUrl,
+    HostIsIpLiteral,
     HostNotAllowed,
     HostHeaderNotPermitted,
     DnsResolutionFailed,
@@ -211,6 +212,11 @@ pub enum FetchError {
     SchemeNotHttps,
     #[error("invalid URL: {0}")]
     InvalidUrl(String),
+    #[error(
+        "URL host must be a DNS name, not an IP literal ({0}); apsides.fetch resolves a \
+         declared hostname itself and refuses to bypass that"
+    )]
+    HostIsIpLiteral(IpAddr),
     #[error("{0}:{1} is not on the egress allowlist")]
     HostNotAllowed(String, u16),
     #[error(
@@ -232,6 +238,7 @@ impl FetchError {
         match self {
             Self::SchemeNotHttps => FetchErrorCode::SchemeNotHttps,
             Self::InvalidUrl(_) => FetchErrorCode::InvalidUrl,
+            Self::HostIsIpLiteral(_) => FetchErrorCode::HostIsIpLiteral,
             Self::HostNotAllowed(..) => FetchErrorCode::HostNotAllowed,
             Self::HostHeaderNotPermitted => FetchErrorCode::HostHeaderNotPermitted,
             Self::DnsResolutionFailed(_) => FetchErrorCode::DnsResolutionFailed,
@@ -321,6 +328,15 @@ async fn fetch(
         .to_owned();
     let port = parsed.port_or_known_default().unwrap_or(443);
 
+    // The whole design is "resolve a declared *name*, then vet the
+    // resolved address" (SNI and the outgoing Host header are the parsed
+    // name, never an address) -- a URL that already names a bare IP
+    // literal has no name to declare, so it is rejected outright, even if
+    // that literal happens to appear in the allowlist.
+    if let Ok(ip_literal) = host.parse::<IpAddr>() {
+        return Err(FetchError::HostIsIpLiteral(ip_literal));
+    }
+
     if !egress
         .allowed
         .iter()
@@ -330,7 +346,16 @@ async fn fetch(
     }
 
     let resolved_ip = net::resolve_host(&host, egress.resolver_override.as_ref()).await?;
-    if !net::is_global_unicast(resolved_ip) {
+    // The global-unicast check is skipped only in fixture mode
+    // (`fixture_trust_anchor` set, already validated to carry the required
+    // acknowledgement before this isolate was ever built -- see
+    // `validate_fixture_acknowledgement`): a local HTTPS test server binds
+    // to a loopback address by construction, which the check would
+    // otherwise always reject. Bundled behind the same acknowledgement as
+    // the extra trust anchor, not a separate flag, since both are the same
+    // "this is a disposable test fixture, not a production destination"
+    // relaxation.
+    if egress.fixture_trust_anchor.is_none() && !net::is_global_unicast(resolved_ip) {
         return Err(FetchError::AddressNotGlobalUnicast(resolved_ip));
     }
     let addr = std::net::SocketAddr::new(resolved_ip, port);

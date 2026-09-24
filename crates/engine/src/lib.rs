@@ -581,20 +581,27 @@ pub struct EgressPolicy {
 /// value.
 pub const FIXTURE_ACKNOWLEDGEMENT: &str = "disposable-cluster-only";
 
-/// An explicit, separately-gated extra TLS trust anchor for
-/// `op_apsides_fetch`'s TLS handshake, on top of the compiled-in
-/// `webpki-roots` set.
+/// An explicit, separately-gated bundle of two test-only relaxations for
+/// `op_apsides_fetch`.
+///
+/// An extra TLS trust anchor, on top of the compiled-in `webpki-roots`
+/// set, and skipping the "resolved address must be global unicast" check
+/// (see `ops::fetch`) -- a local HTTPS test server binds to a loopback
+/// address by construction, which that check would otherwise always
+/// reject.
 ///
 /// **Not** enabled merely by setting `EgressPolicy::resolver_override`. A
 /// fixture-mode DNS override alone is safe on its own: it only changes
 /// which address a request goes to, still subject to every other check,
-/// including ordinary public-CA TLS verification against that address.
-/// Trusting an *extra, caller-supplied* certificate authority is a
-/// materially more dangerous capability -- it lets a request succeed
-/// against a TLS endpoint no public CA vouches for -- so it is gated
-/// behind `acknowledgement` matching [`FIXTURE_ACKNOWLEDGEMENT`] exactly.
-/// Every `invoke_handler*` function refuses to build an isolate at all
-/// (returning [`InvokeError::FixtureAcknowledgementMissing`]) if
+/// including the global-unicast check and ordinary public-CA TLS
+/// verification against that address. This bundle is a materially more
+/// dangerous capability -- trusting an *extra, caller-supplied*
+/// certificate authority lets a request succeed against a TLS endpoint no
+/// public CA vouches for, and skipping the global-unicast check lets a
+/// request reach a loopback/private address at all -- so both are gated
+/// together behind `acknowledgement` matching [`FIXTURE_ACKNOWLEDGEMENT`]
+/// exactly. Every `invoke_handler*` function refuses to build an isolate
+/// at all (returning [`InvokeError::FixtureAcknowledgementMissing`]) if
 /// `acknowledgement` is set to anything else, including an empty string or
 /// a close-but-wrong value.
 #[derive(Debug, Clone)]

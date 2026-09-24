@@ -8,6 +8,8 @@
     reason = "shared across independent test binaries; not every binary uses every helper"
 )]
 
+pub mod https_fixture;
+
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
