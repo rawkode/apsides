@@ -205,7 +205,10 @@ fn fetch_allowed_tries_the_second_candidate_after_the_first_fails() -> Result<()
         .parse()
         .map_err(|err| format!("bad literal: {err}"))?;
     let mut overrides = HashMap::new();
-    overrides.insert(FIXTURE_HOST.to_owned(), vec![unreachable_first, server.addr.ip()]);
+    overrides.insert(
+        FIXTURE_HOST.to_owned(),
+        vec![unreachable_first, server.addr.ip()],
+    );
     let egress = EgressPolicy {
         allowed: vec![(FIXTURE_HOST.to_owned(), server.addr.port())],
         resolver_override: Some(overrides),
@@ -257,8 +260,13 @@ fn fetch_allowed_against_local_https_fixture_server() -> Result<(), String> {
         return {{ status: response.status, bodyLength: response.body.length }};
     "#
     );
-    let report = run(&body, |invocation| invocation.egress = fixture_egress(&server));
-    assert_ok_value(report, &serde_json::json!({ "status": 200, "bodyLength": 2 }))?;
+    let report = run(&body, |invocation| {
+        invocation.egress = fixture_egress(&server);
+    });
+    assert_ok_value(
+        report,
+        &serde_json::json!({ "status": 200, "bodyLength": 2 }),
+    )?;
 
     server.join()
 }
@@ -281,7 +289,9 @@ fn fetch_redirect_is_returned_to_the_handler_as_a_normal_response() -> Result<()
     "#
     );
 
-    let report = run(&body, |invocation| invocation.egress = fixture_egress(&server));
+    let report = run(&body, |invocation| {
+        invocation.egress = fixture_egress(&server);
+    });
     assert_ok_value(
         report,
         &serde_json::json!({ "status": 302, "location": "https://elsewhere.invalid/" }),
@@ -306,7 +316,9 @@ fn fetch_denied_response_too_large() -> Result<(), String> {
     let url = fixture_url(&server);
     let body = catches_code(&format!(r#"await apsides.fetch("{url}", {{}});"#));
 
-    let report = run(&body, |invocation| invocation.egress = fixture_egress(&server));
+    let report = run(&body, |invocation| {
+        invocation.egress = fixture_egress(&server);
+    });
     assert_code(&report, "RESPONSE_TOO_LARGE")?;
 
     server.join()
@@ -321,7 +333,8 @@ fn fetch_denied_response_too_large() -> Result<(), String> {
 fn fetch_near_the_byte_cap_succeeds_with_a_small_heap() -> Result<(), String> {
     let body_len = 4 * 1024 * 1024 - 64;
     let big_body = vec![b'a'; body_len];
-    let mut response = format!("HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\n\r\n").into_bytes();
+    let mut response =
+        format!("HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\n\r\n").into_bytes();
     response.extend_from_slice(&big_body);
     let response: &'static [u8] = Box::leak(response.into_boxed_slice());
 
@@ -357,8 +370,13 @@ fn fetch_chunked_response_body_decodes() -> Result<(), String> {
     "#
     );
 
-    let report = run(&body, |invocation| invocation.egress = fixture_egress(&server));
-    assert_ok_value(report, &serde_json::json!({ "status": 200, "text": "hello" }))?;
+    let report = run(&body, |invocation| {
+        invocation.egress = fixture_egress(&server);
+    });
+    assert_ok_value(
+        report,
+        &serde_json::json!({ "status": 200, "text": "hello" }),
+    )?;
 
     server.join()
 }
@@ -374,7 +392,9 @@ fn fetch_short_content_length_is_an_error() -> Result<(), String> {
     let url = fixture_url(&server);
     let body = catches_code(&format!(r#"await apsides.fetch("{url}", {{}});"#));
 
-    let report = run(&body, |invocation| invocation.egress = fixture_egress(&server));
+    let report = run(&body, |invocation| {
+        invocation.egress = fixture_egress(&server);
+    });
     assert_code(&report, "RESPONSE_BODY_FAILED")?;
 
     server.join()
@@ -391,7 +411,9 @@ fn fetch_103_then_200_returns_200() -> Result<(), String> {
     let url = fixture_url(&server);
     let body = format!(r#"const r = await apsides.fetch("{url}", {{}}); return r.status;"#);
 
-    let report = run(&body, |invocation| invocation.egress = fixture_egress(&server));
+    let report = run(&body, |invocation| {
+        invocation.egress = fixture_egress(&server);
+    });
     assert_ok_value(report, &serde_json::json!(200))?;
 
     server.join()
@@ -403,12 +425,15 @@ fn fetch_103_then_200_returns_200() -> Result<(), String> {
 /// hand-rolled client always read to EOF and could not have passed this.
 #[test]
 fn fetch_content_length_without_close_notify_succeeds() -> Result<(), String> {
-    let server =
-        HttpsFixtureServer::start_without_close_notify(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")?;
+    let server = HttpsFixtureServer::start_without_close_notify(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    )?;
     let url = fixture_url(&server);
     let body = format!(r#"const r = await apsides.fetch("{url}", {{}}); return r.status;"#);
 
-    let report = run(&body, |invocation| invocation.egress = fixture_egress(&server));
+    let report = run(&body, |invocation| {
+        invocation.egress = fixture_egress(&server);
+    });
     assert_ok_value(report, &serde_json::json!(200))?;
 
     server.join()
@@ -447,8 +472,12 @@ fn output_write_denied_invalid_key() -> Result<(), String> {
 #[test]
 fn output_write_denied_key_too_long() -> Result<(), String> {
     let long_key = "a".repeat(254);
-    let body = catches_code(&format!(r#"apsides.writeOutput("declared", "{long_key}", "data");"#));
-    let report = run(&body, |invocation| invocation.outputs = one_declared_output(10_000));
+    let body = catches_code(&format!(
+        r#"apsides.writeOutput("declared", "{long_key}", "data");"#
+    ));
+    let report = run(&body, |invocation| {
+        invocation.outputs = one_declared_output(10_000);
+    });
     assert_code(&report, "INVALID_KEY")
 }
 
@@ -457,8 +486,12 @@ fn output_write_denied_key_too_long() -> Result<(), String> {
 #[test]
 fn output_write_denied_key_is_dot_or_dotdot() -> Result<(), String> {
     for key in [".", ".."] {
-        let body = catches_code(&format!(r#"apsides.writeOutput("declared", "{key}", "data");"#));
-        let report = run(&body, |invocation| invocation.outputs = one_declared_output(1024));
+        let body = catches_code(&format!(
+            r#"apsides.writeOutput("declared", "{key}", "data");"#
+        ));
+        let report = run(&body, |invocation| {
+            invocation.outputs = one_declared_output(1024);
+        });
         assert_code(&report, "INVALID_KEY").map_err(|err| format!("key {key:?}: {err}"))?;
     }
     Ok(())
@@ -513,12 +546,9 @@ struct RecordingOutputSink {
 
 impl OutputSink for RecordingOutputSink {
     fn write_output(&self, id: &str, key: &str, data: &[u8]) -> Result<(), OutputSinkError> {
-        let mut writes = self
-            .writes
-            .lock()
-            .map_err(|_poisoned| OutputSinkError {
-                message: "mutex poisoned".to_owned(),
-            })?;
+        let mut writes = self.writes.lock().map_err(|_poisoned| OutputSinkError {
+            message: "mutex poisoned".to_owned(),
+        })?;
         writes.push((id.to_owned(), key.to_owned(), data.to_owned()));
         Ok(())
     }
@@ -543,7 +573,10 @@ fn output_write_allowed_reaches_the_sink() -> Result<(), String> {
         .lock()
         .map_err(|_poisoned| "mutex poisoned".to_owned())?;
     if writes.len() != 1 {
-        return Err(format!("expected exactly one recorded write, got {}", writes.len()));
+        return Err(format!(
+            "expected exactly one recorded write, got {}",
+            writes.len()
+        ));
     }
     let (id, key, data) = &writes[0];
     if id != "declared" || key != "my-key" || data != b"hello" {
@@ -570,7 +603,10 @@ fn log_truncates_a_line_over_the_4kib_cap() -> Result<(), String> {
         .result
         .map_err(|err| format!("expected the handler to succeed, got Err: {err}"))?;
     if report.logs.len() != 1 {
-        return Err(format!("expected exactly one log line, got {}", report.logs.len()));
+        return Err(format!(
+            "expected exactly one log line, got {}",
+            report.logs.len()
+        ));
     }
     if report.logs[0].message.len() > 4 * 1024 {
         return Err(format!(
@@ -619,10 +655,12 @@ fn log_records_the_given_level() -> Result<(), String> {
     report
         .result
         .map_err(|err| format!("expected the handler to succeed, got Err: {err}"))?;
-    if report.logs != vec![engine::LogLine {
-        level: engine::LogLevel::Warn,
-        message: "a warning".to_owned(),
-    }] {
+    if report.logs
+        != vec![engine::LogLine {
+            level: engine::LogLevel::Warn,
+            message: "a warning".to_owned(),
+        }]
+    {
         return Err(format!("unexpected logs: {:?}", report.logs));
     }
     Ok(())
@@ -728,7 +766,10 @@ fn fetch_concurrent_calls_exceed_the_concurrency_cap() -> Result<(), String> {
         .iter()
         .filter(|code| **code == serde_json::json!("FETCH_CONCURRENCY_EXCEEDED"))
         .count();
-    let ok = codes.iter().filter(|code| **code == serde_json::json!("OK")).count();
+    let ok = codes
+        .iter()
+        .filter(|code| **code == serde_json::json!("OK"))
+        .count();
     if exceeded != 1 || ok != 2 {
         return Err(format!(
             "expected exactly 2 OK and 1 FETCH_CONCURRENCY_EXCEEDED among 3 concurrent calls \
@@ -748,7 +789,8 @@ fn fetch_concurrent_calls_exceed_the_concurrency_cap() -> Result<(), String> {
 #[test]
 fn fetch_concurrent_calls_cannot_exceed_the_total_byte_budget() -> Result<(), String> {
     let body_len = 3 * 1024 * 1024;
-    let mut response = format!("HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\n\r\n").into_bytes();
+    let mut response =
+        format!("HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\n\r\n").into_bytes();
     response.extend_from_slice(&vec![b'a'; body_len]);
     let response: &'static [u8] = Box::leak(response.into_boxed_slice());
 
@@ -915,7 +957,11 @@ fn fetch_failed_calls_refund_their_reservation_so_a_later_valid_fetch_still_succ
         "CONNECT_FAILED",
         "CONNECT_FAILED",
     ]);
-    if *codes != *expected_codes.as_array().ok_or("unreachable: literal array")? {
+    if *codes
+        != *expected_codes
+            .as_array()
+            .ok_or("unreachable: literal array")?
+    {
         return Err(format!(
             "expected the four failing calls to be {expected_codes:?}, got {codes:?} (full \
              result: {value:?})"
@@ -943,7 +989,8 @@ fn fetch_failed_calls_refund_their_reservation_so_a_later_valid_fetch_still_succ
 #[test]
 fn fetch_concurrent_calls_over_budget_dial_at_most_once() -> Result<(), String> {
     let body_len = 3 * 1024 * 1024;
-    let mut response = format!("HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\n\r\n").into_bytes();
+    let mut response =
+        format!("HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\n\r\n").into_bytes();
     response.extend_from_slice(&vec![b'a'; body_len]);
     let response: &'static [u8] = Box::leak(response.into_boxed_slice());
 
@@ -973,7 +1020,10 @@ fn fetch_concurrent_calls_over_budget_dial_at_most_once() -> Result<(), String> 
         .as_array()
         .ok_or_else(|| format!("expected an array, got {value:?}"))?;
 
-    let ok = codes.iter().filter(|code| **code == serde_json::json!("OK")).count();
+    let ok = codes
+        .iter()
+        .filter(|code| **code == serde_json::json!("OK"))
+        .count();
     let budget_or_too_large = codes
         .iter()
         .filter(|code| {
@@ -1055,8 +1105,8 @@ fn log_emission_is_capped_and_reports_a_dropped_count() -> Result<(), String> {
             lines.len()
         ));
     }
-    let last: serde_json::Value =
-        serde_json::from_str(&lines[64]).map_err(|err| format!("last emitted line was not JSON: {err}"))?;
+    let last: serde_json::Value = serde_json::from_str(&lines[64])
+        .map_err(|err| format!("last emitted line was not JSON: {err}"))?;
     if last.get("dropped_log_lines") != Some(&serde_json::json!(36)) {
         return Err(format!(
             "expected the final record's dropped_log_lines to be 36 (100 - 64), got {last:?}"
@@ -1086,7 +1136,9 @@ fn fetch_denied_response_headers_too_large() -> Result<(), String> {
     let url = fixture_url(&server);
     let body = catches_code(&format!(r#"await apsides.fetch("{url}", {{}});"#));
 
-    let report = run(&body, |invocation| invocation.egress = fixture_egress(&server));
+    let report = run(&body, |invocation| {
+        invocation.egress = fixture_egress(&server);
+    });
     assert_code(&report, "RESPONSE_HEADERS_TOO_LARGE")?;
 
     server.join()
@@ -1104,7 +1156,9 @@ fn fetch_invalid_request_never_opens_a_connection() -> Result<(), String> {
         r#"await apsides.fetch("{url}", {{ headers: {{ "X-Evil": "a\r\nbad" }} }});"#
     ));
 
-    let report = run(&body, |invocation| invocation.egress = fixture_egress(&server));
+    let report = run(&body, |invocation| {
+        invocation.egress = fixture_egress(&server);
+    });
     assert_code(&report, "INVALID_REQUEST_HEADER")?;
 
     server.join()?;

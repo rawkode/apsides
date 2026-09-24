@@ -15,8 +15,8 @@
 //! never sets `fixture_trust_anchor` at all.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rcgen::{CertifiedKey, generate_simple_self_signed};
@@ -75,8 +75,7 @@ impl HttpsFixtureServer {
                 .map_err(|err| format!("failed to generate the fixture certificate: {err}"))?;
         let cert_der = cert.der().clone();
         let ca_der = cert_der.to_vec();
-        let key_der =
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
 
         let listener_std = std::net::TcpListener::bind("127.0.0.1:0")
             .map_err(|err| format!("failed to bind the fixture listener: {err}"))?;
@@ -101,7 +100,9 @@ impl HttpsFixtureServer {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map_err(|err| format!("failed to build the fixture server's tokio runtime: {err}"))?;
+                .map_err(|err| {
+                    format!("failed to build the fixture server's tokio runtime: {err}")
+                })?;
 
             rt.block_on(async move {
                 let listener = TcpListener::from_std(listener_std)
@@ -216,7 +217,9 @@ impl HttpsFixtureServer {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map_err(|err| format!("failed to build the fixture server's tokio runtime: {err}"))?;
+                .map_err(|err| {
+                    format!("failed to build the fixture server's tokio runtime: {err}")
+                })?;
 
             rt.block_on(async move {
                 let listener = TcpListener::from_std(listener_std)

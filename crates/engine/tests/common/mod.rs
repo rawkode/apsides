@@ -15,7 +15,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use engine::{EgressPolicy, HandlerInvocation, Limits, OutputSink, OutputSinkError, StderrLogWriter};
+use engine::{
+    EgressPolicy, HandlerInvocation, Limits, OutputSink, OutputSinkError, StderrLogWriter,
+};
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{GOOGLE, ResolverConfig};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;

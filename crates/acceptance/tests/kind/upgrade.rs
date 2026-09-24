@@ -38,13 +38,13 @@ use std::{collections::BTreeMap, time::Duration};
 #[tokio::test]
 #[ignore = "creates a kind cluster; needs Docker, kind and `cuenv task acceptancePrepare`"]
 async fn cnpg_upgrade_through_the_public_cli() -> Result {
-    scenario::run("cnpg-upgrade", async |scenario| {
+    Box::pin(scenario::run("cnpg-upgrade", async |scenario| {
         let pair = Pair::load(
             &scenario.inputs.initial_release,
             &scenario.inputs.successor_release,
         )?;
         Upgrade { pair: &pair }.run(scenario).await
-    })
+    }))
     .await
 }
 

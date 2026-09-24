@@ -145,7 +145,9 @@ const fn is_global_unicast_v6(ip: Ipv6Addr) -> bool {
         return false;
     }
     // NAT64 well-known prefixes, 64:ff9b::/96 and 64:ff9b:1::/48.
-    if s[0] == 0x0064 && s[1] == 0xff9b && ((s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0) || s[2] == 0x0001)
+    if s[0] == 0x0064
+        && s[1] == 0xff9b
+        && ((s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0) || s[2] == 0x0001)
     {
         return false;
     }
@@ -386,7 +388,11 @@ fn ensure_crypto_provider_installed() {
 
 fn remaining(deadline: Instant) -> Result<Duration, ()> {
     let now = Instant::now();
-    if now >= deadline { Err(()) } else { Ok(deadline - now) }
+    if now >= deadline {
+        Err(())
+    } else {
+        Ok(deadline - now)
+    }
 }
 
 /// Vets and dials the first reachable address in `candidate_ips`,
@@ -508,7 +514,10 @@ pub async fn https_request(
         // it is mapped to the same `ResponseHeadersTooLarge` code here
         // (review round 6, non-blocking item).
         if err.is_parse_too_large() {
-            HttpsError::ResponseHeadersTooLarge(MAX_RESPONSE_HEADER_COUNT, MAX_RESPONSE_HEADER_BYTES)
+            HttpsError::ResponseHeadersTooLarge(
+                MAX_RESPONSE_HEADER_COUNT,
+                MAX_RESPONSE_HEADER_BYTES,
+            )
         } else {
             HttpsError::RequestSend(err.to_string())
         }
@@ -663,7 +672,8 @@ mod tests {
     /// addresses sharing one port: nothing listens on `127.0.0.1` at that
     /// port, and a real listener is bound to `127.0.0.2`.
     #[tokio::test]
-    async fn dial_first_vetted_skips_an_unreachable_candidate_and_uses_the_next() -> Result<(), String> {
+    async fn dial_first_vetted_skips_an_unreachable_candidate_and_uses_the_next()
+    -> Result<(), String> {
         let listener = tokio::net::TcpListener::bind("127.0.0.2:0")
             .await
             .map_err(|err| format!("failed to bind the reachable candidate: {err}"))?;

@@ -1002,7 +1002,10 @@ struct PreparedIsolate {
 /// inside an entered runtime" as a doc-comment convention, means no future
 /// call site can silently reintroduce the bug: there is no `Handle` to
 /// pass without first having a runtime to get one from.
-#[allow(clippy::too_many_arguments, reason = "each argument is a distinct, independently-owned piece of one invocation's isolate configuration; bundling them into a struct here would only move the same field list one level up")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct, independently-owned piece of one invocation's isolate configuration; bundling them into a struct here would only move the same field list one level up"
+)]
 fn prepare_isolate(
     handle: &tokio::runtime::Handle,
     limits: Limits,
@@ -1372,7 +1375,11 @@ fn begin_invocation<'a>(
     // on the isolate's own thread) without needing `&mut JsRuntime`, which
     // the callback signature does not provide.
     let terminated = Arc::new(AtomicBool::new(false));
-    install_heap_limit_callback(&mut runtime, isolate_handle.clone(), Arc::clone(&terminated));
+    install_heap_limit_callback(
+        &mut runtime,
+        isolate_handle.clone(),
+        Arc::clone(&terminated),
+    );
 
     Ok(BegunInvocation {
         isolate: PreparedIsolate {

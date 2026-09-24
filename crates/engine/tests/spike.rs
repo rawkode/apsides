@@ -49,11 +49,9 @@ fn run_with_limits(limits: Limits, body: &str) -> InvocationReport {
 /// (Rust -> V8 -> Rust, observed via `InvocationReport::logs`).
 #[test]
 fn apsides_log_is_callable_from_the_handler_export() -> Result<(), String> {
-    let report = run(
-        r#"
+    let report = run(r#"
         apsides.log("info", "pong-from-rust");
-    "#,
-    );
+    "#);
 
     report
         .result
@@ -75,16 +73,14 @@ fn apsides_log_is_callable_from_the_handler_export() -> Result<(), String> {
 /// asserting flag names are "right" by inspection.
 #[test]
 fn wasm_and_shared_array_buffer_are_not_exposed() {
-    let result = run(
-        r#"
+    let result = run(r#"
         if (typeof WebAssembly !== "undefined") {
             throw new Error("WebAssembly must not be exposed under --jitless");
         }
         if (typeof SharedArrayBuffer !== "undefined") {
             throw new Error("SharedArrayBuffer must not be exposed by default");
         }
-    "#,
-    );
+    "#);
 
     assert!(
         result.result.is_ok(),
@@ -143,8 +139,7 @@ fn array_buffer_allocation_over_the_cap_terminates_the_isolate_without_aborting_
 /// Layer 2 guards. Closed by Layer 1 (hiding `Deno` entirely).
 #[test]
 fn deserialize_route_is_closed_by_hiding_deno() {
-    let result = run(
-        r"
+    let result = run(r"
         let threw = false;
         let errorName = '';
         try {
@@ -160,8 +155,7 @@ fn deserialize_route_is_closed_by_hiding_deno() {
         if (errorName !== 'ReferenceError') {
             throw new Error('expected ReferenceError (Deno undefined), got ' + errorName);
         }
-    ",
-    );
+    ");
 
     assert!(
         result.result.is_ok(),
@@ -173,8 +167,7 @@ fn deserialize_route_is_closed_by_hiding_deno() {
 /// structured-clone machinery as `deserialize`. Closed the same way.
 #[test]
 fn structured_clone_route_is_closed_by_hiding_deno() {
-    let result = run(
-        r"
+    let result = run(r"
         let threw = false;
         let errorName = '';
         try {
@@ -189,8 +182,7 @@ fn structured_clone_route_is_closed_by_hiding_deno() {
         if (errorName !== 'ReferenceError') {
             throw new Error('expected ReferenceError (Deno undefined), got ' + errorName);
         }
-    ",
-    );
+    ");
 
     assert!(
         result.result.is_ok(),
@@ -204,8 +196,7 @@ fn structured_clone_route_is_closed_by_hiding_deno() {
 /// receiver -- including via the `prototype.constructor` bypass.
 #[test]
 fn guarded_constructor_toctou_and_resize_transfer_are_closed() {
-    let result = run(
-        r"
+    let result = run(r"
         let getterCalls = 0;
         const evilOptions = {
             get maxByteLength() {
@@ -248,8 +239,7 @@ fn guarded_constructor_toctou_and_resize_transfer_are_closed() {
         if (!viaPrototypeResizeThrew) {
             throw new Error('resize must throw on a prototype.constructor-bypass buffer too');
         }
-    ",
-    );
+    ");
 
     assert!(
         result.result.is_ok(),
@@ -262,8 +252,7 @@ fn guarded_constructor_toctou_and_resize_transfer_are_closed() {
 /// the new `apsides` global is present and frozen instead.
 #[test]
 fn deno_and_bootstrap_internals_are_unreachable_but_apsides_is_present() {
-    let result = run(
-        r#"
+    let result = run(r#"
         if (typeof globalThis.__bootstrap !== "undefined") {
             throw new Error("globalThis.__bootstrap must be undefined");
         }
@@ -302,8 +291,7 @@ fn deno_and_bootstrap_internals_are_unreachable_but_apsides_is_present() {
         if (apsides.fetch !== originalFetch) {
             throw new Error("apsides.fetch must be unchanged after the rejected assignment");
         }
-    "#,
-    );
+    "#);
 
     assert!(
         result.result.is_ok(),
@@ -317,8 +305,7 @@ fn deno_and_bootstrap_internals_are_unreachable_but_apsides_is_present() {
 /// calls `Object.setPrototypeOf` on the guarded constructor at all.
 #[test]
 fn native_array_buffer_constructor_is_unreachable_via_prototype_chain() {
-    let result = run(
-        r#"
+    let result = run(r#"
         if (Object.getPrototypeOf(ArrayBuffer) !== Function.prototype) {
             throw new Error("Object.getPrototypeOf(ArrayBuffer) must be Function.prototype");
         }
@@ -362,8 +349,7 @@ fn native_array_buffer_constructor_is_unreachable_via_prototype_chain() {
         if (descriptor.writable !== false || descriptor.configurable !== false) {
             throw new Error("ArrayBuffer.prototype.constructor must be non-writable and non-configurable");
         }
-    "#,
-    );
+    "#);
 
     assert!(
         result.result.is_ok(),
@@ -378,8 +364,7 @@ fn native_array_buffer_constructor_is_unreachable_via_prototype_chain() {
 /// `BOOTSTRAP_GUARD_SCRIPT`, before any other statement runs.
 #[test]
 fn reflect_construct_and_apply_are_captured_before_hijack() {
-    let result = run(
-        r#"
+    let result = run(r#"
         const nativeConstruct = Reflect.construct;
         const nativeApply = Reflect.apply;
         const constructCalls = [];
@@ -412,8 +397,7 @@ fn reflect_construct_and_apply_are_captured_before_hijack() {
         if (buf.resizable || transferred.resizable || attempt.resizable) {
             throw new Error("a resizable buffer was constructed with Reflect hijacked");
         }
-    "#,
-    );
+    "#);
 
     assert!(
         result.result.is_ok(),
@@ -429,8 +413,7 @@ fn reflect_construct_and_apply_are_captured_before_hijack() {
 /// not consult either.
 #[test]
 fn apsides_wrappers_never_leak_the_captured_op_functions_via_call_or_apply_hijack() {
-    let result = run(
-        r#"
+    let result = run(r#"
         const capturedThis = [];
         Function.prototype.call = function (thisArg, ...args) {
             capturedThis.push(thisArg);
@@ -457,8 +440,7 @@ fn apsides_wrappers_never_leak_the_captured_op_functions_via_call_or_apply_hijac
                 " hijacked call(s)",
             );
         }
-    "#,
-    );
+    "#);
 
     assert!(
         result.result.is_ok(),
@@ -471,8 +453,7 @@ fn apsides_wrappers_never_leak_the_captured_op_functions_via_call_or_apply_hijac
 /// native constructor is never made reachable via `Object.setPrototypeOf`.
 #[test]
 fn array_buffer_statics_are_preserved() {
-    let result = run(
-        r#"
+    let result = run(r#"
         if (ArrayBuffer.isView(new Uint8Array(1)) !== true) {
             throw new Error("ArrayBuffer.isView(new Uint8Array(1)) must be true");
         }
@@ -482,8 +463,7 @@ fn array_buffer_statics_are_preserved() {
         if (ArrayBuffer[Symbol.species] !== ArrayBuffer) {
             throw new Error("ArrayBuffer[Symbol.species] must be ArrayBuffer itself");
         }
-    "#,
-    );
+    "#);
 
     assert!(
         result.result.is_ok(),
@@ -497,8 +477,7 @@ fn array_buffer_statics_are_preserved() {
 /// unreachable since `SharedArrayBuffer`/`WebAssembly` are absent).
 #[test]
 fn other_construction_routes_do_not_bypass_the_array_buffer_guard() {
-    let result = run(
-        r#"
+    let result = run(r#"
         const evalBuf = eval("new ArrayBuffer(0, { maxByteLength: 1024 })");
         if (evalBuf.resizable) {
             throw new Error("eval() bypassed the ArrayBuffer guard");
@@ -523,8 +502,7 @@ fn other_construction_routes_do_not_bypass_the_array_buffer_guard() {
         if (view.getUint32(0) !== 0xdead_beef) {
             throw new Error("DataView over an ordinary fixed buffer must still work");
         }
-    "#,
-    );
+    "#);
 
     assert!(
         result.result.is_ok(),
@@ -683,15 +661,16 @@ fn allocation_churn_survives_through_the_watchdog_entry_point() {
 #[test]
 fn the_isolate_is_not_reused_across_invocations() {
     let first = run(r"globalThis.leakedFromFirstInvocation = 42;");
-    assert!(first.result.is_ok(), "expected the first invocation to succeed, got {first:?}");
+    assert!(
+        first.result.is_ok(),
+        "expected the first invocation to succeed, got {first:?}"
+    );
 
-    let second = run(
-        r#"
+    let second = run(r#"
         if (typeof globalThis.leakedFromFirstInvocation !== "undefined") {
             throw new Error("a global set in a prior invocation leaked into this one");
         }
-    "#,
-    );
+    "#);
     assert!(
         second.result.is_ok(),
         "expected the second invocation to see a clean isolate, got {second:?}"

@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use common::{
-    SPIKE_HTTPS_HOST, apply_deny_all_or_fail_closed, assert_file_open_denied,
-    handler_invocation, https_get_via_hickory, wrap_as_handler,
+    SPIKE_HTTPS_HOST, apply_deny_all_or_fail_closed, assert_file_open_denied, handler_invocation,
+    https_get_via_hickory, wrap_as_handler,
 };
 use landlock::RulesetStatus;
 

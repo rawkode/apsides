@@ -29,7 +29,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::net;
-use crate::{EgressPolicy, EgressResolver, LogLevel, LogLine, LogWriter, OutputSink, OutputSinkError};
+use crate::{
+    EgressPolicy, EgressResolver, LogLevel, LogLine, LogWriter, OutputSink, OutputSinkError,
+};
 
 /// Per-invocation state the ops above read from `OpState`. Built once by
 /// `crate::prepare_isolate` from the caller's `HandlerInvocation` and
@@ -498,7 +500,10 @@ pub enum FetchOutcome {
 /// these itself too (defense in depth; it must never trust an unvalidated
 /// caller), so this is deliberately redundant with, not a replacement
 /// for, the check inside it.
-fn validate_method_and_headers(method: &str, headers: &[(String, String)]) -> Result<(), FetchError> {
+fn validate_method_and_headers(
+    method: &str,
+    headers: &[(String, String)],
+) -> Result<(), FetchError> {
     hyper::Method::from_bytes(method.as_bytes())
         .map_err(|_err| FetchError::Https(net::HttpsError::InvalidMethod(method.to_owned())))?;
     for (name, value) in headers {
@@ -551,8 +556,9 @@ impl Drop for InFlightGuard {
         let engine_state = state_ref.borrow_mut::<EngineOpState>();
         engine_state.fetches_in_flight = engine_state.fetches_in_flight.saturating_sub(1);
         if !self.success {
-            engine_state.fetch_bytes_reserved =
-                engine_state.fetch_bytes_reserved.saturating_sub(self.reservation);
+            engine_state.fetch_bytes_reserved = engine_state
+                .fetch_bytes_reserved
+                .saturating_sub(self.reservation);
         }
     }
 }
@@ -686,8 +692,9 @@ async fn fetch(
         let total_reservation = body_len + response_reservation;
 
         engine_state.fetches_in_flight += 1;
-        engine_state.fetch_bytes_reserved =
-            engine_state.fetch_bytes_reserved.saturating_add(total_reservation);
+        engine_state.fetch_bytes_reserved = engine_state
+            .fetch_bytes_reserved
+            .saturating_add(total_reservation);
 
         (total_reservation, response_reservation)
     };
@@ -716,12 +723,13 @@ async fn fetch(
         path_and_query.push_str(query);
     }
 
-    let extra_trust_anchor = egress
-        .fixture_trust_anchor
-        .as_ref()
-        .map(|fixture| net::FixtureTrustAnchor {
-            der: fixture.trust_anchor_der.clone(),
-        });
+    let extra_trust_anchor =
+        egress
+            .fixture_trust_anchor
+            .as_ref()
+            .map(|fixture| net::FixtureTrustAnchor {
+                der: fixture.trust_anchor_der.clone(),
+            });
     let fetch_limits = net::FetchLimits {
         max_response_bytes: response_reservation,
         deadline,
@@ -744,8 +752,9 @@ async fn fetch(
     if unused_reservation > 0 {
         let mut state_ref = state.borrow_mut();
         let engine_state = state_ref.borrow_mut::<EngineOpState>();
-        engine_state.fetch_bytes_reserved =
-            engine_state.fetch_bytes_reserved.saturating_sub(unused_reservation);
+        engine_state.fetch_bytes_reserved = engine_state
+            .fetch_bytes_reserved
+            .saturating_sub(unused_reservation);
     }
     // A real response was received and its true size is now reflected in
     // `fetch_bytes_reserved` above -- from here the guard's `Drop` must
