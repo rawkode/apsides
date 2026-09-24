@@ -90,36 +90,38 @@ impl PermissionsDiff {
     }
 }
 
-/// A kept secret ((namespace, name)) whose reader changed.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SecretReadChange {
-    pub namespace: String,
-    pub name: String,
-    pub reader: ValueChange<String>,
-}
-
+/// Secrets read are keyed by (namespace, name, reader).
+///
+/// A reader is part of the identity, not a mutable field, so a second
+/// reader appearing on an already-read secret is a distinct row — reported
+/// as `added`, never as an in-place change a reviewer could miss.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SecretsReadDiff {
     pub added: Vec<SurfaceSecretRead>,
     pub removed: Vec<SurfaceSecretRead>,
-    pub changed: Vec<SecretReadChange>,
 }
 
 impl SecretsReadDiff {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+        self.added.is_empty() && self.removed.is_empty()
     }
 }
 
-/// A kept resource ((kind, namespace, name)) whose other fields changed.
+/// A kept resource ((`apiGroup`, kind, namespace, name)) whose other fields
+/// changed.
 ///
-/// The resource's own `id` is compared too — an author-visible rename of the
-/// same live object — but never the resource's key, since `apiVersion` can
-/// move (a CRD version bump) while the deployed object stays the same
-/// identity.
+/// `apiGroup` is parsed from `apiVersion` (the part before the last `/`, or
+/// empty for the core group) and is part of the identity: two custom
+/// resources can share a `Kind` and name across different API groups (an
+/// Istio `Gateway` and a `gateway.networking.k8s.io` `Gateway` both named
+/// `web`, say), and collapsing them onto one key would silently drop
+/// whichever removal or addition lost the collision. A version bump inside
+/// the same group is not a new identity: `apiVersion` is still only a
+/// compared field, never part of the key, so it surfaces as `changed`. The
+/// resource's own `id` is compared too — an author-visible rename of the
+/// same live object.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourceChange {
@@ -433,10 +435,14 @@ fn diff_permissions(base: &[SurfacePermission], head: &[SurfacePermission]) -> P
     diff
 }
 
-type SecretKey = (String, String);
+type SecretKey = (String, String, String);
 
 fn secret_key(secret: &SurfaceSecretRead) -> SecretKey {
-    (secret.namespace.clone(), secret.name.clone())
+    (
+        secret.namespace.clone(),
+        secret.name.clone(),
+        secret.reader.clone(),
+    )
 }
 
 fn diff_secrets_read(base: &[SurfaceSecretRead], head: &[SurfaceSecretRead]) -> SecretsReadDiff {
@@ -449,25 +455,25 @@ fn diff_secrets_read(base: &[SurfaceSecretRead], head: &[SurfaceSecretRead]) -> 
         match (base_map.get(&key), head_map.get(&key)) {
             (None, Some(head)) => diff.added.push((*head).clone()),
             (Some(base), None) => diff.removed.push((*base).clone()),
-            (Some(base), Some(head)) => {
-                if let Some(reader) = value_change(&base.reader, &head.reader) {
-                    diff.changed.push(SecretReadChange {
-                        namespace: head.namespace.clone(),
-                        name: head.name.clone(),
-                        reader,
-                    });
-                }
-            }
-            (None, None) => {}
+            (Some(_), Some(_)) | (None, None) => {}
         }
     }
     diff
 }
 
-type ResourceKey = (String, String, String);
+/// (`apiGroup`, kind, namespace, name). `apiGroup` is parsed from
+/// `apiVersion`, never `apiVersion` itself: see [`ResourceChange`].
+type ResourceKey = (String, String, String, String);
+
+/// The API group named by `api_version`: the part before its last `/`, or
+/// empty for the core group (`apiVersion: v1`, no group segment at all).
+fn api_group_of(api_version: &str) -> &str {
+    api_version.rsplit_once('/').map_or("", |(group, _)| group)
+}
 
 fn resource_key(resource: &SurfaceResource) -> ResourceKey {
     (
+        api_group_of(&resource.api_version).to_owned(),
         resource.kind.clone(),
         resource.namespace.clone(),
         resource.name.clone(),

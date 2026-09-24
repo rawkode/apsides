@@ -8,7 +8,7 @@
 //! never trigger, since there is nothing yet for them to match.
 
 use crate::json::parse_strict;
-use crate::surface_diff::SurfaceDiff;
+use crate::surface_diff::{PermissionChange, SurfaceDiff};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 
@@ -82,12 +82,28 @@ pub fn parse_policy(input: &str) -> Result<SurfacePolicy> {
     Ok(policy)
 }
 
+/// Whether a kept permission target's `changed` row widens what it grants:
+/// a new verb, a name added to an already-granted verb, or a verb widened
+/// from a name-restricted set to `allNames`. A pure narrowing (a verb or a
+/// name dropped, or `allNames` narrowed to specific names) never counts —
+/// `permissions.added` names growth in authority, not every edit.
+fn widens_permissions(change: &PermissionChange) -> bool {
+    !change.verbs_added.is_empty()
+        || change
+            .verbs_changed
+            .iter()
+            .any(|verb| !verb.names_added.is_empty() || verb.widened_to_all_names)
+}
+
 /// Whether `rule` matches a change present in `diff`.
 fn matches(rule: PolicyRule, diff: &SurfaceDiff) -> bool {
     match rule {
         PolicyRule::EgressAdded | PolicyRule::HandlersAdded => false,
         PolicyRule::SecretsReadAdded => !diff.secrets_read.added.is_empty(),
-        PolicyRule::PermissionsAdded => !diff.permissions.added.is_empty(),
+        PolicyRule::PermissionsAdded => {
+            !diff.permissions.added.is_empty()
+                || diff.permissions.changed.iter().any(widens_permissions)
+        }
         PolicyRule::PermissionsChanged => !diff.permissions.changed.is_empty(),
         PolicyRule::ImagesUnpinned => {
             diff.images.added.iter().any(|image| !image.pinned)

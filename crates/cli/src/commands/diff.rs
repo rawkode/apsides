@@ -13,14 +13,14 @@
 
 use crate::{Result, cli, report};
 use compiler_core::{
-    Surface, SurfacePolicy, diff_surfaces, evaluate_policy, parse_policy, parse_strict,
-    render_markdown,
+    SURFACE_SCHEMA, Surface, SurfacePolicy, diff_surfaces, evaluate_policy, parse_policy,
+    parse_strict, render_markdown,
 };
 use serde_json::json;
-use std::{fs, path::Path};
+use std::{fs, io::Read as _, path::Path};
 
 /// The largest surface or policy document this command will read.
-const MAX_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// Exit status for an unreadable or malformed input, alongside clap's own
 /// usage errors.
@@ -28,24 +28,50 @@ const USAGE_EXIT: i32 = 2;
 /// Exit status when the policy names at least one triggered rule.
 const APPROVAL_EXIT: i32 = 1;
 
+/// Read `path` under an explicit input bound, the same way
+/// `crate::source::document` reads a staged compiler document: `symlink_metadata`
+/// so a symlink (to a device, a FIFO, or anything else) is rejected outright
+/// rather than followed, and a capped `take(MAX_BYTES + 1)` read so a file
+/// that grows between the metadata check and the read — or a special file
+/// whose reported length is not its actual content length — still cannot
+/// smuggle more than the bound through.
 fn read_bounded(path: &Path) -> Result<String> {
-    if fs::metadata(path)?.len() > MAX_BYTES {
-        return Err("input exceeds 8 MiB limit".into());
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_BYTES as u64 {
+        return Err("input is missing, not a regular file, or exceeds 8 MiB".into());
     }
-    Ok(fs::read_to_string(path)?)
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_BYTES {
+        return Err("input exceeds 8 MiB".into());
+    }
+    Ok(String::from_utf8(bytes)?)
 }
 
 /// Read a deployment surface from `path`: an artifact directory, in which
 /// case its `surface.json` is read, or a `surface.json` file directly.
+///
+/// # Errors
+/// Returns an error if the target is unreadable, malformed, or its
+/// `schemaVersion` is not [`SURFACE_SCHEMA`] — an artifact from a
+/// mismatched compiler version is never silently compared.
 fn read_surface(path: &Path) -> Result<Surface> {
     let target = if fs::metadata(path)?.is_dir() {
         path.join("surface.json")
     } else {
         path.to_path_buf()
     };
-    Ok(serde_json::from_value(parse_strict(&read_bounded(
-        &target,
-    )?)?)?)
+    let surface: Surface = serde_json::from_value(parse_strict(&read_bounded(&target)?)?)?;
+    if surface.schema_version != SURFACE_SCHEMA {
+        return Err(format!(
+            "unsupported surface schemaVersion {:?}; expected {SURFACE_SCHEMA:?}",
+            surface.schema_version
+        )
+        .into());
+    }
+    Ok(surface)
 }
 
 fn read_policy(path: &Path) -> Result<SurfacePolicy> {

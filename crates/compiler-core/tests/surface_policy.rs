@@ -107,6 +107,117 @@ fn evaluate_policy_reports_triggered_rules_in_declared_order() {
     );
 }
 
+fn empty_diff() -> SurfaceDiff {
+    SurfaceDiff {
+        schema_version: SURFACE_DIFF_SCHEMA.into(),
+        domain: None,
+        kubernetes: None,
+        permissions: PermissionsDiff::default(),
+        secrets_read: SecretsReadDiff::default(),
+        resources: ResourcesDiff::default(),
+        inputs: InputsDiff::default(),
+        reactions: ReactionsDiff::default(),
+        images: ImagesDiff::default(),
+        risks: StringSetDiff::default(),
+        enforcement_gaps: StringSetDiff::default(),
+    }
+}
+
+fn permission_change(
+    verbs_added: Vec<&str>,
+    verbs_removed: Vec<&str>,
+    verbs_changed: Vec<PermissionVerbChange>,
+) -> PermissionChange {
+    PermissionChange {
+        namespace: "production".into(),
+        api_group: String::new(),
+        resource: "configmaps".into(),
+        subresource: None,
+        verbs_added: verbs_added.into_iter().map(str::to_owned).collect(),
+        verbs_removed: verbs_removed.into_iter().map(str::to_owned).collect(),
+        verbs_changed,
+    }
+}
+
+fn verb_change(
+    verb: &str,
+    names_added: Vec<&str>,
+    names_removed: Vec<&str>,
+    widened_to_all_names: bool,
+    narrowed_from_all_names: bool,
+) -> PermissionVerbChange {
+    PermissionVerbChange {
+        verb: verb.into(),
+        names_added: names_added.into_iter().map(str::to_owned).collect(),
+        names_removed: names_removed.into_iter().map(str::to_owned).collect(),
+        widened_to_all_names,
+        narrowed_from_all_names,
+    }
+}
+
+fn require(rule: PolicyRule) -> SurfacePolicy {
+    SurfacePolicy {
+        schema_version: SURFACE_POLICY_SCHEMA.into(),
+        require_approval: vec![rule],
+    }
+}
+
+#[test]
+fn permissions_added_matches_a_new_verb_on_an_existing_row() {
+    let mut diff = empty_diff();
+    diff.permissions.changed = vec![permission_change(vec!["watch"], vec![], vec![])];
+    assert_eq!(
+        evaluate_policy(&require(PolicyRule::PermissionsAdded), &diff),
+        vec![PolicyRule::PermissionsAdded]
+    );
+}
+
+#[test]
+fn permissions_added_matches_a_name_added_to_an_existing_verb() {
+    let mut diff = empty_diff();
+    diff.permissions.changed = vec![permission_change(
+        vec![],
+        vec![],
+        vec![verb_change("get", vec!["new-config"], vec![], false, false)],
+    )];
+    assert_eq!(
+        evaluate_policy(&require(PolicyRule::PermissionsAdded), &diff),
+        vec![PolicyRule::PermissionsAdded]
+    );
+}
+
+#[test]
+fn permissions_added_matches_a_verb_widened_to_all_names() {
+    let mut diff = empty_diff();
+    diff.permissions.changed = vec![permission_change(
+        vec![],
+        vec![],
+        vec![verb_change("get", vec![], vec![], true, false)],
+    )];
+    assert_eq!(
+        evaluate_policy(&require(PolicyRule::PermissionsAdded), &diff),
+        vec![PolicyRule::PermissionsAdded]
+    );
+}
+
+#[test]
+fn permissions_added_does_not_match_a_pure_narrowing() {
+    let mut diff = empty_diff();
+    diff.permissions.changed = vec![permission_change(
+        vec![],
+        vec!["delete"],
+        vec![verb_change("list", vec![], vec!["old-config"], false, true)],
+    )];
+
+    assert!(evaluate_policy(&require(PolicyRule::PermissionsAdded), &diff).is_empty());
+    // A narrowing is still a change, just never a widening: `permissions.changed`
+    // must still see it.
+    assert_eq!(
+        evaluate_policy(&require(PolicyRule::PermissionsChanged), &diff),
+        vec![PolicyRule::PermissionsChanged]
+    );
+}
+
 #[test]
 fn evaluate_policy_is_empty_when_nothing_matches() {
     let policy = SurfacePolicy {

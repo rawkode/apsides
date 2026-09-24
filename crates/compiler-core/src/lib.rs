@@ -27,8 +27,8 @@ pub use surface::{
 pub use surface_diff::{
     DomainChange, ImageChange, ImagesDiff, InputChange, InputsDiff, KubernetesChange,
     PermissionChange, PermissionVerbChange, PermissionsDiff, ReactionsDiff, ResourceChange,
-    ResourcesDiff, SURFACE_DIFF_SCHEMA, SecretReadChange, SecretsReadDiff, StringSetDiff,
-    SurfaceDiff, ValueChange, diff_surfaces,
+    ResourcesDiff, SURFACE_DIFF_SCHEMA, SecretsReadDiff, StringSetDiff, SurfaceDiff, ValueChange,
+    diff_surfaces,
 };
 pub use surface_diff_markdown::render_markdown;
 pub use surface_policy::{

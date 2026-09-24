@@ -54,21 +54,50 @@ names are rejected):
 }
 ```
 
-`requireApproval` draws from a fixed rule vocabulary. `egress.added` and
-`handlers.added` are also accepted today for forward compatibility with the
-event plane's `egress` and `handlers` surface sections; until those sections
-exist, the two rules simply never match.
+`requireApproval` draws from a fixed rule vocabulary; an unrecognized name is
+rejected. Each rule matches a specific diff condition, never "any change to
+this section" unless stated:
+
+| Rule | Matches when |
+| --- | --- |
+| `egress.added` | never yet — accepted for forward compatibility, since Phase 4 adds an `egress` surface section this rule will match against; until then there is nothing for it to match |
+| `secretsRead.added` | a `(namespace, name, reader)` row appears that was not present before. Secrets read are keyed by reader as well as by secret, so a second reader added to an already-read secret matches this rule too, not just a wholly new secret |
+| `permissions.added` | a new permission target appears, **or** a kept target's authority widens: a new verb granted, a name added to an already-granted verb, or a verb widened from a name-restricted set to every name (`allNames`). A pure narrowing — a verb or a name dropped, or `allNames` narrowed back to specific names — never matches this rule by itself |
+| `permissions.changed` | a kept permission target's verb set changed at all, widening or narrowing alike — the section `permissions.added` only watches for growth |
+| `images.unpinned` | a newly added image, or a changed image's new (head) reference, has no `@sha256:` digest |
+| `kubernetes.changed` | the `kubernetes` section's `minVersion` or `qualifiedOn` differs |
+| `handlers.added` | never yet — accepted for forward compatibility with Phase 4's `handlers` surface section, the same way `egress.added` is |
+| `resources.removed` | a managed resource present in the base surface is absent from the head surface |
+| `risks.added` | a risk identifier appears that was not present before |
+
+A rule never matches on a removal or narrowing it was not written for:
+`permissions.added` ignores a dropped verb, and there is deliberately no
+`secretsRead.removed` or `permissions.removed` rule in this vocabulary —
+review what is newly granted, not what is no longer needed.
 
 ## GitHub Actions: post a sticky diff comment
 
-This job checks out both commits, builds `aps` once from the head commit (so
-base and head are compiled with the same compiler), compiles each commit's
-program, runs `aps diff` and keeps one running comment on the pull request
-up to date with the result — using
+This job checks out the pull request's base commit separately, builds `aps`
+from **that** checkout, compiles both the base and the head program with it,
+runs `aps diff` and keeps one running comment on the pull request up to date
+with the result — using
 [`marocchino/sticky-pull-request-comment`](https://github.com/marocchino/sticky-pull-request-comment),
 pinned by commit SHA. `gh api` (`POST/PATCH
 /repos/{owner}/{repo}/issues/{number}/comments`) against a comment id
 tracked in a prior run works too, if you would rather not add the action.
+
+Build `aps` from the base commit, never from the pull request's head, and
+never let the head checkout's own crates or `packages/compiler` sources into
+that build. The head commit is exactly the untrusted content under review;
+if the same build compiled both surfaces with a head-built `aps`, a pull
+request could change `compiler-core`'s surface derivation itself (or the
+authoring compiler) and use that change to hide what it grants from its own
+diff. Building from base means one fixed, already-reviewed tool derives both
+surfaces, so a head-only compiler change can never doctor its own review. A
+pinned, independently released `aps` distribution — verified the way `aps
+verify-release` checks a signed release — is a stronger choice still, if your
+project has one; building from the base commit below is the from-source
+fallback.
 
 ```yaml
 name: Surface diff
@@ -97,24 +126,28 @@ jobs:
           rustup toolchain install
           rustup show active-toolchain
 
-      # One `aps` build, from the head commit, compiles both surfaces: a
-      # diff must never blame a compiler difference for a program difference.
-      - name: Build aps
+      # Every later step reads `aps` from here — the base commit's own
+      # checkout — never from the head checkout above, so nothing the pull
+      # request changes in the compiler itself can affect how either surface
+      # is derived. Only the two `--source` programs below come from
+      # untrusted trees.
+      - name: Check out and build aps from the base commit
         run: |
+          git worktree add /tmp/base "${{ github.event.pull_request.base.sha }}"
+          cd /tmp/base
           cargo fetch --locked
           cargo build --locked -p cli
           deno install --frozen
 
       - name: Compile the base surface
         run: |
-          git worktree add /tmp/base "${{ github.event.pull_request.base.sha }}"
-          target/debug/aps compile \
+          /tmp/base/target/debug/aps compile \
             --source /tmp/base/examples/web-application/program.tsx \
             --output work/base-surface
 
       - name: Compile the head surface
         run: |
-          target/debug/aps compile \
+          /tmp/base/target/debug/aps compile \
             --source examples/web-application/program.tsx \
             --output work/head-surface
 
@@ -125,7 +158,7 @@ jobs:
         id: diff
         run: |
           set +e
-          target/debug/aps diff \
+          /tmp/base/target/debug/aps diff \
             --base work/base-surface \
             --head work/head-surface \
             --format markdown \
@@ -133,7 +166,11 @@ jobs:
             > work/surface-diff.md
           echo "exit-code=$?" >> "$GITHUB_OUTPUT"
 
+      # Exit 2 means aps diff itself never produced a usable diff (a missing
+      # path, a malformed surface or policy, a broken step above) — post
+      # nothing rather than a comment that looks like a result but is not.
       - uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+        if: steps.diff.outputs.exit-code == '0' || steps.diff.outputs.exit-code == '1'
         with:
           header: surface-diff
           path: work/surface-diff.md
@@ -149,6 +186,18 @@ jobs:
 Replace `examples/web-application/program.tsx` with the pull request's own
 program entry point. A monorepo with several programs runs this job once per
 program, each with its own `header:` so the sticky comments do not collide.
+
+A pull request from a fork gets a read-only `GITHUB_TOKEN` on `pull_request`
+(GitHub downgrades the `pull-requests: write` permission above regardless of
+what the workflow declares), so the sticky-comment step fails there with no
+comment posted. The gate still fails closed: the job still fails on that
+error, `Require approval for a matched policy rule` still runs for a
+same-repo pull request and still blocks on a matched rule, and a required
+status check on this job still blocks merge either way. Only the
+human-readable comment is missing for a fork pull request, never the
+approval requirement itself. Do not switch this workflow to
+`pull_request_target` to work around that: it would run with base-repo
+write access against the fork's own, unreviewed code.
 
 The sticky comment gives reviewers the same Markdown `aps diff` prints
 locally, so `git worktree add` and re-running the two `aps compile` steps by

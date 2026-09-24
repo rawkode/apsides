@@ -70,9 +70,18 @@ fn permission(
 }
 
 fn resource(id: &str, kind: &str, name: &str) -> SurfaceResource {
+    resource_with_api_version(id, "apps/v1", kind, name)
+}
+
+fn resource_with_api_version(
+    id: &str,
+    api_version: &str,
+    kind: &str,
+    name: &str,
+) -> SurfaceResource {
     SurfaceResource {
         id: id.into(),
-        api_version: "apps/v1".into(),
+        api_version: api_version.into(),
         kind: kind.into(),
         namespace: "production".into(),
         name: name.into(),
@@ -139,6 +148,69 @@ fn diff_detects_removed_resource() {
 }
 
 #[test]
+fn diff_does_not_collide_same_kind_resources_across_api_groups() {
+    // Two custom resources can share a Kind and name across different API
+    // groups: an Istio `Gateway` and a `gateway.networking.k8s.io` `Gateway`
+    // both named "web". Keying resources by (kind, namespace, name) alone
+    // would collapse them onto one map entry and drop whichever one lost the
+    // collision; apiGroup (parsed from apiVersion) must be part of the key.
+    let istio_gateway = resource_with_api_version(
+        "istio-web-gateway",
+        "networking.istio.io/v1",
+        "Gateway",
+        "web",
+    );
+    let k8s_gateway = resource_with_api_version(
+        "k8s-web-gateway",
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "web",
+    );
+
+    let mut base = empty_surface();
+    base.resources = vec![istio_gateway.clone(), k8s_gateway.clone()];
+    let mut head = empty_surface();
+    head.resources = vec![k8s_gateway];
+
+    let diff = diff_surfaces(&base, &head);
+
+    assert_eq!(diff.resources.removed, vec![istio_gateway]);
+    assert!(diff.resources.added.is_empty());
+    assert!(diff.resources.changed.is_empty());
+}
+
+#[test]
+fn diff_reports_a_version_bump_within_the_same_group_as_changed() -> TestResult {
+    let mut base = empty_surface();
+    base.resources = vec![resource_with_api_version(
+        "cluster-db",
+        "postgresql.cnpg.io/v1",
+        "Cluster",
+        "db",
+    )];
+    let mut head = empty_surface();
+    head.resources = vec![resource_with_api_version(
+        "cluster-db",
+        "postgresql.cnpg.io/v1beta1",
+        "Cluster",
+        "db",
+    )];
+
+    let diff = diff_surfaces(&base, &head);
+
+    assert!(diff.resources.added.is_empty());
+    assert!(diff.resources.removed.is_empty());
+    assert_eq!(diff.resources.changed.len(), 1);
+    let change = &diff.resources.changed[0];
+    let Some(api_version) = &change.api_version else {
+        return Err("no apiVersion change recorded".into());
+    };
+    assert_eq!(api_version.base, "postgresql.cnpg.io/v1");
+    assert_eq!(api_version.head, "postgresql.cnpg.io/v1beta1");
+    Ok(())
+}
+
+#[test]
 fn diff_changed_verbs() -> TestResult {
     let mut base = empty_surface();
     base.permissions = vec![permission(
@@ -198,7 +270,11 @@ fn diff_changed_verbs() -> TestResult {
 }
 
 #[test]
-fn diff_detects_added_secret_and_reader_change() {
+fn diff_detects_added_secret_and_a_second_reader_on_a_kept_secret() {
+    // secretsRead is keyed by (namespace, name, reader): a reader is part of
+    // the identity, so a second reader appearing on an already-read secret
+    // is a distinct row (`added`), never an in-place `changed` edit a
+    // reviewer could miss by only reading a diff of unique targets.
     let mut base = empty_surface();
     base.secrets_read = vec![SurfaceSecretRead {
         namespace: "production".into(),
@@ -207,6 +283,11 @@ fn diff_detects_added_secret_and_reader_change() {
     }];
     let mut head = empty_surface();
     head.secrets_read = vec![
+        SurfaceSecretRead {
+            namespace: "production".into(),
+            name: "database-credentials".into(),
+            reader: "reconcile".into(),
+        },
         SurfaceSecretRead {
             namespace: "production".into(),
             name: "database-credentials".into(),
@@ -221,12 +302,45 @@ fn diff_detects_added_secret_and_reader_change() {
 
     let diff = diff_surfaces(&base, &head);
 
-    assert_eq!(diff.secrets_read.added.len(), 1);
-    assert_eq!(diff.secrets_read.added[0].name, "new-credentials");
     assert!(diff.secrets_read.removed.is_empty());
-    assert_eq!(diff.secrets_read.changed.len(), 1);
-    assert_eq!(diff.secrets_read.changed[0].reader.base, "reconcile");
-    assert_eq!(diff.secrets_read.changed[0].reader.head, "sync-flags");
+    let mut added_names: Vec<&str> = diff
+        .secrets_read
+        .added
+        .iter()
+        .map(|row| row.name.as_str())
+        .collect();
+    added_names.sort_unstable();
+    assert_eq!(added_names, vec!["database-credentials", "new-credentials"]);
+    assert!(
+        diff.secrets_read
+            .added
+            .iter()
+            .any(|row| row.name == "database-credentials" && row.reader == "sync-flags")
+    );
+}
+
+#[test]
+fn diff_treats_a_changed_reader_as_remove_and_add() {
+    // Swapping a secret's only reader is not an in-place "changed" edit
+    // either: the old (namespace, name, reader) row disappears and a new
+    // one appears.
+    let mut base = empty_surface();
+    base.secrets_read = vec![SurfaceSecretRead {
+        namespace: "production".into(),
+        name: "database-credentials".into(),
+        reader: "reconcile".into(),
+    }];
+    let mut head = empty_surface();
+    head.secrets_read = vec![SurfaceSecretRead {
+        namespace: "production".into(),
+        name: "database-credentials".into(),
+        reader: "sync-flags".into(),
+    }];
+
+    let diff = diff_surfaces(&base, &head);
+
+    assert_eq!(diff.secrets_read.added, head.secrets_read);
+    assert_eq!(diff.secrets_read.removed, base.secrets_read);
 }
 
 #[test]

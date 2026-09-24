@@ -3,6 +3,8 @@
 //! resource, everything else unchanged).
 use compiler_core::*;
 
+type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 fn domain() -> SurfaceDomain {
     SurfaceDomain {
         id: "team-api-production".into(),
@@ -67,10 +69,82 @@ fn render_markdown_matches_a_small_diff_exactly() {
         markdown,
         "# Deployment surface diff\n\
 \n\
+```diff\n\
 + permissions production/core/secrets: get(all)\n\
 \n\
 - resources ConfigMap production/legacy: id=legacy, deletionPolicy=orphan\n\
+```\n\
 \n\
 No change: domain, kubernetes, secretsRead, inputs, reactions, images, risks, enforcementGaps\n"
     );
+}
+
+/// A container image reference is attacker-controlled free text: an HTML
+/// comment that would hide everything after it outside a fence, an
+/// `@mention` that would ping someone, a triple-backtick run that would
+/// close a naively-sized fence early, and an embedded newline that would
+/// otherwise read as an extra, independent line. All four must stay inside
+/// the fence, verbatim, without breaking it — and every section after the
+/// hostile one must still render.
+#[test]
+fn render_markdown_keeps_a_hostile_image_inside_the_fence() -> TestResult {
+    let mut base = empty_surface();
+    base.images = vec![SurfaceImage {
+        resource: "api".into(),
+        container: "api".into(),
+        image: "nginx@sha256:aaaa".into(),
+        pinned: true,
+    }];
+
+    let mut head = empty_surface();
+    let hostile = "nginx:<!-- hidden --> @team ```evil``` and\ninjected";
+    head.images = vec![SurfaceImage {
+        resource: "api".into(),
+        container: "api".into(),
+        image: hostile.into(),
+        pinned: false,
+    }];
+    head.risks = vec!["opaque-custom-resource-effects".into()];
+
+    let diff = diff_surfaces(&base, &head);
+    let markdown = render_markdown(&diff);
+
+    // The longest backtick run in the hostile content is 3 (from
+    // "```evil```"), so the fence must be 4 backticks — long enough that
+    // nothing inside the content can close it early.
+    let fence_open = "````diff\n";
+    let fence_close = "\n````\n";
+    let Some(open_at) = markdown.find(fence_open) else {
+        return Err(format!("fence did not open with {fence_open:?}: {markdown}").into());
+    };
+    let content_start = open_at + fence_open.len();
+    let Some(close_at) = markdown[content_start..].find(fence_close) else {
+        return Err(format!("fence did not close with {fence_close:?}: {markdown}").into());
+    };
+    let close_at = content_start + close_at;
+    let (before, content, after) = (
+        &markdown[..open_at],
+        &markdown[content_start..close_at],
+        &markdown[close_at + fence_close.len()..],
+    );
+
+    // The hostile substrings and the section after images are inside the
+    // fence, verbatim (bar the escaped newline).
+    assert!(content.contains("<!-- hidden -->"));
+    assert!(content.contains("@team"));
+    assert!(content.contains("```evil```"));
+    assert!(content.contains("and\\ninjected"), "{content}");
+    assert!(!content.contains("and\ninjected"), "{content}");
+    assert!(content.contains("+ risks: opaque-custom-resource-effects"));
+
+    // Nothing outside the fence — the heading and the "No change" line —
+    // carries any surface-controlled text.
+    assert_eq!(before, "# Deployment surface diff\n\n");
+    assert!(!before.contains("@team") && !before.contains("<!--"));
+    assert!(!after.contains("@team") && !after.contains("<!--"));
+    assert_eq!(
+        after,
+        "\nNo change: domain, kubernetes, permissions, secretsRead, resources, inputs, reactions, enforcementGaps\n"
+    );
+    Ok(())
 }

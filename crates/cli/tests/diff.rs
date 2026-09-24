@@ -251,6 +251,32 @@ fn diff_exits_two_for_malformed_surface_json() -> Result {
 }
 
 #[test]
+fn diff_exits_two_for_a_mismatched_schema_version() -> Result {
+    let directory = tempfile::tempdir()?;
+    let base = directory.path().join("base.json");
+    let head = directory.path().join("head.json");
+    fs::write(
+        &base,
+        br#"{"schemaVersion":"apsides.dev/surface/v0","domain":{"id":"d","namespace":"n","controlNamespace":"c"},"kubernetes":{"minVersion":"1.34","qualifiedOn":"v1.34.3"},"permissions":[],"secretsRead":[],"resources":[],"inputs":[],"reactions":[],"images":[],"risks":[],"enforcementGaps":[]}"#,
+    )?;
+    write_surface(&head, &empty_surface())?;
+
+    let output = aps()
+        .args(["diff", "--base"])
+        .arg(&base)
+        .arg("--head")
+        .arg(&head)
+        .output()?;
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.starts_with("aps: --base:"), "{stderr}");
+    assert!(stderr.contains("schemaVersion"), "{stderr}");
+    assert!(output.stdout.is_empty());
+    Ok(())
+}
+
+#[test]
 fn diff_exits_two_for_an_invalid_policy() -> Result {
     let directory = tempfile::tempdir()?;
     let base = directory.path().join("base.json");
