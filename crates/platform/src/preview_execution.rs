@@ -235,10 +235,16 @@ fn require_target_authority(
         }
         return Ok(false);
     }
-    let uid = prior_uid
-        .or(claim_uid)
-        .filter(|_| previous.is_some())
-        .ok_or_else(|| invalid("preview cannot adopt an unapproved existing target"))?;
+    let uid = prior_uid.or(claim_uid).filter(|_| previous.is_some()).ok_or_else(|| {
+        if resource.handler_output {
+            invalid(&format!(
+                "handler output {} already exists and is not owned by this domain; it is created absent-only and can never be adopted",
+                resource.id
+            ))
+        } else {
+            invalid("preview cannot adopt an unapproved existing target")
+        }
+    })?;
     if object.metadata.uid.as_deref() != Some(uid) {
         return Err(invalid("preview target UID differs from predecessor"));
     }
