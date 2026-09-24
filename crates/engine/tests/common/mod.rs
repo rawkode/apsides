@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use engine::{EgressPolicy, HandlerInvocation, Limits, OutputSink, OutputSinkError};
+use engine::{EgressPolicy, HandlerInvocation, Limits, OutputSink, OutputSinkError, StderrLogWriter};
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{GOOGLE, ResolverConfig};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
@@ -33,6 +33,7 @@ pub const GENEROUS_LIMITS: Limits = Limits {
     max_heap_bytes: 64 * 1024 * 1024,
     max_array_buffer_bytes: 16 * 1024 * 1024,
     max_fetch_bytes_total: 16 * 1024 * 1024,
+    max_concurrent_fetches: 4,
 };
 
 /// An [`OutputSink`] that accepts every write. Used by tests that do not
@@ -82,6 +83,7 @@ pub fn handler_invocation(bundle: &str) -> HandlerInvocation<'_> {
         resolver: None,
         handler_id: "test-handler",
         invocation_id: "test-invocation",
+        log_writer: Arc::new(StderrLogWriter),
     }
 }
 

@@ -49,7 +49,14 @@ webpki-roots = "1"
 bytes = "1"
 http = "=1.5.0"
 http-body-util = "=0.1.5"
-hyper = { version = "=1.11.1", features = ["client", "http1"] }
+# `server`: not used to serve anything -- this crate is HTTP/1.1 client-only
+# -- but `hyper::Error::is_parse_too_large()` (used to classify a response
+# whose headers hyper itself refused to buffer) is gated behind
+# `all(feature = "http1", feature = "server")` in hyper 1.11.1, seemingly a
+# quirk of how hyper shares its header-parsing error classification between
+# both sides rather than an actual server-only capability. No server-side
+# API from this crate is ever called.
+hyper = { version = "=1.11.1", features = ["client", "http1", "server"] }
 hyper-util = { version = "=0.1.20", features = ["tokio"] }
 
 [features]

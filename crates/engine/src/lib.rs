@@ -296,15 +296,20 @@ const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
   // for the same reason `construct`/`apply`/`NativeTypeError` are: the
   // `apsides.*` wrapper functions below persist past bootstrap and must
   // never perform a fresh lookup of a global/built-in a handler could have
-  // already replaced by the time they run -- see the invariant above,
-  // which review round 5 asked to be made true of *every* built-in these
-  // wrappers touch, not just the ones with an obvious capability-leak
-  // shape. `nativeArraySet`/index assignment (not `.push`) builds
-  // `utf8Encode`'s byte array so no `Array.prototype.push` lookup happens
-  // either.
+  // already replaced by the time they run -- see the invariant above. The
+  // specific guarantee this buys, and the only one it needs to: no
+  // privileged value (an `op_apsides_*` function reference, or the native,
+  // unguarded `ArrayBuffer` constructor Layer 2 hides) is ever handed to
+  // code the handler could have replaced. Capturing every built-in these
+  // wrappers touch (not just the ones with an obvious leak shape) is
+  // defense in depth for that one guarantee, not a claim that hijacking,
+  // say, `Object.prototype.toString`'s tag output can never affect this
+  // script's own behavior at all -- see `isUint8Array`'s doc comment for
+  // where that line is actually drawn, and
+  // `apsides_wrappers_are_robust_to_prototype_and_symbol_hijacking_of_uint8array_handling`
+  // in `tests/spike.rs` for what is and is not asserted about it.
   const NativeJSONStringify = JSON.stringify;
   const NativeUint8Array = Uint8Array;
-  const nativeUint8ArrayFrom = NativeUint8Array.from;
   const nativeObjectEntries = Object.entries;
   const nativeObjectToString = Object.prototype.toString;
   const nativeCodePointAt = String.prototype.codePointAt;
@@ -319,8 +324,20 @@ const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
   // Avoids `value instanceof NativeUint8Array`, which consults
   // `NativeUint8Array[Symbol.hasInstance]` -- itself an ordinary,
   // reassignable property -- at every call, not just once at bootstrap.
-  // `Object.prototype.toString`'s built-in `[object <Tag>]` behavior does
-  // not consult `Symbol.hasInstance` at all.
+  // `Object.prototype.toString`'s `[object <Tag>]` behavior does not
+  // consult `Symbol.hasInstance`, but per spec it *does* consult the
+  // argument's own `Symbol.toStringTag` before falling back to its
+  // built-in tag, so `Uint8Array.prototype[Symbol.toStringTag]` being
+  // reassigned can still make this misclassify a real `Uint8Array` (or
+  // classify a look-alike object as one). That is an accepted, bounded
+  // gap, not a guard defeat: a misclassification only changes which
+  // branch of `toBytes` runs (a `TypeError`, or treating a non-buffer as
+  // one) -- it never exposes `opFetch`/`opOutputWrite`/`opLog`, and the
+  // actual `#[buffer]` marshalling at the Rust/V8 boundary (`ops.rs`)
+  // independently validates the real V8 object kind regardless of what
+  // this check, or `Object.prototype.toString`, concluded -- a value that
+  // is not truly a typed array can never reach the ops as bytes no matter
+  // what this function returns.
   function isUint8Array(value) {
     return apply(nativeObjectToString, value, []) === "[object Uint8Array]";
   }
@@ -329,34 +346,62 @@ const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
   // TextEncoder (that is a `deno_web` extension, not registered here), and
   // this must stay usable from a closure that persists past bootstrap, so
   // it touches nothing but its own arguments/locals and the captured
-  // values above. Builds `bytes` with index assignment, then converts it
-  // to a real `Uint8Array` with the captured `nativeUint8ArrayFrom` --
-  // `Array.prototype.push` is never called.
-  function utf8Encode(text) {
-    const bytes = [];
+  // values above. Two passes (`utf8ByteLength` then this) so the result
+  // can be written directly into a preallocated `Uint8Array` via integer-
+  // indexed `[[Set]]` -- unlike a plain `Array`'s indexed assignment, a
+  // typed array's integer-indexed exotic `[[Set]]` for an in-range index
+  // writes straight to the backing buffer and never consults the
+  // prototype chain, so it cannot be intercepted by an
+  // `Object.defineProperty(Array.prototype, "0", { set() {...} })`-style
+  // hijack the way building a plain `Array` first (via index assignment,
+  // then `Uint8Array.from`) could have been -- `Array.prototype.from`'s
+  // iterable path also consults `Symbol.iterator`, another hijack surface
+  // this sidesteps entirely by never producing an intermediate `Array`.
+  function utf8ByteLength(text) {
     let length = 0;
+    for (let i = 0; i < text.length; i++) {
+      const code = apply(nativeCodePointAt, text, [i]);
+      if (code > 0xffff) {
+        i++;
+      }
+      if (code < 0x80) {
+        length += 1;
+      } else if (code < 0x800) {
+        length += 2;
+      } else if (code < 0x10000) {
+        length += 3;
+      } else {
+        length += 4;
+      }
+    }
+    return length;
+  }
+
+  function utf8Encode(text) {
+    const result = new NativeUint8Array(utf8ByteLength(text));
+    let offset = 0;
     for (let i = 0; i < text.length; i++) {
       let code = apply(nativeCodePointAt, text, [i]);
       if (code > 0xffff) {
         i++;
       }
       if (code < 0x80) {
-        bytes[length++] = code;
+        result[offset++] = code;
       } else if (code < 0x800) {
-        bytes[length++] = 0xc0 | (code >> 6);
-        bytes[length++] = 0x80 | (code & 0x3f);
+        result[offset++] = 0xc0 | (code >> 6);
+        result[offset++] = 0x80 | (code & 0x3f);
       } else if (code < 0x10000) {
-        bytes[length++] = 0xe0 | (code >> 12);
-        bytes[length++] = 0x80 | ((code >> 6) & 0x3f);
-        bytes[length++] = 0x80 | (code & 0x3f);
+        result[offset++] = 0xe0 | (code >> 12);
+        result[offset++] = 0x80 | ((code >> 6) & 0x3f);
+        result[offset++] = 0x80 | (code & 0x3f);
       } else {
-        bytes[length++] = 0xf0 | (code >> 18);
-        bytes[length++] = 0x80 | ((code >> 12) & 0x3f);
-        bytes[length++] = 0x80 | ((code >> 6) & 0x3f);
-        bytes[length++] = 0x80 | (code & 0x3f);
+        result[offset++] = 0xf0 | (code >> 18);
+        result[offset++] = 0x80 | ((code >> 12) & 0x3f);
+        result[offset++] = 0x80 | ((code >> 6) & 0x3f);
+        result[offset++] = 0x80 | (code & 0x3f);
       }
     }
-    return apply(nativeUint8ArrayFrom, NativeUint8Array, [bytes]);
+    return result;
   }
 
   function toBytes(input) {
@@ -598,7 +643,24 @@ pub struct Limits {
     /// suggest, simply by calling `apsides.fetch` repeatedly (each
     /// individual call is already capped at 4 MiB by `ops::fetch`, but
     /// nothing else would stop a handler from calling it 1000 times).
+    ///
+    /// This budget is *reserved* synchronously, before any `.await` point,
+    /// the moment `apsides.fetch` is called -- not charged only after the
+    /// response finishes -- and concurrent calls each reserve against the
+    /// same running total (see `max_concurrent_fetches`). A version that
+    /// only charged completed responses let `N` concurrent calls each read
+    /// the same "budget still available" snapshot and all proceed,
+    /// together pulling `N` times this budget into the process at once
+    /// (review round 6, N1).
     pub max_fetch_bytes_total: usize,
+    /// Hard cap on `apsides.fetch` calls in flight at once for this
+    /// invocation. Without this, a handler could open unboundedly many
+    /// concurrent requests (e.g. `Promise.all` of hundreds of calls to an
+    /// address that never responds), each holding open a TCP connection
+    /// and a file descriptor until `Limits::timeout`, independent of
+    /// `max_fetch_bytes_total` (which caps bytes, not connection/FD
+    /// count) -- review round 6, N1.
+    pub max_concurrent_fetches: usize,
 }
 
 /// Egress policy for `apsides.fetch`.
@@ -746,6 +808,28 @@ pub trait OutputSink: Send + Sync {
     fn write_output(&self, id: &str, key: &str, data: &[u8]) -> Result<(), OutputSinkError>;
 }
 
+/// Where `apsides.log` writes each line.
+///
+/// Receives each capped, `serde_json`-escaped JSON line from
+/// `ops::op_apsides_log`, and the one final "dropped N log lines" record
+/// when the per-invocation cap was exceeded (see
+/// `EngineOpState::dropped_log_lines`). Defaults to real stderr
+/// ([`StderrLogWriter`]); tests inject a recording implementation instead
+/// of trying to capture the process's actual stderr.
+pub trait LogWriter: Send + Sync {
+    fn write_line(&self, line: &str);
+}
+
+/// The default [`LogWriter`]: writes each line to the process's real
+/// stderr, one line per call.
+pub struct StderrLogWriter;
+
+impl LogWriter for StderrLogWriter {
+    fn write_line(&self, line: &str) {
+        eprintln!("{line}");
+    }
+}
+
 /// One handler invocation.
 ///
 /// The ESM `bundle` source, the `export`ed async function to call with
@@ -771,11 +855,13 @@ pub struct HandlerInvocation<'a> {
     pub resolver: Option<Arc<EgressResolver>>,
     /// A caller-supplied identifier for the handler this invocation runs,
     /// attached (with `invocation_id`) to every `apsides.log` line this
-    /// crate emits to stderr (see [`LogLine`]) so multiple handlers' and
-    /// invocations' interleaved log lines can be told apart in a shared
-    /// process's stderr stream.
+    /// crate emits via `log_writer` (see [`LogLine`]) so multiple
+    /// handlers' and invocations' interleaved log lines can be told apart.
     pub handler_id: &'a str,
     pub invocation_id: &'a str,
+    /// Where `apsides.log` lines are written -- see [`LogWriter`]. Pass
+    /// `Arc::new(StderrLogWriter)` for real stderr.
+    pub log_writer: Arc<dyn LogWriter>,
 }
 
 /// One `apsides.log` line: the level the handler passed, and the message
@@ -892,10 +978,15 @@ fn prepare_isolate(
     deadline: Instant,
     handler_id: String,
     invocation_id: String,
+    log_writer: Arc<dyn LogWriter>,
 ) -> Result<PreparedIsolate, EngineError> {
     ensure_platform_initialized();
 
-    let max_fetch_bytes_total = limits.max_fetch_bytes_total;
+    let fetch_budget = ops::FetchBudget {
+        deadline,
+        max_fetch_bytes_total: limits.max_fetch_bytes_total,
+        max_concurrent_fetches: limits.max_concurrent_fetches,
+    };
     let allocator = v8_alloc::capped_array_buffer_allocator(limits.max_array_buffer_bytes, usage);
     // `initial` is set equal to `max`, not 0: with `initial=0` V8 picks its
     // own (much smaller) starting ceiling and grows it heuristically, which
@@ -924,12 +1015,12 @@ fn prepare_isolate(
             outputs,
             sink,
             resolver,
-            deadline,
-            max_fetch_bytes_total,
+            fetch_budget,
             ops::InvocationIds {
                 handler_id,
                 invocation_id,
             },
+            log_writer,
         )],
         create_params: Some(create_params),
         ..Default::default()
@@ -1153,13 +1244,16 @@ async fn run_invocation(
     call_handler_export(runtime, module_id, export, event).await
 }
 
+/// Called once, after `run_invocation` returns (`Ok` or `Err`): emits the
+/// final "dropped N log lines" record (if any lines were dropped for
+/// exceeding the per-invocation cap -- see `ops::EngineOpState`) and
+/// returns every captured line.
 fn collect_logs(runtime: &JsRuntime) -> Vec<LogLine> {
-    runtime
-        .op_state()
-        .borrow()
-        .borrow::<ops::EngineOpState>()
-        .logs
-        .clone()
+    let op_state = runtime.op_state();
+    let op_state_ref = op_state.borrow();
+    let engine_state = op_state_ref.borrow::<ops::EngineOpState>();
+    engine_state.emit_dropped_log_record_if_needed();
+    engine_state.logs.clone()
 }
 
 /// If `result` is `Err` and `terminated` is set, replaces it with
@@ -1221,6 +1315,7 @@ fn begin_invocation<'a>(
         deadline,
         invocation.handler_id.to_owned(),
         invocation.invocation_id.to_owned(),
+        invocation.log_writer,
     )?;
 
     // Captured before installing the near-heap-limit callback, and moved

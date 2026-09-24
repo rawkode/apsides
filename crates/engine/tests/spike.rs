@@ -96,6 +96,7 @@ fn array_buffer_allocation_over_the_cap_terminates_the_isolate_without_aborting_
         max_heap_bytes: 64 * 1024 * 1024,
         timeout: Duration::from_secs(10),
         max_fetch_bytes_total: 16 * 1024 * 1024,
+        max_concurrent_fetches: 4,
     };
     let result = run_with_limits(
         limits,
@@ -536,6 +537,7 @@ fn heap_limit_terminates_the_isolate_without_aborting_the_process() {
         max_heap_bytes: 20 * 1024 * 1024,
         timeout: Duration::from_secs(20),
         max_fetch_bytes_total: 16 * 1024 * 1024,
+        max_concurrent_fetches: 4,
     };
     let result = run_with_limits(
         limits,

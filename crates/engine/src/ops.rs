@@ -29,14 +29,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::net;
-use crate::{EgressPolicy, EgressResolver, LogLevel, LogLine, OutputSink, OutputSinkError};
+use crate::{EgressPolicy, EgressResolver, LogLevel, LogLine, LogWriter, OutputSink, OutputSinkError};
 
 /// Per-invocation state the ops above read from `OpState`. Built once by
 /// `crate::prepare_isolate` from the caller's `HandlerInvocation` and
 /// mutated only by the ops themselves (`logs`, `outputs_written`,
-/// `fetched_bytes_used`) and by `crate::call_handler_export` (`closed`,
-/// set once the handler's own promise has settled -- see that function's
-/// doc comment).
+/// `fetch_bytes_reserved`, `fetches_in_flight`, `dropped_log_lines`) and by
+/// `crate::call_handler_export` (`closed`, set once the handler's own
+/// promise has settled -- see that function's doc comment).
 pub(crate) struct EngineOpState {
     pub egress: EgressPolicy,
     /// Declared output id -> its `max_bytes` cap.
@@ -54,15 +54,64 @@ pub(crate) struct EngineOpState {
     /// one.
     pub deadline: Instant,
     pub max_fetch_bytes_total: usize,
-    pub fetched_bytes_used: usize,
+    /// Bytes of `max_fetch_bytes_total` currently reserved: the sum, over
+    /// every `apsides.fetch` call that has started and not yet released
+    /// its reservation, of that call's request body length plus its
+    /// worst-case response allowance (see `fetch`'s doc comment). Reserved
+    /// synchronously before any `.await`, refunded down to actual usage on
+    /// success, and left fully charged on failure (review round 6, N1) --
+    /// this is a *reservation* ledger, not a "bytes actually seen so far"
+    /// counter.
+    pub fetch_bytes_reserved: usize,
+    /// `apsides.fetch` calls with a reservation currently held (started,
+    /// not yet finished). Bounded by `max_concurrent_fetches`.
+    pub fetches_in_flight: usize,
+    pub max_concurrent_fetches: usize,
     pub handler_id: String,
     pub invocation_id: String,
     pub logs: Vec<LogLine>,
+    /// Lines a handler attempted to log past `MAX_LOG_LINES`, dropped from
+    /// both `logs` and stderr -- see `op_apsides_log`. Reported as one
+    /// final stderr record by `emit_dropped_log_record_if_needed`, called
+    /// once the invocation finishes.
+    pub dropped_log_lines: usize,
+    pub log_writer: Arc<dyn LogWriter>,
     /// Set once, by `crate::call_handler_export`, after the handler's own
     /// promise has resolved but before its return value is marshalled back
     /// to Rust -- see that function's doc comment for why. Every op checks
     /// this first and fails fast once it is set.
     pub closed: bool,
+}
+
+#[derive(Serialize)]
+struct DroppedLogRecord<'a> {
+    handler_id: &'a str,
+    invocation_id: &'a str,
+    level: &'static str,
+    dropped_log_lines: usize,
+}
+
+impl EngineOpState {
+    /// Emits one final `serde_json`-escaped stderr record
+    /// (`{"handler_id","invocation_id","level":"warn","dropped_log_lines"}`)
+    /// if any `apsides.log` lines were dropped for exceeding
+    /// [`MAX_LOG_LINES`] this invocation. Called once, by
+    /// `crate::collect_logs`, after the invocation has finished -- the
+    /// final count is only known once no more `apsides.log` calls can
+    /// happen (see `EngineOpState::closed`).
+    pub(crate) fn emit_dropped_log_record_if_needed(&self) {
+        if self.dropped_log_lines == 0 {
+            return;
+        }
+        if let Ok(record) = serde_json::to_string(&DroppedLogRecord {
+            handler_id: &self.handler_id,
+            invocation_id: &self.invocation_id,
+            level: "warn",
+            dropped_log_lines: self.dropped_log_lines,
+        }) {
+            self.log_writer.write_line(&record);
+        }
+    }
 }
 
 /// See the plan's `op_apsides_log` rule.
@@ -103,23 +152,33 @@ struct StderrLogRecord<'a> {
 }
 
 /// Appends one log line, truncated (at a UTF-8 char boundary, never
-/// splitting a code point) to at most [`MAX_LOG_LINE_BYTES`], and -- at op
-/// time, unconditionally, before the in-memory cap below is even checked
-/// -- emits it to stderr as one `serde_json`-escaped JSON object per line,
-/// tagged with this invocation's `handler_id`/`invocation_id`. The
-/// stderr line is built entirely in Rust from already-validated/truncated
-/// fields, so a handler cannot forge or inject an extra line into it.
+/// splitting a code point) to at most [`MAX_LOG_LINE_BYTES`], and emits it
+/// via `EngineOpState::log_writer` (real stderr in production; an
+/// injectable [`LogWriter`] in tests) as one `serde_json`-escaped JSON
+/// object per line, tagged with this invocation's
+/// `handler_id`/`invocation_id`. The emitted line is built entirely in
+/// Rust from already-validated/truncated fields, so a handler cannot forge
+/// or inject an extra line into it.
 ///
-/// Once [`MAX_LOG_LINES`] lines have been recorded in `EngineOpState.logs`
-/// for this invocation, further calls still reach stderr but are silently
-/// dropped from the in-memory/`InvocationReport` copy: logging must never
-/// be able to fail a handler that is otherwise working correctly, and the
-/// in-memory cap exists only to bound `InvocationReport`'s own size, not
-/// to bound what reaches stderr.
+/// Once [`MAX_LOG_LINES`] lines have been recorded for this invocation,
+/// **every** further call -- both the in-memory `InvocationReport` copy
+/// and the emitted line -- is dropped, not just the in-memory one:
+/// without that, a handler logging in an unbounded loop could still push
+/// unbounded bytes through `log_writer` even though `InvocationReport`
+/// itself stayed capped (review round 6, N2 -- an earlier version emitted
+/// every line regardless of the cap). Dropped calls are counted in
+/// `EngineOpState::dropped_log_lines`, reported once, at the end of the
+/// invocation, by `emit_dropped_log_record_if_needed` -- logging must
+/// never be able to fail a handler that is otherwise working correctly,
+/// so a dropped line is silent to the handler itself, not thrown.
 #[op2(fast)]
 pub fn op_apsides_log(state: &mut OpState, #[string] level: &str, #[string] line: &str) {
     let engine_state = state.borrow_mut::<EngineOpState>();
     if engine_state.closed {
+        return;
+    }
+    if engine_state.logs.len() >= MAX_LOG_LINES {
+        engine_state.dropped_log_lines += 1;
         return;
     }
 
@@ -141,15 +200,13 @@ pub fn op_apsides_log(state: &mut OpState, #[string] level: &str, #[string] line
         level: &level,
         message: &truncated,
     }) {
-        eprintln!("{record}");
+        engine_state.log_writer.write_line(&record);
     }
 
-    if engine_state.logs.len() < MAX_LOG_LINES {
-        engine_state.logs.push(LogLine {
-            level,
-            message: truncated,
-        });
-    }
+    engine_state.logs.push(LogLine {
+        level,
+        message: truncated,
+    });
 }
 
 // ---------------------------------------------------------------------
@@ -315,6 +372,7 @@ pub enum FetchErrorCode {
     InvalidRequestMethod,
     RequestBodyTooLarge,
     FetchByteBudgetExceeded,
+    FetchConcurrencyExceeded,
     DnsResolutionFailed,
     NoGlobalUnicastAddress,
     ConnectFailed,
@@ -353,6 +411,11 @@ pub enum FetchError {
          (Limits::max_fetch_bytes_total) is exhausted"
     )]
     FetchByteBudgetExceeded,
+    #[error(
+        "this invocation already has Limits::max_concurrent_fetches apsides.fetch calls in \
+         flight"
+    )]
+    FetchConcurrencyExceeded,
     #[error("DNS resolution failed: {0}")]
     DnsResolutionFailed(#[from] net::ResolveError),
     #[error(transparent)]
@@ -370,6 +433,7 @@ impl FetchError {
             Self::ForbiddenRequestHeader(_) => FetchErrorCode::ForbiddenRequestHeader,
             Self::RequestBodyTooLarge(..) => FetchErrorCode::RequestBodyTooLarge,
             Self::FetchByteBudgetExceeded => FetchErrorCode::FetchByteBudgetExceeded,
+            Self::FetchConcurrencyExceeded => FetchErrorCode::FetchConcurrencyExceeded,
             Self::DnsResolutionFailed(_) => FetchErrorCode::DnsResolutionFailed,
             Self::Https(err) => match err {
                 net::HttpsError::Dial(dial) => match dial {
@@ -425,9 +489,71 @@ pub enum FetchOutcome {
     },
 }
 
+/// Structurally validates `method`/`headers` the same way `hyper` would
+/// when actually building the request (`Method::from_bytes`/
+/// `HeaderName`/`HeaderValue::from_bytes`), but *before* any DNS
+/// resolution or dial -- review round 6's non-blocking item: an invalid
+/// method/header must never open a connection at all, not fail only after
+/// one is already established. `net::https_request` still validates
+/// these itself too (defense in depth; it must never trust an unvalidated
+/// caller), so this is deliberately redundant with, not a replacement
+/// for, the check inside it.
+fn validate_method_and_headers(method: &str, headers: &[(String, String)]) -> Result<(), FetchError> {
+    hyper::Method::from_bytes(method.as_bytes())
+        .map_err(|_err| FetchError::Https(net::HttpsError::InvalidMethod(method.to_owned())))?;
+    for (name, value) in headers {
+        hyper::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_err| FetchError::Https(net::HttpsError::InvalidHeader(name.clone())))?;
+        hyper::header::HeaderValue::from_bytes(value.as_bytes())
+            .map_err(|_err| FetchError::Https(net::HttpsError::InvalidHeader(value.clone())))?;
+    }
+    Ok(())
+}
+
+/// Releases this call's `fetches_in_flight` slot when dropped -- covering
+/// every exit path after [`fetch`] reserves one (an early `?` return, a
+/// dropped future if the isolate is terminated mid-call, or falling off
+/// the end normally), not just the success path. Byte-budget accounting
+/// (`fetch_bytes_reserved`) is handled separately, explicitly, only on the
+/// success path -- see `fetch`'s doc comment for why a failure keeps its
+/// full worst-case reservation charged rather than trying to refund an
+/// unknown, possibly-nonzero number of bytes that were actually read
+/// before the failure.
+struct InFlightGuard {
+    state: Rc<RefCell<OpState>>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut state_ref = self.state.borrow_mut();
+        let engine_state = state_ref.borrow_mut::<EngineOpState>();
+        engine_state.fetches_in_flight = engine_state.fetches_in_flight.saturating_sub(1);
+    }
+}
+
+/// Implements `op_apsides_fetch`'s full request. Reserves this call's
+/// concurrency slot and byte budget **synchronously, before the first
+/// `.await`** (review round 6, N1): without that, `N` concurrent
+/// `apsides.fetch` calls could each read the same "budget/slots still
+/// available" snapshot before any of them updates it, and all proceed --
+/// together using `N` times the intended cap. The byte reservation is
+/// this call's request body length plus a *worst-case* response
+/// allowance (`MAX_FETCH_RESPONSE_BYTES`, clamped to whatever of the
+/// budget remains after the body) -- not the eventual actual response
+/// size, which is not known yet. On success, the unused part of that
+/// worst-case allowance (`response_reservation - actual body length`) is
+/// refunded. On failure, the full reservation stays charged: this crate
+/// cannot always tell how many bytes were actually pulled over the wire
+/// before a given failure (e.g. `ResponseTooLarge` means up to the cap
+/// *was* read), and refunding an unverified amount would reopen the same
+/// bypass this fix exists to close.
 #[allow(
     clippy::future_not_send,
     reason = "deno_core::OpState/JsRuntime are deliberately !Send (single isolate, single thread); see crate::invoke_handler_with_watchdog's doc comment"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "validate -> reserve concurrency/budget -> parse/vet the URL -> resolve -> dial+request -> refund is one inherently sequential, hard-to-split pipeline; see the doc comment above for why each step exists"
 )]
 async fn fetch(
     state: &Rc<RefCell<OpState>>,
@@ -448,26 +574,45 @@ async fn fetch(
             return Err(FetchError::ForbiddenRequestHeader(name.clone()));
         }
     }
+    validate_method_and_headers(&request.method, &request.headers)?;
 
-    let (egress, deadline, resolver, closed, remaining_fetch_budget) = {
-        let state_ref = state.borrow();
-        let engine_state = state_ref.borrow::<EngineOpState>();
+    let body_len = body.len();
+    let (egress, deadline, resolver, response_reservation) = {
+        let mut state_ref = state.borrow_mut();
+        let engine_state = state_ref.borrow_mut::<EngineOpState>();
+        if engine_state.closed {
+            return Err(FetchError::OpsClosed);
+        }
+        if engine_state.fetches_in_flight >= engine_state.max_concurrent_fetches {
+            return Err(FetchError::FetchConcurrencyExceeded);
+        }
+        let remaining_budget = engine_state
+            .max_fetch_bytes_total
+            .saturating_sub(engine_state.fetch_bytes_reserved);
+        if body_len > remaining_budget {
+            return Err(FetchError::FetchByteBudgetExceeded);
+        }
+        let response_reservation =
+            MAX_FETCH_RESPONSE_BYTES.min(remaining_budget - body_len);
+        let total_reservation = body_len + response_reservation;
+
+        engine_state.fetches_in_flight += 1;
+        engine_state.fetch_bytes_reserved =
+            engine_state.fetch_bytes_reserved.saturating_add(total_reservation);
+
         (
             engine_state.egress.clone(),
             engine_state.deadline,
             engine_state.resolver.clone(),
-            engine_state.closed,
-            engine_state
-                .max_fetch_bytes_total
-                .saturating_sub(engine_state.fetched_bytes_used),
+            response_reservation,
         )
     };
-    if closed {
-        return Err(FetchError::OpsClosed);
-    }
-    if remaining_fetch_budget == 0 {
-        return Err(FetchError::FetchByteBudgetExceeded);
-    }
+    // From here on, every exit path (an early `?` return below, or a
+    // dropped future) must release the concurrency slot reserved above --
+    // `_in_flight_guard`'s `Drop` does that unconditionally.
+    let _in_flight_guard = InFlightGuard {
+        state: Rc::clone(state),
+    };
 
     let parsed = deno_core::url::Url::parse(&request.url)
         .map_err(|err| FetchError::InvalidUrl(err.to_string()))?;
@@ -520,7 +665,7 @@ async fn fetch(
             der: fixture.trust_anchor_der.clone(),
         });
     let fetch_limits = net::FetchLimits {
-        max_response_bytes: remaining_fetch_budget.min(MAX_FETCH_RESPONSE_BYTES),
+        max_response_bytes: response_reservation,
         deadline,
     };
 
@@ -537,12 +682,12 @@ async fn fetch(
     )
     .await?;
 
-    {
+    let unused_reservation = response_reservation.saturating_sub(response.body.len());
+    if unused_reservation > 0 {
         let mut state_ref = state.borrow_mut();
         let engine_state = state_ref.borrow_mut::<EngineOpState>();
-        engine_state.fetched_bytes_used = engine_state
-            .fetched_bytes_used
-            .saturating_add(response.body.len());
+        engine_state.fetch_bytes_reserved =
+            engine_state.fetch_bytes_reserved.saturating_sub(unused_reservation);
     }
 
     Ok((response.status, response.headers, response.body))
@@ -574,12 +719,20 @@ pub async fn op_apsides_fetch(
 }
 
 /// The two caller-supplied identifiers `apsides.log` attaches to every
-/// stderr line (see `EngineOpState`/`StderrLogRecord`). Bundled into one
+/// emitted line (see `EngineOpState`/`StderrLogRecord`). Bundled into one
 /// type so the `extension!` macro below (which becomes an `init` function
-/// clippy counts arguments on) stays at 7 options, not 8.
+/// clippy counts arguments on) has fewer than 8 options.
 pub(crate) struct InvocationIds {
     pub handler_id: String,
     pub invocation_id: String,
+}
+
+/// `apsides.fetch`'s deadline and byte/concurrency budgets, bundled for
+/// the same reason as [`InvocationIds`].
+pub(crate) struct FetchBudget {
+    pub deadline: Instant,
+    pub max_fetch_bytes_total: usize,
+    pub max_concurrent_fetches: usize,
 }
 
 deno_core::extension!(
@@ -590,9 +743,9 @@ deno_core::extension!(
         outputs: HashMap<String, usize>,
         sink: Arc<dyn OutputSink>,
         resolver: Option<Arc<EgressResolver>>,
-        deadline: Instant,
-        max_fetch_bytes_total: usize,
+        fetch_budget: FetchBudget,
         ids: InvocationIds,
+        log_writer: Arc<dyn LogWriter>,
     },
     state = |state, options| {
         state.put(EngineOpState {
@@ -601,12 +754,16 @@ deno_core::extension!(
             outputs_written: HashMap::new(),
             sink: options.sink,
             resolver: options.resolver,
-            deadline: options.deadline,
-            max_fetch_bytes_total: options.max_fetch_bytes_total,
-            fetched_bytes_used: 0,
+            deadline: options.fetch_budget.deadline,
+            max_fetch_bytes_total: options.fetch_budget.max_fetch_bytes_total,
+            fetch_bytes_reserved: 0,
+            fetches_in_flight: 0,
+            max_concurrent_fetches: options.fetch_budget.max_concurrent_fetches,
             handler_id: options.ids.handler_id,
             invocation_id: options.ids.invocation_id,
             logs: Vec::new(),
+            dropped_log_lines: 0,
+            log_writer: options.log_writer,
             closed: false,
         });
     },

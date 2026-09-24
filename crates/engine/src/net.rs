@@ -499,7 +499,20 @@ pub async fn https_request(
     )
     .await
     .map_err(|_elapsed| HttpsError::Timeout)?
-    .map_err(|err| HttpsError::RequestSend(err.to_string()))?;
+    .map_err(|err| {
+        // `hyper` enforces its own internal header-size limit while
+        // parsing the response, independently of the manual header
+        // count/byte cap this function enforces afterward on whatever it
+        // *did* get back -- a response whose headers are large enough to
+        // hit hyper's own limit never reaches that later check at all, so
+        // it is mapped to the same `ResponseHeadersTooLarge` code here
+        // (review round 6, non-blocking item).
+        if err.is_parse_too_large() {
+            HttpsError::ResponseHeadersTooLarge(MAX_RESPONSE_HEADER_COUNT, MAX_RESPONSE_HEADER_BYTES)
+        } else {
+            HttpsError::RequestSend(err.to_string())
+        }
+    })?;
 
     let status = response.status().as_u16();
 
@@ -574,6 +587,7 @@ mod tests {
             ("2606:4700:4700::1111", true),
             // IPv4 loopback / unspecified / link-local / multicast / broadcast.
             ("127.0.0.1", false),
+            ("127.255.255.255", false),
             ("0.0.0.0", false),
             ("0.1.2.3", false),
             ("169.254.1.1", false),
