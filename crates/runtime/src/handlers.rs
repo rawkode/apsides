@@ -584,13 +584,14 @@ impl HandlerRuntime {
         plan: &CompiledPlan,
         observations: &BTreeMap<String, Observation>,
         applied: &BTreeSet<String>,
+        output_uids: &BTreeMap<String, String>,
         client: &Client,
         controller: &crate::production::ProductionController,
     ) -> Result<Vec<RuntimeCondition>, RuntimeError> {
         let mut conditions = Vec::new();
         self.detect_triggers(plan, observations, client, &mut conditions)
             .await;
-        self.dispatch_ready(plan, applied, controller, &mut conditions)
+        self.dispatch_ready(plan, applied, output_uids, controller, &mut conditions)
             .await?;
         Ok(conditions)
     }
@@ -691,6 +692,7 @@ impl HandlerRuntime {
         &mut self,
         plan: &CompiledPlan,
         applied: &BTreeSet<String>,
+        output_uids: &BTreeMap<String, String>,
         controller: &crate::production::ProductionController,
         conditions: &mut Vec<RuntimeCondition>,
     ) -> Result<(), RuntimeError> {
@@ -737,7 +739,7 @@ impl HandlerRuntime {
             };
             self.queue_order.retain(|id| *id != handler_id);
             dispatched_one = true;
-            let outcome = self.invoke(handler, &queued, controller).await;
+            let outcome = self.invoke(handler, &queued, output_uids, controller).await;
             let state = self.states.entry(handler_id.clone()).or_default();
             state.last_run = Some(Instant::now());
             match outcome {
@@ -786,6 +788,7 @@ impl HandlerRuntime {
         &self,
         handler: &Handler,
         queued: &QueuedEvent,
+        output_uids: &BTreeMap<String, String>,
         controller: &crate::production::ProductionController,
     ) -> Result<BTreeMap<String, String>, InvokeCommitError> {
         let Some(bundle) = self.bundles.get(handler.id.as_str()).copied() else {
@@ -845,6 +848,7 @@ impl HandlerRuntime {
                     &self.field_manager,
                     &written,
                     &queued.revision,
+                    output_uids,
                 )
                 .await
                 .map_err(|error| match error {

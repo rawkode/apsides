@@ -1066,7 +1066,7 @@ pub(crate) fn validate_exact_apply_owner(
     }
 }
 
-fn manager_main_resource_entries<'a>(
+pub(crate) fn manager_main_resource_entries<'a>(
     object: &'a DynamicObject,
     manager: &str,
     operation: &str,
