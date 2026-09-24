@@ -65,6 +65,12 @@ pub fn plan() -> Result<CompiledPlan> {
 /// The fixtures, overlay and coverage documents the compiler would stage for
 /// [`plan`].
 pub fn fixture_documents(plan: &CompiledPlan) -> Result<(Value, Value, Value)> {
+    // `Output`-mode inputs get no synthetic fixture: unlike an `Observed`
+    // input, there is no "present"/"missing" presence state to synthesize —
+    // the reconciler itself creates the handler-output `ConfigMap`
+    // absent-only every cycle, before anything observes it, so
+    // `missing-input`/`input-returned`-style presence scenarios never apply
+    // to an output (see `test_plan.rs`'s `OUTPUT` scenario set).
     let fixtures = json!({
         "schemaVersion": "apsides.dev/fixtures/v1", "testOnly": true, "productionReady": false,
         "inputs": plan.ir.inputs.iter()

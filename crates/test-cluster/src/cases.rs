@@ -63,6 +63,22 @@ const NEEDS_MANAGED: [&str; 4] = [
 /// Reasons the controller reports for a write another field manager blocks.
 const CONFLICT_REASONS: [&str; 2] = ["field-or-version-conflict", "ownership-conflict"];
 
+/// The field manager a domain's handler writes attribute to (see
+/// `suite.rs`'s `domain_manager` for the reconciler's own, distinct
+/// `apsides-<domainId>`).
+fn handler_field_manager(domain_id: &str) -> String {
+    format!("apsides-handler-{domain_id}")
+}
+
+/// The SSA payload a handler write applies to its output: identity plus
+/// exactly the `data` it is writing, never the metadata the reconciler's own
+/// apply of the handler output owns.
+fn handler_output_payload(input: &Input, data: &Map<String, Value>) -> Value {
+    json!({"apiVersion": "v1", "kind": input.kind,
+        "metadata": {"name": input.name, "namespace": input.namespace},
+        "data": data})
+}
+
 /// What the cases record as they run. The suite holds it too, so an
 /// interrupted run still scans and writes what was recorded.
 #[derive(Debug, Default)]
@@ -411,6 +427,42 @@ impl Live<'_> {
         Ok(())
     }
 
+    /// Simulate a handler's own write to its output: an SSA apply of exactly
+    /// the changed `data` key, under the handler field manager
+    /// (`apsides-handler-<domainId>`), never forced. This increment has no
+    /// handler execution runtime yet (`IR-CONTRACT.md`'s "Runtime execution
+    /// of a handler's bundle … is a later phase"), so the fixture stands in
+    /// for it to exercise a `rolloutOn` reaction on an output end to end; the
+    /// reconciler's own manager (`apsides-<domainId>`) never claims `data` on
+    /// a handler output (see `preview_execution.rs::require_apply_owner`),
+    /// so this distinct manager owns it without conflict.
+    async fn write_handler_output(&self, input: &Input, value: &str, key: &str) -> Result<()> {
+        self.remember(&input.kind, value);
+        let data = Map::from_iter([(key.to_owned(), json!(encode(&input.kind, value)))]);
+        self.driver
+            .apply(
+                &handler_output_payload(input, &data),
+                &handler_field_manager(&self.release.plan.ir.domain.id),
+                false,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Change one data key of `input`'s live object, as whichever writer a
+    /// change to that input's mode models: a foreign patch for an
+    /// `Observed` input, or a simulated handler SSA write for an `Output`
+    /// input (see [`Self::write_handler_output`]). `Output`-mode inputs are
+    /// the only ones ever passed here for a scenario that changes data (see
+    /// `test_plan.rs`'s `OUTPUT` scenario set), so `Managed` never reaches
+    /// this call.
+    async fn change_input(&self, input: &Input, value: &str, key: &str) -> Result<()> {
+        match input.mode {
+            InputMode::Output => self.write_handler_output(input, value, key).await,
+            InputMode::Observed | InputMode::Managed => self.mutate_input(input, value, key).await,
+        }
+    }
+
     /// Write `data`, already in stored form, as the whole input.
     async fn apply_input_data(&self, input: &Input, data: &Map<String, Value>) -> Result<()> {
         self.driver
@@ -449,7 +501,7 @@ impl Live<'_> {
         let mut observed = BTreeMap::new();
         for input in
             plan.ir.inputs.iter().filter(|input| {
-                input.mode == InputMode::Observed
+                matches!(input.mode, InputMode::Observed | InputMode::Output)
                     && plan.ir.reactions.iter().any(|item| {
                         item.target == reaction.target && item.inputs.contains(&input.id)
                     })
@@ -735,10 +787,15 @@ impl Live<'_> {
                 reaction.inputs.contains(&input.id) && case.input_ids.contains(&input.id)
             })
             .collect::<Vec<_>>();
+        // An `Output`-mode input is observed live exactly like an `Observed`
+        // one (see `InputMode::Output`); `test_plan.rs`'s smaller `OUTPUT`
+        // scenario set never mixes an output's input into a case alongside
+        // an `Observed` one, so this filter and `NEEDS_OBSERVED` below are
+        // safe to share between the two modes.
         let observed = stimulus
             .iter()
             .copied()
-            .filter(|input| input.mode == InputMode::Observed)
+            .filter(|input| matches!(input.mode, InputMode::Observed | InputMode::Output))
             .collect::<Vec<_>>();
         let managed = stimulus
             .iter()
@@ -819,7 +876,7 @@ impl Live<'_> {
 
     async fn projected(&self, reaction: &Reaction, input: &Input) -> Result<Vec<Assertion>> {
         let before = self.revision(reaction).await?;
-        self.mutate_input(input, &format!("projected-{}", reaction.id), "message")
+        self.change_input(input, &format!("projected-{}", reaction.id), "message")
             .await?;
         let expected = self.wait_expected(reaction, "projected revision").await?;
         let actual = self.revision(reaction).await?;
@@ -988,7 +1045,7 @@ impl Live<'_> {
         let saved = self.input_data(input).await?;
         let stopped = async {
             self.scale_controller(0).await?;
-            self.mutate_input(input, &format!("stopped-{}", reaction.id), "message")
+            self.change_input(input, &format!("stopped-{}", reaction.id), "message")
                 .await
         }
         .await;
@@ -1620,5 +1677,149 @@ mod tests {
         ]}});
         assert!(owns_revision(&object, "apsides-unit"));
         assert!(!owns_revision(&object, FOREIGN_MANAGER));
+    }
+
+    fn output_input() -> Input {
+        Input {
+            id: "output-flags-input".into(),
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            name: "flags".into(),
+            namespace: "workload".into(),
+            mode: InputMode::Output,
+            managed_resource_id: Some("output-flags".into()),
+            projection: vec!["data".into()],
+            sensitive: false,
+            missing: "block-dependent-mutations".into(),
+            source: compiler_core::SourceLocation {
+                file: "program.tsx".into(),
+                line: 1,
+                column: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn handler_output_stimulus_is_pure_ssa_of_only_the_changed_data_under_the_handler_manager() {
+        let input = output_input();
+        let data = Map::from_iter([("message".to_owned(), json!("cGF5bG9hZA=="))]);
+        let payload = handler_output_payload(&input, &data);
+        assert_eq!(payload["apiVersion"], json!("v1"));
+        assert_eq!(payload["kind"], json!("ConfigMap"));
+        assert_eq!(payload["metadata"]["name"], json!("flags"));
+        assert_eq!(payload["metadata"]["namespace"], json!("workload"));
+        assert_eq!(payload["data"], json!({"message": "cGF5bG9hZA=="}));
+        // The reconciler's own apply of the handler output is metadata-only
+        // (see IR-CONTRACT.md); the handler stimulus payload never carries
+        // metadata the reconciler owns, such as the reserved label.
+        assert!(payload["metadata"].get("labels").is_none());
+        assert_eq!(handler_field_manager("example"), "apsides-handler-example");
+        assert_ne!(handler_field_manager("example"), "apsides-example");
+    }
+
+    /// A program with `rolloutOn` on a handler output must generate only the
+    /// small `OUTPUT` scenario set's cases for that reaction, and
+    /// `execute()`'s stimulus selection (replicated here without a live
+    /// cluster) must resolve every one of them to exactly the output's own
+    /// `Output`-mode input — never empty (which would make `NEEDS_OBSERVED`
+    /// reject the case, the exact failure B3 reported) and never mixed with
+    /// another input.
+    #[test]
+    fn output_rollout_produces_only_applicable_cases_with_resolvable_stimulus() -> Result<()> {
+        let source = json!({"file": "program.tsx", "line": 1, "column": 1});
+        let ir = json!({
+            "schemaVersion": "apsides.dev/ir/v2",
+            "domain": {"id": "example", "namespace": "workload", "controlNamespace": "apsides-system",
+                "clusterBinding": "test-cluster", "policyRef": "platform/example", "enforcement": "api-bound",
+                "minKubernetesVersion": "1.34",
+                "budgets": {"maxResources": 32, "maxInputs": 32, "maxReactions": 32, "maxObjectBytes": 262_144, "maxQueueDepth": 32, "maxConcurrentRequests": 4}},
+            "resources": [
+                {"id": "api", "apiVersion": "apps/v1", "kind": "Deployment", "name": "api", "namespace": "workload",
+                    "desired": {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "api", "namespace": "workload"},
+                        "spec": {"replicas": 1, "selector": {"matchLabels": {"app": "api"}},
+                            "template": {"metadata": {"labels": {"app": "api"}},
+                                "spec": {"serviceAccountName": "api-workload",
+                                    "containers": [{"name": "api", "image": format!("example.invalid/api@sha256:{}", "0".repeat(64))}]}}}},
+                    "lifecycle": {"deletionPolicy": "orphan"}, "source": source},
+                {"id": "output-flags", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags", "namespace": "workload",
+                    "desired": {"apiVersion": "v1", "kind": "ConfigMap",
+                        "metadata": {"name": "flags", "namespace": "workload", "labels": {"apsides.dev/handler-output": "output-flags"}}},
+                    "lifecycle": {"deletionPolicy": "orphan"}, "source": source, "handlerOutput": true},
+            ],
+            "inputs": [
+                {"id": "settings", "apiVersion": "v1", "kind": "ConfigMap", "name": "settings", "namespace": "workload",
+                    "mode": "observed", "projection": ["data"], "sensitive": false,
+                    "missing": "block-dependent-mutations", "source": source},
+                {"id": "output-flags-input", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags", "namespace": "workload",
+                    "mode": "output", "managedResourceId": "output-flags", "projection": ["data"], "sensitive": false,
+                    "missing": "block-dependent-mutations", "source": source},
+            ],
+            "reactions": [
+                {"id": "rollout-flags", "op": "rollout", "inputs": ["output-flags-input"], "target": "api", "source": source},
+            ],
+            "handlers": [{
+                "id": "sync-flags", "module": "handlers/sync-flags.ts", "export": "syncFlags",
+                "trigger": {"kind": "input-changed", "input": "settings"},
+                "inputs": ["settings"], "egress": [{"host": "api.example.com", "port": 443}],
+                "outputs": ["output-flags"], "timeoutMillis": 30000, "maxHeapBytes": 67_108_864,
+                "bundleSha256": "1".repeat(64), "source": source,
+            }],
+            "outputs": [{"id": "output-flags", "name": "flags", "namespace": "workload"}],
+            "provenance": {"compiler": "apsides/0.1", "inputs": [{"path": "program.tsx", "sha256": "0".repeat(64)}, {"path": "handlers/sync-flags.ts", "sha256": "1".repeat(64)}]},
+        });
+        let plan = compiler_core::parse_and_validate(&ir.to_string())
+            .map_err(|error| Error::Case(error.to_string()))?;
+        let reaction = plan
+            .ir
+            .reactions
+            .iter()
+            .find(|reaction| reaction.id == "rollout-flags")
+            .ok_or_else(|| Error::Case("reaction missing".into()))?;
+        let cases: Vec<_> = plan
+            .test_plan
+            .iter()
+            .filter(|case| case.reaction_id == "rollout-flags")
+            .collect();
+        assert!(!cases.is_empty());
+        for case in &cases {
+            // Exactly `execute()`'s stimulus selection.
+            let stimulus: Vec<_> = plan
+                .ir
+                .inputs
+                .iter()
+                .filter(|input| {
+                    reaction.inputs.contains(&input.id) && case.input_ids.contains(&input.id)
+                })
+                .collect();
+            let observed: Vec<_> = stimulus
+                .iter()
+                .copied()
+                .filter(|input| matches!(input.mode, InputMode::Observed | InputMode::Output))
+                .collect();
+            if NEEDS_OBSERVED.contains(&case.scenario.as_str()) {
+                assert!(
+                    !observed.is_empty(),
+                    "scenario {} has no observed-or-output stimulus (case: {case:?})",
+                    case.scenario
+                );
+                assert_eq!(
+                    observed
+                        .iter()
+                        .map(|input| input.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["output-flags-input"],
+                    "scenario {} resolved unexpected stimulus",
+                    case.scenario
+                );
+            }
+        }
+        // The scenarios B3 explicitly reported as broken (`missing-input`,
+        // which cannot apply since the reconciler recreates the output
+        // absent-only before anything observes it) must be entirely absent.
+        assert!(
+            !cases.iter().any(|case| case.scenario == "missing-input"),
+            "missing-input must never be generated for an output reaction"
+        );
+        Ok(())
     }
 }

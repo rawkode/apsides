@@ -133,6 +133,13 @@ pub fn workload_service_accounts(plan: &CompiledPlan) -> Vec<Value> {
 
 /// The generated fixture for every observed input, as the driver seeds it.
 ///
+/// `Output`-mode inputs are deliberately excluded: their backing `ConfigMap`
+/// is a `handlerOutput` resource the reconciler itself creates absent-only
+/// on every cycle (see `IR-CONTRACT.md`'s handler-output paragraph), so
+/// there is nothing for the fixture driver to seed — seeding one here would
+/// race the reconciler's own create and could hand the fixture driver's
+/// manager ownership of metadata that must stay the reconciler's alone.
+///
 /// # Errors
 /// Reports `FixtureRequired` when an observed input has no usable fixture.
 pub fn seed_inputs(release: &FixtureRelease) -> Result<Vec<Value>> {
