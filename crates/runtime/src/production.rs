@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     net::SocketAddr,
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -10,10 +9,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::Engine as _;
 use compiler_core::{
     CompiledPlan, InputMode, InputSnapshot, Resource, RolloutKey, RolloutOutcome, evaluate_rollout,
 };
 use deploy::{ResourceIdentity, RuntimeObservation};
+use hickory_resolver::config::ResolverConfig;
 use http_body_util::Full;
 use hyper::{Request, Response, StatusCode, body::Bytes, service::service_fn};
 use hyper_util::rt::TokioIo;
@@ -26,15 +27,15 @@ use platform::{
     RuntimeCondition, RuntimeInventory, SCHEMA_VERSION, VerifiedActivation, Versioned,
     conditional_apply_request,
 };
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::Write as _;
 use tokio::sync::{Mutex, RwLock, watch};
 
 use crate::{
-    KubeRuntimeClient, Observation, RuntimeClient, RuntimeError, block_reason, insert_revision,
-    manager_main_resource_entries, normalized_object, validate_exact_apply_owner,
+    KubeRuntimeClient, LockdownState, Observation, RuntimeClient, RuntimeError, block_reason,
+    insert_revision, manager_main_resource_entries, normalized_object, validate_exact_apply_owner,
 };
 
 const MAX_DIAGNOSTIC_CONDITIONS: usize = 256;
@@ -51,10 +52,23 @@ pub enum ApiAccess {
 const PROXY_CA_PATH: &str = "/etc/apsides/proxy/ca.crt";
 const PROXY_CERT_PATH: &str = "/etc/apsides/proxy/tls.crt";
 const PROXY_KEY_PATH: &str = "/etc/apsides/proxy/tls.key";
-/// Read once, at `HandlerRuntime` construction, only when some declared
-/// handler has egress hosts -- see the Apsides v0.3 plan, Phase 5b review
-/// item 3.
+/// Read once, in `read_production_startup_files`, during `startup::start`'s
+/// synchronous phase, before Landlock lockdown -- see the Apsides v0.3
+/// plan, Phase 5c. Every production startup reads this file: the proxy
+/// Service is reached by hostname (`apsides-proxy-<generation>.<namespace>.svc`),
+/// so DNS is needed on every (re)connect, independent of whether any
+/// declared handler also has egress hosts.
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
+
+/// Small, fixed upper bounds for each proxy identity file -- a CA bundle,
+/// leaf certificate or private key is at most a few KiB in practice; these
+/// are generous enough for a multi-certificate chain while still bounding
+/// how much of `read_production_startup_files`'s one-shot pre-lockdown read
+/// budget any single file can consume.
+const PROXY_CA_MAX_BYTES: u64 = 64 * 1024;
+const PROXY_CERT_MAX_BYTES: u64 = 64 * 1024;
+const PROXY_KEY_MAX_BYTES: u64 = 64 * 1024;
+const RESOLV_CONF_MAX_BYTES: u64 = 64 * 1024;
 
 /// Explicit production startup data. None of these values grants authority;
 /// protected platform records must independently match the binding.
@@ -78,6 +92,15 @@ struct DiagnosticSnapshot {
     domain: String,
     build_digest: String,
     generation: String,
+    /// The effective filesystem-lockdown state established at startup
+    /// (`startup::start`, before this controller's diagnostics server ever
+    /// binds) -- see the Apsides v0.3 plan, Phase 5c. Always
+    /// `LockdownState::Landlock` in practice: `start` fails closed before
+    /// reaching `run_production` at all for every other case, since
+    /// production mode never accepts the fixture-only `allowNoLandlock`
+    /// escape hatch. Exposed anyway so the fail-closed contract is directly
+    /// observable, not merely asserted by tests elsewhere.
+    lockdown: LockdownState,
     phase: DiagnosticPhase,
     cache: CacheState,
     blocked_targets: usize,
@@ -149,13 +172,14 @@ struct Diagnostics {
 }
 
 impl Diagnostics {
-    fn new(binding: &RuntimeBinding) -> Self {
+    fn new(binding: &RuntimeBinding, lockdown: LockdownState) -> Self {
         Self {
             snapshot: RwLock::new(DiagnosticSnapshot {
                 schema_version: "apsides.dev/runtime-status/v1",
                 domain: binding.domain_id.clone(),
                 build_digest: binding.build_digest.clone(),
                 generation: binding.generation_id.clone(),
+                lockdown,
                 phase: DiagnosticPhase::Starting,
                 cache: CacheState::Pending,
                 blocked_targets: 0,
@@ -313,24 +337,69 @@ enum CycleControl {
     Retry(&'static str),
 }
 
-pub(crate) async fn run_production(
-    plan: &CompiledPlan,
-    config: ProductionConfig,
-    handlers: &'static [(&'static str, &'static str)],
-) -> Result<(), RuntimeError> {
-    validate_production_config(plan, &config)?;
-    crate::install_rustls_provider()?;
-    let mut kube_config = production_kube_config(&config)?;
-    kube_config.connect_timeout = Some(Duration::from_secs(5));
-    kube_config.read_timeout = Some(Duration::from_secs(15));
-    kube_config.write_timeout = Some(Duration::from_secs(15));
-    kube_config.default_retry = false;
-    let client = Client::try_from(kube_config)
-        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-    run_production_with_client(plan, config, client, handlers).await
+/// Everything `read_production_startup_files` reads from the filesystem and
+/// derives from those bytes, during `startup::start`'s synchronous
+/// pre-lockdown phase: the proxy client identity, already converted into
+/// the exact in-memory shapes `kube::Config` takes (never a file path), and
+/// the DNS material `kube_connector::build_client` needs to reach the proxy
+/// Service by hostname without glibc's `getaddrinfo`.
+pub(crate) struct ProductionStartupFiles {
+    /// `PROXY_CA_PATH`'s PEM bundle, parsed into DER certificates --
+    /// `kube::Config::root_cert`'s exact shape. `root_cert_file` is never
+    /// set: the file is read exactly once, here.
+    root_cert_der: Vec<Vec<u8>>,
+    /// `PROXY_CERT_PATH`'s PEM bytes, base64-encoded --
+    /// `kube::Config::auth_info::client_certificate_data`'s exact shape
+    /// (`kube-client` base64-decodes it straight back to these same bytes;
+    /// see `AuthInfo::load_client_certificate`). `client_certificate` (the
+    /// file-path field) is never set.
+    client_certificate_data: String,
+    /// `PROXY_KEY_PATH`'s PEM bytes, base64-encoded, the same way as
+    /// `client_certificate_data` above.
+    client_key_data: SecretString,
+    /// The proxy's certificate SAN / mTLS SNI
+    /// (`apsides-proxy-<generation>.<namespace>.svc`) -- unchanged from
+    /// before Phase 5c, and unrelated to DNS resolution: `cluster_url`
+    /// below is the resolvable FQDN, but the TLS handshake still presents
+    /// (and must still validate against) this exact short name, since
+    /// that's what `platform::tls`'s proxy certificate issuance signs.
+    server_name: String,
+    /// `https://<server_name>.<cluster_domain>:8443` -- the FQDN this
+    /// process can actually resolve without search-list expansion.
+    /// `<server_name>` alone (e.g. `apsides-proxy-x.ns.svc`) is not itself a
+    /// resolvable record; real cluster DNS only serves the fully-qualified
+    /// `<name>.<namespace>.svc.<cluster-domain>` form, and a plain DNS
+    /// client normally reaches it by trying `resolv.conf`'s `search`
+    /// suffixes in turn (glibc's `ndots`-gated expansion). This process
+    /// builds the FQDN itself instead of relying on that expansion (see
+    /// `cluster_domain_from_resolv_conf`), so `kube_connector`'s resolver
+    /// only ever needs a single, unambiguous lookup.
+    cluster_url: http::Uri,
+    /// `RESOLV_CONF_PATH`'s `nameserver` lines, for
+    /// `kube_connector::build_client`'s own hickory resolver.
+    kube_resolver_config: ResolverConfig,
+    /// `RESOLV_CONF_PATH`'s raw contents, for `HandlerRuntime::new`'s own
+    /// (separately built, handler-egress-only) resolver config -- see the
+    /// Apsides v0.3 plan, Phase 5b.
+    resolv_conf_contents: String,
 }
 
-fn production_kube_config(config: &ProductionConfig) -> Result<Config, RuntimeError> {
+/// Reads every file `ProductionConfig` needs and converts each into the
+/// in-memory shape its consumer takes -- see [`ProductionStartupFiles`].
+/// Called once, by `startup::start`, before Landlock lockdown; nothing
+/// downstream of it (`run_production` and everything it calls) ever opens
+/// a file again.
+///
+/// # Errors
+///
+/// Returns an error if the generation identifier is not a DNS label, if
+/// any required file is missing, oversized or not UTF-8 (`resolv.conf`
+/// only) or not valid PEM (the CA bundle only), or if `resolv.conf` has no
+/// `nameserver` line or no `search` domain to derive the cluster domain
+/// from.
+pub(crate) fn read_production_startup_files(
+    config: &ProductionConfig,
+) -> Result<ProductionStartupFiles, RuntimeError> {
     let ApiAccess::Proxy = config.api_access;
     let generation = &config.binding.generation_id;
     if !valid_dns_label(generation) {
@@ -342,15 +411,146 @@ fn production_kube_config(config: &ProductionConfig) -> Result<Config, RuntimeEr
         "apsides-proxy-{generation}.{}.svc",
         config.control_namespace
     );
-    let uri = format!("https://{server_name}:8443")
+
+    let ca_pem = crate::read_bounded_file(
+        std::path::Path::new(PROXY_CA_PATH),
+        PROXY_CA_MAX_BYTES,
+        "proxy client CA",
+    )?;
+    let cert_pem = crate::read_bounded_file(
+        std::path::Path::new(PROXY_CERT_PATH),
+        PROXY_CERT_MAX_BYTES,
+        "proxy client certificate",
+    )?;
+    let key_pem = crate::read_bounded_file(
+        std::path::Path::new(PROXY_KEY_PATH),
+        PROXY_KEY_MAX_BYTES,
+        "proxy client key",
+    )?;
+    let resolv_conf_bytes = crate::read_bounded_file(
+        std::path::Path::new(RESOLV_CONF_PATH),
+        RESOLV_CONF_MAX_BYTES,
+        "resolv.conf",
+    )?;
+    let resolv_conf_contents = String::from_utf8(resolv_conf_bytes)
+        .map_err(|_error| RuntimeError::Configuration("resolv.conf is not UTF-8".into()))?;
+
+    let root_cert_der = parse_ca_der(&ca_pem)?;
+    let client_certificate_data = base64::engine::general_purpose::STANDARD.encode(&cert_pem);
+    let client_key_data =
+        SecretString::from(base64::engine::general_purpose::STANDARD.encode(&key_pem));
+
+    let kube_resolver_config = engine::resolver_config_from_resolv_conf(&resolv_conf_contents)
+        .map_err(|error| RuntimeError::Configuration(format!("resolv.conf: {error}")))?;
+    let cluster_domain =
+        cluster_domain_from_resolv_conf(&resolv_conf_contents).ok_or_else(|| {
+            RuntimeError::Configuration(
+                "resolv.conf has no search domain to derive the cluster domain from".into(),
+            )
+        })?;
+    let cluster_url = format!("https://{server_name}.{cluster_domain}:8443")
         .parse()
         .map_err(|_| RuntimeError::Configuration("invalid fixed proxy API URL".into()))?;
-    let mut kube_config = Config::new(uri);
-    kube_config.root_cert_file = Some(PathBuf::from(PROXY_CA_PATH));
-    kube_config.auth_info.client_certificate = Some(PROXY_CERT_PATH.into());
-    kube_config.auth_info.client_key = Some(PROXY_KEY_PATH.into());
-    kube_config.tls_server_name = Some(server_name);
-    Ok(kube_config)
+
+    Ok(ProductionStartupFiles {
+        root_cert_der,
+        client_certificate_data,
+        client_key_data,
+        server_name,
+        cluster_url,
+        kube_resolver_config,
+        resolv_conf_contents,
+    })
+}
+
+/// Parses a PEM bundle into the DER-encoded `CERTIFICATE` blocks it
+/// contains, in file order -- `kube::Config::root_cert`'s exact shape.
+/// Mirrors `kube_client::config::certs` (which is `pub(crate)` to that
+/// crate, not reusable directly).
+///
+/// # Errors
+///
+/// Returns an error if the bytes are not valid PEM, or contain no
+/// `CERTIFICATE` block at all.
+fn parse_ca_der(pem_bytes: &[u8]) -> Result<Vec<Vec<u8>>, RuntimeError> {
+    let blocks = pem::parse_many(pem_bytes)
+        .map_err(|error| RuntimeError::Configuration(format!("proxy client CA: {error}")))?;
+    let der: Vec<Vec<u8>> = blocks
+        .into_iter()
+        .filter(|block| block.tag() == "CERTIFICATE")
+        .map(pem::Pem::into_contents)
+        .collect();
+    if der.is_empty() {
+        return Err(RuntimeError::Configuration(
+            "proxy client CA contains no CERTIFICATE PEM blocks".into(),
+        ));
+    }
+    Ok(der)
+}
+
+/// The cluster's DNS domain suffix (e.g. `cluster.local`), read from
+/// `resolv.conf`'s `search` line. Kubelet always writes the search list as
+/// `<pod-namespace>.svc.<cluster-domain> svc.<cluster-domain>
+/// <cluster-domain>`, in that order, so the *last* entry is the bare
+/// cluster domain regardless of what it is actually named -- this makes no
+/// assumption that it equals the literal string `cluster.local`.
+///
+/// This function performs no I/O: the caller reads `resolv.conf` and hands
+/// the contents in (see `read_production_startup_files`), the same
+/// discipline `engine::resolver_config_from_resolv_conf` documents for the
+/// same reason.
+fn cluster_domain_from_resolv_conf(contents: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let uncommented = line.split(['#', ';']).next().unwrap_or("");
+        let mut tokens = uncommented.split_whitespace();
+        if tokens.next() != Some("search") {
+            return None;
+        }
+        tokens.last().map(str::to_owned)
+    })
+}
+
+pub(crate) async fn run_production(
+    plan: &CompiledPlan,
+    config: ProductionConfig,
+    files: ProductionStartupFiles,
+    handlers: &'static [(&'static str, &'static str)],
+    lockdown: LockdownState,
+) -> Result<(), RuntimeError> {
+    validate_production_config(plan, &config)?;
+    crate::install_rustls_provider()?;
+    let mut kube_config = production_kube_config(&files);
+    kube_config.connect_timeout = Some(Duration::from_secs(5));
+    kube_config.read_timeout = Some(Duration::from_secs(15));
+    kube_config.write_timeout = Some(Duration::from_secs(15));
+    kube_config.default_retry = false;
+    let client =
+        crate::kube_connector::build_client(&kube_config, files.kube_resolver_config.clone())?;
+    run_production_with_client(
+        plan,
+        config,
+        client,
+        &files.resolv_conf_contents,
+        handlers,
+        lockdown,
+    )
+    .await
+}
+
+/// Builds the `kube::Config` for the proxy connection entirely from
+/// already-in-memory data (see [`ProductionStartupFiles`]): `root_cert` as
+/// DER certificates, `auth_info.client_certificate_data`/`client_key_data`
+/// as base64 PEM. `root_cert_file`, `auth_info.client_certificate` and
+/// `auth_info.client_key` (the file-path fields) are never set -- nothing
+/// this `Config` is used to build ever opens a file, including on
+/// reconnect (see `kube_connector::build_client`).
+fn production_kube_config(files: &ProductionStartupFiles) -> Config {
+    let mut kube_config = Config::new(files.cluster_url.clone());
+    kube_config.root_cert = Some(files.root_cert_der.clone());
+    kube_config.auth_info.client_certificate_data = Some(files.client_certificate_data.clone());
+    kube_config.auth_info.client_key_data = Some(files.client_key_data.clone());
+    kube_config.tls_server_name = Some(files.server_name.clone());
+    kube_config
 }
 
 fn valid_dns_label(value: &str) -> bool {
@@ -373,14 +573,16 @@ async fn run_production_with_client(
     plan: &CompiledPlan,
     config: ProductionConfig,
     client: Client,
+    resolv_conf_contents: &str,
     handlers: &'static [(&'static str, &'static str)],
+    lockdown: LockdownState,
 ) -> Result<(), RuntimeError> {
     let authority = RuntimeAuthority::new(
         client.clone(),
         &config.control_namespace,
         config.binding.clone(),
     )?;
-    let diagnostics = Arc::new(Diagnostics::new(&config.binding));
+    let diagnostics = Arc::new(Diagnostics::new(&config.binding, lockdown));
     let listener = tokio::net::TcpListener::bind(config.diagnostics_bind)
         .await
         .map_err(|error| RuntimeError::Configuration(format!("diagnostics listener: {error}")))?;
@@ -392,30 +594,18 @@ async fn run_production_with_client(
     let handler_runtime = if plan.ir.handlers.is_empty() {
         None
     } else {
-        // Only read `/etc/resolv.conf` when some declared handler actually
-        // has egress hosts -- see the Apsides v0.3 plan, Phase 5b review
-        // item 3; `HandlerRuntime::new` itself never reads the file, only
-        // parses contents it is handed (so Phase 5c can read it before a
-        // Landlock lockdown and pass the bytes in here instead).
-        let resolv_conf_contents = if plan
-            .ir
-            .handlers
-            .iter()
-            .any(|handler| !handler.egress.is_empty())
-        {
-            Some(std::fs::read_to_string(RESOLV_CONF_PATH).map_err(|error| {
-                RuntimeError::Configuration(format!("failed to read {RESOLV_CONF_PATH}: {error}"))
-            })?)
-        } else {
-            None
-        };
+        // `resolv_conf_contents` was already read once, before Landlock
+        // lockdown, by `read_production_startup_files` -- `HandlerRuntime::new`
+        // itself never reads the file, only parses the contents it is
+        // handed. See the Apsides v0.3 plan, Phase 5b review item 3 and
+        // Phase 5c.
         let mut runtime = crate::handlers::HandlerRuntime::new(
             plan,
             handlers,
             crate::handlers::handler_field_manager(&plan.ir.domain.id),
             Duration::from_millis(config.base_backoff_millis),
             Duration::from_millis(config.max_backoff_millis),
-            resolv_conf_contents.as_deref(),
+            Some(resolv_conf_contents),
         )?;
         runtime.seed_from_annotations(plan, &client).await;
         Some(Mutex::new(runtime))
@@ -1928,7 +2118,10 @@ mod tests {
                 activation.binding.clone(),
             )?,
             kube: KubeRuntimeClient::from_client(client, 2, "example"),
-            diagnostics: Arc::new(Diagnostics::new(&activation.binding)),
+            diagnostics: Arc::new(Diagnostics::new(
+                &activation.binding,
+                LockdownState::Landlock,
+            )),
             terminating: Arc::new(AtomicBool::new(false)),
             last_mutation: Mutex::new(None),
             last_successful_apply: Mutex::new(BTreeMap::new()),
@@ -1952,42 +2145,177 @@ mod tests {
         assert!(serde_json::from_str::<ApiAccess>("{\"proxy\":\"https://example\"}").is_err());
     }
 
-    #[tokio::test]
-    async fn proxy_access_uses_only_fixed_mtls_identity() -> TestResult {
-        let plan = plan()?;
-        let policy = policy(&plan);
-        let activation = activation(&plan, &policy, None)?;
-        let controller = controller(&plan, &activation, wire(vec![]).0)?;
-        let config = production_kube_config(&controller.config)?;
+    /// A syntactically valid, arbitrary (not cryptographically real) PEM
+    /// `CERTIFICATE` block -- `parse_ca_der` only checks PEM structure and
+    /// the block tag, never certificate validity (the same as
+    /// `kube::Config::root_cert`'s own contract: it is trusted TLS
+    /// material, not independently re-validated at `Config`-construction
+    /// time).
+    const TEST_CA_PEM: &str =
+        "-----BEGIN CERTIFICATE-----\nZmFrZS1jYS1kYXRh\n-----END CERTIFICATE-----\n";
+
+    fn test_startup_files() -> TestResult<ProductionStartupFiles> {
+        Ok(ProductionStartupFiles {
+            root_cert_der: parse_ca_der(TEST_CA_PEM.as_bytes())?,
+            client_certificate_data: base64::engine::general_purpose::STANDARD
+                .encode(b"fake-cert-pem"),
+            client_key_data: SecretString::from(
+                base64::engine::general_purpose::STANDARD.encode(b"fake-key-pem"),
+            ),
+            server_name: "apsides-proxy-generation-a.control.svc".into(),
+            cluster_url: "https://apsides-proxy-generation-a.control.svc.cluster.local:8443"
+                .parse()
+                .map_err(|error| format!("{error}"))?,
+            kube_resolver_config: ResolverConfig::from_parts(
+                None,
+                vec![],
+                vec![hickory_resolver::config::NameServerConfig::udp_and_tcp(
+                    "127.0.0.1"
+                        .parse::<std::net::IpAddr>()
+                        .map_err(|e| e.to_string())?,
+                )],
+            ),
+            resolv_conf_contents: "nameserver 127.0.0.1\n".into(),
+        })
+    }
+
+    /// `production_kube_config` builds a `kube::Config` entirely from
+    /// [`ProductionStartupFiles`]'s in-memory fields: `root_cert` as DER,
+    /// `client_certificate_data`/`client_key_data` as base64 PEM, and
+    /// (critically for the Apsides v0.3 plan, Phase 5c) never sets
+    /// `root_cert_file`, `auth_info.client_certificate` or
+    /// `auth_info.client_key` -- the three file-path fields that would
+    /// make `kube-client` open a file again after Landlock lockdown.
+    #[test]
+    fn production_kube_config_uses_only_in_memory_mtls_identity() -> TestResult {
+        let files = test_startup_files()?;
+        let config = production_kube_config(&files);
         assert_eq!(
             config.cluster_url.to_string(),
-            "https://apsides-proxy-generation-a.control.svc:8443/"
+            "https://apsides-proxy-generation-a.control.svc.cluster.local:8443/"
         );
-        assert_eq!(config.root_cert_file, Some(PathBuf::from(PROXY_CA_PATH)));
         assert_eq!(
-            config.auth_info.client_certificate.as_deref(),
-            Some(PROXY_CERT_PATH)
+            config.tls_server_name.as_deref(),
+            Some("apsides-proxy-generation-a.control.svc")
         );
-        assert_eq!(config.auth_info.client_key.as_deref(), Some(PROXY_KEY_PATH));
+        assert!(config.root_cert_file.is_none());
+        assert!(config.auth_info.client_certificate.is_none());
+        assert!(config.auth_info.client_key.is_none());
+        assert_eq!(config.root_cert, Some(vec![b"fake-ca-data".to_vec()]));
+        assert_eq!(
+            config.auth_info.client_certificate_data.as_deref(),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(b"fake-cert-pem")
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            config
+                .auth_info
+                .client_key_data
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(b"fake-key-pem")
+                    .as_str()
+            )
+        );
         assert!(config.auth_info.token.is_none());
         assert!(config.auth_info.token_file.is_none());
         Ok(())
     }
 
+    #[test]
+    fn parse_ca_der_extracts_only_certificate_blocks() -> TestResult {
+        let der = parse_ca_der(TEST_CA_PEM.as_bytes())?;
+        assert_eq!(der, vec![b"fake-ca-data".to_vec()]);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_ca_der_rejects_a_bundle_with_no_certificate_block() {
+        let key_only = "-----BEGIN PRIVATE KEY-----\nZmFrZQ==\n-----END PRIVATE KEY-----\n";
+        assert!(parse_ca_der(key_only.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn cluster_domain_is_the_last_search_entry() {
+        let contents = "nameserver 10.0.0.10\nsearch control.svc.cluster.local svc.cluster.local cluster.local\noptions ndots:5\n";
+        assert_eq!(
+            cluster_domain_from_resolv_conf(contents).as_deref(),
+            Some("cluster.local")
+        );
+    }
+
+    #[test]
+    fn cluster_domain_is_none_without_a_search_line() {
+        assert_eq!(
+            cluster_domain_from_resolv_conf("nameserver 10.0.0.10\n"),
+            None
+        );
+    }
+
+    /// `startup_reads_before_lock` (see the Apsides v0.3 plan, Phase 5c):
+    /// `/etc/apsides/proxy/ca.crt` does not exist in this test environment
+    /// (nothing in this repository's test suites creates it -- only a real
+    /// platform executor does, inside a real pod), so this exercises the
+    /// real, unmocked read path and its real fail-closed error, not a
+    /// simulated one. Proves the read happens (and fails clearly) entirely
+    /// independent of Landlock: nothing about this test applies any
+    /// lockdown at all.
+    #[test]
+    fn read_production_startup_files_fails_clearly_when_the_proxy_ca_is_missing() -> TestResult {
+        let plan = plan()?;
+        let config = ProductionConfig {
+            api_access: ApiAccess::Proxy,
+            control_namespace: plan.ir.domain.control_namespace.clone(),
+            binding: RuntimeBinding {
+                domain_id: plan.ir.domain.id.clone(),
+                cluster_binding: plan.ir.domain.cluster_binding.clone(),
+                generation_id: "generation-a".into(),
+                build_digest: format!("sha256:{}", "1".repeat(64)),
+                ir_digest: plan.ir_digest,
+                policy_digest: format!("sha256:{}", "3".repeat(64)),
+                capability_digest: format!("sha256:{}", "4".repeat(64)),
+                service_account_name: "controller".into(),
+                controller_image: format!("example/controller@sha256:{}", "5".repeat(64)),
+                max_handler_heap_bytes: 0,
+            },
+            poll_interval_millis: 1_000,
+            base_backoff_millis: 100,
+            max_backoff_millis: 1_000,
+            min_mutation_interval_millis: 10,
+            diagnostics_bind: "127.0.0.1:0".parse().map_err(|e| format!("{e}"))?,
+        };
+        let error = read_production_startup_files(&config)
+            .err()
+            .ok_or("expected a missing-file error")?;
+        assert!(
+            error.to_string().contains("proxy client CA"),
+            "expected the error to name the missing file: {error}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn diagnostics_never_include_input_values_or_key_material() -> TestResult {
-        let diagnostics = Arc::new(Diagnostics::new(&RuntimeBinding {
-            domain_id: "domain".into(),
-            cluster_binding: "cluster".into(),
-            generation_id: "generation".into(),
-            build_digest: format!("sha256:{}", "1".repeat(64)),
-            ir_digest: format!("sha256:{}", "2".repeat(64)),
-            policy_digest: format!("sha256:{}", "3".repeat(64)),
-            capability_digest: format!("sha256:{}", "4".repeat(64)),
-            service_account_name: "controller".into(),
-            controller_image: format!("example/controller@sha256:{}", "5".repeat(64)),
-            max_handler_heap_bytes: 0,
-        }));
+        let diagnostics = Arc::new(Diagnostics::new(
+            &RuntimeBinding {
+                domain_id: "domain".into(),
+                cluster_binding: "cluster".into(),
+                generation_id: "generation".into(),
+                build_digest: format!("sha256:{}", "1".repeat(64)),
+                ir_digest: format!("sha256:{}", "2".repeat(64)),
+                policy_digest: format!("sha256:{}", "3".repeat(64)),
+                capability_digest: format!("sha256:{}", "4".repeat(64)),
+                service_account_name: "controller".into(),
+                controller_image: format!("example/controller@sha256:{}", "5".repeat(64)),
+                max_handler_heap_bytes: 0,
+            },
+            LockdownState::Landlock,
+        ));
         diagnostics
             .update(
                 DiagnosticPhase::Ready,

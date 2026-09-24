@@ -6,14 +6,17 @@
 //! execution remains a separately acknowledged disposable-cluster mode.
 
 mod handlers;
+mod kube_connector;
 mod production;
+mod startup;
 
 pub use production::{ApiAccess, ProductionConfig};
+pub use startup::start;
 
 use std::io::Write as _;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    fs,
     io::Read,
     net::IpAddr,
     path::{Path, PathBuf},
@@ -23,7 +26,7 @@ use std::{
 use async_trait::async_trait;
 use compiler_core::{
     BlockReason, CompiledPlan, Input, InputMode, InputSnapshot, REVISION_ANNOTATION, Resource,
-    RolloutKey, RolloutOutcome, evaluate_rollout, parse_and_validate,
+    RolloutKey, RolloutOutcome, evaluate_rollout,
 };
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use kube::{
@@ -60,6 +63,24 @@ pub enum RuntimeError {
     Platform(#[from] platform::Error),
 }
 
+/// The controller's effective filesystem-lockdown state.
+///
+/// Set at the end of `startup::start`'s synchronous startup phase (see the
+/// Apsides v0.3 plan, Phase 5c). `NoneFixture` is reachable only when
+/// Landlock was not enforced by the running kernel *and* the fixture-only
+/// `allowNoLandlock`
+/// escape hatch was set -- `start` fails closed before ever reaching
+/// `run_locked` for every other case, including every production-mode
+/// startup, so a production `ProductionController` can only ever report
+/// `Landlock`. Serializes to exactly the two lowercase, hyphenated values
+/// the plan names for `/status`: `"landlock"` and `"none-fixture"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LockdownState {
+    Landlock,
+    NoneFixture,
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
 enum StartupConfig {
@@ -79,6 +100,13 @@ pub struct FixtureConfig {
     pub max_watch_cycles: usize,
     #[serde(default)]
     pub rollout_key: Option<FixtureRolloutKey>,
+    /// Accepts an unenforced Landlock lockdown (see `startup::start`)
+    /// instead of failing closed. Defaults to `false`. Structurally only
+    /// ever reachable in fixture mode: `ProductionConfig` has no such
+    /// field, and `StartupConfig`'s `deny_unknown_fields` rejects it there
+    /// -- see the Apsides v0.3 plan, Phase 5c.
+    #[serde(default)]
+    pub allow_no_landlock: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -128,11 +156,10 @@ pub trait RuntimeClient: Send + Sync {
     ) -> Result<(), RuntimeError>;
 }
 
-/// Entrypoint used by generated native controllers.
-///
-/// The sole startup input is a path to an explicit mode document. Production
-/// accepts only an explicit in-cluster transport configuration. Fixture mode
-/// requires a dedicated absolute kubeconfig path.
+/// Runs the finite plan once startup has already read every file it needs
+/// (see `startup::start`, the crate's real entrypoint) and Landlock
+/// lockdown is already in effect on this thread and every thread the tokio
+/// runtime driving this call creates.
 ///
 /// `handlers` is the `(id, bundle source)` pair for every declared event
 /// handler, embedded by the generated controller via `include_str!` next to
@@ -144,32 +171,32 @@ pub trait RuntimeClient: Send + Sync {
 ///
 /// # Errors
 ///
-/// Returns an error for invalid IR or startup configuration, failed protected
+/// Returns an error for invalid startup configuration, failed protected
 /// activation, or a Kubernetes operation failure.
-pub async fn run(
-    ir_json: &'static str,
+pub(crate) async fn run_locked(
+    plan: &CompiledPlan,
+    prepared: startup::PreparedStartup,
     handlers: &'static [(&'static str, &'static str)],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let plan = parse_and_validate(ir_json)?;
-    verify_embedded_handlers(&plan, handlers)?;
-    let path = env::var(CONFIG_PATH_ENV)
-        .map_err(|_| RuntimeError::Configuration(format!("{CONFIG_PATH_ENV} is required")))?;
-    let startup = read_startup(Path::new(&path))?;
-    match startup {
-        StartupConfig::Production(config) => {
-            production::run_production(&plan, config, handlers).await?;
-            Ok(())
+    lockdown: LockdownState,
+) -> Result<(), RuntimeError> {
+    match prepared {
+        startup::PreparedStartup::Production { config, files } => {
+            production::run_production(plan, config, *files, handlers, lockdown).await
         }
-        StartupConfig::Fixture(config) => {
-            validate_fixture_config(&plan, &config)?;
+        startup::PreparedStartup::Fixture {
+            config,
+            kubeconfig_bytes,
+        } => {
+            validate_fixture_config(plan, &config)?;
             install_rustls_provider()?;
-            let client = KubeRuntimeClient::from_fixture_config(
+            let client = KubeRuntimeClient::from_fixture_config_bytes(
+                &kubeconfig_bytes,
                 &config,
                 plan.ir.domain.budgets.max_concurrent_requests,
                 &plan.ir.domain.id,
             )
             .await?;
-            let report = run_fixture_with_client(&plan, &config, &client).await?;
+            let report = run_fixture_with_client(plan, &config, &client).await?;
             writeln!(
                 std::io::stdout().lock(),
                 "{}",
@@ -189,7 +216,7 @@ pub async fn run(
 /// wrong bundle, dropped one, or duplicated an id fails closed at startup
 /// rather than silently running mismatched code once a later phase adds
 /// execution.
-fn verify_embedded_handlers(
+pub(crate) fn verify_embedded_handlers(
     plan: &CompiledPlan,
     handlers: &[(&'static str, &'static str)],
 ) -> Result<(), RuntimeError> {
@@ -235,7 +262,7 @@ pub(crate) fn strict_apply_params(manager: &str, force: bool) -> PatchParams {
     if force { params.force() } else { params }
 }
 
-fn read_startup(path: &Path) -> Result<StartupConfig, RuntimeError> {
+pub(crate) fn read_startup(path: &Path) -> Result<StartupConfig, RuntimeError> {
     if !path.is_absolute() {
         return Err(RuntimeError::Configuration(
             "runtime config path must be absolute".into(),
@@ -249,7 +276,11 @@ fn read_startup(path: &Path) -> Result<StartupConfig, RuntimeError> {
     serde_json::from_value(value).map_err(|error| RuntimeError::Configuration(error.to_string()))
 }
 
-fn read_bounded_file(path: &Path, limit: u64, label: &str) -> Result<Vec<u8>, RuntimeError> {
+pub(crate) fn read_bounded_file(
+    path: &Path,
+    limit: u64,
+    label: &str,
+) -> Result<Vec<u8>, RuntimeError> {
     let file = fs::File::open(path)
         .map_err(|error| RuntimeError::Configuration(format!("{label}: {error}")))?;
     let metadata = file
@@ -272,7 +303,7 @@ fn read_bounded_file(path: &Path, limit: u64, label: &str) -> Result<Vec<u8>, Ru
     Ok(bytes)
 }
 
-fn validate_fixture_config(
+pub(crate) fn validate_fixture_config(
     plan: &CompiledPlan,
     config: &FixtureConfig,
 ) -> Result<(), RuntimeError> {
@@ -576,17 +607,18 @@ pub struct KubeRuntimeClient {
 }
 
 impl KubeRuntimeClient {
-    async fn from_fixture_config(
+    /// Builds the fixture-mode client from a dedicated kubeconfig's bytes,
+    /// already read (and bounded to [`KUBECONFIG_MAX_BYTES`]) by
+    /// `startup::start`'s synchronous, pre-Landlock-lockdown phase -- this
+    /// function itself never touches the filesystem. See the Apsides v0.3
+    /// plan, Phase 5c.
+    pub(crate) async fn from_fixture_config_bytes(
+        kubeconfig_bytes: &[u8],
         config: &FixtureConfig,
         max_concurrent: usize,
         domain_id: &str,
     ) -> Result<Self, RuntimeError> {
-        let bytes = read_bounded_file(
-            &config.kubeconfig,
-            KUBECONFIG_MAX_BYTES,
-            "dedicated kubeconfig",
-        )?;
-        let text = std::str::from_utf8(&bytes)
+        let text = std::str::from_utf8(kubeconfig_bytes)
             .map_err(|_| RuntimeError::Configuration("dedicated kubeconfig is not UTF-8".into()))?;
         let kubeconfig = Kubeconfig::from_yaml(text).map_err(|error| {
             RuntimeError::Configuration(format!("dedicated kubeconfig: {error}"))
@@ -1148,6 +1180,7 @@ mod tests {
     use super::*;
     use compiler_core::{
         ApiResourceMapping, ApiResourceScope, DeletionPolicy, Lifecycle, SourceLocation,
+        parse_and_validate,
     };
     use http::{Method, Request, Response, StatusCode, header::CONTENT_TYPE};
     use http_body_util::BodyExt;

@@ -12,7 +12,21 @@ futures-util = "0.3"
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["server", "tokio"] }
+# `client-legacy`: Phase 5c's hickory-resolver-backed connector for the
+# production kube client (see `src/kube_connector.rs`) builds on
+# `hyper_util::client::legacy`, the same low-level client `kube-client`
+# itself uses internally -- see that module's doc comment for why a custom
+# connector is needed at all (the proxy Service is reached by hostname, so
+# DNS is needed on every reconnect, and the default connector's
+# `GaiResolver` reads `/etc/resolv.conf`/`/etc/hosts`/`/etc/nsswitch.conf`
+# via glibc `getaddrinfo`, which Landlock lockdown denies).
+hyper-util = { version = "0.1", features = ["client-legacy", "server", "tokio"] }
+# Pinned to match kube-client 4.2's own internal use of the same crate for
+# its default client's connect/read/write timeouts (`TimeoutConnector`) --
+# `src/kube_connector.rs` reproduces that same composition around the
+# custom connector, so it uses the identical crate/version already in the
+# lockfile rather than a second copy.
+hyper-timeout = "0.5"
 k8s-openapi = { version = "0.28", default-features = false, features = ["v1_36"] }
 kube = { version = "4.2", default-features = false, features = ["client", "config", "runtime", "rustls-tls"] }
 compiler-core = { path = "../compiler-core" }
@@ -25,19 +39,67 @@ secrecy = "0.10"
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-# The handler-egress DNS resolver (`engine::EgressResolver::new`) takes a
-# `hickory_resolver::config::ResolverConfig`, a type `engine` does not
-# re-export -- see the Apsides v0.3 plan, Phase 5b. Same version as `engine`
-# itself pins, so this resolves to the identical crate in the lockfile
-# rather than a second copy.
+# `src/kube_connector.rs`'s custom connector and `Client::new` composition
+# (mirroring `kube::Client::new`'s own documented "advanced use" example)
+# needs `ServiceBuilder`/`option_layer`/`BoxError`; already a dev-dependency
+# of this crate's own tests, promoted to a normal dependency here rather
+# than kept as two separate entries.
+tower = { version = "0.5", features = ["util"] }
+# Parses the proxy client CA's PEM bundle into the DER certificates
+# `kube::Config::root_cert` takes, in memory, before Landlock lockdown (see
+# `src/production.rs`'s `read_production_startup_files`). Already resolves
+# to the identical crate `kube-client` itself depends on for the same
+# purpose (`kube::config::certs`, which is `pub(crate)` and so not reusable
+# directly), not a second copy.
+pem = "3"
+# Base64-encodes the proxy client certificate/key PEM bytes into
+# `kube::Config::auth_info.client_certificate_data`/`client_key_data`,
+# which `kube-client` itself always base64-decodes back to the identical
+# bytes (`AuthInfo::load_client_certificate`/`load_client_key`) -- see
+# `read_production_startup_files`. Already resolves to the identical crate
+# already in the lockfile (`kube-client`'s own dependency).
+base64 = "0.22"
+# The handler-egress DNS resolver (`engine::EgressResolver::new`) and the
+# production kube client's own hickory connector (`src/kube_connector.rs`)
+# both take a `hickory_resolver::config::ResolverConfig`/build a
+# `TokioResolver`, types `engine` does not re-export -- see the Apsides
+# v0.3 plan, Phase 5b and 5c. Same version as `engine` itself pins, so this
+# resolves to the identical crate in the lockfile rather than a second copy.
 hickory-resolver = { version = "0.26", default-features = false, features = ["tokio"] }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
 # `engine::test_support::HttpsFixtureServer` -- see the Apsides v0.3 plan,
 # Phase 5b review item 4's two-invocation `EgressResolver` runtime-affinity
-# test in `handlers.rs`.
+# test in `handlers.rs`. Also `engine::count_process_threads`/
+# `apply_deny_all_or_fail_closed` directly, for
+# `tests/landlock_denies_worker_thread_open.rs` (Phase 5c).
 engine = { path = "../engine", features = ["test-util"] }
+# `tests/startup_reads_before_lock.rs` computes the fixture startup
+# config's required `irDigest` by validating its own embedded IR the same
+# way `runtime::start` will.
+compiler-core = { path = "../compiler-core" }
+# `tests/kube_client_resolves_via_hickory_after_lockdown.rs`'s minimal
+# stand-in DNS server encodes/decodes real DNS wire-format messages with
+# this crate's own types (`Message`, `Record`, ...) instead of hand-rolling
+# wire bytes. Already resolves to the identical crate already in the
+# lockfile (`hickory-resolver`'s own dependency), not a second copy.
+hickory-proto = "0.26"
+
+# `harness = false`: each of these binaries' own `fn main` applies a real
+# Landlock lockdown (directly, or via `runtime::start`) to its own main
+# thread, which must not leak into other tests' threads under libtest's
+# shared-process default per-test-thread harness -- the same reason
+# `crates/engine/tests/landlock_order.rs` uses it. See each file's own doc
+# comment for what it proves.
+[[test]]
+name = "landlock_denies_worker_thread_open"
+path = "tests/landlock_denies_worker_thread_open.rs"
+harness = false
+
+[[test]]
+name = "startup_reads_before_lock"
+path = "tests/startup_reads_before_lock.rs"
+harness = false

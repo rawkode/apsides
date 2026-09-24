@@ -71,7 +71,11 @@ pub fn emit(plan: &CompiledPlan, output: &Path, stage: &Path) -> Result<()> {
     )?;
     let runtime_path = assets.join("crates/runtime").canonicalize()?;
     let manifest = format!(
-        "[package]\nname = \"controller\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n\n[dependencies]\nruntime = {{ path = {} }}\ntokio = {{ version = \"1\", features = [\"macros\", \"rt-multi-thread\"] }}\n",
+        // No `tokio` dependency here: `main.rs` is synchronous (see the
+        // Apsides v0.3 plan, Phase 5c) and calls `runtime::start` directly,
+        // which builds and owns its own tokio runtime internally, after
+        // Landlock lockdown.
+        "[package]\nname = \"controller\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n\n[dependencies]\nruntime = {{ path = {} }}\n",
         serde_json::to_string(runtime_path.to_str().ok_or("non UTF-8 runtime path")?)?
     );
     write(
@@ -81,11 +85,19 @@ pub fn emit(plan: &CompiledPlan, output: &Path, stage: &Path) -> Result<()> {
         &mut files,
     )?;
     let main_rs = format!(
-        "use std::io::Write as _;\n\n\
+        "//! Synchronous by design (see the Apsides v0.3 plan, \"5c. Filesystem\n\
+         //! lockdown\"): `runtime::start` reads every file the controller will\n\
+         //! ever need, builds the kube client's in-memory TLS/DNS state, then\n\
+         //! applies a deny-all Landlock ruleset to this thread -- before any\n\
+         //! other thread in the process exists -- and only then builds the\n\
+         //! tokio runtime this generated binary never constructs itself. No\n\
+         //! the usual tokio-main attribute macro here: that macro would build the runtime (and its\n\
+         //! worker threads) before `main` runs at all, before lockdown had a\n\
+         //! chance to happen first.\n\
+         use std::io::Write as _;\n\n\
          const HANDLERS: &[(&str, &str)] = &[{handlers}];\n\n\
-         #[tokio::main]\n\
-         async fn main() {{\n    \
-             if let Err(error) = runtime::run(include_str!(\"ir.json\"), HANDLERS).await {{\n        \
+         fn main() {{\n    \
+             if let Err(error) = runtime::start(include_str!(\"ir.json\"), HANDLERS) {{\n        \
                  let _ = writeln!(std::io::stderr().lock(), \"apsides controller: {{error}}\");\n        \
                  std::process::exit(1);\n    \
              }}\n\

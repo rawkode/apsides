@@ -121,5 +121,6 @@ fn fixture_config_is_explicitly_bounded() {
         poll_interval_millis: 100,
         max_watch_cycles: 1,
         rollout_key: None,
+        allow_no_landlock: false,
     };
 }

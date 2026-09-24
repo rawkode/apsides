@@ -148,8 +148,16 @@ fn compiled_handler_bundle_is_embedded_and_referenced_by_main_rs() -> Result {
         "main.rs embeds the handler bundle with include_str!: {main_rs}"
     );
     assert!(
-        main_rs.contains("runtime::run(include_str!(\"ir.json\"), HANDLERS)"),
-        "main.rs passes the embedded handlers to runtime::run: {main_rs}"
+        main_rs.contains("runtime::start(include_str!(\"ir.json\"), HANDLERS)"),
+        "main.rs passes the embedded handlers to runtime::start: {main_rs}"
+    );
+    assert!(
+        !main_rs.contains("async fn main") && !main_rs.contains("#[tokio::main]"),
+        "main.rs is synchronous and must not use #[tokio::main]: {main_rs}"
+    );
+    assert!(
+        main_rs.contains("fn main() {"),
+        "main.rs declares a plain, synchronous fn main: {main_rs}"
     );
 
     let manifest: Value = serde_json::from_str(&fs::read_to_string(output.join("manifest.json"))?)?;
