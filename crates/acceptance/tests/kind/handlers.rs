@@ -100,6 +100,40 @@ struct Managers {
     reconciler: String,
 }
 
+/// On a wait timeout, appends the live `handler-derived` output's data
+/// keys (never values -- redaction stays consistent with the diagnostics
+/// collector's own discipline even though this output holds no secret),
+/// revision annotation and `managedFields` managers/operations to the
+/// error, so a `Deadline` is never as opaque as the CI-only failure this
+/// diagnostic was added for: the acceptance report's own redacted
+/// `diagnostics.json` strips both `data` and `managedFields` from every
+/// object on purpose, so it alone could not show whether the output's
+/// data was actually empty or the harness's own capture was misleading.
+/// Only ever fetched after a real failure, never on the hot path.
+async fn describe_deadline(objects: &Objects, error: Error) -> Error {
+    let Error::Deadline(message) = &error else {
+        return error;
+    };
+    let Ok(output) = objects
+        .require("v1", "ConfigMap", Some(WORKLOAD_NAMESPACE), OUTPUT_NAME)
+        .await
+    else {
+        return error;
+    };
+    let keys: Vec<String> = data_of(&output).into_keys().collect();
+    let revision = revision_of(&output).to_owned();
+    let managers: Vec<Value> = output["metadata"]["managedFields"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| json!({"manager": entry["manager"], "operation": entry["operation"]}))
+        .collect();
+    Error::Check(format!(
+        "{message}; live {OUTPUT_NAME}: dataKeys={keys:?} revision={revision:?} \
+         managedFields={managers:?}"
+    ))
+}
+
 /// The revision annotation of `output`.
 fn revision_of(output: &Value) -> &str {
     text(
@@ -116,7 +150,7 @@ async fn assert_first_invocation(
     managers: &Managers,
 ) -> Result<Value> {
     note("(1) the first invocation writes exactly {a,b}");
-    let first = wait::until("the output to reflect {a,b}", DISPATCH, async || {
+    let first = match wait::until("the output to reflect {a,b}", DISPATCH, async || {
         let output = objects
             .require("v1", "ConfigMap", Some(WORKLOAD_NAMESPACE), OUTPUT_NAME)
             .await?;
@@ -125,7 +159,11 @@ async fn assert_first_invocation(
             && !revision_of(&output).is_empty())
         .then_some(output))
     })
-    .await?;
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return Err(describe_deadline(objects, error).await),
+    };
     ensure(
         owned_data_keys(&first, &managers.handler)
             == BTreeSet::from(["a".to_owned(), "b".to_owned()]),
@@ -157,7 +195,7 @@ async fn assert_input_change_drops_a_key(
     note("(2) changing the input drops the key it no longer writes");
     let first_revision = revision_of(first).to_owned();
     update_source(objects, BTreeMap::from([("b", "2"), ("c", "3")])).await?;
-    let second = wait::until("the output to reflect {b,c}", DISPATCH, async || {
+    let second = match wait::until("the output to reflect {b,c}", DISPATCH, async || {
         let output = objects
             .require("v1", "ConfigMap", Some(WORKLOAD_NAMESPACE), OUTPUT_NAME)
             .await?;
@@ -167,7 +205,11 @@ async fn assert_input_change_drops_a_key(
             && !revision_of(&output).is_empty())
         .then_some(output))
     })
-    .await?;
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return Err(describe_deadline(objects, error).await),
+    };
     ensure(
         owned_data_keys(&second, &managers.handler)
             == BTreeSet::from(["b".to_owned(), "c".to_owned()]),
@@ -192,7 +234,7 @@ async fn assert_foreign_key_survives(
     let second_revision = revision_of(second).to_owned();
     add_foreign_key(objects, second, "foreign", "kept-value").await?;
     update_source(objects, BTreeMap::from([("b", "2"), ("c", "4")])).await?;
-    let third = wait::until(
+    let third = match wait::until(
         "the output to reflect {b,c} with c changed",
         DISPATCH,
         async || {
@@ -210,7 +252,11 @@ async fn assert_foreign_key_survives(
             .then_some(output))
         },
     )
-    .await?;
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return Err(describe_deadline(objects, error).await),
+    };
     ensure(
         owned_data_keys(&third, &managers.handler)
             == BTreeSet::from(["b".to_owned(), "c".to_owned()]),

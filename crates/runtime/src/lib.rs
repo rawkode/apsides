@@ -1883,4 +1883,45 @@ mod tests {
         assert!(extra.to_string().contains("not declared"), "{extra}");
         Ok(())
     }
+
+    /// Regression test for a CI-only acceptance failure (`handlers::
+    /// a_handler_commits_exactly_its_owned_keys_and_seeds_across_a_restart`,
+    /// assertion 1): closes the one link in that investigation neither
+    /// `handlers::tests::derive_keys_real_bundle` nor
+    /// `production::tests::handler_commit::handler_full_cycle_real_bundle`
+    /// covers, both of which hand-build an `Observation::Available`
+    /// directly rather than deriving it from a real Kubernetes response.
+    /// Parses a realistic `ConfigMap` JSON body -- as `kube`'s own
+    /// `Api<DynamicObject>::get_opt` would deserialize one off the wire,
+    /// through `DynamicObject`'s `#[serde(flatten)]` catch-all field, not
+    /// a hand-built `DynamicObject` value -- and requires
+    /// `observation_from_object` to read back exactly the `ConfigMap`'s own
+    /// `data` map, proving the JSON-to-`Observation` conversion this
+    /// crate's event-construction tests assume is itself correct.
+    #[test]
+    fn observation_from_object_reads_a_realistic_configmaps_data() -> TestResult {
+        let object: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": "handler-source", "namespace": "default", "uid": "source-uid", "resourceVersion": "617"},
+            "data": {"a": "1", "b": "2"},
+        }))?;
+        let Observation::Available {
+            data,
+            resource_version,
+        } = observation_from_object(&object)?
+        else {
+            return Err("expected an Available observation".into());
+        };
+        assert_eq!(resource_version, "617");
+        assert_eq!(
+            data,
+            BTreeMap::from([
+                ("a".to_owned(), "1".to_owned()),
+                ("b".to_owned(), "2".to_owned())
+            ]),
+            "observation_from_object must read back the ConfigMap's own data map, not an \
+             empty one, from a realistically-shaped Kubernetes response"
+        );
+        Ok(())
+    }
 }

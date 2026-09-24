@@ -318,6 +318,71 @@ impl engine::LogWriter for HandlerLogWriter {
     }
 }
 
+/// One JSON line to the controller's own stderr recording an
+/// invocation's dispatch or outcome -- the *only* place a real
+/// invocation's dispatch/outcome is ever recorded independent of the
+/// handler's own optional `apsides.log` calls (`HandlerLogWriter`,
+/// above, writes only when the handler code itself calls
+/// `apsides.log`). Added after a CI-only acceptance failure whose
+/// controller log was empty and therefore gave no signal at all: a
+/// handler that never calls `apsides.log` left no trace it had run,
+/// succeeded, or what it wrote. Never logs a handler *value*, only ids,
+/// the revision, output ids and the *keys* (never values) a successful
+/// commit actually wrote -- `fields` must never carry anything from a
+/// handler's own written data or the observed input snapshot.
+fn log_invocation(level: &str, event: &str, handler_id: &str, invocation_id: &str, fields: &Value) {
+    let mut line = json!({
+        "level": level,
+        "event": event,
+        "handler": handler_id,
+        "invocation": invocation_id,
+    });
+    if let (Some(line_object), Some(fields_object)) = (line.as_object_mut(), fields.as_object()) {
+        line_object.extend(fields_object.clone());
+    }
+    let _ = std::io::Write::write_fmt(&mut std::io::stderr().lock(), format_args!("{line}\n"));
+}
+
+/// Logs a completed commit attempt's outcome: on success, the *keys*
+/// (never values) actually committed per declared output, read from the
+/// sink's own buffer, not from what `commit_handler_outputs` reports
+/// back (which is only committed uids); on failure, the typed reason.
+fn log_commit_outcome(
+    handler_id: &str,
+    invocation_id: &str,
+    handler_outputs: &[String],
+    written: &BufferedWrites,
+    outcome: &Result<BTreeMap<String, String>, RuntimeError>,
+) {
+    match outcome {
+        Ok(_committed_uids) => {
+            let written_keys: BTreeMap<&str, Vec<&str>> = handler_outputs
+                .iter()
+                .map(|id| {
+                    let keys = written
+                        .get(id)
+                        .map_or_else(Vec::new, |keys| keys.keys().map(String::as_str).collect());
+                    (id.as_str(), keys)
+                })
+                .collect();
+            log_invocation(
+                "info",
+                "handler-committed",
+                handler_id,
+                invocation_id,
+                &json!({"writtenKeys": written_keys}),
+            );
+        }
+        Err(error) => log_invocation(
+            "warn",
+            "handler-commit-failed",
+            handler_id,
+            invocation_id,
+            &json!({"reason": error.to_string()}),
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------
 // HandlerRuntime
 // ---------------------------------------------------------------------
@@ -816,6 +881,14 @@ impl HandlerRuntime {
             invocation_id: invocation_id.clone(),
         });
 
+        log_invocation(
+            "info",
+            "handler-dispatching",
+            &handler_id,
+            &invocation_id,
+            &json!({"revision": queued.revision, "outputs": handler.outputs}),
+        );
+
         let report = tokio::task::spawn_blocking(move || {
             let usage = Arc::new(AtomicUsize::new(0));
             engine::invoke_handler_with_watchdog(
@@ -841,7 +914,7 @@ impl HandlerRuntime {
         match report.result {
             Ok(_value) => {
                 let written = buffered_sink.take();
-                crate::production::commit_handler_outputs(
+                let outcome = crate::production::commit_handler_outputs(
                     controller,
                     &handler.outputs,
                     &self.outputs_by_id,
@@ -850,15 +923,32 @@ impl HandlerRuntime {
                     &queued.revision,
                     output_uids,
                 )
-                .await
-                .map_err(|error| match error {
+                .await;
+                log_commit_outcome(
+                    &handler.id,
+                    &queued.event_id,
+                    &handler.outputs,
+                    &written,
+                    &outcome,
+                );
+                outcome.map_err(|error| match error {
                     RuntimeError::Terminating | RuntimeError::Platform(_) => {
                         InvokeCommitError::Fatal(error)
                     }
                     other => InvokeCommitError::Code(format!("HANDLER_COMMIT_FAILED:{other}")),
                 })
             }
-            Err(error) => Err(InvokeCommitError::Code(invoke_error_code(&error))),
+            Err(error) => {
+                let code = invoke_error_code(&error);
+                log_invocation(
+                    "warn",
+                    "handler-invocation-failed",
+                    &handler.id,
+                    &queued.event_id,
+                    &json!({"code": code}),
+                );
+                Err(InvokeCommitError::Code(code))
+            }
         }
     }
 
@@ -1689,6 +1779,112 @@ export async function fetchOnce() {{
             server
                 .join()
                 .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
+            Ok(())
+        }
+    }
+
+    /// Regression test for a CI-only acceptance failure (`handlers::
+    /// a_handler_commits_exactly_its_owned_keys_and_seeds_across_a_restart`,
+    /// assertion 1): `commit_handler_outputs` stamped the revision
+    /// annotation but wrote no data keys, as if the handler had written
+    /// nothing at all. This runs the REAL `handlers/derive-keys.ts` bundle
+    /// (the exact bytes `packages/compiler/src/compiler.ts`'s
+    /// `bundleHandlerModule` emits for
+    /// `crates/acceptance/programs/handler-output/handlers/derive-keys.ts`
+    /// -- captured by compiling that program with `compileApsides` and
+    /// reading `handlers/<id>.js`, not a hand-written approximation)
+    /// through the exact event this crate's own `handler_inputs_snapshot`/
+    /// `compute_input_revision`/`build_event` build for a realistic
+    /// observed `ConfigMap` snapshot, and the exact
+    /// `production_egress_policy`/`handler_limits`/`BufferedOutputSink`
+    /// shape `HandlerRuntime::invoke` uses -- proving (or disproving) the
+    /// "double-wrapped/mismatched event shape" hypothesis independently of
+    /// a kind cluster.
+    mod derive_keys_real_bundle {
+        use super::*;
+        use engine::{HandlerInvocation, OutputDeclaration, StderrLogWriter};
+
+        /// Regenerate by compiling
+        /// `crates/acceptance/programs/handler-output/program.tsx` with
+        /// `compileApsides` (`packages/compiler/src/compiler.ts`) and
+        /// reading `handlers/<id>.js` from its output, if
+        /// `handlers/derive-keys.ts`'s source ever changes.
+        const DERIVE_KEYS_BUNDLE: &str = r#"
+//#region apsides:/source/handlers/derive-keys.ts
+/**
+* Copies every key of the `handler-source` input's `data` into the
+* `handler-derived` output, unchanged. No egress: the whole point of this
+* handler is to exercise the runtime's own commit path (uid binding,
+* per-key SSA ownership), not any capability the handler itself uses.
+*/
+async function deriveKeys(event) {
+	const data = event.inputs["handler-source"]?.data ?? {};
+	const keys = Object.keys(data).sort();
+	for (const key of keys) {
+		apsides.writeOutput("handler-derived", key, data[key] ?? "");
+	}
+	return { keys };
+}
+
+//#endregion
+export { deriveKeys };
+"#;
+
+        #[test]
+        fn the_real_bundle_writes_every_input_key_from_a_realistic_event() -> TestResult {
+            // `handler()` builds a fixture whose module/export are
+            // `handlers/sync.ts`/`sync`; overridden here to match the real
+            // bundle's actual export name, since `derive-keys.ts` exports
+            // `deriveKeys`.
+            let mut handler = handler("derive-keys", &["handler-source"], &["handler-derived"]);
+            handler.module = "handlers/derive-keys.ts".into();
+            handler.export = "deriveKeys".into();
+            let mut observations = BTreeMap::new();
+            observations.insert(
+                "handler-source".to_owned(),
+                available(&[("a", "1"), ("b", "2")]),
+            );
+            let inputs = handler_inputs_snapshot(&handler, &observations)
+                .ok_or("expected the observed input to be ready")?;
+            let revision = compute_input_revision(&handler, &inputs)?;
+            let (_event_id, event) = build_event(&handler, &inputs, &revision)?;
+
+            let sink = Arc::new(BufferedOutputSink::new());
+            let sink_for_engine: Arc<dyn engine::OutputSink> = sink.clone();
+            let usage = Arc::new(AtomicUsize::new(0));
+            let report = engine::invoke_handler_with_watchdog(
+                HandlerInvocation {
+                    bundle: DERIVE_KEYS_BUNDLE,
+                    export: &handler.export,
+                    event,
+                    limits: handler_limits(&handler),
+                    egress: production_egress_policy(&handler),
+                    outputs: vec![OutputDeclaration {
+                        id: "handler-derived".into(),
+                        max_bytes: 262_144,
+                    }],
+                    sink: sink_for_engine,
+                    resolver: None,
+                    handler_id: &handler.id,
+                    invocation_id: "test-invocation",
+                    log_writer: Arc::new(StderrLogWriter),
+                },
+                &usage,
+            );
+            report
+                .result
+                .map_err(|error| format!("expected the real bundle to succeed: {error}"))?;
+            let written = sink.take();
+            assert_eq!(
+                written.get("handler-derived").cloned().unwrap_or_default(),
+                BTreeMap::from([
+                    ("a".to_owned(), "1".to_owned()),
+                    ("b".to_owned(), "2".to_owned())
+                ]),
+                "the real derive-keys.ts bundle must write both input keys from a \
+                 realistic observed snapshot -- if this fails, the event shape \
+                 `build_event` constructs does not match what the handler reads"
+            );
             Ok(())
         }
     }

@@ -3152,5 +3152,191 @@ mod tests {
             );
             Ok(())
         }
+
+        /// Full-pipeline regression test for a CI-only acceptance failure
+        /// (`handlers::
+        /// a_handler_commits_exactly_its_owned_keys_and_seeds_across_a_restart`,
+        /// assertion 1: `Deadline("the output to reflect {a,b}")`, the output
+        /// carrying its revision annotation but no data keys). Drives
+        /// `HandlerRuntime::run_cycle` -- the exact `detect_triggers` ->
+        /// `dispatch_ready` -> `invoke` -> `commit_handler_outputs` path
+        /// `reconcile()` itself uses -- with a realistic observed snapshot and
+        /// the REAL `handlers/derive-keys.ts` bundle (the same bytes as
+        /// `handlers::tests::derive_keys_real_bundle`, which isolates the
+        /// event-construction/engine half of this same question; this test
+        /// isolates everything downstream of it instead: `HandlerRuntime`'s
+        /// queueing, `commit_handler_outputs`'s uid binding and untouched-key
+        /// handling, and the real SSA request this crate builds from the
+        /// sink's buffered writes), and inspects the actual wire PATCH body
+        /// `commit_handler_outputs` sends.
+        mod handler_full_cycle_real_bundle {
+            use super::*;
+
+            /// See `handlers::tests::derive_keys_real_bundle::DERIVE_KEYS_BUNDLE`
+            /// for how this was captured.
+            const DERIVE_KEYS_BUNDLE: &str = r#"
+//#region apsides:/source/handlers/derive-keys.ts
+async function deriveKeys(event) {
+	const data = event.inputs["handler-source"]?.data ?? {};
+	const keys = Object.keys(data).sort();
+	for (const key of keys) {
+		apsides.writeOutput("handler-derived", key, data[key] ?? "");
+	}
+	return { keys };
+}
+
+//#endregion
+export { deriveKeys };
+"#;
+            const HANDLERS: &[(&str, &str)] = &[("derive-keys", DERIVE_KEYS_BUNDLE)];
+
+            fn real_plan() -> TestResult<CompiledPlan> {
+                Ok(parse_and_validate(&json!({
+                "schemaVersion":"apsides.dev/ir/v2", "testOnly":false,
+                "domain":{"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound","minKubernetesVersion":"1.34","budgets":{"maxResources":8,"maxInputs":8,"maxReactions":8,"maxObjectBytes":262_144,"maxQueueDepth":8,"maxConcurrentRequests":2}},
+                "resources":[{
+                    "id":"handler-derived","apiVersion":"v1","kind":"ConfigMap","name":"handler-derived","namespace":"workload",
+                    "handlerOutput":true,
+                    "desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"handler-derived","namespace":"workload","labels":{"apsides.dev/handler-output":"handler-derived"}}},
+                    "lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"program.tsx","line":1,"column":1}
+                }],
+                "inputs":[
+                    {"id":"handler-source","apiVersion":"v1","kind":"ConfigMap","name":"handler-source","namespace":"workload","mode":"observed","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.tsx","line":1,"column":1}},
+                    {"id":"output-input-handler-derived","apiVersion":"v1","kind":"ConfigMap","name":"handler-derived","namespace":"workload","mode":"output","managedResourceId":"handler-derived","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.tsx","line":1,"column":1}}
+                ],
+                "reactions":[],
+                "handlers":[{
+                    "id":"derive-keys","module":"handlers/derive-keys.ts","export":"deriveKeys",
+                    "trigger":{"kind":"input-changed","input":"handler-source"},
+                    "inputs":["handler-source"],"egress":[],"outputs":["handler-derived"],
+                    "timeoutMillis":5_000,"maxHeapBytes":8_388_608,
+                    "bundleSha256": "0".repeat(64),"source":{"file":"program.tsx","line":1,"column":1}
+                }],
+                "outputs":[{"id":"handler-derived","name":"handler-derived","namespace":"workload"}],
+                "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.tsx","sha256":"0".repeat(64)},{"path":"handlers/derive-keys.ts","sha256":"1".repeat(64)}]}
+            }).to_string())?)
+            }
+
+            /// `existing` (before any handler commit), `projected` (the dry-run
+            /// response) and `applied` (the real commit response) for
+            /// `handler-derived`, plus the two `authority.verify()` round-trips
+            /// `commit_handler_outputs`/`apply_existing_claimed` each need --
+            /// see `run_cycle_commits_the_real_bundles_written_keys`.
+            fn commit_wire_responses(
+                activation: &ActivationState,
+                policy: &PolicyState,
+            ) -> TestResult<Vec<Value>> {
+                let existing = json!({
+                    "apiVersion":"v1","kind":"ConfigMap",
+                    "metadata":{"name":"handler-derived","namespace":"workload","uid":"handler-derived-uid","resourceVersion":"5",
+                        "labels":{"apsides.dev/handler-output":"handler-derived"},
+                        "managedFields":[{"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:metadata":{"f:labels":{}}},"manager":"apsides-example","operation":"Apply"}]},
+                    "data":{},
+                });
+                let projected = json!({
+                    "apiVersion":"v1","kind":"ConfigMap",
+                    "metadata":{"name":"handler-derived","namespace":"workload","uid":"handler-derived-uid","resourceVersion":"5",
+                        "labels":{"apsides.dev/handler-output":"handler-derived"},
+                        "annotations":{"apsides.dev/handler-input-revision":"placeholder"}},
+                    "data":{"a":"1","b":"2"},
+                });
+                let applied = json!({
+                    "apiVersion":"v1","kind":"ConfigMap",
+                    "metadata":{"name":"handler-derived","namespace":"workload","uid":"handler-derived-uid","resourceVersion":"6",
+                        "labels":{"apsides.dev/handler-output":"handler-derived"},
+                        "annotations":{"apsides.dev/handler-input-revision":"placeholder"},
+                        "managedFields":[
+                            {"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:metadata":{"f:labels":{}}},"manager":"apsides-example","operation":"Apply"},
+                            {"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:data":{},"f:metadata":{"f:annotations":{}}},"manager":"apsides-handler-example","operation":"Apply"}
+                        ]},
+                    "data":{"a":"1","b":"2"},
+                });
+                Ok(vec![
+                    existing,
+                    control_object(
+                        "apsides-activation-example",
+                        activation,
+                        "activation-uid",
+                        "20",
+                    )?,
+                    control_object("apsides-policy-example", policy, "policy-uid", "19")?,
+                    projected,
+                    control_object(
+                        "apsides-activation-example",
+                        activation,
+                        "activation-uid",
+                        "20",
+                    )?,
+                    control_object("apsides-policy-example", policy, "policy-uid", "19")?,
+                    applied,
+                ])
+            }
+
+            #[tokio::test]
+            async fn run_cycle_commits_the_real_bundles_written_keys() -> TestResult {
+                let plan = real_plan()?;
+                let policy = policy(&plan);
+                let activation = handler_activation(&plan, &policy, &["handler-derived"])?;
+                let (client, calls) = wire(commit_wire_responses(&activation, &policy)?);
+                let controller = controller(&plan, &activation, client)?;
+                let (unused_client, _unused_calls) = wire(vec![]);
+
+                let mut handler_runtime = crate::handlers::HandlerRuntime::new(
+                    &plan,
+                    HANDLERS,
+                    "apsides-handler-example".into(),
+                    Duration::from_millis(1),
+                    Duration::from_millis(10),
+                    None,
+                )?;
+
+                let mut observations = BTreeMap::new();
+                observations.insert(
+                    "handler-source".to_owned(),
+                    Observation::Available {
+                        data: BTreeMap::from([
+                            ("a".to_owned(), "1".to_owned()),
+                            ("b".to_owned(), "2".to_owned()),
+                        ]),
+                        resource_version: "1".into(),
+                    },
+                );
+                let applied_set = BTreeSet::from(["handler-derived".to_owned()]);
+                let output_uids = BTreeMap::from([(
+                    "handler-derived".to_owned(),
+                    "handler-derived-uid".to_owned(),
+                )]);
+
+                let conditions = handler_runtime
+                    .run_cycle(
+                        &plan,
+                        &observations,
+                        &applied_set,
+                        &output_uids,
+                        &unused_client,
+                        &controller,
+                    )
+                    .await?;
+                assert!(
+                    conditions.is_empty(),
+                    "the handler invocation must succeed with no conditions: {conditions:?}"
+                );
+
+                let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
+                let real_patch = calls
+                    .iter()
+                    .rev()
+                    .find(|(method, uri, _)| *method == Method::PATCH && !uri.contains("dryRun"))
+                    .ok_or("expected exactly one real (non-dry-run) PATCH")?;
+                assert_eq!(
+                    real_patch.2.get("data"),
+                    Some(&json!({"a": "1", "b": "2"})),
+                    "the real SSA the runtime sends for handler-derived must carry both keys the \
+                 real bundle wrote -- this is the exact request body a CI-only failure showed \
+                 empty"
+                );
+                Ok(())
+            }
+        }
     }
 }
