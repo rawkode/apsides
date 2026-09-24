@@ -479,7 +479,7 @@ throws(() => constrained.manage(new ConfigMap({ metadata: { name: "two", namespa
     outputs: [],
     source,
   }), "wildcard");
-  for (const host of ["127.1", "2130706433", "0x7f.1", "0177.0.0.1", "1.2.3.04", "example.123", "localhost", "internal"]) {
+  for (const host of ["127.1", "2130706433", "0x7f.1", "0177.0.0.1", "1.2.3.04", "example.123", "localhost", "internal", "foo.localhost", "bar.foo.localhost"]) {
     throws(() => defineHandler(value, {
       module: "./handlers/bad.ts",
       export: "bad",

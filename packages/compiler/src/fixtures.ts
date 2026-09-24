@@ -154,8 +154,26 @@ const commonScenarios = [
   ["rollout-readiness", "workload", "real new-template Pods reach fixture readiness"],
 ] as const;
 
-const observedScenarios = [
+// Scenarios that apply identically to "observed" and "output"-mode inputs:
+// both are observed live, so a foreign writer's change and a handler's own
+// write change the revision the same way, and a restart relists and
+// converges on either one's latest live value the same way. Mirrors Rust's
+// `test_plan.rs`'s `LIVE_SHARED`. For a reaction whose inputs span both
+// modes, one row per scenario here covers every relevant input (observed
+// and output together) so (reactionId, scenario) stays unique -- see
+// `observedOnlyScenarios` below for scenarios that cannot be merged this way.
+const liveSharedScenarios = [
   ["projected-change", "semantic", "changed projected data changes the revision"],
+  ["restart-and-relist", "workload", "controller restart converges from changes made while stopped"],
+] as const;
+
+// Scenarios that apply only to "observed"-mode inputs, never "output" ones:
+// each models a failure mode specific to an external writer's input, which
+// cannot apply to a handler-written output (see `test_plan.rs`'s
+// `OBSERVED_ONLY` doc comment for why, scenario by scenario). Applicability
+// here is always the reaction's observed inputs alone, even for a mixed
+// reaction, since none of these can involve an output one.
+const observedOnlyScenarios = [
   ["coalesced-inputs", "semantic", "evaluation uses the latest complete input set"],
   ["missing-input", "semantic", "missing required input blocks dependent mutation"],
   ["input-returned", "semantic", "returning required input recovers the stable revision"],
@@ -163,7 +181,6 @@ const observedScenarios = [
   ["credential-read-denial", "api", "actual runtime credentials cannot read a declared input denied by policy and dependent mutation remains blocked"],
   ["unavailable-input", "semantic", "transport failure is distinguishable from absence"],
   ["invalid-input", "semantic", "invalid projection blocks without exposing contents"],
-  ["restart-and-relist", "workload", "controller restart converges from changes made while stopped"],
 ] as const;
 
 const managedDriftScenario = ["managed-drift-repair", "workload", "external managed-source data drift is repaired to declared intent without changing revision"] as const;
@@ -181,9 +198,10 @@ const fixtureCoverage = (ir: ProductionIr, fixtures: FixtureBundle, productionIr
   let requiredCases = 0;
   const reactions = ir.reactions.map(reaction => {
     const reactionInputs = reaction.inputs.map(id => inputs.get(id)).filter((input): input is Input => input !== undefined);
+    const observedOnly = reactionInputs.filter(input => input.mode === "observed");
     // Output-mode inputs are observed live, exactly like Observed inputs
-    // (InputMode::Output), so they share the same coverage scenarios.
-    const observed = reactionInputs.filter(input => input.mode === "observed" || input.mode === "output");
+    // (InputMode::Output), so both feed the scenarios in `liveSharedScenarios`.
+    const live = reactionInputs.filter(input => input.mode === "observed" || input.mode === "output");
     const managed = reactionInputs.filter(input => input.mode === "managed");
     const managedWithOwnedData = managed.filter(input => {
       const data = input.managedResourceId === undefined ? undefined : resources.get(input.managedResourceId)?.desired.data;
@@ -191,7 +209,8 @@ const fixtureCoverage = (ir: ProductionIr, fixtures: FixtureBundle, productionIr
     });
     const selected = [
       ...commonScenarios.map(scenario => ({ scenario: scenario[0] === "field-conflict" && resources.get(reaction.target)?.force === true ? forceScenario : scenario, applicable: reactionInputs })),
-      ...(observed.length === 0 ? [] : observedScenarios.map(scenario => ({ scenario, applicable: observed }))),
+      ...(live.length === 0 ? [] : liveSharedScenarios.map(scenario => ({ scenario, applicable: live }))),
+      ...(observedOnly.length === 0 ? [] : observedOnlyScenarios.map(scenario => ({ scenario, applicable: observedOnly }))),
       ...(managedWithOwnedData.length === 0 ? [] : [{ scenario: managedDriftScenario, applicable: managedWithOwnedData }]),
       ...(managed.length === 0 ? [] : managedScenarios.map(scenario => ({ scenario, applicable: managed }))),
       { scenario: mutationScenario, applicable: reactionInputs },

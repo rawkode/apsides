@@ -1226,7 +1226,9 @@ const endsInANumber = (host: string): boolean => {
  * an IP literal (v4 or v6), never a numeric IPv4 shorthand (decimal, hex or
  * octal — see {@link endsInANumber}), never `localhost` or another
  * single-label host (an egress host always has at least one dot), never
- * containing a wildcard — with an optional `:port` suffix defaulting to 443.
+ * under the `.localhost` TLD RFC 6761 reserves for loopback (`foo.localhost`,
+ * `bar.foo.localhost`, …), never containing a wildcard — with an optional
+ * `:port` suffix defaulting to 443.
  */
 const egressHost = (value: unknown, context: string): EgressHost => {
   const raw = text(value, context);
@@ -1241,12 +1243,13 @@ const egressHost = (value: unknown, context: string): EgressHost => {
     host.length > 253 ||
     host.includes("*") ||
     host === "localhost" ||
+    host.endsWith(".localhost") ||
     !host.includes(".") ||
     isIpLiteral(host) ||
     endsInANumber(host) ||
     !host.split(".").every((part) => dnsLabelPattern.test(part) && part.length <= 63)
   ) {
-    throw new Error(`${context} host must be a lowercase DNS name (never an IP literal, a numeric shorthand, localhost, or a wildcard)`);
+    throw new Error(`${context} host must be a lowercase DNS name (never an IP literal, a numeric shorthand, localhost or *.localhost, or a wildcard)`);
   }
   return freeze({ host, port });
 };
