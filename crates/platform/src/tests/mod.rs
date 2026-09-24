@@ -708,6 +708,7 @@ fn activation(plan: &CompiledPlan, policy: &PolicyState) -> TestResult<Activatio
             capability_digest: digest(&plan.capabilities)?,
             service_account_name: "apsides-example-generation-a".into(),
             controller_image: format!("example.invalid/controller@sha256:{}", "b".repeat(64)),
+            max_handler_heap_bytes: 0,
         },
         status: ActivationStatus::Active,
         approved_claims: vec![ApprovedClaim {

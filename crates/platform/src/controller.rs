@@ -275,6 +275,14 @@ impl PlatformClient {
                 .service_account_name
                 .clone(),
             controller_image: release.image.into(),
+            max_handler_heap_bytes: next
+                .compiled
+                .ir
+                .handlers
+                .iter()
+                .map(|handler| handler.max_heap_bytes)
+                .max()
+                .unwrap_or(0),
         };
         crate::runtime::validate_binding(&binding)?;
         Ok(binding)
@@ -479,6 +487,22 @@ fn startup_config(binding: &RuntimeBinding, control_namespace: &str) -> Value {
     json!({"mode":"production","apiAccess":"proxy","controlNamespace":control_namespace,"binding":binding,"pollIntervalMillis":1_000,"baseBackoffMillis":500,"maxBackoffMillis":30_000,"minMutationIntervalMillis":100,"diagnosticsBind":"0.0.0.0:8080"})
 }
 
+/// The controller pod's memory limit, as a whole `"<N>Mi"` quantity: a fixed
+/// 256Mi reconciler/runtime baseline, plus the largest `maxHeapBytes` any one
+/// declared handler needs (0 for a domain with no handlers), plus a fixed
+/// 32Mi allowance for the V8 platform/isolate bookkeeping and the bundle(s)
+/// embedded alongside it. `max_handler_heap_bytes` is a *ceiling* (handlers
+/// run one at a time, one isolate per invocation -- see the Apsides v0.3
+/// plan, Phase 5b), not a sum over every declared handler, so this scales
+/// with the domain's single largest handler, never with how many it has.
+fn controller_memory_limit_mi(binding: &RuntimeBinding) -> String {
+    const BASELINE_MI: u64 = 256;
+    const ENGINE_OVERHEAD_MI: u64 = 32;
+    const BYTES_PER_MI: u64 = 1024 * 1024;
+    let handler_mi = binding.max_handler_heap_bytes.div_ceil(BYTES_PER_MI);
+    format!("{}Mi", BASELINE_MI + handler_mi + ENGINE_OVERHEAD_MI)
+}
+
 fn controller_deployment(
     binding: &RuntimeBinding,
     namespace: &str,
@@ -496,7 +520,8 @@ fn controller_deployment(
         json!({"name":"proxy-client","secret":{"secretName":proxy_secret,"defaultMode":420,"items":[{"key":"ca.crt","path":"ca.crt"},{"key":"client.crt","path":"tls.crt"},{"key":"client.key","path":"tls.key"}]}}),
     ];
     let account = format!("{}-process", binding.service_account_name);
-    let mut deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":binding.service_account_name,"namespace":namespace},"spec":{"replicas":0,"selector":{"matchLabels":labels},"strategy":{"type":"Recreate"},"template":{"metadata":{"labels":labels,"finalizers":[crate::TERMINATION_FINALIZER]},"spec":{"serviceAccountName":account,"automountServiceAccountToken":false,"tolerations":[{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoExecute"},{"key":"node.kubernetes.io/unreachable","operator":"Exists","effect":"NoExecute"}],"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"controller","image":binding.controller_image,"imagePullPolicy":"IfNotPresent","env":[{"name":"APSIDES_RUNTIME_CONFIG_PATH","value":"/etc/apsides/config.json"}],"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}},"volumeMounts":mounts,"ports":[{"containerPort":8080,"name":"diagnostics"}],"resources":{"requests":{"cpu":"10m","memory":"32Mi"},"limits":{"cpu":"1","memory":"256Mi"}},"livenessProbe":{"httpGet":{"path":"/livez","port":"diagnostics"}},"readinessProbe":{"httpGet":{"path":"/readyz","port":"diagnostics"}}}],"volumes":volumes}}}});
+    let memory_limit = controller_memory_limit_mi(binding);
+    let mut deployment = json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":binding.service_account_name,"namespace":namespace},"spec":{"replicas":0,"selector":{"matchLabels":labels},"strategy":{"type":"Recreate"},"template":{"metadata":{"labels":labels,"finalizers":[crate::TERMINATION_FINALIZER]},"spec":{"serviceAccountName":account,"automountServiceAccountToken":false,"tolerations":[{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoExecute"},{"key":"node.kubernetes.io/unreachable","operator":"Exists","effect":"NoExecute"}],"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"controller","image":binding.controller_image,"imagePullPolicy":"IfNotPresent","env":[{"name":"APSIDES_RUNTIME_CONFIG_PATH","value":"/etc/apsides/config.json"}],"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}},"volumeMounts":mounts,"ports":[{"containerPort":8080,"name":"diagnostics"}],"resources":{"requests":{"cpu":"10m","memory":"32Mi"},"limits":{"cpu":"1","memory":memory_limit}},"livenessProbe":{"httpGet":{"path":"/livez","port":"diagnostics"}},"readinessProbe":{"httpGet":{"path":"/readyz","port":"diagnostics"}}}],"volumes":volumes}}}});
     set_image_pull_secrets(&mut deployment, pull_secrets);
     deployment
 }
@@ -609,6 +634,7 @@ mod image_pull_tests {
             capability_digest: "capability".into(),
             service_account_name: "runtime".into(),
             controller_image: "registry/controller@sha256:digest".into(),
+            max_handler_heap_bytes: 0,
         };
         let names = vec!["registry-auth".to_string()];
         let populated = controller_deployment(&binding, "control", "config", "tls", &names);

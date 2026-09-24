@@ -130,6 +130,7 @@ fn registry() -> Result<(NamespaceRegistry, deploy::TransitionPlan)> {
             capability_digest: BUILD.into(),
             service_account_name: SERVICE_ACCOUNT_1.into(),
             controller_image: "image".into(),
+            max_handler_heap_bytes: 0,
         }),
         staged_trust_policy_digest: None,
         staged_provenance_digest: None,
@@ -412,6 +413,7 @@ fn review_checkpoint(
             capability_digest: BUILD.into(),
             service_account_name: name.clone(),
             controller_image: format!("registry.example/controller@{BUILD}"),
+            max_handler_heap_bytes: 0,
         },
         request_drain_qualification: platform::RequestDrainQualification::IsolatedEnvoy {
             qualification_digest: BUILD.into(),

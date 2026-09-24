@@ -361,6 +361,7 @@ mod image_pull_tests {
             capability_digest: "capability".into(),
             service_account_name: "runtime".into(),
             controller_image: "registry/controller@sha256:digest".into(),
+            max_handler_heap_bytes: 0,
         };
         let names = vec!["registry-auth".to_string()];
         let populated = proxy_deployment(&binding, "control", "config", "tls", &names);
