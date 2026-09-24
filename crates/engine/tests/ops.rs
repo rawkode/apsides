@@ -21,7 +21,8 @@ use common::https_fixture::{FIXTURE_HOST, HttpsFixtureServer};
 use common::{handler_invocation, wrap_as_handler};
 use engine::{
     EgressPolicy, FIXTURE_ACKNOWLEDGEMENT, FixtureEgressOverride, HandlerInvocation,
-    InvocationReport, OutputDeclaration, OutputSink, OutputSinkError, invoke_handler_blocking,
+    InvocationReport, LogWriter, OutputDeclaration, OutputSink, OutputSinkError,
+    invoke_handler_blocking,
 };
 
 fn no_usage() -> Arc<AtomicUsize> {
@@ -369,12 +370,7 @@ fn fetch_short_content_length_is_an_error() -> Result<(), String> {
     let body = catches_code(&format!(r#"await apsides.fetch("{url}", {{}});"#));
 
     let report = run(&body, |invocation| invocation.egress = fixture_egress(&server));
-    let outcome = report
-        .result
-        .map_err(|err| format!("expected the handler to return a code, got Err: {err}"))?;
-    if outcome == serde_json::json!("NO_ERROR_THROWN") {
-        return Err("expected a short Content-Length body to be rejected, but it succeeded".to_owned());
-    }
+    assert_code(&report, "RESPONSE_BODY_FAILED")?;
 
     server.join()
 }
@@ -682,6 +678,317 @@ fn ops_are_closed_before_the_return_value_is_marshalled() -> Result<(), String> 
     if *output != serde_json::json!("OPS_CLOSED") {
         return Err(format!(
             "expected the getter's apsides.writeOutput call to fail with OPS_CLOSED, got {output:?}"
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// review round 6, N1: concurrent apsides.fetch calls
+// ---------------------------------------------------------------------
+
+/// N1: `Limits::max_concurrent_fetches` is enforced -- an extra call
+/// beyond the cap is rejected immediately with `FETCH_CONCURRENCY_EXCEEDED`,
+/// not merely queued or throttled.
+#[test]
+fn fetch_concurrent_calls_exceed_the_concurrency_cap() -> Result<(), String> {
+    let (server, _accepted) = HttpsFixtureServer::start_multi(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok",
+        3,
+    )?;
+    let url = fixture_url(&server);
+    let body = format!(
+        r#"
+        const results = await Promise.allSettled([
+            apsides.fetch("{url}", {{}}),
+            apsides.fetch("{url}", {{}}),
+            apsides.fetch("{url}", {{}}),
+        ]);
+        return results.map((r) => (r.status === "fulfilled" ? "OK" : r.reason.code));
+    "#
+    );
+
+    let report = run(&body, |invocation| {
+        invocation.egress = fixture_egress(&server);
+        invocation.limits.max_concurrent_fetches = 2;
+    });
+    let value = report
+        .result
+        .map_err(|err| format!("expected the handler to succeed, got Err: {err}"))?;
+    let codes = value
+        .as_array()
+        .ok_or_else(|| format!("expected an array, got {value:?}"))?;
+
+    let exceeded = codes
+        .iter()
+        .filter(|code| **code == serde_json::json!("FETCH_CONCURRENCY_EXCEEDED"))
+        .count();
+    let ok = codes.iter().filter(|code| **code == serde_json::json!("OK")).count();
+    if exceeded != 1 || ok != 2 {
+        return Err(format!(
+            "expected exactly 2 OK and 1 FETCH_CONCURRENCY_EXCEEDED among 3 concurrent calls \
+             against a cap of 2, got {codes:?}"
+        ));
+    }
+
+    server.join()
+}
+
+/// N1: concurrent `apsides.fetch` calls cannot together pull more than
+/// `Limits::max_fetch_bytes_total` into the process, even though each
+/// individual call's budget check runs before any of them has completed
+/// (the bug this fixes: 4 concurrent 3 MiB fetches against a 4 MiB budget
+/// used to all succeed, since the budget was only charged after a
+/// response finished).
+#[test]
+fn fetch_concurrent_calls_cannot_exceed_the_total_byte_budget() -> Result<(), String> {
+    let body_len = 3 * 1024 * 1024;
+    let mut response = format!("HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\n\r\n").into_bytes();
+    response.extend_from_slice(&vec![b'a'; body_len]);
+    let response: &'static [u8] = Box::leak(response.into_boxed_slice());
+
+    let (server, _accepted) = HttpsFixtureServer::start_multi(response, 4)?;
+    let url = fixture_url(&server);
+    let body = format!(
+        r#"
+        const results = await Promise.allSettled([
+            apsides.fetch("{url}", {{}}),
+            apsides.fetch("{url}", {{}}),
+            apsides.fetch("{url}", {{}}),
+            apsides.fetch("{url}", {{}}),
+        ]);
+        let succeeded = 0;
+        let totalBytes = 0;
+        for (const r of results) {{
+            if (r.status === "fulfilled") {{
+                succeeded += 1;
+                totalBytes += r.value.body.length;
+            }}
+        }}
+        return {{ succeeded, totalBytes }};
+    "#
+    );
+
+    let report = run(&body, |invocation| {
+        invocation.egress = fixture_egress(&server);
+        invocation.limits.max_fetch_bytes_total = 4 * 1024 * 1024;
+        invocation.limits.max_concurrent_fetches = 4;
+    });
+    let value = report
+        .result
+        .map_err(|err| format!("expected the handler to succeed, got Err: {err}"))?;
+    let succeeded = value
+        .get("succeeded")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("missing `succeeded` in {value:?}"))?;
+    let total_bytes = value
+        .get("totalBytes")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("missing `totalBytes` in {value:?}"))?;
+
+    if succeeded >= 4 {
+        return Err(format!(
+            "expected not every one of 4 concurrent 3 MiB fetches to succeed against a 4 MiB \
+             total budget, got {value:?}"
+        ));
+    }
+    if total_bytes > 4 * 1024 * 1024 {
+        return Err(format!(
+            "expected the combined bytes actually received across concurrent fetches to stay \
+             within the budget, got {total_bytes} bytes (full result: {value:?})"
+        ));
+    }
+
+    server.join()
+}
+
+/// N1: a request body counts against `Limits::max_fetch_bytes_total` too,
+/// not just the response -- no network needed, since the budget check
+/// runs before resolution/dialing.
+#[test]
+fn fetch_request_body_counts_against_the_byte_budget() -> Result<(), String> {
+    let body = catches_code(
+        r#"await apsides.fetch("https://not-listed.fixture.invalid/", { method: "POST", body: "x".repeat(600) });"#,
+    );
+    let report = run(&body, |invocation| {
+        invocation.limits.max_fetch_bytes_total = 500;
+    });
+    assert_code(&report, "FETCH_BYTE_BUDGET_EXCEEDED")
+}
+
+// ---------------------------------------------------------------------
+// review round 6, N2: capped, injectable log emission
+// ---------------------------------------------------------------------
+
+struct RecordingLogWriter {
+    lines: Mutex<Vec<String>>,
+}
+
+impl LogWriter for RecordingLogWriter {
+    fn write_line(&self, line: &str) {
+        if let Ok(mut lines) = self.lines.lock() {
+            lines.push(line.to_owned());
+        }
+    }
+}
+
+/// N2: the 64-line cap applies to emitted lines too (not just the
+/// in-memory `InvocationReport` copy), and exactly one final "dropped N
+/// log lines" record is emitted once the invocation finishes.
+#[test]
+fn log_emission_is_capped_and_reports_a_dropped_count() -> Result<(), String> {
+    let recording = Arc::new(RecordingLogWriter {
+        lines: Mutex::new(Vec::new()),
+    });
+    let bundle = wrap_as_handler(
+        r#"
+        for (let i = 0; i < 100; i++) {
+            apsides.log("info", "line " + i);
+        }
+        return "done";
+    "#,
+    );
+    let mut invocation = handler_invocation(&bundle);
+    invocation.log_writer = Arc::clone(&recording) as Arc<dyn LogWriter>;
+
+    invoke_handler_blocking(invocation, &no_usage())
+        .result
+        .map_err(|err| format!("expected the handler to succeed, got Err: {err}"))?;
+
+    let lines = recording
+        .lines
+        .lock()
+        .map_err(|_poisoned| "mutex poisoned".to_owned())?;
+    // 64 real lines + one final dropped-count record.
+    if lines.len() != 65 {
+        return Err(format!(
+            "expected 65 emitted lines (64 capped lines + 1 dropped-count record), got {}: {lines:?}",
+            lines.len()
+        ));
+    }
+    let last: serde_json::Value =
+        serde_json::from_str(&lines[64]).map_err(|err| format!("last emitted line was not JSON: {err}"))?;
+    if last.get("dropped_log_lines") != Some(&serde_json::json!(36)) {
+        return Err(format!(
+            "expected the final record's dropped_log_lines to be 36 (100 - 64), got {last:?}"
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// review round 6, non-blocking items
+// ---------------------------------------------------------------------
+
+/// hyper's own internal response-header-size limit (independent of this
+/// crate's own manual header count/byte cap, which never even sees a
+/// response hyper itself refused to buffer) is mapped to the same
+/// `RESPONSE_HEADERS_TOO_LARGE` code.
+#[test]
+fn fetch_denied_response_headers_too_large() -> Result<(), String> {
+    let mut response = b"HTTP/1.1 200 OK\r\n".to_vec();
+    for i in 0..150 {
+        response.extend_from_slice(format!("X-Test-{i}: value\r\n").as_bytes());
+    }
+    response.extend_from_slice(b"Content-Length: 0\r\n\r\n");
+    let response: &'static [u8] = Box::leak(response.into_boxed_slice());
+
+    let server = HttpsFixtureServer::start(response)?;
+    let url = fixture_url(&server);
+    let body = catches_code(&format!(r#"await apsides.fetch("{url}", {{}});"#));
+
+    let report = run(&body, |invocation| invocation.egress = fixture_egress(&server));
+    assert_code(&report, "RESPONSE_HEADERS_TOO_LARGE")?;
+
+    server.join()
+}
+
+/// An invalid request (here: a header value containing a raw CR/LF, which
+/// is not a valid `HeaderValue`) is rejected before any connection is
+/// opened -- confirmed against a server that counts accepted TCP
+/// connections, not just by checking the error code.
+#[test]
+fn fetch_invalid_request_never_opens_a_connection() -> Result<(), String> {
+    let (server, accepted) = HttpsFixtureServer::start_multi(b"", 0)?;
+    let url = fixture_url(&server);
+    let body = catches_code(&format!(
+        r#"await apsides.fetch("{url}", {{ headers: {{ "X-Evil": "a\r\nbad" }} }});"#
+    ));
+
+    let report = run(&body, |invocation| invocation.egress = fixture_egress(&server));
+    assert_code(&report, "INVALID_REQUEST_HEADER")?;
+
+    server.join()?;
+    let count = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    if count != 0 {
+        return Err(format!(
+            "expected zero connections to be opened for an invalid request, got {count}"
+        ));
+    }
+    Ok(())
+}
+
+/// A handler hijacking `Uint8Array.prototype[Symbol.toStringTag]`,
+/// `Array.prototype[Symbol.iterator]`, and `Array.prototype`'s numeric
+/// index setters (all things `BOOTSTRAP_GUARD_SCRIPT`'s `apsides.*`
+/// wrappers were found, in review, to have residual exposure to) must
+/// still get an ordinary, correct outcome: the op functions stay
+/// reachable and behave normally (not leaked, not broken), and body bytes
+/// passed through `apsides.writeOutput` are unchanged.
+#[test]
+fn apsides_wrappers_are_robust_to_prototype_and_symbol_hijacking() -> Result<(), String> {
+    let recording = Arc::new(RecordingOutputSink {
+        writes: Mutex::new(Vec::new()),
+    });
+    let bundle = wrap_as_handler(
+        r#"
+        Object.defineProperty(Uint8Array.prototype, Symbol.toStringTag, {
+            get() { return "NotUint8Array"; },
+            configurable: true,
+        });
+        Array.prototype[Symbol.iterator] = function () {
+            throw new Error("hijacked iterator");
+        };
+        Object.defineProperty(Array.prototype, "0", {
+            set() { throw new Error("hijacked index setter"); },
+            configurable: true,
+        });
+
+        let fetchThrew = false;
+        let fetchCode = null;
+        try {
+            await apsides.fetch("https://not-listed.fixture.invalid/", {});
+        } catch (e) {
+            fetchThrew = true;
+            fetchCode = e.code;
+        }
+
+        apsides.writeOutput("declared", "key", "hello");
+        return { fetchThrew, fetchCode };
+    "#,
+    );
+    let mut invocation = handler_invocation(&bundle);
+    invocation.outputs = one_declared_output(1024);
+    invocation.sink = Arc::clone(&recording) as Arc<dyn OutputSink>;
+
+    let report = invoke_handler_blocking(invocation, &no_usage());
+    let value = report.result.map_err(|err| {
+        format!("expected the handler to succeed despite the hijacks, got Err: {err}")
+    })?;
+    if value != serde_json::json!({ "fetchThrew": true, "fetchCode": "HOST_NOT_ALLOWED" }) {
+        return Err(format!(
+            "expected apsides.fetch to still fail its ordinary way (HOST_NOT_ALLOWED), with no \
+             op function leaked or corrupted by the hijacks, got {value:?}"
+        ));
+    }
+
+    let writes = recording
+        .writes
+        .lock()
+        .map_err(|_poisoned| "mutex poisoned".to_owned())?;
+    if writes.len() != 1 || writes[0].2 != b"hello" {
+        return Err(format!(
+            "expected the output write's bytes to be unchanged by the hijacks, got {writes:?}"
         ));
     }
     Ok(())

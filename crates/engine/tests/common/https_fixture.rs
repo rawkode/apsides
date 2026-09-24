@@ -15,7 +15,9 @@
 //! never sets `fixture_trust_anchor` at all.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -160,5 +162,136 @@ impl HttpsFixtureServer {
             Ok(result) => result,
             Err(_panic) => Err("fixture server thread panicked".to_owned()),
         }
+    }
+
+    /// Like [`Self::start`], but accepts up to `connections` connections
+    /// (each handled concurrently, after a small artificial delay before
+    /// responding, so several concurrent `apsides.fetch` calls all stay in
+    /// flight together rather than finishing one at a time), all serving
+    /// the same `response`. `connections: 0` starts a server that accepts
+    /// nothing at all and returns immediately -- used to confirm a request
+    /// this crate rejects before dialing never opens a connection.
+    ///
+    /// Returns the server plus a shared counter of TCP connections
+    /// actually accepted (incremented at `TcpListener::accept()`, before
+    /// any TLS handshake), so a test can assert exactly how many
+    /// connections were opened, independent of how many `apsides.fetch`
+    /// calls were attempted.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::start`].
+    pub fn start_multi(
+        response: &'static [u8],
+        connections: usize,
+    ) -> Result<(Self, Arc<AtomicUsize>), String> {
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec![FIXTURE_HOST.to_owned()])
+                .map_err(|err| format!("failed to generate the fixture certificate: {err}"))?;
+        let cert_der = cert.der().clone();
+        let ca_der = cert_der.to_vec();
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
+
+        let listener_std = std::net::TcpListener::bind("127.0.0.1:0")
+            .map_err(|err| format!("failed to bind the fixture listener: {err}"))?;
+        listener_std
+            .set_nonblocking(true)
+            .map_err(|err| format!("failed to set the fixture listener non-blocking: {err}"))?;
+        let addr = listener_std
+            .local_addr()
+            .map_err(|err| format!("failed to read the fixture listener's local address: {err}"))?;
+
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_for_thread = Arc::clone(&accepted);
+
+        let handle = std::thread::spawn(move || -> Result<(), String> {
+            let _ignored = rustls::crypto::ring::default_provider().install_default();
+
+            let server_config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der], key_der)
+                .map_err(|err| format!("failed to build the fixture TLS server config: {err}"))?;
+            let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| format!("failed to build the fixture server's tokio runtime: {err}"))?;
+
+            rt.block_on(async move {
+                let listener = TcpListener::from_std(listener_std)
+                    .map_err(|err| format!("failed to adopt the fixture listener: {err}"))?;
+
+                // A caller does not always know in advance exactly how
+                // many of its concurrent client-side attempts will
+                // actually reach the network (some tests exist precisely
+                // to confirm several of them are rejected before ever
+                // dialing) -- `connections` is an upper bound, accepted
+                // within one overall deadline, not a count this loop
+                // blocks forever waiting to reach exactly.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                let mut tasks = Vec::new();
+                for _ in 0..connections {
+                    let (tcp, _peer) = match tokio::time::timeout_at(deadline, listener.accept()).await {
+                        Ok(Ok(pair)) => pair,
+                        Ok(Err(err)) => return Err(format!("fixture accept failed: {err}")),
+                        Err(_elapsed) => break,
+                    };
+                    accepted_for_thread.fetch_add(1, Ordering::SeqCst);
+                    let acceptor = acceptor.clone();
+                    tasks.push(tokio::spawn(async move {
+                        // Keeps every concurrent connection open long
+                        // enough that several concurrent apsides.fetch
+                        // calls are all still in flight together when
+                        // this test inspects them, rather than finishing
+                        // one at a time as each connection is accepted.
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        let mut tls = acceptor
+                            .accept(tcp)
+                            .await
+                            .map_err(|err| format!("fixture TLS handshake failed: {err}"))?;
+                        let mut buf = [0_u8; 4096];
+                        loop {
+                            let read = tls
+                                .read(&mut buf)
+                                .await
+                                .map_err(|err| format!("fixture request read failed: {err}"))?;
+                            if read == 0 || buf[..read].windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        // A concurrency/budget test may cause the client
+                        // to legitimately close its side early (e.g. once
+                        // *it* decides a response has gone over its own
+                        // cap) -- unlike `start`/`start_without_close_notify`
+                        // (a single exact-behavior connection, where a
+                        // write/shutdown failure is a real test-fixture
+                        // problem), a write/shutdown failure here is not
+                        // treated as this task's own failure, only logged.
+                        if let Err(err) = tls.write_all(response).await {
+                            eprintln!("[https_fixture] response write on a start_multi connection ended early (expected if the client closed early): {err}");
+                        } else if let Err(err) = tls.shutdown().await {
+                            eprintln!("[https_fixture] TLS shutdown on a start_multi connection failed (expected if the client already closed): {err}");
+                        }
+                        Ok::<(), String>(())
+                    }));
+                }
+
+                for task in tasks {
+                    task.await
+                        .map_err(|err| format!("fixture connection task panicked: {err}"))??;
+                }
+                Ok(())
+            })
+        });
+
+        Ok((
+            Self {
+                addr,
+                ca_der,
+                handle,
+            },
+            accepted,
+        ))
     }
 }
