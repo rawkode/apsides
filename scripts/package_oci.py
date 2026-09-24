@@ -5,6 +5,7 @@ The one exception is `prepare()` fetching the pinned rusty_v8 archive (see
 `scripts/rusty_v8.py`): that fetch and its SHA-256 verification happen here,
 outside the `--network=none` Docker build `build()` later runs."""
 import argparse
+import collections
 from datetime import datetime, timezone
 import gzip
 import hashlib
@@ -37,6 +38,30 @@ def command(argv, cwd=None, timeout=180):
     if result.returncode:
         raise diagnostics.SubprocessFailure(f"{argv[0]} {argv[1]} failed", result.stderr)
     return result.stdout
+
+
+def stream(argv):
+    """Run `argv`, echoing its combined, redacted output to this process's
+    stderr line by line as it arrives -- so a killed or timed-out build
+    never loses everything it already printed, unlike buffering the whole
+    thing before deciding what to show -- while keeping only the last
+    `diagnostics.DEFAULT_TAIL_LINES` lines (raw, unredacted: redaction of a
+    `SubprocessFailure`'s `output` happens exactly once, in
+    `diagnostics.failure_message()`) for a failure's diagnostic.
+
+    Raises `diagnostics.SubprocessFailure` if `argv` exits non-zero.
+    """
+    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    tail = collections.deque(maxlen=diagnostics.DEFAULT_TAIL_LINES)
+    try:
+        for line in process.stdout:
+            sys.stderr.write(diagnostics.redact(line))
+            tail.append(line.rstrip("\n"))
+    finally:
+        process.stdout.close()
+        returncode = process.wait()
+    if returncode:
+        raise diagnostics.SubprocessFailure(f"{argv[0]} {argv[1]} build failed", "\n".join(tail))
 
 
 def sha256(data):
@@ -484,7 +509,7 @@ def rusty_v8_component(pin, path):
     }
 
 
-def prepare(artifact, output, repository=ROOT, builder_image=BUILDER, source_date_epoch=0, rusty_v8_cache_dir=rusty_v8.DEFAULT_CACHE_DIR):
+def prepare(artifact, output, repository=ROOT, builder_image=BUILDER, source_date_epoch=0, rusty_v8_cache_dir=None):
     if not isinstance(source_date_epoch, int) or not 0 <= source_date_epoch <= 253402300799:
         raise ValueError("source date epoch must be a nonnegative supported Unix timestamp")
     artifact, output, repository = artifact.resolve(), output.absolute(), repository.resolve()
@@ -505,8 +530,10 @@ def prepare(artifact, output, repository=ROOT, builder_image=BUILDER, source_dat
         raise ValueError(f"builder platform {builder['platform']} has no pinned rusty_v8 archive target")
     # Fetched and SHA-256-verified here, before the network-less Docker
     # build: crates/engine's pinned `v8` crate build.rs needs this archive
-    # locally, and `build()` below runs Cargo with `--network=none`.
-    archive_path, archive_pin = rusty_v8.resolve(target, cache_dir=rusty_v8_cache_dir)
+    # locally, and `build()` below runs Cargo with `--network=none`. Also
+    # cross-checks the pin against the locked v8 crate version so a
+    # Cargo.lock bump can never silently fetch the wrong archive.
+    archive_path, archive_pin = rusty_v8.resolve(target, lock_bytes=lock, cache_dir=rusty_v8_cache_dir)
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".apsides-oci-", dir=output.parent))
     try:
@@ -614,19 +641,15 @@ def build(context, runtime_image, runtime_base, output, no_cache=False, pins=RUN
                 "--output", f"type=local,dest={destination}", str(context)]
         if no_cache:
             argv.insert(3, "--no-cache")
-        # Build logs remain visible: stdout and stderr are merged and written
-        # to this process's stderr below whether the build succeeds or fails,
-        # so the RUN --network=none Cargo compile's own output (e.g. a
-        # crates/engine v8/deno_core build.rs failure) is never silently
-        # dropped. Captured (not inherited) so a failure can also raise a
-        # SubprocessFailure carrying it, for build.py's bounded, redacted
-        # diagnostic on top-level failure.
-        try:
-            compiled = subprocess.run(argv, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        except subprocess.CalledProcessError as error:
-            sys.stderr.write(error.stdout or "")
-            raise diagnostics.SubprocessFailure(f"{argv[0]} {argv[1]} build failed", error.stdout) from None
-        sys.stderr.write(compiled.stdout)
+        # Build logs remain visible: stream() tees this potentially long
+        # step's redacted output to stderr line by line as it runs (so the
+        # RUN --network=none Cargo compile's own output -- e.g. a
+        # crates/engine v8/deno_core build.rs failure -- is never silently
+        # dropped, and a killed or timed-out build does not lose everything
+        # already printed), while raising a SubprocessFailure carrying a
+        # bounded tail on failure, for build.py's diagnostic on top-level
+        # failure.
+        stream(argv)
         verify_context(context)
         if read_regular(context / "context.json") != context_snapshot:
             raise ValueError("context metadata changed during the build; no packaging receipt published")
@@ -652,7 +675,7 @@ def main():
     prep.add_argument("--output", type=Path, required=True)
     prep.add_argument("--builder-image", default=BUILDER)
     prep.add_argument("--source-date-epoch", type=int, default=0)
-    prep.add_argument("--rusty-v8-cache-dir", type=Path, default=rusty_v8.DEFAULT_CACHE_DIR)
+    prep.add_argument("--rusty-v8-cache-dir", type=Path, default=None)
     verify = subcommands.add_parser("verify")
     verify.add_argument("--context", type=Path, required=True)
     image = subcommands.add_parser("build")

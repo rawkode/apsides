@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -35,6 +36,19 @@ import finalize_inputs  # noqa: E402
 import package_oci  # noqa: E402
 import rusty_v8  # noqa: E402
 import sbom  # noqa: E402
+
+
+class _FakeProcess:
+    """A minimal `subprocess.Popen`-shaped fake: `stdout` behaves like a
+    real text-mode pipe (iterable for lines, closeable), `wait()` returns
+    `returncode`."""
+
+    def __init__(self, lines=(), returncode=0):
+        self.stdout = io.StringIO("".join(lines))
+        self.returncode = returncode
+
+    def wait(self):
+        return self.returncode
 
 
 class PackagingTests(unittest.TestCase):
@@ -78,14 +92,14 @@ class PackagingTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def fake_rusty_v8_resolve(self, target, cache_dir=None, pins_path=None, opener=None):
+    def fake_rusty_v8_resolve(self, target, **kwargs):
         return self.rusty_v8_archive, {
             "target": target, "name": "librusty_v8", "version": "150.4.0",
             "url": f"https://example.invalid/rusty-v8/{target}.a.gz", "sha256": self.rusty_v8_sha256,
         }
 
-    def build(self, destination, run, no_cache=False):
-        with patch.object(packaging, "command", self.fake_command), patch.object(packaging.subprocess, "run", run):
+    def build(self, destination, popen, no_cache=False):
+        with patch.object(packaging, "command", self.fake_command), patch.object(packaging.subprocess, "Popen", popen):
             return packaging.build(self.output, self.runtime_image, self.base_archive, destination,
                                    no_cache=no_cache, pins=self.pins)
 
@@ -178,7 +192,7 @@ class PackagingTests(unittest.TestCase):
                         path.write_text(json.dumps(metadata))
                     else:
                         path.write_text("// source changed during image build\n")
-                    return subprocess.CompletedProcess(argv, 0, stdout="")
+                    return _FakeProcess(["Compiling controller v0.1.0\n"])
                 with self.assertRaisesRegex(ValueError, "changed"):
                     self.build(destination, fake_build)
                 self.assertFalse((destination / "packaging-inputs.json").exists())
@@ -200,7 +214,7 @@ class PackagingTests(unittest.TestCase):
             exported = Path(output.removeprefix("type=local,dest="))
             exported.mkdir(parents=True)
             (exported / "apsides-controller").write_bytes(ELF)
-            return subprocess.CompletedProcess(argv, 0, stdout="Compiling controller v0.1.0\n")
+            return _FakeProcess(["Compiling controller v0.1.0\n"])
         digest = self.build(destination, fake_build, no_cache=True)
         receipt = json.loads((destination / "packaging-inputs.json").read_text())
         self.assertEqual(receipt["contextDigest"], packaging.sha256(initial))
@@ -228,7 +242,7 @@ class PackagingTests(unittest.TestCase):
             exported = Path(output.removeprefix("type=local,dest="))
             (exported / "etc").mkdir(parents=True)
             (exported / "apsides-controller").write_bytes(ELF)
-            return subprocess.CompletedProcess(argv, 0, stdout="")
+            return _FakeProcess(["Compiling controller v0.1.0\n"])
         with self.assertRaisesRegex(ValueError, "more or less than the controller"):
             self.build(self.root / "image", fake_build)
         self.assertFalse((self.root / "image/packaging-inputs.json").exists())
@@ -306,14 +320,51 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("scripts/diagnostics.py", finalize_inputs.PACKAGING_SOURCES)
         self.assertIn("scripts/rusty_v8.py", finalize_inputs.PACKAGING_SOURCES)
 
-    def test_build_raises_subprocess_failure_with_captured_compile_output_on_failure(self):
+    def test_finalize_inputs_requires_the_matching_source_closure_schema(self):
+        finalize_inputs.ensure_source_closure_schema({"schemaVersion": "apsides.dev/compiler-closure/v3"})
+        with self.assertRaisesRegex(ValueError, "unexpected schema version"):
+            finalize_inputs.ensure_source_closure_schema({"schemaVersion": "apsides.dev/compiler-closure/v2"})
+        with self.assertRaisesRegex(ValueError, "unexpected schema version"):
+            finalize_inputs.ensure_source_closure_schema({})
+        # crates/release/src/compiler.rs's COMPILER_CLOSURE_SCHEMA and
+        # packages/compiler/src/compiler.ts's COMPILER_CLOSURE_SCHEMA must
+        # both agree with this, one version end to end.
+        self.assertEqual(finalize_inputs.SOURCE_CLOSURE_SCHEMA, "apsides.dev/compiler-closure/v3")
+
+    def test_build_raises_subprocess_failure_with_a_bounded_raw_tail_on_compile_failure(self):
         self.prepare()
-        def fake_build(argv, **kwargs):
-            raise subprocess.CalledProcessError(1, argv, output="error: failed to download rusty_v8 archive\ntoken=SEKRET1234567890\n")
+        lines = [f"line {i}\n" for i in range(250)] + ["error: token=SEKRET1234567890\n"]
+        def fake_popen(argv, **kwargs):
+            self.assertEqual(kwargs.get("stdout"), subprocess.PIPE)
+            self.assertEqual(kwargs.get("stderr"), subprocess.STDOUT)
+            return _FakeProcess(lines, returncode=1)
         with self.assertRaises(diagnostics.SubprocessFailure) as failure:
-            self.build(self.root / "image-compile-failure", fake_build)
-        self.assertIn("failed to download rusty_v8 archive", failure.exception.output)
+            self.build(self.root / "image-compile-failure", fake_popen)
+        # Raw and unbounded-by-redaction at this layer -- diagnostics.
+        # failure_message() is the only place that redacts -- but already
+        # bounded to the last diagnostics.DEFAULT_TAIL_LINES lines, since
+        # stream() never buffers the whole (potentially huge) build log.
+        self.assertIn("SEKRET1234567890", failure.exception.output)
+        self.assertNotIn("line 0\n", failure.exception.output)
+        self.assertIn("line 249", failure.exception.output)
+        self.assertEqual(failure.exception.output.count("\n"), diagnostics.DEFAULT_TAIL_LINES - 1)
         self.assertFalse((self.root / "image-compile-failure/packaging-inputs.json").exists())
+
+    def test_build_echoes_redacted_output_to_stderr_as_it_streams(self):
+        self.prepare()
+        def fake_popen(argv, **kwargs):
+            [output] = [argument for argument in argv if argument.startswith("type=local,dest=")]
+            exported = Path(output.removeprefix("type=local,dest="))
+            exported.mkdir(parents=True)
+            (exported / "apsides-controller").write_bytes(ELF)
+            return _FakeProcess(["Compiling controller v0.1.0\n", "token=SEKRET1234567890\n"])
+        captured = io.StringIO()
+        with patch.object(sys, "stderr", captured):
+            self.build(self.root / "image-echo", fake_popen)
+        echoed = captured.getvalue()
+        self.assertIn("Compiling controller v0.1.0", echoed)
+        self.assertIn("token=[REDACTED]", echoed)
+        self.assertNotIn("SEKRET1234567890", echoed)
 
     def test_sbom_adds_rusty_v8_manual_components_from_the_verified_context(self):
         self.prepare()
@@ -743,6 +794,49 @@ class RustyV8Tests(unittest.TestCase):
         self.assertEqual(fetched.read_bytes(), self.data)
         self.assertEqual(pin["sha256"], self.sha256)
 
+    def test_fetch_maps_a_filesystem_error_creating_the_cache_directory_to_a_clear_error(self):
+        # A privilege-independent way to force a real OSError from mkdir()
+        # (chmod alone would not: this sandbox runs as root, which bypasses
+        # permission bits): the cache path has a regular file, not a
+        # directory, as one of its own parent components.
+        blocking_file = self.root / "not-a-directory"
+        blocking_file.write_text("occupies the path a cache directory would need")
+        with self.assertRaisesRegex(ValueError, "cannot create the rusty_v8 archive cache directory"):
+            rusty_v8.fetch(self.pin(), cache_dir=blocking_file / "nested", opener=lambda url, timeout=None: _FakeResponse(self.data))
+
+    def test_locked_version_reads_the_pinned_v8_crate_version(self):
+        lock = b'[[package]]\nname = "v8"\nversion = "150.4.0"\n\n[[package]]\nname = "other"\nversion = "1.0.0"\n'
+        self.assertEqual(rusty_v8.locked_version(lock), "150.4.0")
+        self.assertIsNone(rusty_v8.locked_version(b'[[package]]\nname = "other"\nversion = "1.0.0"\n'))
+        duplicated = b'[[package]]\nname = "v8"\nversion = "150.4.0"\n\n[[package]]\nname = "v8"\nversion = "150.4.1"\n'
+        with self.assertRaisesRegex(ValueError, "more than one v8 crate version"):
+            rusty_v8.locked_version(duplicated)
+
+    def test_ensure_pin_matches_lock_fails_closed_on_a_version_mismatch(self):
+        lock = b'[[package]]\nname = "v8"\nversion = "150.4.0"\n'
+        rusty_v8.ensure_pin_matches_lock(lock, self.pins)  # matches; must not raise
+        with self.assertRaisesRegex(ValueError, "pins v8 crate version"):
+            rusty_v8.ensure_pin_matches_lock(lock, {**self.pins, "v8CrateVersion": "150.4.1"})
+        with self.assertRaisesRegex(ValueError, "does not lock the v8 crate"):
+            rusty_v8.ensure_pin_matches_lock(b'[[package]]\nname = "other"\nversion = "1.0.0"\n', self.pins)
+
+    def test_resolve_cross_checks_lock_bytes_against_the_pin_when_given(self):
+        path = self.root / "pins.json"
+        path.write_text(json.dumps(self.pins))
+        matching = b'[[package]]\nname = "v8"\nversion = "150.4.0"\n'
+        rusty_v8.resolve(
+            "x86_64-unknown-linux-gnu", lock_bytes=matching, cache_dir=self.cache, pins_path=path,
+            opener=lambda url, timeout=None: _FakeResponse(self.data),
+        )
+        mismatched = b'[[package]]\nname = "v8"\nversion = "999.0.0"\n'
+        def must_not_be_called(url, timeout=None):
+            raise AssertionError("a mismatched pin must fail before any fetch")
+        with self.assertRaisesRegex(ValueError, "pins v8 crate version"):
+            rusty_v8.resolve(
+                "x86_64-unknown-linux-gnu", lock_bytes=mismatched, cache_dir=self.cache, pins_path=path,
+                opener=must_not_be_called,
+            )
+
 
 class DiagnosticsTests(unittest.TestCase):
     """`scripts/diagnostics.py`'s redaction, bounding and failure-message shaping."""
@@ -822,6 +916,69 @@ class DockerfileWiringTests(unittest.TestCase):
         run_index = text.index("RUN --network=none")
         self.assertLess(text.index("ENV RUSTY_V8_ARCHIVE="), run_index)
         self.assertLess(text.index("COPY rusty-v8 rusty-v8"), run_index)
+
+
+class DistributionLayoutTests(unittest.TestCase):
+    """The rusty_v8 archive cache must never resolve under an installed CLI
+    distribution's verified asset tree.
+
+    `crates/cli/src/assets.rs`'s `assets::root()` hash-checks the entire
+    `<prefix>/share/apsides` tree (where `scripts/` lives in a distribution)
+    against a manifest on every `aps` invocation; a cache directory
+    `rusty_v8.py`'s own `ROOT` (`scripts/`'s parent) that landed inside that
+    tree would make every `aps` command after the first `aps build` fail
+    with "distribution assets do not match this binary" -- or, on a
+    read-only installation prefix, fail immediately with a raw
+    PermissionError. This copies the real scripts into a temporary
+    `<prefix>/share/apsides/scripts/` layout (as `package_cli.py` would
+    install them) and imports that copy fresh, so `ROOT` genuinely resolves
+    to the simulated prefix, the same way it would for an installed CLI.
+    """
+
+    def test_default_cache_dir_and_a_real_fetch_never_write_under_the_prefix(self):
+        with tempfile.TemporaryDirectory(prefix="apsides-distribution-test-") as temporary:
+            temporary = Path(temporary).resolve()
+            prefix = temporary / "prefix"
+            assets = prefix / "share/apsides"
+            scripts_dir = assets / "scripts"
+            scripts_dir.mkdir(parents=True)
+            shutil.copy(ROOT / "scripts/rusty_v8.py", scripts_dir / "rusty_v8.py")
+            before = sorted(path.relative_to(prefix) for path in prefix.rglob("*"))
+            home = temporary / "home"
+            home.mkdir()
+            spec = importlib.util.spec_from_file_location("apsides_distribution_rusty_v8", scripts_dir / "rusty_v8.py")
+            distributed = importlib.util.module_from_spec(spec)
+            # Simulates an installed distribution's environment: HOME is the
+            # only thing naming a cache location (no APSIDES_RUSTY_V8_CACHE
+            # or XDG_CACHE_HOME override, which would trivially pass this).
+            # dont_write_bytecode matches crates/cli/src/commands/compile.rs
+            # setting PYTHONDONTWRITEBYTECODE=1 for the real invocation, so
+            # this doesn't fail on an unrelated __pycache__ artifact of
+            # exec'ing the copy directly (a subprocess launch, unlike this,
+            # reads that env var at interpreter startup).
+            with patch.dict(os.environ, {"HOME": str(home), "XDG_CACHE_HOME": "", "APSIDES_RUSTY_V8_CACHE": ""}), \
+                 patch.object(sys, "dont_write_bytecode", True):
+                spec.loader.exec_module(distributed)
+                self.assertEqual(distributed.ROOT, assets.resolve())
+                cache_dir = distributed.default_cache_dir()
+                self.assertEqual(cache_dir, home / ".cache/apsides/rusty-v8")
+                self.assertFalse(str(cache_dir).startswith(str(prefix)))
+                data = b"a fake distributed rusty_v8 archive\n"
+                pin = {
+                    "target": "x86_64-unknown-linux-gnu", "name": "librusty_v8", "version": "150.4.0",
+                    "url": "https://example.invalid/a.gz", "sha256": hashlib.sha256(data).hexdigest(),
+                }
+                fetched = distributed.fetch(pin, opener=lambda url, timeout=None: _FakeResponse(data))
+            self.assertTrue(str(fetched).startswith(str(home)))
+            self.assertEqual(fetched.read_bytes(), data)
+            after = sorted(path.relative_to(prefix) for path in prefix.rglob("*"))
+            self.assertEqual(before, after, "a real fetch must not add, remove or change anything under the prefix")
+
+    def test_default_cache_dir_fails_closed_without_any_usable_environment(self):
+        with tempfile.TemporaryDirectory(prefix="apsides-distribution-test-") as temporary:
+            with patch.dict(os.environ, {"APSIDES_RUSTY_V8_CACHE": "", "XDG_CACHE_HOME": "", "HOME": ""}):
+                with self.assertRaisesRegex(ValueError, "cannot determine a rusty_v8 archive cache directory"):
+                    rusty_v8.default_cache_dir()
 
 
 if __name__ == "__main__":

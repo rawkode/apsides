@@ -29,6 +29,17 @@ PACKAGING_SOURCES = [
     "scripts/toolchain_snapshot.py",
 ]
 
+# Must match packages/compiler/src/compiler.ts's COMPILER_CLOSURE_SCHEMA and
+# crates/release/src/compiler.rs's COMPILER_CLOSURE_SCHEMA: one compiler
+# closure schema version end to end, so the source (Deno/TS) and native
+# (this file) halves can never silently disagree.
+SOURCE_CLOSURE_SCHEMA = "apsides.dev/compiler-closure/v3"
+
+
+def ensure_source_closure_schema(closure):
+    if closure.get("schemaVersion") != SOURCE_CLOSURE_SCHEMA:
+        raise ValueError(f"source compiler closure has an unexpected schema version; expected {SOURCE_CLOSURE_SCHEMA}")
+
 
 def finalize(source, context, runtime_base, packaging_inputs, profile, tool_snapshot, output):
     if output.exists():
@@ -54,6 +65,11 @@ def finalize(source, context, runtime_base, packaging_inputs, profile, tool_snap
         raise ValueError("build profile differs from the executed packaging inputs")
     inputs=json.loads(read_regular(source))
     closure=inputs["compilerClosure"]
+    # Failing closed here catches source/native schema drift immediately,
+    # instead of silently overwriting whatever schemaVersion the source
+    # receipt carried (the previous behaviour), which let the two sides
+    # disagree unnoticed.
+    ensure_source_closure_schema(closure)
     if closure["nativeCompiler"] is not None:
         raise ValueError("source receipt already has a native compiler closure")
     build_context_files=[{"path":path,"sha256":sha} for path,sha in metadata["files"].items()]
@@ -67,7 +83,6 @@ def finalize(source, context, runtime_base, packaging_inputs, profile, tool_snap
     packaging_files.sort(key=lambda item:item["path"])
     cli=[entry for entry in packaging_files if entry["path"].startswith("crates/cli/")]
     cli.sort(key=lambda item:item["path"])
-    closure["schemaVersion"]="apsides.dev/compiler-closure/v3"
     closure["nativeCompiler"]={
         "builderImage":{key:metadata["builder"][key] for key in ["reference","platform"]},
         "cargoLockSha256":metadata["controllerLockDigest"],

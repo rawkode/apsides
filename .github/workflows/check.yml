@@ -79,6 +79,13 @@ jobs:
     # every generated reactor case on a disposable kind cluster.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    # scripts/rusty_v8.py never caches under the checkout (that would be
+    # gitignored `work/`, but also wrong in principle: an installed CLI
+    # distribution's equivalent path is the asset tree
+    # crates/cli/src/assets.rs hash-verifies in full); this names the same
+    # directory the cache step below persists.
+    env:
+      APSIDES_RUSTY_V8_CACHE: ${{ runner.temp }}/rusty-v8-cache
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -112,11 +119,12 @@ jobs:
       # `aps build` fetches the pinned rusty_v8 archive itself (scripts/
       # rusty_v8.py, before the --network=none Cargo build); caching it
       # avoids a ~40 MB re-download every run. Keyed on pins.json, so a pin
-      # bump fetches fresh instead of serving a stale entry.
+      # bump fetches fresh instead of serving a stale entry. Path matches
+      # this job's APSIDES_RUSTY_V8_CACHE above.
       - name: Cache the pinned rusty_v8 archive
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: work/rusty-v8-cache
+          path: ${{ env.APSIDES_RUSTY_V8_CACHE }}
           key: rusty-v8-${{ hashFiles('scripts/rusty-v8/pins.json') }}
       # `aps build` and `aps test --cluster` never pull: the builder, runtime
       # base, fixture base, kind node and proxy images must already be local.
@@ -148,6 +156,13 @@ jobs:
     # and hands them with the `aps` that built them to the scenario jobs.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    # scripts/rusty_v8.py never caches under the checkout (that would be
+    # gitignored `work/`, but also wrong in principle: an installed CLI
+    # distribution's equivalent path is the asset tree
+    # crates/cli/src/assets.rs hash-verifies in full); this names the same
+    # directory the cache step below persists.
+    env:
+      APSIDES_RUSTY_V8_CACHE: ${{ runner.temp }}/rusty-v8-cache
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -173,11 +188,12 @@ jobs:
       # `aps build` fetches the pinned rusty_v8 archive itself (scripts/
       # rusty_v8.py, before the --network=none Cargo build); caching it
       # avoids a ~40 MB re-download every run. Keyed on pins.json, so a pin
-      # bump fetches fresh instead of serving a stale entry.
+      # bump fetches fresh instead of serving a stale entry. Path matches
+      # this job's APSIDES_RUSTY_V8_CACHE above.
       - name: Cache the pinned rusty_v8 archive
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: work/rusty-v8-cache
+          path: ${{ env.APSIDES_RUSTY_V8_CACHE }}
           key: rusty-v8-${{ hashFiles('scripts/rusty-v8/pins.json') }}
       # `aps build` never pulls: the builder and runtime base images must
       # already be local.
