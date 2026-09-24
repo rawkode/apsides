@@ -128,12 +128,13 @@ fn handler_and_hickory_https_work_after_v8_init_and_landlock_lockdown() -> Resul
 async fn run_handler_module_under_lockdown() -> Result<(), String> {
     let bundle = wrap_as_handler(
         r#"
-        apsides.log("pong-from-rust");
+        apsides.log("info", "pong-from-rust");
     "#,
     );
     let usage = Arc::new(AtomicUsize::new(0));
     engine::invoke_handler(handler_invocation(&bundle), &usage)
         .await
+        .result
         .map_err(|err| format!("handler module failed under lockdown: {err}"))?;
     Ok(())
 }

@@ -18,18 +18,18 @@ use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use common::{GENEROUS_LIMITS, handler_invocation, wrap_as_handler};
-use engine::{HandlerInvocation, InvokeError, Limits, invoke_handler_blocking, invoke_handler_with_watchdog};
+use engine::{HandlerInvocation, InvocationReport, Limits, invoke_handler_blocking, invoke_handler_with_watchdog};
 
 fn no_usage() -> Arc<AtomicUsize> {
     Arc::new(AtomicUsize::new(0))
 }
 
-fn run(body: &str) -> Result<engine::HandlerOutput, InvokeError> {
+fn run(body: &str) -> InvocationReport {
     let bundle = wrap_as_handler(body);
     invoke_handler_blocking(handler_invocation(&bundle), &no_usage())
 }
 
-fn run_with_limits(limits: Limits, body: &str) -> Result<engine::HandlerOutput, InvokeError> {
+fn run_with_limits(limits: Limits, body: &str) -> InvocationReport {
     let bundle = wrap_as_handler(body);
     let mut invocation = handler_invocation(&bundle);
     invocation.limits = limits;
@@ -42,14 +42,22 @@ fn run_with_limits(limits: Limits, body: &str) -> Result<engine::HandlerOutput, 
 /// (Rust -> V8 -> Rust, observed via `HandlerOutput::logs`).
 #[test]
 fn apsides_log_is_callable_from_the_handler_export() -> Result<(), String> {
-    let result = run(
+    let report = run(
         r#"
-        apsides.log("pong-from-rust");
+        apsides.log("info", "pong-from-rust");
     "#,
     );
 
-    let output = result.map_err(|err| format!("expected the handler invocation to succeed: {err}"))?;
-    assert_eq!(output.logs, vec!["pong-from-rust".to_owned()]);
+    report
+        .result
+        .map_err(|err| format!("expected the handler invocation to succeed: {err}"))?;
+    assert_eq!(
+        report.logs,
+        vec![engine::LogLine {
+            level: engine::LogLevel::Info,
+            message: "pong-from-rust".to_owned(),
+        }]
+    );
     Ok(())
 }
 
@@ -72,7 +80,7 @@ fn wasm_and_shared_array_buffer_are_not_exposed() {
     );
 
     assert!(
-        result.is_ok(),
+        result.result.is_ok(),
         "expected WebAssembly/SharedArrayBuffer to be absent, got {result:?}"
     );
 }
@@ -87,6 +95,7 @@ fn array_buffer_allocation_over_the_cap_terminates_the_isolate_without_aborting_
         max_array_buffer_bytes: 1024 * 1024,
         max_heap_bytes: 64 * 1024 * 1024,
         timeout: Duration::from_secs(10),
+        max_fetch_bytes_total: 16 * 1024 * 1024,
     };
     let result = run_with_limits(
         limits,
@@ -105,15 +114,15 @@ fn array_buffer_allocation_over_the_cap_terminates_the_isolate_without_aborting_
     "#,
     );
 
-    let terminated = matches!(&result, Err(err) if err.is_isolate_termination());
+    let terminated = matches!(&result.result, Err(err) if err.is_isolate_termination());
     assert!(
         terminated,
         "expected an isolate-termination error, not merely any `Err`. Got {result:?}"
     );
 
-    let followup = run(r#"apsides.log("still alive");"#);
+    let followup = run(r#"apsides.log("info", "still alive");"#);
     assert!(
-        followup.is_ok(),
+        followup.result.is_ok(),
         "process must still be able to run further isolates after an \
          over-cap array-buffer allocation, got {followup:?}"
     );
@@ -147,7 +156,7 @@ fn deserialize_route_is_closed_by_hiding_deno() {
     );
 
     assert!(
-        result.is_ok(),
+        result.result.is_ok(),
         "expected the deserialize route to be closed (caught ReferenceError), got {result:?}"
     );
 }
@@ -176,7 +185,7 @@ fn structured_clone_route_is_closed_by_hiding_deno() {
     );
 
     assert!(
-        result.is_ok(),
+        result.result.is_ok(),
         "expected the structuredClone route to be closed (caught ReferenceError), got {result:?}"
     );
 }
@@ -235,7 +244,7 @@ fn guarded_constructor_toctou_and_resize_transfer_are_closed() {
     );
 
     assert!(
-        result.is_ok(),
+        result.result.is_ok(),
         "expected the TOCTOU/resize/transfer checks to pass, got {result:?}"
     );
 }
@@ -289,7 +298,7 @@ fn deno_and_bootstrap_internals_are_unreachable_but_apsides_is_present() {
     );
 
     assert!(
-        result.is_ok(),
+        result.result.is_ok(),
         "expected Deno/__bootstrap to be unreachable and apsides to be present and frozen, got {result:?}"
     );
 }
@@ -349,7 +358,7 @@ fn native_array_buffer_constructor_is_unreachable_via_prototype_chain() {
     );
 
     assert!(
-        result.is_ok(),
+        result.result.is_ok(),
         "expected the native-constructor-unreachable checks to pass, got {result:?}"
     );
 }
@@ -399,7 +408,7 @@ fn reflect_construct_and_apply_are_captured_before_hijack() {
     );
 
     assert!(
-        result.is_ok(),
+        result.result.is_ok(),
         "expected the Reflect-hijack checks to pass, got {result:?}"
     );
 }
@@ -424,7 +433,7 @@ fn apsides_wrappers_never_leak_the_captured_op_functions_via_call_or_apply_hijac
             return this(...(args || []));
         };
 
-        apsides.log("hello");
+        apsides.log("info", "hello");
         try {
             apsides.writeOutput("undeclared", "key", "data");
         } catch (e) {
@@ -444,7 +453,7 @@ fn apsides_wrappers_never_leak_the_captured_op_functions_via_call_or_apply_hijac
     );
 
     assert!(
-        result.is_ok(),
+        result.result.is_ok(),
         "expected no hijacked call/apply invocation to have fired, got {result:?}"
     );
 }
@@ -469,7 +478,7 @@ fn array_buffer_statics_are_preserved() {
     );
 
     assert!(
-        result.is_ok(),
+        result.result.is_ok(),
         "expected ArrayBuffer's static methods to still work, got {result:?}"
     );
 }
@@ -510,7 +519,7 @@ fn other_construction_routes_do_not_bypass_the_array_buffer_guard() {
     );
 
     assert!(
-        result.is_ok(),
+        result.result.is_ok(),
         "expected the probed routes to be closed (or, for DataView, to keep working), got {result:?}"
     );
 }
@@ -526,6 +535,7 @@ fn heap_limit_terminates_the_isolate_without_aborting_the_process() {
         // booting the isolate before the callback ever fires.
         max_heap_bytes: 20 * 1024 * 1024,
         timeout: Duration::from_secs(20),
+        max_fetch_bytes_total: 16 * 1024 * 1024,
     };
     let result = run_with_limits(
         limits,
@@ -537,15 +547,15 @@ fn heap_limit_terminates_the_isolate_without_aborting_the_process() {
     ",
     );
 
-    let terminated = matches!(&result, Err(err) if err.is_isolate_termination());
+    let terminated = matches!(&result.result, Err(err) if err.is_isolate_termination());
     assert!(
         terminated,
         "expected an isolate-termination error, got {result:?}"
     );
 
-    let followup = run(r#"apsides.log("still alive");"#);
+    let followup = run(r#"apsides.log("info", "still alive");"#);
     assert!(
-        followup.is_ok(),
+        followup.result.is_ok(),
         "process must still be able to run further isolates after a \
          heap-limit termination, got {followup:?}"
     );
@@ -569,7 +579,7 @@ fn watchdog_thread_terminates_a_synchronous_infinite_loop() {
 
     let result = invoke_handler_with_watchdog(invocation, &no_usage());
 
-    let terminated = matches!(&result, Err(err) if err.is_isolate_termination());
+    let terminated = matches!(&result.result, Err(err) if err.is_isolate_termination());
     assert!(
         terminated,
         "expected the watchdog thread to terminate the synchronous infinite \
@@ -579,9 +589,9 @@ fn watchdog_thread_terminates_a_synchronous_infinite_loop() {
     // The watchdog thread terminates *the isolate*; this process (standing
     // in for the controller process) must still be alive and able to run
     // further isolates afterward, i.e. it did not abort.
-    let followup = run(r#"apsides.log("still alive");"#);
+    let followup = run(r#"apsides.log("info", "still alive");"#);
     assert!(
-        followup.is_ok(),
+        followup.result.is_ok(),
         "process must still be able to run further isolates after a \
          watchdog timeout termination, got {followup:?}"
     );
@@ -592,7 +602,7 @@ fn watchdog_thread_terminates_a_synchronous_infinite_loop() {
 #[test]
 fn the_isolate_is_not_reused_across_invocations() {
     let first = run(r"globalThis.leakedFromFirstInvocation = 42;");
-    assert!(first.is_ok(), "expected the first invocation to succeed, got {first:?}");
+    assert!(first.result.is_ok(), "expected the first invocation to succeed, got {first:?}");
 
     let second = run(
         r#"
@@ -602,7 +612,7 @@ fn the_isolate_is_not_reused_across_invocations() {
     "#,
     );
     assert!(
-        second.is_ok(),
+        second.result.is_ok(),
         "expected the second invocation to see a clean isolate, got {second:?}"
     );
 }

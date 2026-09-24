@@ -36,6 +36,8 @@ mod net;
 mod ops;
 mod v8_alloc;
 
+pub use net::EgressResolver;
+
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::rc::Rc;
@@ -46,6 +48,7 @@ use std::time::{Duration, Instant};
 
 use deno_core::v8;
 use deno_core::{JsRuntime, ModuleSpecifier, RuntimeOptions, StaticModuleLoader};
+use serde::Serialize;
 use thiserror::Error;
 
 /// V8 flags applied before `JsRuntime::init_platform`/the first
@@ -289,12 +292,22 @@ const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
   const construct = Reflect.construct;
   const apply = Reflect.apply;
   const NativeTypeError = TypeError;
-  // Captured for `apsides.log`'s non-string argument formatting and
-  // `apsides.fetch`'s body encoding, respectively -- see the invariant
-  // above: every value a persisting closure below uses is captured here,
-  // before any user code has had a chance to run.
+  // Every one of these is captured here, at the very top of the script,
+  // for the same reason `construct`/`apply`/`NativeTypeError` are: the
+  // `apsides.*` wrapper functions below persist past bootstrap and must
+  // never perform a fresh lookup of a global/built-in a handler could have
+  // already replaced by the time they run -- see the invariant above,
+  // which review round 5 asked to be made true of *every* built-in these
+  // wrappers touch, not just the ones with an obvious capability-leak
+  // shape. `nativeArraySet`/index assignment (not `.push`) builds
+  // `utf8Encode`'s byte array so no `Array.prototype.push` lookup happens
+  // either.
   const NativeJSONStringify = JSON.stringify;
   const NativeUint8Array = Uint8Array;
+  const nativeUint8ArrayFrom = NativeUint8Array.from;
+  const nativeObjectEntries = Object.entries;
+  const nativeObjectToString = Object.prototype.toString;
+  const nativeCodePointAt = String.prototype.codePointAt;
 
   // Layer 1: hide deno_core's own internals. Captures only the three op
   // functions this engine's own `apsides` global needs, before deleting
@@ -303,45 +316,54 @@ const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
   const opOutputWrite = globalThis.Deno.core.ops.op_apsides_output_write;
   const opLog = globalThis.Deno.core.ops.op_apsides_log;
 
+  // Avoids `value instanceof NativeUint8Array`, which consults
+  // `NativeUint8Array[Symbol.hasInstance]` -- itself an ordinary,
+  // reassignable property -- at every call, not just once at bootstrap.
+  // `Object.prototype.toString`'s built-in `[object <Tag>]` behavior does
+  // not consult `Symbol.hasInstance` at all.
+  function isUint8Array(value) {
+    return apply(nativeObjectToString, value, []) === "[object Uint8Array]";
+  }
+
   // A minimal, self-contained UTF-8 encoder: bare deno_core has no
   // TextEncoder (that is a `deno_web` extension, not registered here), and
   // this must stay usable from a closure that persists past bootstrap, so
   // it touches nothing but its own arguments/locals and the captured
-  // NativeUint8Array.
+  // values above. Builds `bytes` with index assignment, then converts it
+  // to a real `Uint8Array` with the captured `nativeUint8ArrayFrom` --
+  // `Array.prototype.push` is never called.
   function utf8Encode(text) {
     const bytes = [];
+    let length = 0;
     for (let i = 0; i < text.length; i++) {
-      let code = text.codePointAt(i);
+      let code = apply(nativeCodePointAt, text, [i]);
       if (code > 0xffff) {
         i++;
       }
       if (code < 0x80) {
-        bytes.push(code);
+        bytes[length++] = code;
       } else if (code < 0x800) {
-        bytes.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+        bytes[length++] = 0xc0 | (code >> 6);
+        bytes[length++] = 0x80 | (code & 0x3f);
       } else if (code < 0x10000) {
-        bytes.push(
-          0xe0 | (code >> 12),
-          0x80 | ((code >> 6) & 0x3f),
-          0x80 | (code & 0x3f),
-        );
+        bytes[length++] = 0xe0 | (code >> 12);
+        bytes[length++] = 0x80 | ((code >> 6) & 0x3f);
+        bytes[length++] = 0x80 | (code & 0x3f);
       } else {
-        bytes.push(
-          0xf0 | (code >> 18),
-          0x80 | ((code >> 12) & 0x3f),
-          0x80 | ((code >> 6) & 0x3f),
-          0x80 | (code & 0x3f),
-        );
+        bytes[length++] = 0xf0 | (code >> 18);
+        bytes[length++] = 0x80 | ((code >> 12) & 0x3f);
+        bytes[length++] = 0x80 | ((code >> 6) & 0x3f);
+        bytes[length++] = 0x80 | (code & 0x3f);
       }
     }
-    return NativeUint8Array.from(bytes);
+    return apply(nativeUint8ArrayFrom, NativeUint8Array, [bytes]);
   }
 
   function toBytes(input) {
     if (input === undefined || input === null) {
       return new NativeUint8Array(0);
     }
-    if (input instanceof NativeUint8Array) {
+    if (isUint8Array(input)) {
       return input;
     }
     if (typeof input === "string") {
@@ -358,33 +380,41 @@ const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
     }
   }
 
+  function isValidLogLevel(level) {
+    return (
+      level === "debug" || level === "info" || level === "warn" || level === "error"
+    );
+  }
+
   const apsides = Object.freeze({
     fetch: async (url, options) => {
       const opts = options || {};
       const method = opts.method || "GET";
-      const headers = opts.headers ? Object.entries(opts.headers) : [];
+      const headers = opts.headers ? nativeObjectEntries(opts.headers) : [];
       const bodyBytes = toBytes(opts.body);
       const outcome = await opFetch({ url, method, headers }, bodyBytes);
       throwIfError(outcome);
+      // `outcome.body` already arrives as a real `Uint8Array` (the op
+      // returns it as a `deno_core::ToJsBuffer`, not a plain JSON number
+      // array), so no conversion is needed here.
       return {
         status: outcome.status,
         headers: outcome.headers,
-        body: NativeUint8Array.from(outcome.body),
+        body: outcome.body,
       };
     },
     writeOutput: (id, key, data) => {
       const outcome = opOutputWrite(id, key, toBytes(data));
       throwIfError(outcome);
     },
-    log: (...args) => {
-      let line = "";
-      for (let i = 0; i < args.length; i++) {
-        if (i > 0) {
-          line += " ";
-        }
-        line += typeof args[i] === "string" ? args[i] : NativeJSONStringify(args[i]);
+    log: (level, message) => {
+      if (!isValidLogLevel(level)) {
+        throw new NativeTypeError(
+          `apsides.log level must be one of "debug", "info", "warn", "error"; got ${level}`,
+        );
       }
-      opLog(line);
+      const text = typeof message === "string" ? message : NativeJSONStringify(message);
+      opLog(level, text);
     },
   });
   Object.defineProperty(globalThis, "apsides", {
@@ -554,22 +584,61 @@ pub struct Limits {
     /// constant) since the capped allocator this crate inherited from the
     /// Phase 5a spike needs a byte cap to construct at all.
     pub max_array_buffer_bytes: usize,
+    /// Hard cap on the total bytes of every `apsides.fetch` response body
+    /// across the *whole invocation* (summed, not per call).
+    ///
+    /// A response body arrives as a V8 `ArrayBuffer` backing store built
+    /// directly by `serde_v8::ToJsBuffer`
+    /// (`v8::ArrayBuffer::new_backing_store_from_boxed_slice`), which never
+    /// goes through the capped allocator in `v8_alloc.rs` and is not
+    /// counted against `max_heap_bytes` either -- an op-created backing
+    /// store lives outside the heap the near-heap-limit callback watches.
+    /// Without this separate budget, a handler could pull far more memory
+    /// into the process than `max_heap_bytes`/`max_array_buffer_bytes`
+    /// suggest, simply by calling `apsides.fetch` repeatedly (each
+    /// individual call is already capped at 4 MiB by `ops::fetch`, but
+    /// nothing else would stop a handler from calling it 1000 times).
+    pub max_fetch_bytes_total: usize,
 }
 
 /// Egress policy for `apsides.fetch`.
 #[derive(Debug, Clone, Default)]
 pub struct EgressPolicy {
     /// `(host, port)` pairs a request's URL host:port must match exactly
-    /// before `op_apsides_fetch` will even resolve it.
+    /// before `op_apsides_fetch` will even resolve it. Normalized (each
+    /// host lowercased with `to_ascii_lowercase`) and validated (no empty
+    /// host) once, by [`EgressPolicy::normalized`], before any isolate is
+    /// built -- never left to `ops::fetch` to discover per request, and
+    /// never silently mismatching a request's already-lowercase parsed URL
+    /// host because the caller wrote a mixed-case entry here.
     pub allowed: Vec<(String, u16)>,
     /// When set, replaces the real `hickory-resolver` DNS lookup with this
-    /// fixed `host -> addr` map -- used by tests to point a request at a
+    /// fixed `host -> addrs` map (every candidate address for that host,
+    /// tried in the given order) -- used by tests to point a request at a
     /// local fixture server, or to exercise the "private address from DNS"
     /// denial deterministically, without needing real DNS or (that is a
     /// *separate* gate; see [`FixtureEgressOverride`]) an extra trusted TLS
     /// certificate authority.
-    pub resolver_override: Option<HashMap<String, IpAddr>>,
+    pub resolver_override: Option<HashMap<String, Vec<IpAddr>>>,
     pub fixture_trust_anchor: Option<FixtureEgressOverride>,
+}
+
+impl EgressPolicy {
+    /// Lowercases every `allowed` host (DNS names are case-insensitive,
+    /// and a request's parsed URL host from the `url` crate is always
+    /// already lowercase, so a mixed-case entry here would otherwise
+    /// silently never match) and rejects an empty host entry outright.
+    /// Called once, by every `invoke_handler*` entry point, before any
+    /// isolate is built.
+    fn normalized(mut self) -> Result<Self, InvokeError> {
+        for (host, _port) in &mut self.allowed {
+            if host.trim().is_empty() {
+                return Err(InvokeError::InvalidEgressAllowlistEntry(host.clone()));
+            }
+            *host = host.to_ascii_lowercase();
+        }
+        Ok(self)
+    }
 }
 
 /// The exact string [`FixtureEgressOverride::acknowledgement`] must equal
@@ -604,6 +673,12 @@ pub const FIXTURE_ACKNOWLEDGEMENT: &str = "disposable-cluster-only";
 /// at all (returning [`InvokeError::FixtureAcknowledgementMissing`]) if
 /// `acknowledgement` is set to anything else, including an empty string or
 /// a close-but-wrong value.
+///
+/// `crates/runtime` (once Phase 4 wires this crate in) must construct a
+/// `FixtureEgressOverride` only from its own fixture-mode startup config --
+/// the same posture as `runtime`'s own `FIXTURE_ACKNOWLEDGEMENT` constant
+/// and `allowNoLandlock` escape hatch -- never from anything a request or
+/// a handler's own event payload could influence.
 #[derive(Debug, Clone)]
 pub struct FixtureEgressOverride {
     pub acknowledgement: String,
@@ -635,11 +710,17 @@ pub struct OutputSinkError {
 /// Implemented by the caller to actually persist an `apsides.writeOutput`
 /// call this crate has already validated.
 ///
-/// Validation already done by the time this is called: declared output
-/// id, key matching `[-._a-zA-Z0-9]+`, data within the declared
-/// `max_bytes`. Kept as a trait, not a concrete type, so this crate never
-/// touches Kubernetes (or any other storage) directly -- see the crate doc
-/// comment's IR-agnostic goal.
+/// Validation already done by the time this is called, all before the
+/// sink is ever invoked: the output id was declared for this invocation;
+/// the key matches `[-._a-zA-Z0-9]+`, is at most 253 characters, and is
+/// never exactly `.` or `..`; and the *running total* of `key.len() +
+/// data.len()` across every key ever written to this output id in this
+/// invocation (this write's own contribution replacing, not adding to,
+/// any earlier write of the same key) stays within the output's declared
+/// `max_bytes` -- the cap bounds one output's total footprint, not just
+/// one call's payload. Kept as a trait, not a concrete type, so this crate
+/// never touches Kubernetes (or any other storage) directly -- see the
+/// crate doc comment's IR-agnostic goal.
 ///
 /// This crate does **not** implement unchanged-data skipping (skip a write
 /// whose `data` is byte-identical to what is already stored for
@@ -669,8 +750,9 @@ pub trait OutputSink: Send + Sync {
 ///
 /// The ESM `bundle` source, the `export`ed async function to call with
 /// `event`, resource `limits`, the `egress` policy `apsides.fetch` is
-/// checked against, and the `outputs` this invocation may write via
-/// `apsides.writeOutput` (persisted through `sink`).
+/// checked against (and the `resolver` it dials through), and the
+/// `outputs` this invocation may write via `apsides.writeOutput`
+/// (persisted through `sink`).
 pub struct HandlerInvocation<'a> {
     pub bundle: &'a str,
     pub export: &'a str,
@@ -679,17 +761,55 @@ pub struct HandlerInvocation<'a> {
     pub egress: EgressPolicy,
     pub outputs: Vec<OutputDeclaration>,
     pub sink: Arc<dyn OutputSink>,
+    /// The shared, built-once DNS resolver `apsides.fetch` dials through
+    /// -- see [`EgressResolver::new`]'s doc comment for why this must be
+    /// built once by the caller (before any Landlock lockdown) and reused
+    /// across every invocation, never rebuilt per call. `None` is only
+    /// valid when every host `egress.allowed` lists is also covered by
+    /// `egress.resolver_override` (fixture/test mode); a real deployment
+    /// always sets this.
+    pub resolver: Option<Arc<EgressResolver>>,
+    /// A caller-supplied identifier for the handler this invocation runs,
+    /// attached (with `invocation_id`) to every `apsides.log` line this
+    /// crate emits to stderr (see [`LogLine`]) so multiple handlers' and
+    /// invocations' interleaved log lines can be told apart in a shared
+    /// process's stderr stream.
+    pub handler_id: &'a str,
+    pub invocation_id: &'a str,
 }
 
-/// A completed handler invocation's result.
+/// One `apsides.log` line: the level the handler passed, and the message
+/// (already capped at 4 KiB, at a UTF-8 char boundary; see `ops.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogLine {
+    pub level: LogLevel,
+    pub message: String,
+}
+
+/// The outcome of one [`HandlerInvocation`], from
+/// [`invoke_handler_with_watchdog`].
 ///
-/// The JSON value the handler's exported function resolved with, and
-/// every line captured by `apsides.log` (already capped at invocation
-/// time -- 64 lines of at most 4 KiB each; see `ops.rs`).
-#[derive(Debug, Clone)]
-pub struct HandlerOutput {
-    pub value: serde_json::Value,
-    pub logs: Vec<String>,
+/// `result` is `Ok` with the handler's resolved JSON value, or `Err` with
+/// why the invocation failed. Either way, `logs` carries every
+/// `apsides.log` line the invocation captured before it stopped (already
+/// capped -- see `ops.rs`): a handler that logs its own diagnosis right
+/// before throwing must not lose that diagnosis just because the
+/// invocation itself failed. `logs` is empty only when the invocation
+/// failed before any isolate was ever built (an invalid `egress.allowed`
+/// entry, or a missing/wrong fixture acknowledgement).
+#[derive(Debug)]
+pub struct InvocationReport {
+    pub result: Result<serde_json::Value, InvokeError>,
+    pub logs: Vec<LogLine>,
 }
 
 #[derive(Debug, Error)]
@@ -768,10 +888,14 @@ fn prepare_isolate(
     egress: EgressPolicy,
     outputs: HashMap<String, usize>,
     sink: Arc<dyn OutputSink>,
+    resolver: Option<Arc<EgressResolver>>,
     deadline: Instant,
+    handler_id: String,
+    invocation_id: String,
 ) -> Result<PreparedIsolate, EngineError> {
     ensure_platform_initialized();
 
+    let max_fetch_bytes_total = limits.max_fetch_bytes_total;
     let allocator = v8_alloc::capped_array_buffer_allocator(limits.max_array_buffer_bytes, usage);
     // `initial` is set equal to `max`, not 0: with `initial=0` V8 picks its
     // own (much smaller) starting ceiling and grows it heuristically, which
@@ -795,7 +919,18 @@ fn prepare_isolate(
 
     let mut runtime = JsRuntime::new(RuntimeOptions {
         module_loader: Some(Rc::new(module_loader)),
-        extensions: vec![ops::apsides_ops::init(egress, outputs, sink, deadline)],
+        extensions: vec![ops::apsides_ops::init(
+            egress,
+            outputs,
+            sink,
+            resolver,
+            deadline,
+            max_fetch_bytes_total,
+            ops::InvocationIds {
+                handler_id,
+                invocation_id,
+            },
+        )],
         create_params: Some(create_params),
         ..Default::default()
     });
@@ -960,6 +1095,20 @@ async fn call_handler_export(
         .await
         .map_err(EngineError::Call)?;
 
+    // Closed *before* marshalling the return value, not after: a handler
+    // can return an object with a getter (or a `toJSON` method) that runs
+    // arbitrary code, including another `apsides.fetch`/`writeOutput`
+    // call, during `serde_v8::from_v8`'s property walk below -- i.e.
+    // *after* the handler's own promise has already resolved. Every op
+    // checks this flag and fails fast with a typed "ops closed" error
+    // rather than doing any real work once it is set. See
+    // `tests/ops.rs`'s `ops_are_closed_before_the_return_value_is_marshalled`.
+    runtime
+        .op_state()
+        .borrow_mut()
+        .borrow_mut::<ops::EngineOpState>()
+        .closed = true;
+
     deno_core::scope!(scope, runtime);
     let result_local = v8::Local::new(scope, result_global);
     deno_core::serde_v8::from_v8::<serde_json::Value>(scope, result_local)
@@ -985,31 +1134,32 @@ fn output_caps(outputs: &[OutputDeclaration]) -> HashMap<String, usize> {
         .collect()
 }
 
-/// Loads/evaluates `specifier`, calls `export(event)`, and collects the
-/// invocation's captured `apsides.log` lines. Factored out of
-/// `invoke_handler`/`invoke_handler_with_watchdog` so both can wrap its
-/// `Err` with [`InvokeError::Terminated`] the same way when `terminated`
-/// (shared with [`install_heap_limit_callback`] and, for the watchdog
-/// variant, the watchdog thread) is set.
+/// Loads/evaluates `specifier` and calls `export(event)`. Does not itself
+/// collect `apsides.log` lines -- [`collect_logs`] does that separately,
+/// from `runtime`'s still-alive `OpState`, after this returns (`Ok` or
+/// `Err`), so a handler's diagnostic logging right before it throws is
+/// never lost.
 #[allow(
     clippy::future_not_send,
-    reason = "deno_core::JsRuntime is deliberately !Send; see the crate's `invoke_handler` doc comment"
+    reason = "deno_core::JsRuntime is deliberately !Send; see the crate's `invoke_handler_with_watchdog` doc comment"
 )]
 async fn run_invocation(
     runtime: &mut JsRuntime,
     specifier: &ModuleSpecifier,
     export: &str,
     event: &serde_json::Value,
-) -> Result<HandlerOutput, InvokeError> {
+) -> Result<serde_json::Value, InvokeError> {
     let module_id = load_and_evaluate(runtime, specifier).await?;
-    let value = call_handler_export(runtime, module_id, export, event).await?;
-    let logs = runtime
+    call_handler_export(runtime, module_id, export, event).await
+}
+
+fn collect_logs(runtime: &JsRuntime) -> Vec<LogLine> {
+    runtime
         .op_state()
         .borrow()
         .borrow::<ops::EngineOpState>()
         .logs
-        .clone();
-    Ok(HandlerOutput { value, logs })
+        .clone()
 }
 
 /// If `result` is `Err` and `terminated` is set, replaces it with
@@ -1017,9 +1167,9 @@ async fn run_invocation(
 /// this crate tracks termination itself rather than only inferring it from
 /// the error `deno_core` happens to surface.
 fn mark_terminated(
-    result: Result<HandlerOutput, InvokeError>,
+    result: Result<serde_json::Value, InvokeError>,
     terminated: &AtomicBool,
-) -> Result<HandlerOutput, InvokeError> {
+) -> Result<serde_json::Value, InvokeError> {
     match result {
         Err(err) if terminated.load(Ordering::SeqCst) => {
             Err(InvokeError::Terminated(Box::new(err)))
@@ -1028,121 +1178,30 @@ fn mark_terminated(
     }
 }
 
-/// Runs one [`HandlerInvocation`] to completion in a fresh isolate.
-///
-/// Builds it (see [`prepare_isolate`]), loads/evaluates `invocation.bundle`
-/// as the main module, calls its `invocation.export`ed function with
-/// `invocation.event`, and returns its resolved value plus every
-/// `apsides.log` line the invocation captured.
-///
-/// Does **not** itself enforce `invocation.limits.timeout` against a
-/// synchronous, never-yielding handler body -- see
-/// [`invoke_handler_with_watchdog`] for the mechanism that does. The
-/// caller's own tokio runtime must have its network/IO driver enabled
-/// (`enable_io()`/`enable_all()`), not just `enable_time()`: a handler that
-/// calls `apsides.fetch` needs it.
-///
-/// `usage` reports the capped `ArrayBuffer` allocator's live byte usage
-/// (see `v8_alloc::capped_array_buffer_allocator`); pass a fresh
-/// `Arc::new(AtomicUsize::new(0))` if the caller does not need to inspect
-/// it.
-///
-/// # Errors
-///
-/// Returns `Err` if `invocation.egress.fixture_trust_anchor` is set without
-/// the required acknowledgement, if the module specifier cannot be parsed
-/// (never, in practice: it is a fixed literal), if the bootstrap guard
-/// script fails, if the bundle fails to load/evaluate, if the event loop
-/// reports a failure (including a heap-limit or array-buffer-cap
-/// termination -- see [`EngineError::is_isolate_termination`]), if
-/// `invocation.export` does not name a callable export, or if the event/
-/// result value fails to marshal across the V8 boundary.
-///
-/// This function's returned future is not `Send`: `deno_core::JsRuntime`
-/// (and the V8 isolate it owns) is deliberately single-threaded and must
-/// only ever be driven from the one current-thread tokio runtime that owns
-/// it, matching the "one fresh isolate per invocation, never shared across
-/// threads" model.
-#[allow(
-    clippy::future_not_send,
-    reason = "deno_core::JsRuntime is deliberately !Send; see the doc comment above"
-)]
-pub async fn invoke_handler(
-    invocation: HandlerInvocation<'_>,
-    usage: &Arc<AtomicUsize>,
-) -> Result<HandlerOutput, InvokeError> {
-    validate_fixture_acknowledgement(&invocation.egress)?;
-    let deadline = Instant::now() + invocation.limits.timeout;
-    let outputs = output_caps(&invocation.outputs);
-
-    let PreparedIsolate {
-        mut runtime,
-        isolate_handle,
-        specifier,
-    } = prepare_isolate(
-        invocation.limits,
-        invocation.bundle,
-        Arc::clone(usage),
-        invocation.egress,
-        outputs,
-        invocation.sink,
-        deadline,
-    )?;
-
-    // Captured before installing the near-heap-limit callback, and moved
-    // into it, so the callback can request termination of *this* isolate
-    // from wherever V8 invokes it (documented as callable from a GC pause
-    // on the isolate's own thread) without needing `&mut JsRuntime`, which
-    // the callback signature does not provide.
-    let terminated = Arc::new(AtomicBool::new(false));
-    install_heap_limit_callback(&mut runtime, isolate_handle, Arc::clone(&terminated));
-
-    let result =
-        run_invocation(&mut runtime, &specifier, invocation.export, &invocation.event).await;
-    mark_terminated(result, &terminated)
+/// Everything [`begin_invocation`] hands back to a caller that will drive
+/// the isolate to completion itself (with or without a watchdog thread).
+struct BegunInvocation<'a> {
+    isolate: PreparedIsolate,
+    terminated: Arc<AtomicBool>,
+    timeout: Duration,
+    export: &'a str,
+    event: serde_json::Value,
 }
 
-/// Like [`invoke_handler`], but with a watchdog `std::thread` attached and
-/// its own dedicated, current-thread tokio runtime (with the network/IO
-/// driver enabled, for `apsides.fetch`).
+/// Validates/normalizes `invocation.egress`'s allowlist and fixture
+/// acknowledgement, builds a fresh isolate, and installs the heap-limit
+/// callback -- shared by every `invoke_handler*` entry point so each only
+/// has to add its own runtime/watchdog concerns on top.
 ///
-/// Spawns a watchdog `std::thread` that calls
-/// `IsolateHandle::terminate_execution()` after `invocation.limits.timeout`,
-/// runs the isolate on that dedicated runtime, and blocks the calling
-/// thread until it finishes.
-///
-/// This is the mechanism the plan's wall-clock watchdog (`timeoutMillis`)
-/// needs, and [`invoke_handler_blocking`]'s `tokio::time::timeout` is *not*
-/// a substitute for it: a `tokio::time::timeout` around an `.await` only
-/// ever gets a chance to fire at an await point the awaited future
-/// actually yields at. A synchronous, never-yielding handler body (`while
-/// (true) {}` at module top level, with no `await` in it at all) runs
-/// entirely inside a single, uninterrupted `poll()` of that future --
-/// `tokio::time::timeout` cannot preempt it, because the executor never
-/// gets control back to check the deadline. `IsolateHandle::terminate_execution()`
-/// called from a *different* OS thread works regardless, because V8 checks
-/// for a pending termination request at points a tight synchronous loop
-/// still reaches (that is its documented purpose). See
-/// `tests/spike.rs`'s `watchdog_thread_terminates_a_synchronous_infinite_loop`.
-///
-/// The watchdog thread does not linger past this call: it blocks on a
-/// channel with `invocation.limits.timeout` as the `recv_timeout`
-/// deadline instead of a bare `sleep`, so dropping the sending half here
-/// (once the invocation finishes, however it finishes) wakes it
-/// immediately with `Disconnected` rather than `Timeout`, and it exits
-/// without calling `terminate_execution()`. This function joins it before
-/// returning either way, so it never returns with the watchdog thread
-/// still alive.
-///
-/// # Errors
-///
-/// See [`invoke_handler`]'s `# Errors`; additionally returns
-/// `Err(InvokeError::Runtime(_))` if the tokio runtime fails to build.
-pub fn invoke_handler_with_watchdog(
-    invocation: HandlerInvocation<'_>,
+/// On any failure before an isolate exists at all (an invalid
+/// `egress.allowed` entry, or a missing/wrong fixture acknowledgement),
+/// returns `Err` directly, with no logs to collect.
+fn begin_invocation<'a>(
+    invocation: HandlerInvocation<'a>,
     usage: &Arc<AtomicUsize>,
-) -> Result<HandlerOutput, InvokeError> {
-    validate_fixture_acknowledgement(&invocation.egress)?;
+) -> Result<BegunInvocation<'a>, InvokeError> {
+    let egress = invocation.egress.normalized()?;
+    validate_fixture_acknowledgement(&egress)?;
     let timeout = invocation.limits.timeout;
     let deadline = Instant::now() + timeout;
     let outputs = output_caps(&invocation.outputs);
@@ -1155,27 +1214,161 @@ pub fn invoke_handler_with_watchdog(
         invocation.limits,
         invocation.bundle,
         Arc::clone(usage),
-        invocation.egress,
+        egress,
         outputs,
         invocation.sink,
+        invocation.resolver,
         deadline,
+        invocation.handler_id.to_owned(),
+        invocation.invocation_id.to_owned(),
     )?;
 
+    // Captured before installing the near-heap-limit callback, and moved
+    // into it, so the callback can request termination of *this* isolate
+    // from wherever V8 invokes it (documented as callable from a GC pause
+    // on the isolate's own thread) without needing `&mut JsRuntime`, which
+    // the callback signature does not provide.
     let terminated = Arc::new(AtomicBool::new(false));
     install_heap_limit_callback(&mut runtime, isolate_handle.clone(), Arc::clone(&terminated));
 
-    // Built *before* the watchdog thread is spawned below: if this fails,
-    // it returns before any thread but the caller's own exists, so there
-    // is nothing to join. `enable_io()`: a handler that calls
-    // `apsides.fetch` needs the tokio net driver, not just timers.
-    let rt = tokio::runtime::Builder::new_current_thread()
+    Ok(BegunInvocation {
+        isolate: PreparedIsolate {
+            runtime,
+            isolate_handle,
+            specifier,
+        },
+        terminated,
+        timeout,
+        export: invocation.export,
+        event: invocation.event,
+    })
+}
+
+/// Runs one [`HandlerInvocation`] to completion in a fresh isolate, on
+/// whatever tokio runtime is already driving the calling `.await` chain.
+///
+/// Test-only: gated behind the `test-util` Cargo feature (enabled
+/// automatically for this crate's own `tests/*.rs`, via a self
+/// dev-dependency in `Cargo.toml`). Does **not** itself enforce
+/// `invocation.limits.timeout` against a synchronous, never-yielding
+/// handler body -- see [`invoke_handler_with_watchdog`], the crate's one
+/// production entry point, for the mechanism that does and for why a bare
+/// `tokio::time::timeout` (as [`invoke_handler_blocking`] uses) is not a
+/// substitute for a real watchdog thread. The caller's own tokio runtime
+/// must have its network/IO driver enabled (`enable_io()`/`enable_all()`),
+/// not just `enable_time()`: a handler that calls `apsides.fetch` needs
+/// it.
+///
+/// This function's returned future is not `Send`: `deno_core::JsRuntime`
+/// (and the V8 isolate it owns) is deliberately single-threaded and must
+/// only ever be driven from the one current-thread tokio runtime that owns
+/// it, matching the "one fresh isolate per invocation, never shared across
+/// threads" model.
+#[cfg(feature = "test-util")]
+#[allow(
+    clippy::future_not_send,
+    reason = "deno_core::JsRuntime is deliberately !Send; see the doc comment above"
+)]
+pub async fn invoke_handler(
+    invocation: HandlerInvocation<'_>,
+    usage: &Arc<AtomicUsize>,
+) -> InvocationReport {
+    let mut begun = match begin_invocation(invocation, usage) {
+        Ok(begun) => begun,
+        Err(err) => {
+            return InvocationReport {
+                result: Err(err),
+                logs: Vec::new(),
+            };
+        }
+    };
+
+    let result = run_invocation(
+        &mut begun.isolate.runtime,
+        &begun.isolate.specifier,
+        begun.export,
+        &begun.event,
+    )
+    .await;
+    let result = mark_terminated(result, &begun.terminated);
+    let logs = collect_logs(&begun.isolate.runtime);
+    InvocationReport { result, logs }
+}
+
+/// The crate's one production entry point.
+///
+/// Runs one [`HandlerInvocation`] to completion in a fresh isolate, with a
+/// watchdog `std::thread` attached and its own dedicated, current-thread
+/// tokio runtime (with the network/IO driver enabled, for
+/// `apsides.fetch`).
+///
+/// Spawns a watchdog `std::thread` that calls
+/// `IsolateHandle::terminate_execution()` after `invocation.limits.timeout`,
+/// runs the isolate on that dedicated runtime, and blocks the calling
+/// thread until it finishes.
+///
+/// This is the mechanism the plan's wall-clock watchdog (`timeoutMillis`)
+/// needs: a `tokio::time::timeout` around an `.await` only ever gets a
+/// chance to fire at an await point the awaited future actually yields at.
+/// A synchronous, never-yielding handler body (`while (true) {}` at module
+/// top level, with no `await` in it at all) runs entirely inside a single,
+/// uninterrupted `poll()` of that future -- `tokio::time::timeout` cannot
+/// preempt it, because the executor never gets control back to check the
+/// deadline. `IsolateHandle::terminate_execution()` called from a
+/// *different* OS thread works regardless, because V8 checks for a
+/// pending termination request at points a tight synchronous loop still
+/// reaches (that is its documented purpose). See `tests/spike.rs`'s
+/// `watchdog_thread_terminates_a_synchronous_infinite_loop`.
+///
+/// The watchdog thread does not linger past this call: it blocks on a
+/// channel with `invocation.limits.timeout` as the `recv_timeout`
+/// deadline instead of a bare `sleep`, so dropping the sending half here
+/// (once the invocation finishes, however it finishes) wakes it
+/// immediately with `Disconnected` rather than `Timeout`, and it exits
+/// without calling `terminate_execution()`. This function joins it before
+/// returning either way, so it never returns with the watchdog thread
+/// still alive.
+///
+/// Always returns an [`InvocationReport`] (never a bare `Result`):
+/// `result` carries the handler's resolved value or why the invocation
+/// failed, and `logs` carries every `apsides.log` line captured either
+/// way -- see that type's doc comment.
+pub fn invoke_handler_with_watchdog(
+    invocation: HandlerInvocation<'_>,
+    usage: &Arc<AtomicUsize>,
+) -> InvocationReport {
+    let mut begun = match begin_invocation(invocation, usage) {
+        Ok(begun) => begun,
+        Err(err) => {
+            return InvocationReport {
+                result: Err(err),
+                logs: Vec::new(),
+            };
+        }
+    };
+
+    // `enable_io()`: a handler that calls `apsides.fetch` needs the tokio
+    // net driver, not just timers. Built *before* the watchdog thread is
+    // spawned below: if this fails, it returns before any thread but the
+    // caller's own exists, so there is nothing to join.
+    let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .enable_io()
         .build()
-        .map_err(InvokeError::Runtime)?;
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            return InvocationReport {
+                result: Err(InvokeError::Runtime(err)),
+                logs: Vec::new(),
+            };
+        }
+    };
 
     let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
-    let terminated_for_watchdog = Arc::clone(&terminated);
+    let terminated_for_watchdog = Arc::clone(&begun.terminated);
+    let isolate_handle = begun.isolate.isolate_handle.clone();
+    let timeout = begun.timeout;
     let watchdog = std::thread::spawn(move || {
         // `Timeout`: the deadline passed with the run still going --
         // terminate it. `Disconnected` (the sender was dropped below,
@@ -1192,54 +1385,61 @@ pub fn invoke_handler_with_watchdog(
     });
 
     let result = rt.block_on(run_invocation(
-        &mut runtime,
-        &specifier,
-        invocation.export,
-        &invocation.event,
+        &mut begun.isolate.runtime,
+        &begun.isolate.specifier,
+        begun.export,
+        &begun.event,
     ));
-    let result = mark_terminated(result, &terminated);
+    let result = mark_terminated(result, &begun.terminated);
+    let logs = collect_logs(&begun.isolate.runtime);
 
     drop(cancel_tx);
     // A panicking watchdog thread (it cannot: the closure above has no
     // fallible/panicking calls) would be the only way `join` returns
     // `Err`; there is nothing more to do with that here than let it drop.
-    let _ = watchdog.join();
+    let _ignored = watchdog.join();
 
-    result
+    InvocationReport { result, logs }
 }
 
 /// Runs [`invoke_handler`] on a fresh single-threaded current-thread tokio
 /// runtime (with the network/IO driver enabled) and blocks on it.
 ///
-/// `invocation.limits.timeout` here is a `tokio::time::timeout` around the
-/// whole `.await` chain, which only helps between await points (op calls,
-/// event loop turns) -- it is **not** a substitute for a real wall-clock
-/// watchdog against a synchronous, never-yielding script; see
-/// [`invoke_handler_with_watchdog`]'s doc comment for why, and for the
-/// mechanism a real deployment needs (a separate OS thread calling
-/// `IsolateHandle::terminate_execution()`).
-///
-/// `usage` is forwarded to [`invoke_handler`]; see its doc comment.
-///
-/// # Errors
-///
-/// Returns `Err` if the tokio runtime fails to build, if the invocation
-/// does not finish within `invocation.limits.timeout`, or if
-/// [`invoke_handler`] itself returns `Err` (see its docs).
+/// Test-only, gated the same way as [`invoke_handler`]. The
+/// `tokio::time::timeout` this wraps the whole `.await` chain in only
+/// helps between await points (op calls, event loop turns) -- it is
+/// **not** a substitute for a real wall-clock watchdog against a
+/// synchronous, never-yielding script; see
+/// [`invoke_handler_with_watchdog`]'s doc comment for why. A timeout here
+/// drops the in-flight invocation's future, so `logs` is empty in that one
+/// case (the watchdog-based entry point does not have this gap).
+#[cfg(feature = "test-util")]
 pub fn invoke_handler_blocking(
     invocation: HandlerInvocation<'_>,
     usage: &Arc<AtomicUsize>,
-) -> Result<HandlerOutput, InvokeError> {
+) -> InvocationReport {
     let timeout = invocation.limits.timeout;
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .enable_io()
         .build()
-        .map_err(InvokeError::Runtime)?;
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            return InvocationReport {
+                result: Err(InvokeError::Runtime(err)),
+                logs: Vec::new(),
+            };
+        }
+    };
     rt.block_on(async move {
-        tokio::time::timeout(timeout, invoke_handler(invocation, usage))
-            .await
-            .map_err(|_elapsed| InvokeError::Timeout)?
+        match tokio::time::timeout(timeout, invoke_handler(invocation, usage)).await {
+            Ok(report) => report,
+            Err(_elapsed) => InvocationReport {
+                result: Err(InvokeError::Timeout),
+                logs: Vec::new(),
+            },
+        }
     })
 }
 
@@ -1259,6 +1459,8 @@ pub enum InvokeError {
         "egress.fixture_trust_anchor was set without acknowledgement == FIXTURE_ACKNOWLEDGEMENT"
     )]
     FixtureAcknowledgementMissing,
+    #[error("egress.allowed entry {0:?} is invalid (empty host)")]
+    InvalidEgressAllowlistEntry(String),
     #[error("failed to build tokio runtime: {0}")]
     Runtime(#[source] std::io::Error),
     #[error("handler invocation timed out")]

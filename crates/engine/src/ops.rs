@@ -2,12 +2,13 @@
 //! `op_apsides_log`. Exposed to handler code only through the frozen
 //! `apsides` global object `BOOTSTRAP_GUARD_SCRIPT` (in `lib.rs`) installs;
 //! nothing in this module is reachable by any other name, and nothing here
-//! trusts a caller-supplied `Host` header, follows a redirect, or writes to
-//! an output id the caller did not declare.
+//! trusts a caller-supplied `Host`/`Content-Length`/`Transfer-Encoding`/etc.
+//! header, follows a redirect, or writes to an output id the caller did
+//! not declare.
 //!
 //! Every fallible op below is infallible at the `#[op2]` boundary itself:
-//! each returns a `#[serde]`-tagged `..Outcome`/`..Result` enum (`Ok { .. }`
-//! or `Error { code, message }`) rather than a `Result<T, E>` thrown through
+//! each returns a `#[serde]`-tagged `..Outcome` enum (`Ok { .. }` or
+//! `Error { code, message }`) rather than a `Result<T, E>` thrown through
 //! `deno_core`'s own error machinery. `code` is always the `Display`-paired
 //! variant of a dedicated Rust error enum (`FetchError`/`OutputWriteError`),
 //! serialized as a fixed `SCREAMING_SNAKE_CASE` identifier -- the "thiserror
@@ -18,35 +19,50 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use deno_core::JsBuffer;
 use deno_core::OpState;
-use deno_core::op2;
+use deno_core::{JsBuffer, ToJsBuffer, op2};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{EgressPolicy, OutputSink, OutputSinkError};
 use crate::net;
+use crate::{EgressPolicy, EgressResolver, LogLevel, LogLine, OutputSink, OutputSinkError};
 
 /// Per-invocation state the ops above read from `OpState`. Built once by
-/// `crate::prepare_isolate` from the caller's `HandlerInvocation` and never
-/// replaced; `logs` is the only field any op mutates.
+/// `crate::prepare_isolate` from the caller's `HandlerInvocation` and
+/// mutated only by the ops themselves (`logs`, `outputs_written`,
+/// `fetched_bytes_used`) and by `crate::call_handler_export` (`closed`,
+/// set once the handler's own promise has settled -- see that function's
+/// doc comment).
 pub(crate) struct EngineOpState {
     pub egress: EgressPolicy,
     /// Declared output id -> its `max_bytes` cap.
     pub outputs: HashMap<String, usize>,
+    /// Declared output id -> (key -> `key.len() + data.len()` for the
+    /// most recent write of that key). The cap in `outputs` bounds the sum
+    /// of this inner map's values, not any one write.
+    pub outputs_written: HashMap<String, HashMap<String, usize>>,
     pub sink: Arc<dyn OutputSink>,
+    pub resolver: Option<Arc<EgressResolver>>,
     /// Absolute deadline for the whole invocation (`Instant::now() +
-    /// Limits::timeout` at invocation start), forwarded to
-    /// `net::FetchLimits::deadline` so a fetch's own "total time <=
+    /// Limits::timeout` at invocation start), forwarded to DNS resolution
+    /// and `net::FetchLimits::deadline` so a fetch's own "total time <=
     /// timeout" budget can never outlive the invocation's watchdog-enforced
     /// one.
     pub deadline: Instant,
-    pub logs: Vec<String>,
+    pub max_fetch_bytes_total: usize,
+    pub fetched_bytes_used: usize,
+    pub handler_id: String,
+    pub invocation_id: String,
+    pub logs: Vec<LogLine>,
+    /// Set once, by `crate::call_handler_export`, after the handler's own
+    /// promise has resolved but before its return value is marshalled back
+    /// to Rust -- see that function's doc comment for why. Every op checks
+    /// this first and fails fast once it is set.
+    pub closed: bool,
 }
 
 /// See the plan's `op_apsides_log` rule.
@@ -57,22 +73,57 @@ const MAX_LOG_LINES: usize = 64;
 const MAX_FETCH_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 /// See the plan's `op_apsides_fetch` rule.
 const MAX_FETCH_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+/// Output key length cap (review round 5, B7).
+const MAX_OUTPUT_KEY_LEN: usize = 253;
 
 // ---------------------------------------------------------------------
 // op_apsides_log
 // ---------------------------------------------------------------------
 
+fn parse_log_level(level: &str) -> LogLevel {
+    match level {
+        "debug" => LogLevel::Debug,
+        "warn" => LogLevel::Warn,
+        "error" => LogLevel::Error,
+        // The `apsides.log` JS wrapper validates `level` against exactly
+        // these four strings before ever calling this op (see
+        // `BOOTSTRAP_GUARD_SCRIPT`); an unrecognized value here can only
+        // mean a future wrapper bug, and this op must never panic over
+        // that -- default to `Info` rather than reject the line outright.
+        _other => LogLevel::Info,
+    }
+}
+
+#[derive(Serialize)]
+struct StderrLogRecord<'a> {
+    handler_id: &'a str,
+    invocation_id: &'a str,
+    level: &'a LogLevel,
+    message: &'a str,
+}
+
 /// Appends one log line, truncated (at a UTF-8 char boundary, never
-/// splitting a code point) to at most [`MAX_LOG_LINE_BYTES`]. Once
-/// [`MAX_LOG_LINES`] lines have been recorded for this invocation, further
-/// calls are silently dropped rather than throwing: logging must never be
-/// able to fail a handler that is otherwise working correctly.
+/// splitting a code point) to at most [`MAX_LOG_LINE_BYTES`], and -- at op
+/// time, unconditionally, before the in-memory cap below is even checked
+/// -- emits it to stderr as one `serde_json`-escaped JSON object per line,
+/// tagged with this invocation's `handler_id`/`invocation_id`. The
+/// stderr line is built entirely in Rust from already-validated/truncated
+/// fields, so a handler cannot forge or inject an extra line into it.
+///
+/// Once [`MAX_LOG_LINES`] lines have been recorded in `EngineOpState.logs`
+/// for this invocation, further calls still reach stderr but are silently
+/// dropped from the in-memory/`InvocationReport` copy: logging must never
+/// be able to fail a handler that is otherwise working correctly, and the
+/// in-memory cap exists only to bound `InvocationReport`'s own size, not
+/// to bound what reaches stderr.
 #[op2(fast)]
-pub fn op_apsides_log(state: &mut OpState, #[string] line: &str) {
+pub fn op_apsides_log(state: &mut OpState, #[string] level: &str, #[string] line: &str) {
     let engine_state = state.borrow_mut::<EngineOpState>();
-    if engine_state.logs.len() >= MAX_LOG_LINES {
+    if engine_state.closed {
         return;
     }
+
+    let level = parse_log_level(level);
     let mut truncated = String::new();
     let mut byte_len = 0_usize;
     for ch in line.chars() {
@@ -83,7 +134,22 @@ pub fn op_apsides_log(state: &mut OpState, #[string] line: &str) {
         truncated.push(ch);
         byte_len += ch_len;
     }
-    engine_state.logs.push(truncated);
+
+    if let Ok(record) = serde_json::to_string(&StderrLogRecord {
+        handler_id: &engine_state.handler_id,
+        invocation_id: &engine_state.invocation_id,
+        level: &level,
+        message: &truncated,
+    }) {
+        eprintln!("{record}");
+    }
+
+    if engine_state.logs.len() < MAX_LOG_LINES {
+        engine_state.logs.push(LogLine {
+            level,
+            message: truncated,
+        });
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -93,6 +159,7 @@ pub fn op_apsides_log(state: &mut OpState, #[string] line: &str) {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OutputWriteErrorCode {
+    OpsClosed,
     UndeclaredOutputId,
     InvalidKey,
     DataTooLarge,
@@ -101,11 +168,19 @@ pub enum OutputWriteErrorCode {
 
 #[derive(Debug, Error)]
 pub enum OutputWriteError {
+    #[error("apsides.writeOutput is no longer available: the handler has already returned")]
+    OpsClosed,
     #[error("output id {0:?} was not declared for this invocation")]
     UndeclaredOutputId(String),
-    #[error("key {0:?} does not match the required pattern [-._a-zA-Z0-9]+")]
+    #[error(
+        "key {0:?} is invalid: it must match [-._a-zA-Z0-9]+, be at most {MAX_OUTPUT_KEY_LEN} \
+         characters, and never be exactly \".\" or \"..\""
+    )]
     InvalidKey(String),
-    #[error("data is {0} bytes, over the declared {1} byte cap for output {2:?}")]
+    #[error(
+        "writing {0} would bring output {2:?}'s total (key + data bytes, across every key) to \
+         {1} bytes, over its declared cap"
+    )]
     DataTooLarge(usize, usize, String),
     #[error("output sink rejected the write: {0}")]
     SinkRejected(#[from] OutputSinkError),
@@ -114,6 +189,7 @@ pub enum OutputWriteError {
 impl OutputWriteError {
     const fn code(&self) -> OutputWriteErrorCode {
         match self {
+            Self::OpsClosed => OutputWriteErrorCode::OpsClosed,
             Self::UndeclaredOutputId(_) => OutputWriteErrorCode::UndeclaredOutputId,
             Self::InvalidKey(_) => OutputWriteErrorCode::InvalidKey,
             Self::DataTooLarge(..) => OutputWriteErrorCode::DataTooLarge,
@@ -132,44 +208,66 @@ pub enum OutputWriteOutcome {
     },
 }
 
-/// `[-._a-zA-Z0-9]+`, checked byte-wise (the pattern is ASCII-only).
+/// `[-._a-zA-Z0-9]+`, at most [`MAX_OUTPUT_KEY_LEN`] characters, never
+/// exactly `.` or `..` (checked byte-wise; the pattern is ASCII-only).
 fn is_valid_output_key(key: &str) -> bool {
-    !key.is_empty()
-        && key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+    if key.is_empty() || key.len() > MAX_OUTPUT_KEY_LEN || key == "." || key == ".." {
+        return false;
+    }
+    key.bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
 }
 
 fn write_output(
-    state: &OpState,
+    state: &mut OpState,
     id: &str,
     key: &str,
     data: &[u8],
 ) -> Result<(), OutputWriteError> {
-    let engine_state = state.borrow::<EngineOpState>();
+    let engine_state = state.borrow_mut::<EngineOpState>();
+    if engine_state.closed {
+        return Err(OutputWriteError::OpsClosed);
+    }
     let Some(&max_bytes) = engine_state.outputs.get(id) else {
         return Err(OutputWriteError::UndeclaredOutputId(id.to_owned()));
     };
     if !is_valid_output_key(key) {
         return Err(OutputWriteError::InvalidKey(key.to_owned()));
     }
-    if data.len() > max_bytes {
+
+    let entry_size = key.len() + data.len();
+    let existing = engine_state
+        .outputs_written
+        .entry(id.to_owned())
+        .or_default();
+    let previous_for_this_key = existing.get(key).copied().unwrap_or(0);
+    let total_excluding_this_key = existing.values().sum::<usize>() - previous_for_this_key;
+    let new_total = total_excluding_this_key.saturating_add(entry_size);
+    if new_total > max_bytes {
         return Err(OutputWriteError::DataTooLarge(
-            data.len(),
-            max_bytes,
+            entry_size,
+            new_total,
             id.to_owned(),
         ));
     }
+
     engine_state
         .sink
         .write_output(id, key, data)
-        .map_err(OutputWriteError::from)
+        .map_err(OutputWriteError::from)?;
+
+    engine_state
+        .outputs_written
+        .entry(id.to_owned())
+        .or_default()
+        .insert(key.to_owned(), entry_size);
+    Ok(())
 }
 
 #[op2]
 #[serde]
 pub fn op_apsides_output_write(
-    state: &OpState,
+    state: &mut OpState,
     #[string] id: &str,
     #[string] key: &str,
     #[buffer] data: &[u8],
@@ -187,27 +285,54 @@ pub fn op_apsides_output_write(
 // op_apsides_fetch
 // ---------------------------------------------------------------------
 
+/// Request headers no handler may ever set directly -- each is either
+/// derived automatically from the vetted connection (`Host`), describes
+/// the request body in a way only this client may set correctly
+/// (`Content-Length`/`Transfer-Encoding`), or governs connection-level
+/// framing/upgrade semantics this crate's one-shot HTTP/1.1 client does
+/// not support and must not let a handler quietly desynchronize
+/// (`Connection`/`TE`/`Upgrade`/`Trailer`). Checked case-insensitively.
+const FORBIDDEN_REQUEST_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "te",
+    "upgrade",
+    "trailer",
+];
+
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum FetchErrorCode {
+    OpsClosed,
     SchemeNotHttps,
     InvalidUrl,
     HostIsIpLiteral,
     HostNotAllowed,
-    HostHeaderNotPermitted,
-    DnsResolutionFailed,
-    AddressNotGlobalUnicast,
+    ForbiddenRequestHeader,
+    InvalidRequestHeader,
+    InvalidRequestMethod,
     RequestBodyTooLarge,
+    FetchByteBudgetExceeded,
+    DnsResolutionFailed,
+    NoGlobalUnicastAddress,
     ConnectFailed,
+    ConnectTimeout,
     TlsHandshakeFailed,
+    HttpHandshakeFailed,
+    RequestSendFailed,
+    ResponseHeadersTooLarge,
+    InvalidResponseHeader,
     ResponseTooLarge,
-    RedirectNotFollowed,
+    ResponseBodyFailed,
     Timeout,
-    MalformedResponse,
 }
 
 #[derive(Debug, Error)]
 pub enum FetchError {
+    #[error("apsides.fetch is no longer available: the handler has already returned")]
+    OpsClosed,
     #[error("URL scheme must be https")]
     SchemeNotHttps,
     #[error("invalid URL: {0}")]
@@ -216,19 +341,20 @@ pub enum FetchError {
         "URL host must be a DNS name, not an IP literal ({0}); apsides.fetch resolves a \
          declared hostname itself and refuses to bypass that"
     )]
-    HostIsIpLiteral(IpAddr),
+    HostIsIpLiteral(String),
     #[error("{0}:{1} is not on the egress allowlist")]
     HostNotAllowed(String, u16),
-    #[error(
-        "caller-supplied Host header is not permitted; the declared host is set automatically"
-    )]
-    HostHeaderNotPermitted,
-    #[error("DNS resolution failed: {0}")]
-    DnsResolutionFailed(#[from] net::ResolveError),
-    #[error("resolved address {0} is not a global unicast address")]
-    AddressNotGlobalUnicast(IpAddr),
+    #[error("request header {0:?} is not permitted; it is set automatically or never allowed")]
+    ForbiddenRequestHeader(String),
     #[error("request body is {0} bytes, over the {1} byte limit")]
     RequestBodyTooLarge(usize, usize),
+    #[error(
+        "this invocation's cumulative apsides.fetch response budget \
+         (Limits::max_fetch_bytes_total) is exhausted"
+    )]
+    FetchByteBudgetExceeded,
+    #[error("DNS resolution failed: {0}")]
+    DnsResolutionFailed(#[from] net::ResolveError),
     #[error(transparent)]
     Https(#[from] net::HttpsError),
 }
@@ -236,26 +362,37 @@ pub enum FetchError {
 impl FetchError {
     const fn code(&self) -> FetchErrorCode {
         match self {
+            Self::OpsClosed => FetchErrorCode::OpsClosed,
             Self::SchemeNotHttps => FetchErrorCode::SchemeNotHttps,
             Self::InvalidUrl(_) => FetchErrorCode::InvalidUrl,
             Self::HostIsIpLiteral(_) => FetchErrorCode::HostIsIpLiteral,
             Self::HostNotAllowed(..) => FetchErrorCode::HostNotAllowed,
-            Self::HostHeaderNotPermitted => FetchErrorCode::HostHeaderNotPermitted,
-            Self::DnsResolutionFailed(_) => FetchErrorCode::DnsResolutionFailed,
-            Self::AddressNotGlobalUnicast(_) => FetchErrorCode::AddressNotGlobalUnicast,
+            Self::ForbiddenRequestHeader(_) => FetchErrorCode::ForbiddenRequestHeader,
             Self::RequestBodyTooLarge(..) => FetchErrorCode::RequestBodyTooLarge,
+            Self::FetchByteBudgetExceeded => FetchErrorCode::FetchByteBudgetExceeded,
+            Self::DnsResolutionFailed(_) => FetchErrorCode::DnsResolutionFailed,
             Self::Https(err) => match err {
-                net::HttpsError::ResponseTooLarge(_) => FetchErrorCode::ResponseTooLarge,
-                net::HttpsError::RedirectNotFollowed => FetchErrorCode::RedirectNotFollowed,
-                net::HttpsError::Timeout => FetchErrorCode::Timeout,
-                net::HttpsError::Connect(..) => FetchErrorCode::ConnectFailed,
-                net::HttpsError::TlsHandshake(..)
+                net::HttpsError::Dial(dial) => match dial {
+                    net::DialError::NoGlobalUnicastAddress => {
+                        FetchErrorCode::NoGlobalUnicastAddress
+                    }
+                    net::DialError::Timeout => FetchErrorCode::ConnectTimeout,
+                    net::DialError::AllAttemptsFailed(_) => FetchErrorCode::ConnectFailed,
+                },
+                net::HttpsError::CryptoProvider(_)
                 | net::HttpsError::InvalidServerName(..)
-                | net::HttpsError::CryptoProvider(_) => FetchErrorCode::TlsHandshakeFailed,
-                net::HttpsError::Write(_)
-                | net::HttpsError::Read(_)
-                | net::HttpsError::MalformedStatusLine
-                | net::HttpsError::MalformedHeaders => FetchErrorCode::MalformedResponse,
+                | net::HttpsError::TlsHandshake(..) => FetchErrorCode::TlsHandshakeFailed,
+                net::HttpsError::InvalidMethod(_) => FetchErrorCode::InvalidRequestMethod,
+                net::HttpsError::InvalidHeader(_) => FetchErrorCode::InvalidRequestHeader,
+                net::HttpsError::HttpHandshake(_) => FetchErrorCode::HttpHandshakeFailed,
+                net::HttpsError::RequestSend(_) => FetchErrorCode::RequestSendFailed,
+                net::HttpsError::ResponseHeadersTooLarge(..) => {
+                    FetchErrorCode::ResponseHeadersTooLarge
+                }
+                net::HttpsError::InvalidResponseHeader => FetchErrorCode::InvalidResponseHeader,
+                net::HttpsError::ResponseTooLarge(_) => FetchErrorCode::ResponseTooLarge,
+                net::HttpsError::ResponseBody(_) => FetchErrorCode::ResponseBodyFailed,
+                net::HttpsError::Timeout => FetchErrorCode::Timeout,
             },
         }
     }
@@ -280,7 +417,7 @@ pub enum FetchOutcome {
     Ok {
         status: u16,
         headers: Vec<(String, String)>,
-        body: Vec<u8>,
+        body: ToJsBuffer,
     },
     Error {
         code: FetchErrorCode,
@@ -290,7 +427,7 @@ pub enum FetchOutcome {
 
 #[allow(
     clippy::future_not_send,
-    reason = "deno_core::OpState/JsRuntime are deliberately !Send (single isolate, single thread); see crate::invoke_handler's doc comment"
+    reason = "deno_core::OpState/JsRuntime are deliberately !Send (single isolate, single thread); see crate::invoke_handler_with_watchdog's doc comment"
 )]
 async fn fetch(
     state: &Rc<RefCell<OpState>>,
@@ -303,39 +440,56 @@ async fn fetch(
             MAX_FETCH_REQUEST_BODY_BYTES,
         ));
     }
-    if request
-        .headers
-        .iter()
-        .any(|(name, _value)| name.eq_ignore_ascii_case("host"))
-    {
-        return Err(FetchError::HostHeaderNotPermitted);
+    for (name, _value) in &request.headers {
+        if FORBIDDEN_REQUEST_HEADERS
+            .iter()
+            .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+        {
+            return Err(FetchError::ForbiddenRequestHeader(name.clone()));
+        }
     }
 
-    let (egress, deadline) = {
+    let (egress, deadline, resolver, closed, remaining_fetch_budget) = {
         let state_ref = state.borrow();
         let engine_state = state_ref.borrow::<EngineOpState>();
-        (engine_state.egress.clone(), engine_state.deadline)
+        (
+            engine_state.egress.clone(),
+            engine_state.deadline,
+            engine_state.resolver.clone(),
+            engine_state.closed,
+            engine_state
+                .max_fetch_bytes_total
+                .saturating_sub(engine_state.fetched_bytes_used),
+        )
     };
+    if closed {
+        return Err(FetchError::OpsClosed);
+    }
+    if remaining_fetch_budget == 0 {
+        return Err(FetchError::FetchByteBudgetExceeded);
+    }
 
     let parsed = deno_core::url::Url::parse(&request.url)
         .map_err(|err| FetchError::InvalidUrl(err.to_string()))?;
     if parsed.scheme() != "https" {
         return Err(FetchError::SchemeNotHttps);
     }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| FetchError::InvalidUrl("URL has no host".to_owned()))?
-        .to_owned();
+    // `parsed.host()`, not `host_str()`: a bracketed IPv6 literal
+    // (`https://[::1]/`) parses to `Host::Ipv6` either way, but matching
+    // on the typed `Host` (rather than re-parsing the string form) is
+    // what makes the IP-literal rejection below exhaustive and structural,
+    // not a second, possibly-divergent parse.
+    let host = match parsed.host() {
+        Some(deno_core::url::Host::Domain(domain)) => domain.to_owned(),
+        Some(deno_core::url::Host::Ipv4(ip)) => {
+            return Err(FetchError::HostIsIpLiteral(ip.to_string()));
+        }
+        Some(deno_core::url::Host::Ipv6(ip)) => {
+            return Err(FetchError::HostIsIpLiteral(format!("[{ip}]")));
+        }
+        None => return Err(FetchError::InvalidUrl("URL has no host".to_owned())),
+    };
     let port = parsed.port_or_known_default().unwrap_or(443);
-
-    // The whole design is "resolve a declared *name*, then vet the
-    // resolved address" (SNI and the outgoing Host header are the parsed
-    // name, never an address) -- a URL that already names a bare IP
-    // literal has no name to declare, so it is rejected outright, even if
-    // that literal happens to appear in the allowlist.
-    if let Ok(ip_literal) = host.parse::<IpAddr>() {
-        return Err(FetchError::HostIsIpLiteral(ip_literal));
-    }
 
     if !egress
         .allowed
@@ -345,20 +499,13 @@ async fn fetch(
         return Err(FetchError::HostNotAllowed(host, port));
     }
 
-    let resolved_ip = net::resolve_host(&host, egress.resolver_override.as_ref()).await?;
-    // The global-unicast check is skipped only in fixture mode
-    // (`fixture_trust_anchor` set, already validated to carry the required
-    // acknowledgement before this isolate was ever built -- see
-    // `validate_fixture_acknowledgement`): a local HTTPS test server binds
-    // to a loopback address by construction, which the check would
-    // otherwise always reject. Bundled behind the same acknowledgement as
-    // the extra trust anchor, not a separate flag, since both are the same
-    // "this is a disposable test fixture, not a production destination"
-    // relaxation.
-    if egress.fixture_trust_anchor.is_none() && !net::is_global_unicast(resolved_ip) {
-        return Err(FetchError::AddressNotGlobalUnicast(resolved_ip));
-    }
-    let addr = std::net::SocketAddr::new(resolved_ip, port);
+    let candidates = net::resolve_host(
+        &host,
+        egress.resolver_override.as_ref(),
+        resolver.as_deref(),
+        deadline,
+    )
+    .await?;
 
     let mut path_and_query = parsed.path().to_owned();
     if let Some(query) = parsed.query() {
@@ -373,28 +520,37 @@ async fn fetch(
             der: fixture.trust_anchor_der.clone(),
         });
     let fetch_limits = net::FetchLimits {
-        max_response_bytes: MAX_FETCH_RESPONSE_BYTES,
+        max_response_bytes: remaining_fetch_budget.min(MAX_FETCH_RESPONSE_BYTES),
         deadline,
     };
 
     let response = net::https_request(
-        addr,
+        &candidates,
+        port,
         &host,
         &request.method,
         &path_and_query,
         &request.headers,
-        &body,
+        body,
         &fetch_limits,
         extra_trust_anchor.as_ref(),
     )
     .await?;
+
+    {
+        let mut state_ref = state.borrow_mut();
+        let engine_state = state_ref.borrow_mut::<EngineOpState>();
+        engine_state.fetched_bytes_used = engine_state
+            .fetched_bytes_used
+            .saturating_add(response.body.len());
+    }
 
     Ok((response.status, response.headers, response.body))
 }
 
 #[allow(
     clippy::future_not_send,
-    reason = "deno_core::OpState/JsRuntime are deliberately !Send (single isolate, single thread); see crate::invoke_handler's doc comment"
+    reason = "deno_core::OpState/JsRuntime are deliberately !Send (single isolate, single thread); see crate::invoke_handler_with_watchdog's doc comment"
 )]
 #[op2]
 #[serde]
@@ -408,13 +564,22 @@ pub async fn op_apsides_fetch(
         Ok((status, headers, body)) => FetchOutcome::Ok {
             status,
             headers,
-            body,
+            body: body.into(),
         },
         Err(err) => FetchOutcome::Error {
             code: err.code(),
             message: err.to_string(),
         },
     }
+}
+
+/// The two caller-supplied identifiers `apsides.log` attaches to every
+/// stderr line (see `EngineOpState`/`StderrLogRecord`). Bundled into one
+/// type so the `extension!` macro below (which becomes an `init` function
+/// clippy counts arguments on) stays at 7 options, not 8.
+pub(crate) struct InvocationIds {
+    pub handler_id: String,
+    pub invocation_id: String,
 }
 
 deno_core::extension!(
@@ -424,15 +589,25 @@ deno_core::extension!(
         egress: EgressPolicy,
         outputs: HashMap<String, usize>,
         sink: Arc<dyn OutputSink>,
+        resolver: Option<Arc<EgressResolver>>,
         deadline: Instant,
+        max_fetch_bytes_total: usize,
+        ids: InvocationIds,
     },
     state = |state, options| {
         state.put(EngineOpState {
             egress: options.egress,
             outputs: options.outputs,
+            outputs_written: HashMap::new(),
             sink: options.sink,
+            resolver: options.resolver,
             deadline: options.deadline,
+            max_fetch_bytes_total: options.max_fetch_bytes_total,
+            fetched_bytes_used: 0,
+            handler_id: options.ids.handler_id,
+            invocation_id: options.ids.invocation_id,
             logs: Vec::new(),
+            closed: false,
         });
     },
 );

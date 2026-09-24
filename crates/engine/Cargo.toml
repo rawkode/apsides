@@ -52,7 +52,21 @@ http-body-util = "=0.1.5"
 hyper = { version = "=1.11.1", features = ["client", "http1"] }
 hyper-util = { version = "=0.1.20", features = ["tokio"] }
 
+[features]
+# Review round 5 (decision): the only entry point exposed without this
+# feature is `invoke_handler_with_watchdog` (the plan's watchdog-enforced
+# production API). `invoke_handler`/`invoke_handler_blocking` exist for
+# this crate's own tests, which want an `.await`able or a
+# `tokio::time::timeout`-wrapped form without a watchdog thread getting in
+# the way of asserting on the underlying error shape -- gated behind this
+# feature rather than made `pub(crate)` so tests/*.rs (separate,
+# external-crate integration test binaries) can still reach them. Enabled
+# automatically for `cargo test`/`cargo clippy --tests` via the self
+# dev-dependency below; never enabled for an ordinary `cargo build`.
+test-util = []
+
 [dev-dependencies]
+engine = { path = ".", features = ["test-util"] }
 landlock = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 # Local HTTPS test-server fixture for the `op_apsides_fetch` "allowed"

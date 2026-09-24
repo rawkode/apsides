@@ -1034,6 +1034,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "deno_core",
+ "engine",
  "hickory-resolver",
  "http",
  "http-body-util",

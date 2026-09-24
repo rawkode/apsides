@@ -174,12 +174,13 @@ fn run_gc_heavy_handler() -> Result<(), String> {
             }
             chunks = null;
         }
-        apsides.log("pong-from-rust");
+        apsides.log("info", "pong-from-rust");
     "#,
     );
     let mut invocation = handler_invocation(&bundle);
     invocation.limits.timeout = Duration::from_secs(30);
     engine::invoke_handler_blocking(invocation, &usage)
-        .map(|_output| ())
+        .result
+        .map(|_value| ())
         .map_err(|err| format!("GC-heavy handler failed under lockdown: {err}"))
 }

@@ -32,6 +32,7 @@ pub const GENEROUS_LIMITS: Limits = Limits {
     timeout: Duration::from_secs(10),
     max_heap_bytes: 64 * 1024 * 1024,
     max_array_buffer_bytes: 16 * 1024 * 1024,
+    max_fetch_bytes_total: 16 * 1024 * 1024,
 };
 
 /// An [`OutputSink`] that accepts every write. Used by tests that do not
@@ -74,6 +75,13 @@ pub fn handler_invocation(bundle: &str) -> HandlerInvocation<'_> {
         egress: EgressPolicy::default(),
         outputs: Vec::new(),
         sink: accepting_output_sink(),
+        // No real resolver: nothing in this crate's own test suite that
+        // uses `handler_invocation` unmodified calls `apsides.fetch`
+        // against a real host (tests that do build their own
+        // `EgressResolver` or `resolver_override`).
+        resolver: None,
+        handler_id: "test-handler",
+        invocation_id: "test-invocation",
     }
 }
 
