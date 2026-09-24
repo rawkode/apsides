@@ -52,12 +52,55 @@ pub struct Toolchain {
     pub node_image_id: String,
 }
 
+/// Where the running kernel lists its active Linux Security Modules
+/// (comma-separated, e.g. `lockdown,capability,landlock,...`).
+const LSM_PATH: &str = "/sys/kernel/security/lsm";
+
+/// Kind nodes share the host kernel, so Landlock support -- required by
+/// every generated controller's Phase 5c startup lockdown -- is a property
+/// of *this* host, not of the node image. GitHub's `ubuntu-24.04` runners
+/// have it; a self-hosted or older runner might not, which would otherwise
+/// surface much later and far more confusingly, as every acceptance
+/// scenario's controller Pod failing to start (or, if a scenario's fixture
+/// mode ever set `allowNoLandlock`, silently running unlocked instead).
+///
+/// # Errors
+/// Returns a clear infrastructure error naming the missing prerequisite,
+/// not the kernel's raw error text, if [`LSM_PATH`] cannot be read or does
+/// not list `landlock`.
+fn ensure_landlock_available() -> Result<()> {
+    let lsm = std::fs::read_to_string(LSM_PATH).map_err(|error| {
+        crate::Error::Infrastructure(format!(
+            "failed to read {LSM_PATH} to confirm the host kernel has Landlock (needed by \
+             every generated controller's filesystem lockdown, and shared with kind nodes): \
+             {error}"
+        ))
+    })?;
+    check_landlock_listed(&lsm)
+}
+
+/// The pure check behind [`ensure_landlock_available`], separated out so it
+/// can be tested against sample `/sys/kernel/security/lsm` contents without
+/// depending on this host's own kernel configuration.
+fn check_landlock_listed(lsm: &str) -> Result<()> {
+    if lsm.split(',').any(|name| name.trim() == "landlock") {
+        Ok(())
+    } else {
+        infrastructure(format!(
+            "the host kernel does not have Landlock enabled ({LSM_PATH} lists {lsm:?}, not \
+             \"landlock\"); every generated controller's startup applies a Landlock lockdown, \
+             and kind nodes share this host's kernel, so the acceptance suite cannot run here"
+        ))
+    }
+}
+
 /// Check the Docker daemon, kind and the pinned node image before anything is
 /// created, so each missing prerequisite is reported as itself.
 ///
 /// # Errors
 /// Names the first prerequisite that is missing.
 pub async fn preflight() -> Result<Toolchain> {
+    ensure_landlock_available()?;
     let docker = Invocation::new("docker")
         .args(["version", "--format", "{{.Server.Version}}"])
         .timeout(Duration::from_secs(30))
@@ -484,6 +527,37 @@ mod tests {
         assert!(config.contains(&format!("podSubnet: \"{POD_SUBNET}\"")));
         assert!(config.contains(&format!("serviceSubnet: \"{SERVICE_SUBNET}\"")));
         assert!(config.contains("ipFamily: ipv4"));
+    }
+
+    /// See the Apsides v0.3 plan, Phase 5c, item 5: `aps test --cluster`/the
+    /// acceptance suite must report a clear infrastructure error, not a
+    /// confusing downstream controller-pod failure, when the host kernel
+    /// lacks Landlock.
+    #[test]
+    fn landlock_listed_is_accepted_in_any_position() {
+        assert!(check_landlock_listed("landlock").is_ok());
+        assert!(check_landlock_listed("lockdown,capability,landlock,yama,apparmor").is_ok());
+        assert!(check_landlock_listed("lockdown,capability,landlock\n").is_ok());
+    }
+
+    #[test]
+    fn landlock_missing_is_a_clear_infrastructure_error() -> Result<()> {
+        let Err(error) = check_landlock_listed("lockdown,capability,yama,apparmor") else {
+            return Err(crate::Error::Case(
+                "missing landlock must be rejected".into(),
+            ));
+        };
+        let message = error.to_string();
+        assert!(message.contains("Landlock"), "{message}");
+        assert!(message.contains(LSM_PATH), "{message}");
+        Ok(())
+    }
+
+    #[test]
+    fn landlock_check_does_not_match_a_substring_of_another_module_name() {
+        // A hostile or coincidental LSM name containing "landlock" as a
+        // substring (rather than being exactly it) must not pass.
+        assert!(check_landlock_listed("not_landlock_at_all").is_err());
     }
 
     #[cfg(unix)]
