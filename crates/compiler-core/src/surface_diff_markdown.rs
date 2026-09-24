@@ -23,9 +23,11 @@
 //!   comment, `@mention` or `[text](url)` markup for it to render, since
 //!   none of that is interpreted inside a fenced code block regardless of
 //!   its content.
-//! - Every value is passed through [`esc`], which escapes CR and LF, so a
+//! - Every value is passed through [`esc`], which escapes CR and LF (so a
 //!   value cannot inject what looks like an extra, independent line into
-//!   the fenced block.
+//!   the fenced block) and every Unicode bidirectional-control code point
+//!   (so a value cannot visually reorder the characters after it — flipping
+//!   what a reviewer reads without changing the underlying bytes at all).
 use crate::model::{DeletionPolicy, InputMode};
 use crate::surface::SurfaceVerb;
 use crate::surface_diff::{
@@ -33,14 +35,31 @@ use crate::surface_diff::{
     ResourcesDiff, SecretsReadDiff, StringSetDiff, SurfaceDiff,
 };
 
+/// Unicode bidirectional-control code points: the explicit
+/// embedding/override/isolate controls plus the directional marks and the
+/// Arabic letter mark. Each can silently reorder how the characters around
+/// it render without changing a single byte of the underlying text, so a
+/// crafted value (an image reference, say) could otherwise make a line read
+/// as something other than what it actually is.
+const BIDI_CONTROLS: [char; 12] = [
+    '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}',
+    '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+];
+
 /// Escape a surface value before it goes on a fenced diff line: backslash
 /// first (so the escapes this inserts are never themselves ambiguous with a
 /// literal backslash in the source value), then CR and LF, so an embedded
-/// newline can never read as a second, independent line.
+/// newline can never read as a second, independent line, then every
+/// [`BIDI_CONTROLS`] code point as a `\u{...}` escape.
 fn esc(text: &str) -> String {
-    text.replace('\\', "\\\\")
+    let mut escaped = text
+        .replace('\\', "\\\\")
         .replace('\r', "\\r")
-        .replace('\n', "\\n")
+        .replace('\n', "\\n");
+    for control in BIDI_CONTROLS {
+        escaped = escaped.replace(control, &format!("\\u{{{:04x}}}", control as u32));
+    }
+    escaped
 }
 
 const fn api_group_display(api_group: &str) -> &str {

@@ -82,10 +82,12 @@ No change: domain, kubernetes, secretsRead, inputs, reactions, images, risks, en
 /// A container image reference is attacker-controlled free text: an HTML
 /// comment that would hide everything after it outside a fence, an
 /// `@mention` that would ping someone, a triple-backtick run that would
-/// close a naively-sized fence early, and an embedded newline that would
-/// otherwise read as an extra, independent line. All four must stay inside
-/// the fence, verbatim, without breaking it — and every section after the
-/// hostile one must still render.
+/// close a naively-sized fence early, an embedded newline that would
+/// otherwise read as an extra, independent line, and a right-to-left
+/// override that would visually reorder the characters after it without
+/// changing a single byte. All five must stay inside the fence, verbatim
+/// (the newline and the override escaped), without breaking it — and every
+/// section after the hostile one must still render.
 #[test]
 fn render_markdown_keeps_a_hostile_image_inside_the_fence() -> TestResult {
     let mut base = empty_surface();
@@ -97,7 +99,7 @@ fn render_markdown_keeps_a_hostile_image_inside_the_fence() -> TestResult {
     }];
 
     let mut head = empty_surface();
-    let hostile = "nginx:<!-- hidden --> @team ```evil``` and\ninjected";
+    let hostile = "nginx:<!-- hidden --> @team ```evil``` \u{202e}reversed and\ninjected";
     head.images = vec![SurfaceImage {
         resource: "api".into(),
         container: "api".into(),
@@ -135,6 +137,8 @@ fn render_markdown_keeps_a_hostile_image_inside_the_fence() -> TestResult {
     assert!(content.contains("```evil```"));
     assert!(content.contains("and\\ninjected"), "{content}");
     assert!(!content.contains("and\ninjected"), "{content}");
+    assert!(content.contains("\\u{202e}reversed"), "{content}");
+    assert!(!content.contains('\u{202e}'), "{content}");
     assert!(content.contains("+ risks: opaque-custom-resource-effects"));
 
     // Nothing outside the fence — the heading and the "No change" line —

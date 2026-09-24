@@ -99,6 +99,25 @@ verify-release` checks a signed release — is a stronger choice still, if your
 project has one; building from the base commit below is the from-source
 fallback.
 
+Read the review policy from that same base checkout too
+(`/tmp/base/apsides.surface-policy.json` below), never from the head
+checkout. `aps diff` only requires approval for a rule the policy names; a
+policy read from head would let a pull request set `requireApproval` to `[]`
+(or drop the rule it would otherwise trip) and exit 0 on its own review.
+
+The base build, the base policy and the two `--source` programs are not the
+whole trust boundary, though: on `pull_request` (as opposed to
+`pull_request_target`), GitHub runs the workflow file itself from the pull
+request's own merge ref, not from the base branch. A pull request can
+therefore edit `.github/workflows/surface-diff.yml` directly — remove the
+approval step, point `--policy` back at its own tree, anything — and that
+edited workflow is what actually runs, with no elevated token or secret to
+show for it, but full control over what the resulting status check reports.
+Treat this gate the way you would any other required check: protect
+`.github/workflows/` (and the review policy file, if it lives outside that
+directory) with a `CODEOWNERS` entry and required review, so a workflow or
+policy change needs the same approval a permissions change would.
+
 ```yaml
 name: Surface diff
 on:
@@ -126,11 +145,13 @@ jobs:
           rustup toolchain install
           rustup show active-toolchain
 
-      # Every later step reads `aps` from here — the base commit's own
-      # checkout — never from the head checkout above, so nothing the pull
-      # request changes in the compiler itself can affect how either surface
-      # is derived. Only the two `--source` programs below come from
-      # untrusted trees.
+      # Every later step reads `aps` — and the review policy below — from
+      # here, the base commit's own checkout, never from the head checkout
+      # above: nothing the pull request changes in the compiler or the
+      # policy can affect how either surface is derived or what requires
+      # approval. Only the two `--source` programs are read from the head
+      # checkout; see the CODEOWNERS note above this snippet for the
+      # workflow file's own trust boundary, which this alone does not cover.
       - name: Check out and build aps from the base commit
         run: |
           git worktree add /tmp/base "${{ github.event.pull_request.base.sha }}"
@@ -162,7 +183,7 @@ jobs:
             --base work/base-surface \
             --head work/head-surface \
             --format markdown \
-            --policy apsides.surface-policy.json \
+            --policy /tmp/base/apsides.surface-policy.json \
             > work/surface-diff.md
           echo "exit-code=$?" >> "$GITHUB_OUTPUT"
 

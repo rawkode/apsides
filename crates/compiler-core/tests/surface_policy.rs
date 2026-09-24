@@ -202,11 +202,20 @@ fn permissions_added_matches_a_verb_widened_to_all_names() {
 
 #[test]
 fn permissions_added_does_not_match_a_pure_narrowing() {
+    // Each of `diff_verb`'s own narrowing outputs, separately: a dropped
+    // verb, a name dropped from an already name-restricted verb (neither
+    // side `allNames`, so no widening/narrowing flag applies), and a verb
+    // narrowed from `allNames` back to specific names (which never carries
+    // `namesRemoved` itself — see `diff_verb` — so it is its own case, not
+    // combined with the one above).
     let mut diff = empty_diff();
     diff.permissions.changed = vec![permission_change(
         vec![],
         vec!["delete"],
-        vec![verb_change("list", vec![], vec!["old-config"], false, true)],
+        vec![
+            verb_change("list", vec![], vec!["old-config"], false, false),
+            verb_change("watch", vec![], vec![], false, true),
+        ],
     )];
 
     assert!(evaluate_policy(&require(PolicyRule::PermissionsAdded), &diff).is_empty());
