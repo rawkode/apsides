@@ -33,6 +33,9 @@ fn empty_surface() -> Surface {
         inputs: Vec::new(),
         reactions: Vec::new(),
         images: Vec::new(),
+        handlers: Vec::new(),
+        egress: Vec::new(),
+        outputs: Vec::new(),
         risks: Vec::new(),
         enforcement_gaps: Vec::new(),
     }
@@ -473,5 +476,142 @@ fn diff_detects_kubernetes_and_domain_changes() -> TestResult {
     };
     assert_eq!(namespace.head, "staging");
     assert!(domain.id.is_none());
+    Ok(())
+}
+
+fn handler(id: &str, trigger: &str, inputs: &[&str], outputs: &[&str]) -> SurfaceHandler {
+    SurfaceHandler {
+        id: id.into(),
+        trigger: trigger.into(),
+        inputs: inputs.iter().map(|s| (*s).to_owned()).collect(),
+        outputs: outputs.iter().map(|s| (*s).to_owned()).collect(),
+    }
+}
+
+#[test]
+fn diff_detects_added_handler() {
+    let base = empty_surface();
+    let mut head = empty_surface();
+    head.handlers = vec![handler("sync-flags", "settings", &["settings"], &["flags"])];
+
+    let diff = diff_surfaces(&base, &head);
+
+    assert_eq!(diff.handlers.added, head.handlers);
+    assert!(diff.handlers.removed.is_empty());
+    assert!(diff.handlers.changed.is_empty());
+}
+
+#[test]
+fn diff_detects_removed_handler() {
+    let mut base = empty_surface();
+    base.handlers = vec![handler("sync-flags", "settings", &["settings"], &["flags"])];
+    let head = empty_surface();
+
+    let diff = diff_surfaces(&base, &head);
+
+    assert_eq!(diff.handlers.removed, base.handlers);
+    assert!(diff.handlers.added.is_empty());
+}
+
+#[test]
+fn diff_detects_changed_handler_trigger_and_edges() -> TestResult {
+    let mut base = empty_surface();
+    base.handlers = vec![handler("sync-flags", "settings", &["settings"], &["flags"])];
+    let mut head = empty_surface();
+    head.handlers = vec![handler(
+        "sync-flags",
+        "other-settings",
+        &["settings", "other-settings"],
+        &[],
+    )];
+
+    let diff = diff_surfaces(&base, &head);
+
+    assert_eq!(diff.handlers.added.len(), 0);
+    assert_eq!(diff.handlers.removed.len(), 0);
+    let Some(change) = diff.handlers.changed.first() else {
+        return Err("no handler change recorded".into());
+    };
+    let Some(trigger) = change.trigger.as_ref() else {
+        return Err("no trigger change recorded".into());
+    };
+    assert_eq!(trigger.base, "settings");
+    assert_eq!(trigger.head, "other-settings");
+    assert_eq!(change.inputs_added, vec!["other-settings".to_owned()]);
+    assert!(change.inputs_removed.is_empty());
+    assert_eq!(change.outputs_removed, vec!["flags".to_owned()]);
+    assert!(change.outputs_added.is_empty());
+    Ok(())
+}
+
+#[test]
+fn diff_treats_egress_as_a_set() {
+    let mut base = empty_surface();
+    base.egress = vec![SurfaceEgress {
+        host: "api.example.com".into(),
+        port: 443,
+        handler: "sync-flags".into(),
+    }];
+    let mut head = empty_surface();
+    head.egress = vec![
+        SurfaceEgress {
+            host: "api.example.com".into(),
+            port: 443,
+            handler: "sync-flags".into(),
+        },
+        SurfaceEgress {
+            host: "other.example.com".into(),
+            port: 443,
+            handler: "sync-flags".into(),
+        },
+    ];
+
+    let diff = diff_surfaces(&base, &head);
+
+    assert_eq!(
+        diff.egress.added,
+        vec![SurfaceEgress {
+            host: "other.example.com".into(),
+            port: 443,
+            handler: "sync-flags".into(),
+        }]
+    );
+    assert!(diff.egress.removed.is_empty());
+}
+
+#[test]
+fn diff_detects_added_and_changed_output() -> TestResult {
+    let mut base = empty_surface();
+    base.outputs = vec![SurfaceOutput {
+        id: "flags".into(),
+        name: "flags".into(),
+        namespace: "production".into(),
+    }];
+    let mut head = empty_surface();
+    head.outputs = vec![
+        SurfaceOutput {
+            id: "flags".into(),
+            name: "flags-renamed".into(),
+            namespace: "production".into(),
+        },
+        SurfaceOutput {
+            id: "other-output".into(),
+            name: "other-output".into(),
+            namespace: "production".into(),
+        },
+    ];
+
+    let diff = diff_surfaces(&base, &head);
+
+    assert_eq!(diff.outputs.added.len(), 1);
+    assert_eq!(diff.outputs.added[0].id, "other-output");
+    let Some(change) = diff.outputs.changed.first() else {
+        return Err("no output change recorded".into());
+    };
+    let Some(name) = change.name.as_ref() else {
+        return Err("no name change recorded".into());
+    };
+    assert_eq!(name.base, "flags");
+    assert_eq!(name.head, "flags-renamed");
     Ok(())
 }

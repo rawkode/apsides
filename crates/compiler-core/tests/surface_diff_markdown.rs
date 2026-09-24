@@ -31,6 +31,9 @@ fn empty_surface() -> Surface {
         inputs: Vec::new(),
         reactions: Vec::new(),
         images: Vec::new(),
+        handlers: Vec::new(),
+        egress: Vec::new(),
+        outputs: Vec::new(),
         risks: Vec::new(),
         enforcement_gaps: Vec::new(),
     }
@@ -75,7 +78,7 @@ fn render_markdown_matches_a_small_diff_exactly() {
 - resources ConfigMap production/legacy: id=legacy, deletionPolicy=orphan\n\
 ```\n\
 \n\
-No change: domain, kubernetes, secretsRead, inputs, reactions, images, risks, enforcementGaps\n"
+No change: domain, kubernetes, secretsRead, inputs, reactions, images, handlers, egress, outputs, risks, enforcementGaps\n"
     );
 }
 
@@ -148,7 +151,7 @@ fn render_markdown_keeps_a_hostile_image_inside_the_fence() -> TestResult {
     assert!(!after.contains("@team") && !after.contains("<!--"));
     assert_eq!(
         after,
-        "\nNo change: domain, kubernetes, permissions, secretsRead, resources, inputs, reactions, enforcementGaps\n"
+        "\nNo change: domain, kubernetes, permissions, secretsRead, resources, inputs, reactions, handlers, egress, outputs, enforcementGaps\n"
     );
     Ok(())
 }

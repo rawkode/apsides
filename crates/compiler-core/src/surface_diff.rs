@@ -14,8 +14,9 @@
 
 use crate::model::{DeletionPolicy, InputMode};
 use crate::surface::{
-    Surface, SurfaceDomain, SurfaceImage, SurfaceInput, SurfaceKubernetes, SurfacePermission,
-    SurfaceReaction, SurfaceResource, SurfaceSecretRead, SurfaceVerb,
+    Surface, SurfaceDomain, SurfaceEgress, SurfaceHandler, SurfaceImage, SurfaceInput,
+    SurfaceKubernetes, SurfaceOutput, SurfacePermission, SurfaceReaction, SurfaceResource,
+    SurfaceSecretRead, SurfaceVerb,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -236,6 +237,80 @@ impl ImagesDiff {
     }
 }
 
+/// A kept handler (by id) whose trigger, inputs or outputs changed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HandlerChange {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<ValueChange<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs_added: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs_removed: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs_added: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs_removed: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HandlersDiff {
+    pub added: Vec<SurfaceHandler>,
+    pub removed: Vec<SurfaceHandler>,
+    pub changed: Vec<HandlerChange>,
+}
+
+impl HandlersDiff {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+}
+
+/// Egress is a set of (host, port, handler) edges: an edge either exists or
+/// it does not, so there is no `changed` row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EgressDiff {
+    pub added: Vec<SurfaceEgress>,
+    pub removed: Vec<SurfaceEgress>,
+}
+
+impl EgressDiff {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
+}
+
+/// A kept output (by id) whose name or namespace changed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OutputChange {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<ValueChange<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<ValueChange<String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OutputsDiff {
+    pub added: Vec<SurfaceOutput>,
+    pub removed: Vec<SurfaceOutput>,
+    pub changed: Vec<OutputChange>,
+}
+
+impl OutputsDiff {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+}
+
 /// Risks and enforcement gaps are sets of strings: a change is an addition
 /// and a removal, not an in-place edit.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Default)]
@@ -288,6 +363,9 @@ pub struct SurfaceDiff {
     pub inputs: InputsDiff,
     pub reactions: ReactionsDiff,
     pub images: ImagesDiff,
+    pub handlers: HandlersDiff,
+    pub egress: EgressDiff,
+    pub outputs: OutputsDiff,
     pub risks: StringSetDiff,
     pub enforcement_gaps: StringSetDiff,
 }
@@ -610,6 +688,108 @@ fn diff_images(base: &[SurfaceImage], head: &[SurfaceImage]) -> ImagesDiff {
     diff
 }
 
+fn diff_handler(base: &SurfaceHandler, head: &SurfaceHandler) -> Option<HandlerChange> {
+    let trigger = value_change(&base.trigger, &head.trigger);
+    let base_inputs: BTreeSet<&str> = base.inputs.iter().map(String::as_str).collect();
+    let head_inputs: BTreeSet<&str> = head.inputs.iter().map(String::as_str).collect();
+    let inputs_added: Vec<String> = head_inputs
+        .difference(&base_inputs)
+        .map(|id| (*id).to_owned())
+        .collect();
+    let inputs_removed: Vec<String> = base_inputs
+        .difference(&head_inputs)
+        .map(|id| (*id).to_owned())
+        .collect();
+    let base_outputs: BTreeSet<&str> = base.outputs.iter().map(String::as_str).collect();
+    let head_outputs: BTreeSet<&str> = head.outputs.iter().map(String::as_str).collect();
+    let outputs_added: Vec<String> = head_outputs
+        .difference(&base_outputs)
+        .map(|id| (*id).to_owned())
+        .collect();
+    let outputs_removed: Vec<String> = base_outputs
+        .difference(&head_outputs)
+        .map(|id| (*id).to_owned())
+        .collect();
+    if trigger.is_none()
+        && inputs_added.is_empty()
+        && inputs_removed.is_empty()
+        && outputs_added.is_empty()
+        && outputs_removed.is_empty()
+    {
+        return None;
+    }
+    Some(HandlerChange {
+        id: head.id.clone(),
+        trigger,
+        inputs_added,
+        inputs_removed,
+        outputs_added,
+        outputs_removed,
+    })
+}
+
+fn diff_handlers(base: &[SurfaceHandler], head: &[SurfaceHandler]) -> HandlersDiff {
+    let base_map: BTreeMap<&str, &SurfaceHandler> =
+        base.iter().map(|row| (row.id.as_str(), row)).collect();
+    let head_map: BTreeMap<&str, &SurfaceHandler> =
+        head.iter().map(|row| (row.id.as_str(), row)).collect();
+    let mut diff = HandlersDiff::default();
+    for key in union_keys(&base_map, &head_map) {
+        match (base_map.get(key), head_map.get(key)) {
+            (None, Some(head)) => diff.added.push((*head).clone()),
+            (Some(base), None) => diff.removed.push((*base).clone()),
+            (Some(base), Some(head)) => diff.changed.extend(diff_handler(base, head)),
+            (None, None) => {}
+        }
+    }
+    diff
+}
+
+fn diff_egress(base: &[SurfaceEgress], head: &[SurfaceEgress]) -> EgressDiff {
+    let base_set: BTreeSet<&SurfaceEgress> = base.iter().collect();
+    let head_set: BTreeSet<&SurfaceEgress> = head.iter().collect();
+    EgressDiff {
+        added: head_set
+            .difference(&base_set)
+            .map(|row| (*row).clone())
+            .collect(),
+        removed: base_set
+            .difference(&head_set)
+            .map(|row| (*row).clone())
+            .collect(),
+    }
+}
+
+fn diff_output(base: &SurfaceOutput, head: &SurfaceOutput) -> Option<OutputChange> {
+    let name = value_change(&base.name, &head.name);
+    let namespace = value_change(&base.namespace, &head.namespace);
+    if name.is_none() && namespace.is_none() {
+        return None;
+    }
+    Some(OutputChange {
+        id: head.id.clone(),
+        name,
+        namespace,
+    })
+}
+
+fn diff_outputs(base: &[SurfaceOutput], head: &[SurfaceOutput]) -> OutputsDiff {
+    let base_map: BTreeMap<&str, &SurfaceOutput> =
+        base.iter().map(|row| (row.id.as_str(), row)).collect();
+    let head_map: BTreeMap<&str, &SurfaceOutput> =
+        head.iter().map(|row| (row.id.as_str(), row)).collect();
+    let mut diff = OutputsDiff::default();
+    for key in union_keys(&base_map, &head_map) {
+        match (base_map.get(key), head_map.get(key)) {
+            (None, Some(head)) => diff.added.push((*head).clone()),
+            (Some(base), None) => diff.removed.push((*base).clone()),
+            (Some(base), Some(head)) => diff.changed.extend(diff_output(base, head)),
+            (None, None) => {}
+        }
+    }
+    diff
+}
+
 fn diff_string_set(base: &[String], head: &[String]) -> StringSetDiff {
     let base_set: BTreeSet<&str> = base.iter().map(String::as_str).collect();
     let head_set: BTreeSet<&str> = head.iter().map(String::as_str).collect();
@@ -642,6 +822,9 @@ pub fn diff_surfaces(base: &Surface, head: &Surface) -> SurfaceDiff {
         inputs: diff_inputs(&base.inputs, &head.inputs),
         reactions: diff_reactions(&base.reactions, &head.reactions),
         images: diff_images(&base.images, &head.images),
+        handlers: diff_handlers(&base.handlers, &head.handlers),
+        egress: diff_egress(&base.egress, &head.egress),
+        outputs: diff_outputs(&base.outputs, &head.outputs),
         risks: diff_string_set(&base.risks, &head.risks),
         enforcement_gaps: diff_string_set(&base.enforcement_gaps, &head.enforcement_gaps),
     }

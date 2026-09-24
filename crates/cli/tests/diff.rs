@@ -26,6 +26,9 @@ fn empty_surface() -> Surface {
         inputs: Vec::new(),
         reactions: Vec::new(),
         images: Vec::new(),
+        handlers: Vec::new(),
+        egress: Vec::new(),
+        outputs: Vec::new(),
         risks: Vec::new(),
         enforcement_gaps: Vec::new(),
     }
@@ -257,7 +260,7 @@ fn diff_exits_two_for_a_mismatched_schema_version() -> Result {
     let head = directory.path().join("head.json");
     fs::write(
         &base,
-        br#"{"schemaVersion":"apsides.dev/surface/v0","domain":{"id":"d","namespace":"n","controlNamespace":"c"},"kubernetes":{"minVersion":"1.34","qualifiedOn":"v1.34.3"},"permissions":[],"secretsRead":[],"resources":[],"inputs":[],"reactions":[],"images":[],"risks":[],"enforcementGaps":[]}"#,
+        br#"{"schemaVersion":"apsides.dev/surface/v0","domain":{"id":"d","namespace":"n","controlNamespace":"c"},"kubernetes":{"minVersion":"1.34","qualifiedOn":"v1.34.3"},"permissions":[],"secretsRead":[],"resources":[],"inputs":[],"reactions":[],"images":[],"handlers":[],"egress":[],"outputs":[],"risks":[],"enforcementGaps":[]}"#,
     )?;
     write_surface(&head, &empty_surface())?;
 

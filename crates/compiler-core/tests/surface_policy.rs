@@ -30,6 +30,9 @@ fn empty_surface() -> Surface {
         inputs: Vec::new(),
         reactions: Vec::new(),
         images: Vec::new(),
+        handlers: Vec::new(),
+        egress: Vec::new(),
+        outputs: Vec::new(),
         risks: Vec::new(),
         enforcement_gaps: Vec::new(),
     }
@@ -99,8 +102,8 @@ fn evaluate_policy_reports_triggered_rules_in_declared_order() {
     let diff = diff_surfaces(&base, &head);
     let triggered = evaluate_policy(&policy, &diff);
 
-    // `egress.added` is accepted but never matches (no `egress` section
-    // exists yet); `resources.removed` does not match either.
+    // Neither surface declares a handler, so `egress.added` does not match
+    // in this scenario; `resources.removed` does not match either.
     assert_eq!(
         triggered,
         vec![PolicyRule::KubernetesChanged, PolicyRule::PermissionsAdded]
@@ -118,6 +121,9 @@ fn empty_diff() -> SurfaceDiff {
         inputs: InputsDiff::default(),
         reactions: ReactionsDiff::default(),
         images: ImagesDiff::default(),
+        handlers: HandlersDiff::default(),
+        egress: EgressDiff::default(),
+        outputs: OutputsDiff::default(),
         risks: StringSetDiff::default(),
         enforcement_gaps: StringSetDiff::default(),
     }
@@ -236,4 +242,44 @@ fn evaluate_policy_is_empty_when_nothing_matches() {
     let surface = empty_surface();
     let diff = diff_surfaces(&surface, &surface.clone());
     assert!(evaluate_policy(&policy, &diff).is_empty());
+}
+
+#[test]
+fn handlers_added_matches_a_new_handler() {
+    let mut diff = empty_diff();
+    diff.handlers.added = vec![SurfaceHandler {
+        id: "sync-flags".into(),
+        trigger: "settings".into(),
+        inputs: vec!["settings".into()],
+        outputs: vec!["flags".into()],
+    }];
+    assert_eq!(
+        evaluate_policy(&require(PolicyRule::HandlersAdded), &diff),
+        vec![PolicyRule::HandlersAdded]
+    );
+}
+
+#[test]
+fn egress_added_matches_a_new_egress_edge() {
+    let mut diff = empty_diff();
+    diff.egress.added = vec![SurfaceEgress {
+        host: "api.example.com".into(),
+        port: 443,
+        handler: "sync-flags".into(),
+    }];
+    assert_eq!(
+        evaluate_policy(&require(PolicyRule::EgressAdded), &diff),
+        vec![PolicyRule::EgressAdded]
+    );
+}
+
+#[test]
+fn egress_added_does_not_match_a_removal() {
+    let mut diff = empty_diff();
+    diff.egress.removed = vec![SurfaceEgress {
+        host: "api.example.com".into(),
+        port: 443,
+        handler: "sync-flags".into(),
+    }];
+    assert!(evaluate_policy(&require(PolicyRule::EgressAdded), &diff).is_empty());
 }

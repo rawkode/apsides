@@ -31,8 +31,8 @@
 use crate::model::{DeletionPolicy, InputMode};
 use crate::surface::SurfaceVerb;
 use crate::surface_diff::{
-    DomainChange, ImagesDiff, InputsDiff, KubernetesChange, PermissionsDiff, ReactionsDiff,
-    ResourcesDiff, SecretsReadDiff, StringSetDiff, SurfaceDiff,
+    DomainChange, EgressDiff, HandlersDiff, ImagesDiff, InputsDiff, KubernetesChange, OutputsDiff,
+    PermissionsDiff, ReactionsDiff, ResourcesDiff, SecretsReadDiff, StringSetDiff, SurfaceDiff,
 };
 
 /// Unicode bidirectional-control code points: the explicit
@@ -123,6 +123,7 @@ const fn input_mode_str(mode: InputMode) -> &'static str {
     match mode {
         InputMode::Managed => "managed",
         InputMode::Observed => "observed",
+        InputMode::Output => "output",
     }
 }
 
@@ -434,6 +435,122 @@ fn image_lines(diff: &ImagesDiff) -> Vec<String> {
     lines
 }
 
+fn handler_lines(diff: &HandlersDiff) -> Vec<String> {
+    let mut lines = Vec::new();
+    for row in &diff.added {
+        lines.push(format!(
+            "+ handlers {}: trigger={}, inputs=[{}], outputs=[{}]",
+            esc(&row.id),
+            esc(&row.trigger),
+            name_list(&row.inputs),
+            name_list(&row.outputs)
+        ));
+    }
+    for row in &diff.removed {
+        lines.push(format!(
+            "- handlers {}: trigger={}, inputs=[{}], outputs=[{}]",
+            esc(&row.id),
+            esc(&row.trigger),
+            name_list(&row.inputs),
+            name_list(&row.outputs)
+        ));
+    }
+    for change in &diff.changed {
+        let id = esc(&change.id);
+        if let Some(trigger) = &change.trigger {
+            lines.push(format!(
+                "! handlers {id}: trigger \"{}\" -> \"{}\"",
+                esc(&trigger.base),
+                esc(&trigger.head)
+            ));
+        }
+        if !change.inputs_added.is_empty() {
+            lines.push(format!(
+                "+ handlers {id}: inputs [{}]",
+                name_list(&change.inputs_added)
+            ));
+        }
+        if !change.inputs_removed.is_empty() {
+            lines.push(format!(
+                "- handlers {id}: inputs [{}]",
+                name_list(&change.inputs_removed)
+            ));
+        }
+        if !change.outputs_added.is_empty() {
+            lines.push(format!(
+                "+ handlers {id}: outputs [{}]",
+                name_list(&change.outputs_added)
+            ));
+        }
+        if !change.outputs_removed.is_empty() {
+            lines.push(format!(
+                "- handlers {id}: outputs [{}]",
+                name_list(&change.outputs_removed)
+            ));
+        }
+    }
+    lines
+}
+
+fn egress_lines(diff: &EgressDiff) -> Vec<String> {
+    let mut lines = Vec::new();
+    for row in &diff.added {
+        lines.push(format!(
+            "+ egress {}:{} <- handler {}",
+            esc(&row.host),
+            row.port,
+            esc(&row.handler)
+        ));
+    }
+    for row in &diff.removed {
+        lines.push(format!(
+            "- egress {}:{} <- handler {}",
+            esc(&row.host),
+            row.port,
+            esc(&row.handler)
+        ));
+    }
+    lines
+}
+
+fn output_lines(diff: &OutputsDiff) -> Vec<String> {
+    let mut lines = Vec::new();
+    for row in &diff.added {
+        lines.push(format!(
+            "+ outputs {}: {}/{}",
+            esc(&row.id),
+            esc(&row.namespace),
+            esc(&row.name)
+        ));
+    }
+    for row in &diff.removed {
+        lines.push(format!(
+            "- outputs {}: {}/{}",
+            esc(&row.id),
+            esc(&row.namespace),
+            esc(&row.name)
+        ));
+    }
+    for change in &diff.changed {
+        let id = esc(&change.id);
+        if let Some(name) = &change.name {
+            lines.push(format!(
+                "! outputs {id}: name \"{}\" -> \"{}\"",
+                esc(&name.base),
+                esc(&name.head)
+            ));
+        }
+        if let Some(namespace) = &change.namespace {
+            lines.push(format!(
+                "! outputs {id}: namespace \"{}\" -> \"{}\"",
+                esc(&namespace.base),
+                esc(&namespace.head)
+            ));
+        }
+    }
+    lines
+}
+
 fn string_set_lines(section: &str, diff: &StringSetDiff) -> Vec<String> {
     let mut lines = Vec::new();
     for value in &diff.added {
@@ -469,7 +586,7 @@ fn fence_length(content: &str) -> usize {
 /// ` ```diff ` block; see the module documentation for why.
 #[must_use]
 pub fn render_markdown(diff: &SurfaceDiff) -> String {
-    let sections: [(&str, Vec<String>); 10] = [
+    let sections: [(&str, Vec<String>); 13] = [
         (
             "domain",
             diff.domain.as_ref().map_or_else(Vec::new, domain_lines),
@@ -486,6 +603,9 @@ pub fn render_markdown(diff: &SurfaceDiff) -> String {
         ("inputs", input_lines(&diff.inputs)),
         ("reactions", reaction_lines(&diff.reactions)),
         ("images", image_lines(&diff.images)),
+        ("handlers", handler_lines(&diff.handlers)),
+        ("egress", egress_lines(&diff.egress)),
+        ("outputs", output_lines(&diff.outputs)),
         ("risks", string_set_lines("risks", &diff.risks)),
         (
             "enforcementGaps",

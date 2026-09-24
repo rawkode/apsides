@@ -35,6 +35,8 @@ fn domain_fixture(
         "resources":resources,
         "inputs":inputs,
         "reactions":[{"id":"restart","op":"rollout","inputs":reaction_inputs,"target":"api","source":source()}],
+        "handlers":[],
+        "outputs":[],
         "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"controller.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
     })
 }

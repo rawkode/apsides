@@ -128,6 +128,36 @@ pub struct SurfaceImage {
     pub pinned: bool,
 }
 
+/// A declared event handler: what triggers it and what it reads and writes.
+/// Never the handler's own source or bundle contents.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SurfaceHandler {
+    pub id: String,
+    /// The input id whose revision change triggers this handler.
+    pub trigger: String,
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+}
+
+/// One egress host a handler's `fetch` op may reach, always over HTTPS.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SurfaceEgress {
+    pub host: String,
+    pub port: u16,
+    pub handler: String,
+}
+
+/// A handler-written managed `ConfigMap` output.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SurfaceOutput {
+    pub id: String,
+    pub name: String,
+    pub namespace: String,
+}
+
 /// A reviewable projection of a compiled domain: what it can reach, what it
 /// reads and writes, and what it runs — never the values it reads or writes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +172,9 @@ pub struct Surface {
     pub inputs: Vec<SurfaceInput>,
     pub reactions: Vec<SurfaceReaction>,
     pub images: Vec<SurfaceImage>,
+    pub handlers: Vec<SurfaceHandler>,
+    pub egress: Vec<SurfaceEgress>,
+    pub outputs: Vec<SurfaceOutput>,
     pub risks: Vec<String>,
     pub enforcement_gaps: Vec<String>,
 }
@@ -319,6 +352,61 @@ fn images(plan: &CompiledPlan) -> Vec<SurfaceImage> {
     rows
 }
 
+fn handlers(plan: &CompiledPlan) -> Vec<SurfaceHandler> {
+    let mut rows: Vec<SurfaceHandler> = plan
+        .ir
+        .handlers
+        .iter()
+        .map(|handler| {
+            let mut inputs = handler.inputs.clone();
+            inputs.sort();
+            let mut outputs = handler.outputs.clone();
+            outputs.sort();
+            SurfaceHandler {
+                id: handler.id.clone(),
+                trigger: handler.trigger.input.clone(),
+                inputs,
+                outputs,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows
+}
+
+fn egress(plan: &CompiledPlan) -> Vec<SurfaceEgress> {
+    let mut rows: Vec<SurfaceEgress> = plan
+        .ir
+        .handlers
+        .iter()
+        .flat_map(|handler| {
+            handler.egress.iter().map(|host| SurfaceEgress {
+                host: host.host.clone(),
+                port: host.port,
+                handler: handler.id.clone(),
+            })
+        })
+        .collect();
+    rows.sort();
+    rows.dedup();
+    rows
+}
+
+fn outputs(plan: &CompiledPlan) -> Vec<SurfaceOutput> {
+    let mut rows: Vec<SurfaceOutput> = plan
+        .ir
+        .outputs
+        .iter()
+        .map(|output| SurfaceOutput {
+            id: output.id.clone(),
+            name: output.name.clone(),
+            namespace: output.namespace.clone(),
+        })
+        .collect();
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows
+}
+
 /// Derive the reviewable deployment surface from a validated, compiled plan.
 ///
 /// Pure and deterministic: the result depends only on `plan`, and every
@@ -343,6 +431,9 @@ pub fn derive_surface(plan: &CompiledPlan) -> Surface {
         inputs: inputs(plan),
         reactions: reactions(plan),
         images: images(plan),
+        handlers: handlers(plan),
+        egress: egress(plan),
+        outputs: outputs(plan),
         risks: plan.indirect_risks.clone(),
         enforcement_gaps: plan.enforcement_gaps.clone(),
     }

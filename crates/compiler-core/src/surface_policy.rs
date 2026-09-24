@@ -1,11 +1,8 @@
 //! The review policy `aps diff --policy` evaluates against a [`SurfaceDiff`].
 //!
 //! A policy names the diff conditions that require human approval before a
-//! head surface can be deployed. The rule vocabulary is fixed: `egress.added`
-//! and `handlers.added` are accepted today so a policy file written against
-//! this schema version keeps parsing once Phase 4 adds an `egress` and a
-//! `handlers` section to [`SurfaceDiff`] — until then those two rules simply
-//! never trigger, since there is nothing yet for them to match.
+//! head surface can be deployed. `egress.added` and `handlers.added` match
+//! the `egress` and `handlers` sections Phase 4 added to [`SurfaceDiff`].
 
 use crate::json::parse_strict;
 use crate::surface_diff::{PermissionChange, SurfaceDiff};
@@ -15,9 +12,7 @@ use serde::{Deserialize, Serialize};
 /// The `apsides.surface-policy.json` schema version this module accepts.
 pub const SURFACE_POLICY_SCHEMA: &str = "apsides.dev/surface-policy/v1";
 
-/// One diff condition that requires human approval. `EgressAdded` and
-/// `HandlersAdded` never trigger yet: Phase 2's [`SurfaceDiff`] has no
-/// `egress` or `handlers` section for them to match against.
+/// One diff condition that requires human approval.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PolicyRule {
     #[serde(rename = "egress.added")]
@@ -98,7 +93,8 @@ fn widens_permissions(change: &PermissionChange) -> bool {
 /// Whether `rule` matches a change present in `diff`.
 fn matches(rule: PolicyRule, diff: &SurfaceDiff) -> bool {
     match rule {
-        PolicyRule::EgressAdded | PolicyRule::HandlersAdded => false,
+        PolicyRule::EgressAdded => !diff.egress.added.is_empty(),
+        PolicyRule::HandlersAdded => !diff.handlers.added.is_empty(),
         PolicyRule::SecretsReadAdded => !diff.secrets_read.added.is_empty(),
         PolicyRule::PermissionsAdded => {
             !diff.permissions.added.is_empty()

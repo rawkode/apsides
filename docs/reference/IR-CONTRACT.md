@@ -1,12 +1,12 @@
 # Apsides IR contract
 
-This is the current implementation boundary for specification 0.2. It is not a claim of production readiness. Unknown fields and unsupported operations are errors.
+This is the current implementation boundary for specification 0.3. It is not a claim of production readiness. Unknown fields and unsupported operations are errors.
 
-`schemaVersion` is `apsides.dev/ir/v1`. JSON uses camelCase. Every declaration has `source: {file: string, line: positive integer, column: positive integer}`. Resource and input IDs are unique within their category. A reaction references input IDs and a managed resource ID.
+`schemaVersion` is `apsides.dev/ir/v2`. JSON uses camelCase. Every declaration has `source: {file: string, line: positive integer, column: positive integer}`. Resource and input IDs are unique within their category. A reaction references input IDs and a managed resource ID.
 
 ```json
 {
-  "schemaVersion": "apsides.dev/ir/v1",
+  "schemaVersion": "apsides.dev/ir/v2",
   "domain": {
     "id": "example",
     "namespace": "workload",
@@ -23,16 +23,47 @@ This is the current implementation boundary for specification 0.2. It is not a c
     "lifecycle": {"deletionPolicy": "orphan"},
     "source": {"file": "controller.ts", "line": 1, "column": 1}
   }],
-  "inputs": [], "reactions": [],
+  "inputs": [], "reactions": [], "handlers": [], "outputs": [],
   "provenance": {"compiler": "reference/0.1", "inputs": [{"path": "controller.ts", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}]}
 }
 ```
 
 Managed resources support `ConfigMap`, `Service`, and `Deployment`, plus namespaced custom resources with an explicit `apiResource` mapping (`plural`, `scope: "Namespaced"`, `schemaSha256`). Their `desired` identity must exactly match the declaration. Builtins use a conservative schema subset and cannot override their REST mapping. Custom resources validate metadata, identity and plain JSON locally; the Kubernetes SSA dry-run validates the installed CRD schema. `schemaSha256` binds the fetched CRD source bytes used for type generation. Lifecycle policy is `orphan` or `delete`; actual deletion is deployment cleanup authority and is never a runtime effect. All resources and observations use the one workload namespace. Control namespace must differ.
 
-Inputs have `{id, apiVersion, kind, name, namespace, mode, managedResourceId?, projection, sensitive, missing, source}`. Kinds are `ConfigMap` or `Secret`, `apiVersion` is `v1`, mode is `managed` or `observed`, projection is exactly `["data"]`, and missing is exactly `block-dependent-mutations`. Managed inputs reference a declared ConfigMap with matching identity and use authoritative desired data. Observed inputs must not alias a managed resource. Secret inputs must be observed and sensitive. ConfigMap inputs must be non-sensitive in this initial increment. Fixture values are external to production IR.
+A resource may carry `handlerOutput: true` (default `false`): it is the managed `ConfigMap` a handler `Output` compiles to (see below). Its `desired` is metadata-only — never a `data` key — and its `metadata.labels` must carry the reserved label `apsides.dev/handler-output` set to its own resource id; that label is rejected on every other resource, the same way `apsides.dev/revision` is reserved for the rollout primitive. The reconciler's own SSA of it, under field manager `apsides-<domainId>`, therefore never claims `data`; a later phase's handler writes attribute to the distinct field manager `apsides-handler-<domainId>`.
 
-Reactions have `{id, op: "rollout", inputs: [inputId, ...], target: resourceId, source}`. Targets must be managed Deployments. Multiple reactions contributing to one target are combined into a single stable revision. Input IDs and reaction IDs are part of the canonical digest. The reserved annotation is `apsides.dev/revision`; source must not supply it. There are no generic expressions, callback operations, event actions, runtime names, adoption, delegated fields or readiness predicates yet; such requests fail validation.
+Inputs have `{id, apiVersion, kind, name, namespace, mode, managedResourceId?, projection, sensitive, missing, source}`. Kinds are `ConfigMap` or `Secret`, `apiVersion` is `v1`, mode is `managed`, `observed` or `output`, projection is exactly `["data"]`, and missing is exactly `block-dependent-mutations`. Managed inputs reference a declared ConfigMap with matching identity and use authoritative desired data. Observed inputs must not alias a managed resource. Secret inputs must be observed and sensitive. ConfigMap inputs must be non-sensitive outside `output` mode. Fixture values are external to production IR.
+
+`output`-mode inputs are auto-created for a handler `Output`, with `managedResourceId` naming its `handlerOutput` resource; they are non-sensitive `ConfigMap` inputs, exempt from the observed/managed aliasing rule (their identity intentionally matches their own output resource), and are observed live the same way as `observed` inputs — never treated as the reconciler's own authoritative desired state.
+
+Reactions have `{id, op: "rollout", inputs: [inputId, ...], target: resourceId, source}`. Targets must be managed Deployments. Multiple reactions contributing to one target are combined into a single stable revision. Input IDs and reaction IDs are part of the canonical digest. The reserved annotation is `apsides.dev/revision`; source must not supply it. There are no generic expressions, callback operations, runtime names, adoption, delegated fields or readiness predicates yet; such requests fail validation.
+
+## Handlers and outputs
+
+`outputs` declares handler-written managed `ConfigMap`s: `{id, name, namespace}`. Each output id must name exactly one `handlerOutput` resource with a matching identity (kind `ConfigMap`, same `name`/`namespace`), and every `handlerOutput` resource must have a matching declared output — the two are always paired.
+
+`handlers` declares Brigade-style event handlers, each a bundled TypeScript module invoked when its trigger input's revision changes:
+
+```json
+{
+  "id": "sync-flags", "module": "handlers/sync-flags.ts", "export": "syncFlags",
+  "trigger": {"kind": "input-changed", "input": "settings"},
+  "inputs": ["settings"],
+  "egress": [{"host": "api.example.com", "port": 443}],
+  "outputs": ["flags"],
+  "timeoutMillis": 30000, "maxHeapBytes": 67108864,
+  "bundleSha256": "…64 lowercase hex…",
+  "source": {"file": "app.tsx", "line": 12, "column": 5}
+}
+```
+
+`trigger.kind` is always `input-changed` in this increment; `trigger.input` must be one of `inputs`. Every id in `inputs` must resolve to a non-sensitive `ConfigMap` input (never `Secret`, never `sensitive: true`, whether `observed`, `managed` or `output` mode). Every id in `outputs` must resolve to a declared output. A handler may not trigger on or read (list it in `inputs`) an `output`-mode input backed by one of its own declared outputs — a self-loop — and the whole handler graph (a handler's outputs feeding another handler's inputs through an `output`-mode input) must be acyclic; either shape is a compile error. `module` is a normalized relative path (no leading slash, no `.`/`..` segment) that must name one of `provenance.inputs`; `export` is a bare identifier; `bundleSha256` is the sha256 of the bundle the compiler wrote to `handlers/<id>.js` next to `ir.json`, embedded into the generated controller image with `include_str!`. `egress` hosts are lowercase DNS names — never an IP literal or a wildcard — reached only over HTTPS; `port` defaults to 443. Budgets: at most 16 handlers per domain, at most 16 distinct egress hosts across every handler combined, `timeoutMillis` in `1..=30000`, `maxHeapBytes` in `1..=67108864` (64 MiB).
+
+Handler modules are authored as `<On trigger={input.changed} handler="./path.ts#exportName" inputs={[...]} egress={[...]} outputs={[...]} />` in the SDK; passing a function instead of a module-reference string is a compile error — handlers run in a separate execution context and cannot capture author closures. `useHandlerOutput({name})` declares an output and returns a projection usable in `rolloutOn`, exactly like an observed or managed input's projection. Handler modules must be listed in `apsides.lock.json` and may import only other locked modules — never an npm or remote specifier, never the authoring SDK itself.
+
+Capabilities: an output's backing `output`-mode input adds named `get`/`list`/`watch` on its `ConfigMap`, exactly like an `observed` input; the `handlerOutput` resource itself adds the same `list`/`patch`/`create` capabilities every managed resource gets. Runtime execution of a handler's bundle (the V8 isolate, its `fetch` and output-write ops) is a later phase, in a separate crate; this increment only validates, bundles and embeds it.
+
+Ownership intents can never target a `handlerOutput` resource: it is either absent at first deploy (created absent-only by the reconciler, like any other managed resource with no prior owner) or already owned by this domain — adoption is meaningless for a resource only this domain's own handlers ever write to.
 
 `validate(&Ir) -> Result<CompiledPlan>` independently derives effects, exact request strategy, runtime authorization, enforcement gaps, indirect risks, and semantic scenario plans. `parse_and_validate(&str)` also rejects duplicate JSON object keys. `CompiledPlan` fields use camelCase: `{irDigest, ir, effects, requestPlan, capabilities, enforcementGaps, indirectRisks, testPlan}`. Public `validate_ceiling(&CompiledPlan, &PermissionCeiling)` revalidates/recomputes the plan before checking scope and explicit risk/gap acceptance. Build identity is `sha256:` plus the canonical IR digest. Generation identity belongs to trusted deployment state, never the IR.
 

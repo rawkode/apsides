@@ -3,9 +3,10 @@ title: Surface diff in CI
 description: Post a deployment surface diff as a PR comment and require approval for reviewable changes.
 ---
 
-`aps diff` compares two `surface.json` deployment surfaces (Phase 1's
-reviewable projection of a compiled program: permissions, secrets read,
-managed resources, inputs, reactions, images and known risks) and reports
+`aps diff` compares two `surface.json` deployment surfaces (the reviewable
+projection of a compiled program: permissions, secrets read, managed
+resources, inputs, reactions, images, known risks, and — since Phase 4 —
+declared event handlers, their egress hosts, and their outputs) and reports
 what changed between a pull request's base and head commit. An optional
 review policy names the diff conditions a human must approve before the
 change can be treated as reviewed.
@@ -60,20 +61,24 @@ this section" unless stated:
 
 | Rule | Matches when |
 | --- | --- |
-| `egress.added` | never yet — accepted for forward compatibility, since Phase 4 adds an `egress` surface section this rule will match against; until then there is nothing for it to match |
+| `egress.added` | a `(host, port, handler)` edge appears in the `egress` section that was not present before — a handler reaching a new host, a new port on an already-reached host, or a new handler declared with egress at all |
 | `secretsRead.added` | a `(namespace, name, reader)` row appears that was not present before. Secrets read are keyed by reader as well as by secret, so a second reader added to an already-read secret matches this rule too, not just a wholly new secret |
 | `permissions.added` | a new permission target appears, **or** a kept target's authority widens: a new verb granted, a name added to an already-granted verb, or a verb widened from a name-restricted set to every name (`allNames`). A pure narrowing — a verb or a name dropped, or `allNames` narrowed back to specific names — never matches this rule by itself |
 | `permissions.changed` | a kept permission target's verb set changed at all, widening or narrowing alike — the section `permissions.added` only watches for growth |
 | `images.unpinned` | a newly added image, or a changed image's new (head) reference, has no `@sha256:` digest |
 | `kubernetes.changed` | the `kubernetes` section's `minVersion` or `qualifiedOn` differs |
-| `handlers.added` | never yet — accepted for forward compatibility with Phase 4's `handlers` surface section, the same way `egress.added` is |
+| `handlers.added` | a handler id present in the head `handlers` section was absent from the base — a wholly new event handler. A handler's trigger, inputs or outputs changing on an already-declared handler id is reported in the diff's `handlers.changed`, but does not itself trigger this rule; name a `permissions.added`/`egress.added`-style rule, or review `handlers.changed` directly, if a kept handler's edges must also require approval |
 | `resources.removed` | a managed resource present in the base surface is absent from the head surface |
 | `risks.added` | a risk identifier appears that was not present before |
 
 A rule never matches on a removal or narrowing it was not written for:
 `permissions.added` ignores a dropped verb, and there is deliberately no
-`secretsRead.removed` or `permissions.removed` rule in this vocabulary —
-review what is newly granted, not what is no longer needed.
+`secretsRead.removed`, `permissions.removed`, `handlers.removed` or
+`egress.removed` rule in this vocabulary — review what is newly granted, not
+what is no longer needed. The `outputs` surface section (a handler's own
+written `ConfigMap`s) has no dedicated policy rule: an output only ever
+appears alongside the handler that writes it, which `handlers.added` already
+covers.
 
 ## GitHub Actions: post a sticky diff comment
 
