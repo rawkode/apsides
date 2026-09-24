@@ -1,18 +1,23 @@
 //! Wires the Phase 5b `engine` crate (a fresh V8 isolate per invocation, no
 //! filesystem/net access except through its own typed, capability-checked
 //! ops) into the reconcile cycle: computes each handler's input revision
-//! each cycle, enqueues/dispatches handler invocations at global
-//! concurrency 1, and persists `apsides.writeOutput`/the post-success
-//! revision stamp through a server-side-apply output sink using field
-//! manager `apsides-handler-<domainId>`.
+//! each cycle, enqueues, and dispatches at most one handler invocation per
+//! cycle at global concurrency 1. `apsides.writeOutput` calls are buffered
+//! in memory for the invocation's duration ([`BufferedOutputSink`]); once
+//! (and only if) the handler returns successfully, every declared output
+//! is committed with exactly one server-side apply each, through
+//! `production::commit_handler_outputs` -- the same authority/claim
+//! re-check reconciler mutations use, under field manager
+//! `apsides-handler-<domainId>`.
 //!
-//! See the Apsides v0.3 plan, Phase 5b. `HandlerRuntime` is driven only by
-//! [`crate::production::ProductionController`] today -- fixture mode
-//! (`reconcile_once`/`run_fixture_with_client`) still does not execute
-//! handlers, unchanged from Phase 4; see this module's own tests (a fake
-//! `kube::Client` built the same way `production.rs`'s own test module
-//! builds one) for coverage of the dispatch, queue, backoff, and output-sink
-//! behavior in isolation from that larger harness.
+//! See the Apsides v0.3 plan, Phase 5b. `HandlerRuntime` is driven by
+//! [`crate::production::ProductionController`] (production mode) and by
+//! the fixture controller (`crate::fixture`, gated the same way as its own
+//! egress override); see this module's own tests (a fake `kube::Client`
+//! built the same way `production.rs`'s own test module builds one) for
+//! coverage of the dispatch, queue, backoff, and revision-computation
+//! behavior in isolation from that larger harness, and `production.rs`'s
+//! own tests for the end-to-end commit path.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -21,11 +26,10 @@ use std::time::{Duration, Instant};
 
 use compiler_core::{CompiledPlan, Handler, Output};
 use kube::Client;
-use kube::api::{Api, ApiResource, DynamicObject, Patch};
+use kube::api::{Api, ApiResource, DynamicObject};
 use kube::core::GroupVersionKind;
-use platform::{ApplyPrecondition, RuntimeCondition, conditional_apply_request};
+use platform::RuntimeCondition;
 use serde_json::{Map, Value, json};
-use tokio::sync::mpsc as async_mpsc;
 
 use crate::{Observation, RuntimeError};
 
@@ -36,14 +40,34 @@ use crate::{Observation, RuntimeError};
 /// revision that output now reflects.
 pub(crate) const HANDLER_INPUT_REVISION_ANNOTATION: &str = "apsides.dev/handler-input-revision";
 
+/// Converts one of `compiler_core::handler_budgets`' `u64` constants to
+/// `usize`.
+///
+/// Justification for the lone `#[allow]`: every value this is ever called
+/// with (from a `const` initializer, always) is a small, fixed budget
+/// constant (low megabytes), never anywhere near truncating even on a
+/// 32-bit `usize`; named and confined to this one function instead of an
+/// `unwrap_or`/`.expect()` at each call site (both denied by this
+/// workspace's own `clippy::unwrap_used`/`expect_used`).
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "converts a small, fixed handler-budget constant (low megabytes); never near usize::MAX"
+)]
+const fn budget_as_usize(value: u64) -> usize {
+    value as usize
+}
+
 /// Hard cap on `apsides.fetch` response bytes across one whole invocation.
 /// Not named by the IR (only a per-handler `timeoutMillis`/`maxHeapBytes`
-/// budget is declared) -- a fixed, conservative runtime constant, well
-/// under the per-call 4 MiB response cap `engine::ops` enforces internally
-/// times a small burst allowance.
-const MAX_FETCH_BYTES_TOTAL: usize = 16 * 1024 * 1024;
+/// budget is declared) -- from `compiler_core::handler_budgets`, the
+/// single shared source this crate and `platform`'s controller-pod memory
+/// formula both derive from (see the Apsides v0.3 plan, Phase 5b review
+/// item C).
+const MAX_FETCH_BYTES_TOTAL: usize =
+    budget_as_usize(compiler_core::HANDLER_FETCH_BUDGET_TOTAL_BYTES);
 /// Hard cap on concurrent `apsides.fetch` calls within one invocation.
-const MAX_CONCURRENT_FETCHES: usize = 4;
+const MAX_CONCURRENT_FETCHES: usize =
+    budget_as_usize(compiler_core::HANDLER_MAX_CONCURRENT_FETCHES);
 
 // ---------------------------------------------------------------------
 // Input revision / event construction
@@ -79,14 +103,34 @@ fn handler_inputs_snapshot(
     Some(inputs)
 }
 
-/// A hash of the trigger input's id plus every declared input's projected
-/// snapshot -- see the Apsides v0.3 plan, Phase 5b, "Trigger detection".
+/// A hash of the trigger input's id, every declared input's projected
+/// snapshot, and the handler's own code/output identity -- see the
+/// Apsides v0.3 plan, Phase 5b, "Trigger detection", and review item 2.
+///
+/// Includes `handler.id`, `handler.bundle_sha256`, `handler.export`, and
+/// the handler's declared outputs (sorted, for determinism) *in addition*
+/// to the trigger/input data: without the bundle's own digest here, a new
+/// handler bundle deployed with unchanged input data would compute the
+/// exact same revision as the previous bundle, so a restart (which seeds
+/// `known_revision` from this same digest recorded on the outputs) would
+/// never re-run the handler even though its code changed. `id`/`export`
+/// are included too so two distinct handlers reacting to the same input
+/// with byte-identical data never collide on the same revision string.
 fn compute_input_revision(
     handler: &Handler,
     inputs: &BTreeMap<String, Value>,
 ) -> Result<String, RuntimeError> {
-    compiler_core::digest(&json!({"trigger": handler.trigger.input, "inputs": inputs}))
-        .map_err(|error| RuntimeError::Plan(error.to_string()))
+    let mut outputs = handler.outputs.clone();
+    outputs.sort();
+    compiler_core::digest(&json!({
+        "handlerId": handler.id,
+        "bundleSha256": handler.bundle_sha256,
+        "export": handler.export,
+        "outputs": outputs,
+        "trigger": handler.trigger.input,
+        "inputs": inputs,
+    }))
+    .map_err(|error| RuntimeError::Plan(error.to_string()))
 }
 
 /// `event = { id, trigger, inputs: {<inputId>: {data}} }`; `id` is a hash
@@ -129,6 +173,13 @@ struct HandlerState {
     /// lifetime -- seeded from the outputs' own annotation at startup by
     /// [`HandlerRuntime::seed_from_annotations`]).
     known_revision: Option<String>,
+    /// Each declared output's `uid` as last observed (at seed time, or
+    /// after a successful commit) -- see the Apsides v0.3 plan, Phase 5b
+    /// review item 5: an output whose live `uid` no longer matches what is
+    /// recorded here was deleted and recreated since `known_revision` was
+    /// last trusted, so it must not be treated as still agreeing with it
+    /// even though nothing about the handler's *input* changed.
+    output_uids: BTreeMap<String, String>,
     queued: Option<QueuedEvent>,
     backoff_until: Option<Instant>,
     attempt: u32,
@@ -161,34 +212,23 @@ pub(crate) struct HandlerStatus {
 }
 
 // ---------------------------------------------------------------------
-// Output writer: bridges the engine's synchronous `OutputSink::write_output`
-// (called on the isolate's own thread, itself deep inside that
-// invocation's *own* dedicated tokio runtime -- see
-// `engine::invoke_handler_with_watchdog`'s doc comment) to the async
-// Kubernetes client, without ever nesting one runtime's `block_on` inside
-// another's (which tokio detects and panics on, regardless of which
-// `Runtime` object is involved). A `std::sync::mpsc` channel -- plain OS
-// thread parking, not a tokio primitive -- is the only safe bridge here.
+// Output sink: buffers `apsides.writeOutput(id, key, data)` calls in
+// memory for the duration of one invocation. No I/O and no cross-thread
+// hop here at all -- see the Apsides v0.3 plan, Phase 5b review item 1:
+// the previous design sent one server-side apply per `writeOutput` call
+// (plus one more for the post-success revision stamp), all under the same
+// field manager; since SSA replaces a manager's *whole* field set on each
+// request, every write after the first deleted the keys the previous
+// write had just added, and the final stamp deleted the data entirely.
+// The fix is to never write anything to Kubernetes until the whole
+// invocation has resolved successfully -- `write_output` here only
+// validates (already done by `engine` itself before calling this trait;
+// see its doc comment) and buffers; [`commit_handler_outputs`] in
+// `production.rs` then sends exactly one SSA per declared output,
+// containing that output's *complete* data map, after the handler
+// returns `Ok`. See that function's doc comment for what happens to a
+// declared output the handler did not write this invocation.
 // ---------------------------------------------------------------------
-
-enum WriteJob {
-    /// One `apsides.writeOutput(id, key, data)` call.
-    Data {
-        output_id: String,
-        key: String,
-        data: Vec<u8>,
-        reply: std::sync::mpsc::Sender<Result<(), String>>,
-    },
-    /// The post-success revision-annotation stamp for one output, sent
-    /// only from `HandlerRuntime::invoke` (an ordinary async fn on the
-    /// main runtime, not the isolate thread) after the whole invocation
-    /// has already resolved.
-    Stamp {
-        output_id: String,
-        revision: String,
-        reply: std::sync::mpsc::Sender<Result<(), String>>,
-    },
-}
 
 fn configmap_api(client: &Client, namespace: &str) -> Api<DynamicObject> {
     let resource = ApiResource::from_gvk_with_plural(
@@ -198,213 +238,62 @@ fn configmap_api(client: &Client, namespace: &str) -> Api<DynamicObject> {
     Api::namespaced_with(client.clone(), namespace, &resource)
 }
 
-/// Applies one `data.<key>` or the revision annotation to `output`'s
-/// `ConfigMap` through the existing conditional-apply path
-/// (`platform::conditional_apply_request`), with field manager
-/// `apsides-handler-<domainId>`, claiming only that one field. Skips the
-/// write entirely if the target field's live value already equals `value`.
-/// Enforces `min_interval` since the last real write to this output
-/// (tracked in `last_write`, keyed by output id).
-async fn apply_claimed_field(
-    client: &Client,
-    field_manager: &str,
-    output: &Output,
-    field_path: FieldPath<'_>,
-    min_interval: Duration,
-    last_write: &mut BTreeMap<String, Instant>,
-) -> Result<(), String> {
-    let api = configmap_api(client, &output.namespace);
-    let existing = api
-        .get(&output.name)
-        .await
-        .map_err(|error| format!("handler output read failed: {error}"))?;
-    let current = field_path.read(&existing);
-    if current.as_deref() == Some(field_path.value()) {
-        return Ok(());
-    }
-    if let Some(last) = last_write.get(&output.id)
-        && let Some(remaining) = min_interval.checked_sub(last.elapsed())
-    {
-        tokio::time::sleep(remaining).await;
-    }
-    let uid = existing
-        .metadata
-        .uid
-        .clone()
-        .filter(|uid| !uid.is_empty())
-        .ok_or_else(|| "handler output is missing a uid".to_owned())?;
-    let resource_version = existing
-        .metadata
-        .resource_version
-        .clone()
-        .filter(|version| !version.is_empty() && version != "0")
-        .ok_or_else(|| "handler output is missing a resourceVersion".to_owned())?;
-    let payload = field_path.payload(&output.name, &output.namespace);
-    let request = conditional_apply_request(
-        &payload,
-        &output.name,
-        &output.namespace,
-        field_manager,
-        false,
-        ApplyPrecondition::Existing {
-            uid: &uid,
-            resource_version: &resource_version,
-        },
-    )
-    .map_err(|error| error.to_string())?;
-    api.patch(
-        &output.name,
-        request.params(),
-        &Patch::Apply(request.payload()),
-    )
-    .await
-    .map_err(|error| format!("handler output write failed: {error}"))?;
-    last_write.insert(output.id.clone(), Instant::now());
-    Ok(())
+/// `output_id -> key -> value`, one invocation's complete set of buffered
+/// `apsides.writeOutput` calls. Values are already-validated UTF-8 text
+/// (see [`BufferedOutputSink::write_output`]) -- `ConfigMap` `data` values
+/// must be UTF-8 (Kubernetes' `binaryData` sibling field is not used by
+/// this release).
+pub(crate) type BufferedWrites = BTreeMap<String, BTreeMap<String, String>>;
+
+struct BufferedOutputSink {
+    buffer: std::sync::Mutex<BufferedWrites>,
 }
 
-enum FieldPath<'a> {
-    Data { key: &'a str, value: &'a str },
-    Annotation { value: &'a str },
-}
-
-impl FieldPath<'_> {
-    const fn value(&self) -> &str {
-        match self {
-            Self::Data { value, .. } | Self::Annotation { value } => value,
+impl BufferedOutputSink {
+    const fn new() -> Self {
+        Self {
+            buffer: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
-    fn read(&self, object: &DynamicObject) -> Option<String> {
-        match self {
-            Self::Data { key, .. } => object
-                .data
-                .get("data")
-                .and_then(Value::as_object)
-                .and_then(|data| data.get(*key))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            Self::Annotation { .. } => object
-                .metadata
-                .annotations
-                .as_ref()
-                .and_then(|annotations| annotations.get(HANDLER_INPUT_REVISION_ANNOTATION))
-                .cloned(),
-        }
-    }
-
-    fn payload(&self, name: &str, namespace: &str) -> Value {
-        match self {
-            Self::Data { key, value } => json!({
-                "apiVersion": "v1", "kind": "ConfigMap",
-                "metadata": {"name": name, "namespace": namespace},
-                "data": {*key: value},
-            }),
-            Self::Annotation { value } => json!({
-                "apiVersion": "v1", "kind": "ConfigMap",
-                "metadata": {
-                    "name": name, "namespace": namespace,
-                    "annotations": {HANDLER_INPUT_REVISION_ANNOTATION: value},
-                },
-            }),
-        }
+    /// Takes the accumulated buffer, leaving an empty one behind. Called
+    /// once, by `HandlerRuntime::invoke`, after the isolate has finished
+    /// running (successfully) -- never concurrently with `write_output`,
+    /// since the isolate thread that calls `write_output` has, by
+    /// construction, already returned by the time this runs.
+    fn take(&self) -> BufferedWrites {
+        self.buffer
+            .lock()
+            .map(|mut guard| std::mem::take(&mut *guard))
+            .unwrap_or_default()
     }
 }
 
-async fn run_writer(
-    mut jobs: async_mpsc::UnboundedReceiver<WriteJob>,
-    client: Client,
-    field_manager: String,
-    min_interval: Duration,
-    outputs: BTreeMap<String, Output>,
-) {
-    let mut last_write: BTreeMap<String, Instant> = BTreeMap::new();
-    while let Some(job) = jobs.recv().await {
-        let (output_id, field, reply) = match job {
-            WriteJob::Data {
-                output_id,
-                key,
-                data,
-                reply,
-            } => {
-                let Ok(value) = std::str::from_utf8(&data) else {
-                    let _ = reply.send(Err(
-                        "handler output data must be valid UTF-8 text in this release".into(),
-                    ));
-                    continue;
-                };
-                (
-                    output_id,
-                    StoredField::Data {
-                        key,
-                        value: value.to_owned(),
-                    },
-                    reply,
-                )
-            }
-            WriteJob::Stamp {
-                output_id,
-                revision,
-                reply,
-            } => (output_id, StoredField::Annotation { revision }, reply),
-        };
-        let Some(output) = outputs.get(&output_id) else {
-            let _ = reply.send(Err(format!("undeclared output id {output_id:?}")));
-            continue;
-        };
-        let field_path = match &field {
-            StoredField::Data { key, value } => FieldPath::Data { key, value },
-            StoredField::Annotation { revision } => FieldPath::Annotation { value: revision },
-        };
-        let outcome = apply_claimed_field(
-            &client,
-            &field_manager,
-            output,
-            field_path,
-            min_interval,
-            &mut last_write,
-        )
-        .await;
-        let _ = reply.send(outcome);
-    }
-}
-
-enum StoredField {
-    Data { key: String, value: String },
-    Annotation { revision: String },
-}
-
-struct ChannelOutputSink {
-    tx: async_mpsc::UnboundedSender<WriteJob>,
-}
-
-impl engine::OutputSink for ChannelOutputSink {
+impl engine::OutputSink for BufferedOutputSink {
     fn write_output(
         &self,
         id: &str,
         key: &str,
         data: &[u8],
     ) -> Result<(), engine::OutputSinkError> {
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        self.tx
-            .send(WriteJob::Data {
-                output_id: id.to_owned(),
-                key: key.to_owned(),
-                data: data.to_owned(),
-                reply: reply_tx,
-            })
+        // See the SDK's `writeOutput` JSDoc and IR-CONTRACT.md: output
+        // values must be UTF-8 text (ConfigMap `data`, not `binaryData`).
+        let Ok(value) = std::str::from_utf8(data) else {
+            return Err(engine::OutputSinkError {
+                message: "handler output data must be valid UTF-8 text in this release".into(),
+            });
+        };
+        let mut buffer = self
+            .buffer
+            .lock()
             .map_err(|_error| engine::OutputSinkError {
-                message: "the handler output writer is no longer running".into(),
+                message: "the handler output buffer lock was poisoned".into(),
             })?;
-        // A plain `std::sync::mpsc` recv, not a tokio primitive: this runs
-        // on the isolate's own thread, already deep inside that
-        // invocation's own `rt.block_on` -- see this module's doc comment.
-        reply_rx
-            .recv()
-            .map_err(|_error| engine::OutputSinkError {
-                message: "the handler output writer dropped the reply channel".into(),
-            })?
-            .map_err(|message| engine::OutputSinkError { message })
+        buffer
+            .entry(id.to_owned())
+            .or_default()
+            .insert(key.to_owned(), value.to_owned());
+        Ok(())
     }
 }
 
@@ -435,10 +324,20 @@ impl engine::LogWriter for HandlerLogWriter {
 
 fn handler_limits(handler: &Handler) -> engine::Limits {
     let heap_bytes = usize::try_from(handler.max_heap_bytes).unwrap_or(usize::MAX);
+    let array_buffer_cap = usize::try_from(compiler_core::array_buffer_cap_bytes(
+        handler.max_heap_bytes,
+    ))
+    .unwrap_or(usize::MAX);
     engine::Limits {
         timeout: Duration::from_millis(u64::from(handler.timeout_millis)),
         max_heap_bytes: heap_bytes,
-        max_array_buffer_bytes: heap_bytes,
+        // Capped at half the declared heap (never more than a fixed
+        // ceiling), not set equal to the whole heap -- see the Apsides
+        // v0.3 plan, Phase 5b review item C: `ArrayBuffer` allocations
+        // live outside the V8 heap the near-heap-limit callback watches,
+        // so an uncapped `max_array_buffer_bytes` let them add up to
+        // another whole heap's worth of memory on top of the heap itself.
+        max_array_buffer_bytes: array_buffer_cap,
         max_fetch_bytes_total: MAX_FETCH_BYTES_TOTAL,
         max_concurrent_fetches: MAX_CONCURRENT_FETCHES,
     }
@@ -471,6 +370,29 @@ fn backoff_duration(attempt: u32, base: Duration, max: Duration) -> Duration {
     Duration::from_millis(millis).min(max)
 }
 
+/// The outcome of [`HandlerRuntime::invoke`]'s commit step: a plain error
+/// code (an ordinary invocation/commit failure -- folded into a
+/// `RuntimeCondition` plus backoff by `dispatch_ready`), or a fatal
+/// [`RuntimeError`] (`Terminating`/`Platform`) that must abort the whole
+/// reconcile cycle immediately, the same way a reconciler resource apply
+/// does.
+enum InvokeCommitError {
+    Code(String),
+    Fatal(RuntimeError),
+}
+
+/// `Some(r)` only when every entry in `recorded` is `Some(r)` for the same
+/// `r`; `None` (no agreement, or an empty list) otherwise -- see
+/// [`HandlerRuntime::seed_from_annotations`]'s doc comment, Phase 5b
+/// review item 5.
+fn agreed_revision(recorded: &[Option<String>]) -> Option<String> {
+    let (first, rest) = recorded.split_first()?;
+    first.clone().filter(|value| {
+        rest.iter()
+            .all(|other| other.as_deref() == Some(value.as_str()))
+    })
+}
+
 pub(crate) struct HandlerRuntime {
     queue_capacity: usize,
     base_backoff: Duration,
@@ -479,26 +401,31 @@ pub(crate) struct HandlerRuntime {
     bundles: BTreeMap<String, &'static str>,
     outputs_by_id: BTreeMap<String, Output>,
     resolver: Option<Arc<engine::EgressResolver>>,
-    writer_tx: async_mpsc::UnboundedSender<WriteJob>,
+    field_manager: String,
     states: BTreeMap<String, HandlerState>,
     queue_order: VecDeque<String>,
 }
 
 impl HandlerRuntime {
     /// Builds the runtime for one domain's declared handlers: a shared DNS
-    /// resolver for `apsides.fetch` (built once, only if some handler
-    /// declares egress hosts -- see `engine::EgressResolver::new`'s doc
-    /// comment on why this must happen once, up front, never per
-    /// invocation), and the background output-writer task. Must be called
-    /// from within an entered tokio runtime (it spawns that task).
+    /// resolver *configuration* for `apsides.fetch` (built once, only if
+    /// some handler declares egress hosts -- see
+    /// `engine::EgressResolver`'s doc comment on why this crate never
+    /// reads `/etc/resolv.conf` itself and never builds the real resolver
+    /// here either, only its config).
+    ///
+    /// `resolv_conf_contents` is required (an error is returned) exactly
+    /// when some declared handler has a non-empty `egress` list; a domain
+    /// with no handler egress never needs it and this function never reads
+    /// the file itself either way -- see the Apsides v0.3 plan, Phase 5b
+    /// review item 3.
     pub(crate) fn new(
         plan: &CompiledPlan,
         handlers: &'static [(&'static str, &'static str)],
-        client: Client,
         field_manager: String,
-        min_mutation_interval: Duration,
         base_backoff: Duration,
         max_backoff: Duration,
+        resolv_conf_contents: Option<&str>,
     ) -> Result<Self, RuntimeError> {
         let bundles: BTreeMap<String, &'static str> = handlers
             .iter()
@@ -516,23 +443,19 @@ impl HandlerRuntime {
             .iter()
             .any(|handler| !handler.egress.is_empty())
         {
-            let resolver =
-                engine::EgressResolver::new(hickory_resolver::config::ResolverConfig::udp_and_tcp(
-                    &hickory_resolver::config::CLOUDFLARE,
-                ))
-                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-            Some(Arc::new(resolver))
+            let contents = resolv_conf_contents.ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "a declared handler has egress hosts, but no resolv.conf contents were \
+                     provided to build the DNS resolver"
+                        .into(),
+                )
+            })?;
+            let config = engine::resolver_config_from_resolv_conf(contents)
+                .map_err(|error| RuntimeError::Configuration(format!("resolv.conf: {error}")))?;
+            Some(Arc::new(engine::EgressResolver::new(config)))
         } else {
             None
         };
-        let (writer_tx, writer_rx) = async_mpsc::unbounded_channel();
-        tokio::spawn(run_writer(
-            writer_rx,
-            client,
-            field_manager,
-            min_mutation_interval,
-            outputs_by_id.clone(),
-        ));
         Ok(Self {
             queue_capacity: plan.ir.domain.budgets.max_queue_depth.max(1),
             base_backoff,
@@ -541,81 +464,142 @@ impl HandlerRuntime {
             bundles,
             outputs_by_id,
             resolver,
-            writer_tx,
+            field_manager,
             states: BTreeMap::new(),
             queue_order: VecDeque::new(),
         })
     }
 
     /// Level-based startup recomputation (see the Apsides v0.3 plan, Phase
-    /// 5b, "Delivery"): seeds each handler's `known_revision` from the
-    /// revision annotation already recorded on its declared outputs, so a
-    /// restart re-enqueues a handler exactly when its current input
-    /// revision differs from the one its outputs already reflect. A
-    /// handler with no declared outputs has nothing to seed from and
-    /// always looks pending immediately after a restart, by construction.
+    /// 5b, "Delivery"): seeds each handler's `known_revision` (and
+    /// `output_uids`, for the per-cycle drift check `outputs_still_agree`
+    /// also relies on -- Phase 5b review item 5) from the revision
+    /// annotation already recorded on its declared outputs, so a restart
+    /// re-enqueues a handler exactly when its current input revision
+    /// differs from the one its outputs already reflect. A handler with no
+    /// declared outputs has nothing to seed from and always looks pending
+    /// immediately after a restart, by construction.
+    ///
+    /// Seeds `known_revision = Some(r)` only when **every** declared
+    /// output records that exact same `Some(r)` -- review item 5: treating
+    /// `[None, Some(r)]` (one output missing the annotation entirely, e.g.
+    /// recreated empty) as agreement would wrongly seed the handler as
+    /// already up to date.
     pub(crate) async fn seed_from_annotations(&mut self, plan: &CompiledPlan, client: &Client) {
         for handler in &plan.ir.handlers {
             if handler.outputs.is_empty() {
                 continue;
             }
-            let mut agreed: Option<String> = None;
-            let mut every_output_agrees = true;
+            let state = self.states.entry(handler.id.clone()).or_default();
+            let mut recorded_revisions: Vec<Option<String>> =
+                Vec::with_capacity(handler.outputs.len());
             for output_id in &handler.outputs {
-                let Some(output) = self.outputs_by_id.get(output_id) else {
-                    every_output_agrees = false;
-                    break;
-                };
-                let api = configmap_api(client, &output.namespace);
-                let recorded = match api.get_opt(&output.name).await {
-                    Ok(Some(object)) => object
-                        .metadata
-                        .annotations
-                        .as_ref()
-                        .and_then(|annotations| annotations.get(HANDLER_INPUT_REVISION_ANNOTATION))
-                        .cloned(),
-                    Ok(None) | Err(_) => None,
-                };
-                match (&agreed, recorded) {
-                    (None, Some(value)) if agreed.is_none() && self.states.is_empty() => {
-                        agreed = Some(value);
+                let recorded = if let Some(output) = self.outputs_by_id.get(output_id) {
+                    let api = configmap_api(client, &output.namespace);
+                    match api.get_opt(&output.name).await {
+                        Ok(Some(object)) => {
+                            if let Some(uid) =
+                                object.metadata.uid.clone().filter(|uid| !uid.is_empty())
+                            {
+                                state.output_uids.insert(output_id.clone(), uid);
+                            }
+                            object
+                                .metadata
+                                .annotations
+                                .as_ref()
+                                .and_then(|annotations| {
+                                    annotations.get(HANDLER_INPUT_REVISION_ANNOTATION)
+                                })
+                                .cloned()
+                        }
+                        Ok(None) | Err(_) => None,
                     }
-                    (None, value) => agreed = value,
-                    (Some(current), Some(value)) if *current == value => {}
-                    _ => {
-                        every_output_agrees = false;
-                        break;
-                    }
-                }
+                } else {
+                    None
+                };
+                recorded_revisions.push(recorded);
             }
-            let known_revision = if every_output_agrees { agreed } else { None };
-            self.states
-                .entry(handler.id.clone())
-                .or_default()
-                .known_revision = known_revision;
+            state.known_revision = agreed_revision(&recorded_revisions);
         }
     }
 
-    /// Computes revisions, enqueues changed handlers, and dispatches every
-    /// currently-ready queued entry serially (global concurrency 1 -- see
-    /// the Apsides v0.3 plan, Phase 5b, "Delivery"). Returns the
-    /// conditions to fold into the cycle's existing conditions list.
+    /// Re-checks whether `handler`'s declared outputs still actually agree
+    /// with `revision` -- called only when the freshly-computed input
+    /// revision already matches the in-memory `known_revision` (the case
+    /// that would otherwise be skipped as unchanged), so this extra GET
+    /// round-trip per output is paid only for handlers already believed
+    /// idle, once per cycle each. See the Apsides v0.3 plan, Phase 5b
+    /// review item 5: an output recreated (its `uid` changed) or emptied
+    /// (its annotation is gone) since it was last observed must force a
+    /// re-run even though nothing about the handler's *input* changed.
+    async fn outputs_still_agree(
+        &mut self,
+        handler: &Handler,
+        revision: &str,
+        client: &Client,
+    ) -> bool {
+        for output_id in &handler.outputs {
+            let Some(output) = self.outputs_by_id.get(output_id) else {
+                return false;
+            };
+            let api = configmap_api(client, &output.namespace);
+            let Ok(Some(object)) = api.get_opt(&output.name).await else {
+                return false;
+            };
+            let live_annotation = object
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(HANDLER_INPUT_REVISION_ANNOTATION));
+            if live_annotation.map(String::as_str) != Some(revision) {
+                return false;
+            }
+            let live_uid = object.metadata.uid.clone().filter(|uid| !uid.is_empty());
+            let state = self.states.entry(handler.id.clone()).or_default();
+            let recorded_uid = state.output_uids.get(output_id.as_str()).cloned();
+            match (&live_uid, &recorded_uid) {
+                (Some(live), Some(recorded)) if live == recorded => {}
+                _ => return false,
+            }
+            if let Some(uid) = live_uid {
+                state.output_uids.insert(output_id.clone(), uid);
+            }
+        }
+        true
+    }
+
+    /// Computes revisions, enqueues changed handlers, and dispatches at
+    /// most one ready queued entry (global concurrency 1, and at most one
+    /// dispatch per cycle -- see the Apsides v0.3 plan, Phase 5b,
+    /// "Delivery", and review item E: reconciles and inventory publishing
+    /// must never be starved by a busy handler queue). Returns the
+    /// conditions to fold into the cycle's existing conditions list, or
+    /// `Err` only for a fatal error (`RuntimeError::Terminating` /
+    /// `RuntimeError::Platform`) that must abort the whole reconcile cycle
+    /// the same way a reconciler resource apply does -- every other
+    /// failure is already folded into a `RuntimeCondition` plus backoff
+    /// before this returns.
     pub(crate) async fn run_cycle(
         &mut self,
         plan: &CompiledPlan,
         observations: &BTreeMap<String, Observation>,
         applied: &BTreeSet<String>,
-    ) -> Vec<RuntimeCondition> {
+        client: &Client,
+        controller: &crate::production::ProductionController,
+    ) -> Result<Vec<RuntimeCondition>, RuntimeError> {
         let mut conditions = Vec::new();
-        self.detect_triggers(plan, observations, &mut conditions);
-        self.dispatch_ready(plan, applied, &mut conditions).await;
-        conditions
+        self.detect_triggers(plan, observations, client, &mut conditions)
+            .await;
+        self.dispatch_ready(plan, applied, controller, &mut conditions)
+            .await?;
+        Ok(conditions)
     }
 
-    fn detect_triggers(
+    async fn detect_triggers(
         &mut self,
         plan: &CompiledPlan,
         observations: &BTreeMap<String, Observation>,
+        client: &Client,
         conditions: &mut Vec<RuntimeCondition>,
     ) {
         for handler in &plan.ir.handlers {
@@ -625,6 +609,21 @@ impl HandlerRuntime {
             let Ok(revision) = compute_input_revision(handler, &inputs) else {
                 continue;
             };
+            let state = self.states.entry(handler.id.clone()).or_default();
+            let same_revision = state.known_revision.as_deref() == Some(revision.as_str());
+            let already_queued_for_this_revision = state
+                .queued
+                .as_ref()
+                .is_some_and(|queued| queued.revision == revision);
+            if same_revision && !handler.outputs.is_empty() && !already_queued_for_this_revision {
+                let confirmed = self.outputs_still_agree(handler, &revision, client).await;
+                if !confirmed {
+                    self.states
+                        .entry(handler.id.clone())
+                        .or_default()
+                        .known_revision = None;
+                }
+            }
             let state = self.states.entry(handler.id.clone()).or_default();
             let unchanged = state.known_revision.as_deref() == Some(revision.as_str())
                 && state
@@ -680,13 +679,23 @@ impl HandlerRuntime {
         EnqueueOutcome::New
     }
 
+    /// Dispatches **at most one** ready queued handler this cycle (review
+    /// item E) -- other ready/not-ready entries are still scanned (for
+    /// backoff/`handler-output-not-ready` bookkeeping) but never invoked
+    /// once one dispatch has already happened. Checks
+    /// `controller.is_terminating()` immediately before that one dispatch,
+    /// so a shutdown in progress never starts a new invocation (the commit
+    /// path inside `invoke` re-checks it again before each output's
+    /// commit SSA too -- see `production::commit_handler_outputs`).
     async fn dispatch_ready(
         &mut self,
         plan: &CompiledPlan,
         applied: &BTreeSet<String>,
+        controller: &crate::production::ProductionController,
         conditions: &mut Vec<RuntimeCondition>,
-    ) {
+    ) -> Result<(), RuntimeError> {
         let ids: Vec<String> = self.queue_order.iter().cloned().collect();
+        let mut dispatched_one = false;
         for handler_id in ids {
             let Some(handler) = plan
                 .ir
@@ -713,6 +722,12 @@ impl HandlerRuntime {
                 });
                 continue;
             }
+            if dispatched_one {
+                continue;
+            }
+            if controller.is_terminating() {
+                return Err(RuntimeError::Terminating);
+            }
             let Some(queued) = self
                 .states
                 .get_mut(&handler_id)
@@ -721,17 +736,20 @@ impl HandlerRuntime {
                 continue;
             };
             self.queue_order.retain(|id| *id != handler_id);
-            let outcome = self.invoke(handler, &queued).await;
+            dispatched_one = true;
+            let outcome = self.invoke(handler, &queued, controller).await;
             let state = self.states.entry(handler_id.clone()).or_default();
             state.last_run = Some(Instant::now());
             match outcome {
-                Ok(()) => {
+                Ok(committed_uids) => {
                     state.known_revision = Some(queued.revision);
+                    state.output_uids.extend(committed_uids);
                     state.attempt = 0;
                     state.backoff_until = None;
                     state.last_error_code = None;
                 }
-                Err(code) => {
+                Err(InvokeCommitError::Fatal(error)) => return Err(error),
+                Err(InvokeCommitError::Code(code)) => {
                     state.attempt = state.attempt.saturating_add(1);
                     state.backoff_until = Some(
                         now + backoff_duration(state.attempt, self.base_backoff, self.max_backoff),
@@ -748,11 +766,30 @@ impl HandlerRuntime {
                 }
             }
         }
+        Ok(())
     }
 
-    async fn invoke(&self, handler: &Handler, queued: &QueuedEvent) -> Result<(), String> {
+    /// Runs `handler`'s isolate (returning `InvokeCommitError::Code` for
+    /// any engine-side failure), then -- only if it returned `Ok` --
+    /// commits every declared output through
+    /// `production::commit_handler_outputs`, the SAME authority/claim
+    /// re-check path reconciler mutations use (review item E; "reuse that
+    /// path, don't duplicate it"). Returns the committed uid of every
+    /// output actually committed, so the caller can refresh
+    /// `HandlerState::output_uids`.
+    ///
+    /// A handler can no longer catch `SINK_REJECTED` for an apply failure:
+    /// `BufferedOutputSink::write_output` only ever fails for a UTF-8/lock
+    /// problem, never for a Kubernetes error, since every real write now
+    /// happens after the handler has already returned (review item 1).
+    async fn invoke(
+        &self,
+        handler: &Handler,
+        queued: &QueuedEvent,
+        controller: &crate::production::ProductionController,
+    ) -> Result<BTreeMap<String, String>, InvokeCommitError> {
         let Some(bundle) = self.bundles.get(handler.id.as_str()).copied() else {
-            return Err("HANDLER_BUNDLE_MISSING".into());
+            return Err(InvokeCommitError::Code("HANDLER_BUNDLE_MISSING".into()));
         };
         let export = handler.export.clone();
         let handler_id = handler.id.clone();
@@ -768,9 +805,8 @@ impl HandlerRuntime {
                 max_bytes: self.max_object_bytes,
             })
             .collect::<Vec<_>>();
-        let sink: Arc<dyn engine::OutputSink> = Arc::new(ChannelOutputSink {
-            tx: self.writer_tx.clone(),
-        });
+        let buffered_sink = Arc::new(BufferedOutputSink::new());
+        let sink: Arc<dyn engine::OutputSink> = buffered_sink.clone();
         let resolver = self.resolver.clone();
         let log_writer: Arc<dyn engine::LogWriter> = Arc::new(HandlerLogWriter {
             handler_id: handler_id.clone(),
@@ -797,38 +833,29 @@ impl HandlerRuntime {
             )
         })
         .await
-        .map_err(|_join_error| "HANDLER_INVOCATION_TASK_FAILED".to_owned())?;
+        .map_err(|_join_error| InvokeCommitError::Code("HANDLER_INVOCATION_TASK_FAILED".into()))?;
 
         match report.result {
-            Ok(_value) => self.stamp_outputs(handler, &queued.revision),
-            Err(error) => Err(invoke_error_code(&error)),
-        }
-    }
-
-    /// Not `async`: every step here is either a non-blocking channel send
-    /// or `block_in_place` (itself synchronous from its caller's
-    /// perspective -- it parks this thread while handing off the
-    /// runtime's other work, never an `.await` point). Called only from
-    /// `invoke`, itself always on the main (multi-threaded) runtime, never
-    /// the isolate thread.
-    fn stamp_outputs(&self, handler: &Handler, revision: &str) -> Result<(), String> {
-        for output_id in &handler.outputs {
-            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-            self.writer_tx
-                .send(WriteJob::Stamp {
-                    output_id: output_id.clone(),
-                    revision: revision.to_owned(),
-                    reply: reply_tx,
+            Ok(_value) => {
+                let written = buffered_sink.take();
+                crate::production::commit_handler_outputs(
+                    controller,
+                    &handler.outputs,
+                    &self.outputs_by_id,
+                    &self.field_manager,
+                    &written,
+                    &queued.revision,
+                )
+                .await
+                .map_err(|error| match error {
+                    RuntimeError::Terminating | RuntimeError::Platform(_) => {
+                        InvokeCommitError::Fatal(error)
+                    }
+                    other => InvokeCommitError::Code(format!("HANDLER_COMMIT_FAILED:{other}")),
                 })
-                .map_err(|_error| "HANDLER_OUTPUT_WRITER_STOPPED".to_owned())?;
-            // Called from an ordinary async fn on the main (multi-threaded)
-            // runtime, never the isolate thread -- `block_in_place` is legal
-            // here (unlike in `ChannelOutputSink::write_output`).
-            let outcome = tokio::task::block_in_place(|| reply_rx.recv())
-                .map_err(|_error| "HANDLER_OUTPUT_WRITER_STOPPED".to_owned())?;
-            outcome.map_err(|_message| "HANDLER_OUTPUT_STAMP_FAILED".to_owned())?;
+            }
+            Err(error) => Err(InvokeCommitError::Code(invoke_error_code(&error))),
         }
-        Ok(())
     }
 
     pub(crate) fn statuses(&self) -> Vec<HandlerStatus> {
@@ -943,6 +970,37 @@ mod tests {
         Ok(())
     }
 
+    /// Phase 5b review item 2: a new bundle (different `bundleSha256`),
+    /// with the input data held exactly constant, must compute a
+    /// different revision, so a restart re-runs the handler instead of
+    /// wrongly trusting the previous bundle's stamped revision.
+    #[test]
+    fn revision_changes_when_the_bundle_sha256_changes() -> TestResult {
+        let mut handler = handler("sync", &["settings"], &["flags"]);
+        let mut inputs = BTreeMap::new();
+        inputs.insert("settings".to_owned(), json!({"flag": "on"}));
+        let before = compute_input_revision(&handler, &inputs)?;
+        handler.bundle_sha256 = "1".repeat(64);
+        let after = compute_input_revision(&handler, &inputs)?;
+        assert_ne!(before, after);
+        Ok(())
+    }
+
+    /// Distinct handlers reacting to identical input data must not
+    /// collide on the same revision (their `id`/`export`/`outputs` all
+    /// differ).
+    #[test]
+    fn revision_differs_between_two_handlers_on_identical_input_data() -> TestResult {
+        let handler_a = handler("sync-a", &["settings"], &["flags-a"]);
+        let handler_b = handler("sync-b", &["settings"], &["flags-b"]);
+        let mut inputs = BTreeMap::new();
+        inputs.insert("settings".to_owned(), json!({"flag": "on"}));
+        let revision_a = compute_input_revision(&handler_a, &inputs)?;
+        let revision_b = compute_input_revision(&handler_b, &inputs)?;
+        assert_ne!(revision_a, revision_b);
+        Ok(())
+    }
+
     #[test]
     fn missing_declared_input_blocks_snapshot_and_dispatch() {
         let handler = handler("sync", &["settings"], &["flags"]);
@@ -975,7 +1033,7 @@ mod tests {
             bundles: BTreeMap::new(),
             outputs_by_id: BTreeMap::new(),
             resolver: None,
-            writer_tx: async_mpsc::unbounded_channel().0,
+            field_manager: "apsides-handler-example".into(),
             states: BTreeMap::new(),
             queue_order: VecDeque::new(),
         }
@@ -1082,7 +1140,41 @@ mod tests {
         let limits = handler_limits(&handler);
         assert_eq!(limits.timeout, Duration::from_millis(1_000));
         assert_eq!(limits.max_heap_bytes, 8 * 1024 * 1024);
-        assert_eq!(limits.max_array_buffer_bytes, 8 * 1024 * 1024);
+        // Half the declared heap, per `compiler_core::array_buffer_cap_bytes`
+        // -- not set equal to the whole heap (Phase 5b review item C).
+        assert_eq!(limits.max_array_buffer_bytes, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn handler_limits_caps_the_array_buffer_budget_for_a_large_declared_heap() -> TestResult {
+        let mut handler = handler("sync", &["settings"], &["flags"]);
+        handler.max_heap_bytes = 256 * 1024 * 1024;
+        let limits = handler_limits(&handler);
+        assert_eq!(
+            limits.max_array_buffer_bytes,
+            usize::try_from(compiler_core::HANDLER_ARRAY_BUFFER_CAP_BYTES)?
+        );
+        Ok(())
+    }
+
+    /// `engine`'s own internal memory constants cannot be imported by
+    /// `compiler_core::handler_budgets` (it is deliberately IR-agnostic
+    /// and does not depend on `engine`), so they are mirrored there
+    /// instead -- see that module's doc comment. This crate depends on
+    /// both, so it is the one place that can assert the mirror has not
+    /// drifted from what `engine` actually enforces (Phase 5b review item
+    /// C).
+    #[test]
+    fn engine_memory_constants_match_their_compiler_core_mirror() -> TestResult {
+        assert_eq!(
+            u64::try_from(engine::MAX_FETCH_REQUEST_BODY_BYTES)?,
+            compiler_core::HANDLER_FETCH_REQUEST_BODY_BYTES,
+        );
+        assert_eq!(
+            u64::try_from(engine::HEAP_LIMIT_TERMINATION_HEADROOM_TOTAL_CAP_BYTES)?,
+            compiler_core::HANDLER_HEAP_HEADROOM_TOTAL_BYTES,
+        );
+        Ok(())
     }
 
     #[test]
@@ -1099,51 +1191,30 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------
-    // End-to-end: a real `engine` V8 invocation, dispatched by
-    // `HandlerRuntime` against a fake `kube::Client` (the same
-    // `tower::service_fn` pattern `production.rs`'s own test module
-    // uses), covering the plan's core Phase 5b scenarios directly
-    // against `run_cycle`/`seed_from_annotations` -- no
-    // `ProductionController`/authority/inventory machinery needed,
-    // since both take their inputs as plain arguments.
-    // -------------------------------------------------------------
-    mod engine_integration {
+    /// Phase 5b review item 5: seeding must not treat `[None, Some(r)]`
+    /// (one declared output missing the annotation entirely -- e.g.
+    /// recreated empty) as agreement, and the same drift must also be
+    /// caught mid-run, without a restart, by `outputs_still_agree`.
+    mod seeding_and_drift {
         use super::*;
         use compiler_core::parse_and_validate;
         use http::{Method, Request, Response};
         use http_body_util::BodyExt;
         use kube::client::Body;
-        use sha2::{Digest, Sha256};
         use std::collections::VecDeque;
         use std::convert::Infallible;
         use std::sync::Mutex as StdMutex;
         use tower::service_fn;
 
-        type IntegrationResult<T = ()> =
-            std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
         type Calls = Arc<StdMutex<Vec<(Method, Value)>>>;
-
-        const HANDLER_BUNDLE: &str = r#"
-export async function syncFlags(event) {
-  const value = event.inputs.settings.data.flag;
-  apsides.writeOutput("flags", "value", value);
-  return {};
-}
-"#;
-
-        fn bundle_sha256() -> String {
-            format!("{:x}", Sha256::digest(HANDLER_BUNDLE.as_bytes()))
-        }
 
         fn source() -> Value {
             json!({"file": "program.tsx", "line": 1, "column": 1})
         }
 
-        /// A validated one-handler-one-output plan: handler `sync-flags`
-        /// triggers on the observed `settings` input and writes its
-        /// `flag` field to key `value` of output `flags`.
-        fn plan() -> IntegrationResult<CompiledPlan> {
+        /// A two-output handler ("flags-a", "flags-b") triggered by
+        /// "settings".
+        fn plan() -> TestResult<CompiledPlan> {
             let ir = json!({
                 "schemaVersion": compiler_core::IR_SCHEMA,
                 "domain": {
@@ -1152,64 +1223,54 @@ export async function syncFlags(event) {
                     "minKubernetesVersion": "1.34",
                     "budgets": {"maxResources": 8, "maxInputs": 8, "maxReactions": 8, "maxObjectBytes": 262_144, "maxQueueDepth": 8, "maxConcurrentRequests": 2},
                 },
-                "resources": [{
-                    "id": "flags", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags", "namespace": "workload",
-                    "handlerOutput": true,
-                    "desired": {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "flags", "namespace": "workload", "labels": {"apsides.dev/handler-output": "flags"}}},
-                    "lifecycle": {"deletionPolicy": "orphan"}, "source": source(),
-                }],
+                "resources": [
+                    {"id": "flags-a", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags-a", "namespace": "workload",
+                     "handlerOutput": true,
+                     "desired": {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "flags-a", "namespace": "workload", "labels": {"apsides.dev/handler-output": "flags-a"}}},
+                     "lifecycle": {"deletionPolicy": "orphan"}, "source": source()},
+                    {"id": "flags-b", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags-b", "namespace": "workload",
+                     "handlerOutput": true,
+                     "desired": {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "flags-b", "namespace": "workload", "labels": {"apsides.dev/handler-output": "flags-b"}}},
+                     "lifecycle": {"deletionPolicy": "orphan"}, "source": source()},
+                ],
                 "inputs": [
                     {"id": "settings", "apiVersion": "v1", "kind": "ConfigMap", "name": "settings", "namespace": "workload", "mode": "observed", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source()},
-                    {"id": "flags-output", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags", "namespace": "workload", "mode": "output", "managedResourceId": "flags", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source()},
+                    {"id": "flags-a-output", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags-a", "namespace": "workload", "mode": "output", "managedResourceId": "flags-a", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source()},
+                    {"id": "flags-b-output", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags-b", "namespace": "workload", "mode": "output", "managedResourceId": "flags-b", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source()},
                 ],
                 "reactions": [],
                 "handlers": [{
                     "id": "sync-flags", "module": "handlers/sync-flags.ts", "export": "syncFlags",
                     "trigger": {"kind": "input-changed", "input": "settings"},
-                    "inputs": ["settings"], "egress": [], "outputs": ["flags"],
+                    "inputs": ["settings"], "egress": [], "outputs": ["flags-a", "flags-b"],
                     "timeoutMillis": 5_000, "maxHeapBytes": 8_388_608,
-                    "bundleSha256": bundle_sha256(), "source": source(),
+                    "bundleSha256": "0".repeat(64), "source": source(),
                 }],
-                "outputs": [{"id": "flags", "name": "flags", "namespace": "workload"}],
+                "outputs": [
+                    {"id": "flags-a", "name": "flags-a", "namespace": "workload"},
+                    {"id": "flags-b", "name": "flags-b", "namespace": "workload"},
+                ],
                 "provenance": {"compiler": "apsides/0.1", "inputs": [{"path": "program.tsx", "sha256": "0".repeat(64)}, {"path": "handlers/sync-flags.ts", "sha256": "1".repeat(64)}]},
             });
             Ok(parse_and_validate(&ir.to_string())?)
         }
 
-        fn settings_observations(flag: &str) -> BTreeMap<String, Observation> {
-            let mut observations = BTreeMap::new();
-            observations.insert("settings".to_owned(), available(&[("flag", flag)]));
-            observations
-        }
-
-        fn flags_object(uid: &str, rv: &str, value: Option<&str>, revision: Option<&str>) -> Value {
-            let mut data = Map::new();
-            if let Some(value) = value {
-                data.insert("value".into(), Value::String(value.into()));
-            }
-            let mut annotations = Map::new();
-            annotations.insert(
-                "apsides.dev/handler-output".into(),
-                Value::String("flags".into()),
-            );
-            if let Some(revision) = revision {
-                annotations.insert(
-                    HANDLER_INPUT_REVISION_ANNOTATION.into(),
-                    Value::String(revision.into()),
-                );
-            }
-            json!({
-                "apiVersion": "v1", "kind": "ConfigMap",
-                "metadata": {"name": "flags", "namespace": "workload", "uid": uid, "resourceVersion": rv, "annotations": annotations},
-                "data": Value::Object(data),
-            })
+        fn runtime_for(plan: &CompiledPlan) -> TestResult<HandlerRuntime> {
+            Ok(HandlerRuntime::new(
+                plan,
+                &[],
+                "apsides-handler-example".into(),
+                Duration::from_millis(10),
+                Duration::from_millis(100),
+                None,
+            )?)
         }
 
         async fn wire_response(
             request: Request<Body>,
             responses: &StdMutex<VecDeque<Value>>,
             calls: &Calls,
-        ) -> IntegrationResult<Response<Body>> {
+        ) -> TestResult<Response<Body>> {
             let (parts, body) = request.into_parts();
             let bytes = body.collect().await?.to_bytes();
             let value = if bytes.is_empty() {
@@ -1255,224 +1316,375 @@ export async function syncFlags(event) {
             (Client::new(service, "workload"), calls)
         }
 
-        fn runtime_for(plan: &CompiledPlan, client: Client) -> IntegrationResult<HandlerRuntime> {
-            Ok(HandlerRuntime::new(
-                plan,
-                &[("sync-flags", HANDLER_BUNDLE)],
-                client,
-                "apsides-handler-example".into(),
-                Duration::from_millis(1),
-                Duration::from_millis(10),
-                Duration::from_millis(100),
-            )?)
-        }
-
-        /// An input change dispatches the handler, its output is written
-        /// through the handler field manager, and the revision annotation
-        /// is stamped only after the invocation succeeds.
-        #[tokio::test(flavor = "multi_thread")]
-        async fn input_change_writes_output_and_stamps_the_revision_annotation() -> IntegrationResult
-        {
-            let plan = plan()?;
-            let observations = settings_observations("on");
-            let (client, calls) = wire(vec![
-                flags_object("flags-uid", "1", None, None), // GET before the data write
-                flags_object("flags-uid", "2", Some("on"), None), // PATCH response
-                flags_object("flags-uid", "2", Some("on"), None), // GET before the stamp
-                flags_object("flags-uid", "3", Some("on"), Some("stamped")), // PATCH response
-            ]);
-            let mut runtime = runtime_for(&plan, client)?;
-            let mut applied = BTreeSet::new();
-            applied.insert("flags".to_owned());
-
-            let conditions = runtime.run_cycle(&plan, &observations, &applied).await;
-            assert!(
-                conditions.is_empty(),
-                "unexpected conditions: {conditions:?}"
+        fn flags_object(name: &str, uid: &str, rv: &str, revision: Option<&str>) -> Value {
+            let mut annotations = Map::new();
+            annotations.insert(
+                "apsides.dev/handler-output".into(),
+                Value::String(name.into()),
             );
-
-            let recorded = calls.lock().map_err(|_| "calls poisoned")?;
-            assert_eq!(recorded.len(), 4);
-            assert_eq!(recorded[0].0, Method::GET);
-            assert_eq!(recorded[1].0, Method::PATCH);
-            assert_eq!(recorded[1].1["data"]["value"], json!("on"));
-            assert_eq!(recorded[3].0, Method::PATCH);
-            assert!(
-                recorded[3].1["metadata"]["annotations"]
-                    .get(HANDLER_INPUT_REVISION_ANNOTATION)
-                    .is_some()
-            );
-            // The reconciler's own field manager never appears on a
-            // handler-triggered write: every SSA request this crate sends
-            // for a handler output uses the distinct handler manager.
-            drop(recorded);
-
-            let state = runtime
-                .states
-                .get("sync-flags")
-                .ok_or("handler state must exist after a dispatch")?;
-            assert!(state.known_revision.is_some());
-            assert!(state.queued.is_none());
-            assert_eq!(state.last_error_code, None);
-            Ok(())
-        }
-
-        /// Unchanged data is never rewritten: the writer's own read shows
-        /// the value (and, separately, the annotation) already match, so
-        /// no PATCH is ever issued for either.
-        #[tokio::test(flavor = "multi_thread")]
-        async fn unchanged_output_and_annotation_are_not_rewritten() -> IntegrationResult {
-            let plan = plan()?;
-            let observations = settings_observations("on");
-            // The revision this cycle will compute must already be
-            // recorded, so the annotation stamp is also a no-op.
-            let mut inputs = BTreeMap::new();
-            inputs.insert("settings".to_owned(), json!({"flag": "on"}));
-            let handler = &plan.ir.handlers[0];
-            let revision = compute_input_revision(handler, &inputs)?;
-            let (client, calls) = wire(vec![
-                flags_object("flags-uid", "1", Some("on"), Some(&revision)), // GET before the data write: already "on"
-                flags_object("flags-uid", "1", Some("on"), Some(&revision)), // GET before the stamp: already stamped
-            ]);
-            let mut runtime = runtime_for(&plan, client)?;
-            let mut applied = BTreeSet::new();
-            applied.insert("flags".to_owned());
-
-            let conditions = runtime.run_cycle(&plan, &observations, &applied).await;
-            assert!(
-                conditions.is_empty(),
-                "unexpected conditions: {conditions:?}"
-            );
-            let recorded = calls.lock().map_err(|_| "calls poisoned")?;
-            assert_eq!(recorded.len(), 2, "no PATCH should be issued: {recorded:?}");
-            assert!(recorded.iter().all(|(method, _)| *method == Method::GET));
-            Ok(())
-        }
-
-        /// A handler whose declared output was not in this cycle's
-        /// successfully-applied set is never invoked; the condition is
-        /// recorded and the event stays queued.
-        #[tokio::test(flavor = "multi_thread")]
-        async fn output_not_ready_blocks_dispatch() -> IntegrationResult {
-            let plan = plan()?;
-            let observations = settings_observations("on");
-            let (client, calls) = wire(vec![]); // no HTTP call should ever be made
-            let mut runtime = runtime_for(&plan, client)?;
-            let applied = BTreeSet::new(); // "flags" was not successfully applied this cycle
-
-            let conditions = runtime.run_cycle(&plan, &observations, &applied).await;
-            assert_eq!(conditions.len(), 1);
-            assert_eq!(conditions[0].reason_code, "handler-output-not-ready");
-            assert_eq!(conditions[0].resource_name.as_deref(), Some("sync-flags"));
-            assert!(calls.lock().map_err(|_| "calls poisoned")?.is_empty());
-            let state = runtime
-                .states
-                .get("sync-flags")
-                .ok_or("handler state must exist")?;
-            assert!(state.queued.is_some(), "the event must stay queued");
-            Ok(())
-        }
-
-        /// After a restart, `seed_from_annotations` recomputes
-        /// `known_revision` from the output's own annotation: a handler
-        /// whose current input revision already matches its output's
-        /// recorded revision does not re-run.
-        #[tokio::test(flavor = "multi_thread")]
-        async fn restart_seeds_known_revision_from_the_output_annotation_and_skips_a_matching_cycle()
-        -> IntegrationResult {
-            let plan = plan()?;
-            let mut inputs = BTreeMap::new();
-            inputs.insert("settings".to_owned(), json!({"flag": "on"}));
-            let handler = &plan.ir.handlers[0];
-            let revision = compute_input_revision(handler, &inputs)?;
-            let (client, calls) = wire(vec![flags_object(
-                "flags-uid",
-                "1",
-                Some("on"),
-                Some(&revision),
-            )]);
-            let mut runtime = runtime_for(&plan, client.clone())?;
-            runtime.seed_from_annotations(&plan, &client).await;
-            {
-                let seeded = calls.lock().map_err(|_| "calls poisoned")?;
-                assert_eq!(seeded.len(), 1);
-                assert_eq!(seeded[0].0, Method::GET);
+            if let Some(revision) = revision {
+                annotations.insert(
+                    HANDLER_INPUT_REVISION_ANNOTATION.into(),
+                    Value::String(revision.into()),
+                );
             }
+            json!({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": {"name": name, "namespace": "workload", "uid": uid, "resourceVersion": rv, "annotations": annotations},
+                "data": {},
+            })
+        }
+
+        fn observations() -> BTreeMap<String, Observation> {
+            let mut observations = BTreeMap::new();
+            observations.insert("settings".to_owned(), available(&[("flag", "on")]));
+            observations
+        }
+
+        fn expected_revision(plan: &CompiledPlan) -> TestResult<String> {
+            let handler = &plan.ir.handlers[0];
+            let mut inputs = BTreeMap::new();
+            inputs.insert("settings".to_owned(), json!({"flag": "on"}));
+            Ok(compute_input_revision(handler, &inputs)?)
+        }
+
+        /// The seeding half of review item 5: "flags-a" was recreated
+        /// (its uid is fresh and its annotation is gone) while "flags-b"
+        /// still carries the old revision -- `[None, Some(rev)]` must NOT
+        /// be treated as agreement, so the handler is seeded as needing a
+        /// re-run, not as already up to date.
+        #[tokio::test]
+        async fn seed_treats_one_missing_annotation_as_disagreement() -> TestResult {
+            let plan = plan()?;
+            let revision = expected_revision(&plan)?;
+            let (client, _calls) = wire(vec![
+                flags_object("flags-a", "flags-a-uid-2", "9", None), // recreated, empty
+                flags_object("flags-b", "flags-b-uid", "5", Some(&revision)),
+            ]);
+            let mut runtime = runtime_for(&plan)?;
+            runtime.seed_from_annotations(&plan, &client).await;
+            let state = runtime
+                .states
+                .get("sync-flags")
+                .ok_or("handler state must exist after seeding")?;
+            assert_eq!(
+                state.known_revision, None,
+                "one output missing the annotation must not be treated as agreement"
+            );
+            Ok(())
+        }
+
+        /// The seeding half's positive case: both outputs agreeing on the
+        /// same revision is trusted.
+        #[tokio::test]
+        async fn seed_trusts_agreement_when_every_output_matches() -> TestResult {
+            let plan = plan()?;
+            let revision = expected_revision(&plan)?;
+            let (client, _calls) = wire(vec![
+                flags_object("flags-a", "flags-a-uid", "5", Some(&revision)),
+                flags_object("flags-b", "flags-b-uid", "5", Some(&revision)),
+            ]);
+            let mut runtime = runtime_for(&plan)?;
+            runtime.seed_from_annotations(&plan, &client).await;
             let state = runtime
                 .states
                 .get("sync-flags")
                 .ok_or("handler state must exist after seeding")?;
             assert_eq!(state.known_revision.as_deref(), Some(revision.as_str()));
-
-            // The current cycle's input revision matches what was seeded,
-            // so nothing is enqueued and no further HTTP calls happen.
-            let observations = settings_observations("on");
-            let mut applied = BTreeSet::new();
-            applied.insert("flags".to_owned());
-            let conditions = runtime.run_cycle(&plan, &observations, &applied).await;
-            assert!(conditions.is_empty());
-            assert_eq!(calls.lock().map_err(|_| "calls poisoned")?.len(), 1);
             Ok(())
         }
 
-        /// A handler invocation that throws records a condition, backs
-        /// off, and does not stamp the annotation -- the event is
-        /// re-queued for at-least-once retry once backoff clears.
-        #[tokio::test(flavor = "multi_thread")]
-        async fn a_failed_invocation_records_a_condition_and_backs_off_without_stamping()
-        -> IntegrationResult {
-            const FAILING_BUNDLE: &str = r#"
-export async function syncFlags(event) {
-  throw new Error("boom");
-}
-"#;
-            let mut plan = plan()?;
-            plan.ir.handlers[0].bundle_sha256 =
-                format!("{:x}", Sha256::digest(FAILING_BUNDLE.as_bytes()));
-            let observations = settings_observations("on");
-            let (client, calls) = wire(vec![]); // the handler must never reach the writer
-            let runtime = HandlerRuntime::new(
-                &plan,
-                &[("sync-flags", FAILING_BUNDLE)],
-                client,
-                "apsides-handler-example".into(),
-                Duration::from_millis(1),
-                Duration::from_millis(50),
-                Duration::from_millis(500),
-            )?;
-            let mut runtime = runtime;
-            let mut applied = BTreeSet::new();
-            applied.insert("flags".to_owned());
+        /// The no-restart half of review item 5: the handler already
+        /// believes it is up to date (seeded `known_revision` and
+        /// `output_uids` from a prior successful run), but "flags-a" is
+        /// then recreated (a fresh uid) mid-run, with no restart in
+        /// between. The next `detect_triggers` pass must notice via
+        /// `outputs_still_agree` and re-enqueue the handler even though
+        /// the *input* (`settings`) never changed.
+        #[tokio::test]
+        async fn drift_without_a_restart_forces_a_rerun() -> TestResult {
+            let plan = plan()?;
+            let revision = expected_revision(&plan)?;
+            let mut runtime = runtime_for(&plan)?;
+            let state = runtime.states.entry("sync-flags".to_owned()).or_default();
+            state.known_revision = Some(revision.clone());
+            state
+                .output_uids
+                .insert("flags-a".to_owned(), "flags-a-uid-old".to_owned());
+            state
+                .output_uids
+                .insert("flags-b".to_owned(), "flags-b-uid".to_owned());
 
-            let conditions = runtime.run_cycle(&plan, &observations, &applied).await;
-            assert_eq!(conditions.len(), 1);
-            assert!(
-                conditions[0]
-                    .reason_code
-                    .starts_with("handler-invocation-failed:")
-            );
-            assert!(calls.lock().map_err(|_| "calls poisoned")?.is_empty());
+            // "flags-a" comes back with a *different* uid than recorded
+            // (recreated) -- still carrying the same revision annotation,
+            // which is exactly the case a naive annotation-only check
+            // would miss.
+            let (client, _calls) = wire(vec![flags_object(
+                "flags-a",
+                "flags-a-uid-new",
+                "11",
+                Some(&revision),
+            )]);
+            let mut conditions = Vec::new();
+            runtime
+                .detect_triggers(&plan, &observations(), &client, &mut conditions)
+                .await;
 
             let state = runtime
                 .states
                 .get("sync-flags")
                 .ok_or("handler state must exist")?;
-            assert_eq!(
-                state.known_revision, None,
-                "a failed run must not advance known_revision"
-            );
-            assert!(state.backoff_until.is_some());
-            assert_eq!(state.attempt, 1);
             assert!(
                 state.queued.is_some(),
-                "at-least-once: the event must be re-queued"
+                "a recreated output must force the handler back onto the queue, even though \
+                 the input never changed and no restart happened"
+            );
+            Ok(())
+        }
+    }
+
+    /// Phase 5b review item 4: `EgressResolver` must hold only its
+    /// resolver *configuration*, never a `TokioResolver` built once on one
+    /// runtime and reused from a later invocation's own, different,
+    /// short-lived runtime -- see `engine::net::EgressResolver`'s doc
+    /// comment for the failure this guards against (hickory's
+    /// `TokioRuntimeProvider` ties background connection-management tasks
+    /// to whichever runtime is current when they are actually driven, not
+    /// merely the one current at construction time).
+    ///
+    /// Exercises the exact invocation shape `HandlerRuntime::invoke` uses
+    /// (a shared `Arc<engine::EgressResolver>`, each invocation run via
+    /// `spawn_blocking` + `engine::invoke_handler_with_watchdog` on its own
+    /// fresh, short-lived runtime) twice in a row, against a real DNS
+    /// resolver pointed at a local UDP stub and `engine`'s own fixture
+    /// HTTPS server -- not `EgressPolicy::resolver_override` (which
+    /// bypasses DNS resolution entirely and would not exercise this bug at
+    /// all). `HandlerRuntime::invoke` itself is not called directly:
+    /// `production_egress_policy` deliberately has no way to ever supply a
+    /// `FixtureEgressOverride` (see
+    /// `fixture_egress_override_has_no_production_construction_path`
+    /// above), so this test builds the same `HandlerInvocation` shape by
+    /// hand instead, with a policy that does carry one.
+    mod egress_resolver_runtime_affinity {
+        use super::*;
+        use engine::test_support::{HttpsFixtureServer, RESOLVABLE_FIXTURE_HOST};
+        use engine::{
+            EgressPolicy, FIXTURE_ACKNOWLEDGEMENT, FixtureEgressOverride, HandlerInvocation,
+            OutputSinkError, StderrLogWriter,
+        };
+        use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ResolverConfig};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use tokio::net::UdpSocket;
+
+        type StubResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+        /// A no-op sink: this test only exercises `apsides.fetch`.
+        struct NullSink;
+        impl engine::OutputSink for NullSink {
+            fn write_output(
+                &self,
+                _id: &str,
+                _key: &str,
+                _data: &[u8],
+            ) -> Result<(), OutputSinkError> {
+                Ok(())
+            }
+        }
+
+        /// The exact question section length of a DNS query message
+        /// (header + QNAME + QTYPE + QCLASS), found by walking the
+        /// length-prefixed QNAME labels to their terminating zero byte --
+        /// robust to a query that also carries an EDNS0 OPT additional
+        /// record (as hickory's client attaches by default), which this
+        /// stub's minimal reply never echoes back.
+        fn question_len(query: &[u8]) -> usize {
+            let mut offset = 12_usize;
+            while offset < query.len() {
+                let len = usize::from(query[offset]);
+                offset += 1;
+                if len == 0 {
+                    break;
+                }
+                offset += len;
+            }
+            offset + 4
+        }
+
+        const DNS_QTYPE_A: u16 = 1;
+
+        /// A minimal DNS response echoing the query's transaction id and
+        /// question section verbatim. Answers exactly one A record
+        /// (`answer_ip`) when the question's QTYPE is A; for every other
+        /// QTYPE (in particular AAAA, which `LookupIpStrategy::Ipv4thenIpv6`
+        /// also always queries), returns a plain NOERROR/empty-answer
+        /// response -- a record of the wrong type in the answer section
+        /// would otherwise make hickory treat the *whole* lookup as
+        /// failed rather than simply "no AAAA records, use the A ones".
+        fn dns_a_response(query: &[u8], answer_ip: Ipv4Addr) -> Vec<u8> {
+            let question_end = question_len(query).min(query.len());
+            let qtype = query
+                .get(question_end.saturating_sub(4)..question_end.saturating_sub(2))
+                .map_or(0, |bytes| u16::from_be_bytes([bytes[0], bytes[1]]));
+            let answer_present = qtype == DNS_QTYPE_A;
+            let mut response = Vec::with_capacity(question_end + 16);
+            response.extend_from_slice(&query[0..2]); // transaction id
+            response.extend_from_slice(&[0x81, 0x80]); // QR=1 RD=1 RA=1, RCODE=0
+            response.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
+            response.extend_from_slice(&[0x00, u8::from(answer_present)]); // ANCOUNT
+            response.extend_from_slice(&[0x00, 0x00]); // NSCOUNT=0
+            response.extend_from_slice(&[0x00, 0x00]); // ARCOUNT=0
+            response.extend_from_slice(&query[12..question_end]); // question, verbatim
+            if answer_present {
+                response.extend_from_slice(&[0xC0, 0x0C]); // NAME: pointer to offset 12
+                response.extend_from_slice(&[0x00, 0x01]); // TYPE A
+                response.extend_from_slice(&[0x00, 0x01]); // CLASS IN
+                response.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // TTL 60
+                response.extend_from_slice(&[0x00, 0x04]); // RDLENGTH 4
+                response.extend_from_slice(&answer_ip.octets());
+            }
+            response
+        }
+
+        /// Binds a UDP socket on an ephemeral loopback port and answers
+        /// every incoming query with an A record for `answer_ip`, for the
+        /// rest of this test's runtime (until the test function returns
+        /// and the spawned task is dropped with it).
+        async fn spawn_dns_stub(answer_ip: Ipv4Addr) -> StubResult<SocketAddr> {
+            let socket = UdpSocket::bind((IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).await?;
+            let addr = socket.local_addr()?;
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 512];
+                loop {
+                    let Ok((len, peer)) = socket.recv_from(&mut buf).await else {
+                        return;
+                    };
+                    let response = dns_a_response(&buf[..len], answer_ip);
+                    let _ignored = socket.send_to(&response, peer).await;
+                }
+            });
+            Ok(addr)
+        }
+
+        fn stub_resolver_config(stub_addr: SocketAddr) -> ResolverConfig {
+            let mut connection = ConnectionConfig::udp();
+            connection.port = stub_addr.port();
+            let name_server = NameServerConfig::new(stub_addr.ip(), true, vec![connection]);
+            ResolverConfig::from_parts(None, vec![], vec![name_server])
+        }
+
+        /// One invocation, built exactly the way `HandlerRuntime::invoke`
+        /// builds one, on its own fresh runtime via
+        /// `engine::invoke_handler_with_watchdog` -- called twice by the
+        /// test below, sharing one `Arc<engine::EgressResolver>` across
+        /// both, the same way `HandlerRuntime` shares one across every
+        /// invocation for the process's lifetime.
+        fn run_one_fetch_invocation(
+            server_addr: SocketAddr,
+            ca_der: Vec<u8>,
+            resolver: Arc<engine::EgressResolver>,
+            invocation_id: &str,
+        ) -> engine::InvocationReport {
+            let bundle = format!(
+                r#"
+export async function fetchOnce() {{
+  const response = await apsides.fetch("https://{RESOLVABLE_FIXTURE_HOST}:{port}/", {{}});
+  return {{ status: response.status }};
+}}
+"#,
+                port = server_addr.port()
+            );
+            let egress = EgressPolicy {
+                allowed: vec![(RESOLVABLE_FIXTURE_HOST.to_owned(), server_addr.port())],
+                resolver_override: None,
+                fixture_trust_anchor: Some(FixtureEgressOverride {
+                    acknowledgement: FIXTURE_ACKNOWLEDGEMENT.to_owned(),
+                    trust_anchor_der: ca_der,
+                }),
+            };
+            let usage = Arc::new(AtomicUsize::new(0));
+            engine::invoke_handler_with_watchdog(
+                HandlerInvocation {
+                    bundle: &bundle,
+                    export: "fetchOnce",
+                    event: json!({}),
+                    limits: engine::Limits {
+                        timeout: Duration::from_secs(5),
+                        max_heap_bytes: 16 * 1024 * 1024,
+                        max_array_buffer_bytes: 4 * 1024 * 1024,
+                        max_fetch_bytes_total: 4 * 1024 * 1024,
+                        max_concurrent_fetches: 1,
+                    },
+                    egress,
+                    outputs: vec![],
+                    sink: Arc::new(NullSink),
+                    resolver: Some(resolver),
+                    handler_id: "sync-flags",
+                    invocation_id,
+                    log_writer: Arc::new(StderrLogWriter),
+                },
+                &usage,
+            )
+        }
+
+        /// The regression test itself: two invocations, sharing one
+        /// `Arc<EgressResolver>`, each on its own fresh runtime (matching
+        /// `invoke_handler_with_watchdog`'s own per-invocation runtime).
+        /// Before the review item 4 fix, the second invocation's runtime
+        /// would try to drive a `TokioResolver` whose background tasks
+        /// were tied to the *first* invocation's already-dropped runtime.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn two_invocations_each_resolve_and_fetch_successfully() -> StubResult {
+            // This crate's own tests run in one shared process, and
+            // `rustls::crypto::CryptoProvider::get_default()` is a single
+            // process-wide slot: `install_rustls_provider` (the same path
+            // `run_production` uses) must win that race deterministically
+            // here, before `HttpsFixtureServer`/`engine`'s own independent
+            // (and more lenient -- it tolerates losing the race) provider
+            // install ever runs, or `tests::rustls_ring_provider_is_explicitly_available`
+            // elsewhere in this binary can observe someone else having
+            // already claimed the slot outside the blessed install path.
+            crate::install_rustls_provider()?;
+            // `start_multi(.., 2)`, not `start`: two separate invocations
+            // each open their own connection against this one server
+            // instance, and `start` only ever accepts one.
+            let (server, _accepted) = HttpsFixtureServer::start_multi(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok",
+                2,
+            )
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
+            let server_addr = server.addr;
+            let ca_der = server.ca_der.clone();
+            let stub_addr = spawn_dns_stub(Ipv4Addr::LOCALHOST).await?;
+            let resolver = Arc::new(engine::EgressResolver::new(stub_resolver_config(stub_addr)));
+
+            let first = tokio::task::spawn_blocking({
+                let resolver = Arc::clone(&resolver);
+                let ca_der = ca_der.clone();
+                move || run_one_fetch_invocation(server_addr, ca_der, resolver, "invocation-1")
+            })
+            .await?;
+            assert!(
+                first.result.is_ok(),
+                "the first invocation must succeed: {:?}",
+                first.result
             );
 
-            // Dispatching again immediately is blocked by backoff: no
-            // second invocation, no second condition beyond the queue
-            // itself staying populated.
-            let conditions_again = runtime.run_cycle(&plan, &observations, &applied).await;
-            assert!(conditions_again.is_empty());
+            let second = tokio::task::spawn_blocking({
+                let resolver = Arc::clone(&resolver);
+                move || run_one_fetch_invocation(server_addr, ca_der, resolver, "invocation-2")
+            })
+            .await?;
+            assert!(
+                second.result.is_ok(),
+                "the second invocation, reusing the same Arc<EgressResolver>, must also \
+                 succeed -- a failure here is exactly the runtime-affinity bug review item 4 \
+                 fixes: {:?}",
+                second.result
+            );
+
+            server
+                .join()
+                .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
             Ok(())
         }
     }
