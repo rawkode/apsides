@@ -75,9 +75,12 @@ pub enum RuntimeError {
 /// `LandlockPartial`, never `NoneFixture`. `LandlockPartial` reports
 /// `engine::LockdownOutcome::PartiallyEnforced` distinctly rather than
 /// folding it into `Landlock` -- real enforcement on a best-effort basis
-/// (e.g. an older Landlock ABI that lacks a couple of the rights this
-/// crate requests), not a fail-closed condition, but worth surfacing
-/// rather than silently reporting as full enforcement. Serializes to
+/// (ABI V7, which every kernel older than Linux 7.1 reports as its
+/// effective ABI, lacks only `ResolveUnix` of the rights this crate
+/// requests -- so `LandlockPartial` is the normal state on most kernels in
+/// the wild today, not an old-ABI edge case), not a fail-closed condition,
+/// but worth surfacing rather than silently reporting as full enforcement.
+/// Serializes to
 /// exactly the lowercase, hyphenated values the plan names for `/status`:
 /// `"landlock"`, `"landlock-partial"`, and `"none-fixture"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

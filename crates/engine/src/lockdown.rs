@@ -55,13 +55,16 @@ pub enum LockdownOutcome {
     /// (`RulesetStatus::FullyEnforced`).
     Enforced,
     /// The running kernel's Landlock ABI does not support every handled
-    /// right this crate requested (e.g. ABI V7 lacks a couple of the
-    /// rights ABI V9 requests, such as `IoctlDev`), so only a subset is
-    /// actually denied -- still real enforcement, on a best-effort basis,
-    /// not a fail-closed condition (`RulesetStatus::PartiallyEnforced`;
-    /// see `tests/landlock_fs.rs`'s own doc comment on this exact ABI V7
-    /// case, where the file-open-denial guarantee this crate actually
-    /// relies on still holds).
+    /// right this crate requested (e.g. ABI V7, the effective ABI on every
+    /// kernel older than Linux 7.1, lacks only `ResolveUnix`, added in ABI
+    /// V9 -- `IoctlDev` is not the gap, it has been present since ABI V5),
+    /// so only a subset is actually denied -- still real enforcement, on a
+    /// best-effort basis, not a fail-closed condition
+    /// (`RulesetStatus::PartiallyEnforced`; see `tests/landlock_fs.rs`'s own
+    /// doc comment on this exact ABI V7 case, where the file-open-denial
+    /// guarantee this crate actually relies on still holds). This is the
+    /// normal, expected status on any pre-7.1 kernel, not an old-ABI edge
+    /// case.
     PartiallyEnforced,
     /// The kernel could not enforce Landlock at all
     /// (`RulesetStatus::NotEnforced`); returned only when the caller passed

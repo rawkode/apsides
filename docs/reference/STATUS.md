@@ -67,31 +67,46 @@ establish narrower properties.
   directives, read before lockdown, so it resolves the same way glibc's
   `getaddrinfo` did before this connector replaced it. Confirmed by
   `strace`: Landlock does not stop every filesystem access after
-  lockdown, only every one that matters. Two glibc/V8-internal reads
-  still happen after lockdown, both denied and both already handled by a
-  working, file-free fallback neither this crate nor V8 needs to be told
-  about: glibc's own CPU-count path (`/sys/devices/system/cpu/online`,
-  then `/proc/stat`), used internally by V8 for its own worker-pool
-  sizing, falls back to the process's CPU affinity mask; each new
-  thread's stack-bounds probe (`/proc/self/maps`) falls back to
-  `__libc_stack_end`. Two other reads `strace` found were eliminated
-  outright rather than left to a fallback: `available_parallelism()`
-  (used for the tokio runtime's own worker count, unlike V8's separate
-  internal CPU-count path above) would otherwise read `/proc/self/cgroup`
-  and the cgroup v1/v2 CPU-quota files after lockdown and silently fall
-  back to the affinity count -- ignoring a Pod's actual CPU quota on a
-  large node -- so it is now read before lockdown instead, once, and
-  passed to the runtime builder; and V8's per-isolate and platform RNGs
-  would otherwise fall back to a `/dev/urandom` read that Landlock
-  denies, replaced by the `getrandom(2)`-syscall-based entropy source
-  above. No other file access remains outstanding.
+  lockdown, only every one that matters. Several glibc/V8-internal reads
+  still happen after lockdown; each is denied and each already falls back
+  to a working, file-free alternative that neither this crate nor V8
+  needs to be told about: glibc's own CPU-count path
+  (`/sys/devices/system/cpu/online`, then `/proc/stat`) falls back to the
+  process's CPU affinity mask; each new thread's stack-bounds probe
+  (`/proc/self/maps`) falls back to `__libc_stack_end`; and a TSC
+  calibration probe (`/sys/devices/system/cpu/cpu0/tsc_freq_khz`) returns
+  `ENOENT` or `EACCES` and is silently ignored either way, harmless.
+  `/proc/self/cgroup` was read for two unrelated reasons before this
+  phase, and only one was eliminated. The tokio runtime's own worker
+  count now calls `available_parallelism()` before lockdown, once, and
+  passes the result to the runtime builder, so that call no longer
+  touches the filesystem at all. V8's own worker-pool sizing is a
+  separate call, inside `deno_core::runtime::setup::init_v8`, made only
+  when `JsRuntime::init_platform` is given `None` for its platform
+  argument; that call still runs after lockdown and still reads
+  `/proc/self/cgroup`, falling back to the same CPU affinity mask as
+  glibc's own CPU-count path above. Supplying an explicit, pre-sized
+  platform instead (`JsRuntime::init_platform(Some(platform))`) would
+  skip that call, but a platform built to behave like deno_core's own
+  needs `DenoPlatformImpl` and the foreground-task queue it drains into,
+  both private to `deno_core::runtime::setup`; an externally built
+  `v8::Platform` passed here would silently break the JS event loop's
+  foreground-task delivery rather than just change V8's worker-pool
+  size, so this crate leaves that internal sizing call as-is instead of
+  risking it. The other read, V8's per-isolate and platform RNG fallback
+  to `/dev/urandom`, was eliminated outright: Landlock denies that open,
+  and it is replaced by the `getrandom(2)`-syscall-based entropy source
+  above, which needs no file.
   An unsupported/unenforced Landlock lockdown fails startup closed; the
   fixture-only `allowNoLandlock` startup-config flag is the sole
   exception, and is structurally unavailable in production mode
   (`ProductionConfig` has no such field). A `RulesetStatus::PartiallyEnforced`
-  kernel (an older Landlock ABI missing a couple of the requested rights)
-  still counts as enforced and is reported at `/status` as
-  `"landlock-partial"`, distinct from full enforcement (`"landlock"`).
+  kernel -- ABI V7, the effective ABI on every kernel older than Linux
+  7.1, lacks only `ResolveUnix` (added in ABI V9) of the rights this
+  crate requests, so `PartiallyEnforced` is the normal state on most
+  kernels in the wild today, not an old-ABI edge case -- still counts as
+  enforced and is reported at `/status` as `"landlock-partial"`,
+  distinct from full enforcement (`"landlock"`).
   `aps test --cluster`/the acceptance suite's preflight checks the host
   kernel's `/sys/kernel/security/lsm` for `landlock`
   before creating a kind cluster, since kind nodes share the host kernel.

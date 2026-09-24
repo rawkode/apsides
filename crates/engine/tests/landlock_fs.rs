@@ -61,11 +61,15 @@ fn fails_closed_without_escape_hatch_iff_landlock_is_unsupported() -> Result<(),
 /// Landlock being unavailable -- but the `landlock` crate's own probe (the
 /// actual `landlock_create_ruleset` syscall, which is authoritative) reports
 /// `Available { effective_abi: V7 }` and this ruleset comes back
-/// `PartiallyEnforced` (ABI V7 lacks a couple of the rights the pinned
-/// `ABI::V9` requests, e.g. `IoctlDev`, so it is partial rather than full,
-/// but the basic read/open rights this test exercises are covered). Do not
-/// trust `/sys/kernel/security/lsm`'s absence as "Landlock unavailable" --
-/// probe with the syscall, as this test does.
+/// `PartiallyEnforced` (ABI V7 lacks only `ResolveUnix`, added in ABI V9,
+/// out of the rights the pinned `ABI::V9` requests -- `IoctlDev` has been
+/// present since ABI V5 and is not the gap -- so it is partial rather than
+/// full, but the basic read/open rights this test exercises are covered).
+/// ABI V7 is also the effective ABI on every kernel older than Linux 7.1,
+/// so `PartiallyEnforced` is this test's normal, expected outcome on most
+/// kernels in the wild today, not an old-ABI edge case. Do not trust
+/// `/sys/kernel/security/lsm`'s absence as "Landlock unavailable" -- probe
+/// with the syscall, as this test does.
 #[test]
 fn deny_all_blocks_file_access_iff_actually_enforced() -> Result<(), String> {
     let status = apply_deny_all_or_fail_closed(true)?;

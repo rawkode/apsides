@@ -63,15 +63,31 @@ lockdown) through a dedicated `hickory-resolver`-backed connector rather than
 glibc's `getaddrinfo`, so a proxy reconnect never needs a file again, and V8's
 platform and per-isolate RNGs are seeded from `getrandom(2)` directly rather
 than a `/dev/urandom` read Landlock would deny. `strace` against the locked
-down process still shows two glibc/V8-internal reads after lockdown (V8's own
-CPU-count path, and a new thread's stack-bounds probe); both are denied and
-both already fall back to a working, file-free alternative (the process's CPU
-affinity mask, and `__libc_stack_end`, respectively) with no code here
-involved. An unenforced Landlock lockdown fails startup closed in production;
-a `PartiallyEnforced` kernel (an older Landlock ABI missing some requested
-rights) still counts as enforced, reported distinctly at `/status`. A
-fixture-only `allowNoLandlock` escape hatch exists for disposable-cluster
-testing and is structurally unavailable in production mode.
+down process still shows several glibc/V8-internal reads after lockdown --
+glibc's own CPU-count path, a new thread's stack-bounds probe, and a TSC
+calibration probe -- each denied and each already falling back to a working,
+file-free alternative (the process's CPU affinity mask, `__libc_stack_end`,
+and a harmless ignored failure, respectively) with no code here involved.
+One of those reads is `/proc/self/cgroup`, and it is *not* fully eliminated:
+the tokio runtime's own worker count reads it before lockdown instead (once,
+passed into the runtime builder), but V8's own worker-pool sizing --
+`deno_core::runtime::setup::init_v8`'s internal `available_parallelism()`
+call, made whenever `JsRuntime::init_platform` is given `None` -- is a
+separate call this crate does not control and still reads it after lockdown,
+falling back the same way glibc's own CPU-count path does. Supplying an
+explicit, pre-sized `v8::Platform` instead would skip that call, but
+replicating deno_core's own platform needs `DenoPlatformImpl` and the
+foreground-task queue it feeds, both private to `deno_core::runtime::setup`,
+so an externally-built platform risks breaking the JS event loop rather than
+just changing a thread-pool size -- this crate leaves the internal call
+in place instead. An unenforced Landlock lockdown fails startup closed in
+production; a `PartiallyEnforced` kernel -- ABI V7, the effective ABI on
+every kernel older than Linux 7.1, which lacks only `ResolveUnix` (added in
+ABI V9) of the requested rights, so this is the normal state on most kernels
+in the wild today, not an old-ABI edge case -- still counts as enforced,
+reported distinctly at `/status`. A fixture-only `allowNoLandlock` escape
+hatch exists for disposable-cluster testing and is structurally unavailable
+in production mode.
 
 ## Policy and force
 
