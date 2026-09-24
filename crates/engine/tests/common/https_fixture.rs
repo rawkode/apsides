@@ -50,6 +50,24 @@ impl HttpsFixtureServer {
     /// Returns `Err` if certificate generation or the listening socket
     /// bind fails.
     pub fn start(response: &'static [u8]) -> Result<Self, String> {
+        Self::start_internal(response, true)
+    }
+
+    /// Like [`Self::start`], but ends the connection by simply dropping it
+    /// (no TLS `close_notify`) after writing `response`, rather than a
+    /// clean `tls.shutdown()`. Used by the tests confirming `hyper` still
+    /// completes a `Content-Length`-delimited response correctly without
+    /// one (review round 5, B2) -- the crate's old hand-rolled client,
+    /// which always read to EOF, could not have passed that case.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::start`].
+    pub fn start_without_close_notify(response: &'static [u8]) -> Result<Self, String> {
+        Self::start_internal(response, false)
+    }
+
+    fn start_internal(response: &'static [u8], send_close_notify: bool) -> Result<Self, String> {
         let CertifiedKey { cert, signing_key } =
             generate_simple_self_signed(vec![FIXTURE_HOST.to_owned()])
                 .map_err(|err| format!("failed to generate the fixture certificate: {err}"))?;
@@ -109,9 +127,15 @@ impl HttpsFixtureServer {
                 tls.write_all(response)
                     .await
                     .map_err(|err| format!("fixture response write failed: {err}"))?;
-                tls.shutdown()
-                    .await
-                    .map_err(|err| format!("fixture TLS shutdown failed: {err}"))?;
+                if send_close_notify {
+                    tls.shutdown()
+                        .await
+                        .map_err(|err| format!("fixture TLS shutdown failed: {err}"))?;
+                }
+                // Without `send_close_notify`, `tls` (and the underlying
+                // `TcpStream`) is simply dropped here at the end of this
+                // async block, closing the connection without a TLS
+                // `close_notify`.
                 Ok(())
             })
         });

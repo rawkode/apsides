@@ -642,4 +642,46 @@ mod tests {
         }
         Ok(())
     }
+
+    /// review round 5, B4: every resolved candidate is tried in order,
+    /// not just the first -- a vetted-but-unreachable candidate must be
+    /// skipped, not abort the whole dial. Uses two distinct loopback
+    /// addresses sharing one port: nothing listens on `127.0.0.1` at that
+    /// port, and a real listener is bound to `127.0.0.2`.
+    #[tokio::test]
+    async fn dial_first_vetted_skips_an_unreachable_candidate_and_uses_the_next() -> Result<(), String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.2:0")
+            .await
+            .map_err(|err| format!("failed to bind the reachable candidate: {err}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|err| format!("failed to read the reachable candidate's address: {err}"))?
+            .port();
+        let accept_task = tokio::spawn(async move {
+            let _ignored = listener.accept().await;
+        });
+
+        let candidates = [
+            addr("127.0.0.1")?, // vetted (loopback is filtered only via `skip_vetting=false`... see below), but unreachable
+            addr("127.0.0.2")?,
+        ];
+        let deadline = super::Instant::now() + super::Duration::from_secs(5);
+        // `skip_vetting: true`: loopback addresses would otherwise fail
+        // `is_global_unicast` (covered by `classifies_every_named_range`
+        // above) before ever reaching the dial loop this test exists to
+        // exercise -- that classification is deliberately bypassed here,
+        // the same way fixture-mode `apsides.fetch` calls bypass it, so
+        // this test is purely about "try every candidate in order, skip a
+        // failed one", independent of address classification.
+        let result = super::dial_first_vetted(&candidates, port, deadline, true).await;
+        let connected = result.is_ok();
+        accept_task.abort();
+
+        if !connected {
+            return Err(format!(
+                "expected the second, reachable candidate to succeed after the first failed, got {result:?}"
+            ));
+        }
+        Ok(())
+    }
 }
