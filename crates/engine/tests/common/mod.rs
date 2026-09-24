@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use engine::{EgressPolicy, HandlerInvocation, Limits, OutputSink, OutputSinkError};
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{GOOGLE, ResolverConfig};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
@@ -21,6 +22,58 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls;
 use tokio_rustls::rustls::pki_types::ServerName;
+
+/// Resource limits generous enough that no test in this crate hits them by
+/// accident; tests that want to exercise a cap build their own tighter
+/// [`Limits`] instead.
+pub const GENEROUS_LIMITS: Limits = Limits {
+    timeout: Duration::from_secs(10),
+    max_heap_bytes: 64 * 1024 * 1024,
+    max_array_buffer_bytes: 16 * 1024 * 1024,
+};
+
+/// An [`OutputSink`] that accepts every write. Used by tests that do not
+/// themselves exercise `apsides.writeOutput`.
+pub struct AcceptingOutputSink;
+
+impl OutputSink for AcceptingOutputSink {
+    fn write_output(&self, _id: &str, _key: &str, _data: &[u8]) -> Result<(), OutputSinkError> {
+        Ok(())
+    }
+}
+
+#[must_use]
+pub fn accepting_output_sink() -> Arc<dyn OutputSink> {
+    Arc::new(AcceptingOutputSink)
+}
+
+/// Wraps `body` (an ordinary script body, as the Phase 5a spike tests wrote
+/// it) as the exported async handler function [`invoke_handler`]/
+/// [`invoke_handler_blocking`]/[`invoke_handler_with_watchdog`] require:
+/// `export async function handler(event) { <body> }`. `body` is expected to
+/// `throw` on failure (as the original spike scripts did) and otherwise
+/// fall through, returning `undefined`.
+#[must_use]
+pub fn wrap_as_handler(body: &str) -> String {
+    format!("export async function handler(event) {{\n{body}\n}}\n")
+}
+
+/// A [`HandlerInvocation`] over `wrap_as_handler(body)`, with
+/// [`GENEROUS_LIMITS`], an empty (deny-all) [`EgressPolicy`], no declared
+/// outputs, and an [`accepting_output_sink`] that is never expected to be
+/// called by these tests.
+#[must_use]
+pub fn handler_invocation(bundle: &str) -> HandlerInvocation<'_> {
+    HandlerInvocation {
+        bundle,
+        export: "handler",
+        event: serde_json::Value::Null,
+        limits: GENEROUS_LIMITS,
+        egress: EgressPolicy::default(),
+        outputs: Vec::new(),
+        sink: accepting_output_sink(),
+    }
+}
 
 /// An arbitrary, always-present path with no relation to anything this
 /// spike needs, used only to prove file access is actually denied.

@@ -374,94 +374,115 @@ mod tests {
     use super::{is_global_unicast, parse_http_response};
     use std::net::IpAddr;
 
-    fn v4(s: &str) -> IpAddr {
-        s.parse().unwrap_or_else(|err| panic!("bad literal {s:?}: {err}"))
-    }
-
-    fn v6(s: &str) -> IpAddr {
-        s.parse().unwrap_or_else(|err| panic!("bad literal {s:?}: {err}"))
-    }
-
-    #[test]
-    fn accepts_ordinary_public_addresses() {
-        assert!(is_global_unicast(v4("8.8.8.8")));
-        assert!(is_global_unicast(v4("1.1.1.1")));
-        assert!(is_global_unicast(v6("2606:4700:4700::1111")));
+    /// `s.parse()` on a fixed literal below never actually fails; returning
+    /// `Result` and propagating with `?` (rather than `.unwrap()`/
+    /// `.expect()`/`panic!`, all denied by the workspace's clippy lints)
+    /// still gives a real, readable test failure if one of these literals
+    /// is ever mistyped.
+    fn addr(s: &str) -> Result<IpAddr, String> {
+        s.parse().map_err(|err| format!("bad literal {s:?}: {err}"))
     }
 
     #[test]
-    fn rejects_ipv4_loopback() {
-        assert!(!is_global_unicast(v4("127.0.0.1")));
-        assert!(!is_global_unicast(v4("127.255.255.255")));
+    fn accepts_ordinary_public_addresses() -> Result<(), String> {
+        assert!(is_global_unicast(addr("8.8.8.8")?));
+        assert!(is_global_unicast(addr("1.1.1.1")?));
+        assert!(is_global_unicast(addr("2606:4700:4700::1111")?));
+        Ok(())
     }
 
     #[test]
-    fn rejects_ipv4_rfc1918_private() {
-        assert!(!is_global_unicast(v4("10.0.0.1")));
-        assert!(!is_global_unicast(v4("172.16.0.1")));
-        assert!(!is_global_unicast(v4("172.31.255.255")));
-        assert!(is_global_unicast(v4("172.32.0.1")), "172.32/16 is public, outside 172.16-31/12");
-        assert!(!is_global_unicast(v4("192.168.1.1")));
+    fn rejects_ipv4_loopback() -> Result<(), String> {
+        assert!(!is_global_unicast(addr("127.0.0.1")?));
+        assert!(!is_global_unicast(addr("127.255.255.255")?));
+        Ok(())
     }
 
     #[test]
-    fn rejects_ipv4_link_local() {
-        assert!(!is_global_unicast(v4("169.254.1.1")));
+    fn rejects_ipv4_rfc1918_private() -> Result<(), String> {
+        assert!(!is_global_unicast(addr("10.0.0.1")?));
+        assert!(!is_global_unicast(addr("172.16.0.1")?));
+        assert!(!is_global_unicast(addr("172.31.255.255")?));
+        assert!(
+            is_global_unicast(addr("172.32.0.1")?),
+            "172.32/16 is public, outside 172.16-31/12"
+        );
+        assert!(!is_global_unicast(addr("192.168.1.1")?));
+        Ok(())
     }
 
     #[test]
-    fn rejects_ipv4_cgnat() {
-        assert!(!is_global_unicast(v4("100.64.0.1")));
-        assert!(!is_global_unicast(v4("100.127.255.255")));
-        assert!(is_global_unicast(v4("100.63.255.255")), "just below the CGNAT range");
-        assert!(is_global_unicast(v4("100.128.0.0")), "just above the CGNAT range");
+    fn rejects_ipv4_link_local() -> Result<(), String> {
+        assert!(!is_global_unicast(addr("169.254.1.1")?));
+        Ok(())
     }
 
     #[test]
-    fn rejects_ipv4_this_network_and_unspecified() {
-        assert!(!is_global_unicast(v4("0.0.0.0")));
-        assert!(!is_global_unicast(v4("0.1.2.3")));
+    fn rejects_ipv4_cgnat() -> Result<(), String> {
+        assert!(!is_global_unicast(addr("100.64.0.1")?));
+        assert!(!is_global_unicast(addr("100.127.255.255")?));
+        assert!(
+            is_global_unicast(addr("100.63.255.255")?),
+            "just below the CGNAT range"
+        );
+        assert!(
+            is_global_unicast(addr("100.128.0.0")?),
+            "just above the CGNAT range"
+        );
+        Ok(())
     }
 
     #[test]
-    fn rejects_ipv4_multicast_and_broadcast() {
-        assert!(!is_global_unicast(v4("224.0.0.1")));
-        assert!(!is_global_unicast(v4("255.255.255.255")));
+    fn rejects_ipv4_this_network_and_unspecified() -> Result<(), String> {
+        assert!(!is_global_unicast(addr("0.0.0.0")?));
+        assert!(!is_global_unicast(addr("0.1.2.3")?));
+        Ok(())
     }
 
     #[test]
-    fn rejects_ipv6_loopback_and_unspecified() {
-        assert!(!is_global_unicast(v6("::1")));
-        assert!(!is_global_unicast(v6("::")));
+    fn rejects_ipv4_multicast_and_broadcast() -> Result<(), String> {
+        assert!(!is_global_unicast(addr("224.0.0.1")?));
+        assert!(!is_global_unicast(addr("255.255.255.255")?));
+        Ok(())
     }
 
     #[test]
-    fn rejects_ipv6_link_local() {
-        assert!(!is_global_unicast(v6("fe80::1")));
+    fn rejects_ipv6_loopback_and_unspecified() -> Result<(), String> {
+        assert!(!is_global_unicast(addr("::1")?));
+        assert!(!is_global_unicast(addr("::")?));
+        Ok(())
     }
 
     #[test]
-    fn rejects_ipv6_unique_local() {
-        assert!(!is_global_unicast(v6("fc00::1")));
-        assert!(!is_global_unicast(v6("fd12:3456:789a::1")));
+    fn rejects_ipv6_link_local() -> Result<(), String> {
+        assert!(!is_global_unicast(addr("fe80::1")?));
+        Ok(())
     }
 
     #[test]
-    fn rejects_ipv6_multicast() {
-        assert!(!is_global_unicast(v6("ff02::1")));
+    fn rejects_ipv6_unique_local() -> Result<(), String> {
+        assert!(!is_global_unicast(addr("fc00::1")?));
+        assert!(!is_global_unicast(addr("fd12:3456:789a::1")?));
+        Ok(())
     }
 
     #[test]
-    fn rejects_ipv4_mapped_and_nat64_ipv6() {
-        assert!(!is_global_unicast(v6("::ffff:8.8.8.8")));
-        assert!(!is_global_unicast(v6("64:ff9b::8.8.8.8")));
+    fn rejects_ipv6_multicast() -> Result<(), String> {
+        assert!(!is_global_unicast(addr("ff02::1")?));
+        Ok(())
     }
 
     #[test]
-    fn parses_an_ordinary_response() {
+    fn rejects_ipv4_mapped_and_nat64_ipv6() -> Result<(), String> {
+        assert!(!is_global_unicast(addr("::ffff:8.8.8.8")?));
+        assert!(!is_global_unicast(addr("64:ff9b::8.8.8.8")?));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_an_ordinary_response() -> Result<(), String> {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
-        let response =
-            parse_http_response(raw, 1024).unwrap_or_else(|err| panic!("expected Ok, got {err}"));
+        let response = parse_http_response(raw, 1024).map_err(|err| err.to_string())?;
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"hello");
         assert!(
@@ -470,6 +491,7 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "Content-Type" && v == "text/plain")
         );
+        Ok(())
     }
 
     #[test]

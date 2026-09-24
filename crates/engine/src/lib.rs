@@ -41,7 +41,7 @@ use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Once;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use deno_core::v8;
@@ -855,9 +855,26 @@ const HEAP_LIMIT_TERMINATION_HEADROOM_TOTAL_CAP_BYTES: usize =
 /// first call, and every isolate this crate's own tests actually exercise
 /// (including the deliberately-runaway ones) terminates well within the
 /// total cap -- see `tests/spike.rs`.
-fn install_heap_limit_callback(runtime: &mut JsRuntime, isolate_handle: v8::IsolateHandle) {
+/// `terminated` is set `true` the moment this callback first calls
+/// `terminate_execution()` -- see [`InvokeError::Terminated`] for why this
+/// crate tracks that itself rather than only inferring it from the error
+/// V8 surfaces afterward: a termination that interrupts a *call to the
+/// handler's exported async function* (as opposed to top-level module
+/// evaluation) does not always come back as `deno_core`'s usual "execution
+/// terminated" `CoreErrorKind::Js` -- it can instead leave the handler's
+/// returned promise permanently unsettled, which `with_event_loop_promise`
+/// reports as `CoreErrorKind::PendingPromiseResolution` once the event loop
+/// otherwise goes idle. Both shapes mean the same thing operationally (the
+/// isolate was terminated by *this callback*), so this flag is the
+/// authoritative signal, not the error's shape.
+fn install_heap_limit_callback(
+    runtime: &mut JsRuntime,
+    isolate_handle: v8::IsolateHandle,
+    terminated: Arc<AtomicBool>,
+) {
     let mut headroom_granted_bytes: usize = 0;
     runtime.add_near_heap_limit_callback(move |current, initial| {
+        terminated.store(true, Ordering::SeqCst);
         isolate_handle.terminate_execution();
         if headroom_granted_bytes >= HEAP_LIMIT_TERMINATION_HEADROOM_TOTAL_CAP_BYTES {
             return current;
@@ -961,6 +978,49 @@ fn output_caps(outputs: &[OutputDeclaration]) -> HashMap<String, usize> {
         .collect()
 }
 
+/// Loads/evaluates `specifier`, calls `export(event)`, and collects the
+/// invocation's captured `apsides.log` lines. Factored out of
+/// `invoke_handler`/`invoke_handler_with_watchdog` so both can wrap its
+/// `Err` with [`InvokeError::Terminated`] the same way when `terminated`
+/// (shared with [`install_heap_limit_callback`] and, for the watchdog
+/// variant, the watchdog thread) is set.
+#[allow(
+    clippy::future_not_send,
+    reason = "deno_core::JsRuntime is deliberately !Send; see the crate's `invoke_handler` doc comment"
+)]
+async fn run_invocation(
+    runtime: &mut JsRuntime,
+    specifier: &ModuleSpecifier,
+    export: &str,
+    event: &serde_json::Value,
+) -> Result<HandlerOutput, InvokeError> {
+    let module_id = load_and_evaluate(runtime, specifier).await?;
+    let value = call_handler_export(runtime, module_id, export, event).await?;
+    let logs = runtime
+        .op_state()
+        .borrow()
+        .borrow::<ops::EngineOpState>()
+        .logs
+        .clone();
+    Ok(HandlerOutput { value, logs })
+}
+
+/// If `result` is `Err` and `terminated` is set, replaces it with
+/// [`InvokeError::Terminated`] -- see that variant's doc comment for why
+/// this crate tracks termination itself rather than only inferring it from
+/// the error `deno_core` happens to surface.
+fn mark_terminated(
+    result: Result<HandlerOutput, InvokeError>,
+    terminated: &AtomicBool,
+) -> Result<HandlerOutput, InvokeError> {
+    match result {
+        Err(err) if terminated.load(Ordering::SeqCst) => {
+            Err(InvokeError::Terminated(Box::new(err)))
+        }
+        other => other,
+    }
+}
+
 /// Runs one [`HandlerInvocation`] to completion in a fresh isolate.
 ///
 /// Builds it (see [`prepare_isolate`]), loads/evaluates `invocation.bundle`
@@ -1027,19 +1087,12 @@ pub async fn invoke_handler(
     // from wherever V8 invokes it (documented as callable from a GC pause
     // on the isolate's own thread) without needing `&mut JsRuntime`, which
     // the callback signature does not provide.
-    install_heap_limit_callback(&mut runtime, isolate_handle);
+    let terminated = Arc::new(AtomicBool::new(false));
+    install_heap_limit_callback(&mut runtime, isolate_handle, Arc::clone(&terminated));
 
-    let module_id = load_and_evaluate(&mut runtime, &specifier).await?;
-    let value =
-        call_handler_export(&mut runtime, module_id, invocation.export, &invocation.event).await?;
-    let logs = runtime
-        .op_state()
-        .borrow()
-        .borrow::<ops::EngineOpState>()
-        .logs
-        .clone();
-
-    Ok(HandlerOutput { value, logs })
+    let result =
+        run_invocation(&mut runtime, &specifier, invocation.export, &invocation.event).await;
+    mark_terminated(result, &terminated)
 }
 
 /// Like [`invoke_handler`], but with a watchdog `std::thread` attached and
@@ -1101,7 +1154,8 @@ pub fn invoke_handler_with_watchdog(
         deadline,
     )?;
 
-    install_heap_limit_callback(&mut runtime, isolate_handle.clone());
+    let terminated = Arc::new(AtomicBool::new(false));
+    install_heap_limit_callback(&mut runtime, isolate_handle.clone(), Arc::clone(&terminated));
 
     // Built *before* the watchdog thread is spawned below: if this fails,
     // it returns before any thread but the caller's own exists, so there
@@ -1114,6 +1168,7 @@ pub fn invoke_handler_with_watchdog(
         .map_err(InvokeError::Runtime)?;
 
     let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
+    let terminated_for_watchdog = Arc::clone(&terminated);
     let watchdog = std::thread::spawn(move || {
         // `Timeout`: the deadline passed with the run still going --
         // terminate it. `Disconnected` (the sender was dropped below,
@@ -1124,23 +1179,18 @@ pub fn invoke_handler_with_watchdog(
             cancel_rx.recv_timeout(timeout),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ) {
+            terminated_for_watchdog.store(true, Ordering::SeqCst);
             isolate_handle.terminate_execution();
         }
     });
 
-    let result = rt.block_on(async {
-        let module_id = load_and_evaluate(&mut runtime, &specifier).await?;
-        let value =
-            call_handler_export(&mut runtime, module_id, invocation.export, &invocation.event)
-                .await?;
-        let logs = runtime
-            .op_state()
-            .borrow()
-            .borrow::<ops::EngineOpState>()
-            .logs
-            .clone();
-        Ok::<HandlerOutput, InvokeError>(HandlerOutput { value, logs })
-    });
+    let result = rt.block_on(run_invocation(
+        &mut runtime,
+        &specifier,
+        invocation.export,
+        &invocation.event,
+    ));
+    let result = mark_terminated(result, &terminated);
 
     drop(cancel_tx);
     // A panicking watchdog thread (it cannot: the closure above has no
@@ -1206,12 +1256,33 @@ pub enum InvokeError {
     Runtime(#[source] std::io::Error),
     #[error("handler invocation timed out")]
     Timeout,
+    /// The isolate was terminated by this crate's own heap-limit callback
+    /// or watchdog thread (tracked directly via a shared flag, not
+    /// inferred from `deno_core`'s error shape -- see
+    /// `install_heap_limit_callback`'s doc comment for why: a termination
+    /// that interrupts a *call to the handler's exported function* does
+    /// not always come back as the usual "execution terminated"
+    /// `CoreErrorKind::Js`; it can instead surface as
+    /// `CoreErrorKind::PendingPromiseResolution` once the event loop goes
+    /// idle with the handler's promise never settled). The wrapped error
+    /// is whatever `deno_core` actually reported, kept for diagnostics.
+    #[error("isolate was terminated (heap limit or timeout): {0}")]
+    Terminated(#[source] Box<Self>),
 }
 
 impl InvokeError {
-    /// See [`EngineError::is_isolate_termination`].
+    /// True if this invocation ended because *this crate's own*
+    /// heap-limit callback or watchdog thread terminated the isolate (see
+    /// [`Self::Terminated`]), or -- for a termination that happened during
+    /// top-level module evaluation, before the handler's exported function
+    /// was ever called -- because the underlying [`EngineError`] carries
+    /// `deno_core`'s usual "execution terminated" shape (see
+    /// [`EngineError::is_isolate_termination`]).
     #[must_use]
     pub fn is_isolate_termination(&self) -> bool {
+        if matches!(self, Self::Terminated(_)) {
+            return true;
+        }
         matches!(self, Self::Engine(err) if err.is_isolate_termination())
     }
 }
