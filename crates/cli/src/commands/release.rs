@@ -3,7 +3,7 @@
 pub mod verify;
 
 use crate::{Result, artifact, cli, report};
-use compiler_core::{canonical_bytes, digest, parse_strict};
+use compiler_core::{MAX_BUILD_INPUTS_BYTES, canonical_bytes, digest, parse_bounded, parse_strict};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs, path::Path};
@@ -19,7 +19,11 @@ pub fn command(arguments: &cli::Release) -> Result<()> {
     if output.exists() {
         return Err("release output exists; choose a fresh directory".into());
     }
-    let inputs = read_json(&arguments.build_inputs)?;
+    // build-inputs.json's own budget, not IR's: its compiler closure's
+    // build-context file manifest records every vendored source file
+    // (thousands, once crates/engine's deno_core is in the dependency
+    // graph), routinely multiple MiB on its own.
+    let inputs = read_build_inputs(&arguments.build_inputs)?;
     let ir = read_json(&artifact_root.join("ir.json"))?;
     let mode = if ir["testOnly"] == true {
         "fixture"
@@ -92,6 +96,14 @@ fn read_json(path: &Path) -> Result<Value> {
     Ok(parse_strict(&fs::read_to_string(path)?)?)
 }
 
+fn read_build_inputs(path: &Path) -> Result<Value> {
+    Ok(parse_bounded(
+        &fs::read_to_string(path)?,
+        MAX_BUILD_INPUTS_BYTES,
+        "build-inputs.json",
+    )?)
+}
+
 fn collect_files(
     arguments: &cli::Release,
     output: &Path,
@@ -128,4 +140,60 @@ fn collect_files(
         copy(source, output, name, files)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A syntactically valid JSON document of at least `bytes` bytes.
+    fn oversized_document(bytes: usize) -> String {
+        format!("{{\"padding\":\"{}\"}}", "a".repeat(bytes))
+    }
+
+    #[test]
+    fn read_build_inputs_accepts_a_document_larger_than_the_ir_budget() -> Result<()> {
+        // Bigger than compiler_core::MAX_IR_BYTES (4 MiB) -- real ones now
+        // routinely are, once crates/engine's deno_core is in the vendored
+        // dependency closure -- but within build-inputs.json's own, larger
+        // budget.
+        let bytes = compiler_core::MAX_IR_BYTES + 1024;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("build-inputs.json");
+        fs::write(&path, oversized_document(bytes))?;
+        let value = read_build_inputs(&path)?;
+        let Some(padding) = value["padding"].as_str() else {
+            return Err("expected a string padding field".into());
+        };
+        assert_eq!(padding.len(), bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn read_build_inputs_rejects_a_document_over_its_own_budget_by_name() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("build-inputs.json");
+        fs::write(&path, oversized_document(MAX_BUILD_INPUTS_BYTES))?;
+        let error = read_build_inputs(&path)
+            .err()
+            .ok_or("expected an oversized build-inputs.json to be rejected")?
+            .to_string();
+        assert!(error.contains("build-inputs.json"), "{error}");
+        assert!(!error.contains("IR"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn read_json_still_uses_the_ir_budget_for_ir() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("ir.json");
+        fs::write(&path, oversized_document(compiler_core::MAX_IR_BYTES))?;
+        let error = read_json(&path)
+            .err()
+            .ok_or("expected oversized IR to be rejected")?
+            .to_string();
+        assert!(error.contains("IR"), "{error}");
+        assert!(error.contains("4 MiB"), "{error}");
+        Ok(())
+    }
 }

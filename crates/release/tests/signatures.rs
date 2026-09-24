@@ -84,7 +84,10 @@ struct Documents {
     files: BTreeMap<String, String>,
 }
 
-fn write_documents(root: &Path) -> TestResult<Documents> {
+/// `padding_entries` inflates `build-inputs.json` with that many extra
+/// synthetic `buildContextFiles` entries (see `compiler_inputs`); `0` for
+/// the ordinary fixture.
+fn write_documents_with_padding(root: &Path, padding_entries: usize) -> TestResult<Documents> {
     let ir = json!({
         "schemaVersion":"apsides.dev/ir/v2","testOnly":false,
         "domain":{"id":"example","namespace":"workload","controlNamespace":"apsides-system","clusterBinding":"test-cluster","policyRef":"platform/example","enforcement":"api-bound","minKubernetesVersion":"1.34","budgets":{"maxResources":64,"maxInputs":64,"maxReactions":64,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},
@@ -93,7 +96,7 @@ fn write_documents(root: &Path) -> TestResult<Documents> {
         "handlers":[],"outputs":[],"provenance":{"compiler":"apsides/0.1","inputs":[{"path":"controller.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
     });
     let plan = parse_and_validate(&ir.to_string())?;
-    let (inputs, compiler) = compiler_inputs()?;
+    let (inputs, compiler) = compiler_inputs(padding_entries)?;
     // Verifier test payloads only; nothing here is compiled or executed.
     let mut files = BTreeMap::new();
     for (name, value) in [
@@ -128,12 +131,21 @@ fn write_documents(root: &Path) -> TestResult<Documents> {
 }
 
 fn release(root: &Path) -> TestResult<TrustPolicy> {
+    release_with_padding(root, 0)
+}
+
+/// `padding_entries` inflates `build-inputs.json` well past
+/// `compiler_core::MAX_IR_BYTES` (4 MiB), the way a real one now does once
+/// `crates/engine`'s `deno_core` is in the vendored dependency closure, but
+/// stays a fully valid, digest-consistent, signed release: every digest
+/// here is computed from the actual (inflated) document, not hardcoded.
+fn release_with_padding(root: &Path, padding_entries: usize) -> TestResult<TrustPolicy> {
     let Documents {
         plan,
         inputs,
         compiler,
         mut files,
-    } = write_documents(root)?;
+    } = write_documents_with_padding(root, padding_entries)?;
     // Minimal architecture header exercises metadata verification, not execution.
     let mut binary = vec![0_u8; 64];
     binary[..6].copy_from_slice(b"\x7fELF\x02\x01");
@@ -214,6 +226,60 @@ async fn actual_openssh_signature_is_required_and_policy_bound() -> TestResult {
     assert!(verify_candidate(root.path(), &wrong).await.is_err());
     fs::write(root.path().join("provenance.sig"), b"not a signature")?;
     assert!(verify_candidate(root.path(), &policy).await.is_err());
+    Ok(())
+}
+
+/// A `build-inputs.json` over `compiler_core::MAX_IR_BYTES` (4 MiB) -- as a
+/// real one now is, once `crates/engine`'s `deno_core` dependency inflates
+/// the vendored source closure `compilerClosure.nativeCompiler.
+/// buildContextFiles` records into the thousands of files -- must still
+/// verify: it has its own, larger budget (`MAX_BUILD_INPUTS_BYTES`), not
+/// IR's.
+#[tokio::test]
+async fn an_oversized_but_valid_build_inputs_document_still_verifies() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let padding_entries = 30_000;
+    let policy = release_with_padding(root.path(), padding_entries)?;
+    let build_inputs_bytes = fs::metadata(root.path().join("build-inputs.json"))?.len();
+    assert!(
+        build_inputs_bytes > compiler_core::MAX_IR_BYTES as u64,
+        "fixture must actually exceed the IR budget to exercise the fix; got {build_inputs_bytes} bytes"
+    );
+    assert!(
+        build_inputs_bytes < compiler_core::MAX_BUILD_INPUTS_BYTES as u64,
+        "fixture must still fit build-inputs.json's own budget; got {build_inputs_bytes} bytes"
+    );
+    let verified = verify_candidate(root.path(), &policy).await?;
+    assert_eq!(verified.manifest().source.repository, policy.repository);
+    Ok(())
+}
+
+/// A `build-inputs.json` over even its own, larger budget
+/// (`MAX_BUILD_INPUTS_BYTES`, matching this crate's own `MAX_DOCUMENT`) is
+/// still rejected here -- at the raw byte-read cap the release verifier
+/// already applied to every document before this change, not a newly
+/// misleading "IR exceeds 4 MiB" for a document that was never IR.
+/// `crates/cli/src/commands/release.rs`'s own `read_build_inputs` (unit
+/// tests in that file) is the parse-time bound named specifically after
+/// `build-inputs.json`, reached because that reader has no separate raw
+/// byte-read cap ahead of it the way this crate's `bounded_read` does.
+#[tokio::test]
+async fn a_build_inputs_document_over_its_own_larger_budget_is_still_rejected() -> TestResult {
+    let root = tempfile::tempdir()?;
+    // ~152 bytes/padding entry; comfortably over MAX_BUILD_INPUTS_BYTES (8 MiB).
+    let policy = release_with_padding(root.path(), 60_000)?;
+    let build_inputs_bytes = fs::metadata(root.path().join("build-inputs.json"))?.len();
+    assert!(
+        build_inputs_bytes > compiler_core::MAX_BUILD_INPUTS_BYTES as u64,
+        "fixture must actually exceed build-inputs.json's own budget; got {build_inputs_bytes} bytes"
+    );
+    let error = verify_candidate(root.path(), &policy)
+        .await
+        .err()
+        .ok_or("expected an oversized build-inputs.json to be rejected")?
+        .to_string();
+    assert!(error.contains("exceeds"), "{error}");
+    assert!(!error.contains("IR exceeds"), "{error}");
     Ok(())
 }
 
@@ -407,18 +473,33 @@ fn write_oci_with_base(
     Ok(hash(&manifest))
 }
 
-fn compiler_inputs() -> TestResult<(Value, String)> {
-    let build_context_files = json!([
-        {"path":".cargo/config.toml","sha256":format!("sha256:{}", "1".repeat(64))},
-        {"path":"Dockerfile","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"controller/Cargo.lock","sha256":format!("sha256:{}", "3".repeat(64))},
-        {"path":"controller/Cargo.toml","sha256":format!("sha256:{}", "4".repeat(64))},
-        {"path":"controller/src/ir.json","sha256":format!("sha256:{}", "5".repeat(64))},
-        {"path":"controller/src/main.rs","sha256":format!("sha256:{}", "6".repeat(64))},
-        {"path":"rusty-v8/librusty_v8.a.gz","sha256":format!("sha256:{}", "9".repeat(64))},
-        {"path":"vendor/example/src/lib.rs","sha256":format!("sha256:{}", "7".repeat(64))},
-        {"path":"workspace/Cargo.toml","sha256":format!("sha256:{}", "8".repeat(64))}
-    ]);
+/// `padding_entries` extra, unique, correctly sorted `vendor/` file entries,
+/// so a test can build a `build-inputs.json` document as large as a real
+/// one gets once `crates/engine`'s `deno_core` inflates the vendored
+/// dependency closure into the thousands of files -- without needing a real
+/// `cargo vendor` run.
+fn compiler_inputs(padding_entries: usize) -> TestResult<(Value, String)> {
+    let mut build_context_files = vec![
+        json!({"path":".cargo/config.toml","sha256":format!("sha256:{}", "1".repeat(64))}),
+        json!({"path":"Dockerfile","sha256":format!("sha256:{}", "2".repeat(64))}),
+        json!({"path":"controller/Cargo.lock","sha256":format!("sha256:{}", "3".repeat(64))}),
+        json!({"path":"controller/Cargo.toml","sha256":format!("sha256:{}", "4".repeat(64))}),
+        json!({"path":"controller/src/ir.json","sha256":format!("sha256:{}", "5".repeat(64))}),
+        json!({"path":"controller/src/main.rs","sha256":format!("sha256:{}", "6".repeat(64))}),
+        json!({"path":"rusty-v8/librusty_v8.a.gz","sha256":format!("sha256:{}", "9".repeat(64))}),
+        json!({"path":"vendor/example/src/lib.rs","sha256":format!("sha256:{}", "7".repeat(64))}),
+    ];
+    // Sorts after "vendor/example/..." ('e' < 's') and before
+    // "workspace/..." ('v' < 'w'), keeping buildContextFiles sorted as
+    // validate_files requires.
+    for index in 0..padding_entries {
+        build_context_files.push(json!({
+            "path": format!("vendor/synthetic-package-{index:06}/src/generated/module.rs"),
+            "sha256": format!("sha256:{index:064x}"),
+        }));
+    }
+    build_context_files.push(json!({"path":"workspace/Cargo.toml","sha256":format!("sha256:{}", "8".repeat(64))}));
+    let build_context_files = Value::Array(build_context_files);
     let packaging_files = json!([
         {"path":"crates/cli/Cargo.toml","sha256":format!("sha256:{}", "1".repeat(64))},
         {"path":"crates/cli/src/main.rs","sha256":format!("sha256:{}", "1".repeat(64))},

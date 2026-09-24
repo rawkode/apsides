@@ -50,6 +50,10 @@ const withFrontmatter = (source, title) => {
       (_, fragment = "") => `](../status/${fragment})`,
     )
     .replace(
+      /\]\(OCI-PACKAGING\.md(#[^)]+)?\)/g,
+      (_, fragment = "") => `](../oci-packaging/${fragment})`,
+    )
+    .replace(
       /\]\(\.\.\/\.\.\/examples\/cnpg\/cleanup\/README\.md\)/g,
       "](https://github.com/rawkode/apsides/blob/main/examples/cnpg/cleanup/README.md)",
     );

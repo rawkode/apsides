@@ -21,7 +21,9 @@ pub use handler_budgets::{
     HANDLER_MAX_CONCURRENT_FETCHES, POD_MEMORY_BASELINE_BYTES, POD_MEMORY_SLACK_BYTES,
     array_buffer_cap_bytes, controller_memory_limit_bytes,
 };
-pub use json::{canonical_bytes, digest, parse_strict};
+pub use json::{
+    MAX_BUILD_INPUTS_BYTES, MAX_IR_BYTES, canonical_bytes, digest, parse_bounded, parse_strict,
+};
 pub use kubernetes_version::{
     QUALIFIED_FLOOR as KUBERNETES_QUALIFIED_FLOOR, is_supported_min_version, parse_min_version,
     parse_server_version,

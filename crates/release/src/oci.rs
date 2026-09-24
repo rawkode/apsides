@@ -18,10 +18,10 @@ fn approved_runtime(
     root: &Path,
     release: &ReleaseManifest,
 ) -> Result<crate::compiler::ValidatedRuntime> {
-    let build_inputs = json(&bounded_read(
-        &contained(root, "build-inputs.json")?,
-        MAX_DOCUMENT,
-    )?)?;
+    let build_inputs = json(
+        &bounded_read(&contained(root, "build-inputs.json")?, MAX_DOCUMENT)?,
+        "build-inputs.json",
+    )?;
     let (_, runtime) =
         crate::compiler::validated_compiler_closure(&build_inputs, &release.compiler_digest)?;
     Ok(runtime)
@@ -67,6 +67,7 @@ pub(crate) fn verify(root: &Path, release: &ReleaseManifest) -> Result<()> {
         files
             .get("oci-layout")
             .ok_or_else(|| crate::Error::Rejected("missing OCI layout".into()))?,
+        "oci-layout",
     )?["imageLayoutVersion"]
         != "1.0.0"
     {
@@ -83,6 +84,7 @@ pub(crate) fn verify(root: &Path, release: &ReleaseManifest) -> Result<()> {
         files
             .get("index.json")
             .ok_or_else(|| crate::Error::Rejected("missing OCI index".into()))?,
+        "index.json",
     )?;
     let _: ImageIndex = serde_json::from_value(index.clone())?;
     let entries = index["manifests"]
@@ -95,7 +97,7 @@ pub(crate) fn verify(root: &Path, release: &ReleaseManifest) -> Result<()> {
         return reject("OCI archive index does not select the released manifest");
     }
 
-    let value = json(raw)?;
+    let value = json(raw, "OCI image manifest")?;
     let _: ImageManifest = serde_json::from_value(value.clone())?;
     if value["schemaVersion"] != 2
         || value["mediaType"] != "application/vnd.oci.image.manifest.v1+json"
@@ -103,7 +105,7 @@ pub(crate) fn verify(root: &Path, release: &ReleaseManifest) -> Result<()> {
         return reject("release image must name a single-platform OCI manifest");
     }
     let config_bytes = descriptor_blob(&files, &value["config"])?;
-    let config = json(config_bytes)?;
+    let config = json(config_bytes, "OCI image config")?;
     let _: ImageConfiguration = serde_json::from_value(config.clone())?;
     if format!(
         "{}/{}",
