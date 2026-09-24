@@ -86,11 +86,11 @@ struct Documents {
 
 fn write_documents(root: &Path) -> TestResult<Documents> {
     let ir = json!({
-        "schemaVersion":"apsides.dev/ir/v1","testOnly":false,
+        "schemaVersion":"apsides.dev/ir/v2","testOnly":false,
         "domain":{"id":"example","namespace":"workload","controlNamespace":"apsides-system","clusterBinding":"test-cluster","policyRef":"platform/example","enforcement":"api-bound","minKubernetesVersion":"1.34","budgets":{"maxResources":64,"maxInputs":64,"maxReactions":64,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},
         "resources":[{"id":"config","apiVersion":"v1","kind":"ConfigMap","name":"config","namespace":"workload","desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"config","namespace":"workload"},"data":{"hello":"world"}},"lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"controller.ts","line":1,"column":1}}],
         "inputs":[],"reactions":[],
-        "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"controller.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
+        "handlers":[],"outputs":[],"provenance":{"compiler":"apsides/0.1","inputs":[{"path":"controller.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
     });
     let plan = parse_and_validate(&ir.to_string())?;
     let (inputs, compiler) = compiler_inputs()?;

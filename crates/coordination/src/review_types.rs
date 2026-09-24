@@ -32,6 +32,7 @@ pub struct ReviewLifecycle {
 pub enum ReviewInputMode {
     Managed,
     Observed,
+    Output,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

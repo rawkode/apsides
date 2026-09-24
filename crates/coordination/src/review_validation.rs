@@ -206,6 +206,20 @@ fn validate_inputs(
                         .any(|r| r.kind == input.kind && r.identity.name == input.name),
                 "review observed input aliases managed identity",
             )?,
+            ReviewInputMode::Output => {
+                let resource = input
+                    .managed_resource_id
+                    .as_ref()
+                    .and_then(|id| resources.get(id))
+                    .ok_or(Error::Invalid("review output input association"))?;
+                require(
+                    input.kind == "ConfigMap"
+                        && resource.kind == input.kind
+                        && resource.identity.name == input.name
+                        && resource.identity.namespace == input.namespace,
+                    "review output input association",
+                )?;
+            }
         }
     }
     Ok(())

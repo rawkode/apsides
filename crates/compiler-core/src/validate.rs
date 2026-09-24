@@ -1,7 +1,9 @@
 use crate::{
-    Capability, CompiledPlan, Effect, Error, IR_SCHEMA, Input, InputMode, Ir, PermissionCeiling,
-    Provenance, Request, Resource, Result, SourceLocation, TestCase, canonical_bytes, digest,
-    parse_strict, resolve_resource_api,
+    Capability, CompiledPlan, Effect, Error, HANDLER_OUTPUT_LABEL, HANDLER_TRIGGER_INPUT_CHANGED,
+    Handler, IR_SCHEMA, Input, InputMode, Ir, MAX_EGRESS_HOSTS, MAX_HANDLER_HEAP_BYTES,
+    MAX_HANDLER_TIMEOUT_MILLIS, MAX_HANDLERS, Output, PermissionCeiling, Provenance, Request,
+    Resource, Result, SourceLocation, TestCase, canonical_bytes, digest, parse_strict,
+    resolve_resource_api,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -128,8 +130,10 @@ fn field_paths(value: &Value, path: &str, result: &mut Vec<String>) {
 pub fn validate(ir: &Ir) -> Result<CompiledPlan> {
     validate_domain(ir)?;
     let resources = validate_resources(ir)?;
+    let outputs = validate_outputs(ir, &resources)?;
     let inputs = validate_inputs(ir, &resources)?;
     validate_reactions(ir, &resources, &inputs)?;
+    validate_handlers(ir, &inputs, &outputs)?;
     derive_plan(ir, &inputs)
 }
 
@@ -263,9 +267,90 @@ fn validate_resources(ir: &Ir) -> Result<BTreeMap<String, &Resource>> {
             canonical_bytes(&resource.desired)?.len() <= ir.domain.budgets.max_object_bytes,
             format!("resource {} exceeds object byte budget", resource.id),
         )?;
+        validate_handler_output_label(resource)?;
         crate::schema::validate_resource(resource)?;
     }
     Ok(resources)
+}
+
+/// The reserved `apsides.dev/handler-output` label is required on every
+/// `handlerOutput` resource (with its value equal to the resource's own id)
+/// and forbidden on every other resource, exactly like `apsides.dev/revision`
+/// is reserved for the rollout primitive.
+fn validate_handler_output_label(resource: &Resource) -> Result<()> {
+    let label = resource
+        .desired
+        .pointer("/metadata/labels")
+        .and_then(Value::as_object)
+        .and_then(|labels| labels.get(HANDLER_OUTPUT_LABEL));
+    require(
+        label.is_some() == resource.handler_output,
+        format!(
+            "{HANDLER_OUTPUT_LABEL} is reserved for handler outputs (resource {})",
+            resource.id
+        ),
+    )?;
+    if resource.handler_output {
+        require(
+            resource.kind == "ConfigMap" && resource.desired.get("data").is_none(),
+            format!(
+                "handler output resource {} must be a metadata-only ConfigMap",
+                resource.id
+            ),
+        )?;
+        require(
+            label.and_then(Value::as_str) == Some(resource.id.as_str()),
+            format!(
+                "{HANDLER_OUTPUT_LABEL} must equal the output id on resource {}",
+                resource.id
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+/// Validate every declared handler `Output`, and return the id-keyed map of
+/// them alongside the identity set they occupy (used to reject aliasing).
+fn validate_outputs<'a>(
+    ir: &'a Ir,
+    resources: &BTreeMap<String, &Resource>,
+) -> Result<BTreeMap<String, &'a Output>> {
+    let mut outputs = BTreeMap::new();
+    for output in &ir.outputs {
+        require(
+            dns_label(&output.id, 63) && outputs.insert(output.id.clone(), output).is_none(),
+            "invalid or duplicate output id",
+        )?;
+        require(
+            object_name(&output.name) && output.namespace == ir.domain.namespace,
+            "output identity is outside the fixed workload scope",
+        )?;
+        let resource = resources.get(&output.id).ok_or_else(|| {
+            Error::Invalid(format!(
+                "output {} has no backing handlerOutput resource",
+                output.id
+            ))
+        })?;
+        require(
+            resource.handler_output
+                && resource.kind == "ConfigMap"
+                && resource.name == output.name
+                && resource.namespace == output.namespace,
+            format!(
+                "output {} backing resource identity or handlerOutput flag mismatch",
+                output.id
+            ),
+        )?;
+    }
+    require(
+        resources
+            .values()
+            .filter(|resource| resource.handler_output)
+            .count()
+            == outputs.len(),
+        "every handlerOutput resource must have a matching declared output",
+    )?;
+    Ok(outputs)
 }
 
 fn validate_inputs<'a>(
@@ -347,6 +432,23 @@ fn validate_inputs<'a>(
                     "observed input aliases a managed resource; use managed mode",
                 )?;
             }
+            InputMode::Output => {
+                require(!input.sensitive, "handler output input cannot be sensitive")?;
+                let resource = input
+                    .managed_resource_id
+                    .as_ref()
+                    .and_then(|id| resources.get(id))
+                    .ok_or_else(|| {
+                        Error::Invalid("output input requires an existing managedResourceId".into())
+                    })?;
+                require(
+                    input.kind == "ConfigMap"
+                        && resource.handler_output
+                        && resource.name == input.name
+                        && resource.namespace == input.namespace,
+                    "output input identity differs from its handler output resource",
+                )?;
+            }
         }
     }
     Ok(inputs)
@@ -391,6 +493,273 @@ fn validate_reactions(
     }
 
     Ok(())
+}
+
+/// A lowercase DNS name suitable for a handler's egress allowlist: never an
+/// IP literal (v4 or v6), never containing a wildcard, at most 253 bytes.
+fn is_egress_host(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>().is_err()
+        && host.len() <= 253
+        && !host.is_empty()
+        && host.split('.').all(|part| dns_label(part, 63))
+}
+
+/// A bare identifier suitable for a handler's named ES module export.
+fn is_js_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    value.len() <= 128
+        && chars
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || matches!(first, '_' | '$'))
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'))
+}
+
+/// Depth-first cycle detection over the handler-trigger graph: `path` holds
+/// every node on the current call stack, `visited` every node already known
+/// acyclic from a prior traversal.
+fn detect_handler_cycle<'a>(
+    edges: &BTreeMap<&'a str, BTreeSet<&'a str>>,
+    node: &'a str,
+    visited: &mut BTreeSet<&'a str>,
+    path: &mut BTreeSet<&'a str>,
+) -> Result<()> {
+    if !path.insert(node) {
+        return Err(Error::Invalid(
+            "handler graph contains a cycle through input-changed triggers".into(),
+        ));
+    }
+    if visited.insert(node) {
+        for next in edges.get(node).into_iter().flatten() {
+            detect_handler_cycle(edges, next, visited, path)?;
+        }
+    }
+    path.remove(node);
+    Ok(())
+}
+
+/// Validate every declared `Handler`: identity, module/export/bundle shape,
+/// budgets, resolved inputs/outputs, egress host syntax, and acyclicity of
+/// the handler-trigger graph (a handler's outputs feeding another handler's
+/// inputs through an [`InputMode::Output`] input).
+/// Validate one handler's identity, module/export/bundle shape, source and
+/// budgets (everything but its resolved inputs, outputs and egress hosts).
+fn validate_handler_shape(ir: &Ir, handler: &Handler) -> Result<()> {
+    require(
+        dns_label(&handler.id, 63),
+        "invalid or duplicate handler id",
+    )?;
+    require(
+        !handler.module.is_empty()
+            && handler.module.len() <= 512
+            && !handler.module.starts_with('/')
+            && !handler.module.contains('\\')
+            && handler
+                .module
+                .split('/')
+                .all(|part| !matches!(part, "" | "." | "..")),
+        format!(
+            "handler {} module must be a normalized relative path",
+            handler.id
+        ),
+    )?;
+    require(
+        ir.provenance
+            .inputs
+            .iter()
+            .any(|input| input.path == handler.module),
+        format!(
+            "handler {} module is not a declared build input",
+            handler.id
+        ),
+    )?;
+    require(
+        is_js_identifier(&handler.export),
+        format!("handler {} export must be a valid identifier", handler.id),
+    )?;
+    require(
+        handler.bundle_sha256.len() == 64
+            && handler
+                .bundle_sha256
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),
+        format!("handler {} has an invalid bundleSha256", handler.id),
+    )?;
+    require(
+        source_valid(&handler.source, &ir.provenance),
+        format!(
+            "handler {} source is not a declared build input",
+            handler.id
+        ),
+    )?;
+    require(
+        (1..=MAX_HANDLER_TIMEOUT_MILLIS).contains(&handler.timeout_millis),
+        format!(
+            "handler {} timeoutMillis must be in 1..={MAX_HANDLER_TIMEOUT_MILLIS}",
+            handler.id
+        ),
+    )?;
+    require(
+        (1..=MAX_HANDLER_HEAP_BYTES).contains(&handler.max_heap_bytes),
+        format!(
+            "handler {} maxHeapBytes must be in 1..={MAX_HANDLER_HEAP_BYTES}",
+            handler.id
+        ),
+    )?;
+    require(
+        handler.trigger.kind == HANDLER_TRIGGER_INPUT_CHANGED,
+        format!("handler {} has an unsupported trigger kind", handler.id),
+    )
+}
+
+/// Validate one handler's resolved inputs, outputs and egress hosts.
+/// Inserts the handler's egress hosts into `egress_hosts` for the caller's
+/// aggregate `maxEgressHosts` check.
+fn validate_handler_edges(
+    handler: &Handler,
+    inputs: &BTreeMap<String, &Input>,
+    outputs: &BTreeMap<String, &Output>,
+    egress_hosts: &mut BTreeSet<String>,
+) -> Result<()> {
+    let unique_inputs: BTreeSet<_> = handler.inputs.iter().collect();
+    require(
+        !handler.inputs.is_empty() && unique_inputs.len() == handler.inputs.len(),
+        format!("handler {} requires distinct nonempty inputs", handler.id),
+    )?;
+    require(
+        unique_inputs.contains(&handler.trigger.input),
+        format!(
+            "handler {} trigger input must be one of its declared inputs",
+            handler.id
+        ),
+    )?;
+    for input_id in &handler.inputs {
+        let input = inputs.get(input_id).ok_or_else(|| {
+            Error::Invalid(format!(
+                "handler {} has unresolved input {input_id}",
+                handler.id
+            ))
+        })?;
+        require(
+            input.kind == "ConfigMap" && !input.sensitive,
+            format!(
+                "handler {} input {input_id} must be a non-sensitive ConfigMap input",
+                handler.id
+            ),
+        )?;
+        if input.mode == InputMode::Output {
+            let backing = input.managed_resource_id.as_deref().unwrap_or_default();
+            require(
+                !handler.outputs.iter().any(|id| id == backing),
+                format!(
+                    "handler {} may not trigger on or read its own output",
+                    handler.id
+                ),
+            )?;
+        }
+    }
+    let unique_outputs: BTreeSet<_> = handler.outputs.iter().collect();
+    require(
+        unique_outputs.len() == handler.outputs.len(),
+        format!("handler {} outputs must be distinct", handler.id),
+    )?;
+    for output_id in &handler.outputs {
+        require(
+            outputs.contains_key(output_id),
+            format!("handler {} has unresolved output {output_id}", handler.id),
+        )?;
+    }
+    let unique_egress: BTreeSet<_> = handler
+        .egress
+        .iter()
+        .map(|host| (host.host.as_str(), host.port))
+        .collect();
+    require(
+        unique_egress.len() == handler.egress.len(),
+        format!("handler {} egress hosts must be distinct", handler.id),
+    )?;
+    for egress in &handler.egress {
+        require(
+            is_egress_host(&egress.host) && egress.port >= 1,
+            format!(
+                "handler {} egress host {} must be a lowercase DNS name (never an IP literal or wildcard), reached over HTTPS",
+                handler.id, egress.host
+            ),
+        )?;
+        egress_hosts.insert(egress.host.clone());
+    }
+    Ok(())
+}
+
+/// Build the handler-trigger graph (a handler's outputs feeding another
+/// handler's inputs through an [`InputMode::Output`] input) and reject any
+/// cycle, including a handler triggering on or reading its own output.
+fn validate_handler_graph(
+    ir: &Ir,
+    inputs: &BTreeMap<String, &Input>,
+    handler_ids: &BTreeSet<&str>,
+) -> Result<()> {
+    // Which handlers read each output through an Output-mode input.
+    let mut consumers_of: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for handler in &ir.handlers {
+        for input_id in &handler.inputs {
+            let Some(input) = inputs.get(input_id) else {
+                continue;
+            };
+            if input.mode == InputMode::Output
+                && let Some(resource_id) = input.managed_resource_id.as_deref()
+            {
+                consumers_of
+                    .entry(resource_id)
+                    .or_default()
+                    .insert(handler.id.as_str());
+            }
+        }
+    }
+    let mut edges: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for handler in &ir.handlers {
+        for output_id in &handler.outputs {
+            if let Some(consumers) = consumers_of.get(output_id.as_str()) {
+                edges
+                    .entry(handler.id.as_str())
+                    .or_default()
+                    .extend(consumers.iter().copied());
+            }
+        }
+    }
+    let mut visited = BTreeSet::new();
+    for &handler_id in handler_ids {
+        if !visited.contains(handler_id) {
+            let mut path = BTreeSet::new();
+            detect_handler_cycle(&edges, handler_id, &mut visited, &mut path)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_handlers(
+    ir: &Ir,
+    inputs: &BTreeMap<String, &Input>,
+    outputs: &BTreeMap<String, &Output>,
+) -> Result<()> {
+    require(
+        ir.handlers.len() <= MAX_HANDLERS,
+        format!("domain exceeds maxHandlers budget of {MAX_HANDLERS}"),
+    )?;
+    let mut handler_ids = BTreeSet::new();
+    let mut egress_hosts = BTreeSet::new();
+    for handler in &ir.handlers {
+        require(
+            handler_ids.insert(handler.id.as_str()),
+            "duplicate handler id",
+        )?;
+        validate_handler_shape(ir, handler)?;
+        validate_handler_edges(handler, inputs, outputs, &mut egress_hosts)?;
+    }
+    require(
+        egress_hosts.len() <= MAX_EGRESS_HOSTS,
+        format!("domain exceeds maxEgressHosts budget of {MAX_EGRESS_HOSTS}"),
+    )?;
+    validate_handler_graph(ir, inputs, &handler_ids)
 }
 
 fn derive_resources(
@@ -513,18 +882,19 @@ fn container_uses_secret(container: &Value) -> bool {
             })
 }
 
-fn derive_plan(ir: &Ir, inputs: &BTreeMap<String, &Input>) -> Result<CompiledPlan> {
-    let domain = &ir.domain;
-    let mut requests = Vec::new();
-    let mut effects = Vec::new();
-    let mut gaps = BTreeSet::new();
-    let mut risks = BTreeSet::new();
-    derive_resources(ir, &mut requests, &mut effects, &mut gaps, &mut risks)?;
+/// Requests and risks for every input that is read live rather than through
+/// the reconciler's own applied state: `Observed` (external authority) and
+/// `Output` (a handler's own written state, read the same way).
+fn derive_input_capabilities(
+    ir: &Ir,
+    requests: &mut Vec<Request>,
+    risks: &mut BTreeSet<String>,
+) -> Result<()> {
     for input in &ir.inputs {
         if input.mode == InputMode::Observed {
             for verb in ["get", "list", "watch"] {
                 request(
-                    &mut requests,
+                    requests,
                     "external-input",
                     &input.kind,
                     &input.namespace,
@@ -534,10 +904,33 @@ fn derive_plan(ir: &Ir, inputs: &BTreeMap<String, &Input>) -> Result<CompiledPla
             }
             risks.insert("external-input-writers-influence-rollout".to_owned());
         }
+        if input.mode == InputMode::Output {
+            for verb in ["get", "list", "watch"] {
+                request(
+                    requests,
+                    "handler-output-read",
+                    &input.kind,
+                    &input.namespace,
+                    &input.name,
+                    verb,
+                )?;
+            }
+        }
         if input.sensitive {
             risks.insert("secret-read-authority".to_owned());
         }
     }
+    Ok(())
+}
+
+fn derive_plan(ir: &Ir, inputs: &BTreeMap<String, &Input>) -> Result<CompiledPlan> {
+    let domain = &ir.domain;
+    let mut requests = Vec::new();
+    let mut effects = Vec::new();
+    let mut gaps = BTreeSet::new();
+    let mut risks = BTreeSet::new();
+    derive_resources(ir, &mut requests, &mut effects, &mut gaps, &mut risks)?;
+    derive_input_capabilities(ir, &mut requests, &mut risks)?;
     for reaction in &ir.reactions {
         effects.push(Effect {
             target: reaction.target.clone(),

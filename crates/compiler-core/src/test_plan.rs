@@ -139,12 +139,12 @@ pub(crate) fn generate(ir: &Ir) -> Vec<TestCase> {
             };
             append(&mut cases, reaction, std::slice::from_ref(selected), &all);
         }
-        append(
-            &mut cases,
-            reaction,
-            OBSERVED,
-            &mode_ids(InputMode::Observed),
-        );
+        // Output-mode inputs are observed live, exactly like Observed inputs
+        // (see model::InputMode::Output), so they share the same scenarios.
+        let mut observed_like = mode_ids(InputMode::Observed);
+        observed_like.extend(mode_ids(InputMode::Output));
+        observed_like.sort();
+        append(&mut cases, reaction, OBSERVED, &observed_like);
         let managed = mode_ids(InputMode::Managed);
         for scenario in MANAGED {
             let applicable = if scenario.0 == "managed-drift-repair" {

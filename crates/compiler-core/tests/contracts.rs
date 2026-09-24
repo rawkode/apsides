@@ -15,6 +15,8 @@ fn fixture() -> Value {
         "resources":[{"id":"api","apiVersion":"apps/v1","kind":"Deployment","name":"api","namespace":"workload","desired":{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"api","namespace":"workload"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"api"}},"template":{"metadata":{"labels":{"app":"api"}},"spec":{"serviceAccountName":"api-workload","containers":[{"name":"api","image":"example.invalid/api@sha256:0000000000000000000000000000000000000000000000000000000000000000"}]}}}},"lifecycle":{"deletionPolicy":"orphan"},"source":source()}],
         "inputs":[{"id":"config","apiVersion":"v1","kind":"ConfigMap","name":"external","namespace":"workload","mode":"observed","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":source()}],
         "reactions":[{"id":"restart","op":"rollout","inputs":["config"],"target":"api","source":source()}],
+        "handlers":[],
+        "outputs":[],
         "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"controller.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
     })
 }

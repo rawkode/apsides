@@ -19,6 +19,7 @@ fn resource() -> Resource {
             line: 1,
             column: 1,
         },
+        handler_output: false,
     }
 }
 fn object() -> Result<DynamicObject> {
@@ -28,6 +29,63 @@ fn object() -> Result<DynamicObject> {
             "manager":"apsides-example","operation":"Apply","apiVersion":"v1","fieldsType":"FieldsV1",
             "fieldsV1":{"f:data":{"f:private":{}}}}]},"data":{"private":"canary"}}),
     )?)
+}
+
+fn handler_output_resource() -> Resource {
+    Resource {
+        id: "output-flags".into(),
+        api_version: "v1".into(),
+        kind: "ConfigMap".into(),
+        api_resource: None,
+        name: "flags".into(),
+        namespace: "workload".into(),
+        force: false,
+        desired: json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"flags","namespace":"workload","labels":{"apsides.dev/handler-output":"output-flags"}}}),
+        lifecycle: compiler_core::Lifecycle {
+            deletion_policy: compiler_core::DeletionPolicy::Orphan,
+        },
+        source: compiler_core::SourceLocation {
+            file: "source.tsx".into(),
+            line: 1,
+            column: 1,
+        },
+        handler_output: true,
+    }
+}
+
+/// A handler output's desired value is metadata-only (see [`handler_output_resource`]):
+/// the reconciler's own SSA of it, under field manager `apsides-<domain>`, never
+/// claims `data`, so it still passes `require_apply_owner` on the strength of the
+/// reserved label alone, while a distinct field manager (`apsides-handler-<domain>`,
+/// where a later phase attributes handler writes) separately owns `data` without
+/// conflict.
+#[test]
+fn handler_output_apply_evidence_never_claims_data_which_a_distinct_manager_owns() -> Result<()> {
+    let object: DynamicObject = serde_json::from_value(json!({
+        "apiVersion": "v1", "kind": "ConfigMap",
+        "metadata": {
+            "name": "flags", "namespace": "workload", "uid": "uid", "resourceVersion": "2",
+            "labels": {"apsides.dev/handler-output": "output-flags"},
+            "managedFields": [
+                {
+                    "manager": "apsides-example", "operation": "Apply", "apiVersion": "v1",
+                    "fieldsType": "FieldsV1", "fieldsV1": {"f:metadata": {"f:labels": {"f:apsides.dev/handler-output": {}}}},
+                },
+                {
+                    "manager": "apsides-handler-example", "operation": "Apply", "apiVersion": "v1",
+                    "fieldsType": "FieldsV1", "fieldsV1": {"f:data": {}},
+                },
+            ],
+        },
+        "data": {"value": "written-by-handler"},
+    }))?;
+    let resource = handler_output_resource();
+    assert!(
+        resource.desired.get("data").is_none(),
+        "handler output desired value must never carry data"
+    );
+    require_apply_owner(&object, &resource, "example")?;
+    Ok(())
 }
 
 #[test]

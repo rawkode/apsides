@@ -895,7 +895,7 @@ mod tests {
         let mut plan: CompiledPlan = serde_json::from_value(json!({
             "irDigest": format!("sha256:{}", "0".repeat(64)),
             "ir": {
-                "schemaVersion": "apsides.dev/ir/v1", "testOnly": false,
+                "schemaVersion": "apsides.dev/ir/v2", "testOnly": false,
                 "domain": {"id": "demo", "namespace": "default", "controlNamespace": "apsides-system",
                     "clusterBinding": "local", "policyRef": "platform/demo", "enforcement": "api-bound",
                     "minKubernetesVersion": "1.34",
@@ -908,7 +908,7 @@ mod tests {
                     "lifecycle": {"deletionPolicy": "orphan"},
                     "source": {"file": "program.tsx", "line": 1, "column": 1}}],
                 "inputs": [], "reactions": [],
-                "provenance": {"compiler": "apsides/0.1", "inputs": []},
+                "handlers":[],"outputs":[],"provenance": {"compiler": "apsides/0.1", "inputs": []},
             },
             "effects": [], "requestPlan": [], "capabilities": [], "enforcementGaps": [],
             "indirectRisks": [], "testPlan": [],

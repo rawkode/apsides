@@ -212,7 +212,7 @@ fn generation(
     private_annotation: &str,
 ) -> Result<GenerationPlan, Box<dyn std::error::Error + Send + Sync>> {
     let value = json!({
-        "schemaVersion": "apsides.dev/ir/v1",
+        "schemaVersion": "apsides.dev/ir/v2",
         "domain": {
             "id": "example",
             "namespace": "workload",
@@ -251,7 +251,7 @@ fn generation(
         }],
         "inputs": [],
         "reactions": [],
-        "provenance": {
+        "handlers":[],"outputs":[],"provenance": {
             "compiler": "apsides/0.1",
             "inputs": [{
                 "path": "program.ts",

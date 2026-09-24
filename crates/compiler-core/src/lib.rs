@@ -25,15 +25,15 @@ pub use review::review_documents;
 pub use rollout::*;
 pub use semantic::*;
 pub use surface::{
-    SURFACE_SCHEMA, Surface, SurfaceDomain, SurfaceImage, SurfaceInput, SurfaceKubernetes,
-    SurfacePermission, SurfaceReaction, SurfaceResource, SurfaceSecretRead, SurfaceVerb,
-    derive_surface,
+    SURFACE_SCHEMA, Surface, SurfaceDomain, SurfaceEgress, SurfaceHandler, SurfaceImage,
+    SurfaceInput, SurfaceKubernetes, SurfaceOutput, SurfacePermission, SurfaceReaction,
+    SurfaceResource, SurfaceSecretRead, SurfaceVerb, derive_surface,
 };
 pub use surface_diff::{
-    DomainChange, ImageChange, ImagesDiff, InputChange, InputsDiff, KubernetesChange,
-    PermissionChange, PermissionVerbChange, PermissionsDiff, ReactionsDiff, ResourceChange,
-    ResourcesDiff, SURFACE_DIFF_SCHEMA, SecretsReadDiff, StringSetDiff, SurfaceDiff, ValueChange,
-    diff_surfaces,
+    DomainChange, EgressDiff, HandlerChange, HandlersDiff, ImageChange, ImagesDiff, InputChange,
+    InputsDiff, KubernetesChange, OutputChange, OutputsDiff, PermissionChange,
+    PermissionVerbChange, PermissionsDiff, ReactionsDiff, ResourceChange, ResourcesDiff,
+    SURFACE_DIFF_SCHEMA, SecretsReadDiff, StringSetDiff, SurfaceDiff, ValueChange, diff_surfaces,
 };
 pub use surface_diff_markdown::render_markdown;
 pub use surface_policy::{

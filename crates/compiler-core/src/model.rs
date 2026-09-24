@@ -1,8 +1,21 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const IR_SCHEMA: &str = "apsides.dev/ir/v1";
+pub const IR_SCHEMA: &str = "apsides.dev/ir/v2";
 pub const REVISION_ANNOTATION: &str = "apsides.dev/revision";
+/// Reserved label marking a managed `ConfigMap` as a handler output: required
+/// on every `handlerOutput` resource, rejected on every other resource.
+pub const HANDLER_OUTPUT_LABEL: &str = "apsides.dev/handler-output";
+/// The only supported handler trigger kind in this increment.
+pub const HANDLER_TRIGGER_INPUT_CHANGED: &str = "input-changed";
+/// A handler's declared timeout may not exceed 30 seconds.
+pub const MAX_HANDLER_TIMEOUT_MILLIS: u32 = 30_000;
+/// A handler's declared V8 heap ceiling may not exceed 64 MiB.
+pub const MAX_HANDLER_HEAP_BYTES: u64 = 64 * 1024 * 1024;
+/// At most 16 handlers per domain.
+pub const MAX_HANDLERS: usize = 16;
+/// At most 16 distinct egress hosts across every handler in a domain.
+pub const MAX_EGRESS_HOSTS: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -81,6 +94,11 @@ pub struct Resource {
     pub desired: Value,
     pub lifecycle: Lifecycle,
     pub source: SourceLocation,
+    /// True for the managed `ConfigMap` a handler `Output` compiles to. Its
+    /// desired value carries only `metadata` (never `data`) and must carry
+    /// the reserved [`HANDLER_OUTPUT_LABEL`]; every other resource must not.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub handler_output: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +106,11 @@ pub struct Resource {
 pub enum InputMode {
     Managed,
     Observed,
+    /// A non-sensitive `ConfigMap` input auto-created for a handler
+    /// [`Output`], observed the same way as [`InputMode::Observed`] but
+    /// distinguished so review and surface projections can label it
+    /// accurately. `managedResourceId` names the output's resource.
+    Output,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +140,58 @@ pub struct Reaction {
     pub source: SourceLocation,
 }
 
+/// A handler-written managed `ConfigMap` output. The resource itself (kind
+/// `ConfigMap`, `handlerOutput: true`) lives in `Ir::resources`; this row is
+/// only the output's own identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Output {
+    pub id: String,
+    pub name: String,
+    pub namespace: String,
+}
+
+/// The only supported handler trigger shape in this increment: fires when
+/// the named input's revision changes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HandlerTrigger {
+    pub kind: String,
+    pub input: String,
+}
+
+/// An egress host a handler's `fetch` op may reach: a lowercase DNS name
+/// (never an IP literal or a wildcard), always over HTTPS.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EgressHost {
+    pub host: String,
+    pub port: u16,
+}
+
+/// A Brigade-style event handler.
+///
+/// A bundled TypeScript module invoked when its trigger input's revision
+/// changes, reading declared inputs, reaching declared egress hosts, and
+/// writing declared outputs. Runtime execution is out of scope for this IR:
+/// the compiled bundle is embedded in the controller image for a later phase
+/// to run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Handler {
+    pub id: String,
+    pub module: String,
+    pub export: String,
+    pub trigger: HandlerTrigger,
+    pub inputs: Vec<String>,
+    pub egress: Vec<EgressHost>,
+    pub outputs: Vec<String>,
+    pub timeout_millis: u32,
+    pub max_heap_bytes: u64,
+    pub bundle_sha256: String,
+    pub source: SourceLocation,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BuildInput {
@@ -141,6 +216,8 @@ pub struct Ir {
     pub resources: Vec<Resource>,
     pub inputs: Vec<Input>,
     pub reactions: Vec<Reaction>,
+    pub handlers: Vec<Handler>,
+    pub outputs: Vec<Output>,
     pub provenance: Provenance,
 }
 
