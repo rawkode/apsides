@@ -6,7 +6,22 @@ use std::{collections::BTreeSet, path::Path};
 
 pub const COMPILER_CLOSURE_SCHEMA: &str = "apsides.dev/compiler-closure/v3";
 const MAX_COMPILER_CLOSURE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_COMPILER_FILES: usize = 32_768;
+/// A ceiling on `buildContextFiles.len() + packagingFiles.len()`, not a byte
+/// budget (see [`MAX_COMPILER_CLOSURE_BYTES`] for that): sized for the real
+/// vendored dependency closure, not an arbitrary round number.
+///
+/// A real `cargo vendor --offline --versioned-dirs` of `controller/Cargo.lock`
+/// once `crates/engine`'s `deno_core`/`v8` are in the dependency graph
+/// (342 locked packages, as of this pin) stages 37,408 files under `vendor/`
+/// alone, plus a few hundred more for the trusted Apsides crate sources and
+/// packaging scripts `validate_native_compiler` below also requires --
+/// comfortably over the previous 32,768 ceiling, which rejected every real
+/// release with a correct, non-misleading "native compiler closure is
+/// incomplete or invalid" (the file-count check, not a corrupted document).
+/// 65,536 keeps real closures well inside this budget with room for the
+/// dependency tree to grow, while still bounding how much a single closure
+/// document can make this validator iterate over.
+const MAX_COMPILER_FILES: usize = 65_536;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

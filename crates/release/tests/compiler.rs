@@ -5,17 +5,38 @@ use serde_json::{Value, json};
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 fn valid_inputs() -> TestResult<(Value, String)> {
-    let build_context_files = json!([
-        {"path":".cargo/config.toml","sha256":format!("sha256:{}", "1".repeat(64))},
-        {"path":"Dockerfile","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"controller/Cargo.lock","sha256":format!("sha256:{}", "3".repeat(64))},
-        {"path":"controller/Cargo.toml","sha256":format!("sha256:{}", "4".repeat(64))},
-        {"path":"controller/src/ir.json","sha256":format!("sha256:{}", "5".repeat(64))},
-        {"path":"controller/src/main.rs","sha256":format!("sha256:{}", "6".repeat(64))},
-        {"path":"rusty-v8/librusty_v8.a.gz","sha256":format!("sha256:{}", "9".repeat(64))},
-        {"path":"vendor/example/src/lib.rs","sha256":format!("sha256:{}", "7".repeat(64))},
-        {"path":"workspace/Cargo.toml","sha256":format!("sha256:{}", "8".repeat(64))}
-    ]);
+    inputs_with_padding(0)
+}
+
+/// [`valid_inputs`], with `extra_vendor_files` synthetic entries added to
+/// `buildContextFiles` between the fixture's real `vendor/example/...` entry
+/// and `workspace/Cargo.toml` -- short, sorted, digest-bound paths that stay
+/// well under the closure's own 8 MiB byte budget even at real-vendor scale,
+/// so a padded closure's rejection or acceptance is driven by the file-count
+/// ceiling being tested, not incidentally by the byte budget.
+fn inputs_with_padding(extra_vendor_files: usize) -> TestResult<(Value, String)> {
+    let mut build_context_files = vec![
+        json!({"path":".cargo/config.toml","sha256":format!("sha256:{}", "1".repeat(64))}),
+        json!({"path":"Dockerfile","sha256":format!("sha256:{}", "2".repeat(64))}),
+        json!({"path":"controller/Cargo.lock","sha256":format!("sha256:{}", "3".repeat(64))}),
+        json!({"path":"controller/Cargo.toml","sha256":format!("sha256:{}", "4".repeat(64))}),
+        json!({"path":"controller/src/ir.json","sha256":format!("sha256:{}", "5".repeat(64))}),
+        json!({"path":"controller/src/main.rs","sha256":format!("sha256:{}", "6".repeat(64))}),
+        json!({"path":"rusty-v8/librusty_v8.a.gz","sha256":format!("sha256:{}", "9".repeat(64))}),
+        json!({"path":"vendor/example/src/lib.rs","sha256":format!("sha256:{}", "7".repeat(64))}),
+    ];
+    // Sorts after "vendor/example/..." ('p' > 'e') and before
+    // "workspace/..." ('v' < 'w') for every index in range, keeping the
+    // whole manifest in the sorted, unique order validate_files requires.
+    for index in 0..extra_vendor_files {
+        build_context_files.push(json!({
+            "path": format!("vendor/pad-{index:06}"),
+            "sha256": format!("sha256:{:064x}", index),
+        }));
+    }
+    build_context_files
+        .push(json!({"path":"workspace/Cargo.toml","sha256":format!("sha256:{}", "8".repeat(64))}));
+    let build_context_files = Value::Array(build_context_files);
     let packaging_files = json!([
         {"path":"crates/cli/Cargo.toml","sha256":format!("sha256:{}", "1".repeat(64))},
         {"path":"crates/cli/src/main.rs","sha256":format!("sha256:{}", "1".repeat(64))},
@@ -220,5 +241,33 @@ fn rejects_a_rusty_v8_record_disconnected_from_its_staged_file() -> TestResult {
         json!("rusty-v8/other.a.gz");
     let (inputs, identity) = resealed(inputs)?;
     assert!(validate_compiler_closure(&inputs, &identity).is_err());
+    Ok(())
+}
+
+/// A real `cargo vendor --offline --versioned-dirs` of the actual
+/// `controller/Cargo.lock` (342 locked packages, once `crates/engine`'s
+/// `deno_core`/`v8` are in the graph) stages 37,408 files under `vendor/`
+/// alone -- comfortably over the file-count ceiling's previous value of
+/// 32,768, which rejected every such real, valid closure with "native
+/// compiler closure is incomplete or invalid" (measured directly: a real
+/// vendor of this workspace's actual locked dependencies, not an estimate).
+/// 40,000 padding entries reproduces that real scale directly rather than
+/// only asserting the ceiling moved.
+#[test]
+fn accepts_a_real_scale_vendored_dependency_closure_over_the_previous_file_count_ceiling()
+-> TestResult {
+    let (inputs, identity) = inputs_with_padding(40_000)?;
+    assert_eq!(validate_compiler_closure(&inputs, &identity)?, identity);
+    Ok(())
+}
+
+#[test]
+fn rejects_a_build_context_file_manifest_over_its_own_file_count_ceiling() -> TestResult {
+    let (inputs, identity) = inputs_with_padding(65_600)?;
+    let error = validate_compiler_closure(&inputs, &identity)
+        .err()
+        .ok_or("expected a build context file manifest over the ceiling to be rejected")?
+        .to_string();
+    assert!(error.contains("incomplete or invalid"), "{error}");
     Ok(())
 }
