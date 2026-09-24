@@ -606,40 +606,54 @@ fn watchdog_thread_terminates_a_synchronous_infinite_loop() {
 /// Regression test for review round 6, X1: `invoke_handler_with_watchdog`
 /// used to build its isolate (`JsRuntime::new`, inside `begin_invocation`)
 /// *before* building its own tokio runtime, so `deno_core` registered the
-/// isolate with no `Handle` to post tasks onto at all. Sustained
-/// allocation churn -- batches of plain-object arrays allocated and
-/// dropped in a loop, with an `await` between batches so the event loop
-/// actually gets turns, for around 3 real seconds -- reliably drives V8's
-/// GC hard enough that its background memory reducer schedules a delayed
-/// foreground task, which is exactly the path that used to call `abort()`
-/// and kill this whole test process outright (not a catchable Rust
-/// `Result`, not an isolate-termination error -- the process itself dying
-/// is the failure mode this test exists to catch). This goes through
-/// `run`, i.e. `invoke_handler_with_watchdog` directly, unlike the
-/// original bug report's repro, which needed the production entry point
-/// specifically because the test suite's prior use of
-/// `invoke_handler_blocking` (inside an already-built `rt.block_on`)
-/// could never have reproduced this.
+/// isolate with no `Handle` to post tasks onto at all. V8's background
+/// memory reducer only schedules the delayed foreground task that path
+/// used to crash on *after* old-generation growth and a mark-compact
+/// pass -- allocations that die young are reclaimed by a young-generation
+/// scavenge and never reach it. So the handler below *retains* a bounded
+/// but non-trivial set of arrays (up to 200 at a time, each 10k elements)
+/// across many rounds instead of letting each one die immediately: an
+/// earlier version of this test allocated-and-dropped every array within
+/// the same iteration, which passed even against the unfixed `lib.rs`
+/// (verified directly, per review round 6, T1) because it never
+/// pressured the old generation enough to trigger a mark-compact at all.
+/// `if (n % 50 === 0) await null` -- not a `Promise.resolve()` after
+/// every array -- keeps enough allocation *density* between event-loop
+/// turns for GC to actually run under real memory pressure, while still
+/// yielding periodically so this exercises the same "isolate driven
+/// across multiple event loop turns while GC does real background work"
+/// shape as the original repro, not one uninterrupted synchronous call.
+/// This is exactly the path that used to call `abort()` and kill this
+/// whole test process outright (not a catchable Rust `Result`, not an
+/// isolate-termination error -- the process itself dying is the failure
+/// mode this test exists to catch). Goes through `run_with_limits`, i.e.
+/// `invoke_handler_with_watchdog` directly, unlike the original bug
+/// report's repro, which needed the production entry point specifically
+/// because the test suite's prior use of `invoke_handler_blocking`
+/// (inside an already-built `rt.block_on`) could never have reproduced
+/// this.
 #[test]
 fn allocation_churn_survives_through_the_watchdog_entry_point() {
     let mut limits = GENEROUS_LIMITS;
     limits.timeout = Duration::from_secs(30);
+    // `GENEROUS_LIMITS`' 64 MiB default already leaves ample room for up
+    // to 200 retained 10k-element `Array`s of small integers (well under
+    // 10 MiB even accounting for V8's per-element/per-object overhead)
+    // plus normal churn -- kept as an explicit field here, not left
+    // implicit, so a future change to the shared default cannot silently
+    // shrink this test's margin and turn it back into a heap-limit
+    // termination test instead of an X1 regression test.
+    limits.max_heap_bytes = 64 * 1024 * 1024;
 
     let result = run_with_limits(
         limits,
         r#"
-        const deadline = Date.now() + 3000;
-        let n = 0;
-        while (Date.now() < deadline) {
-            for (let i = 0; i < 50; i++) {
-                const churn = new Array(10000).fill(n);
-                n = (n + churn.length) % 1000;
-            }
-            // Yields back to the event loop between batches, so this
-            // exercises the same "isolate driven across multiple event
-            // loop turns while GC does real background work" shape as
-            // the original repro, not one uninterrupted synchronous call.
-            await Promise.resolve();
+        const end = Date.now() + 3000;
+        let keep = []; let n = 0;
+        while (Date.now() < end) {
+            keep.push(new Array(10000).fill(n++));
+            if (keep.length > 200) keep = [];
+            if (n % 50 === 0) await null;
         }
         return "survived";
     "#,
