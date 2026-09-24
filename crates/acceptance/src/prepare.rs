@@ -112,6 +112,7 @@ pub async fn prepare(options: &Options) -> Result<Inputs> {
         .await?;
         sign(&key, &release).await?;
         releases.push(release);
+        reclaim_build_cache(&directory).await?;
     }
     std::fs::remove_file(&key)?;
 
@@ -251,6 +252,58 @@ async fn build_release(build: &Build<'_>) -> Result<PathBuf> {
         .run()
         .await?;
     Ok(release)
+}
+
+/// Reclaim disk after one program's release is built and signed, before the
+/// next program's `aps build` compiles the whole dependency graph again.
+///
+/// [`RELEASES`] builds several programs in the same job. Every one of them
+/// depends on the same `runtime` crate, so every `aps build` recompiles
+/// `crates/engine`'s `deno_core`/`v8` from scratch inside a fresh, `RUN
+/// --network=none cargo build --release` `BuildKit` layer (each program's
+/// differing `controller/src` invalidates `Docker`'s layer cache for every
+/// build after it, by design -- see `scripts/package_oci.py`'s `build()`).
+/// Neither that layer's build cache nor `aps build`'s own
+/// `<artifact>.oci-context` staging directory (which holds `cargo vendor`'s
+/// output -- routinely 700+ MB once `deno_core` is in the dependency graph)
+/// is ever consulted again once `aps release` has copied what it needs out
+/// of `artifact` into `release`: nothing downstream reads `build/` or
+/// `build.oci-context/` (`check.yml`'s "Pack the prepared inputs" step packs
+/// only each program's `release/` directory). Left in place across five
+/// sequential full builds, they are large enough on their own to exhaust a
+/// hosted runner's disk before every program has an image -- observed
+/// directly in CI (`No space left on device` mid-`cargo build`, on a run
+/// whose `reactor` job, building only one program, otherwise passed).
+///
+/// # Errors
+/// Fails if a spawned cleanup command cannot run or a directory removal
+/// fails for a reason other than the path already being gone.
+async fn reclaim_build_cache(directory: &Path) -> Result {
+    remove_build_artifacts(directory)?;
+    // The default (non---all) prune only removes cache unreferenced by any
+    // image, which is every layer these `--output type=local` builds
+    // produce (they never tag or push an image), not the base images
+    // "Pull pinned build images" already fetched once for the whole job.
+    Invocation::new("docker")
+        .args(["buildx", "prune", "--force"])
+        .timeout(Duration::from_mins(5))
+        .run()
+        .await?;
+    Ok(())
+}
+
+/// The filesystem half of [`reclaim_build_cache`], split out so it is
+/// testable without a `Docker` daemon: removes `build/` and
+/// `build.oci-context/` under `directory` if present, leaving `release/`
+/// (and anything else) untouched.
+fn remove_build_artifacts(directory: &Path) -> Result {
+    for name in ["build", "build.oci-context"] {
+        let path = directory.join(name);
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Sign `release/provenance.json` into `release/provenance.sig`.
@@ -404,6 +457,41 @@ mod tests {
     #[test]
     fn build_env_names_forward_the_rusty_v8_cache_directory() {
         assert!(BUILD_ENV_NAMES.contains(&"APSIDES_RUSTY_V8_CACHE"));
+    }
+
+    /// `remove_build_artifacts` deletes `build/` and `build.oci-context/`
+    /// (the `cargo vendor` staging directory `aps build` never needs again
+    /// once `aps release` has copied what it needs into `release/`) without
+    /// touching `release/` or anything else -- the fix for the acceptance
+    /// matrix's five sequential full `deno_core`/`v8` compiles exhausting a
+    /// hosted runner's disk before every program has an image.
+    #[test]
+    fn remove_build_artifacts_deletes_only_the_build_staging_directories() -> Result {
+        let program = tempfile::tempdir()?;
+        let program = program.path();
+        std::fs::create_dir_all(program.join("build/image"))?;
+        std::fs::write(program.join("build/build-result.json"), b"{}")?;
+        std::fs::create_dir_all(program.join("build.oci-context/vendor/example"))?;
+        std::fs::write(program.join("build.oci-context/context.json"), b"{}")?;
+        std::fs::create_dir_all(program.join("release"))?;
+        std::fs::write(program.join("release/release.json"), b"{}")?;
+
+        remove_build_artifacts(program)?;
+
+        assert!(!program.join("build").exists());
+        assert!(!program.join("build.oci-context").exists());
+        assert!(program.join("release/release.json").exists());
+        Ok(())
+    }
+
+    /// Neither directory need exist -- a program whose build already failed,
+    /// or one `reclaim_build_cache` already ran for, is not an error.
+    #[test]
+    fn remove_build_artifacts_tolerates_directories_that_are_already_gone() -> Result {
+        let program = tempfile::tempdir()?;
+        remove_build_artifacts(program.path())?;
+        remove_build_artifacts(program.path())?;
+        Ok(())
     }
 
     /// `envs_for_build`'s real lookup is `std::env::var_os`, which this
