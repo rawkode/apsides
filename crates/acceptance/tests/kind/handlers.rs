@@ -292,7 +292,7 @@ async fn assert_restart_seeds_and_rewrites_nothing(
         .require("v1", "ConfigMap", Some(WORKLOAD_NAMESPACE), OUTPUT_NAME)
         .await?;
     let before_version = text(&before_restart, "/metadata/resourceVersion").to_owned();
-    let checkpoint = writer_checkpoint(&platform.registry().await?)?.clone();
+    let checkpoint = writer_checkpoint(&platform.registry().await?, DOMAIN)?.clone();
     // The controller Pod's own service account, `{runtime}-process` (see
     // `platform::controller::controller_deployment`) -- NOT
     // `runtime_binding.service_account_name` alone, which is the Envoy

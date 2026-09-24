@@ -121,7 +121,7 @@ impl Upgrade<'_> {
         let database = cnpg::persistence(&objects, WORKLOAD_NAMESPACE, None).await?;
         create_api_settings(&objects).await?;
         let registry = platform.registry().await?;
-        let checkpoint = writer_checkpoint(&registry)?;
+        let checkpoint = writer_checkpoint(&registry, DOMAIN)?;
         ensure(
             checkpoint.allocation.generation_id == committed.generation
                 && checkpoint.allocation.transition_id == committed.transition,
@@ -156,7 +156,7 @@ impl Upgrade<'_> {
     ) -> Result {
         let objects = scenario.objects.clone();
         let registry = platform.registry().await?;
-        let checkpoint = writer_checkpoint(&registry)?;
+        let checkpoint = writer_checkpoint(&registry, DOMAIN)?;
         let runtime = checkpoint.runtime_binding.service_account_name.clone();
         let proxy = checkpoint.proxy_identity.deployment_name.clone();
         let sequence = registry.value.next_sequence;
@@ -372,7 +372,7 @@ async fn old_identity_retired(
         )?;
     }
     let registry = platform.registry().await?;
-    let checkpoint = writer_checkpoint(&registry)?;
+    let checkpoint = writer_checkpoint(&registry, DOMAIN)?;
     ensure(
         checkpoint.allocation.generation_id == successor.generation,
         "the active writer is not the successor generation",

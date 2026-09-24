@@ -38,12 +38,19 @@ pub fn committed_report(committed: &Committed) -> Value {
     })
 }
 
-/// The domain's active writer checkpoint.
-pub fn writer_checkpoint(registry: &Versioned<NamespaceRegistry>) -> Result<&WriterCheckpoint> {
+/// `domain`'s active writer checkpoint. Every scenario but
+/// `handlers::` deploys the CNPG demo domain (`pair::DOMAIN`); pass the
+/// domain id explicitly rather than assuming it, so a scenario deploying
+/// a different domain (its own id, not `pair::DOMAIN`) gets the right
+/// lookup instead of a spurious "no active writer checkpoint".
+pub fn writer_checkpoint<'a>(
+    registry: &'a Versioned<NamespaceRegistry>,
+    domain: &str,
+) -> Result<&'a WriterCheckpoint> {
     registry
         .value
         .active_writer_checkpoints
-        .get(DOMAIN)
+        .get(domain)
         .ok_or_else(|| Error::Check("the domain has no active writer checkpoint".into()))
 }
 
@@ -259,7 +266,7 @@ pub async fn writers_healthy(
     retired: Option<&str>,
 ) -> Result<Value> {
     let registry = platform.registry().await?;
-    let checkpoint = writer_checkpoint(&registry)?;
+    let checkpoint = writer_checkpoint(&registry, DOMAIN)?;
     let runtime = checkpoint.runtime_binding.service_account_name.clone();
     let proxy = checkpoint.proxy_identity.deployment_name.clone();
     let writers = wait::until(
