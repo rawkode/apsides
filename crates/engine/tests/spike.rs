@@ -30,7 +30,7 @@ fn no_usage() -> Arc<AtomicUsize> {
 #[test]
 fn op2_op_is_callable_from_an_es_module() {
     let module = r#"
-        const pong = Deno.core.ops.op_apsides_spike_ping();
+        const pong = __apsidesOps.ping();
         if (pong !== "pong-from-rust") {
             throw new Error(`unexpected op result: ${pong}`);
         }
@@ -154,7 +154,7 @@ fn array_buffer_allocation_over_the_cap_terminates_the_isolate_without_aborting_
     let followup = run_spike_module_blocking(
         GENEROUS_LIMITS,
         r#"
-            const pong = Deno.core.ops.op_apsides_spike_ping();
+            const pong = __apsidesOps.ping();
             if (pong !== "pong-from-rust") {
                 throw new Error("op broken after an over-cap allocation elsewhere");
             }
@@ -169,70 +169,310 @@ fn array_buffer_allocation_over_the_cap_terminates_the_isolate_without_aborting_
     );
 }
 
-/// Regression test for a review finding: the capped allocator in
-/// `v8_alloc.rs` only governs ordinary, fixed-size `ArrayBuffer`s.
-/// Resizable ones (`new ArrayBuffer(0, {maxByteLength: N})`, then
-/// `.resize(N)`) are backed by memory V8 reserves/commits through its own
-/// page allocator, bypassing that allocator's vtable entirely -- so before
-/// `ARRAY_BUFFER_GUARD_SCRIPT` (`src/lib.rs`) existed, this exact
-/// construction succeeded well past a 1 MiB cap. Reproduces the review's
-/// repro precisely and asserts it is now rejected *at construction time*
-/// (the guard script throws before `.resize()` is ever reached), with the
-/// allocator's usage counter confirming no 256 MiB allocation happened.
+/// Regression test, route 1 of 3 the second review round found (1 MiB cap,
+/// 256 MiB resizable buffer, allocator counter stayed 0 throughout):
+/// `Deno.core.deserialize` reaches V8's structured-clone deserializer
+/// directly, which builds `ArrayBuffer`s (including resizable ones, from a
+/// suitable serialized tag) at the C++ level -- never through the
+/// JS-visible `ArrayBuffer` constructor `BOOTSTRAP_GUARD_SCRIPT`'s Layer 2
+/// guards, so Layer 2 alone did not close this route. Layer 1 (hiding
+/// `Deno` entirely) does: reproduces the review's exact byte sequence and
+/// confirms the whole route -- not just the resizable-buffer part of it --
+/// throws a `ReferenceError` before `Deno.core.deserialize` is ever called.
 #[test]
-fn resizable_array_buffer_construction_is_rejected() {
+fn deserialize_route_is_closed_by_hiding_deno() {
     let cap_bytes = 1024 * 1024;
     let limits = EngineLimits {
         max_array_buffer_bytes: cap_bytes,
         max_heap_bytes: 64 * 1024 * 1024,
     };
-    let module = r#"
+    let module = r"
         let threw = false;
-        let message = "";
+        let errorName = '';
         try {
-            const buf = new ArrayBuffer(0, { maxByteLength: 256 * 1024 * 1024 });
-            buf.resize(256 * 1024 * 1024);
+            // The review's exact repro: this byte sequence is a V8
+            // structured-clone encoding of a resizable ArrayBuffer.
+            Deno.core.deserialize(new Uint8Array([255, 16, 126, 0, 128, 128, 128, 128, 1]));
         } catch (e) {
             threw = true;
-            message = String(e);
+            errorName = e.constructor.name;
         }
         if (!threw) {
-            throw new Error("resizable ArrayBuffer construction should have been rejected");
+            throw new Error('Deno.core.deserialize should be unreachable');
         }
-        if (!message.includes("resizable")) {
-            throw new Error(`unexpected rejection message: ${message}`);
+        if (errorName !== 'ReferenceError') {
+            throw new Error('expected ReferenceError (Deno undefined), got ' + errorName);
         }
-
-        // The guard must not be bypassable via the prototype's `constructor`
-        // (which native `Uint8Array`/`TypedArray` construction reaches
-        // directly, not through the JS-visible global binding): confirm
-        // that route is patched too.
-        const ViaPrototype = new Uint8Array(1).buffer.constructor;
-        let prototypeThrew = false;
-        try {
-            new ViaPrototype(0, { maxByteLength: 1024 });
-        } catch (e) {
-            prototypeThrew = true;
-        }
-        if (!prototypeThrew) {
-            throw new Error("prototype.constructor bypass of the guard was not closed");
-        }
-    "#;
+    ";
     let usage = no_usage();
 
     let result = run_spike_module_blocking(limits, module, &usage, Duration::from_secs(10));
 
     assert!(
         result.is_ok(),
-        "expected the resizable-ArrayBuffer construction to be rejected \
-         (and caught) in JS, not to terminate or otherwise error the isolate, \
+        "expected the deserialize route to be closed (caught ReferenceError), \
          got {result:?}"
     );
     let observed_usage = usage.load(Ordering::SeqCst);
+    assert_eq!(
+        observed_usage, 0,
+        "the capped allocator's own usage counter must have stayed at 0: \
+         Deno.core.deserialize must never have run at all"
+    );
+}
+
+/// Regression test, route 2 of 3: `Deno.core.structuredClone` reaches the
+/// same V8 structured-clone machinery as `deserialize` (see
+/// `deserialize_route_is_closed_by_hiding_deno`'s doc comment) and would
+/// pass a resizable buffer straight through. Closed the same way, by the
+/// same fix (Layer 1 of `BOOTSTRAP_GUARD_SCRIPT`): `Deno` is unreachable, so
+/// `Deno.core.structuredClone` throws `ReferenceError` before it is ever
+/// called.
+#[test]
+fn structured_clone_route_is_closed_by_hiding_deno() {
+    let cap_bytes = 1024 * 1024;
+    let limits = EngineLimits {
+        max_array_buffer_bytes: cap_bytes,
+        max_heap_bytes: 64 * 1024 * 1024,
+    };
+    let module = r"
+        let threw = false;
+        let errorName = '';
+        try {
+            Deno.core.structuredClone(new ArrayBuffer(0));
+        } catch (e) {
+            threw = true;
+            errorName = e.constructor.name;
+        }
+        if (!threw) {
+            throw new Error('Deno.core.structuredClone should be unreachable');
+        }
+        if (errorName !== 'ReferenceError') {
+            throw new Error('expected ReferenceError (Deno undefined), got ' + errorName);
+        }
+    ";
+    let usage = no_usage();
+
+    let result = run_spike_module_blocking(limits, module, &usage, Duration::from_secs(10));
+
     assert!(
-        observed_usage < cap_bytes,
-        "the capped allocator's own usage counter reported {observed_usage} bytes; \
-         a 256 MiB resizable ArrayBuffer must never have actually been committed"
+        result.is_ok(),
+        "expected the structuredClone route to be closed (caught \
+         ReferenceError), got {result:?}"
+    );
+    let observed_usage = usage.load(Ordering::SeqCst);
+    assert_eq!(
+        observed_usage, 0,
+        "the capped allocator's own usage counter must have stayed at 0"
+    );
+}
+
+/// Regression test, route 3 of 3: the guarded `ArrayBuffer` constructor
+/// itself. An earlier version read `options.maxByteLength` once and
+/// rejected it if present -- a TOCTOU bug, since a hostile `options` object
+/// could use a getter that lies on that one read. Confirms the actual fix
+/// (never read or forward `options` at all: the getter below must be called
+/// zero times) and, as defense in depth in case any construction route ever
+/// does produce a resizable buffer, that `.resize`/`.transfer` on it are
+/// unconditionally disabled regardless of receiver -- including via the
+/// `prototype.constructor` bypass (native `TypedArray` construction reaches
+/// the native `ArrayBuffer` constructor directly, not through the
+/// JS-visible global binding).
+#[test]
+fn guarded_constructor_toctou_and_resize_transfer_are_closed() {
+    let cap_bytes = 1024 * 1024;
+    let limits = EngineLimits {
+        max_array_buffer_bytes: cap_bytes,
+        max_heap_bytes: 64 * 1024 * 1024,
+    };
+    let module = r"
+        let getterCalls = 0;
+        const evilOptions = {
+            // Simulates the real TOCTOU shape: lies (undefined, not
+            // resizable) on the first read, in case something still checks
+            // `maxByteLength !== undefined` once and only once, then tells
+            // the truth (a real, dangerous value) on any further read -- the
+            // read the *native* constructor itself would perform if this
+            // object were ever forwarded to it.
+            get maxByteLength() {
+                getterCalls++;
+                return getterCalls === 1 ? undefined : 256 * 1024 * 1024;
+            },
+        };
+        const buf = new ArrayBuffer(0, evilOptions);
+        if (getterCalls !== 0) {
+            throw new Error(
+                'the guarded constructor must never read options at all, read it ' +
+                getterCalls + ' time(s)',
+            );
+        }
+        if (buf.resizable) {
+            throw new Error('buffer must not be resizable despite the TOCTOU options object');
+        }
+
+        let resizeThrew = false;
+        try {
+            buf.resize(0);
+        } catch (e) {
+            resizeThrew = true;
+        }
+        if (!resizeThrew) {
+            throw new Error('ArrayBuffer.prototype.resize must always throw');
+        }
+
+        const ViaPrototype = new Uint8Array(1).buffer.constructor;
+        const viaPrototypeBuf = new ViaPrototype(0, evilOptions);
+        if (viaPrototypeBuf.resizable) {
+            throw new Error('prototype.constructor bypass produced a resizable buffer');
+        }
+        let viaPrototypeResizeThrew = false;
+        try {
+            viaPrototypeBuf.resize(0);
+        } catch (e) {
+            viaPrototypeResizeThrew = true;
+        }
+        if (!viaPrototypeResizeThrew) {
+            throw new Error('resize must throw on a prototype.constructor-bypass buffer too');
+        }
+    ";
+    let usage = no_usage();
+
+    let result = run_spike_module_blocking(limits, module, &usage, Duration::from_secs(10));
+
+    assert!(
+        result.is_ok(),
+        "expected the TOCTOU/resize/transfer checks to pass without \
+         terminating or otherwise erroring the isolate, got {result:?}"
+    );
+    let observed_usage = usage.load(Ordering::SeqCst);
+    assert_eq!(
+        observed_usage, 0,
+        "no actual ArrayBuffer memory should have been committed by this test \
+         (every buffer constructed is 0 bytes); the capped allocator's own \
+         usage counter confirms nothing slipped through"
+    );
+}
+
+/// Review item 3: confirms `BOOTSTRAP_GUARD_SCRIPT`'s Layer 1 actually
+/// removed `Deno`/`globalThis.__bootstrap` from what a user module can see,
+/// not merely that the three specific exploit routes above happen to throw.
+#[test]
+fn deno_and_bootstrap_internals_are_unreachable_from_user_code() {
+    let module = r#"
+        if (typeof globalThis.__bootstrap !== "undefined") {
+            throw new Error("globalThis.__bootstrap must be undefined");
+        }
+        if (typeof Deno !== "undefined") {
+            throw new Error("Deno must be undefined");
+        }
+    "#;
+
+    let result = run_spike_module_blocking(
+        GENEROUS_LIMITS,
+        module,
+        &no_usage(),
+        Duration::from_secs(10),
+    );
+
+    assert!(
+        result.is_ok(),
+        "expected Deno/__bootstrap to be unreachable, got {result:?}"
+    );
+}
+
+/// Non-blocking review item: the guarded `ArrayBuffer` constructor's own
+/// `[[Prototype]]` must be set to the native constructor
+/// (`Object.setPrototypeOf(Guarded, Native)` in `BOOTSTRAP_GUARD_SCRIPT`),
+/// or static methods like `ArrayBuffer.isView` would resolve to `undefined`
+/// (a plain function's own `[[Prototype]]` is `Function.prototype`, which
+/// does not have `isView`).
+#[test]
+fn array_buffer_statics_are_preserved() {
+    let module = r#"
+        if (ArrayBuffer.isView(new Uint8Array(1)) !== true) {
+            throw new Error("ArrayBuffer.isView(new Uint8Array(1)) must be true");
+        }
+        if (ArrayBuffer.isView({}) !== false) {
+            throw new Error("ArrayBuffer.isView({}) must be false");
+        }
+    "#;
+
+    let result = run_spike_module_blocking(
+        GENEROUS_LIMITS,
+        module,
+        &no_usage(),
+        Duration::from_secs(10),
+    );
+
+    assert!(
+        result.is_ok(),
+        "expected ArrayBuffer's static methods to still work, got {result:?}"
+    );
+}
+
+/// Self-check probe (review ask: "run a quick self-check probe for other
+/// resizable/growable creation routes"). Tried, with the outcome found:
+///   - `eval("new ArrayBuffer(0, {maxByteLength:...})")` and
+///     `new Function(...)` returning the same expression: both run in this
+///     isolate's one realm, so both resolve the identifier `ArrayBuffer` to
+///     the same guarded constructor ordinary code gets -- neither is a
+///     distinct route. Asserted below, not just reasoned about.
+///   - `new Response(...)`/other Fetch API constructors: not present (bare
+///     `deno_core` with no `deno_fetch`/`deno_web` extension registered --
+///     `typeof Response === "undefined"`; asserted below).
+///   - `DataView` over a resizable buffer, tracking its live length: no
+///     resizable buffer can exist at all (Layers 1+2), so this has no
+///     buffer to attach to; `DataView` itself is asserted still present and
+///     usable over an ordinary fixed buffer, since it is a legitimate,
+///     harmless API this crate has no reason to remove.
+///   - `Atomics.waitAsync`: requires a `SharedArrayBuffer`-backed view
+///     (throws `TypeError` otherwise, per spec); `SharedArrayBuffer` itself
+///     is `undefined` (`wasm_and_shared_array_buffer_are_not_exposed`), so
+///     this route has no reachable input. Not re-asserted here (already
+///     covered by that test); listed for completeness of the probe.
+///   - `WebAssembly.Memory` (growable): needs `WebAssembly`, already
+///     confirmed `undefined` under `--jitless` by
+///     `wasm_and_shared_array_buffer_are_not_exposed`.
+#[test]
+fn other_construction_routes_do_not_bypass_the_array_buffer_guard() {
+    let module = r#"
+        const evalBuf = eval("new ArrayBuffer(0, { maxByteLength: 1024 })");
+        if (evalBuf.resizable) {
+            throw new Error("eval() bypassed the ArrayBuffer guard");
+        }
+
+        const fnBuf = new Function(
+            "return new ArrayBuffer(0, { maxByteLength: 1024 });",
+        )();
+        if (fnBuf.resizable) {
+            throw new Error("new Function(...)() bypassed the ArrayBuffer guard");
+        }
+
+        if (typeof Response !== "undefined") {
+            throw new Error("Response must not be present (no deno_fetch/deno_web extension)");
+        }
+
+        if (typeof DataView !== "function") {
+            throw new Error("DataView must still be present for ordinary fixed buffers");
+        }
+        const view = new DataView(new ArrayBuffer(4));
+        view.setUint32(0, 0xdead_beef);
+        if (view.getUint32(0) !== 0xdead_beef) {
+            throw new Error("DataView over an ordinary fixed buffer must still work");
+        }
+    "#;
+
+    let result = run_spike_module_blocking(
+        GENEROUS_LIMITS,
+        module,
+        &no_usage(),
+        Duration::from_secs(10),
+    );
+
+    assert!(
+        result.is_ok(),
+        "expected the probed routes to be closed (or, for DataView, to keep \
+         working normally over ordinary buffers), got {result:?}"
     );
 }
 
@@ -272,7 +512,7 @@ fn heap_limit_terminates_the_isolate_without_aborting_the_process() {
     let followup = run_spike_module_blocking(
         GENEROUS_LIMITS,
         r#"
-            const pong = Deno.core.ops.op_apsides_spike_ping();
+            const pong = __apsidesOps.ping();
             if (pong !== "pong-from-rust") {
                 throw new Error("op broken after a prior isolate's heap-limit termination");
             }

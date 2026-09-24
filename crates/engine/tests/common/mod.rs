@@ -59,6 +59,29 @@ pub fn apply_deny_all_or_fail_closed(allow_no_landlock: bool) -> Result<Restrict
     Ok(status)
 }
 
+/// Counts this process's threads via `/proc/self/task` (one entry per
+/// thread, including the calling one). Used by `tests/landlock_order.rs` to
+/// assert exactly one thread exists immediately before it applies Landlock,
+/// so the test's own premise -- that lockdown genuinely happens before V8's
+/// or tokio's worker threads are created, not just before this function
+/// checks for them -- is verified, not merely assumed: a future edit that
+/// moved V8/tokio init above the lockdown call would make this count `> 1`
+/// and fail the test, instead of silently passing on a since-invalidated
+/// assumption. Reads `/proc/self/task` itself (not e.g.
+/// `std::thread::available_parallelism`, which reports CPU count, not
+/// live thread count), so it must run *before* Landlock denies filesystem
+/// reads.
+pub fn count_process_threads() -> Result<usize, String> {
+    let entries = fs::read_dir("/proc/self/task")
+        .map_err(|err| format!("failed to read /proc/self/task: {err}"))?;
+    let mut count = 0usize;
+    for entry in entries {
+        entry.map_err(|err| format!("failed to read a /proc/self/task entry: {err}"))?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 /// Attempts to open [`DENY_ALL_PROBE_PATH`] and returns `Ok(())` only if
 /// that fails with a permission-denied-shaped error (what a deny-all
 /// Landlock ruleset produces). `context` names the thread/call site for the

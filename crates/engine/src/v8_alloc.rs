@@ -14,14 +14,18 @@
 // memory V8 itself requests through `v8::ArrayBuffer::Allocator` -- i.e.
 // ordinary `new ArrayBuffer(n)` / `new Uint8Array(n)` allocations. It does
 // **not** cover:
-//   - Resizable/growable `ArrayBuffer`s (`new ArrayBuffer(0, {maxByteLength})`):
-//     V8 reserves/commits their backing memory through its own page
-//     allocator, bypassing this vtable entirely, and `.resize()` can then
-//     grow one past this cap with zero calls into `allocate`. That JS-level
-//     construction path is closed separately, in `lib.rs`'s bootstrap guard
-//     script (`ARRAY_BUFFER_GUARD_SCRIPT`), before user code runs; see
-//     `tests/spike.rs`'s `resizable_array_buffer_construction_is_rejected`
-//     for the regression test.
+//   - Resizable/growable `ArrayBuffer`s (`new ArrayBuffer(0, {maxByteLength})`,
+//     and `Deno.core.deserialize`/`structuredClone`, which can produce one
+//     directly from V8's structured-clone deserializer): V8
+//     reserves/commits their backing memory through its own page allocator,
+//     bypassing this vtable entirely, and `.resize()` can then grow one past
+//     this cap with zero calls into `allocate`. Both are closed separately,
+//     in `lib.rs`'s bootstrap guard script (`BOOTSTRAP_GUARD_SCRIPT`), before
+//     user code runs; see `tests/spike.rs`'s
+//     `deserialize_route_is_closed_by_hiding_deno`,
+//     `structured_clone_route_is_closed_by_hiding_deno`, and
+//     `guarded_constructor_toctou_and_resize_transfer_are_closed` for the
+//     regression tests (one per bypass route two review rounds found).
 //   - Backing stores an op builds directly from a Rust `Box<[u8]>` (e.g. via
 //     `serde_v8`'s buffer conversions) and hands to V8 as an already-owned
 //     buffer. Those never call into this allocator's `allocate`/

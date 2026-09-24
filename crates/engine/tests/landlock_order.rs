@@ -36,11 +36,31 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
-use common::{SPIKE_HTTPS_HOST, apply_deny_all_or_fail_closed, assert_file_open_denied};
+use common::{
+    SPIKE_HTTPS_HOST, apply_deny_all_or_fail_closed, assert_file_open_denied, count_process_threads,
+};
 use engine::EngineLimits;
 use landlock::RulesetStatus;
 
 fn main() -> Result<(), String> {
+    // 0. Verify this test's own premise, rather than assuming it: exactly
+    //    one thread (this one) must exist right now, before Landlock is
+    //    applied. If a future edit moved V8 platform init or the tokio
+    //    runtime build above step 1 below, threads would already exist
+    //    here, this assertion would fail, and steps (b)/(c) further down
+    //    would otherwise have silently stopped proving anything (they'd
+    //    still find *later* threads restricted, but not the ones created
+    //    by that hypothetical earlier, unrestricted init).
+    let thread_count = count_process_threads()?;
+    if thread_count != 1 {
+        return Err(format!(
+            "expected exactly one thread before Landlock lockdown (this \
+             test's whole point is that lockdown happens before any other \
+             thread, including V8's or tokio's worker threads, is \
+             created), found {thread_count} entries in /proc/self/task"
+        ));
+    }
+
     // 1. Landlock deny-all FIRST -- before V8 platform init, before any
     //    tokio runtime, before any other thread exists in this process at
     //    all -- so every thread spawned from here on inherits it.
@@ -157,7 +177,7 @@ fn run_gc_heavy_handler() -> Result<(), String> {
             }
             chunks = null;
         }
-        const pong = Deno.core.ops.op_apsides_spike_ping();
+        const pong = __apsidesOps.ping();
         if (pong !== "pong-from-rust") {
             throw new Error("op broken after GC-heavy work under lockdown");
         }

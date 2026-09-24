@@ -127,7 +127,7 @@ fn handler_and_hickory_https_work_after_v8_init_and_landlock_lockdown() -> Resul
 )]
 async fn run_handler_module_under_lockdown() -> Result<(), String> {
     let module = r#"
-        const pong = Deno.core.ops.op_apsides_spike_ping();
+        const pong = __apsidesOps.ping();
         if (pong !== "pong-from-rust") {
             throw new Error("op broken under Landlock lockdown");
         }

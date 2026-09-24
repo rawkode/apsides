@@ -3,13 +3,16 @@
 //!
 //! This crate is deliberately small: it proves that a pinned `deno_core`
 //! can be embedded with a capped `ArrayBuffer` allocator, a heap limit that
-//! terminates the isolate (not the process) on approach, restrictive V8
-//! flags (`--jitless`, no `WebAssembly`, no `SharedArrayBuffer`) applied
-//! before platform init, a JS-level bootstrap guard that closes the
-//! resizable-`ArrayBuffer` gap those caps leave open, and a module loader
-//! with no filesystem access — one op, one in-memory module, one isolate
-//! per call. It is not the Phase 5b event-plane engine (no ops beyond the
-//! spike ping, no fetch/output ops, no queueing).
+//! requests isolate termination on approach, restrictive V8 flags
+//! (`--jitless`, no `WebAssembly`, no `SharedArrayBuffer`) applied before
+//! platform init, a JS-level bootstrap guard that closes the resizable-
+//! `ArrayBuffer` gap those caps leave open (including through `deno_core`'s
+//! own `Deno.core.deserialize`/`structuredClone`, which reach V8's
+//! structured-clone deserializer directly and never call the JS-visible
+//! `ArrayBuffer` constructor at all — see [`BOOTSTRAP_GUARD_SCRIPT`]), and a
+//! module loader with no filesystem access — one op, one in-memory module,
+//! one isolate per call. It is not the Phase 5b event-plane engine (no ops
+//! beyond the spike ping, no fetch/output ops, no queueing).
 //!
 //! Kept separate from `runtime` because `runtime/src/lib.rs` carries
 //! `#![forbid(unsafe_code)]`, which cannot be locally relaxed; see the
@@ -64,52 +67,102 @@ use thiserror::Error;
 const SPIKE_V8_FLAGS: &str = "--jitless --enable-sharedarraybuffer-per-context";
 
 /// Runs once, synchronously, in every isolate this crate builds (see
-/// `prepare_isolate`), before any user module code, and replaces
-/// `ArrayBuffer`'s (and, defensively, `SharedArrayBuffer`'s, in case a
-/// future V8 upgrade re-exposes it) constructor with one that rejects a
-/// `maxByteLength` option and freezes both the constructor and its
-/// prototype so user code cannot restore or bypass it.
+/// `prepare_isolate`), before any user module code. Two layers, found
+/// necessary by two rounds of review:
 ///
-/// This closes a real gap found in review: the capped allocator in
-/// `v8_alloc.rs` only governs ordinary, fixed-size `ArrayBuffer`
-/// allocations. A *resizable* `ArrayBuffer` (`new ArrayBuffer(0,
-/// {maxByteLength: N})`, then `.resize(N)`) is backed by memory V8 reserves
-/// and commits through its own page allocator, never calling into the
-/// custom `v8::ArrayBuffer::Allocator` vtable at all -- so
-/// `array_buffer_allocation_over_the_cap_...` tests in `tests/spike.rs`
-/// would not have caught `new ArrayBuffer(0, {maxByteLength: 256 <<
-/// 20}).resize(256 << 20)` succeeding well past a 1 MiB cap. There is no V8
-/// build flag to disable resizable `ArrayBuffer`s in this pinned version
-/// (checked: no `resizable`/`growable`/`max_byte_length` flag exists in
-/// `v8-150.4.0/src/flags/flag-definitions.h`), so this closes it at the JS
-/// level instead. See `tests/spike.rs`'s
-/// `resizable_array_buffer_construction_is_rejected` for the regression
-/// test, which reproduces the exact construction the review flagged and
-/// asserts it now throws and never allocates past the cap.
+/// **Layer 1 -- hide `deno_core`'s own internals from user code.** Captures
+/// exactly the one op this engine's own curated `globalThis.__apsidesOps`
+/// surface needs, then deletes `globalThis.Deno` and `globalThis.__bootstrap`
+/// entirely (a pattern `deno_core` itself anticipates and supports -- see
+/// `01_core.js`'s comment on the "harness" that "deletes
+/// `globalThis.__bootstrap`"). This is what actually closes the review's
+/// found bypasses through `Deno.core.deserialize`/`Deno.core.structuredClone`
+/// (and, incidentally, everything else under `Deno.core`, e.g.
+/// `Deno.core.evalContext`): those reach V8's structured-clone deserializer,
+/// which builds `ArrayBuffer`s (including resizable ones, from a suitable
+/// serialized tag) directly in C++, never through the JS-visible
+/// `ArrayBuffer` constructor Layer 2 guards -- so Layer 2 alone did not
+/// close them; they were only reachable at all via `Deno.core`, which no
+/// longer exists once this runs.
 ///
-/// Patches `NativeCtor.prototype.constructor`, not just the `globalThis`
-/// binding: patching only the global name would still let user code recover
-/// the native, unguarded constructor via any existing instance's prototype
-/// chain (e.g. `new Uint8Array(1).buffer.constructor`), since ordinary
-/// `TypedArray` construction allocates its backing `ArrayBuffer` through an
-/// internal V8 builtin that never consults the JS-visible global binding.
-const ARRAY_BUFFER_GUARD_SCRIPT: &str = r#""use strict";
+/// **Layer 2 -- make growing *any* `ArrayBuffer`/`SharedArrayBuffer`
+/// impossible, regardless of how it was constructed.** The capped allocator
+/// in `v8_alloc.rs` only governs ordinary, fixed-size `ArrayBuffer`
+/// allocations: a *resizable* one (`new ArrayBuffer(0, {maxByteLength: N})`,
+/// then `.resize(N)`) is backed by memory V8 reserves/commits through its
+/// own page allocator, never calling into the custom
+/// `v8::ArrayBuffer::Allocator` vtable at all. There is no V8 build flag to
+/// disable resizable `ArrayBuffer`s in this pinned version (checked: no
+/// `resizable`/`growable`/`max_byte_length` flag exists in
+/// `v8-150.4.0/src/flags/flag-definitions.h`). This layer:
+///   - Replaces the constructor with one that **never reads or forwards a
+///     second (`options`) argument at all** (found in review: an earlier
+///     version that read `options.maxByteLength` once and rejected it if
+///     present was a TOCTOU bug -- a getter on `options.maxByteLength` that
+///     returns `undefined` on that one read but a real value if the native
+///     constructor were to read it again could have smuggled a resizable
+///     buffer through; never forwarding `options` at all removes that class
+///     of bug structurally, since the native constructor is now never
+///     invoked with anything that could contain `maxByteLength`).
+///   - Also patches `NativeCtor.prototype.constructor`, not just the
+///     `globalThis` binding: patching only the global name would still let
+///     user code recover the native, unguarded constructor via any existing
+///     instance's prototype chain (e.g. `new Uint8Array(1).buffer.constructor`),
+///     since ordinary `TypedArray` construction allocates its backing
+///     `ArrayBuffer` through an internal V8 builtin that never consults the
+///     JS-visible global binding.
+///   - Most importantly, replaces `NativeCtor.prototype.resize` with a
+///     function that **always throws, unconditionally, regardless of the
+///     receiver**, and `.transfer` with one that throws when `this.resizable`
+///     (`.transfer()` on a resizable buffer produces another resizable
+///     buffer, preserving resizability; `.transferToFixedLength()` is left
+///     alone, since it always produces a fixed buffer). Every `ArrayBuffer`
+///     instance in one realm, however it was constructed -- via this guarded
+///     constructor, via the raw native one if somehow still reachable, or
+///     via `Deno.core.deserialize` before Layer 1 ran -- shares this one
+///     `%ArrayBuffer.prototype%` object, so this is the layer that actually
+///     closes every construction route uniformly, including ones this
+///     review (or a future one) did not enumerate.
+///   - Sets `Guarded`'s own `[[Prototype]]` to `Native` (`Object.setPrototypeOf`),
+///     so static methods/properties users depend on --
+///     `ArrayBuffer.isView`, `ArrayBuffer[Symbol.species]` -- still resolve
+///     through the guarded constructor (found in review: without this,
+///     `Guarded.isView` would be `undefined`, since a plain function's own
+///     `[[Prototype]]` is `Function.prototype`, not `Native`).
+///
+/// See `tests/spike.rs` for the regression tests: one per bypass route this
+/// and the prior review round found, plus the static-preservation and
+/// Deno-unreachability checks.
+const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
 (() => {
+  // Layer 1: hide deno_core's own internals. Captures only the one op
+  // function this spike needs before deleting every other route to it.
+  const opPing = globalThis.Deno.core.ops.op_apsides_spike_ping;
+  globalThis.__apsidesOps = Object.freeze({
+    ping: () => opPing(),
+  });
+  delete globalThis.Deno;
+  delete globalThis.__bootstrap;
+
+  // Layer 2: make growing any ArrayBuffer/SharedArrayBuffer impossible,
+  // regardless of construction route.
   function guardResizable(name) {
     const Native = globalThis[name];
     if (typeof Native !== "function") {
       return;
     }
-    function Guarded(length, options) {
+    function Guarded(length) {
       if (new.target === undefined) {
         throw new TypeError(`Constructor ${name} requires 'new'`);
       }
-      if (options !== undefined && options !== null && options.maxByteLength !== undefined) {
-        throw new RangeError(`resizable/growable ${name} is disabled in this sandbox`);
-      }
-      return Reflect.construct(Native, [length, options], new.target);
+      // Never forwards a second argument: the native constructor is only
+      // ever invoked with `length`, so there is no `options` value --
+      // plain or a hostile getter -- for it to ever read a
+      // `maxByteLength` from.
+      return Reflect.construct(Native, [length], new.target);
     }
     Guarded.prototype = Native.prototype;
+    Object.setPrototypeOf(Guarded, Native);
     Object.defineProperty(Guarded, "name", { value: name, configurable: true });
     Object.defineProperty(Guarded, "length", { value: 1, configurable: true });
     Object.defineProperty(Native.prototype, "constructor", {
@@ -117,6 +170,30 @@ const ARRAY_BUFFER_GUARD_SCRIPT: &str = r#""use strict";
       writable: false,
       configurable: false,
     });
+
+    Object.defineProperty(Native.prototype, "resize", {
+      value: function resize() {
+        throw new TypeError(`${name}.prototype.resize is disabled in this sandbox`);
+      },
+      writable: false,
+      configurable: false,
+    });
+    if (typeof Native.prototype.transfer === "function") {
+      const nativeTransfer = Native.prototype.transfer;
+      Object.defineProperty(Native.prototype, "transfer", {
+        value: function transfer(...args) {
+          if (this.resizable) {
+            throw new TypeError(
+              `${name}.prototype.transfer of a resizable buffer is disabled in this sandbox`,
+            );
+          }
+          return Reflect.apply(nativeTransfer, this, args);
+        },
+        writable: false,
+        configurable: false,
+      });
+    }
+
     Object.defineProperty(globalThis, name, {
       value: Guarded,
       writable: false,
@@ -165,7 +242,7 @@ pub struct EngineLimits {
     /// `array_buffer_allocation_over_the_cap_terminates_the_isolate_without_aborting_the_process`
     /// in `tests/spike.rs` for why, and the Phase 5a report for the open
     /// design question this leaves for Phase 5b. Does not by itself cover
-    /// resizable `ArrayBuffer`s (see `ARRAY_BUFFER_GUARD_SCRIPT`) or
+    /// resizable `ArrayBuffer`s or `Deno.core.deserialize`/`structuredClone` (see `BOOTSTRAP_GUARD_SCRIPT`) or
     /// op-created backing stores (see `v8_alloc.rs`'s module doc comment).
     pub max_array_buffer_bytes: usize,
     /// V8 heap size (young + old generation) at which the near-heap-limit
@@ -215,7 +292,7 @@ impl EngineError {
 /// A freshly built, not-yet-run isolate: the V8 platform is initialized,
 /// the capped allocator and heap limits are set, the module loader only
 /// knows `module_code` (see `StaticModuleLoader`'s docs -- no filesystem
-/// access, no other module reachable), and `ARRAY_BUFFER_GUARD_SCRIPT` has
+/// access, no other module reachable), and `BOOTSTRAP_GUARD_SCRIPT` has
 /// already run. Produced only by [`prepare_isolate`].
 struct PreparedIsolate {
     runtime: JsRuntime,
@@ -232,7 +309,7 @@ struct PreparedIsolate {
 /// under a fixed specifier and nothing else (no `FsModuleLoader`: that
 /// would let a static or dynamic `import` in `module_code` read arbitrary
 /// files from disk, independently of any OS-level lockdown), and runs
-/// [`ARRAY_BUFFER_GUARD_SCRIPT`] before returning.
+/// [`BOOTSTRAP_GUARD_SCRIPT`] before returning.
 fn prepare_isolate(
     limits: EngineLimits,
     module_code: &'static str,
@@ -265,8 +342,8 @@ fn prepare_isolate(
 
     runtime
         .execute_script(
-            "ext:apsides-engine/array_buffer_guard.js",
-            ARRAY_BUFFER_GUARD_SCRIPT,
+            "ext:apsides-engine/bootstrap_guard.js",
+            BOOTSTRAP_GUARD_SCRIPT,
         )
         .map_err(EngineError::Bootstrap)?;
 
@@ -283,31 +360,58 @@ fn spike_module_specifier() -> Result<ModuleSpecifier, EngineError> {
     ModuleSpecifier::parse("file:///apsides-engine-spike/main.js").map_err(EngineError::Specifier)
 }
 
-/// Bytes of heap-limit headroom granted, once, by [`install_heap_limit_callback`].
-const HEAP_LIMIT_TERMINATION_HEADROOM_BYTES: usize = 8 * 1024 * 1024;
+/// Bytes of heap-limit headroom granted per call by
+/// [`install_heap_limit_callback`], up to [`HEAP_LIMIT_TERMINATION_HEADROOM_TOTAL_CAP_BYTES`]
+/// in total.
+const HEAP_LIMIT_TERMINATION_HEADROOM_STEP_BYTES: usize = 8 * 1024 * 1024;
+
+/// Hard total cap on cumulative headroom [`install_heap_limit_callback`]
+/// will ever grant one isolate, across every call. Bounds how long
+/// termination can be deferred while still giving V8 a few chances (not
+/// just one) to unwind cleanly; see that function's doc comment for why one
+/// grant was found, in review, not always to be enough.
+const HEAP_LIMIT_TERMINATION_HEADROOM_TOTAL_CAP_BYTES: usize =
+    4 * HEAP_LIMIT_TERMINATION_HEADROOM_STEP_BYTES;
 
 /// Installs the near-heap-limit callback that terminates `runtime`'s
 /// isolate (via `isolate_handle`) when its V8 heap approaches
 /// `EngineLimits::max_heap_bytes`.
 ///
-/// Grants a single, fixed headroom bump the *first* time the callback
-/// fires (found in review to need fixing: the original version granted
+/// Grants a fixed headroom step on each call, up to a hard total cap
+/// (found in review to need fixing twice: the original version granted
 /// `current * 1.5` on *every* call, unbounded, which would let a genuinely
 /// runaway isolate keep re-triggering the callback and keep growing the
-/// limit indefinitely instead of actually being terminated). Every
-/// subsequent call returns the limit unchanged: `terminate_execution()` has
-/// already been (re-)requested, and V8 keeps invoking this callback each
-/// time it re-approaches the (now slightly higher) ceiling while unwinding
-/// the terminated script, so the headroom must not grow further.
+/// limit indefinitely instead of actually being terminated; a
+/// single-headroom-ever version fixed that but was too strict --
+/// `terminate_execution()` does not always unwind within one GC pass, so a
+/// large runaway allocation could hit the callback again before actually
+/// stopping, with no headroom left to survive it).
+///
+/// **This does not guarantee the controller process never aborts.** Once
+/// the total cap is exhausted, every further call returns `current`
+/// unchanged while still requesting termination again; if V8 is still not
+/// making progress after that many grants, V8's own fallback is
+/// `V8::FatalProcessOutOfMemory`, which aborts the process. This crate
+/// cannot close that gap without deeper V8 integration (e.g. inspecting
+/// `Isolate::get_heap_statistics()` inside the callback to distinguish "GC
+/// is still reclaiming, give it another grant" from "this isolate is
+/// genuinely never going to stop", which review left as an open question
+/// for Phase 5b, not fixed here -- see `EngineLimits::max_array_buffer_bytes`'s
+/// doc comment for the same trade-off on the array-buffer-cap path). What
+/// this callback does guarantee: termination is requested on the very
+/// first call, and every isolate this crate's own tests actually exercise
+/// (including the deliberately-runaway ones) terminates well within the
+/// total cap -- see `tests/spike.rs`.
 fn install_heap_limit_callback(runtime: &mut JsRuntime, isolate_handle: v8::IsolateHandle) {
-    let mut headroom_granted = false;
+    let mut headroom_granted_bytes: usize = 0;
     runtime.add_near_heap_limit_callback(move |current, initial| {
         isolate_handle.terminate_execution();
-        if headroom_granted {
+        if headroom_granted_bytes >= HEAP_LIMIT_TERMINATION_HEADROOM_TOTAL_CAP_BYTES {
             return current;
         }
-        headroom_granted = true;
-        initial.saturating_add(HEAP_LIMIT_TERMINATION_HEADROOM_BYTES)
+        headroom_granted_bytes =
+            headroom_granted_bytes.saturating_add(HEAP_LIMIT_TERMINATION_HEADROOM_STEP_BYTES);
+        initial.saturating_add(headroom_granted_bytes)
     });
 }
 
@@ -338,9 +442,13 @@ async fn drive_to_completion(
 /// isolate built with `limits`, registering the spike's one op extension.
 ///
 /// Returns `Err` on any JS-side failure, including a heap-limit or
-/// array-buffer-cap termination (see [`EngineError::is_isolate_termination`])
-/// — never aborts the process (that is the property this spike exists to
-/// prove; see `tests/spike.rs`).
+/// array-buffer-cap termination (see [`EngineError::is_isolate_termination`]).
+/// Every termination this crate's own tests exercise stays well within
+/// [`install_heap_limit_callback`]'s headroom cap and so surfaces as this
+/// `Err`, not a process abort -- see `tests/spike.rs` -- but that callback's
+/// doc comment explains why this crate cannot *guarantee* the process never
+/// aborts in the pathological case where V8 still cannot unwind after the
+/// full headroom cap is spent.
 ///
 /// `usage` reports the capped `ArrayBuffer` allocator's live byte usage
 /// (see `v8_alloc::capped_array_buffer_allocator`); pass a fresh
@@ -410,6 +518,17 @@ pub async fn run_spike_module(
 /// still reaches (that is its documented purpose). See
 /// `tests/spike.rs`'s `watchdog_thread_terminates_a_synchronous_infinite_loop`.
 ///
+/// The watchdog thread does not linger past this call (found in review to
+/// need fixing: an earlier version just `sleep`d for `terminate_after`
+/// unconditionally, so a run that finished well before the deadline still
+/// left a thread parked asleep until the full duration elapsed): it blocks
+/// on a channel with `terminate_after` as the `recv_timeout` deadline
+/// instead of a bare `sleep`, so dropping the sending half here (once
+/// `drive_to_completion` returns, however it returns) wakes it immediately
+/// with `Disconnected` rather than `Timeout`, and it exits without calling
+/// `terminate_execution()`. This function joins it before returning either
+/// way, so it never returns with the watchdog thread still alive.
+///
 /// # Errors
 ///
 /// See [`run_spike_module`]'s `# Errors`; additionally returns
@@ -428,17 +547,36 @@ pub fn run_spike_module_with_watchdog(
 
     install_heap_limit_callback(&mut runtime, isolate_handle.clone());
 
-    std::thread::spawn(move || {
-        std::thread::sleep(terminate_after);
-        isolate_handle.terminate_execution();
+    let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        // `Timeout`: the deadline passed with the run still going --
+        // terminate it. `Disconnected` (the sender was dropped below,
+        // meaning the run already finished): exit without touching the
+        // isolate. Nothing is ever sent on this channel; it exists only
+        // for its `Disconnected` signal.
+        if matches!(
+            cancel_rx.recv_timeout(terminate_after),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            isolate_handle.terminate_execution();
+        }
     });
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .map_err(SpikeRunError::Runtime)?;
-    rt.block_on(drive_to_completion(&mut runtime, &specifier))
-        .map_err(SpikeRunError::Engine)
+    let result = rt
+        .block_on(drive_to_completion(&mut runtime, &specifier))
+        .map_err(SpikeRunError::Engine);
+
+    drop(cancel_tx);
+    // A panicking watchdog thread (it cannot: the closure above has no
+    // fallible/panicking calls) would be the only way `join` returns
+    // `Err`; there is nothing more to do with that here than let it drop.
+    let _ = watchdog.join();
+
+    result
 }
 
 /// Runs `run_spike_module` on a fresh single-threaded current-thread tokio
