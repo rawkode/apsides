@@ -68,16 +68,23 @@ pub enum RuntimeError {
 /// Set at the end of `startup::start`'s synchronous startup phase (see the
 /// Apsides v0.3 plan, Phase 5c). `NoneFixture` is reachable only when
 /// Landlock was not enforced by the running kernel *and* the fixture-only
-/// `allowNoLandlock`
-/// escape hatch was set -- `start` fails closed before ever reaching
-/// `run_locked` for every other case, including every production-mode
-/// startup, so a production `ProductionController` can only ever report
-/// `Landlock`. Serializes to exactly the two lowercase, hyphenated values
-/// the plan names for `/status`: `"landlock"` and `"none-fixture"`.
+/// `allowNoLandlock` escape hatch was set -- `start` fails closed before
+/// ever reaching `run_locked` for every other case, including every
+/// production-mode startup where the kernel enforces nothing at all, so a
+/// production `ProductionController` can only ever report `Landlock` or
+/// `LandlockPartial`, never `NoneFixture`. `LandlockPartial` reports
+/// `engine::LockdownOutcome::PartiallyEnforced` distinctly rather than
+/// folding it into `Landlock` -- real enforcement on a best-effort basis
+/// (e.g. an older Landlock ABI that lacks a couple of the rights this
+/// crate requests), not a fail-closed condition, but worth surfacing
+/// rather than silently reporting as full enforcement. Serializes to
+/// exactly the lowercase, hyphenated values the plan names for `/status`:
+/// `"landlock"`, `"landlock-partial"`, and `"none-fixture"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LockdownState {
     Landlock,
+    LandlockPartial,
     NoneFixture,
 }
 
@@ -1803,6 +1810,37 @@ mod tests {
             candidate["clusters"][0]["cluster"] = cluster_override;
             let parsed = Kubeconfig::from_yaml(&candidate.to_string())?;
             assert!(validate_fixture_kubeconfig(&parsed, "kind-fixture").is_err());
+        }
+        Ok(())
+    }
+
+    /// See the Apsides v0.3 plan, Phase 5c review: fixture mode's kube
+    /// client keeps the stock `kube-client` connector (glibc
+    /// `getaddrinfo`, via `Config::from_custom_kubeconfig`/`Client::try_from`),
+    /// unlike production's dedicated hickory connector -- fine for a
+    /// loopback IP literal, which never needs DNS at all, but a hostname
+    /// server would need `/etc/resolv.conf`/`/etc/hosts` on every
+    /// reconnect, exactly what Landlock denies after lockdown. Requiring a
+    /// loopback IP literal (already covered, among other rejected shapes,
+    /// by `fixture_kubeconfig_accepts_only_inline_token_and_ca`'s
+    /// `"https://localhost:6443"` case) is what rules this out
+    /// structurally; this test names that property on its own, with a
+    /// second, more realistic-looking hostname shape.
+    #[test]
+    fn fixture_kubeconfig_rejects_a_hostname_server() -> TestResult {
+        let valid = fixture_kubeconfig();
+        for server in [
+            "https://localhost:6443",
+            "https://kind-control-plane:6443",
+            "https://api.cluster.example:6443",
+        ] {
+            let mut candidate = valid.clone();
+            candidate["clusters"][0]["cluster"]["server"] = Value::String(server.into());
+            let parsed = Kubeconfig::from_yaml(&candidate.to_string())?;
+            let error = validate_fixture_kubeconfig(&parsed, "kind-fixture")
+                .err()
+                .ok_or_else(|| format!("hostname server {server:?} must be rejected"))?;
+            assert!(error.to_string().contains("loopback"), "{error}");
         }
         Ok(())
     }

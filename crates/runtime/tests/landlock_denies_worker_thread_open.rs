@@ -44,7 +44,7 @@ fn main() -> Result<(), String> {
     }
 
     let outcome = engine::apply_deny_all_or_fail_closed(true).map_err(|err| err.to_string())?;
-    let supported = outcome == engine::LockdownOutcome::Enforced;
+    let supported = outcome != engine::LockdownOutcome::NotEnforced;
     eprintln!("[landlock-worker-thread] lockdown outcome: {outcome:?} (supported={supported})");
 
     let rt = tokio::runtime::Builder::new_multi_thread()

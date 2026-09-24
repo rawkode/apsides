@@ -64,7 +64,7 @@ fn main() -> Result<(), String> {
     //    tokio runtime, before any other thread exists in this process at
     //    all -- so every thread spawned from here on inherits it.
     let status = apply_deny_all_or_fail_closed(true)?;
-    let supported = status == LockdownOutcome::Enforced;
+    let supported = status != LockdownOutcome::NotEnforced;
     eprintln!("[landlock-order] landlock status: {status:?} (supported={supported})");
 
     if supported {

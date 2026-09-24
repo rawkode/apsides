@@ -105,6 +105,19 @@ pub fn start(
         }
     };
 
+    // Read before lockdown, same as every other startup input: under
+    // cgroup CPU quotas (every Kubernetes Pod with resource limits),
+    // `std::thread::available_parallelism` reads `/sys/fs/cgroup/cpu.max`
+    // (cgroup v2) or `/proc/self/cgroup` + the v1 quota/period files,
+    // falling back to the process's CPU affinity mask only if those are
+    // unreadable. Denied by Landlock like every other path, that read
+    // would silently fail closed to the *affinity* count instead -- on a
+    // large node, that is every core on the node, not the Pod's actual
+    // quota, which would oversubscribe the tokio runtime's worker thread
+    // pool relative to what the container can actually schedule.
+    let worker_threads =
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+
     // (e): deny-all Landlock, on the main thread, before any other thread
     // in this process exists -- checked, not assumed (see this module's
     // doc comment on why this precondition and the lockdown itself both
@@ -126,8 +139,10 @@ pub fn start(
     engine::ensure_platform_initialized();
 
     // (f): only now does a tokio runtime -- and therefore any of its own
-    // worker threads -- get built.
+    // worker threads -- get built. `worker_threads` was already read above,
+    // before lockdown.
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
         .enable_all()
         .build()
         .map_err(|error| {
@@ -145,6 +160,7 @@ pub fn start(
 const fn lockdown_state_for(outcome: engine::LockdownOutcome) -> LockdownState {
     match outcome {
         engine::LockdownOutcome::Enforced => LockdownState::Landlock,
+        engine::LockdownOutcome::PartiallyEnforced => LockdownState::LandlockPartial,
         engine::LockdownOutcome::NotEnforced => LockdownState::NoneFixture,
     }
 }
@@ -159,6 +175,10 @@ mod tests {
         assert_eq!(
             lockdown_state_for(engine::LockdownOutcome::Enforced),
             LockdownState::Landlock
+        );
+        assert_eq!(
+            lockdown_state_for(engine::LockdownOutcome::PartiallyEnforced),
+            LockdownState::LandlockPartial
         );
         assert_eq!(
             lockdown_state_for(engine::LockdownOutcome::NotEnforced),

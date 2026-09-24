@@ -43,11 +43,26 @@ pub enum LockdownError {
 
 /// Whether the deny-all ruleset [`apply_deny_all_or_fail_closed`] applied
 /// was actually enforced by the running kernel.
+///
+/// The three `landlock::RulesetStatus` outcomes, kept distinct (not
+/// collapsed together) so a caller can report exactly what the kernel
+/// enforced, rather than treating `PartiallyEnforced` as indistinguishable
+/// from `FullyEnforced`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockdownOutcome {
     /// Every handled filesystem-access right is denied for every path, for
-    /// the calling thread and every thread created after it.
+    /// the calling thread and every thread created after it
+    /// (`RulesetStatus::FullyEnforced`).
     Enforced,
+    /// The running kernel's Landlock ABI does not support every handled
+    /// right this crate requested (e.g. ABI V7 lacks a couple of the
+    /// rights ABI V9 requests, such as `IoctlDev`), so only a subset is
+    /// actually denied -- still real enforcement, on a best-effort basis,
+    /// not a fail-closed condition (`RulesetStatus::PartiallyEnforced`;
+    /// see `tests/landlock_fs.rs`'s own doc comment on this exact ABI V7
+    /// case, where the file-open-denial guarantee this crate actually
+    /// relies on still holds).
+    PartiallyEnforced,
     /// The kernel could not enforce Landlock at all
     /// (`RulesetStatus::NotEnforced`); returned only when the caller passed
     /// `allow_unenforced: true`.
@@ -111,13 +126,15 @@ pub fn apply_deny_all_or_fail_closed(
         // denied for every path, with no exceptions.
         .restrict_self()?;
 
-    if status.ruleset == RulesetStatus::NotEnforced {
-        if allow_unenforced {
-            Ok(LockdownOutcome::NotEnforced)
-        } else {
-            Err(LockdownError::NotEnforced)
+    match status.ruleset {
+        RulesetStatus::FullyEnforced => Ok(LockdownOutcome::Enforced),
+        RulesetStatus::PartiallyEnforced => Ok(LockdownOutcome::PartiallyEnforced),
+        RulesetStatus::NotEnforced => {
+            if allow_unenforced {
+                Ok(LockdownOutcome::NotEnforced)
+            } else {
+                Err(LockdownError::NotEnforced)
+            }
         }
-    } else {
-        Ok(LockdownOutcome::Enforced)
     }
 }

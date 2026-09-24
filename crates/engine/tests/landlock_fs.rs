@@ -37,7 +37,7 @@ use common::{
 #[test]
 fn fails_closed_without_escape_hatch_iff_landlock_is_unsupported() -> Result<(), String> {
     let detected = apply_deny_all_or_fail_closed(true)?;
-    let supported = detected == LockdownOutcome::Enforced;
+    let supported = detected != LockdownOutcome::NotEnforced;
     eprintln!("[landlock spike] kernel support detected: {supported} (status = {detected:?})");
 
     let strict = apply_deny_all_or_fail_closed(false);
@@ -75,7 +75,7 @@ fn deny_all_blocks_file_access_iff_actually_enforced() -> Result<(), String> {
             eprintln!("[landlock spike] Landlock unsupported here; not asserting on file access");
             Ok(())
         }
-        LockdownOutcome::Enforced => {
+        LockdownOutcome::Enforced | LockdownOutcome::PartiallyEnforced => {
             assert_file_open_denied("main thread (per-thread restrict_self)")
         }
     }
