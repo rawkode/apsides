@@ -220,6 +220,7 @@ fn generation(
             "clusterBinding": "cluster-a",
             "policyRef": "platform/example",
             "enforcement": "api-bound",
+            "minKubernetesVersion": "1.34",
             "budgets": {
                 "maxResources": 8,
                 "maxInputs": 8,

@@ -4,6 +4,7 @@ use super::{
 };
 use super::{ReviewCapability, ReviewCeiling};
 use crate::Result;
+use compiler_core::is_supported_min_version;
 use std::collections::BTreeSet;
 
 fn verb(value: &str) -> bool {
@@ -254,7 +255,8 @@ fn compatibility(value: &ReviewMetadataV1) -> Result<()> {
     let b = &c.runtime_budgets;
     require(
         c.runtime_replicas == 1
-            && c.qualified_create_precondition_servers == [ReviewQualifiedServer::V1343]
+            && c.kubernetes_version.qualified_on == ReviewQualifiedServer::V1343
+            && is_supported_min_version(&c.kubernetes_version.min_version)
             && c.required_runtime_apis == capability_apis(&value.runtime_permissions)
             && c.required_cleanup_apis == capability_apis(&value.cleanup_permissions)
             && c.required_deployment_apis == deployment_apis(value),

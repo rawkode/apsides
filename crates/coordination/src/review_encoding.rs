@@ -29,7 +29,6 @@ pub(super) fn validate_size(value: &ReviewMetadataV1) -> Result<()> {
         c.required_runtime_apis.len(),
         c.required_cleanup_apis.len(),
         c.required_deployment_apis.len(),
-        c.qualified_create_precondition_servers.len(),
         e.gaps.len(),
         e.indirect_risks.len(),
         e.runtime_ceiling.capabilities.len(),

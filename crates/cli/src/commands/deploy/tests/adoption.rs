@@ -10,6 +10,7 @@ fn adoption_compiled() -> Result<CompiledPlan> {
                 "id":"example","namespace":"workload","controlNamespace":"control",
                 "clusterBinding":"cluster-a","policyRef":"platform/example",
                 "enforcement":"api-bound",
+                "minKubernetesVersion":"1.34",
                 "budgets":{
                     "maxResources":16,"maxInputs":16,"maxReactions":16,
                     "maxObjectBytes":262_144,"maxQueueDepth":128,

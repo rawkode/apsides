@@ -72,7 +72,8 @@ pub fn review_documents(plan: &CompiledPlan) -> BTreeMap<&'static str, Value> {
             "compatibility.json",
             json!({"schemaVersion":"apsides.dev/compatibility/v1","irDigest":plan.ir_digest,
             "schemaLibrary":"k8s-openapi/0.28.0","schemaKubernetesMinor":"1.36","requiredApis":apis,
-            "qualifiedCreatePreconditionServers":["v1.34.3"],"fieldValidation":"Strict",
+            "kubernetesVersion":{"minVersion":ir.domain.min_kubernetes_version,"qualifiedOn":"v1.34.3"},
+            "fieldValidation":"Strict",
             "transitionPlanSchema":"apsides.dev/transition-plan/v4","runtimeReplicas":1}),
         ),
         (

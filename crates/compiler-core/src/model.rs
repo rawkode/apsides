@@ -33,6 +33,11 @@ pub struct Domain {
     pub policy_ref: String,
     pub enforcement: String,
     pub budgets: Budgets,
+    /// The smallest Kubernetes version this domain requires, as `"MAJOR.MINOR"`
+    /// (major fixed at 1, minor >= 34 — the smallest release the absent-only
+    /// conditional SSA create contract is qualified for). Always present in
+    /// the IR; the SDK fills the default ("1.34") when an author omits it.
+    pub min_kubernetes_version: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

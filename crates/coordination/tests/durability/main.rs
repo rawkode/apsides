@@ -106,7 +106,10 @@ fn review(names: &deploy::AllocationNames, sequence: u64) -> ReviewMetadataV1 {
             required_cleanup_apis: Vec::new(),
             required_deployment_apis: Vec::new(),
             deployment_api_scope: ReviewDeploymentScope::IssuedDeployerOnly,
-            qualified_create_precondition_servers: vec![ReviewQualifiedServer::V1343],
+            kubernetes_version: ReviewKubernetesVersion {
+                min_version: "1.34".into(),
+                qualified_on: ReviewQualifiedServer::V1343,
+            },
             field_validation: ReviewFieldValidation::Strict,
             transition_plan_schema: ReviewTransitionSchema::V4,
             runtime_replicas: 1,

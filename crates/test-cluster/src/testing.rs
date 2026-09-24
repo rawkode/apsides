@@ -13,6 +13,7 @@ pub fn ir() -> Value {
         "schemaVersion": "apsides.dev/ir/v1",
         "domain": {"id": "unit", "namespace": "work", "controlNamespace": "control",
             "clusterBinding": "unit-fixture", "policyRef": "platform/unit", "enforcement": "api-bound",
+            "minKubernetesVersion": "1.34",
             "budgets": {"maxResources": 8, "maxInputs": 8, "maxReactions": 8,
                 "maxObjectBytes": 262_144, "maxQueueDepth": 8, "maxConcurrentRequests": 2}},
         "resources": [

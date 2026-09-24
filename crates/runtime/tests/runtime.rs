@@ -9,7 +9,7 @@ type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Sen
 
 const IR: &str = r#"{
   "schemaVersion":"apsides.dev/ir/v1",
-  "domain":{"id":"example","namespace":"workload","controlNamespace":"apsides-system","clusterBinding":"fixture","policyRef":"platform/example","enforcement":"api-bound","budgets":{"maxResources":8,"maxInputs":8,"maxReactions":8,"maxObjectBytes":262144,"maxQueueDepth":8,"maxConcurrentRequests":2}},
+  "domain":{"id":"example","namespace":"workload","controlNamespace":"apsides-system","clusterBinding":"fixture","policyRef":"platform/example","enforcement":"api-bound","minKubernetesVersion":"1.34","budgets":{"maxResources":8,"maxInputs":8,"maxReactions":8,"maxObjectBytes":262144,"maxQueueDepth":8,"maxConcurrentRequests":2}},
   "resources":[
     {"id":"deployment","apiVersion":"apps/v1","kind":"Deployment","name":"api","namespace":"workload","desired":{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"api","namespace":"workload"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"api"}},"template":{"metadata":{"labels":{"app":"api"}},"spec":{"containers":[{"name":"api","image":"fixture.invalid/api@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","imagePullPolicy":"Never"}]}}}},"lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"controller.ts","line":1,"column":1}}
   ],

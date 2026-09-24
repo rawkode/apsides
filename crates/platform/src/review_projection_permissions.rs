@@ -3,9 +3,9 @@ use coordination::{
     ReviewApiRequirement, ReviewAuthorization, ReviewBudgets, ReviewCapability, ReviewCeiling,
     ReviewCeilingDecision, ReviewCompatibility, ReviewCreationTarget, ReviewDeploymentLimitation,
     ReviewDeploymentPermissions, ReviewDeploymentScope, ReviewEnforcement,
-    ReviewEnforcementProfile, ReviewFieldValidation, ReviewQualifiedServer, ReviewResourceAccess,
-    ReviewRoleBinding, ReviewRoleCreation, ReviewRoleDelegation, ReviewSchemaLibrary,
-    ReviewSchemaMinor, ReviewTransitionSchema,
+    ReviewEnforcementProfile, ReviewFieldValidation, ReviewKubernetesVersion,
+    ReviewQualifiedServer, ReviewResourceAccess, ReviewRoleBinding, ReviewRoleCreation,
+    ReviewRoleDelegation, ReviewSchemaLibrary, ReviewSchemaMinor, ReviewTransitionSchema,
 };
 use deploy::TransitionPlan;
 
@@ -129,6 +129,7 @@ pub(super) fn deployment(
 
 pub(super) fn compatibility(
     budgets: &compiler_core::Budgets,
+    min_kubernetes_version: &str,
     runtime: &[ReviewCapability],
     cleanup: &[ReviewCapability],
     deployment: &ReviewDeploymentPermissions,
@@ -168,7 +169,10 @@ pub(super) fn compatibility(
                 .collect(),
         ),
         deployment_api_scope: ReviewDeploymentScope::IssuedDeployerOnly,
-        qualified_create_precondition_servers: vec![ReviewQualifiedServer::V1343],
+        kubernetes_version: ReviewKubernetesVersion {
+            min_version: min_kubernetes_version.into(),
+            qualified_on: ReviewQualifiedServer::V1343,
+        },
         field_validation: ReviewFieldValidation::Strict,
         transition_plan_schema: ReviewTransitionSchema::V4,
         runtime_replicas: 1,

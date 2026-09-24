@@ -31,6 +31,13 @@ export interface DomainOptions {
   readonly policyRef: string;
   readonly enforcement: "api-bound";
   readonly budgets: DomainBudgets;
+  /**
+   * The smallest Kubernetes version this domain requires, as `"MAJOR.MINOR"`.
+   * Defaults to `"1.34"`, the smallest release the absent-only conditional
+   * SSA create contract is qualified for. Authors may only raise it: major
+   * must be 1 and minor must be at least 34.
+   */
+  readonly minKubernetesVersion?: string;
   readonly force?: boolean;
   readonly prune?: boolean;
   readonly provenance: {
@@ -338,6 +345,7 @@ export interface ApsidesIR {
     readonly policyRef: string;
     readonly enforcement: "api-bound";
     readonly budgets: DomainBudgets;
+    readonly minKubernetesVersion: string;
   };
   readonly resources: readonly ResourceDeclaration[];
   readonly inputs: readonly InputDeclaration[];
@@ -649,9 +657,29 @@ export const fixtureInputData = (
   return freeze(Object.fromEntries(["value", ...keys].sort(compareText).map((key) => [key, value])));
 };
 
+/** The smallest Kubernetes minor version a declared `minKubernetesVersion` may name. */
+const MIN_KUBERNETES_VERSION_FLOOR = { major: 1, minor: 34 } as const;
+const DEFAULT_MIN_KUBERNETES_VERSION = `${MIN_KUBERNETES_VERSION_FLOOR.major}.${MIN_KUBERNETES_VERSION_FLOOR.minor}`;
+
+const validateMinKubernetesVersion = (value: unknown): string => {
+  const provided = value === undefined ? DEFAULT_MIN_KUBERNETES_VERSION : boundedText(value, 16, "domain.minKubernetesVersion");
+  const match = /^([0-9]{1,9})\.([0-9]{1,9})$/.exec(provided);
+  if (!match || match[1] === undefined || match[2] === undefined) {
+    throw new Error("domain.minKubernetesVersion must be formatted as MAJOR.MINOR");
+  }
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  if (major !== MIN_KUBERNETES_VERSION_FLOOR.major || minor < MIN_KUBERNETES_VERSION_FLOOR.minor) {
+    throw new Error(
+      `domain.minKubernetesVersion must be at least the qualified floor ${DEFAULT_MIN_KUBERNETES_VERSION} (major ${MIN_KUBERNETES_VERSION_FLOOR.major}, minor >= ${MIN_KUBERNETES_VERSION_FLOOR.minor}); received ${provided}`,
+    );
+  }
+  return provided;
+};
+
 const validateDomainOptions = (options: DomainOptions): DomainOptions => {
   const value = record(options, "domain options");
-  exact(value, ["id", "namespace", "controlNamespace", "clusterBinding", "policyRef", "enforcement", "budgets", "provenance", "force", "prune"], "domain options");
+  exact(value, ["id", "namespace", "controlNamespace", "clusterBinding", "policyRef", "enforcement", "budgets", "minKubernetesVersion", "provenance", "force", "prune"], "domain options");
   const namespace = dnsLabel(value.namespace, 63, "domain.namespace");
   const controlNamespace = dnsLabel(value.controlNamespace, 63, "domain.controlNamespace");
   if (namespace === controlNamespace) throw new Error("controlNamespace must differ from the workload namespace");
@@ -691,6 +719,7 @@ const validateDomainOptions = (options: DomainOptions): DomainOptions => {
     policyRef: boundedText(value.policyRef, 256, "domain.policyRef"),
     enforcement: "api-bound",
     budgets,
+    minKubernetesVersion: validateMinKubernetesVersion(value.minKubernetesVersion),
     force: optionalBoolean(value.force, "domain.force") ?? false,
     prune: optionalBoolean(value.prune, "domain.prune") ?? false,
     provenance: { inputs },

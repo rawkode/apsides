@@ -898,6 +898,7 @@ mod tests {
                 "schemaVersion": "apsides.dev/ir/v1", "testOnly": false,
                 "domain": {"id": "demo", "namespace": "default", "controlNamespace": "apsides-system",
                     "clusterBinding": "local", "policyRef": "platform/demo", "enforcement": "api-bound",
+                    "minKubernetesVersion": "1.34",
                     "budgets": {"maxResources": 4, "maxInputs": 4, "maxReactions": 4, "maxObjectBytes": 262_144,
                         "maxQueueDepth": 8, "maxConcurrentRequests": 1}},
                 "resources": [{"id": "config", "apiVersion": "v1", "kind": "ConfigMap", "name": "config",

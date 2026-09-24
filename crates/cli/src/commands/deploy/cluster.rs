@@ -86,11 +86,37 @@ fn verify_artifact_binding(
     Ok(())
 }
 
+/// Requires the observed server's `major`/`minor` discovery fields to meet
+/// or exceed `min_kubernetes_version` (the domain's declared floor). The
+/// absent-only conditional SSA creation contract itself is qualified only
+/// on v1.34.3; a raised floor still runs against whatever server the
+/// operator deploys to.
+fn require_minimum_server_version(
+    version: &k8s_openapi::apimachinery::pkg::version::Info,
+    min_kubernetes_version: &str,
+) -> Result<()> {
+    let minimum = compiler_core::parse_min_version(min_kubernetes_version)
+        .ok_or("domain.minKubernetesVersion is invalid")?;
+    let observed =
+        compiler_core::parse_server_version(&version.major, &version.minor).ok_or_else(|| {
+            format!(
+                "Kubernetes server version is unparsable: major={}, minor={}",
+                version.major, version.minor
+            )
+        })?;
+    if observed < minimum {
+        return Err(format!(
+            "Kubernetes {} does not meet the domain's declared minimum {}.{}; the absent-only SSA creation contract is qualified on v1.34.3",
+            version.git_version, minimum.0, minimum.1
+        )
+        .into());
+    }
+    Ok(())
+}
+
 async fn compatibility(client: &Client, plan: &CompiledPlan) -> Result<Value> {
     let version = client.apiserver_version().await?;
-    if version.git_version != "v1.34.3" {
-        return Err(format!("Kubernetes {} has no qualified absent-only SSA creation contract; supported version is v1.34.3",version.git_version).into());
-    }
+    require_minimum_server_version(&version, &plan.ir.domain.min_kubernetes_version)?;
     let targets = discovery_targets(&plan.ir.resources, &plan.capabilities)?;
     let group_versions: BTreeSet<_> = targets.values().flatten().collect();
     let mut served = BTreeMap::new();
@@ -215,7 +241,10 @@ fn require_served(
 
 #[cfg(test)]
 mod tests {
-    use super::{ServedResource, discovery_targets, require_served, verify_artifact_binding};
+    use super::{
+        ServedResource, discovery_targets, require_minimum_server_version, require_served,
+        verify_artifact_binding,
+    };
     use compiler_core::{
         ApiResourceMapping, ApiResourceScope, Capability, DeletionPolicy, Lifecycle, Resource,
         SourceLocation,
@@ -383,5 +412,22 @@ mod tests {
         assert!(verify_artifact_binding(discovered, &changed, Some(&changed)).is_err());
         assert!(verify_artifact_binding(discovered, &same, Some(&changed)).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn deploy_compatibility_requires_the_declared_minimum_server_version() {
+        let server = |major: &str, minor: &str, git_version: &str| {
+            k8s_openapi::apimachinery::pkg::version::Info {
+                major: major.into(),
+                minor: minor.into(),
+                git_version: git_version.into(),
+                ..Default::default()
+            }
+        };
+        assert!(require_minimum_server_version(&server("1", "35", "v1.35.0"), "1.34").is_ok());
+        assert!(require_minimum_server_version(&server("1", "34", "v1.34.3"), "1.34").is_ok());
+        assert!(require_minimum_server_version(&server("1", "33", "v1.33.9"), "1.34").is_err());
+        assert!(require_minimum_server_version(&server("1", "34", "v1.34.3"), "1.35").is_err());
+        assert!(require_minimum_server_version(&server("garbage", "garbage", ""), "1.34").is_err());
     }
 }

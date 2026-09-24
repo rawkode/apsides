@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 mod json;
+mod kubernetes_version;
 mod model;
 mod resource_api;
 mod review;
@@ -11,6 +12,10 @@ mod test_plan;
 mod validate;
 
 pub use json::{canonical_bytes, digest, parse_strict};
+pub use kubernetes_version::{
+    QUALIFIED_FLOOR as KUBERNETES_QUALIFIED_FLOOR, is_supported_min_version, parse_min_version,
+    parse_server_version,
+};
 pub use model::*;
 pub use resource_api::{ResolvedApiResource, resolve_namespaced_api, resolve_resource_api};
 pub use review::review_documents;

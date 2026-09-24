@@ -56,6 +56,7 @@ pub fn project_review_metadata(plan: &TransitionPlan) -> Result<ReviewMetadataV1
         reactions: catalogs.reactions,
         compatibility: permissions::compatibility(
             &domain.budgets,
+            &domain.min_kubernetes_version,
             &runtime_permissions,
             &cleanup_permissions,
             &deployment_permissions,

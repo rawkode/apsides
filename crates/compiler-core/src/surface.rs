@@ -20,11 +20,11 @@ use serde::{Deserialize, Serialize};
 /// The `surface.json` schema version this module emits.
 pub const SURFACE_SCHEMA: &str = "apsides.dev/surface/v1";
 
-/// The minimum Kubernetes version Waddle programs currently qualify against.
-/// Phase 3 makes this author-configurable; Phase 1 emits a fixed value.
-const KUBERNETES_MIN_VERSION: &str = "1.34";
 /// The exact server version the absent-only conditional-create contract is
-/// qualified on today (see `apply_absent_with_list_version`).
+/// qualified on today (see `apply_absent_with_list_version`). The minimum
+/// version itself (`kubernetes.minVersion`) is author-declared per domain
+/// (`domain.minKubernetesVersion`); this is the fixed version that
+/// declared floor is qualified against.
 const KUBERNETES_QUALIFIED_ON: &str = "v1.34.3";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -334,7 +334,7 @@ pub fn derive_surface(plan: &CompiledPlan) -> Surface {
             control_namespace: plan.ir.domain.control_namespace.clone(),
         },
         kubernetes: SurfaceKubernetes {
-            min_version: KUBERNETES_MIN_VERSION.into(),
+            min_version: plan.ir.domain.min_kubernetes_version.clone(),
             qualified_on: KUBERNETES_QUALIFIED_ON.into(),
         },
         permissions: permissions(plan),

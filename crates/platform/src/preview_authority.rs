@@ -28,7 +28,10 @@ impl Context {
         let plan = deploy::plan_transition(request)?;
         let platform = issued.platform();
         let domain = &request.next.compiled.ir.domain;
-        require_qualified_server(&platform.client.apiserver_version().await?.git_version)?;
+        require_qualified_server(
+            &platform.client.apiserver_version().await?,
+            &domain.min_kubernetes_version,
+        )?;
         let approval = issued.require_preview_approval().await?;
         if issued.identity().domain_id != domain.id
             || issued.identity().cluster_binding != domain.cluster_binding
@@ -114,11 +117,19 @@ impl Context {
     }
 }
 
-pub(super) fn require_qualified_server(version: &str) -> Result<()> {
-    if version != "v1.34.3" {
-        return Err(invalid(
-            "live preview requires the qualified v1.34.3 conditional SSA server",
-        ));
+pub(super) fn require_qualified_server(
+    version: &k8s_openapi::apimachinery::pkg::version::Info,
+    min_kubernetes_version: &str,
+) -> Result<()> {
+    let minimum = compiler_core::parse_min_version(min_kubernetes_version)
+        .ok_or_else(|| invalid("preview domain minKubernetesVersion is invalid"))?;
+    let observed = compiler_core::parse_server_version(&version.major, &version.minor)
+        .ok_or_else(|| invalid("live preview requires a parsable Kubernetes server version"))?;
+    if observed < minimum {
+        return Err(invalid(&format!(
+            "live preview requires Kubernetes >= {}.{}; server reports {}.{} ({})",
+            minimum.0, minimum.1, observed.0, observed.1, version.git_version
+        )));
     }
     Ok(())
 }

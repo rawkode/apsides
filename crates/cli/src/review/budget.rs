@@ -57,7 +57,6 @@ fn count_metadata(
         compatibility.required_runtime_apis.len(),
         compatibility.required_cleanup_apis.len(),
         compatibility.required_deployment_apis.len(),
-        compatibility.qualified_create_precondition_servers.len(),
         enforcement.gaps.len(),
         enforcement.indirect_risks.len(),
         enforcement.runtime_ceiling.capabilities.len(),

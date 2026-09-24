@@ -11,7 +11,7 @@ fn source() -> Value {
 fn fixture() -> Value {
     json!({
         "schemaVersion":IR_SCHEMA,
-        "domain":{"id":"example","namespace":"workload","controlNamespace":"apsides-system","clusterBinding":"test-cluster","policyRef":"platform/example","enforcement":"api-bound","budgets":{"maxResources":64,"maxInputs":64,"maxReactions":64,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},
+        "domain":{"id":"example","namespace":"workload","controlNamespace":"apsides-system","clusterBinding":"test-cluster","policyRef":"platform/example","enforcement":"api-bound","minKubernetesVersion":"1.34","budgets":{"maxResources":64,"maxInputs":64,"maxReactions":64,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},
         "resources":[{"id":"api","apiVersion":"apps/v1","kind":"Deployment","name":"api","namespace":"workload","desired":{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"api","namespace":"workload"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"api"}},"template":{"metadata":{"labels":{"app":"api"}},"spec":{"serviceAccountName":"api-workload","containers":[{"name":"api","image":"example.invalid/api@sha256:0000000000000000000000000000000000000000000000000000000000000000"}]}}}},"lifecycle":{"deletionPolicy":"orphan"},"source":source()}],
         "inputs":[{"id":"config","apiVersion":"v1","kind":"ConfigMap","name":"external","namespace":"workload","mode":"observed","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":source()}],
         "reactions":[{"id":"restart","op":"rollout","inputs":["config"],"target":"api","source":source()}],
@@ -123,6 +123,25 @@ fn unsupported_effects_and_scope_cannot_cross_ir_boundary() -> TestResult {
     cases.push(value);
     for value in cases {
         assert!(parse_and_validate(&value.to_string()).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn domain_min_kubernetes_version_requires_the_qualified_floor() -> TestResult {
+    for invalid in ["1.33", "1.34.3", "v1.34", "2.0", "34.1", "", "garbage"] {
+        let mut value = fixture();
+        value["domain"]["minKubernetesVersion"] = json!(invalid);
+        assert!(
+            parse_and_validate(&value.to_string()).is_err(),
+            "expected {invalid} to be rejected"
+        );
+    }
+    for raised in ["1.34", "1.35", "1.40"] {
+        let mut value = fixture();
+        value["domain"]["minKubernetesVersion"] = json!(raised);
+        let plan = parse_and_validate(&value.to_string())?;
+        assert_eq!(plan.ir.domain.min_kubernetes_version, raised);
     }
     Ok(())
 }

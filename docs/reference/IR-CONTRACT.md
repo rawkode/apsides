@@ -14,6 +14,7 @@ This is the current implementation boundary for specification 0.2. It is not a c
     "clusterBinding": "local-fixture",
     "policyRef": "platform/example",
     "enforcement": "api-bound",
+    "minKubernetesVersion": "1.34",
     "budgets": {"maxResources": 64, "maxInputs": 64, "maxReactions": 64, "maxObjectBytes": 262144, "maxQueueDepth": 128, "maxConcurrentRequests": 4}
   },
   "resources": [{
@@ -39,7 +40,7 @@ The named read strategy is get/list/watch with `metadata.name` field selectors o
 
 Rollout evaluation accepts current input snapshots. Missing, unauthorized, unavailable and invalid observations block dependent mutation. Managed ConfigMap inputs require successful authoritative application. Sensitive combined revisions require a supplied domain key (at least 32 bytes) and stable key ID, use HMAC-SHA256, and never include secret data or the key in reports. Keys are not part of source, IR or generated artifacts.
 
-The fixture creation path is qualified for fixed ConfigMap, Service, and Deployment resources on Kubernetes 1.34.3. A strongly consistent exact-name list must be empty and return a nonzero collection resourceVersion. Both server dry-run and real SSA carry that exact version, so an intervening creation produces a conflict instead of adoption. There is no resourceVersion-zero or forced fallback. Existing objects require Apply ownership and UID/resourceVersion preconditions. The request plan names the create-preflight list and conditional create-apply requests. This is a version-qualified built-in Kubernetes storage contract, not a claim about arbitrary aggregated APIs or other versions. Production still requires independent protected claims and durable UID inventory.
+The absent-only conditional SSA create contract (fixed ConfigMap, Service, and Deployment resources) is qualified against Kubernetes v1.34.3. `domain.minKubernetesVersion` declares the smallest server version a domain requires, as `"MAJOR.MINOR"`: major fixed at 1, minor at least 34 (`"1.34"` by default; authors may only raise it, never lower it). Deploy-time compatibility parses the connected server's discovery `major`/`minor` fields and requires them to be at or above the declared floor, rather than pinning an exact server version; the create-precondition mechanism itself remains qualified only on v1.34.3 regardless of a raised floor. A strongly consistent exact-name list must be empty and return a nonzero collection resourceVersion. Both server dry-run and real SSA carry that exact version, so an intervening creation produces a conflict instead of adoption. There is no resourceVersion-zero or forced fallback. Existing objects require Apply ownership and UID/resourceVersion preconditions. The request plan names the create-preflight list and conditional create-apply requests. This is a version-qualified built-in Kubernetes storage contract, not a claim about arbitrary aggregated APIs or other versions. Production still requires independent protected claims and durable UID inventory.
 
 Generated test cases carry required `inputIds`, sorted to the scenario's applicable
 reaction inputs. Common evaluation/replay/ownership/readiness cases bind all inputs;

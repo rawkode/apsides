@@ -347,6 +347,7 @@ dependencies = [
  "coordination",
  "deploy",
  "inventory",
+ "k8s-openapi",
  "kube",
  "platform",
  "release",

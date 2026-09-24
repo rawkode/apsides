@@ -180,10 +180,23 @@ pub enum ReviewSchemaMinor {
     #[serde(rename = "1.36")]
     V136,
 }
+/// The exact server version the absent-only conditional SSA create contract
+/// (`apply_absent_with_list_version`) is qualified against.
+///
+/// This is independent of a domain's own declared `minKubernetesVersion`
+/// floor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ReviewQualifiedServer {
     #[serde(rename = "v1.34.3")]
     V1343,
+}
+/// A domain's declared minimum Kubernetes version alongside the exact
+/// server version the create-precondition mechanism is qualified against.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewKubernetesVersion {
+    pub min_version: String,
+    pub qualified_on: ReviewQualifiedServer,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewFieldValidation {
@@ -204,7 +217,7 @@ pub struct ReviewCompatibility {
     pub required_cleanup_apis: Vec<ReviewApiRequirement>,
     pub required_deployment_apis: Vec<ReviewApiRequirement>,
     pub deployment_api_scope: ReviewDeploymentScope,
-    pub qualified_create_precondition_servers: Vec<ReviewQualifiedServer>,
+    pub kubernetes_version: ReviewKubernetesVersion,
     pub field_validation: ReviewFieldValidation,
     pub transition_plan_schema: ReviewTransitionSchema,
     pub runtime_replicas: u8,

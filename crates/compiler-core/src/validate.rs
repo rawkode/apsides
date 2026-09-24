@@ -167,6 +167,15 @@ fn validate_domain(ir: &Ir) -> Result<()> {
             && domain.policy_ref.len() <= 256,
         "clusterBinding and policyRef must be explicit bounded strings",
     )?;
+    require(
+        crate::is_supported_min_version(&domain.min_kubernetes_version),
+        format!(
+            "domain.minKubernetesVersion must be MAJOR.MINOR with major {} and minor >= {} (the qualified floor); received {}",
+            crate::KUBERNETES_QUALIFIED_FLOOR.0,
+            crate::KUBERNETES_QUALIFIED_FLOOR.1,
+            domain.min_kubernetes_version
+        ),
+    )?;
     let b = &domain.budgets;
     require(
         (1..=256).contains(&b.max_resources)

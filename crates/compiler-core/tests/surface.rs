@@ -20,9 +20,18 @@ const IMAGE: &str = "docker.io/nginxinc/nginx-unprivileged@sha256:9b87ad3dd9f431
 /// A web-application-shaped IR: `resources` and `inputs` are supplied by the
 /// caller so determinism can be exercised by reordering them.
 fn fixture(resources: &Value, inputs: &Value, reaction_inputs: &Value) -> Value {
+    domain_fixture(resources, inputs, reaction_inputs, "1.34")
+}
+
+fn domain_fixture(
+    resources: &Value,
+    inputs: &Value,
+    reaction_inputs: &Value,
+    min_kubernetes_version: &str,
+) -> Value {
     json!({
         "schemaVersion":IR_SCHEMA,
-        "domain":{"id":"team-api-production","namespace":"production","controlNamespace":"apsides-system","clusterBinding":"local-fixture","policyRef":"platform/team-api","enforcement":"api-bound","budgets":{"maxResources":64,"maxInputs":64,"maxReactions":64,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},
+        "domain":{"id":"team-api-production","namespace":"production","controlNamespace":"apsides-system","clusterBinding":"local-fixture","policyRef":"platform/team-api","enforcement":"api-bound","minKubernetesVersion":min_kubernetes_version,"budgets":{"maxResources":64,"maxInputs":64,"maxReactions":64,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},
         "resources":resources,
         "inputs":inputs,
         "reactions":[{"id":"restart","op":"rollout","inputs":reaction_inputs,"target":"api","source":source()}],
@@ -362,5 +371,24 @@ fn surface_excludes_values() -> TestResult {
     // real read authority, asserted present in `secrets_read` above.)
     assert!(!text.contains("replicas"));
     assert!(!text.contains("controller.ts"));
+    Ok(())
+}
+
+#[test]
+fn surface_min_kubernetes_version_propagates() -> TestResult {
+    let raised = plan(&domain_fixture(
+        &json!([deployment(), config_map(), service()]),
+        &json!([settings_input(), credentials_input()]),
+        &json!(["settings", "credentials"]),
+        "1.40",
+    ))?;
+    let surface = derive_surface(&raised);
+    assert_eq!(
+        surface.kubernetes,
+        SurfaceKubernetes {
+            min_version: "1.40".into(),
+            qualified_on: "v1.34.3".into(),
+        }
+    );
     Ok(())
 }

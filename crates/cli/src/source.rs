@@ -93,6 +93,7 @@ mod tests {
             "domain":{"id":"fixture-selection","namespace":"workload",
                 "controlNamespace":"control","clusterBinding":"cluster-a",
                 "policyRef":"platform/fixture-selection","enforcement":"api-bound",
+                "minKubernetesVersion":"1.34",
                 "budgets":{"maxResources":4,"maxInputs":4,"maxReactions":4,
                     "maxObjectBytes":262_144,"maxQueueDepth":4,"maxConcurrentRequests":2}},
             "resources":[{"id":"config","apiVersion":"v1","kind":"ConfigMap",

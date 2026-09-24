@@ -117,6 +117,7 @@ equal(ir.inputs.length, 2, "managed and observed inputs emitted");
 equal(ir.inputs.find((input) => input.kind === "Secret")?.sensitive, true, "Secret sensitivity retained");
 equal(ir.reactions.length, 2, "rollout reactions emitted");
 equal(ir.provenance.compiler, "apsides/0.1", "compiler provenance fixed by SDK");
+equal(ir.domain.minKubernetesVersion, "1.34", "minKubernetesVersion defaults to the qualified floor");
 assert(!("requestPlan" in ir) && !("testPlan" in ir) && !("capabilities" in ir), "derived compiler output must not be author-supplied");
 assert(!containsFunction(ir), "IR must contain no runtime callbacks");
 assert(Object.isFrozen(ir) && Object.isFrozen(ir.resources), "IR snapshots must be immutable");
@@ -345,4 +346,18 @@ throws(() => constrained.manage(new ConfigMap({ metadata: { name: "two", namespa
   throws(() => watch(short).project("data").rollout(target, { id: `rollout-${"r".repeat(60)}`, source }), "rollout.id exceeds 63 characters");
   throws(() => watch(short).project("data").rollout(target, { id: "Rollout.Bad", source }), "rollout.id must be a lowercase DNS label");
   throws(() => watch(short).project("data").rollout(target, { source }), "duplicate reaction id: rollout-observed-secret-short-api");
+}
+
+{
+  const options = {
+    id: "min-version", namespace: "workload", controlNamespace: "apsides-system",
+    clusterBinding: "local-fixture", policyRef: "platform/test", enforcement: "api-bound" as const,
+    budgets, provenance: { inputs: [{ path: "domain.ts", sha256 }] },
+  };
+  throws(() => defineDomain({ ...options, minKubernetesVersion: "1.33" }), "at least the qualified floor 1.34");
+  throws(() => defineDomain({ ...options, minKubernetesVersion: "1.34.3" }), "must be formatted as MAJOR.MINOR");
+  throws(() => defineDomain({ ...options, minKubernetesVersion: "2.0" }), "at least the qualified floor 1.34");
+  const raised = defineDomain({ ...options, minKubernetesVersion: "1.35" });
+  raised.manage(new ConfigMap({ metadata: { name: "config", namespace: "workload" } }), { source });
+  equal(raised.toIR().domain.minKubernetesVersion, "1.35", "explicit minKubernetesVersion is retained");
 }
