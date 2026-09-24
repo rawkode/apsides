@@ -129,9 +129,12 @@ const SPIKE_V8_FLAGS: &str = "--jitless --enable-sharedarraybuffer-per-context";
 ///     non-writable and non-configurable.
 ///   - Replaces `NativeCtor.prototype.resize` with a function that
 ///     **always throws, unconditionally, regardless of the receiver**, and
-///     `.transfer` with one that throws when `this.resizable` (`.transfer()`
-///     on a resizable buffer produces another resizable buffer, preserving
-///     resizability; `.transferToFixedLength()` is left alone, since it
+///     `.transfer` with one that throws when a captured reference to the
+///     native `resizable` getter (invoked through the captured `apply`,
+///     never `this.resizable` -- see the invariant below) says `true`
+///     (`.transfer()` on a resizable buffer produces another resizable
+///     buffer, preserving resizability; `.transferToFixedLength()` is left
+///     alone, since it
 ///     always produces a fixed buffer). Every `ArrayBuffer` instance in one
 ///     realm, however it was constructed, shares this one
 ///     `%ArrayBuffer.prototype%` object, so this closes growth for any
@@ -200,12 +203,25 @@ const SPIKE_V8_FLAGS: &str = "--jitless --enable-sharedarraybuffer-per-context";
 ///     a serialized tag, entirely bypassing the JS-visible constructor):
 ///     only reachable via `Deno.core`, deleted by Layer 1 above.
 ///   - WebAssembly (a growable `WebAssembly.Memory` is backed by the same
-///     kind of resizable allocation): `WebAssembly` itself is not exposed
-///     at all under `--jitless` on this non-`DrumBrake` build (see
-///     `SPIKE_V8_FLAGS`'s doc comment).
-///   - V8's C++-only `ArrayBuffer::Allocator::NewResizableBackingStore`-style
-///     embedder API: has no JS-reachable caller; this crate's own Rust code
-///     (`v8_alloc.rs`) never calls it either.
+///     kind of resizable allocation): `wasm-js.cc`'s exact rule is
+///     `expose_wasm = !jitless || correctness_fuzzer_suppressions ||
+///     wasm_jitless` (checked against `v8-150.4.0/src/wasm/wasm-js.cc`),
+///     and this build sets `jitless` while never setting
+///     `correctness_fuzzer_suppressions`; `wasm_jitless` is
+///     `DEFINE_BOOL_READONLY(wasm_jitless, false, ...)` on every target but
+///     tvOS (where `jitless` implies it) on a non-`DrumBrake` build such as
+///     this one's prebuilt, so `expose_wasm` is `false` and `WebAssembly`
+///     is never installed on `globalThis`. Separately, `deno_core` itself
+///     still compiles a module tagged `ModuleType::Wasm` as WebAssembly
+///     (`modules/map.rs`) regardless of this flag -- that path is closed
+///     only because [`StaticModuleLoader`] (used in `prepare_isolate`)
+///     always tags every module it serves `ModuleType::JavaScript`; any
+///     future change to the module loader must keep rejecting/never
+///     producing a `ModuleType::Wasm` source, independently of the V8 flag
+///     above.
+///   - V8's C++-only `v8::ArrayBuffer::NewResizableBackingStore` embedder
+///     API: has no JS-reachable caller; neither `deno_core` nor this
+///     crate's own Rust code (`v8_alloc.rs`) calls it.
 ///   - The V8 snapshot deserializer (which can restore heap objects,
 ///     including resizable buffers, from a startup snapshot blob): this
 ///     crate never builds or loads a startup snapshot (`RuntimeOptions::startup_snapshot`
@@ -213,8 +229,13 @@ const SPIKE_V8_FLAGS: &str = "--jitless --enable-sharedarraybuffer-per-context";
 ///     blob is embedder-supplied, never user input.
 ///   - `%_TheHole()`-style runtime-test intrinsics (`%ArrayBufferMaxByteLength()`
 ///     and friends, which can construct engine-internal objects directly):
-///     require the `--allow-natives-syntax` V8 flag, which
-///     `SPIKE_V8_FLAGS` never sets, so `%`-prefixed syntax is a plain
+///     require the `--allow-natives-syntax` V8 flag, and `deno_core`'s own
+///     `setup.rs` only ever adds that flag when
+///     `RuntimeOptions::unsafe_expose_natives_and_gc` is `true` (it is
+///     `cfg`-gated to the `test`/`unsafe_runtime_options` feature and
+///     defaults to `false` even then). This crate builds with neither the
+///     `unsafe_runtime_options` Cargo feature nor a test-`cfg` build, and
+///     never sets that field, so `%`-prefixed syntax is a plain
 ///     `SyntaxError` in every isolate this crate builds.
 ///
 /// See `tests/spike.rs` for the regression tests: one per bypass route the
@@ -306,9 +327,23 @@ const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
     });
     if (typeof Native.prototype.transfer === "function") {
       const nativeTransfer = Native.prototype.transfer;
+      // Captured here, not read as `this.resizable` inside `transfer`
+      // below: a plain `this.resizable` property read is itself a runtime
+      // lookup that walks `this`'s prototype chain, which -- while not
+      // exploitable today, since no resizable buffer instance can exist
+      // for it to be checked against once construction is closed -- is
+      // exactly the shape of lookup the invariant above forbids inside a
+      // function that runs after bootstrap. Reading the descriptor here
+      // instead, while `Native.prototype` is still pristine, and invoking
+      // the captured getter through the captured `apply` keeps `transfer`
+      // itself free of any post-bootstrap lookup, full stop.
+      const resizableGetter = Object.getOwnPropertyDescriptor(
+        Native.prototype,
+        "resizable",
+      ).get;
       Object.defineProperty(Native.prototype, "transfer", {
         value: function transfer(...args) {
-          if (this.resizable) {
+          if (apply(resizableGetter, this, [])) {
             throw new NativeTypeError(
               `${name}.prototype.transfer of a resizable buffer is disabled in this sandbox`,
             );
