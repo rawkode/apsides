@@ -513,14 +513,36 @@ fn validate_method_and_headers(method: &str, headers: &[(String, String)]) -> Re
 /// Releases this call's `fetches_in_flight` slot when dropped -- covering
 /// every exit path after [`fetch`] reserves one (an early `?` return, a
 /// dropped future if the isolate is terminated mid-call, or falling off
-/// the end normally), not just the success path. Byte-budget accounting
-/// (`fetch_bytes_reserved`) is handled separately, explicitly, only on the
-/// success path -- see `fetch`'s doc comment for why a failure keeps its
-/// full worst-case reservation charged rather than trying to refund an
-/// unknown, possibly-nonzero number of bytes that were actually read
-/// before the failure.
+/// the end normally), not just the success path.
+///
+/// Also refunds the *entire* byte-budget reservation this call took,
+/// unless [`Self::mark_success`] was called first. A failed fetch never
+/// hands a response buffer to JS, so nothing is gained by keeping its
+/// reservation charged, and every call that never gets far enough to know
+/// its own outcome ends this way -- `mark_success` is only ever called
+/// once a response has actually been received and its true size is known
+/// (review round 6, R1; a prior version left a failed call's reservation
+/// charged permanently, on the theory that this crate cannot always tell
+/// how many bytes were actually read before a given failure -- true, but
+/// irrelevant, since a failed fetch never gets those bytes into the
+/// process's live memory via a returned buffer either way, and charging
+/// for them let a burst of e.g. `HOST_NOT_ALLOWED` or connect-failure
+/// calls exhaust an invocation's entire budget without ever touching the
+/// network). On success, [`fetch`] itself refunds the unused part of the
+/// worst-case allowance (the actual body was smaller) before marking the
+/// guard successful; the actual body length then stays charged for the
+/// rest of the invocation, same as before.
 struct InFlightGuard {
     state: Rc<RefCell<OpState>>,
+    /// The total (`body_len + response_reservation`) this call reserved.
+    reservation: usize,
+    success: bool,
+}
+
+impl InFlightGuard {
+    const fn mark_success(&mut self) {
+        self.success = true;
+    }
 }
 
 impl Drop for InFlightGuard {
@@ -528,32 +550,49 @@ impl Drop for InFlightGuard {
         let mut state_ref = self.state.borrow_mut();
         let engine_state = state_ref.borrow_mut::<EngineOpState>();
         engine_state.fetches_in_flight = engine_state.fetches_in_flight.saturating_sub(1);
+        if !self.success {
+            engine_state.fetch_bytes_reserved =
+                engine_state.fetch_bytes_reserved.saturating_sub(self.reservation);
+        }
     }
 }
 
-/// Implements `op_apsides_fetch`'s full request. Reserves this call's
-/// concurrency slot and byte budget **synchronously, before the first
-/// `.await`** (review round 6, N1): without that, `N` concurrent
+/// Implements `op_apsides_fetch`'s full request.
+///
+/// Validates the request (body size, forbidden/malformed headers, URL
+/// scheme, IP-literal host, the egress allowlist) *before* reserving any
+/// concurrency slot or byte budget, so a call that was always going to be
+/// rejected for a reason unrelated to available budget never consumes
+/// budget it does not need (review round 6, R1: a prior version reserved
+/// first, so a burst of e.g. `HOST_NOT_ALLOWED` calls could exhaust an
+/// invocation's entire `max_fetch_bytes_total` without ever touching the
+/// network).
+///
+/// Only once every such check has passed does it reserve this call's
+/// concurrency slot and byte budget -- still **synchronously, before the
+/// first `.await`** (review round 6, N1): without that, `N` concurrent
 /// `apsides.fetch` calls could each read the same "budget/slots still
 /// available" snapshot before any of them updates it, and all proceed --
 /// together using `N` times the intended cap. The byte reservation is
 /// this call's request body length plus a *worst-case* response
 /// allowance (`MAX_FETCH_RESPONSE_BYTES`, clamped to whatever of the
 /// budget remains after the body) -- not the eventual actual response
-/// size, which is not known yet. On success, the unused part of that
-/// worst-case allowance (`response_reservation - actual body length`) is
-/// refunded. On failure, the full reservation stays charged: this crate
-/// cannot always tell how many bytes were actually pulled over the wire
-/// before a given failure (e.g. `ResponseTooLarge` means up to the cap
-/// *was* read), and refunding an unverified amount would reopen the same
-/// bypass this fix exists to close.
+/// size, which is not known yet. If that would leave a zero-byte response
+/// allowance, the call is rejected as budget-exhausted right there,
+/// before dialling, rather than proceeding to a dial that can only ever
+/// fail with a confusing `RESPONSE_TOO_LARGE` on the first byte received.
+///
+/// On success, the unused part of the worst-case allowance
+/// (`response_reservation - actual body length`) is refunded and
+/// [`InFlightGuard::mark_success`] is called. On any failure, the guard's
+/// `Drop` refunds the *entire* reservation -- see its doc comment.
 #[allow(
     clippy::future_not_send,
     reason = "deno_core::OpState/JsRuntime are deliberately !Send (single isolate, single thread); see crate::invoke_handler_with_watchdog's doc comment"
 )]
 #[allow(
     clippy::too_many_lines,
-    reason = "validate -> reserve concurrency/budget -> parse/vet the URL -> resolve -> dial+request -> refund is one inherently sequential, hard-to-split pipeline; see the doc comment above for why each step exists"
+    reason = "validate -> parse/vet the URL -> reserve concurrency/budget -> resolve -> dial+request -> refund is one inherently sequential, hard-to-split pipeline; see the doc comment above for why each step exists"
 )]
 async fn fetch(
     state: &Rc<RefCell<OpState>>,
@@ -577,41 +616,21 @@ async fn fetch(
     validate_method_and_headers(&request.method, &request.headers)?;
 
     let body_len = body.len();
-    let (egress, deadline, resolver, response_reservation) = {
+
+    // Read-only snapshot: `closed`, plus the policy/deadline/resolver this
+    // call needs for URL/host validation and (later) DNS resolution.
+    // Deliberately reserves nothing yet.
+    let (egress, deadline, resolver) = {
         let mut state_ref = state.borrow_mut();
         let engine_state = state_ref.borrow_mut::<EngineOpState>();
         if engine_state.closed {
             return Err(FetchError::OpsClosed);
         }
-        if engine_state.fetches_in_flight >= engine_state.max_concurrent_fetches {
-            return Err(FetchError::FetchConcurrencyExceeded);
-        }
-        let remaining_budget = engine_state
-            .max_fetch_bytes_total
-            .saturating_sub(engine_state.fetch_bytes_reserved);
-        if body_len > remaining_budget {
-            return Err(FetchError::FetchByteBudgetExceeded);
-        }
-        let response_reservation =
-            MAX_FETCH_RESPONSE_BYTES.min(remaining_budget - body_len);
-        let total_reservation = body_len + response_reservation;
-
-        engine_state.fetches_in_flight += 1;
-        engine_state.fetch_bytes_reserved =
-            engine_state.fetch_bytes_reserved.saturating_add(total_reservation);
-
         (
             engine_state.egress.clone(),
             engine_state.deadline,
             engine_state.resolver.clone(),
-            response_reservation,
         )
-    };
-    // From here on, every exit path (an early `?` return below, or a
-    // dropped future) must release the concurrency slot reserved above --
-    // `_in_flight_guard`'s `Drop` does that unconditionally.
-    let _in_flight_guard = InFlightGuard {
-        state: Rc::clone(state),
     };
 
     let parsed = deno_core::url::Url::parse(&request.url)
@@ -643,6 +662,45 @@ async fn fetch(
     {
         return Err(FetchError::HostNotAllowed(host, port));
     }
+
+    // Reservation: still synchronous, still before this function's first
+    // `.await` (DNS resolution, next) -- but only now, after every check
+    // above that can fail for a reason unrelated to available budget has
+    // already passed (review round 6, R1).
+    let (total_reservation, response_reservation) = {
+        let mut state_ref = state.borrow_mut();
+        let engine_state = state_ref.borrow_mut::<EngineOpState>();
+        if engine_state.fetches_in_flight >= engine_state.max_concurrent_fetches {
+            return Err(FetchError::FetchConcurrencyExceeded);
+        }
+        let remaining_budget = engine_state
+            .max_fetch_bytes_total
+            .saturating_sub(engine_state.fetch_bytes_reserved);
+        if body_len >= remaining_budget {
+            return Err(FetchError::FetchByteBudgetExceeded);
+        }
+        let response_reservation = MAX_FETCH_RESPONSE_BYTES.min(remaining_budget - body_len);
+        if response_reservation == 0 {
+            return Err(FetchError::FetchByteBudgetExceeded);
+        }
+        let total_reservation = body_len + response_reservation;
+
+        engine_state.fetches_in_flight += 1;
+        engine_state.fetch_bytes_reserved =
+            engine_state.fetch_bytes_reserved.saturating_add(total_reservation);
+
+        (total_reservation, response_reservation)
+    };
+    // From here on, every exit path (an early `?` return below, or a
+    // dropped future) must release the concurrency slot and refund the
+    // reservation just taken -- `in_flight_guard`'s `Drop` does both,
+    // unless `mark_success` is called first (only once a real response
+    // has been received; see below).
+    let mut in_flight_guard = InFlightGuard {
+        state: Rc::clone(state),
+        reservation: total_reservation,
+        success: false,
+    };
 
     let candidates = net::resolve_host(
         &host,
@@ -689,6 +747,10 @@ async fn fetch(
         engine_state.fetch_bytes_reserved =
             engine_state.fetch_bytes_reserved.saturating_sub(unused_reservation);
     }
+    // A real response was received and its true size is now reflected in
+    // `fetch_bytes_reserved` above -- from here the guard's `Drop` must
+    // not also refund the (now-correct) charge.
+    in_flight_guard.mark_success();
 
     Ok((response.status, response.headers, response.body))
 }

@@ -802,18 +802,202 @@ fn fetch_concurrent_calls_cannot_exceed_the_total_byte_budget() -> Result<(), St
     server.join()
 }
 
-/// N1: a request body counts against `Limits::max_fetch_bytes_total` too,
-/// not just the response -- no network needed, since the budget check
-/// runs before resolution/dialing.
+/// N1 + R1(b): a request body counts against `Limits::max_fetch_bytes_total`
+/// too, not just the response -- and, since the reservation now happens
+/// after the host is checked against the egress allowlist (R1), the host
+/// here must actually be *allowed* for this to be exercising the budget
+/// check and not just `HOST_NOT_ALLOWED`. No network is needed either
+/// way: the budget check runs before resolution/dialing, so the fixture
+/// server started here (`start_multi(_, 0)`) must see exactly zero
+/// accepted connections.
 #[test]
 fn fetch_request_body_counts_against_the_byte_budget() -> Result<(), String> {
-    let body = catches_code(
-        r#"await apsides.fetch("https://not-listed.fixture.invalid/", { method: "POST", body: "x".repeat(600) });"#,
-    );
+    let (server, accepted) = HttpsFixtureServer::start_multi(b"unused", 0)?;
+    let egress = fixture_egress(&server);
+    let url = fixture_url(&server);
+    let body = catches_code(&format!(
+        r#"await apsides.fetch("{url}", {{ method: "POST", body: "x".repeat(600) }});"#
+    ));
     let report = run(&body, |invocation| {
+        invocation.egress = egress;
         invocation.limits.max_fetch_bytes_total = 500;
     });
-    assert_code(&report, "FETCH_BYTE_BUDGET_EXCEEDED")
+    assert_code(&report, "FETCH_BYTE_BUDGET_EXCEEDED")?;
+    if accepted.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        return Err(
+            "expected an exhausted budget to reject the call before dialling, but the fixture \
+             accepted a connection"
+                .to_owned(),
+        );
+    }
+    server.join()
+}
+
+// ---------------------------------------------------------------------
+// review round 6, R1: a failed fetch refunds its reservation in full
+// ---------------------------------------------------------------------
+
+/// R1(a): several `HOST_NOT_ALLOWED` calls (rejected before ever
+/// reserving budget, since the allowlist check now runs first) followed
+/// by several connect failures (rejected only after reserving, but that
+/// reservation must be refunded on failure) must not exhaust a tiny
+/// budget -- a subsequent valid, tiny fetch must still succeed.
+#[test]
+fn fetch_failed_calls_refund_their_reservation_so_a_later_valid_fetch_still_succeeds()
+-> Result<(), String> {
+    let server = HttpsFixtureServer::start(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok",
+    )?;
+    // A throwaway listener, bound then immediately dropped: its port has
+    // nothing listening on it, so dialling it fails with CONNECT_FAILED
+    // rather than ever reaching a server.
+    let closed_listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|err| format!("failed to bind a throwaway listener: {err}"))?;
+    let closed_addr = closed_listener
+        .local_addr()
+        .map_err(|err| format!("failed to read the throwaway listener's address: {err}"))?;
+    drop(closed_listener);
+
+    let mut overrides = HashMap::new();
+    overrides.insert(FIXTURE_HOST.to_owned(), vec![server.addr.ip()]);
+    let egress = EgressPolicy {
+        allowed: vec![
+            (FIXTURE_HOST.to_owned(), closed_addr.port()),
+            (FIXTURE_HOST.to_owned(), server.addr.port()),
+        ],
+        resolver_override: Some(overrides),
+        fixture_trust_anchor: Some(FixtureEgressOverride {
+            acknowledgement: FIXTURE_ACKNOWLEDGEMENT.to_owned(),
+            trust_anchor_der: server.ca_der.clone(),
+        }),
+    };
+    let closed_url = format!("https://{FIXTURE_HOST}:{}/", closed_addr.port());
+    let valid_url = fixture_url(&server);
+    let body = format!(
+        r#"
+        const codes = [];
+        try {{ await apsides.fetch("https://not-listed.fixture.invalid/", {{}}); }}
+        catch (e) {{ codes.push(e.code); }}
+        try {{ await apsides.fetch("https://also-not-listed.fixture.invalid/", {{}}); }}
+        catch (e) {{ codes.push(e.code); }}
+        try {{ await apsides.fetch("{closed_url}", {{}}); }}
+        catch (e) {{ codes.push(e.code); }}
+        try {{ await apsides.fetch("{closed_url}", {{}}); }}
+        catch (e) {{ codes.push(e.code); }}
+        const r = await apsides.fetch("{valid_url}", {{}});
+        return {{ codes, status: r.status }};
+    "#
+    );
+
+    let report = run(&body, |invocation| {
+        invocation.egress = egress;
+        // Small enough that a single un-refunded reservation (each
+        // reserving the whole budget, since a GET has no body) would
+        // starve every later call, but large enough for one small
+        // response.
+        invocation.limits.max_fetch_bytes_total = 4096;
+    });
+    let value = report
+        .result
+        .map_err(|err| format!("expected the handler to succeed, got Err: {err}"))?;
+    let codes = value
+        .get("codes")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("missing `codes` array in {value:?}"))?;
+    let expected_codes = serde_json::json!([
+        "HOST_NOT_ALLOWED",
+        "HOST_NOT_ALLOWED",
+        "CONNECT_FAILED",
+        "CONNECT_FAILED",
+    ]);
+    if *codes != *expected_codes.as_array().ok_or("unreachable: literal array")? {
+        return Err(format!(
+            "expected the four failing calls to be {expected_codes:?}, got {codes:?} (full \
+             result: {value:?})"
+        ));
+    }
+    let status = value.get("status").and_then(serde_json::Value::as_u64);
+    if status != Some(200) {
+        return Err(format!(
+            "expected the final valid fetch to succeed with status 200 after the earlier \
+             failures, got {value:?}"
+        ));
+    }
+
+    server.join()
+}
+
+/// R1(c): the concurrent-budget probe (`fetch_concurrent_calls_cannot_exceed_the_total_byte_budget`)
+/// stays bounded even down at the dial level -- since each reservation
+/// there consumes the *entire* 4 MiB budget (a GET has no body, and the
+/// worst-case response allowance is `MAX_FETCH_RESPONSE_BYTES.min(remaining)`
+/// = the whole remaining budget), only the first of the four concurrent
+/// calls to actually reserve can ever dial at all; the other three must
+/// be rejected as budget-exhausted before ever reaching the network, so
+/// the fixture must see exactly one accepted connection, never four.
+#[test]
+fn fetch_concurrent_calls_over_budget_dial_at_most_once() -> Result<(), String> {
+    let body_len = 3 * 1024 * 1024;
+    let mut response = format!("HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\n\r\n").into_bytes();
+    response.extend_from_slice(&vec![b'a'; body_len]);
+    let response: &'static [u8] = Box::leak(response.into_boxed_slice());
+
+    let (server, accepted) = HttpsFixtureServer::start_multi(response, 4)?;
+    let url = fixture_url(&server);
+    let body = format!(
+        r#"
+        const results = await Promise.allSettled([
+            apsides.fetch("{url}", {{}}),
+            apsides.fetch("{url}", {{}}),
+            apsides.fetch("{url}", {{}}),
+            apsides.fetch("{url}", {{}}),
+        ]);
+        return results.map((r) => (r.status === "fulfilled" ? "OK" : r.reason.code));
+    "#
+    );
+
+    let report = run(&body, |invocation| {
+        invocation.egress = fixture_egress(&server);
+        invocation.limits.max_fetch_bytes_total = 4 * 1024 * 1024;
+        invocation.limits.max_concurrent_fetches = 4;
+    });
+    let value = report
+        .result
+        .map_err(|err| format!("expected the handler to succeed, got Err: {err}"))?;
+    let codes = value
+        .as_array()
+        .ok_or_else(|| format!("expected an array, got {value:?}"))?;
+
+    let ok = codes.iter().filter(|code| **code == serde_json::json!("OK")).count();
+    let budget_or_too_large = codes
+        .iter()
+        .filter(|code| {
+            **code == serde_json::json!("FETCH_BYTE_BUDGET_EXCEEDED")
+                || **code == serde_json::json!("RESPONSE_TOO_LARGE")
+        })
+        .count();
+    if ok > 1 {
+        return Err(format!(
+            "expected at most one of 4 concurrent 3 MiB fetches to succeed against a 4 MiB \
+             total budget, got {ok} (full result: {codes:?})"
+        ));
+    }
+    if ok + budget_or_too_large != codes.len() {
+        return Err(format!(
+            "expected every non-OK result to be FETCH_BYTE_BUDGET_EXCEEDED or \
+             RESPONSE_TOO_LARGE, got {codes:?}"
+        ));
+    }
+
+    let accepted_count = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    if accepted_count > 1 {
+        return Err(format!(
+            "expected at most one dial across 4 concurrent calls over budget, but the fixture \
+             accepted {accepted_count} connections"
+        ));
+    }
+
+    server.join()
 }
 
 // ---------------------------------------------------------------------

@@ -652,6 +652,20 @@ pub struct Limits {
     /// the same "budget still available" snapshot and all proceed,
     /// together pulling `N` times this budget into the process at once
     /// (review round 6, N1).
+    ///
+    /// The reservation is taken only *after* every check that can fail
+    /// for a reason unrelated to available budget (ops already closed, a
+    /// malformed method/header, a non-`https` scheme, an IP-literal host,
+    /// a host not on the egress allowlist) has already passed, and is
+    /// refunded in full if the call then fails for any reason -- a failed
+    /// fetch never hands a response buffer to JS, so nothing is gained by
+    /// keeping its reservation charged. A version that reserved first, or
+    /// kept a failed call's reservation charged, let a burst of e.g.
+    /// `HOST_NOT_ALLOWED` calls or connect failures exhaust an
+    /// invocation's entire budget without ever admitting a single byte
+    /// into the process (review round 6, R1). Only a call that actually
+    /// receives a response keeps a charge -- and then only for that
+    /// response's real size, not the worst-case allowance it reserved.
     pub max_fetch_bytes_total: usize,
     /// Hard cap on `apsides.fetch` calls in flight at once for this
     /// invocation. Without this, a handler could open unboundedly many
