@@ -151,6 +151,18 @@ contexts:
     let status = std::process::Command::new(&exe)
         .env(CHILD_MARKER_ENV, "1")
         .env(runtime::CONFIG_PATH_ENV, &startup_config_path)
+        // This test's fixture kubeconfig names no proxy at all, and the
+        // real controller must not need one either; clearing every
+        // ambient proxy variable (rather than relying on `no_proxy`
+        // covering this test's loopback target) keeps this test
+        // deterministic in an environment that happens to set one, the
+        // same way `op_apsides_fetch` itself always ignores proxy env
+        // vars for its own connections (see the Apsides v0.3 plan, Phase
+        // 5b).
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("http_proxy")
         .status()
         .map_err(|err| format!("failed to spawn the locked-down child process: {err}"))?;
     let _ = fs::remove_dir_all(&dir);
