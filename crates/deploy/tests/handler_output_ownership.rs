@@ -31,7 +31,12 @@ fn plan_with_handler_output() -> TestResult<GenerationPlan> {
             "source": source,
             "handlerOutput": true,
         }],
-        "inputs": [],
+        "inputs": [{
+            "id": "output-flags-input", "apiVersion": "v1", "kind": "ConfigMap",
+            "name": "flags", "namespace": "workload", "mode": "output",
+            "managedResourceId": "output-flags", "projection": ["data"], "sensitive": false,
+            "missing": "block-dependent-mutations", "source": source,
+        }],
         "reactions": [],
         "handlers": [],
         "outputs": [{"id": "output-flags", "name": "flags", "namespace": "workload"}],

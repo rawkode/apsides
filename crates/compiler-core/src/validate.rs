@@ -132,9 +132,34 @@ pub fn validate(ir: &Ir) -> Result<CompiledPlan> {
     let resources = validate_resources(ir)?;
     let outputs = validate_outputs(ir, &resources)?;
     let inputs = validate_inputs(ir, &resources)?;
+    validate_output_wiring(ir, &inputs)?;
     validate_reactions(ir, &resources, &inputs)?;
     validate_handlers(ir, &inputs, &outputs)?;
     derive_plan(ir, &inputs)
+}
+
+/// Every declared output has exactly one Output-mode input watching it — the
+/// named get/list/watch capability an output adds is otherwise not a
+/// well-defined invariant (zero would mean nothing ever reads it live, two
+/// would be an ambiguous duplicate).
+fn validate_output_wiring(ir: &Ir, inputs: &BTreeMap<String, &Input>) -> Result<()> {
+    let mut watchers: BTreeMap<&str, usize> = BTreeMap::new();
+    for input in inputs.values() {
+        if input.mode == InputMode::Output {
+            let output_id = input.managed_resource_id.as_deref().unwrap_or_default();
+            *watchers.entry(output_id).or_insert(0) += 1;
+        }
+    }
+    for output in &ir.outputs {
+        require(
+            watchers.get(output.id.as_str()).copied() == Some(1),
+            format!(
+                "output {} must have exactly one Output-mode input watching it",
+                output.id
+            ),
+        )?;
+    }
+    Ok(())
 }
 
 fn validate_domain(ir: &Ir) -> Result<()> {
@@ -415,6 +440,17 @@ fn validate_inputs<'a>(
                         && resource.namespace == input.namespace,
                     "managed input identity differs from its managed resource",
                 )?;
+                // A handler output is reachable only through its own
+                // Output-mode input: a Managed input aliasing the same
+                // resource would read the reconciler's own static desired
+                // value (always `{}`, since a handler-output resource never
+                // carries `data`) and would silently bypass the handler
+                // graph's self-loop/cycle checks, which only look at
+                // Output-mode inputs.
+                require(
+                    !resource.handler_output,
+                    "managed input cannot reference a handler output; use its Output-mode input instead",
+                )?;
             }
             InputMode::Observed => {
                 require(
@@ -495,12 +531,41 @@ fn validate_reactions(
     Ok(())
 }
 
+/// True when `host`'s last dot-separated label — ignoring one trailing empty
+/// label from a trailing dot — is either `0x`/`0X` followed by one or more
+/// hex digits, or entirely ASCII digits. This is the WHATWG URL "ends in a
+/// number" host check: the signal used to decide whether a domain-shaped
+/// string is actually a numeric (decimal, hex or octal) IPv4 shorthand, since
+/// no real DNS label — and certainly no TLD — is ever purely numeric.
+fn ends_in_a_number(host: &str) -> bool {
+    let mut parts: Vec<&str> = host.split('.').collect();
+    if parts.len() > 1 && parts.last() == Some(&"") {
+        parts.pop();
+    }
+    let Some(last) = parts.last() else {
+        return false;
+    };
+    if last.is_empty() {
+        return false;
+    }
+    if let Some(hex) = last.strip_prefix("0x").or_else(|| last.strip_prefix("0X")) {
+        return !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    last.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// A lowercase DNS name suitable for a handler's egress allowlist: never an
-/// IP literal (v4 or v6), never containing a wildcard, at most 253 bytes.
+/// IP literal (v4 or v6, including decimal/hex/octal IPv4 shorthand — see
+/// [`ends_in_a_number`]), never `localhost` or another single-label host
+/// (an egress host always has at least one dot), never containing a
+/// wildcard, at most 253 bytes.
 fn is_egress_host(host: &str) -> bool {
     host.parse::<std::net::IpAddr>().is_err()
-        && host.len() <= 253
         && !host.is_empty()
+        && host.len() <= 253
+        && host.contains('.')
+        && host != "localhost"
+        && !ends_in_a_number(host)
         && host.split('.').all(|part| dns_label(part, 63))
 }
 
@@ -747,6 +812,7 @@ fn validate_handlers(
     )?;
     let mut handler_ids = BTreeSet::new();
     let mut egress_hosts = BTreeSet::new();
+    let mut claimed_outputs: BTreeSet<&str> = BTreeSet::new();
     for handler in &ir.handlers {
         require(
             handler_ids.insert(handler.id.as_str()),
@@ -754,6 +820,16 @@ fn validate_handlers(
         )?;
         validate_handler_shape(ir, handler)?;
         validate_handler_edges(handler, inputs, outputs, &mut egress_hosts)?;
+        // Each output has exactly one writer handler: two handlers claiming
+        // the same output would both SSA-apply `data` under the same field
+        // manager (`apsides-handler-<domainId>`) and silently drop each
+        // other's keys.
+        for output_id in &handler.outputs {
+            require(
+                claimed_outputs.insert(output_id.as_str()),
+                format!("output {output_id} already has a writer handler"),
+            )?;
+        }
     }
     require(
         egress_hosts.len() <= MAX_EGRESS_HOSTS,

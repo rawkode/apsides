@@ -85,6 +85,44 @@ const OBSERVED: &[Scenario] = &[
         "controller restart converges from changes made while stopped",
     ),
 ];
+/// Scenarios for an `InputMode::Output` input: a deliberately smaller subset
+/// of [`OBSERVED`]'s. An output is observed live the same way an Observed
+/// input is (see `model::InputMode::Output`), but most of `OBSERVED`'s
+/// scenarios model failure modes of an *external* writer's input that never
+/// apply to a handler output:
+///
+/// - `missing-input`/`input-returned` (the missing/recovery pair): a handler
+///   output is a managed resource the reconciler itself recreates
+///   absent-only every cycle, so its metadata is never durably missing the
+///   way an external `ConfigMap` can be; there is nothing for these to exercise.
+/// - `unauthorized-input`/`credential-read-denial`: the reconciler's own
+///   in-domain credentials always hold the get/list/watch capability an
+///   output's Output-mode input adds (see `validate_output_wiring`), unlike
+///   an external input whose access an operator could plausibly deny.
+/// - `unavailable-input`/`invalid-input`: modeled failure injection points
+///   for an external transport/projection this increment has no handler
+///   runtime to trigger for an output specifically.
+/// - `coalesced-inputs`: exercises batching several *independent* external
+///   writers' changes together; an output has exactly one writer (its
+///   handler, `validate_handlers`'s one-writer-per-output rule), so there is
+///   only ever one change to coalesce.
+///
+/// `projected-change` and `restart-and-relist` both still apply exactly as
+/// they do for an Observed input: a handler's write changes the revision,
+/// and a controller restart still relists and converges on the output's
+/// latest live value.
+const OUTPUT: &[Scenario] = &[
+    (
+        "projected-change",
+        "semantic",
+        "a handler's written output data changes the revision",
+    ),
+    (
+        "restart-and-relist",
+        "workload",
+        "controller restart converges from an output change made while stopped",
+    ),
+];
 const MANAGED: &[Scenario] = &[
     (
         "managed-drift-repair",
@@ -139,12 +177,13 @@ pub(crate) fn generate(ir: &Ir) -> Vec<TestCase> {
             };
             append(&mut cases, reaction, std::slice::from_ref(selected), &all);
         }
-        // Output-mode inputs are observed live, exactly like Observed inputs
-        // (see model::InputMode::Output), so they share the same scenarios.
-        let mut observed_like = mode_ids(InputMode::Observed);
-        observed_like.extend(mode_ids(InputMode::Output));
-        observed_like.sort();
-        append(&mut cases, reaction, OBSERVED, &observed_like);
+        append(
+            &mut cases,
+            reaction,
+            OBSERVED,
+            &mode_ids(InputMode::Observed),
+        );
+        append(&mut cases, reaction, OUTPUT, &mode_ids(InputMode::Output));
         let managed = mode_ids(InputMode::Managed);
         for scenario in MANAGED {
             let applicable = if scenario.0 == "managed-drift-repair" {

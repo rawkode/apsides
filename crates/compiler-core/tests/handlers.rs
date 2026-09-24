@@ -158,6 +158,48 @@ fn egress_host_rejects_uppercase() -> TestResult {
     expect_err(&value, "lowercase DNS name")
 }
 
+/// Numeric IPv4 shorthand (decimal, dotted-decimal, hex or octal) and any
+/// host that otherwise "ends in a number" (the WHATWG URL host check) must
+/// never pass as a domain name — a browser or Node's `net` module would
+/// parse every one of these as an IP address, not a hostname.
+#[test]
+fn egress_host_rejects_every_numeric_ip_shorthand() -> TestResult {
+    for host in [
+        "127.1",
+        "2130706433",
+        "0x7f.1",
+        "0177.0.0.1",
+        "1.2.3.04",
+        "example.123",
+    ] {
+        let mut value = fixture();
+        value["handlers"][0]["egress"] = json!([{"host": host, "port": 443}]);
+        expect_err(&value, "lowercase DNS name")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn egress_host_rejects_localhost_and_other_single_label_hosts() -> TestResult {
+    for host in ["localhost", "internal"] {
+        let mut value = fixture();
+        value["handlers"][0]["egress"] = json!([{"host": host, "port": 443}]);
+        expect_err(&value, "lowercase DNS name")?;
+    }
+    Ok(())
+}
+
+/// A host whose last label is a real (non-numeric) TLD is still accepted
+/// even when an earlier label happens to be all digits — only the *last*
+/// label decides "ends in a number".
+#[test]
+fn egress_host_accepts_a_numeric_non_last_label() -> TestResult {
+    let mut value = fixture();
+    value["handlers"][0]["egress"] = json!([{"host": "203.example.com", "port": 443}]);
+    plan(&value)?;
+    Ok(())
+}
+
 #[test]
 fn output_name_cannot_alias_another_resource() -> TestResult {
     let mut value = fixture();
@@ -247,4 +289,304 @@ fn every_handler_output_resource_needs_a_matching_declared_output() -> TestResul
     // resource, and the handler still references it.
     value["handlers"][0]["outputs"] = json!([]);
     expect_err(&value, "matching declared output")
+}
+
+// --- B1: a handler output is reachable only through its own Output-mode
+// input; a Managed input aliasing the same resource must be rejected before
+// it can bypass the self-loop/cycle checks below (which only look at
+// Output-mode inputs). ---
+
+/// A Managed input pointing at a `handlerOutput` resource is rejected
+/// outright: it would read the reconciler's own static desired value
+/// (always `{}`, since a handler-output resource never carries `data`), not
+/// the handler's live write.
+fn add_managed_alias(value: &mut Value) -> TestResult {
+    value["inputs"].as_array_mut().ok_or("not an array")?.push(json!({
+        "id": "flags-alias", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags", "namespace": "workload",
+        "mode": "managed", "managedResourceId": "output-flags", "projection": ["data"], "sensitive": false,
+        "missing": "block-dependent-mutations", "source": source(),
+    }));
+    Ok(())
+}
+
+#[test]
+fn managed_input_cannot_alias_a_handler_output() -> TestResult {
+    let mut value = fixture();
+    add_managed_alias(&mut value)?;
+    expect_err(&value, "managed input cannot reference a handler output")
+}
+
+#[test]
+fn handler_self_read_through_a_managed_alias_is_rejected() -> TestResult {
+    let mut value = fixture();
+    add_managed_alias(&mut value)?;
+    value["handlers"][0]["inputs"] = json!(["settings", "flags-alias"]);
+    // The alias itself is rejected before the handler graph is even built.
+    expect_err(&value, "managed input cannot reference a handler output")
+}
+
+#[test]
+fn handler_self_trigger_through_a_managed_alias_is_rejected() -> TestResult {
+    let mut value = fixture();
+    add_managed_alias(&mut value)?;
+    value["handlers"][0]["trigger"]["input"] = json!("flags-alias");
+    value["handlers"][0]["inputs"] = json!(["flags-alias"]);
+    expect_err(&value, "managed input cannot reference a handler output")
+}
+
+#[test]
+fn two_handler_cycle_through_managed_aliases_is_rejected() -> TestResult {
+    let mut value = fixture();
+    // A second output/handler pair, then close the cycle through Managed
+    // aliases of both outputs instead of their real Output-mode inputs.
+    value["resources"].as_array_mut().ok_or("not an array")?.push(json!({
+        "id": "output-other", "apiVersion": "v1", "kind": "ConfigMap", "name": "other", "namespace": "workload",
+        "desired": {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "other", "namespace": "workload", "labels": {"apsides.dev/handler-output": "output-other"}}},
+        "lifecycle": {"deletionPolicy": "orphan"}, "source": source(), "handlerOutput": true,
+    }));
+    value["inputs"].as_array_mut().ok_or("not an array")?.push(json!({
+        "id": "output-other-input", "apiVersion": "v1", "kind": "ConfigMap", "name": "other", "namespace": "workload",
+        "mode": "output", "managedResourceId": "output-other", "projection": ["data"], "sensitive": false,
+        "missing": "block-dependent-mutations", "source": source(),
+    }));
+    value["outputs"]
+        .as_array_mut()
+        .ok_or("not an array")?
+        .push(json!({"id": "output-other", "name": "other", "namespace": "workload"}));
+    value["inputs"].as_array_mut().ok_or("not an array")?.push(json!({
+        "id": "other-alias", "apiVersion": "v1", "kind": "ConfigMap", "name": "other", "namespace": "workload",
+        "mode": "managed", "managedResourceId": "output-other", "projection": ["data"], "sensitive": false,
+        "missing": "block-dependent-mutations", "source": source(),
+    }));
+    value["handlers"].as_array_mut().ok_or("not an array")?.push(json!({
+        "id": "handler-b", "module": "handlers/sync-flags.ts", "export": "syncFlags",
+        "trigger": {"kind": "input-changed", "input": "flags-alias-b"},
+        "inputs": ["flags-alias-b"], "egress": [], "outputs": ["output-other"],
+        "timeoutMillis": 30000, "maxHeapBytes": 67_108_864, "bundleSha256": "1".repeat(64), "source": source(),
+    }));
+    value["inputs"].as_array_mut().ok_or("not an array")?.push(json!({
+        "id": "flags-alias-b", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags", "namespace": "workload",
+        "mode": "managed", "managedResourceId": "output-flags", "projection": ["data"], "sensitive": false,
+        "missing": "block-dependent-mutations", "source": source(),
+    }));
+    value["handlers"][0]["inputs"] = json!(["settings", "other-alias"]);
+    // Rejected at the Managed-alias check, never reaching cycle detection.
+    expect_err(&value, "managed input cannot reference a handler output")
+}
+
+// --- N2: exactly one Output-mode input per output. ---
+
+#[test]
+fn output_with_no_watching_input_is_rejected() -> TestResult {
+    let mut value = fixture();
+    value["inputs"] = Value::Array(
+        value["inputs"]
+            .as_array()
+            .ok_or("not an array")?
+            .iter()
+            .filter(|input| input["id"] != "output-flags-input")
+            .cloned()
+            .collect(),
+    );
+    value["handlers"][0]["inputs"] = json!(["settings"]);
+    value["handlers"][0]["outputs"] = json!([]);
+    expect_err(&value, "exactly one Output-mode input")
+}
+
+#[test]
+fn output_with_two_watching_inputs_is_rejected() -> TestResult {
+    let mut value = fixture();
+    value["inputs"].as_array_mut().ok_or("not an array")?.push(json!({
+        "id": "output-flags-input-2", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags", "namespace": "workload",
+        "mode": "output", "managedResourceId": "output-flags", "projection": ["data"], "sensitive": false,
+        "missing": "block-dependent-mutations", "source": source(),
+    }));
+    expect_err(&value, "exactly one Output-mode input")
+}
+
+// --- One writer per output (binding decision): two handlers cannot declare
+// the same output. ---
+
+#[test]
+fn two_handlers_cannot_write_the_same_output() -> TestResult {
+    let mut value = fixture();
+    value["handlers"].as_array_mut().ok_or("not an array")?.push(json!({
+        "id": "handler-b", "module": "handlers/sync-flags.ts", "export": "syncFlags",
+        "trigger": {"kind": "input-changed", "input": "settings"},
+        "inputs": ["settings"], "egress": [], "outputs": ["output-flags"],
+        "timeoutMillis": 30000, "maxHeapBytes": 67_108_864, "bundleSha256": "1".repeat(64), "source": source(),
+    }));
+    expect_err(&value, "already has a writer handler")
+}
+
+// --- B3: an output's rolloutOn test plan carries only the scenarios that
+// apply to a handler output, never the full Observed set. ---
+
+#[test]
+fn output_rollout_test_plan_excludes_inapplicable_observed_scenarios() -> TestResult {
+    let mut value = fixture();
+    value["reactions"] = json!([{
+        "id": "rollout-flags", "op": "rollout", "inputs": ["output-flags-input"], "target": "api", "source": source(),
+    }]);
+    let compiled = plan(&value)?;
+    let scenarios: std::collections::BTreeSet<&str> = compiled
+        .test_plan
+        .iter()
+        .filter(|case| case.reaction_id == "rollout-flags")
+        .map(|case| case.scenario.as_str())
+        .collect();
+    for expected in [
+        "projected-change",
+        "restart-and-relist",
+        "initial-evaluation",
+    ] {
+        assert!(
+            scenarios.contains(expected),
+            "expected {expected} in {scenarios:?}"
+        );
+    }
+    for excluded in [
+        "missing-input",
+        "input-returned",
+        "unauthorized-input",
+        "credential-read-denial",
+        "unavailable-input",
+        "invalid-input",
+        "coalesced-inputs",
+    ] {
+        assert!(
+            !scenarios.contains(excluded),
+            "did not expect {excluded} in {scenarios:?}"
+        );
+    }
+    Ok(())
+}
+
+// --- N3: `derive_surface` reports handler/egress/output rows, sorted, with
+// egress attribution kept per handler rather than collapsed across
+// handlers. ---
+
+/// Two handlers, each writing its own output, sharing one egress host, with
+/// resources and handlers declared out of alphabetical order.
+fn two_handler_two_output_fixture() -> Value {
+    let deployment = |id: &str, name: &str| {
+        json!({
+            "id": id, "apiVersion": "apps/v1", "kind": "Deployment", "name": name, "namespace": "workload",
+            "desired": {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": name, "namespace": "workload"}, "spec": {"replicas": 1, "selector": {"matchLabels": {"app": name}}, "template": {"metadata": {"labels": {"app": name}}, "spec": {"serviceAccountName": "api-workload", "containers": [{"name": name, "image": format!("example.invalid/api@sha256:{}", "0".repeat(64))}]}}}},
+            "lifecycle": {"deletionPolicy": "orphan"}, "source": source(),
+        })
+    };
+    let handler_output = |id: &str, name: &str| {
+        json!({
+            "id": id, "apiVersion": "v1", "kind": "ConfigMap", "name": name, "namespace": "workload",
+            "desired": {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": name, "namespace": "workload", "labels": {"apsides.dev/handler-output": id}}},
+            "lifecycle": {"deletionPolicy": "orphan"}, "source": source(), "handlerOutput": true,
+        })
+    };
+    let output_input = |id: &str, resource_id: &str, name: &str| json!({"id": id, "apiVersion": "v1", "kind": "ConfigMap", "name": name, "namespace": "workload", "mode": "output", "managedResourceId": resource_id, "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source()});
+    json!({
+        "schemaVersion": IR_SCHEMA,
+        "domain": {
+            "id": "example", "namespace": "workload", "controlNamespace": "apsides-system",
+            "clusterBinding": "test-cluster", "policyRef": "platform/example", "enforcement": "api-bound",
+            "minKubernetesVersion": "1.34",
+            "budgets": {"maxResources": 32, "maxInputs": 32, "maxReactions": 32, "maxObjectBytes": 262_144, "maxQueueDepth": 32, "maxConcurrentRequests": 4},
+        },
+        // Declared out of alphabetical order, to exercise `derive_surface`'s sorting.
+        "resources": [
+            deployment("api", "api"),
+            handler_output("output-metrics", "metrics"),
+            handler_output("output-flags", "flags"),
+        ],
+        "inputs": [
+            {"id": "settings", "apiVersion": "v1", "kind": "ConfigMap", "name": "settings", "namespace": "workload", "mode": "observed", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source()},
+            output_input("output-flags-input", "output-flags", "flags"),
+            output_input("output-metrics-input", "output-metrics", "metrics"),
+        ],
+        "reactions": [],
+        // "zeta-handler" is declared before "alpha-handler" to exercise sorting by id.
+        "handlers": [
+            {
+                "id": "zeta-handler", "module": "handlers/zeta.ts", "export": "zeta",
+                "trigger": {"kind": "input-changed", "input": "settings"},
+                "inputs": ["settings"],
+                // Same host:port as "alpha-handler" below: two handlers reaching the
+                // same host is allowed (only a *single* handler's own list must be
+                // distinct), so both rows must survive attributed to their own handler.
+                "egress": [{"host": "api.example.com", "port": 443}],
+                "outputs": ["output-flags"], "timeoutMillis": 30000, "maxHeapBytes": 67_108_864,
+                "bundleSha256": "1".repeat(64), "source": source(),
+            },
+            {
+                "id": "alpha-handler", "module": "handlers/alpha.ts", "export": "alpha",
+                "trigger": {"kind": "input-changed", "input": "settings"},
+                "inputs": ["settings"],
+                "egress": [
+                    {"host": "api.example.com", "port": 443},
+                    {"host": "metrics.example.com", "port": 8443},
+                ],
+                "outputs": ["output-metrics"], "timeoutMillis": 30000, "maxHeapBytes": 67_108_864,
+                "bundleSha256": "2".repeat(64), "source": source(),
+            },
+        ],
+        "outputs": [
+            {"id": "output-metrics", "name": "metrics", "namespace": "workload"},
+            {"id": "output-flags", "name": "flags", "namespace": "workload"},
+        ],
+        "provenance": {"compiler": "apsides/0.1", "inputs": [
+            {"path": "program.tsx", "sha256": "0".repeat(64)},
+            {"path": "handlers/zeta.ts", "sha256": "1".repeat(64)},
+            {"path": "handlers/alpha.ts", "sha256": "2".repeat(64)},
+        ]},
+    })
+}
+
+#[test]
+fn derive_surface_reports_handler_egress_and_output_rows_sorted_and_per_handler_attributed()
+-> TestResult {
+    let compiled = plan(&two_handler_two_output_fixture())?;
+    let surface = derive_surface(&compiled);
+
+    // Handler rows: sorted by id, each carrying its own inputs/outputs.
+    assert_eq!(
+        surface
+            .handlers
+            .iter()
+            .map(|h| h.id.as_str())
+            .collect::<Vec<_>>(),
+        ["alpha-handler", "zeta-handler"]
+    );
+    assert_eq!(surface.handlers[0].trigger, "settings");
+    assert_eq!(surface.handlers[0].inputs, ["settings"]);
+    assert_eq!(surface.handlers[0].outputs, ["output-metrics"]);
+    assert_eq!(surface.handlers[1].outputs, ["output-flags"]);
+
+    // Egress rows: sorted by (host, port, handler); the shared host is
+    // attributed separately to each handler, never collapsed into one row.
+    let egress: Vec<(&str, u16, &str)> = surface
+        .egress
+        .iter()
+        .map(|row| (row.host.as_str(), row.port, row.handler.as_str()))
+        .collect();
+    assert_eq!(
+        egress,
+        [
+            ("api.example.com", 443, "alpha-handler"),
+            ("api.example.com", 443, "zeta-handler"),
+            ("metrics.example.com", 8443, "alpha-handler"),
+        ]
+    );
+
+    // Output rows: sorted by id.
+    assert_eq!(
+        surface
+            .outputs
+            .iter()
+            .map(|o| o.id.as_str())
+            .collect::<Vec<_>>(),
+        ["output-flags", "output-metrics"]
+    );
+    assert_eq!(surface.outputs[0].name, "flags");
+    assert_eq!(surface.outputs[1].name, "metrics");
+    Ok(())
 }
