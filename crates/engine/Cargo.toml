@@ -65,6 +65,15 @@ hyper-util = { version = "=0.1.20", features = ["tokio"] }
 # fixture. Default features (`crypto`, `pem`, `ring`) match the `ring`
 # crypto backend already chosen for `rustls`/`tokio-rustls` above.
 rcgen = { version = "0.14", optional = true }
+# Phase 5c filesystem lockdown (see the Apsides v0.3 plan, "5c. Filesystem
+# lockdown"): promoted from `[dev-dependencies]` (where the Phase 5a spike
+# gate first proved the deny-all-before-any-thread ordering in
+# `tests/landlock_order.rs`/`tests/landlock_fs.rs`) to a normal dependency,
+# so `src/lockdown.rs` can expose the same, now-production, lockdown
+# primitives for `runtime::start` to call. Needs no `unsafe` (confirmed by
+# the crate's own docs and this crate's own workspace-lint-clean use of it),
+# so it does not touch the `unsafe_code = "deny"` policy.
+landlock = "0.4"
 
 [features]
 # Review round 5 (decision): the only entry point exposed without this
@@ -86,7 +95,6 @@ test-util = ["dep:rcgen"]
 
 [dev-dependencies]
 engine = { path = ".", features = ["test-util"] }
-landlock = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 
 # `harness = false`: this binary's `fn main()` controls thread creation

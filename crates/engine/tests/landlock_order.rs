@@ -37,10 +37,9 @@ use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use common::{
-    SPIKE_HTTPS_HOST, apply_deny_all_or_fail_closed, assert_file_open_denied,
+    LockdownOutcome, SPIKE_HTTPS_HOST, apply_deny_all_or_fail_closed, assert_file_open_denied,
     count_process_threads, handler_invocation, wrap_as_handler,
 };
-use landlock::RulesetStatus;
 
 fn main() -> Result<(), String> {
     // 0. Verify this test's own premise, rather than assuming it: exactly
@@ -51,7 +50,7 @@ fn main() -> Result<(), String> {
     //    would otherwise have silently stopped proving anything (they'd
     //    still find *later* threads restricted, but not the ones created
     //    by that hypothetical earlier, unrestricted init).
-    let thread_count = count_process_threads()?;
+    let thread_count = count_process_threads().map_err(|err| err.to_string())?;
     if thread_count != 1 {
         return Err(format!(
             "expected exactly one thread before Landlock lockdown (this \
@@ -65,7 +64,7 @@ fn main() -> Result<(), String> {
     //    tokio runtime, before any other thread exists in this process at
     //    all -- so every thread spawned from here on inherits it.
     let status = apply_deny_all_or_fail_closed(true)?;
-    let supported = status.ruleset != RulesetStatus::NotEnforced;
+    let supported = status == LockdownOutcome::Enforced;
     eprintln!("[landlock-order] landlock status: {status:?} (supported={supported})");
 
     if supported {

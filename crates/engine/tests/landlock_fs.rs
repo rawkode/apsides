@@ -24,10 +24,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use common::{
-    SPIKE_HTTPS_HOST, apply_deny_all_or_fail_closed, assert_file_open_denied, handler_invocation,
-    https_get_via_hickory, wrap_as_handler,
+    LockdownOutcome, SPIKE_HTTPS_HOST, apply_deny_all_or_fail_closed, assert_file_open_denied,
+    handler_invocation, https_get_via_hickory, wrap_as_handler,
 };
-use landlock::RulesetStatus;
 
 /// The plan's "if Landlock is unavailable here, ... run the test anyway to
 /// show the unsupported path fails closed": detect support (via the escape
@@ -38,7 +37,7 @@ use landlock::RulesetStatus;
 #[test]
 fn fails_closed_without_escape_hatch_iff_landlock_is_unsupported() -> Result<(), String> {
     let detected = apply_deny_all_or_fail_closed(true)?;
-    let supported = detected.ruleset != RulesetStatus::NotEnforced;
+    let supported = detected == LockdownOutcome::Enforced;
     eprintln!("[landlock spike] kernel support detected: {supported} (status = {detected:?})");
 
     let strict = apply_deny_all_or_fail_closed(false);
@@ -71,16 +70,12 @@ fn fails_closed_without_escape_hatch_iff_landlock_is_unsupported() -> Result<(),
 fn deny_all_blocks_file_access_iff_actually_enforced() -> Result<(), String> {
     let status = apply_deny_all_or_fail_closed(true)?;
 
-    match status.ruleset {
-        RulesetStatus::NotEnforced => {
-            eprintln!(
-                "[landlock spike] Landlock unsupported here (landlock status \
-                 = {:?}); not asserting on file access",
-                status.landlock
-            );
+    match status {
+        LockdownOutcome::NotEnforced => {
+            eprintln!("[landlock spike] Landlock unsupported here; not asserting on file access");
             Ok(())
         }
-        RulesetStatus::FullyEnforced | RulesetStatus::PartiallyEnforced => {
+        LockdownOutcome::Enforced => {
             assert_file_open_denied("main thread (per-thread restrict_self)")
         }
     }

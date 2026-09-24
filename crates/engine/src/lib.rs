@@ -40,12 +40,16 @@
 //! entry point therefore builds (or obtains) its runtime *before* calling
 //! [`begin_invocation`], never after.
 
+mod lockdown;
 mod net;
 mod ops;
 #[cfg(feature = "test-util")]
 pub mod test_support;
 mod v8_alloc;
 
+pub use lockdown::{
+    LockdownError, LockdownOutcome, apply_deny_all_or_fail_closed, count_process_threads,
+};
 pub use net::{EgressResolver, ResolveError, resolver_config_from_resolv_conf};
 /// Mirrored by `compiler_core::HANDLER_FETCH_REQUEST_BODY_BYTES` for the
 /// controller-pod memory formula -- see that constant's doc comment. A

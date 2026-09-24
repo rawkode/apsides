@@ -5,6 +5,7 @@
 //! common;` is compiled independently per binary).
 #![allow(
     dead_code,
+    unused_imports,
     reason = "shared across independent test binaries; not every binary uses every helper"
 )]
 
@@ -18,10 +19,10 @@ use std::time::Duration;
 use engine::{
     EgressPolicy, HandlerInvocation, Limits, OutputSink, OutputSinkError, StderrLogWriter,
 };
+pub use engine::{LockdownOutcome, count_process_threads};
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{GOOGLE, ResolverConfig};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
-use landlock::{ABI, Access, AccessFs, RestrictionStatus, Ruleset, RulesetAttr, RulesetStatus};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls;
@@ -98,55 +99,15 @@ pub const DENY_ALL_PROBE_PATH: &str = "/etc/hostname";
 /// back" is checked.
 pub const SPIKE_HTTPS_HOST: &str = "example.com";
 
-/// Applies a deny-all Landlock ruleset (every `AccessFs` right this crate's
-/// pinned ABI knows, with zero `add_rules` exceptions) to the calling
-/// thread. Mirrors the fail-closed contract planned for the real Phase 5c
-/// startup: if the running kernel cannot actually enforce Landlock, this
-/// refuses to report success unless `allow_no_landlock` is set (standing in
-/// for the plan's fixture-only `allowNoLandlock` startup-config flag).
-pub fn apply_deny_all_or_fail_closed(allow_no_landlock: bool) -> Result<RestrictionStatus, String> {
-    let abi = ABI::V9;
-    let status = Ruleset::default()
-        .handle_access(AccessFs::from_all(abi))
-        .map_err(|err| format!("handle_access: {err}"))?
-        .create()
-        .map_err(|err| format!("create: {err}"))?
-        // No `add_rules` call at all: every handled AccessFs right is
-        // denied for every path, with no exceptions.
-        .restrict_self()
-        .map_err(|err| format!("restrict_self: {err}"))?;
-
-    if status.ruleset == RulesetStatus::NotEnforced && !allow_no_landlock {
-        return Err(format!(
-            "Landlock is not enforced on this kernel ({:?}); refusing to \
-             continue without the fixture-only allowNoLandlock escape hatch",
-            status.landlock
-        ));
-    }
-    Ok(status)
-}
-
-/// Counts this process's threads via `/proc/self/task` (one entry per
-/// thread, including the calling one). Used by `tests/landlock_order.rs` to
-/// assert exactly one thread exists immediately before it applies Landlock,
-/// so the test's own premise -- that lockdown genuinely happens before V8's
-/// or tokio's worker threads are created, not just before this function
-/// checks for them -- is verified, not merely assumed: a future edit that
-/// moved V8/tokio init above the lockdown call would make this count `> 1`
-/// and fail the test, instead of silently passing on a since-invalidated
-/// assumption. Reads `/proc/self/task` itself (not e.g.
-/// `std::thread::available_parallelism`, which reports CPU count, not
-/// live thread count), so it must run *before* Landlock denies filesystem
-/// reads.
-pub fn count_process_threads() -> Result<usize, String> {
-    let entries = fs::read_dir("/proc/self/task")
-        .map_err(|err| format!("failed to read /proc/self/task: {err}"))?;
-    let mut count = 0usize;
-    for entry in entries {
-        entry.map_err(|err| format!("failed to read a /proc/self/task entry: {err}"))?;
-        count += 1;
-    }
-    Ok(count)
+/// Applies a deny-all Landlock ruleset via [`engine::apply_deny_all_or_fail_closed`]
+/// (moved there in Phase 5c, now also the real `runtime::start` startup
+/// path -- see that function's doc comment). Mirrors the fail-closed
+/// contract planned for the real Phase 5c startup: if the running kernel
+/// cannot actually enforce Landlock, this refuses to report success unless
+/// `allow_no_landlock` is set (standing in for the plan's fixture-only
+/// `allowNoLandlock` startup-config flag).
+pub fn apply_deny_all_or_fail_closed(allow_no_landlock: bool) -> Result<LockdownOutcome, String> {
+    engine::apply_deny_all_or_fail_closed(allow_no_landlock).map_err(|err| err.to_string())
 }
 
 /// Attempts to open [`DENY_ALL_PROBE_PATH`] and returns `Ok(())` only if
