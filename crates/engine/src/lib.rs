@@ -472,8 +472,16 @@ const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
      * before anything is buffered or written. Buffered in memory for the
      * rest of this invocation and committed to Kubernetes only after the
      * handler returns successfully, as one server-side apply per declared
-     * output containing that output's complete data map (see
-     * IR-CONTRACT.md, "Handlers and outputs").
+     * output (see IR-CONTRACT.md, "Handlers and outputs").
+     *
+     * Contract per output, across invocations: the keys written in *this*
+     * invocation (if it writes to this output at all) replace all of this
+     * handler's own keys in it. Keys another field manager owns -- another
+     * handler's output, or a key set by `kubectl apply`/`kubectl edit` --
+     * are never touched and always survive. An invocation that never calls
+     * `writeOutput` for this output leaves this handler's own keys in it
+     * unchanged; a handler can therefore never empty an output simply by
+     * not writing to it this invocation.
      * @param {string} id a declared output id
      * @param {string} key `[-._a-zA-Z0-9]+`, at most 253 characters, never
      *   exactly `.` or `..`
