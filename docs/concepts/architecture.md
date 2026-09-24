@@ -49,6 +49,20 @@ Privileged CI owns Roles, RoleBindings, the controller image, activation and
 retirement of the previous writer. A generation-specific proxy and protected
 coordination records form the writer-quiescence boundary.
 
+The generated controller touches the filesystem only during a short,
+synchronous startup: it reads its startup config, the proxy client identity
+(or the fixture kubeconfig), and `/etc/resolv.conf`, converts them into
+in-memory values, then applies a deny-all Landlock ruleset to the process's
+main thread before any other thread exists and before the V8 platform or the
+tokio runtime is initialised. Threads created afterward -- V8's worker pool,
+the tokio runtime's own workers -- inherit that restriction. The production
+kube client reaches the proxy Service by hostname through a dedicated
+`hickory-resolver`-backed connector rather than glibc's `getaddrinfo`, so a
+proxy reconnect never needs a file again. An unenforced Landlock lockdown
+fails startup closed in production; a fixture-only `allowNoLandlock` escape
+hatch exists for disposable-cluster testing and is structurally unavailable
+in production mode.
+
 ## Policy and force
 
 SSA force defaults to `false`. Authors may set a domain default with

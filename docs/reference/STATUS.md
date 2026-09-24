@@ -41,11 +41,32 @@ establish narrower properties.
   dispatches per reconcile cycle, at global concurrency 1; `apsides.fetch` is
   restricted to declared HTTPS egress hosts resolved through a dedicated
   DNS resolver built from `/etc/resolv.conf` (never glibc's own
-  `getaddrinfo`, and only when some declared handler has egress hosts);
-  handler output writes are buffered in memory for the invocation and
-  committed as one server-side apply per declared output, under field
-  manager `apsides-handler-<domainId>`, through the same authority/claim
-  re-check reconciler mutations use.
+  `getaddrinfo`); handler output writes are buffered in memory for the
+  invocation and committed as one server-side apply per declared output,
+  under field manager `apsides-handler-<domainId>`, through the same
+  authority/claim re-check reconciler mutations use.
+- The generated controller's `main` is synchronous: `runtime::start` reads
+  every file it will ever need (the startup config; the proxy client
+  CA/cert/key and `/etc/resolv.conf` in production, or the fixture
+  kubeconfig), converts the proxy identity into the exact in-memory shapes
+  `kube::Config` takes (DER root cert, base64 client cert/key data --
+  `root_cert_file`/`client_certificate`/`client_key` are never set), then
+  applies a deny-all Landlock ruleset to the main thread before any other
+  thread in the process exists (checked, not assumed: startup fails
+  closed if more than one thread is already present), and only then
+  initialises the V8 platform and builds the tokio runtime. The
+  production kube client reaches the proxy Service by hostname through a
+  dedicated `hickory-resolver`-backed connector (nameservers read from
+  `/etc/resolv.conf` before lockdown; the resolvable FQDN is built from
+  the same file's `search` domain), never glibc's `getaddrinfo`, so
+  nothing the controller does after lockdown -- including a proxy
+  reconnect -- touches the filesystem again. An unsupported/unenforced
+  Landlock lockdown fails startup closed; the fixture-only
+  `allowNoLandlock` startup-config flag is the sole exception, and is
+  structurally unavailable in production mode (`ProductionConfig` has no
+  such field). `aps test --cluster`/the acceptance suite's preflight
+  checks the host kernel's `/sys/kernel/security/lsm` for `landlock`
+  before creating a kind cluster, since kind nodes share the host kernel.
 - Protected platform policy can supply registry Secret references for controller
   and proxy image pulls, without granting runtime Secret access. References bind
   to the policy and staged Pod templates; credentials remain platform-owned.
