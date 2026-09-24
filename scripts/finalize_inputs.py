@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import diagnostics
 from package_oci import ROOT, read_regular, runtime_closure, verify_context
 from toolchain_snapshot import public as public_tools, verify as verify_tools
 
@@ -19,9 +20,11 @@ def digest(data):
 PACKAGING_SOURCES = [
     "scripts/Dockerfile",
     "scripts/build.py",
+    "scripts/diagnostics.py",
     "scripts/extract_binary.py",
     "scripts/finalize_inputs.py",
     "scripts/package_oci.py",
+    "scripts/rusty_v8.py",
     "scripts/sbom.py",
     "scripts/toolchain_snapshot.py",
 ]
@@ -64,7 +67,7 @@ def finalize(source, context, runtime_base, packaging_inputs, profile, tool_snap
     packaging_files.sort(key=lambda item:item["path"])
     cli=[entry for entry in packaging_files if entry["path"].startswith("crates/cli/")]
     cli.sort(key=lambda item:item["path"])
-    closure["schemaVersion"]="apsides.dev/compiler-closure/v2"
+    closure["schemaVersion"]="apsides.dev/compiler-closure/v3"
     closure["nativeCompiler"]={
         "builderImage":{key:metadata["builder"][key] for key in ["reference","platform"]},
         "cargoLockSha256":metadata["controllerLockDigest"],
@@ -72,6 +75,12 @@ def finalize(source, context, runtime_base, packaging_inputs, profile, tool_snap
         "buildProfileSha256":digest(profile_bytes),"hostTools":host_tools,
         "trustedCliCodeSha256":digest(canonical(cli)),
         "approvedRuntime":runtime_closure(runtime_base, packaging["runtime"]),
+        # The pinned rusty_v8 static archive scripts/package_oci.py fetched,
+        # verified and staged for the --network=none Cargo build (also
+        # present, as a plain file, in buildContextFiles above); recorded by
+        # identity here so the compiler closure states what it is, not just
+        # that some file with this hash exists at this path.
+        "rustyV8":metadata["rustyV8"],
     }
     inputs["compilerClosureDigest"]=digest(canonical(closure))
     if verify_context(context)!=metadata:
@@ -100,5 +109,5 @@ if __name__ == "__main__":
         args=parser.parse_args()
         snapshot=json.loads(read_regular(args.tool_snapshot))
         print(finalize(args.source,args.context,args.runtime_base,args.packaging_inputs,args.profile,snapshot,args.output))
-    except Exception:
-        raise SystemExit("apsides: build input finalization failed") from None
+    except Exception as error:
+        raise SystemExit(diagnostics.failure_message("build input finalization", error)) from None

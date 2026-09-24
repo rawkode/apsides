@@ -25,6 +25,7 @@ CRATES = (
     "compiler-core",
     "coordination",
     "deploy",
+    "engine",
     "inventory",
     "platform",
     "release",
@@ -50,9 +51,11 @@ STATIC_SOURCES = (
     "packages/kubernetes/src/runtime.ts",
     "scripts/Dockerfile",
     "scripts/build.py",
+    "scripts/diagnostics.py",
     "scripts/extract_binary.py",
     "scripts/finalize_inputs.py",
     "scripts/package_oci.py",
+    "scripts/rusty_v8.py",
     "scripts/sbom.py",
     "scripts/toolchain_snapshot.py",
 )
@@ -97,8 +100,9 @@ def source_files() -> tuple[str, ...]:
     if tracked != set(expected):
         missing = sorted(set(expected) - tracked)
         raise PackagingError(f"distribution source is not tracked: {missing[0]}")
-    # The runtime base's registry metadata, which `aps build` verifies offline.
-    pins = _git_files(["scripts/runtime-base"])
+    # The runtime base's registry metadata and the pinned rusty_v8 archive
+    # URLs/digests, both of which `aps build` verifies offline.
+    pins = _git_files(["scripts/runtime-base", "scripts/rusty-v8"])
     files = sorted({*expected, *recursive, *pins})
     if not recursive or any(not item.startswith(tuple(f"crates/{crate}/src/" for crate in CRATES)) for item in recursive):
         raise PackagingError("invalid tracked Rust source closure")

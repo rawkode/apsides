@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Glue around Cargo vendor and Docker BuildKit; never pulls images or publishes."""
+"""Glue around Cargo vendor and Docker BuildKit; never pulls images or publishes.
+
+The one exception is `prepare()` fetching the pinned rusty_v8 archive (see
+`scripts/rusty_v8.py`): that fetch and its SHA-256 verification happen here,
+outside the `--network=none` Docker build `build()` later runs."""
 import argparse
 from datetime import datetime, timezone
 import gzip
@@ -11,9 +15,13 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import tomllib
+
+import diagnostics
+import rusty_v8
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILDER = "rust@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922"
@@ -27,7 +35,7 @@ ANCESTORS = ("usr", "usr/local", "usr/local/bin")
 def command(argv, cwd=None, timeout=180):
     result = subprocess.run(argv, cwd=cwd, check=False, text=True, capture_output=True, timeout=timeout)
     if result.returncode:
-        raise RuntimeError(f"{argv[0]} {argv[1]} failed: {result.stderr[-3000:]}")
+        raise diagnostics.SubprocessFailure(f"{argv[0]} {argv[1]} failed", result.stderr)
     return result.stdout
 
 
@@ -449,7 +457,7 @@ def local_crates(repository):
         directory = pending.pop().resolve()
         if directory in seen:
             continue
-        if directory.parent != repository / "crates" or directory.name not in {"compiler-core", "runtime", "deploy", "platform", "inventory", "release", "cli", "coordination"}:
+        if directory.parent != repository / "crates" or directory.name not in {"compiler-core", "runtime", "engine", "deploy", "platform", "inventory", "release", "cli", "coordination"}:
             raise ValueError("runtime path dependency escapes the trusted Apsides crate closure")
         seen.add(directory)
         manifest = tomllib.loads(read_regular(directory / "Cargo.toml").decode())
@@ -463,7 +471,20 @@ def local_crates(repository):
     return sorted(path.name for path in seen)
 
 
-def prepare(artifact, output, repository=ROOT, builder_image=BUILDER, source_date_epoch=0):
+def rusty_v8_component(pin, path):
+    """The `rustyV8.archive`/`rustyV8.bindingFile` record `prepare()` writes
+    into `context.json`, and `sbom.py`/`finalize_inputs.py` read back."""
+    return {
+        "name": pin["name"],
+        "version": pin["version"],
+        "target": pin["target"],
+        "url": pin["url"],
+        "sha256": "sha256:" + pin["sha256"],
+        "path": path,
+    }
+
+
+def prepare(artifact, output, repository=ROOT, builder_image=BUILDER, source_date_epoch=0, rusty_v8_cache_dir=rusty_v8.DEFAULT_CACHE_DIR):
     if not isinstance(source_date_epoch, int) or not 0 <= source_date_epoch <= 253402300799:
         raise ValueError("source date epoch must be a nonnegative supported Unix timestamp")
     artifact, output, repository = artifact.resolve(), output.absolute(), repository.resolve()
@@ -479,6 +500,13 @@ def prepare(artifact, output, repository=ROOT, builder_image=BUILDER, source_dat
     if manifest["files"].get("controller/Cargo.lock") != sha256(lock):
         raise ValueError("artifact must contain a recorded exact controller/Cargo.lock; run the native build first")
     builder = pinned_image(builder_image)
+    target = rusty_v8.PLATFORM_TARGETS.get(builder["platform"])
+    if target is None:
+        raise ValueError(f"builder platform {builder['platform']} has no pinned rusty_v8 archive target")
+    # Fetched and SHA-256-verified here, before the network-less Docker
+    # build: crates/engine's pinned `v8` crate build.rs needs this archive
+    # locally, and `build()` below runs Cargo with `--network=none`.
+    archive_path, archive_pin = rusty_v8.resolve(target, cache_dir=rusty_v8_cache_dir)
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".apsides-oci-", dir=output.parent))
     try:
@@ -490,6 +518,7 @@ def prepare(artifact, output, repository=ROOT, builder_image=BUILDER, source_dat
             copy_file(repository / f"crates/{crate}/Cargo.toml", staging / f"workspace/crates/{crate}/Cargo.toml")
             copy_source(repository / f"crates/{crate}/src", staging / f"workspace/crates/{crate}/src")
         copy_file(ROOT / "scripts/Dockerfile", staging / "Dockerfile")
+        copy_file(archive_path, staging / rusty_v8.CONTEXT_RELATIVE_PATH)
         (staging / ".dockerignore").write_text("context.json\n")
         cargo_config = command(["cargo", "vendor", "--locked", "--offline", "--versioned-dirs", "--manifest-path", "controller/Cargo.toml", "vendor"], cwd=staging)
         parsed_config = tomllib.loads(cargo_config)
@@ -510,6 +539,11 @@ def prepare(artifact, output, repository=ROOT, builder_image=BUILDER, source_dat
             "runtimeImage": None,
             "releaseStatus": "blocked",
             "verification": "local-integrity-only",
+            # No bindingFile: the pinned v8 crate ships a pre-generated
+            # binding for both supported targets (scripts/rusty-v8/pins.json
+            # bindingFile.required is false); rusty_v8.load_pins() fails
+            # closed if that ever changes without this being updated.
+            "rustyV8": {"archive": rusty_v8_component(archive_pin, rusty_v8.CONTEXT_RELATIVE_PATH), "bindingFile": None},
             "files": file_manifest(staging),
         }
         (staging / "context.json").write_text(json.dumps(metadata, sort_keys=True, indent=2) + "\n")
@@ -527,6 +561,15 @@ def verify_context(context):
         raise ValueError("unsupported context or false release claim")
     if file_manifest(context) != metadata["files"]:
         raise ValueError("prepared context file set or contents changed")
+    archive = (metadata.get("rustyV8") or {}).get("archive") or {}
+    if (
+        archive.get("target") not in rusty_v8.PLATFORM_TARGETS.values()
+        or not re.fullmatch("sha256:[0-9a-f]{64}", str(archive.get("sha256")))
+        or metadata["files"].get(archive.get("path")) != archive.get("sha256")
+        or not str(archive.get("url") or "").startswith("https://")
+        or not archive.get("name") or not archive.get("version")
+    ):
+        raise ValueError("context lacks a pinned rusty_v8 archive record consistent with its staged file")
     if sha256(read_regular(context / "controller/Cargo.lock")) != metadata["controllerLockDigest"]:
         raise ValueError("controller lock identity changed")
     checked_ir = json.loads(command([os.environ.get("APSIDES_CLI", str(ROOT / "target/debug/aps")), "check", "--ir", str(context / "controller/src/ir.json")]))
@@ -571,8 +614,19 @@ def build(context, runtime_image, runtime_base, output, no_cache=False, pins=RUN
                 "--output", f"type=local,dest={destination}", str(context)]
         if no_cache:
             argv.insert(3, "--no-cache")
-        # Build logs remain visible; callers explicitly request this potentially long step.
-        subprocess.run(argv, check=True)
+        # Build logs remain visible: stdout and stderr are merged and written
+        # to this process's stderr below whether the build succeeds or fails,
+        # so the RUN --network=none Cargo compile's own output (e.g. a
+        # crates/engine v8/deno_core build.rs failure) is never silently
+        # dropped. Captured (not inherited) so a failure can also raise a
+        # SubprocessFailure carrying it, for build.py's bounded, redacted
+        # diagnostic on top-level failure.
+        try:
+            compiled = subprocess.run(argv, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        except subprocess.CalledProcessError as error:
+            sys.stderr.write(error.stdout or "")
+            raise diagnostics.SubprocessFailure(f"{argv[0]} {argv[1]} build failed", error.stdout) from None
+        sys.stderr.write(compiled.stdout)
         verify_context(context)
         if read_regular(context / "context.json") != context_snapshot:
             raise ValueError("context metadata changed during the build; no packaging receipt published")
@@ -598,6 +652,7 @@ def main():
     prep.add_argument("--output", type=Path, required=True)
     prep.add_argument("--builder-image", default=BUILDER)
     prep.add_argument("--source-date-epoch", type=int, default=0)
+    prep.add_argument("--rusty-v8-cache-dir", type=Path, default=rusty_v8.DEFAULT_CACHE_DIR)
     verify = subcommands.add_parser("verify")
     verify.add_argument("--context", type=Path, required=True)
     image = subcommands.add_parser("build")
@@ -608,7 +663,7 @@ def main():
     image.add_argument("--no-cache", action="store_true")
     args = parser.parse_args()
     if args.action == "prepare":
-        result = prepare(args.artifact, args.output, builder_image=args.builder_image, source_date_epoch=args.source_date_epoch)
+        result = prepare(args.artifact, args.output, builder_image=args.builder_image, source_date_epoch=args.source_date_epoch, rusty_v8_cache_dir=args.rusty_v8_cache_dir)
         print(json.dumps({"context": str(args.output.absolute()), "files": len(result["files"]), "releaseStatus": result["releaseStatus"]}))
     elif args.action == "verify":
         result = verify_context(args.context)
@@ -620,5 +675,5 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        raise SystemExit("apsides: OCI packaging failed") from None
+    except Exception as error:
+        raise SystemExit(diagnostics.failure_message("OCI packaging", error)) from None

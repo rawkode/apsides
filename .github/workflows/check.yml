@@ -109,6 +109,15 @@ jobs:
             --output "$RUNNER_TEMP/kind"
           echo 'eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa  '"$RUNNER_TEMP/kind" | sha256sum --check
           chmod +x "$RUNNER_TEMP/kind"
+      # `aps build` fetches the pinned rusty_v8 archive itself (scripts/
+      # rusty_v8.py, before the --network=none Cargo build); caching it
+      # avoids a ~40 MB re-download every run. Keyed on pins.json, so a pin
+      # bump fetches fresh instead of serving a stale entry.
+      - name: Cache the pinned rusty_v8 archive
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: work/rusty-v8-cache
+          key: rusty-v8-${{ hashFiles('scripts/rusty-v8/pins.json') }}
       # `aps build` and `aps test --cluster` never pull: the builder, runtime
       # base, fixture base, kind node and proxy images must already be local.
       - name: Pull pinned images
@@ -161,6 +170,15 @@ jobs:
           rustup show active-toolchain
       - name: Install cargo-cyclonedx
         run: cargo install --locked --version 0.5.9 cargo-cyclonedx
+      # `aps build` fetches the pinned rusty_v8 archive itself (scripts/
+      # rusty_v8.py, before the --network=none Cargo build); caching it
+      # avoids a ~40 MB re-download every run. Keyed on pins.json, so a pin
+      # bump fetches fresh instead of serving a stale entry.
+      - name: Cache the pinned rusty_v8 archive
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: work/rusty-v8-cache
+          key: rusty-v8-${{ hashFiles('scripts/rusty-v8/pins.json') }}
       # `aps build` never pulls: the builder and runtime base images must
       # already be local.
       - name: Pull pinned build images

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path};
 
-pub const COMPILER_CLOSURE_SCHEMA: &str = "apsides.dev/compiler-closure/v2";
+pub const COMPILER_CLOSURE_SCHEMA: &str = "apsides.dev/compiler-closure/v3";
 const MAX_COMPILER_CLOSURE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COMPILER_FILES: usize = 32_768;
 
@@ -34,6 +34,36 @@ pub struct NativeCompiler {
     pub host_tools: Vec<HostTool>,
     pub trusted_cli_code_sha256: String,
     pub approved_runtime: ApprovedRuntime,
+    pub rusty_v8: RustyV8,
+}
+
+/// The pinned `v8` crate (`denoland/rusty_v8`) offline build inputs
+/// `scripts/package_oci.py` fetched, SHA-256-verified against
+/// `scripts/rusty-v8/pins.json` and staged into the `--network=none`
+/// build context (see `crates/engine`'s `deno_core` dependency). Recorded
+/// by identity, not just as an opaque `build_context_files` entry, so the
+/// compiler closure states what the staged file is.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RustyV8 {
+    pub archive: RustyV8Component,
+    /// `None` for the two targets the pinned `v8` crate version ships a
+    /// pre-generated binding for; see `scripts/rusty-v8/pins.json`'s
+    /// `bindingFile`.
+    pub binding_file: Option<RustyV8Component>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RustyV8Component {
+    pub name: String,
+    pub version: String,
+    pub target: String,
+    pub url: String,
+    pub sha256: String,
+    /// Its path within `build_context_files`, cross-checked to name an
+    /// entry there with the same digest.
+    pub path: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -325,12 +355,15 @@ fn validate_native_compiler(native: &NativeCompiler) -> Result<ValidatedRuntime>
     {
         return reject("native compiler context omits vendored dependency sources");
     }
+    validate_rusty_v8(&native.rusty_v8, &native.build_context_files)?;
     for required in [
         "scripts/Dockerfile",
         "scripts/build.py",
+        "scripts/diagnostics.py",
         "scripts/extract_binary.py",
         "scripts/finalize_inputs.py",
         "scripts/package_oci.py",
+        "scripts/rusty_v8.py",
         "scripts/sbom.py",
         "scripts/toolchain_snapshot.py",
         "crates/cli/Cargo.toml",
@@ -375,6 +408,50 @@ fn validate_native_compiler(native: &NativeCompiler) -> Result<ValidatedRuntime>
         return reject("native compiler host tool identities are incomplete or ambiguous");
     }
     Ok(runtime)
+}
+
+fn valid_url(value: &str) -> bool {
+    value.starts_with("https://") && value.len() <= 2048 && !value.chars().any(char::is_control)
+}
+
+fn valid_short_text(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
+fn validate_rusty_v8_component(
+    component: &RustyV8Component,
+    build_context_files: &[CompilerFile],
+) -> Result<()> {
+    if !matches!(
+        component.target.as_str(),
+        "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu"
+    ) || !valid_short_text(&component.name)
+        || !valid_short_text(&component.version)
+        || !valid_url(&component.url)
+        || !valid_digest(&component.sha256)
+        || !valid_path(&component.path)
+    {
+        return reject("rusty_v8 component identity is incomplete or invalid");
+    }
+    if !build_context_files
+        .iter()
+        .any(|file| file.path == component.path && file.sha256 == component.sha256)
+    {
+        return reject("rusty_v8 component is not the staged build context file it names");
+    }
+    Ok(())
+}
+
+/// The pinned `rusty_v8` archive (and optional binding file) must be
+/// consistent with an entry already validated in `build_context_files`, so
+/// this record cannot claim an identity for a file the network-less build
+/// never actually staged.
+fn validate_rusty_v8(rusty_v8: &RustyV8, build_context_files: &[CompilerFile]) -> Result<()> {
+    validate_rusty_v8_component(&rusty_v8.archive, build_context_files)?;
+    if let Some(binding_file) = &rusty_v8.binding_file {
+        validate_rusty_v8_component(binding_file, build_context_files)?;
+    }
+    Ok(())
 }
 
 fn validate_files(files: &[CompilerFile]) -> Result<()> {

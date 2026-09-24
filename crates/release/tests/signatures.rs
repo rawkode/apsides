@@ -415,6 +415,7 @@ fn compiler_inputs() -> TestResult<(Value, String)> {
         {"path":"controller/Cargo.toml","sha256":format!("sha256:{}", "4".repeat(64))},
         {"path":"controller/src/ir.json","sha256":format!("sha256:{}", "5".repeat(64))},
         {"path":"controller/src/main.rs","sha256":format!("sha256:{}", "6".repeat(64))},
+        {"path":"rusty-v8/librusty_v8.a.gz","sha256":format!("sha256:{}", "9".repeat(64))},
         {"path":"vendor/example/src/lib.rs","sha256":format!("sha256:{}", "7".repeat(64))},
         {"path":"workspace/Cargo.toml","sha256":format!("sha256:{}", "8".repeat(64))}
     ]);
@@ -423,9 +424,11 @@ fn compiler_inputs() -> TestResult<(Value, String)> {
         {"path":"crates/cli/src/main.rs","sha256":format!("sha256:{}", "1".repeat(64))},
         {"path":"scripts/Dockerfile","sha256":format!("sha256:{}", "2".repeat(64))},
         {"path":"scripts/build.py","sha256":format!("sha256:{}", "2".repeat(64))},
+        {"path":"scripts/diagnostics.py","sha256":format!("sha256:{}", "2".repeat(64))},
         {"path":"scripts/extract_binary.py","sha256":format!("sha256:{}", "2".repeat(64))},
         {"path":"scripts/finalize_inputs.py","sha256":format!("sha256:{}", "2".repeat(64))},
         {"path":"scripts/package_oci.py","sha256":format!("sha256:{}", "2".repeat(64))},
+        {"path":"scripts/rusty_v8.py","sha256":format!("sha256:{}", "2".repeat(64))},
         {"path":"scripts/sbom.py","sha256":format!("sha256:{}", "2".repeat(64))},
         {"path":"scripts/toolchain_snapshot.py","sha256":format!("sha256:{}", "2".repeat(64))}
     ]);
@@ -447,8 +450,16 @@ fn compiler_inputs() -> TestResult<(Value, String)> {
             json!({"role":role,"sha256":format!("sha256:{}", "6".repeat(64)),"version":"1.0"})
         })
         .collect();
+    let rusty_v8 = json!({
+        "archive": {
+            "name": "librusty_v8", "version": "150.4.0", "target": "aarch64-unknown-linux-gnu",
+            "url": "https://github.com/denoland/rusty_v8/releases/download/v150.4.0/librusty_v8_simdutf_release_aarch64-unknown-linux-gnu.a.gz",
+            "sha256": format!("sha256:{}", "9".repeat(64)), "path": "rusty-v8/librusty_v8.a.gz",
+        },
+        "bindingFile": Value::Null,
+    });
     let closure = json!({
-        "schemaVersion":"apsides.dev/compiler-closure/v2",
+        "schemaVersion":"apsides.dev/compiler-closure/v3",
         "authoringCompiler":{"sdk":{"identity":"@apsides/kubernetes","sha256":"sdk"},"toolchain":{"deno":"pinned"}},
         "nativeCompiler":{
             "builderImage":{"reference":format!("example.invalid/builder@sha256:{}", "3".repeat(64)),"platform":"linux/arm64"},
@@ -458,7 +469,8 @@ fn compiler_inputs() -> TestResult<(Value, String)> {
             "buildProfileSha256":format!("sha256:{}", "5".repeat(64)),
             "hostTools":host_tools,
             "trustedCliCodeSha256":digest(&cli)?,
-            "approvedRuntime":approved_runtime
+            "approvedRuntime":approved_runtime,
+            "rustyV8":rusty_v8
         }
     });
     let identity = digest(&closure)?;
