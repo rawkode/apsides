@@ -788,10 +788,11 @@ impl Live<'_> {
             })
             .collect::<Vec<_>>();
         // An `Output`-mode input is observed live exactly like an `Observed`
-        // one (see `InputMode::Output`); `test_plan.rs`'s smaller `OUTPUT`
-        // scenario set never mixes an output's input into a case alongside
-        // an `Observed` one, so this filter and `NEEDS_OBSERVED` below are
-        // safe to share between the two modes.
+        // one (see `InputMode::Output`); `test_plan.rs`'s `LIVE_SHARED`
+        // scenario set gives a reaction spanning both modes one merged case
+        // whose `input_ids` cover every live input together, so `observed`
+        // here (and `NEEDS_OBSERVED` below) is shared between the two modes
+        // and may legitimately hold a mix of both for those scenarios.
         let observed = stimulus
             .iter()
             .copied()
@@ -825,13 +826,13 @@ impl Live<'_> {
             .ok_or_else(|| Error::Case("the case names no stimulus input".into()));
         let assertions = match scenario {
             "initial-evaluation" => self.initial(reaction).await?,
-            "projected-change" => self.projected(reaction, selected?).await?,
+            "projected-change" => self.projected(reaction, &observed).await?,
             "irrelevant-change" => self.irrelevant(reaction, selected?).await?,
             "same-value-replay" => self.replay(reaction, selected?).await?,
             "coalesced-inputs" => self.coalesced(reaction, &observed).await?,
             "missing-input" => self.missing(reaction, selected?).await?,
             "input-returned" => self.returned(reaction, selected?).await?,
-            "restart-and-relist" => self.relist(reaction, selected?).await?,
+            "restart-and-relist" => self.relist(reaction, &observed).await?,
             "accepted-write-restart" => self.accepted_restart(reaction).await?,
             "credential-read-denial" => self.denied_read(reaction, selected?).await?,
             "forced-field-conflict" => self.forced_conflict(reaction).await?,
@@ -874,10 +875,22 @@ impl Live<'_> {
         ])
     }
 
-    async fn projected(&self, reaction: &Reaction, input: &Input) -> Result<Vec<Assertion>> {
+    /// Change every one of `inputs`' data (a mixed reaction's merged
+    /// `projected-change` case lists both an Observed and an Output-mode
+    /// input, see `test_plan.rs`'s `LIVE_SHARED`), then check the revision
+    /// changed and converged. Each gets its own value, index-suffixed, so a
+    /// multi-input case does not coincidentally leave one input's old value
+    /// still equal to its new one.
+    async fn projected(&self, reaction: &Reaction, inputs: &[&Input]) -> Result<Vec<Assertion>> {
         let before = self.revision(reaction).await?;
-        self.change_input(input, &format!("projected-{}", reaction.id), "message")
+        for (index, input) in inputs.iter().enumerate() {
+            self.change_input(
+                input,
+                &format!("projected-{}-{index}", reaction.id),
+                "message",
+            )
             .await?;
+        }
         let expected = self.wait_expected(reaction, "projected revision").await?;
         let actual = self.revision(reaction).await?;
         Ok(vec![
@@ -927,6 +940,18 @@ impl Live<'_> {
     }
 
     async fn replay(&self, reaction: &Reaction, input: &Input) -> Result<Vec<Assertion>> {
+        // An output-only reaction's handler output starts with no `data` at
+        // all (the reconciler creates it absent-only, metadata-only) until
+        // some other scenario has written it; make same-value-replay
+        // self-contained by seeding it here rather than relying on
+        // `projected-change` having already run first in whatever order the
+        // suite happens to execute cases.
+        if input.mode == InputMode::Output && self.input_data(input).await?.is_empty() {
+            self.write_handler_output(input, &format!("seed-{}", reaction.id), "message")
+                .await?;
+            self.wait_expected(reaction, "same-value-replay seed")
+                .await?;
+        }
         let before = self.revision(reaction).await?;
         let generation = self.generation(reaction).await?;
         let data = self.input_data(input).await?;
@@ -945,7 +970,11 @@ impl Live<'_> {
         } else {
             current.to_owned()
         };
-        self.mutate_input(input, &value, key).await?;
+        // The writer mode-appropriate to `input` (see `change_input`):
+        // a foreign patch for an Observed input, or the handler-manager SSA
+        // for an Output one -- replaying its own current value must use the
+        // same writer identity a real change would, not always the foreign one.
+        self.change_input(input, &value, key).await?;
         self.stable(reaction, &before).await?;
         self.unchanged(reaction, &before, generation, "template-mutations")
             .await
@@ -1041,15 +1070,35 @@ impl Live<'_> {
         Ok(assertions)
     }
 
-    async fn relist(&self, reaction: &Reaction, input: &Input) -> Result<Vec<Assertion>> {
-        let saved = self.input_data(input).await?;
+    /// Change every one of `inputs`' data while the controller is stopped
+    /// (a mixed reaction's merged `restart-and-relist` case lists both an
+    /// Observed and an Output-mode input, see `test_plan.rs`'s
+    /// `LIVE_SHARED`), then restart and check the whole latest set was used.
+    async fn relist(&self, reaction: &Reaction, inputs: &[&Input]) -> Result<Vec<Assertion>> {
+        let mut saved = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            saved.push(self.input_data(input).await?);
+        }
         let stopped = async {
             self.scale_controller(0).await?;
-            self.change_input(input, &format!("stopped-{}", reaction.id), "message")
-                .await
+            for (index, input) in inputs.iter().enumerate() {
+                self.change_input(
+                    input,
+                    &format!("stopped-{}-{index}", reaction.id),
+                    "message",
+                )
+                .await?;
+            }
+            Ok::<(), Error>(())
         }
         .await;
-        let restored = self.restore_input_data(input, &saved).await;
+        let restored = async {
+            for (input, data) in inputs.iter().zip(saved.iter()) {
+                self.restore_input_data(input, data).await?;
+            }
+            Ok::<(), Error>(())
+        }
+        .await;
         let restarted = self.scale_controller(1).await;
         stopped?;
         restored?;

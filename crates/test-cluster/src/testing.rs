@@ -101,7 +101,8 @@ pub fn fixture_documents(plan: &CompiledPlan) -> Result<(Value, Value, Value)> {
                     let modes = inputs
                         .iter()
                         .map(|input| match input.mode {
-                            InputMode::Observed | InputMode::Output => "observed",
+                            InputMode::Observed => "observed",
+                            InputMode::Output => "output",
                             InputMode::Managed => "managed",
                         })
                         .collect::<std::collections::BTreeSet<_>>();

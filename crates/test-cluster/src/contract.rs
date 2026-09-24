@@ -308,10 +308,16 @@ fn applicability(plan: &CompiledPlan, case: &TestCase) -> Applicability {
         .iter()
         .filter(|input| case.input_ids.contains(&input.id))
         .collect::<Vec<_>>();
+    // Records each input's own mode string, never collapsing Output into
+    // Observed: the fixture-coverage document the TypeScript compiler emits
+    // (`fixtures.ts`'s `fixtureCoverage`) already records the raw mode, so
+    // this must match it exactly for `validate_coverage`'s applicability
+    // comparison to agree case for case.
     let modes = inputs
         .iter()
         .map(|input| match input.mode {
-            InputMode::Observed | InputMode::Output => "observed".to_owned(),
+            InputMode::Observed => "observed".to_owned(),
+            InputMode::Output => "output".to_owned(),
             InputMode::Managed => "managed".to_owned(),
         })
         .collect::<BTreeSet<_>>();
@@ -407,6 +413,164 @@ mod tests {
             json!("registry.example/api@sha256:abc");
         let plan = compiler_core::parse_and_validate(&ir.to_string())?;
         assert!(require_fixture_workloads(&plan).is_err());
+        Ok(())
+    }
+
+    /// A production IR with an output-only reaction (`output-only`, watching
+    /// only the handler-output's `output`-mode input) and a mixed reaction
+    /// (`rollout-mixed`, watching both an `observed` input and the same
+    /// `output`-mode one) -- the two shapes B3's review residual reported.
+    /// The SDK's own `<Deployment rolloutOn>` can only ever declare a
+    /// single-input reaction (each array entry becomes its own reaction via
+    /// `Domain[declareRollout]`), so a genuinely mixed *single* reaction can
+    /// only be authored as raw IR, exactly as here.
+    fn cross_language_ir() -> Value {
+        let source = json!({"file": "program.tsx", "line": 1, "column": 1});
+        let deployment = |id: &str, name: &str| {
+            json!({
+                "id": id, "apiVersion": "apps/v1", "kind": "Deployment", "name": name, "namespace": "workload",
+                "desired": {"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": name, "namespace": "workload"}, "spec": {"replicas": 1, "selector": {"matchLabels": {"app": name}}, "template": {"metadata": {"labels": {"app": name}}, "spec": {"serviceAccountName": "api-workload", "containers": [{"name": "api", "image": format!("example.invalid/api@sha256:{}", "0".repeat(64))}]}}}},
+                "lifecycle": {"deletionPolicy": "orphan"}, "source": source,
+            })
+        };
+        json!({
+            "schemaVersion": "apsides.dev/ir/v2", "testOnly": false,
+            "domain": {
+                "id": "coverage-check", "namespace": "workload", "controlNamespace": "apsides-system",
+                "clusterBinding": "test-cluster", "policyRef": "platform/example", "enforcement": "api-bound",
+                "minKubernetesVersion": "1.34",
+                "budgets": {"maxResources": 16, "maxInputs": 16, "maxReactions": 16, "maxObjectBytes": 262_144, "maxQueueDepth": 16, "maxConcurrentRequests": 4},
+            },
+            "resources": [
+                deployment("output-only", "output-only"),
+                deployment("mixed", "mixed"),
+                {
+                    "id": "output-flags", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags", "namespace": "workload",
+                    "desired": {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "flags", "namespace": "workload", "labels": {"apsides.dev/handler-output": "output-flags"}}},
+                    "lifecycle": {"deletionPolicy": "orphan"}, "source": source, "handlerOutput": true,
+                },
+            ],
+            "inputs": [
+                {"id": "settings", "apiVersion": "v1", "kind": "ConfigMap", "name": "settings", "namespace": "workload", "mode": "observed", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source},
+                {"id": "output-flags-input", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags", "namespace": "workload", "mode": "output", "managedResourceId": "output-flags", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source},
+            ],
+            "reactions": [
+                {"id": "output-only", "op": "rollout", "inputs": ["output-flags-input"], "target": "output-only", "source": source},
+                {"id": "rollout-mixed", "op": "rollout", "inputs": ["settings", "output-flags-input"], "target": "mixed", "source": source},
+            ],
+            "handlers": [{
+                "id": "sync-flags", "module": "handlers/sync-flags.ts", "export": "syncFlags",
+                "trigger": {"kind": "input-changed", "input": "settings"},
+                "inputs": ["settings"], "egress": [{"host": "api.example.com", "port": 443}],
+                "outputs": ["output-flags"], "timeoutMillis": 30000, "maxHeapBytes": 67_108_864,
+                "bundleSha256": "1".repeat(64), "source": source,
+            }],
+            "outputs": [{"id": "output-flags", "name": "flags", "namespace": "workload"}],
+            "provenance": {"compiler": "apsides/0.1", "inputs": [
+                {"path": "program.tsx", "sha256": "0".repeat(64)},
+                {"path": "handlers/sync-flags.ts", "sha256": "1".repeat(64)},
+            ]},
+        })
+    }
+
+    /// Runs `fixtures.ts`'s own `buildFixtureOutputs` (the function B3's
+    /// review residual found out of sync with Rust) through a real Deno
+    /// process on [`cross_language_ir`], and writes its four documents to
+    /// `destination` under the names `contract.rs::load` reads. Bypasses the
+    /// JSX renderer entirely (`compiler.ts`'s full pipeline), since the SDK
+    /// cannot author the mixed-input reaction this needs; this still
+    /// exercises the exact TypeScript function the review flagged, with a
+    /// real Deno evaluation, not a hand-maintained duplicate of its output.
+    fn run_fixtures_ts(ir: &Value, destination: &std::path::Path) -> Result<()> {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()?;
+        let fixtures_ts = repo_root.join("packages/compiler/src/fixtures.ts");
+        let harness = destination.join("harness.ts");
+        std::fs::write(
+            &harness,
+            format!(
+                r"import {{ buildFixtureOutputs }} from {fixtures_ts:?};
+const ir = {ir};
+const destination = Deno.args[0];
+const outputs = buildFixtureOutputs(ir);
+await Deno.writeTextFile(`${{destination}}/fixture-ir.json`, JSON.stringify(outputs.fixtureIr));
+await Deno.writeTextFile(`${{destination}}/fixtures.json`, JSON.stringify(outputs.fixtures));
+await Deno.writeTextFile(`${{destination}}/fixture-overlay.json`, JSON.stringify(outputs.overlay));
+await Deno.writeTextFile(`${{destination}}/fixture-coverage.json`, JSON.stringify(outputs.coverage));
+",
+                fixtures_ts = fixtures_ts.display(),
+                ir = ir
+            ),
+        )?;
+        let status = std::process::Command::new("deno")
+            .args(["run", "--allow-read", "--allow-write"])
+            .arg(&harness)
+            .arg(destination)
+            .status()
+            .map_err(|error| crate::Error::Infrastructure(format!("deno spawn failed: {error}")))?;
+        if !status.success() {
+            return Err(crate::Error::Infrastructure(
+                "deno fixtures.ts harness failed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_json(path: &std::path::Path) -> Result<Value> {
+        Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+    }
+
+    #[test]
+    fn typescript_fixture_coverage_for_output_only_and_mixed_reactions_loads_through_rust()
+    -> Result<()> {
+        let production = cross_language_ir();
+        let destination = tempfile::tempdir()?;
+        run_fixtures_ts(&production, destination.path())?;
+
+        let fixture_ir = read_json(&destination.path().join("fixture-ir.json"))?;
+        let fixtures = read_json(&destination.path().join("fixtures.json"))?;
+        let overlay = read_json(&destination.path().join("fixture-overlay.json"))?;
+        let coverage = read_json(&destination.path().join("fixture-coverage.json"))?;
+
+        let plan = compiler_core::parse_and_validate(&fixture_ir.to_string())?;
+        let cases = validate_coverage(&plan, &fixtures, &overlay, &coverage)?;
+        assert_eq!(cases.len(), plan.test_plan.len() + plan.ir.reactions.len());
+
+        let output_only: BTreeSet<&str> = cases
+            .iter()
+            .filter(|case| case.reaction_id == "output-only")
+            .map(|case| case.scenario.as_str())
+            .collect();
+        assert!(output_only.contains("projected-change"));
+        assert!(output_only.contains("restart-and-relist"));
+        for excluded in ["missing-input", "input-returned", "coalesced-inputs"] {
+            assert!(
+                !output_only.contains(excluded),
+                "did not expect {excluded} for an output-only reaction"
+            );
+        }
+
+        let mixed: Vec<_> = cases
+            .iter()
+            .filter(|case| case.reaction_id == "rollout-mixed")
+            .collect();
+        let mixed_scenarios: Vec<&str> = mixed.iter().map(|case| case.scenario.as_str()).collect();
+        let unique: BTreeSet<&str> = mixed_scenarios.iter().copied().collect();
+        assert_eq!(
+            mixed_scenarios.len(),
+            unique.len(),
+            "duplicate scenario rows for the mixed reaction: {mixed_scenarios:?}"
+        );
+        let projected = mixed
+            .iter()
+            .find(|case| case.scenario == "projected-change")
+            .ok_or_else(|| crate::Error::Case("expected one projected-change row".into()))?;
+        assert_eq!(
+            projected.applicability.input_ids,
+            ["output-flags-input", "settings"]
+        );
+        assert_eq!(projected.applicability.input_modes, ["observed", "output"]);
         Ok(())
     }
 }
