@@ -65,8 +65,7 @@ class PackagingTests(unittest.TestCase):
         (self.artifact / "controller/Cargo.lock").write_bytes(lock)
         path = str(self.repo / "crates/runtime")
         self.manifest = ('[package]\nname="controller"\nversion="0.1.0"\nedition="2024"\n'
-                         '[workspace]\n[dependencies]\nruntime={path=' + json.dumps(path) + '}\n'
-                         'tokio={version="1", features=["macros", "rt-multi-thread"]}\n')
+                         '[workspace]\n[dependencies]\nruntime={path=' + json.dumps(path) + '}\n')
         (self.artifact / "controller/Cargo.toml").write_text(self.manifest)
         (self.artifact / "manifest.json").write_text(json.dumps({"irDigest": "sha256:" + "a" * 64,
             "files": {"controller/Cargo.lock": packaging.sha256(lock)}}))

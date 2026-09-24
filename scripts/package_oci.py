@@ -460,9 +460,12 @@ def relocated_manifest(original, repository):
     expected = {
         "package": {"name": "controller", "version": "0.1.0", "edition": "2024"},
         "workspace": {},
+        # No `tokio` dependency: `main.rs` is synchronous (see the Apsides
+        # v0.3 plan, Phase 5c) and calls `runtime::start` directly, which
+        # builds and owns its own tokio runtime internally, after Landlock
+        # lockdown -- see `crates/cli/src/artifact.rs`.
         "dependencies": {
             "runtime": {"path": expected_path},
-            "tokio": {"version": "1", "features": ["macros", "rt-multi-thread"]},
         },
     }
     if parsed != expected:
