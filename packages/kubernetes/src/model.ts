@@ -1,5 +1,14 @@
-export const schemaVersion = "apsides.dev/ir/v1" as const;
+export const schemaVersion = "apsides.dev/ir/v2" as const;
 export const compilerVersion = "apsides/0.1" as const;
+
+/** Reserved label marking a managed ConfigMap as a handler output. */
+export const HANDLER_OUTPUT_LABEL = "apsides.dev/handler-output" as const;
+/** The only supported handler trigger kind in this increment. */
+export const HANDLER_TRIGGER_INPUT_CHANGED = "input-changed" as const;
+export const MAX_HANDLER_TIMEOUT_MILLIS = 30_000;
+export const MAX_HANDLER_HEAP_BYTES = 64 * 1024 * 1024;
+export const MAX_HANDLERS = 16;
+export const MAX_EGRESS_HOSTS = 16;
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
@@ -173,6 +182,8 @@ const managedState = Symbol("apsides.managed");
 const inputState = Symbol("apsides.input");
 const managedInputFor = Symbol("apsides.managed-input");
 const declareRollout = Symbol("apsides.declare-rollout");
+const declareOutput = Symbol("apsides.declare-output");
+const declareHandler = Symbol("apsides.declare-handler");
 
 interface ResourceState {
   readonly id?: string;
@@ -309,6 +320,8 @@ interface ResourceDeclaration {
   readonly desired: ResourceDesired;
   readonly lifecycle: { readonly deletionPolicy: "orphan" | "delete" };
   readonly source: SourceLocation;
+  /** True only for the managed ConfigMap a handler `Output` compiles to. */
+  readonly handlerOutput?: true;
 }
 
 interface InputDeclaration {
@@ -317,7 +330,7 @@ interface InputDeclaration {
   readonly kind: "ConfigMap" | "Secret";
   readonly name: string;
   readonly namespace: string;
-  readonly mode: "managed" | "observed";
+  readonly mode: "managed" | "observed" | "output";
   readonly managedResourceId?: string;
   readonly projection: readonly ["data"];
   readonly sensitive: boolean;
@@ -331,6 +344,37 @@ interface ReactionDeclaration {
   readonly inputs: readonly string[];
   readonly target: string;
   readonly source: SourceLocation;
+}
+
+export interface EgressHost {
+  readonly host: string;
+  readonly port: number;
+}
+
+export interface HandlerTriggerDeclaration {
+  readonly kind: "input-changed";
+  readonly input: string;
+}
+
+interface HandlerDeclaration {
+  readonly id: string;
+  readonly module: string;
+  readonly export: string;
+  readonly trigger: HandlerTriggerDeclaration;
+  readonly inputs: readonly string[];
+  readonly egress: readonly EgressHost[];
+  readonly outputs: readonly string[];
+  readonly timeoutMillis: number;
+  readonly maxHeapBytes: number;
+  /** Filled by the compiler after bundling; the SDK always emits `""`. */
+  readonly bundleSha256: string;
+  readonly source: SourceLocation;
+}
+
+interface OutputDeclaration {
+  readonly id: string;
+  readonly name: string;
+  readonly namespace: string;
 }
 
 export interface ApsidesIR {
@@ -350,6 +394,8 @@ export interface ApsidesIR {
   readonly resources: readonly ResourceDeclaration[];
   readonly inputs: readonly InputDeclaration[];
   readonly reactions: readonly ReactionDeclaration[];
+  readonly handlers: readonly HandlerDeclaration[];
+  readonly outputs: readonly OutputDeclaration[];
   readonly provenance: {
     readonly compiler: typeof compilerVersion;
     readonly inputs: readonly ProvenanceInput[];
@@ -363,6 +409,8 @@ interface DomainState {
   readonly inputs: Map<string, InputDeclaration>;
   readonly inputIdentities: Map<string, string>;
   readonly reactions: Map<string, ReactionDeclaration>;
+  readonly handlers: Map<string, HandlerDeclaration>;
+  readonly outputs: Map<string, OutputDeclaration>;
 }
 
 export class ManagedResource<R extends ManageableResource = ManageableResource> {
@@ -402,6 +450,28 @@ export class ObservedInput<K extends "ConfigMap" | "Secret" = "ConfigMap" | "Sec
   }
 }
 
+/** A handler `Output`'s auto-created, live-observed input: watchable the
+ * same way as [ObservedInput], distinguished only so review/surface
+ * projections can label it accurately (see `InputMode::Output`). */
+export class HandlerOutputInput {
+  readonly [inputState]: { readonly domain: Domain; readonly declaration: InputDeclaration & { readonly kind: "ConfigMap" } };
+  readonly outputId: string;
+
+  private constructor(domain: Domain, declaration: InputDeclaration & { readonly kind: "ConfigMap" }, outputId: string) {
+    this[inputState] = freeze({ domain, declaration });
+    this.outputId = outputId;
+    Object.freeze(this);
+  }
+
+  static create(domain: Domain, declaration: InputDeclaration & { readonly kind: "ConfigMap" }, outputId: string): HandlerOutputInput {
+    return new HandlerOutputInput(domain, declaration, outputId);
+  }
+
+  get id(): string { return this[inputState].declaration.id; }
+  get name(): string { return this[inputState].declaration.name; }
+  get namespace(): string { return this[inputState].declaration.namespace; }
+}
+
 export class Secret {
   private constructor() {}
   static readonly apiVersion = "v1" as const;
@@ -421,6 +491,8 @@ export class Domain {
       inputs: new Map(),
       inputIdentities: new Map(),
       reactions: new Map(),
+      handlers: new Map(),
+      outputs: new Map(),
     };
   }
 
@@ -501,6 +573,7 @@ export class Domain {
       ...this.#state.resources.values(),
       ...this.#state.inputs.values(),
       ...this.#state.reactions.values(),
+      ...this.#state.handlers.values(),
     ].map((declaration) => declaration.source.file);
     const provenancePaths = new Set(this.#state.options.provenance.inputs.map((input) => input.path));
     for (const source of sources) {
@@ -514,6 +587,8 @@ export class Domain {
       resources: sorted(this.#state.resources),
       inputs: sorted(this.#state.inputs),
       reactions: sorted(this.#state.reactions),
+      handlers: sorted(this.#state.handlers),
+      outputs: sorted(this.#state.outputs),
       provenance: { compiler: compilerVersion, inputs: this.#state.options.provenance.inputs },
     }) as unknown as ApsidesIR);
   }
@@ -552,6 +627,116 @@ export class Domain {
     if (this.#state.reactions.size >= this.#state.options.budgets.maxReactions) throw new Error("domain maxReactions budget exceeded");
     const source = raw.source === undefined ? input.source : validateSource(raw.source, "rollout.source");
     this.#state.reactions.set(id, freeze({ id, op: "rollout", inputs: [input.id], target: target.id, source }));
+  }
+
+  [declareOutput](options: { id?: string; name: string; namespace?: string; source: SourceLocation }): HandlerOutputInput {
+    const raw = record(options, "output options");
+    exact(raw, ["id", "name", "namespace", "source"], "output options");
+    const name = kubernetesName(raw.name, "output.name");
+    const namespace = raw.namespace === undefined ? this.#state.options.namespace : dnsLabel(raw.namespace, 63, "output.namespace");
+    this.#requireNamespace(namespace, `output ${name}`);
+    const source = validateSource(raw.source, "output.source");
+    const id = dnsLabel(optionalId(raw.id, "output.id") ?? derivedId(`output-${name}`), 63, "output.id");
+    if (this.#state.outputs.has(id) || this.#state.resources.has(id)) throw new Error(`duplicate output id: ${id}`);
+    const identity = `v1/ConfigMap/${namespace}/${name}`;
+    const identityOwner = this.#state.identities.get(identity);
+    if (identityOwner !== undefined) throw new Error(`output ${identity} aliases managed resource ${identityOwner}`);
+    if (this.#state.resources.size >= this.#state.options.budgets.maxResources) throw new Error("domain maxResources budget exceeded");
+    if (this.#state.resources.size >= this.#state.options.budgets.maxQueueDepth) throw new Error("domain maxQueueDepth cannot hold every managed resource");
+    const deletionPolicy = this.#state.options.prune ? "delete" : "orphan";
+    const desired = canonical({
+      apiVersion: "v1",
+      kind: "ConfigMap",
+      metadata: { name, namespace, labels: { [HANDLER_OUTPUT_LABEL]: id } },
+    }) as unknown as ResourceDeclaration["desired"];
+    const resourceDeclaration: ResourceDeclaration = freeze({
+      id, apiVersion: "v1", kind: "ConfigMap", name, namespace, desired,
+      lifecycle: { deletionPolicy }, source, handlerOutput: true,
+    });
+    this.#state.resources.set(id, resourceDeclaration);
+    this.#state.identities.set(identity, id);
+    this.#state.outputs.set(id, freeze({ id, name, namespace }));
+    const inputId = dnsLabel(derivedId(`output-input-${id}`), 63, "output input id");
+    const inputDeclaration = this.#addInput({
+      id: inputId,
+      apiVersion: "v1",
+      kind: "ConfigMap",
+      name,
+      namespace,
+      mode: "output",
+      managedResourceId: id,
+      projection: ["data"],
+      sensitive: false,
+      missing: "block-dependent-mutations",
+      source,
+    });
+    return HandlerOutputInput.create(this, inputDeclaration as InputDeclaration & { readonly kind: "ConfigMap" }, id);
+  }
+
+  [declareHandler](options: {
+    id?: string;
+    module: string;
+    export: string;
+    trigger: HandlerTriggerDeclaration;
+    inputs: readonly string[];
+    egress: readonly string[];
+    outputs: readonly string[];
+    timeoutMillis?: number;
+    maxHeapBytes?: number;
+    source: SourceLocation;
+  }): void {
+    const id = dnsLabel(optionalId(options.id, "handler.id") ?? derivedId(`handler-${options.export}-${options.module}`), 63, "handler.id");
+    if (this.#state.handlers.has(id)) throw new Error(`duplicate handler id: ${id}`);
+    if (this.#state.handlers.size >= MAX_HANDLERS) throw new Error(`domain exceeds maxHandlers budget of ${MAX_HANDLERS}`);
+    const module = normalizedRelativePath(options.module, "handler.module");
+    const exportName = jsIdentifier(options.export, "handler.export");
+    const timeoutMillis = boundedInteger(options.timeoutMillis ?? MAX_HANDLER_TIMEOUT_MILLIS, 1, MAX_HANDLER_TIMEOUT_MILLIS, "handler.timeoutMillis");
+    const maxHeapBytes = boundedInteger(options.maxHeapBytes ?? MAX_HANDLER_HEAP_BYTES, 1, MAX_HANDLER_HEAP_BYTES, "handler.maxHeapBytes");
+    const inputs = [...new Set(options.inputs)];
+    if (inputs.length === 0 || inputs.length !== options.inputs.length) throw new Error(`handler ${id} requires distinct nonempty inputs`);
+    if (!inputs.includes(options.trigger.input)) throw new Error(`handler ${id} trigger input must be one of its declared inputs`);
+    for (const inputId of inputs) {
+      const input = this.#state.inputs.get(inputId);
+      if (!input) throw new Error(`handler ${id} has unresolved input ${inputId}`);
+      if (input.kind !== "ConfigMap" || input.sensitive) throw new Error(`handler ${id} input ${inputId} must be a non-sensitive ConfigMap input`);
+    }
+    const outputs = [...new Set(options.outputs)];
+    if (outputs.length !== options.outputs.length) throw new Error(`handler ${id} outputs must be distinct`);
+    for (const outputId of outputs) {
+      if (!this.#state.outputs.has(outputId)) throw new Error(`handler ${id} has unresolved output ${outputId}`);
+    }
+    for (const inputId of inputs) {
+      const input = this.#state.inputs.get(inputId)!;
+      if (input.mode === "output" && input.managedResourceId !== undefined && outputs.includes(input.managedResourceId)) {
+        throw new Error(`handler ${id} may not trigger on or read its own output`);
+      }
+    }
+    const egressSeen = new Set<string>();
+    const egress = options.egress.map((host) => {
+      const validated = egressHost(host, `handler ${id} egress`);
+      const key = `${validated.host}:${String(validated.port)}`;
+      if (egressSeen.has(key)) throw new Error(`handler ${id} egress hosts must be distinct`);
+      egressSeen.add(key);
+      return validated;
+    });
+    const existingHosts = [...this.#state.handlers.values()].flatMap((handler) => handler.egress.map((entry) => entry.host));
+    const totalEgressHosts = new Set([...existingHosts, ...egress.map((entry) => entry.host)]);
+    if (totalEgressHosts.size > MAX_EGRESS_HOSTS) throw new Error(`domain exceeds maxEgressHosts budget of ${MAX_EGRESS_HOSTS}`);
+    const source = validateSource(options.source, "handler.source");
+    const declaration = freeze(canonical({
+      id,
+      module,
+      export: exportName,
+      trigger: { kind: "input-changed", input: options.trigger.input },
+      inputs,
+      egress,
+      outputs,
+      timeoutMillis,
+      maxHeapBytes,
+      bundleSha256: "",
+      source,
+    }) as unknown as HandlerDeclaration);
+    this.#state.handlers.set(id, declaration);
   }
 
   #addInput(input: InputDeclaration): InputDeclaration {
@@ -608,14 +793,20 @@ export const validateNamespacedResourceDescriptor = (value: unknown): Namespaced
   return freeze({ apiVersion, kind, apiResource: { plural, scope, schemaSha256 } });
 };
 
-type Watchable = ManagedResource<ConfigMap> | ObservedInput;
+/** The input id watching a managed ConfigMap's data, creating it if absent. */
+export const managedInputId = (input: ManagedResource<ConfigMap>): string => {
+  const state = input[managedState];
+  return state.domain[managedInputFor](input).id;
+};
+
+type Watchable = ManagedResource<ConfigMap> | ObservedInput | HandlerOutputInput;
 
 export const watch = (input: Watchable): {
   project(projectionName: "data"): {
     rollout(target: ManagedResource<Deployment>, options?: RolloutOptions): void;
   };
 } => {
-  if (!(input instanceof ManagedResource || input instanceof ObservedInput)) throw new Error("watch() requires a managed ConfigMap or observed input");
+  if (!(input instanceof ManagedResource || input instanceof ObservedInput || input instanceof HandlerOutputInput)) throw new Error("watch() requires a managed ConfigMap, observed input, or handler output");
   const state = input instanceof ManagedResource ? input[managedState] : input[inputState];
   const domain = state.domain;
   return freeze({
@@ -629,6 +820,30 @@ export const watch = (input: Watchable): {
       });
     },
   });
+};
+
+/** Declare a handler `Output`: a managed `ConfigMap` (metadata only, flagged
+ * `handlerOutput`) plus its auto-created live-observed input. Compiler-facing
+ * entry point for `useHandlerOutput()`; see `Domain[declareOutput]`. */
+export const defineHandlerOutput = (domain: Domain, options: { id?: string; name: string; namespace?: string; source: SourceLocation }): HandlerOutputInput => {
+  return domain[declareOutput](options);
+};
+
+/** Declare a Brigade-style event handler. Compiler-facing entry point for
+ * the `<On>` element; see `Domain[declareHandler]`. */
+export const defineHandler = (domain: Domain, options: {
+  id?: string;
+  module: string;
+  export: string;
+  trigger: HandlerTriggerDeclaration;
+  inputs: readonly string[];
+  egress: readonly string[];
+  outputs: readonly string[];
+  timeoutMillis?: number;
+  maxHeapBytes?: number;
+  source: SourceLocation;
+}): void => {
+  domain[declareHandler](options);
 };
 
 /** @internal Shared fixture seed completion for the SDK and source compiler. */
@@ -957,6 +1172,51 @@ const kubernetesName = (value: unknown, context: string): string => {
 
 const optionalId = (value: unknown, context: string): string | undefined => {
   return value === undefined ? undefined : text(value, context);
+};
+
+/** A normalized relative module path: an optional leading `./` (the natural
+ * author-facing form) is stripped; the stored value has no leading slash, no
+ * backslash, and no empty/`.`/`..` segment (mirrors the provenance-path
+ * contract IR resources and inputs already use). */
+const normalizedRelativePath = (value: unknown, context: string): string => {
+  const original = boundedText(value, 512, context);
+  const result = original.startsWith("./") ? original.slice(2) : original;
+  if (result.length === 0 || result.startsWith("/") || result.includes("\\") || result.split("/").some((part) => part === "" || part === "." || part === "..")) {
+    throw new Error(`${context} must be a normalized relative path`);
+  }
+  return result;
+};
+
+const jsIdentifier = (value: unknown, context: string): string => {
+  const result = boundedText(value, 128, context);
+  if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(result)) throw new Error(`${context} must be a valid identifier`);
+  return result;
+};
+
+const isIpLiteral = (value: string): boolean => {
+  return /^[0-9]{1,3}(?:\.[0-9]{1,3}){3}$/.test(value) || value.includes(":");
+};
+
+/** Parse and validate one `<On egress>` entry: a lowercase DNS name (never an
+ * IP literal or wildcard), with an optional `:port` suffix defaulting to 443. */
+const egressHost = (value: unknown, context: string): EgressHost => {
+  const raw = text(value, context);
+  const separator = raw.lastIndexOf(":");
+  const maybePort = separator === -1 ? undefined : raw.slice(separator + 1);
+  const hasPort = maybePort !== undefined && /^[0-9]+$/.test(maybePort);
+  const host = hasPort ? raw.slice(0, separator) : raw;
+  const port = hasPort ? Number(maybePort) : 443;
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) throw new Error(`${context} port must be in 1..=65535`);
+  if (
+    host.length === 0 ||
+    host.length > 253 ||
+    host.includes("*") ||
+    isIpLiteral(host) ||
+    !host.split(".").every((part) => dnsLabelPattern.test(part) && part.length <= 63)
+  ) {
+    throw new Error(`${context} host must be a lowercase DNS name (never an IP literal or wildcard)`);
+  }
+  return freeze({ host, port });
 };
 
 const positiveInteger = (value: unknown, context: string): number => {

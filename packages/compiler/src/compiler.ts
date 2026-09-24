@@ -127,6 +127,10 @@ export const compileApsides = async (sourceFile: string, output: string): Promis
   const ir = evaluated.productionIR;
   ir.provenance = { compiler: "apsides/0.1", inputs: provenanceInputs };
   validateSourceLocations(ir, author);
+  const handlerBundles = await bundleHandlers(author, ir);
+  ir.handlers = handlerBundles.handlers;
+  const reachable = new Set([...first.loaded, ...handlerBundles.loaded]);
+  for (const item of author.values()) if (!reachable.has(item.virtual)) throw new Error(`source lock contains unreachable module: ${item.logical}`);
   const fixture = buildFixtureOutputs(ir);
   validateSourceLocations(fixture.fixtureIr, author);
 
@@ -173,6 +177,7 @@ export const compileApsides = async (sourceFile: string, output: string): Promis
     },
     typecheck: { engine: "deno", status: "passed", remote: false, npm: false, config: { jsx: "react-jsxdev", jsxImportSource: SDK_PACKAGE, importMap: "generated-local-sdk-only" } },
     bundleSha256: sha256(emittedProgram), evaluationBundleSha256: sha256(first.evaluationBundle), evaluationSourceSha256: sha256(evaluateSource), bundleMapSha256: sha256(canonicalString(bundleMap)),
+    handlers: [...handlerBundles.files.entries()].map(([id, code]) => ({ id, path: `handlers/${id}.js`, sha256: sha256(code) })).sort((a,b) => order(a.id,b.id)),
   };
 
   for (const snapshot of author.values()) if (sha256(await readFile(snapshot.physical)) !== snapshot.sha256) throw new Error(`source input changed during build: ${snapshot.logical}`);
@@ -183,6 +188,10 @@ export const compileApsides = async (sourceFile: string, output: string): Promis
   if (canonicalString(await compilerIdentity()) !== canonicalString(compilerFiles) || canonicalString(await installedToolIdentity()) !== canonicalString(installedTools)) throw new Error("source compiler or installed tool closure changed during build");
 
   await mkdir(destination);
+  if (handlerBundles.files.size > 0) {
+    await mkdir(join(destination, "handlers"));
+    await Promise.all([...handlerBundles.files.entries()].map(([id, code]) => writeFile(join(destination, "handlers", `${id}.js`), code)));
+  }
   await Promise.all([
     writeJson(join(destination, "ir.json"), ir),
     writeFile(join(destination, "program.mjs"), emittedProgram),
@@ -198,7 +207,7 @@ export const compileApsides = async (sourceFile: string, output: string): Promis
   ]);
 };
 
-const bundleSnapshot = async (author: Map<string, Snapshot>, sdk: Map<string, Snapshot>, entry: string): Promise<{bundle: string; evaluationBundle: string; map: unknown}> => {
+const bundleSnapshot = async (author: Map<string, Snapshot>, sdk: Map<string, Snapshot>, entry: string): Promise<{bundle: string; evaluationBundle: string; map: unknown; loaded: Set<string>}> => {
   const loaded = new Set<string>();
   const all = new Map<string, Snapshot>([...author.values(), ...sdk.values()].map(value => [value.virtual, value]));
   const authorEntry = author.get(entry)!;
@@ -262,9 +271,8 @@ const bundleSnapshot = async (author: Map<string, Snapshot>, sdk: Map<string, Sn
     const evaluation = await build.generate({ format: "iife", name: "ApsidesProgram", exports: "named", sourcemap: false });
     const evaluationChunks = evaluation.output.filter(output => output.type === "chunk");
     if (evaluationChunks.length !== 1) throw new Error("evaluation build must emit one closed script");
-    for (const item of author.values()) if (!loaded.has(item.virtual)) throw new Error(`source lock contains unreachable module: ${item.logical}`);
     if (!loaded.has(sdk.get("compiler.ts")!.virtual)) throw new Error("source bundle does not use the trusted compiler wrapper");
-    return { bundle: chunks[0]!.code, evaluationBundle: evaluationChunks[0]!.code, map: chunks[0]!.map ?? null };
+    return { bundle: chunks[0]!.code, evaluationBundle: evaluationChunks[0]!.code, map: chunks[0]!.map ?? null, loaded };
   } finally { await build.close(); }
 };
 
@@ -320,8 +328,74 @@ const parseEvaluation = (stdout: string): { productionIR: ProductionIr } => {
   return { productionIR: value.productionIR as ProductionIr };
 };
 
+/**
+ * Bundle every declared handler as its own deterministic, closed ESM entry
+ * (no externals: only other locked source modules may be imported, never an
+ * npm or remote specifier, never the authoring SDK), and fill in its
+ * `bundleSha256`. Each handler is bundled twice and compared byte-for-byte,
+ * matching the determinism guarantee the top-level program bundle already
+ * gets from `first`/`second` in {@link compileApsides}.
+ */
+const bundleHandlers = async (author: Map<string, Snapshot>, ir: ProductionIr): Promise<{ handlers: ProductionIr["handlers"]; files: Map<string, string>; loaded: Set<string> }> => {
+  const files = new Map<string, string>();
+  const handlers: ProductionIr["handlers"] = [];
+  const loaded = new Set<string>();
+  for (const handler of ir.handlers) {
+    if (!author.has(handler.module)) throw new Error(`handler module is absent from the source lock: ${handler.module}`);
+    const first = await bundleHandlerModule(author, handler.module);
+    const second = await bundleHandlerModule(author, handler.module);
+    if (first.code !== second.code) throw new Error(`independent handler bundles for ${handler.id} were not byte-identical`);
+    if (Buffer.byteLength(first.code) > MAX_OUTPUT_BYTES) throw new Error(`handler ${handler.id} bundle exceeds its output budget`);
+    files.set(handler.id, first.code);
+    for (const id of first.loaded) loaded.add(id);
+    handlers.push({ ...handler, bundleSha256: sha256(first.code) });
+  }
+  return { handlers, files, loaded };
+};
+
+const bundleHandlerModule = async (author: Map<string, Snapshot>, entry: string): Promise<{ code: string; loaded: Set<string> }> => {
+  const entrySnapshot = author.get(entry)!;
+  const loaded = new Set<string>();
+  const build = await rolldown({
+    input: entrySnapshot.virtual,
+    treeshake: false,
+    plugins: [{
+      name: "apsides-locked-handler-closure",
+      resolveId(specifier, importer) {
+        if (!importer) {
+          if (specifier === entrySnapshot.virtual) return specifier;
+          throw new Error("undeclared handler entrypoint");
+        }
+        if (!specifier.startsWith(".")) throw new Error(`handler module cannot import an undeclared package: ${specifier}`);
+        if (!importer.startsWith("apsides:/source/")) throw new Error("handler bundling is restricted to locked source modules");
+        const importerPath = importer.slice("apsides:/source/".length);
+        const logical = normalizeLogical(posix.join(posix.dirname(importerPath), specifier), `handler import ${specifier}`);
+        const snapshot = author.get(logical);
+        if (!snapshot) throw new Error(`handler import is absent from the source lock: ${logical}`);
+        return snapshot.virtual;
+      },
+      load(id) {
+        const snapshot = [...author.values()].find(value => value.virtual === id);
+        if (!snapshot) throw new Error(`undeclared handler bundle input: ${id}`);
+        loaded.add(id);
+        const lang = snapshot.logical.endsWith(".tsx") ? "tsx" : snapshot.logical.endsWith(".ts") ? "ts" : "js";
+        const compiled = transform(snapshot.virtual, snapshot.text, { lang, sourcemap: false });
+        if (compiled.errors.length) throw new Error(`Oxc rejected ${snapshot.logical}: ${compiled.errors.map(error => error.message).join("; ")}`);
+        return { code: compiled.code };
+      },
+      resolveDynamicImport() { throw new Error("handler dynamic imports are not declared build inputs"); },
+    }],
+  });
+  try {
+    const result = await build.generate({ format: "esm", sourcemap: false });
+    const chunks = result.output.filter(output => output.type === "chunk");
+    if (chunks.length !== 1) throw new Error("handler build must emit one closed module");
+    return { code: chunks[0]!.code, loaded };
+  } finally { await build.close(); }
+};
+
 const validateSourceLocations = (ir: ProductionIr, author: Map<string, Snapshot>): void => {
-  for (const declaration of [...ir.resources, ...ir.inputs, ...ir.reactions]) {
+  for (const declaration of [...ir.resources, ...ir.inputs, ...ir.reactions, ...ir.handlers]) {
     const source = declaration.source;
     const file = author.get(source?.file);
     if (!file) throw new Error(`declaration ${declaration.id} source is not in the locked source closure: ${source?.file}`);
@@ -336,7 +410,8 @@ const buildDeclarationMap = (ir: ProductionIr, fixtures: {inputs:{inputId:string
     schemaVersion: "apsides.dev/source-map/v1", virtualRoot: "apsides:/source",
     declarations: [
       ...ir.resources.map(value => entry("resource", value.id, value.source)), ...ir.inputs.map(value => entry("input", value.id, value.source)),
-      ...ir.reactions.map(value => entry("reaction", value.id, value.source)), ...fixtures.inputs.map(value => entry("fixture-input", value.inputId, value.source)),
+      ...ir.reactions.map(value => entry("reaction", value.id, value.source)), ...ir.handlers.map(value => entry("handler", value.id, value.source)),
+      ...fixtures.inputs.map(value => entry("fixture-input", value.inputId, value.source)),
       ...fixtures.workloadSubstitutions.map(value => entry("fixture-workload", value.targetResourceId, value.source)),
     ].sort((a,b) => order(`${a.category}/${a.id}`, `${b.category}/${b.id}`)),
   };

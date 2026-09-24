@@ -1,11 +1,12 @@
 export {
-  Controller, ConfigMap, Deployment, Service, Fragment,
-  useConfigMap, useSecret, useResourceRef, defineNamespacedResource,
+  Controller, ConfigMap, Deployment, Service, Fragment, On,
+  useConfigMap, useSecret, useResourceRef, useHandlerOutput, defineNamespacedResource,
 } from "./runtime.ts";
 export type {
   Component, ApsidesNode, ApsidesElement, ControllerProps, ConfigMapProps,
   DeploymentProps, ServiceProps, ObserveProps, ObservedReference,
-  ResourceRef, DataProjection, NamespacedResourceComponent, NamespacedResourceProps,
+  ResourceRef, DataProjection, ChangeEvent, HandlerProps, HandlerOutputProps, HandlerOutputRef,
+  NamespacedResourceComponent, NamespacedResourceProps,
 } from "./runtime.ts";
 export type {
   ConfigMapDefinition, DeploymentDefinition, ServiceDefinition, ContainerDefinition,

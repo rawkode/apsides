@@ -5,6 +5,8 @@ import {
   Secret,
   Service,
   defineDomain,
+  defineHandler,
+  defineHandlerOutput,
   fixtureInputData,
   watch,
   type ContainerDefinition,
@@ -110,7 +112,9 @@ const first = build("service-first");
 const second = build("service-last");
 const ir = first.toIR();
 equal(JSON.stringify(ir), JSON.stringify(second.toIR()), "declaration order must not affect IR");
-equal(ir.schemaVersion, "apsides.dev/ir/v1", "schema version");
+equal(ir.schemaVersion, "apsides.dev/ir/v2", "schema version");
+equal(ir.handlers.length, 0, "no handlers declared");
+equal(ir.outputs.length, 0, "no outputs declared");
 equal(ir.testOnly, false, "author IR is production-marked");
 equal(ir.resources.map((resource) => resource.id).join(","), "api,config,service", "resources sorted by stable ID");
 equal(ir.inputs.length, 2, "managed and observed inputs emitted");
@@ -364,3 +368,121 @@ throws(() => constrained.manage(new ConfigMap({ metadata: { name: "two", namespa
   raised.manage(new ConfigMap({ metadata: { name: "config", namespace: "workload" } }), { source });
   equal(raised.toIR().domain.minKubernetesVersion, "1.35", "explicit minKubernetesVersion is retained");
 }
+
+{
+  // Handler outputs: an Output-mode input usable in rolloutOn, plus a
+  // declared handler triggering on a sensitive-free ConfigMap input.
+  const value = domain("handlers");
+  const target = value.manage(deployment("api"), { source });
+  const settings = value.observe(ConfigMap, { name: "settings", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  const flags = defineHandlerOutput(value, { name: "flags", source });
+  watch(flags).project("data").rollout(target, { id: "rollout-flags", source });
+  defineHandler(value, {
+    id: "sync-flags",
+    module: "./handlers/sync-flags.ts",
+    export: "syncFlags",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id],
+    egress: ["api.example.com", "other.example.com:8443"],
+    outputs: [flags.outputId],
+    source,
+  });
+  const output = value.toIR();
+  equal(output.outputs.length, 1, "one output declared");
+  equal(output.outputs[0]!.name, "flags", "output name preserved");
+  const outputResource = output.resources.find((resource) => resource.id === flags.outputId);
+  assert(outputResource !== undefined, "output resource declared");
+  equal(outputResource!.handlerOutput, true, "output resource is flagged handlerOutput");
+  equal((outputResource!.desired as unknown as { data?: unknown }).data, undefined, "output resource desired carries no data");
+  equal(
+    (outputResource!.desired as unknown as { metadata: { labels: Record<string, string> } }).metadata.labels["apsides.dev/handler-output"],
+    flags.outputId,
+    "reserved handler-output label carries the output id",
+  );
+  equal(output.handlers.length, 1, "one handler declared");
+  equal(output.handlers[0]!.module, "handlers/sync-flags.ts", "handler module is normalized (leading ./ stripped)");
+  equal(output.handlers[0]!.export, "syncFlags", "handler export preserved");
+  equal(output.handlers[0]!.egress.length, 2, "handler egress hosts preserved");
+  equal(output.handlers[0]!.egress[1]!.port, 8443, "explicit egress port preserved");
+  equal(output.handlers[0]!.egress[0]!.port, 443, "egress port defaults to 443");
+  equal(output.handlers[0]!.bundleSha256, "", "SDK emits an empty bundleSha256 placeholder for the compiler to fill");
+  assert(
+    output.inputs.some((input) => input.mode === "output" && input.managedResourceId === flags.outputId),
+    "an Output-mode input backs the handler output",
+  );
+
+  throws(() => defineHandler(value, {
+    id: "sync-flags",
+    module: "./handlers/other.ts",
+    export: "other",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id],
+    egress: [],
+    outputs: [],
+    source,
+  }), "duplicate handler id");
+}
+
+{
+  // A closure is never a valid handler reference at the runtime.ts JSX
+  // layer; model.ts itself only ever accepts an already-split module/export
+  // pair, so the "closures are rejected" contract is exercised in
+  // traversal.test.ts against the `<On>` element.
+  const value = domain("handler-rules");
+  const secret = value.observe(Secret, { name: "credentials", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  throws(() => defineHandler(value, {
+    module: "./handlers/leak.ts",
+    export: "leak",
+    trigger: { kind: "input-changed", input: secret.id },
+    inputs: [secret.id],
+    egress: [],
+    outputs: [],
+    source,
+  }), "non-sensitive ConfigMap input");
+
+  const settings = value.observe(ConfigMap, { name: "settings", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  throws(() => defineHandler(value, {
+    module: "../outside/handler.ts",
+    export: "bad",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id],
+    egress: [],
+    outputs: [],
+    source,
+  }), "normalized relative path");
+  throws(() => defineHandler(value, {
+    module: "./handlers/bad.ts",
+    export: "bad",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id],
+    egress: ["10.0.0.1"],
+    outputs: [],
+    source,
+  }), "IP literal");
+  throws(() => defineHandler(value, {
+    module: "./handlers/bad.ts",
+    export: "bad",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id],
+    egress: ["*.example.com"],
+    outputs: [],
+    source,
+  }), "wildcard");
+
+  const selfOutput = defineHandlerOutput(value, { name: "self-flags", source });
+  throws(() => defineHandler(value, {
+    module: "./handlers/self.ts",
+    export: "self",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id, selfOutput.id],
+    egress: [],
+    outputs: [selfOutput.outputId],
+    source,
+  }), "may not trigger on or read its own output");
+}
+
+// A two-handler cycle (A writes an output B reads, and B writes an output A
+// reads) is accepted by each individual `defineHandler` call above — the
+// cross-handler graph is only complete once every handler is declared — so
+// that whole-graph acyclicity is validated by compiler-core's `validate()`
+// (see crates/compiler-core/tests/handlers.rs), not the SDK.

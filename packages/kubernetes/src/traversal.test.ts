@@ -1,4 +1,4 @@
-import { ConfigMap, Controller, Deployment, Fragment, defineNamespacedResource, useConfigMap, useResourceRef, useSecret, type DataProjection, type DomainOptions, type ApsidesIR } from "./index.ts";
+import { ConfigMap, Controller, Deployment, Fragment, On, defineNamespacedResource, useConfigMap, useHandlerOutput, useResourceRef, useSecret, type DataProjection, type DomainOptions, type ApsidesIR } from "./index.ts";
 import { jsxDEV } from "./jsx-dev-runtime.ts";
 import { renderExport } from "./compiler.ts";
 
@@ -175,3 +175,53 @@ assert(JSON.stringify(waddleIR.resources.map((resource) => resource.id).sort()) 
 assert(JSON.stringify(waddleIR.inputs.map((input) => input.id).sort()) === JSON.stringify(["managed-configmap-waddle-server-config", "observed-secret-waddle-clustering-keypool"]), "short derived input ids are unchanged");
 assert(waddleIR.reactions.every((reaction) => waddleIR.inputs.some((input) => input.id === reaction.inputs[0]) && reaction.target === "deployment-waddle-server"), "bounded reactions reference their inputs and target");
 assert(JSON.stringify(waddleIR) === JSON.stringify(compile(controller(element(Waddle, {}, 45)))), "bounded derived ids are deterministic");
+
+// Event handlers: <On> plus useHandlerOutput().
+const HandlerApp = () => {
+  const settings = useConfigMap({ name: "settings" });
+  const flags = useHandlerOutput({ name: "flags" });
+  return element(Fragment, {
+    children: [
+      element(On, {
+        trigger: settings.changed,
+        handler: "./handlers/sync-flags.ts#syncFlags",
+        inputs: [settings],
+        egress: ["api.example.com"],
+        outputs: [flags],
+      }, 70),
+      element(Deployment, { ...deployment, rolloutOn: [flags.data] }, 80),
+    ],
+  });
+};
+const handlerIR = compile(controller(element(HandlerApp, {}, 65)));
+assert(handlerIR.handlers.length === 1, "one handler declared");
+assert(handlerIR.handlers[0]!.module === "handlers/sync-flags.ts", "handler module is normalized");
+assert(handlerIR.handlers[0]!.export === "syncFlags", "handler export parsed from the module reference string");
+assert(handlerIR.handlers[0]!.egress.length === 1 && handlerIR.handlers[0]!.egress[0]!.host === "api.example.com", "handler egress lowered");
+assert(handlerIR.handlers[0]!.source.line === 70, "handler source retains its JSX location");
+assert(handlerIR.outputs.length === 1 && handlerIR.outputs[0]!.name === "flags", "one output declared");
+const handlerOutputResource = handlerIR.resources.find((resource) => resource.id === handlerIR.outputs[0]!.id);
+assert(handlerOutputResource?.handlerOutput === true, "output resource is flagged handlerOutput");
+assert(handlerIR.reactions.some((reaction) => handlerIR.inputs.some((input) => input.id === reaction.inputs[0] && input.mode === "output")), "output projection works in rolloutOn");
+
+// Passing a function as `handler` is a compile error, never silently accepted.
+throws(() => compile(controller(element(() => {
+  const settings = useConfigMap({ name: "settings" });
+  return element(On, {
+    trigger: settings.changed,
+    handler: (() => {}) as unknown as string,
+    inputs: [settings],
+    outputs: [],
+  }, 10);
+}, {}))), "not a function");
+
+// A sensitive (Secret) input is rejected, never silently accepted.
+throws(() => compile(controller(element(() => {
+  const credentials = useSecret({ name: "credentials" });
+  return element(On, {
+    trigger: credentials.changed,
+    handler: "./handlers/leak.ts#leak",
+    inputs: [credentials],
+    outputs: [],
+  }, 10);
+}, {}))), "non-sensitive ConfigMap input");

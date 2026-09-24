@@ -4,8 +4,23 @@ import { fixtureInputData } from "../../kubernetes/src/model.ts";
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type Source = { file: string; line: number; column: number };
 type Resource = { force?: boolean; id: string; kind: string; namespace: string; source: Source; desired: Record<string, Json> };
-type Input = { id: string; name: string; namespace: string; kind: "ConfigMap" | "Secret"; mode: "managed" | "observed"; managedResourceId?: string; sensitive: boolean; source: Source };
+type Input = { id: string; name: string; namespace: string; kind: "ConfigMap" | "Secret"; mode: "managed" | "observed" | "output"; managedResourceId?: string; sensitive: boolean; source: Source };
 type Reaction = { id: string; op: "rollout"; inputs: string[]; target: string; source: Source };
+type EgressHost = { host: string; port: number };
+type Handler = {
+  id: string;
+  module: string;
+  export: string;
+  trigger: { kind: "input-changed"; input: string };
+  inputs: string[];
+  egress: EgressHost[];
+  outputs: string[];
+  timeoutMillis: number;
+  maxHeapBytes: number;
+  bundleSha256: string;
+  source: Source;
+};
+type Output = { id: string; name: string; namespace: string };
 export type ProductionIr = {
   schemaVersion: string;
   testOnly: boolean;
@@ -13,6 +28,8 @@ export type ProductionIr = {
   resources: Resource[];
   inputs: Input[];
   reactions: Reaction[];
+  handlers: Handler[];
+  outputs: Output[];
   provenance: { compiler: string; inputs: { path: string; sha256: string }[] };
 };
 
@@ -70,14 +87,14 @@ export const buildFixtureOutputs = (ir: ProductionIr) => {
 };
 
 const validateProductionIrShape = (ir: ProductionIr): void => {
-  if (!plain(ir) || ir.schemaVersion !== "apsides.dev/ir/v1" || ir.testOnly !== false) throw new Error("source must emit production Apsides IR with testOnly false");
-  if (!Array.isArray(ir.resources) || !Array.isArray(ir.inputs) || !Array.isArray(ir.reactions) || !plain(ir.provenance)) throw new Error("source emitted malformed Apsides IR arrays or provenance");
+  if (!plain(ir) || ir.schemaVersion !== "apsides.dev/ir/v2" || ir.testOnly !== false) throw new Error("source must emit production Apsides IR with testOnly false");
+  if (!Array.isArray(ir.resources) || !Array.isArray(ir.inputs) || !Array.isArray(ir.reactions) || !Array.isArray(ir.handlers) || !Array.isArray(ir.outputs) || !plain(ir.provenance)) throw new Error("source emitted malformed Apsides IR arrays or provenance");
   const inputIds = new Set<string>();
   for (const input of ir.inputs) {
     if (!plain(input) || typeof input.id !== "string" || inputIds.has(input.id)) throw new Error("source emitted invalid or duplicate input identity");
-    if (!(["ConfigMap", "Secret"] as unknown[]).includes(input.kind) || !(["managed", "observed"] as unknown[]).includes(input.mode)) throw new Error(`unsupported fixture input ${input.id}`);
+    if (!(["ConfigMap", "Secret"] as unknown[]).includes(input.kind) || !(["managed", "observed", "output"] as unknown[]).includes(input.mode)) throw new Error(`unsupported fixture input ${input.id}`);
     if (input.kind === "Secret" && (input.mode !== "observed" || input.sensitive !== true)) throw new Error(`Secret fixture contract lost sensitivity: ${input.id}`);
-    if ((input.mode === "managed") !== (typeof input.managedResourceId === "string")) throw new Error(`fixture input ${input.id} has inconsistent managed resource identity`);
+    if ((input.mode === "managed" || input.mode === "output") !== (typeof input.managedResourceId === "string")) throw new Error(`fixture input ${input.id} has inconsistent managed resource identity`);
     inputIds.add(input.id);
   }
 };
@@ -164,7 +181,9 @@ const fixtureCoverage = (ir: ProductionIr, fixtures: FixtureBundle, productionIr
   let requiredCases = 0;
   const reactions = ir.reactions.map(reaction => {
     const reactionInputs = reaction.inputs.map(id => inputs.get(id)).filter((input): input is Input => input !== undefined);
-    const observed = reactionInputs.filter(input => input.mode === "observed");
+    // Output-mode inputs are observed live, exactly like Observed inputs
+    // (InputMode::Output), so they share the same coverage scenarios.
+    const observed = reactionInputs.filter(input => input.mode === "observed" || input.mode === "output");
     const managed = reactionInputs.filter(input => input.mode === "managed");
     const managedWithOwnedData = managed.filter(input => {
       const data = input.managedResourceId === undefined ? undefined : resources.get(input.managedResourceId)?.desired.data;

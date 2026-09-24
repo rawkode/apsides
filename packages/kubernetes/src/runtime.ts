@@ -3,15 +3,23 @@ import * as model from "./model.ts";
 declare const elementBrand: unique symbol;
 declare const projectionBrand: unique symbol;
 declare const referenceBrand: unique symbol;
+declare const changeEventBrand: unique symbol;
+declare const handlerOutputBrand: unique symbol;
 export interface ApsidesElement { readonly [elementBrand]: true }
 export type ApsidesNode = ApsidesElement | readonly ApsidesNode[] | null | undefined | boolean;
 export type Component<P = Record<string, unknown>> = (props: P) => ApsidesNode;
 export interface DataProjection { readonly [projectionBrand]: true }
+/** Fires when its backing input's revision changes; usable only as an `<On trigger>`. */
+export interface ChangeEvent { readonly [changeEventBrand]: true }
 export interface ResourceRef<K extends ResourceKind = ResourceKind> {
   readonly [referenceBrand]: K;
   readonly data: K extends "ConfigMap" ? DataProjection : never;
+  readonly changed: K extends "ConfigMap" ? ChangeEvent : never;
 }
-export interface ObservedReference { readonly data: DataProjection }
+export interface ObservedReference { readonly data: DataProjection; readonly changed: ChangeEvent }
+/** A handler-written managed ConfigMap output: usable as `<On outputs>` and,
+ * via `.data`, in `rolloutOn`. */
+export interface HandlerOutputRef { readonly [handlerOutputBrand]: true; readonly data: DataProjection }
 type ResourceKind = "ConfigMap" | "Deployment" | "Service";
 type LifecycleProps = { readonly deletionPolicy?: "orphan" | "delete"; readonly force?: boolean };
 export type ControllerProps = Omit<model.DomainOptions, "provenance"> & { readonly children?: ApsidesNode };
@@ -24,12 +32,32 @@ export type DeploymentProps = model.DeploymentDefinition & LifecycleProps & {
 export type NamespacedResourceProps<Spec> = model.NamespacedResourceDefinition<Spec> & LifecycleProps;
 export type NamespacedResourceComponent<Spec> = Component<NamespacedResourceProps<Spec>>;
 export interface ObserveProps { readonly id?: string; readonly name: string; readonly namespace?: string }
+export interface HandlerOutputProps { readonly id?: string; readonly name: string; readonly namespace?: string }
+/**
+ * A Brigade-style event handler.
+ *
+ * `handler` MUST be a module reference string (`"./handlers/sync.ts#exportName"`,
+ * split here as `handler` + `export`) — never a function: handlers run in a
+ * separate execution context and cannot capture author closures.
+ */
+export interface HandlerProps {
+  readonly id?: string;
+  readonly trigger: ChangeEvent;
+  readonly handler: string;
+  readonly inputs: readonly (ObservedReference | ResourceRef<"ConfigMap">)[];
+  readonly egress?: readonly string[];
+  readonly outputs?: readonly HandlerOutputRef[];
+  readonly timeoutMillis?: number;
+  readonly maxHeapBytes?: number;
+}
 
 const builtin = (): never => { throw new Error("Apsides components must be rendered as JSX by the compiler"); };
 export const Controller = (_props: ControllerProps): ApsidesElement => { return builtin(); };
 export const ConfigMap = (_props: ConfigMapProps): ApsidesElement => { return builtin(); };
 export const Service = (_props: ServiceProps): ApsidesElement => { return builtin(); };
 export const Deployment = (_props: DeploymentProps): ApsidesElement => { return builtin(); };
+/** A Brigade-style event handler element; see {@link HandlerProps}. */
+export const On = (_props: HandlerProps): ApsidesElement => { return builtin(); };
 export const Fragment = Symbol("Apsides.Fragment");
 
 const namespacedResources = new WeakMap<Function, model.NamespacedResourceDescriptor>();
@@ -49,14 +77,16 @@ interface ReferenceState {
   readonly kind: ResourceKind;
   managed?: model.ManagedResource;
 }
-interface ProjectionState { readonly owner: RenderState; readonly ref?: ReferenceState; readonly observed?: model.ObservedInput }
+interface ProjectionState { readonly owner: RenderState; readonly ref?: ReferenceState; readonly observed?: model.ObservedInput | model.HandlerOutputInput }
 const references = new WeakMap<object, ReferenceState>();
 const projections = new WeakMap<object, ProjectionState>();
+const handlerOutputs = new WeakMap<object, model.HandlerOutputInput>();
 interface RenderState {
   readonly domain: model.Domain;
   readonly namespace: string;
   readonly refs: ReferenceState[];
   readonly rollouts: { target: model.ManagedResource<model.Deployment>; inputs: readonly unknown[]; source: model.SourceLocation }[];
+  readonly handlers: { props: HandlerProps; source: model.SourceLocation }[];
 }
 interface Frame { readonly state: RenderState; readonly source: model.SourceLocation }
 let frame: Frame | undefined;
@@ -94,11 +124,16 @@ const makeProjection = (state: ProjectionState): DataProjection => {
   projections.set(value, state);
   return value;
 };
+const makeChangeEvent = (state: ProjectionState): ChangeEvent => {
+  const value = Object.freeze(Object.create(null)) as ChangeEvent;
+  projections.set(value, state);
+  return value;
+};
 export const useResourceRef = <K extends ResourceKind>(kind: K): ResourceRef<K> => {
   const { state } = requireFrame();
   if (kind !== "ConfigMap" && kind !== "Deployment" && kind !== "Service") throw new Error("unsupported resource reference kind");
   const reference: ReferenceState = { owner: state, kind };
-  const value = Object.freeze(kind === "ConfigMap" ? { data: makeProjection({ owner: state, ref: reference }) } : {});
+  const value = Object.freeze(kind === "ConfigMap" ? { data: makeProjection({ owner: state, ref: reference }), changed: makeChangeEvent({ owner: state, ref: reference }) } : {});
   references.set(value, reference);
   state.refs.push(reference);
   return value as ResourceRef<K>;
@@ -109,10 +144,23 @@ const observe = (kind: typeof model.ConfigMap | typeof model.Secret, options: Ob
   for (const key of Object.keys(raw)) if (!["id", "name", "namespace"].includes(key)) throw new Error(`unsupported observation field: ${key}`);
   const supplied = { ...raw, namespace: raw.namespace ?? state.namespace, projection: ["data"], missing: "block-dependent-mutations", source } as unknown as model.ObserveOptions;
   const observed = kind === model.Secret ? state.domain.observe(model.Secret, supplied) : state.domain.observe(model.ConfigMap, supplied);
-  return Object.freeze({ data: makeProjection({ owner: state, observed }) });
+  return Object.freeze({ data: makeProjection({ owner: state, observed }), changed: makeChangeEvent({ owner: state, observed }) });
 };
 export const useConfigMap = (options: ObserveProps): ObservedReference => { return observe(model.ConfigMap, options); };
 export const useSecret = (options: ObserveProps): ObservedReference => { return observe(model.Secret, options); };
+
+/** Declare a handler `Output`: a managed ConfigMap the handler writes to,
+ * usable as `<On outputs>` and, through `.data`, in `rolloutOn`. */
+export const useHandlerOutput = (options: HandlerOutputProps): HandlerOutputRef => {
+  const { state, source } = requireFrame();
+  const raw = record(options, "handler output");
+  for (const key of Object.keys(raw)) if (!["id", "name", "namespace"].includes(key)) throw new Error(`unsupported handler output field: ${key}`);
+  const supplied = { ...raw, namespace: raw.namespace ?? state.namespace, source } as { readonly id?: string; readonly name: string; readonly namespace: string; readonly source: model.SourceLocation };
+  const output = model.defineHandlerOutput(state.domain, supplied);
+  const value = Object.freeze({ data: makeProjection({ owner: state, observed: output }) }) as HandlerOutputRef;
+  handlerOutputs.set(value, output);
+  return value;
+};
 
 const bindReference = (ref: unknown, state: RenderState, managed: model.ManagedResource, kind: ResourceKind): void => {
   if (ref === undefined) return;
@@ -171,7 +219,7 @@ export const renderTree = (root: unknown, provenance: model.DomainOptions["prove
         const { children, ...options } = props;
         if ("provenance" in options) throw new Error("Controller provenance is compiler-owned");
         const domain = model.defineDomain({ ...options, provenance } as model.DomainOptions);
-        state = { domain, namespace: (options as unknown as ControllerProps).namespace, refs: [], rollouts: [] };
+        state = { domain, namespace: (options as unknown as ControllerProps).namespace, refs: [], rollouts: [], handlers: [] };
         visit(children, state, source, depth + 1);
         return;
       }
@@ -211,6 +259,12 @@ export const renderTree = (root: unknown, provenance: model.DomainOptions["prove
         }
         return;
       }
+      if (type === On) {
+        if (!current) throw new Error("handlers require Controller");
+        if (!source) throw new Error("handler JSX requires compiler source information");
+        current.handlers.push({ props: props as unknown as HandlerProps, source });
+        return;
+      }
       if (typeof type !== "function") throw new Error("unsupported JSX element type");
       const previous = frame;
       try {
@@ -233,5 +287,70 @@ export const renderTree = (root: unknown, provenance: model.DomainOptions["prove
       model.watch(targetInput as model.ManagedResource<model.ConfigMap> | model.ObservedInput).project("data").rollout(rollout.target, { source: rollout.source });
     }
   }
+  for (const handler of completed.handlers) declareHandlerFromProps(completed, handler.props, handler.source);
   return completed.domain.toIR();
+};
+
+type Watchable = model.ManagedResource<model.ConfigMap> | model.ObservedInput | model.HandlerOutputInput;
+
+const resolveProjectionTarget = (projection: ProjectionState | undefined, owner: RenderState, context: string): Watchable => {
+  if (!projection || projection.owner !== owner) throw new Error(`${context} requires a reference from this Controller`);
+  const targetInput = projection.observed ?? projection.ref?.managed;
+  if (!targetInput || (projection.ref && projection.ref.kind !== "ConfigMap")) throw new Error(`${context} requires a ConfigMap reference`);
+  return targetInput as Watchable;
+};
+
+const inputIdOf = (target: Watchable): string => {
+  return target instanceof model.ManagedResource ? model.managedInputId(target) : target.id;
+};
+
+const onPropKeys = new Set(["id", "trigger", "handler", "inputs", "egress", "outputs", "timeoutMillis", "maxHeapBytes"]);
+
+const declareHandlerFromProps = (owner: RenderState, props: HandlerProps, source: model.SourceLocation): void => {
+  const raw = record(props, "On props");
+  for (const key of Object.keys(raw)) if (!onPropKeys.has(key)) throw new Error(`unsupported On field: ${key}`);
+  if (typeof raw.handler !== "string") {
+    throw new Error('On.handler must be a module reference string ("./handlers/sync.ts#exportName"), not a function: handlers run in a separate execution context and cannot capture author closures');
+  }
+  const separator = raw.handler.lastIndexOf("#");
+  if (separator <= 0 || separator === raw.handler.length - 1) {
+    throw new Error('On.handler must be formatted as "<module path>#<export name>"');
+  }
+  const modulePath = raw.handler.slice(0, separator);
+  const exportName = raw.handler.slice(separator + 1);
+
+  const triggerProjection = raw.trigger !== null && typeof raw.trigger === "object" ? projections.get(raw.trigger as object) : undefined;
+  const triggerTarget = resolveProjectionTarget(triggerProjection, owner, "On.trigger");
+  const triggerId = inputIdOf(triggerTarget);
+
+  if (!Array.isArray(raw.inputs) || raw.inputs.length === 0) throw new Error("On.inputs requires a non-empty array of ConfigMap references");
+  const inputIds = raw.inputs.map((entry) => {
+    const dataValue = entry !== null && typeof entry === "object" ? (entry as { data?: unknown }).data : undefined;
+    const projection = dataValue !== null && typeof dataValue === "object" ? projections.get(dataValue as object) : undefined;
+    return inputIdOf(resolveProjectionTarget(projection, owner, "On.inputs"));
+  });
+
+  const outputs = raw.outputs === undefined ? [] : raw.outputs;
+  if (!Array.isArray(outputs)) throw new Error("On.outputs must be an array of handler output references");
+  const outputIds = outputs.map((entry) => {
+    const output = entry !== null && typeof entry === "object" ? handlerOutputs.get(entry as object) : undefined;
+    if (!output) throw new Error("On.outputs requires references returned by useHandlerOutput()");
+    return output.outputId;
+  });
+
+  const egress = raw.egress === undefined ? [] : raw.egress;
+  if (!Array.isArray(egress)) throw new Error("On.egress must be an array of host strings");
+
+  model.defineHandler(owner.domain, {
+    ...(raw.id === undefined ? {} : { id: raw.id as string }),
+    module: modulePath,
+    export: exportName,
+    trigger: { kind: "input-changed", input: triggerId },
+    inputs: inputIds,
+    egress: egress as readonly string[],
+    outputs: outputIds,
+    ...(raw.timeoutMillis === undefined ? {} : { timeoutMillis: raw.timeoutMillis as number }),
+    ...(raw.maxHeapBytes === undefined ? {} : { maxHeapBytes: raw.maxHeapBytes as number }),
+    source,
+  });
 };

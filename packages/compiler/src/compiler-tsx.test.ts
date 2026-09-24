@@ -113,6 +113,63 @@ export default async () => {
     await assert.rejects(compileApsides(obsolete.sourcePath, obsolete.output), `${name} exports must not bypass the TSX renderer`);
   }
 
+  const handlerProgram = `import { Controller, On, useConfigMap, useHandlerOutput } from "@apsides/kubernetes";
+const HandlerApp = () => {
+  const settings = useConfigMap({ name: "settings" });
+  const flags = useHandlerOutput({ name: "flags" });
+  return <On trigger={settings.changed} handler="./handlers/sync-flags.ts#syncFlags" inputs={[settings]} egress={["api.example.com"]} outputs={[flags]} />;
+};
+export default (
+  <Controller id="handlers" namespace="workload" controlNamespace="apsides-system" clusterBinding="fixture" policyRef="platform/test" enforcement="api-bound" budgets={{maxResources:8,maxInputs:8,maxReactions:8,maxObjectBytes:32768,maxQueueDepth:8,maxConcurrentRequests:2}}>
+    <HandlerApp />
+  </Controller>
+);
+`;
+  const handlerModule = `export async function syncFlags(event) {
+  return event;
+}
+`;
+
+  {
+    // Bundle determinism: two independent compiles of the same program with
+    // the same handler module produce byte-identical handlers/<id>.js and an
+    // identical bundleSha256 in ir.json.
+    const files = { "program.tsx": handlerProgram, "handlers/sync-flags.ts": handlerModule };
+    const first = await fixture(files, "program.tsx");
+    const second = await fixture(files, "program.tsx");
+    await compileApsides(first.sourcePath, first.output);
+    await compileApsides(second.sourcePath, second.output);
+
+    const ir = JSON.parse(await readFile(join(first.output, "ir.json"), "utf8"));
+    assert.equal(ir.handlers.length, 1, "one handler declared");
+    const handler = ir.handlers[0];
+    assert.equal(handler.module, "handlers/sync-flags.ts", "handler module is normalized");
+    assert.equal(handler.export, "syncFlags", "handler export parsed from the module reference string");
+    assert.match(handler.bundleSha256, /^[0-9a-f]{64}$/, "bundleSha256 is a lowercase sha256 digest");
+    assert.equal(ir.outputs.length, 1, "one output declared");
+
+    const bundlePath = join(first.output, "handlers", `${handler.id}.js`);
+    const bundleCode = await readFile(bundlePath, "utf8");
+    assert.equal(digest(bundleCode), handler.bundleSha256, "ir.json bundleSha256 matches the written handler bundle");
+    assert.match(bundleCode, /syncFlags/, "the handler bundle contains the exported function");
+
+    const secondBundleCode = await readFile(join(second.output, "handlers", `${handler.id}.js`), "utf8");
+    assert.equal(bundleCode, secondBundleCode, "two independent compiles produce a byte-identical handler bundle");
+    const secondIr = JSON.parse(await readFile(join(second.output, "ir.json"), "utf8"));
+    assert.equal(secondIr.handlers[0].bundleSha256, handler.bundleSha256, "two independent compiles produce an identical bundleSha256");
+
+    const buildInputs = JSON.parse(await readFile(join(first.output, "build-inputs.json"), "utf8"));
+    assert.deepEqual(buildInputs.handlers, [{ id: handler.id, path: `handlers/${handler.id}.js`, sha256: handler.bundleSha256 }]);
+  }
+
+  {
+    // A handler module absent from apsides.lock.json is rejected: it is
+    // never bundled from the filesystem outside the locked closure.
+    const unlockedProgram = handlerProgram.replace("./handlers/sync-flags.ts", "./handlers/unlocked.ts");
+    const unlocked = await fixture({ "program.tsx": unlockedProgram, "handlers/sync-flags.ts": handlerModule }, "program.tsx");
+    await assert.rejects(compileApsides(unlocked.sourcePath, unlocked.output), "an unlocked handler module must be rejected before bundling");
+  }
+
   console.log("Apsides TSX source build passed: development JSX lowering, multi-source reproducibility, source provenance, SDK closure, isolated Deno config, and synchronous rendering.");
 } finally {
   await rm(root, { recursive: true, force: true });

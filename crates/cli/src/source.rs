@@ -89,7 +89,7 @@ mod tests {
 
     fn production_ir() -> serde_json::Value {
         json!({
-            "schemaVersion":"apsides.dev/ir/v1","testOnly":false,
+            "schemaVersion":"apsides.dev/ir/v2","testOnly":false,
             "domain":{"id":"fixture-selection","namespace":"workload",
                 "controlNamespace":"control","clusterBinding":"cluster-a",
                 "policyRef":"platform/fixture-selection","enforcement":"api-bound",
@@ -104,7 +104,7 @@ mod tests {
                 "lifecycle":{"deletionPolicy":"orphan"},
                 "source":{"file":"program.tsx","line":1,"column":1}}],
             "inputs":[],"reactions":[],
-            "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.tsx",
+            "handlers":[],"outputs":[],"provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.tsx",
                 "sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
         })
     }
