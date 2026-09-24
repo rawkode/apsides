@@ -82,6 +82,7 @@ See
 | `deploy` | provider-neutral lifecycle planning and transition reduction |
 | `platform` | protected Kubernetes state, proxy transport and generation lifecycle |
 | `runtime` | native fixed-plan reconciliation |
+| `engine` | Phase 5a spike gate for the embedded `deno_core`/V8 handler engine (feasibility evidence only, not yet wired into `runtime` or `aps build`) |
 | `release` | release integrity, signed provenance, compiler closure and OCI verification |
 | `inventory` | metadata-only snapshots and SQLite storage |
 | `coordination` | typed immutable stores for claims, transition audits and review metadata |
