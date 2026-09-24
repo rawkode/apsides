@@ -26,6 +26,8 @@ import tomllib
 import urllib.error
 import urllib.request
 
+import diagnostics
+
 ROOT = Path(__file__).resolve().parents[1]
 PINS_PATH = ROOT / "scripts/rusty-v8/pins.json"
 # Builder image platform (as `docker image inspect`/BuildKit name it) to the
@@ -65,7 +67,7 @@ def default_cache_dir():
         return Path(xdg) / "apsides/rusty-v8"
     home = os.environ.get("HOME")
     if not home:
-        raise ValueError(
+        raise diagnostics.ActionableError(
             "cannot determine a rusty_v8 archive cache directory: set APSIDES_RUSTY_V8_CACHE "
             "(or XDG_CACHE_HOME, or HOME) to a writable directory outside any installed "
             "Apsides CLI distribution prefix"
@@ -82,7 +84,7 @@ def load_pins(path=PINS_PATH):
         # (fetch outside the network-less build, verify, stage, set the env
         # var in scripts/Dockerfile) before building. Failing closed here
         # rather than silently compiling without it.
-        raise ValueError(
+        raise diagnostics.ActionableError(
             "scripts/rusty-v8/pins.json now requires a rusty_v8 binding file; "
             "scripts/rusty_v8.py and scripts/Dockerfile must be updated to fetch, "
             "verify and wire RUSTY_V8_SRC_BINDING_PATH before building"
@@ -94,12 +96,19 @@ def archive_pin(target, pins):
     archives = pins.get("archives", {})
     entry = archives.get(target)
     if not isinstance(entry, dict):
-        raise ValueError(f"no pinned rusty_v8 archive for target {target!r}")
+        raise diagnostics.ActionableError(
+            f"no pinned rusty_v8 archive for target {target!r}; add one to scripts/rusty-v8/pins.json"
+        )
     url, sha256 = entry.get("url"), entry.get("sha256")
     if not isinstance(url, str) or not url.startswith("https://"):
-        raise ValueError(f"pinned rusty_v8 archive URL for {target} must be an explicit https URL")
+        raise diagnostics.ActionableError(
+            f"pinned rusty_v8 archive URL for {target} in scripts/rusty-v8/pins.json must be an explicit https URL"
+        )
     if not isinstance(sha256, str) or len(sha256) != 64 or any(c not in "0123456789abcdef" for c in sha256.lower()):
-        raise ValueError(f"pinned rusty_v8 archive sha256 for {target} must be 64 lowercase hex characters")
+        raise diagnostics.ActionableError(
+            f"pinned rusty_v8 archive sha256 for {target} in scripts/rusty-v8/pins.json must be "
+            "64 lowercase hex characters"
+        )
     return {
         "target": target,
         "url": url,
@@ -112,9 +121,10 @@ def archive_pin(target, pins):
 def _verify(data, pin):
     actual = hashlib.sha256(data).hexdigest()
     if actual != pin["sha256"]:
-        raise ValueError(
+        raise diagnostics.ActionableError(
             f"rusty_v8 archive for {pin['target']} failed sha256 verification: "
-            f"expected {pin['sha256']}, got {actual}"
+            f"expected {pin['sha256']}, got {actual}; check scripts/rusty-v8/pins.json's "
+            "pinned sha256 against the archive actually published at its url"
         )
 
 
@@ -133,7 +143,7 @@ def fetch(pin, cache_dir=None, opener=urllib.request.urlopen):
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
     except OSError as error:
-        raise ValueError(
+        raise diagnostics.ActionableError(
             f"cannot create the rusty_v8 archive cache directory {cache_dir} ({error}); set "
             "APSIDES_RUSTY_V8_CACHE to a writable directory"
         ) from None
@@ -142,7 +152,10 @@ def fetch(pin, cache_dir=None, opener=urllib.request.urlopen):
         try:
             data = cached.read_bytes()
         except OSError as error:
-            raise ValueError(f"cannot read the cached rusty_v8 archive {cached} ({error})") from None
+            raise diagnostics.ActionableError(
+                f"cannot read the cached rusty_v8 archive {cached} ({error}); set APSIDES_RUSTY_V8_CACHE "
+                "to a different, readable directory, or remove that file so it can be re-fetched"
+            ) from None
         if hashlib.sha256(data).hexdigest() == pin["sha256"]:
             return cached
         # A cached file that no longer matches its name is corrupt, not a
@@ -152,7 +165,7 @@ def fetch(pin, cache_dir=None, opener=urllib.request.urlopen):
         with opener(pin["url"], timeout=120) as response:  # noqa: S310 -- fixed https URL from source-controlled pins.json
             data = response.read()
     except (urllib.error.URLError, OSError, ValueError) as error:
-        raise ValueError(
+        raise diagnostics.ActionableError(
             f"rusty_v8 archive for {pin['target']} is not cached under {cache_dir} and fetching "
             f"{pin['url']} failed ({error}); connect to the network once to populate the cache, or "
             "restore a previously fetched archive into that directory"
@@ -163,7 +176,7 @@ def fetch(pin, cache_dir=None, opener=urllib.request.urlopen):
         tmp.write_bytes(data)
         tmp.replace(cached)
     except OSError as error:
-        raise ValueError(
+        raise diagnostics.ActionableError(
             f"cannot write the fetched rusty_v8 archive into {cache_dir} ({error}); set "
             "APSIDES_RUSTY_V8_CACHE to a writable directory"
         ) from None
@@ -176,7 +189,10 @@ def locked_version(lock_bytes):
     document = tomllib.loads(lock_bytes.decode("utf-8"))
     versions = {package["version"] for package in document.get("package", []) if package.get("name") == "v8"}
     if len(versions) > 1:
-        raise ValueError("controller Cargo.lock pins more than one v8 crate version")
+        raise diagnostics.ActionableError(
+            "controller Cargo.lock pins more than one v8 crate version; resolve the duplicate lock "
+            "entries (cargo update -p v8 --precise <version>) before building"
+        )
     return next(iter(versions), None)
 
 
@@ -189,9 +205,12 @@ def ensure_pin_matches_lock(lock_bytes, pins):
     locked = locked_version(lock_bytes)
     pinned = pins.get("v8CrateVersion")
     if locked is None:
-        raise ValueError("controller Cargo.lock does not lock the v8 crate; cannot verify the rusty_v8 archive pin")
+        raise diagnostics.ActionableError(
+            "controller Cargo.lock does not lock the v8 crate; cannot verify the rusty_v8 archive pin "
+            "in scripts/rusty-v8/pins.json against it"
+        )
     if locked != pinned:
-        raise ValueError(
+        raise diagnostics.ActionableError(
             f"scripts/rusty-v8/pins.json pins v8 crate version {pinned!r} but controller/Cargo.lock "
             f"locks {locked!r}; update pins.json's archive URLs and SHA-256 digests to match the "
             "locked v8 crate version before building"

@@ -8,12 +8,20 @@ Every packaging script's `if __name__ == "__main__":` block catches a broad
 `Exception` and re-raises a short `SystemExit("apsides: <label> failed")`,
 deliberately discarding whatever the caught exception carried, so a routine
 usage error (a missing file, an invalid argument) never leaks an internal
-path or traceback. `SubprocessFailure` is the one exception type meant to
-carry real subprocess output past that boundary: raise it (not a bare
-`RuntimeError`) wherever a `docker`/`cargo`/etc. subprocess's stderr is worth
-surfacing, and build the final message with `failure_message()`, which adds
-that output -- bounded to the last `DEFAULT_TAIL_LINES` lines and redacted --
-only when the caught exception actually is one.
+path or traceback. Two exception types are meant to carry detail past that
+boundary, and `failure_message()` is the one place that adds it back,
+redacted:
+
+- `SubprocessFailure` for a `docker`/`cargo`/etc. subprocess that exited
+  non-zero: its captured output, bounded to the last `DEFAULT_TAIL_LINES`
+  lines.
+- `ActionableError` for a prepare-time check whose message already tells
+  the user what to do about it -- which environment variable to set, which
+  file to edit -- so it must never be swallowed by the generic
+  "apsides: ... failed" fallback the way a routine `ValueError` is. Raise
+  it (it is a `ValueError`, so existing `except ValueError`/
+  `assertRaisesRegex(ValueError, ...)` call sites keep working) for
+  anything a person reading only the final line needs to act on.
 """
 import re
 
@@ -82,13 +90,32 @@ class SubprocessFailure(RuntimeError):
         self.output = output or ""
 
 
+class ActionableError(ValueError):
+    """A prepare-time failure whose message already tells the user the
+    remedy: which environment variable to set, which file to edit, which
+    value to change. `failure_message()` always surfaces this message
+    (redacted, never bounded away) -- unlike a plain `ValueError` from a
+    routine usage mistake (a missing file, a bad argument), which the
+    top-level handlers deliberately discard so they never leak an internal
+    path or traceback.
+
+    A subclass of `ValueError`, so existing `except ValueError` and
+    `assertRaisesRegex(ValueError, ...)` call sites keep matching it.
+    """
+
+
 def failure_message(label, error):
     """The final `apsides: <label> failed` message for a caught top-level
-    `error`, with a bounded, redacted subprocess diagnostic appended when
-    `error` is a `SubprocessFailure` that actually captured output."""
+    `error`: a bounded, redacted subprocess diagnostic appended when `error`
+    is a `SubprocessFailure` that actually captured output, or its own
+    redacted message appended verbatim when it is an `ActionableError` --
+    otherwise just the plain label, so a routine usage error never leaks
+    detail past this boundary."""
     message = f"apsides: {label} failed"
     if isinstance(error, SubprocessFailure) and error.output.strip():
         detail = diagnostic(error.output)
         if detail:
             message += "\n" + detail
+    elif isinstance(error, ActionableError) and str(error).strip():
+        message += "\n" + redact(str(error))
     return message

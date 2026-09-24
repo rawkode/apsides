@@ -297,6 +297,43 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual((self.output / rusty_v8.CONTEXT_RELATIVE_PATH).read_bytes(), self.rusty_v8_archive.read_bytes())
         self.assertEqual(result, self.verify())
 
+    def _relock(self, v8_version):
+        """Rewrite the artifact's Cargo.lock (and its recorded manifest
+        digest) so `prepare()`'s real `rusty_v8.resolve()` -- not
+        `fake_rusty_v8_resolve` -- sees a controller/Cargo.lock that locks
+        the `v8` crate at `v8_version`."""
+        lock = f'version = 4\n\n[[package]]\nname = "v8"\nversion = "{v8_version}"\n'.encode()
+        (self.artifact / "controller/Cargo.lock").write_bytes(lock)
+        manifest = json.loads((self.artifact / "manifest.json").read_text())
+        manifest["files"]["controller/Cargo.lock"] = packaging.sha256(lock)
+        (self.artifact / "manifest.json").write_text(json.dumps(manifest))
+
+    def test_prepare_reports_an_actionable_error_when_no_cache_directory_can_be_determined(self):
+        # scripts/rusty-v8/pins.json's real v8CrateVersion, so resolve()
+        # reaches default_cache_dir() instead of failing the pin/lock check
+        # first.
+        self._relock("150.4.0")
+        with patch.object(packaging, "command", self.fake_command), \
+             patch.dict(os.environ, {"APSIDES_RUSTY_V8_CACHE": "", "XDG_CACHE_HOME": "", "HOME": ""}):
+            with self.assertRaises(diagnostics.ActionableError) as failure:
+                packaging.prepare(self.artifact, self.output, repository=self.repo)
+        # Goes through failure_message(), the same as build.py's __main__:
+        # the remedy must survive to the user-facing text, not be dropped
+        # behind a bare "apsides: image build failed".
+        message = diagnostics.failure_message("image build", failure.exception)
+        self.assertTrue(message.startswith("apsides: image build failed\n"))
+        self.assertIn("APSIDES_RUSTY_V8_CACHE", message)
+
+    def test_prepare_reports_an_actionable_error_on_a_pin_lock_version_mismatch(self):
+        self._relock("999.0.0")
+        with patch.object(packaging, "command", self.fake_command):
+            with self.assertRaises(diagnostics.ActionableError) as failure:
+                packaging.prepare(self.artifact, self.output, repository=self.repo)
+        message = diagnostics.failure_message("image build", failure.exception)
+        self.assertTrue(message.startswith("apsides: image build failed\n"))
+        self.assertIn("pins.json", message)
+        self.assertIn("999.0.0", message)
+
     def test_verify_context_rejects_a_rusty_v8_record_inconsistent_with_its_staged_file(self):
         self.prepare()
         path = self.output / "context.json"
@@ -885,6 +922,27 @@ class DiagnosticsTests(unittest.TestCase):
         error = diagnostics.SubprocessFailure("docker build failed", "")
         self.assertEqual(diagnostics.failure_message("image build", error), "apsides: image build failed")
 
+    def test_actionable_error_is_a_value_error_so_existing_catches_still_match(self):
+        self.assertIsInstance(diagnostics.ActionableError("set FOO"), ValueError)
+
+    def test_failure_message_always_appends_an_actionable_errors_own_message(self):
+        error = diagnostics.ActionableError(
+            "cannot determine a rusty_v8 archive cache directory: set APSIDES_RUSTY_V8_CACHE "
+            "(or XDG_CACHE_HOME, or HOME) to a writable directory"
+        )
+        message = diagnostics.failure_message("image build", error)
+        self.assertEqual(message, f"apsides: image build failed\n{error}")
+        self.assertIn("APSIDES_RUSTY_V8_CACHE", message)
+
+    def test_failure_message_redacts_an_actionable_errors_message_too(self):
+        error = diagnostics.ActionableError("update pins.json: token=SEKRET1234567890")
+        message = diagnostics.failure_message("image build", error)
+        self.assertNotIn("SEKRET1234567890", message)
+        self.assertIn("token=[REDACTED]", message)
+
+    def test_failure_message_omits_the_block_for_an_empty_actionable_error(self):
+        self.assertEqual(diagnostics.failure_message("image build", diagnostics.ActionableError("")), "apsides: image build failed")
+
 
 class SubprocessDiagnosticIntegrationTests(unittest.TestCase):
     """`command()` raises `SubprocessFailure` carrying the real, unredacted
@@ -942,7 +1000,15 @@ class DistributionLayoutTests(unittest.TestCase):
             assets = prefix / "share/apsides"
             scripts_dir = assets / "scripts"
             scripts_dir.mkdir(parents=True)
+            # rusty_v8.py imports diagnostics, so a real distribution would
+            # install both (scripts/diagnostics.py is in package_cli.py's
+            # STATIC_SOURCES); copied here for the same reason, even though
+            # this process already has the real diagnostics module cached
+            # under that name and would reuse it either way -- it is pure
+            # and stateless, so nothing about the property under test
+            # (nothing lands under the prefix) depends on which copy runs.
             shutil.copy(ROOT / "scripts/rusty_v8.py", scripts_dir / "rusty_v8.py")
+            shutil.copy(ROOT / "scripts/diagnostics.py", scripts_dir / "diagnostics.py")
             before = sorted(path.relative_to(prefix) for path in prefix.rglob("*"))
             home = temporary / "home"
             home.mkdir()

@@ -342,20 +342,47 @@ pub(crate) fn absolute(path: &Path) -> Result<PathBuf> {
 }
 
 /// Variables `aps build` needs beyond the inherited allowlist: where Cargo,
-/// rustup and Deno keep their caches.
+/// rustup and Deno keep their caches, and where `scripts/rusty_v8.py`
+/// caches the pinned `rusty_v8` archive it fetches before the `--network=none`
+/// Cargo build (`APSIDES_RUSTY_V8_CACHE`; see `scripts/rusty_v8.py`'s
+/// `default_cache_dir()`). Without forwarding it, `Invocation::start`'s
+/// `env_clear()` drops it, `aps build` falls back to its own default
+/// (`$HOME/.cache/apsides/rusty-v8`, still inherited and so not itself
+/// wrong), and CI's cache step (keyed to the same path this crate's caller
+/// sets `APSIDES_RUSTY_V8_CACHE` to) ends up caching a directory nothing
+/// ever writes to.
+const BUILD_ENV_NAMES: [&str; 5] = [
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "DENO_DIR",
+    "APSIDES_RUSTY_V8_CACHE",
+];
+
 pub(crate) trait BuildEnvironment {
     fn envs_for_build(self) -> Self;
 }
 
 impl BuildEnvironment for Invocation {
     fn envs_for_build(self) -> Self {
-        ["CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "DENO_DIR"]
-            .into_iter()
-            .fold(self, |invocation, name| match std::env::var_os(name) {
-                Some(value) => invocation.env(name, value),
-                None => invocation,
-            })
+        envs_for_build_via(self, |name| std::env::var_os(name))
     }
+}
+
+/// `envs_for_build`'s forwarding logic, taking its environment lookup as a
+/// parameter so a test can supply a fixed one instead of mutating this
+/// process's real environment (`std::env::set_var` is `unsafe` under the
+/// 2024 edition, denied workspace-wide).
+fn envs_for_build_via(
+    invocation: Invocation,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Invocation {
+    BUILD_ENV_NAMES
+        .into_iter()
+        .fold(invocation, |invocation, name| match lookup(name) {
+            Some(value) => invocation.env(name, value),
+            None => invocation,
+        })
 }
 
 #[cfg(test)]
@@ -365,6 +392,44 @@ mod tests {
     #[test]
     fn the_host_platform_is_a_linux_platform() -> Result {
         assert!(host_platform()?.starts_with("linux/"));
+        Ok(())
+    }
+
+    #[test]
+    fn build_env_names_forward_the_rusty_v8_cache_directory() {
+        assert!(BUILD_ENV_NAMES.contains(&"APSIDES_RUSTY_V8_CACHE"));
+    }
+
+    /// `envs_for_build`'s real lookup is `std::env::var_os`, which this
+    /// process's own environment cannot be mutated to test (`set_var` is
+    /// `unsafe` under the 2024 edition, denied workspace-wide): a fixed
+    /// lookup closure exercises the same forwarding fold, and actually
+    /// running the invocation proves `Invocation::env` really reaches a
+    /// spawned child (`Invocation::start`'s `env_clear()` would otherwise
+    /// drop it, exactly the `acceptance-prepare` bug this fixes).
+    #[tokio::test]
+    async fn envs_for_build_via_forwards_the_rusty_v8_cache_when_set() -> Result {
+        let invocation = Invocation::new("sh")
+            .args(["-c", "printf '%s' \"$APSIDES_RUSTY_V8_CACHE\""])
+            .timeout(Duration::from_secs(10));
+        let output = envs_for_build_via(invocation, |name| {
+            (name == "APSIDES_RUSTY_V8_CACHE").then(|| std::ffi::OsString::from("/example/rusty-v8-cache"))
+        })
+        .output()
+        .await?;
+        assert!(output.success, "stderr: {}", output.stderr);
+        assert_eq!(output.stdout, "/example/rusty-v8-cache");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn envs_for_build_via_omits_unset_variables() -> Result {
+        let invocation = Invocation::new("sh")
+            .args(["-c", "printf '%s' \"${APSIDES_RUSTY_V8_CACHE:-unset}\""])
+            .timeout(Duration::from_secs(10));
+        let output = envs_for_build_via(invocation, |_| None).output().await?;
+        assert!(output.success, "stderr: {}", output.stderr);
+        assert_eq!(output.stdout, "unset");
         Ok(())
     }
 }
