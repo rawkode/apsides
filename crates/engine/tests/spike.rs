@@ -380,12 +380,119 @@ fn deno_and_bootstrap_internals_are_unreachable_from_user_code() {
     );
 }
 
-/// Non-blocking review item: the guarded `ArrayBuffer` constructor's own
-/// `[[Prototype]]` must be set to the native constructor
-/// (`Object.setPrototypeOf(Guarded, Native)` in `BOOTSTRAP_GUARD_SCRIPT`),
-/// or static methods like `ArrayBuffer.isView` would resolve to `undefined`
-/// (a plain function's own `[[Prototype]]` is `Function.prototype`, which
-/// does not have `isView`).
+/// Regression test, route 4 (found by a third review round): an earlier fix
+/// for `array_buffer_statics_are_preserved`'s concern --
+/// `Object.setPrototypeOf(Guarded, Native)`, so static methods like
+/// `ArrayBuffer.isView` would resolve through `Guarded`'s own prototype
+/// chain -- put the *native, unguarded* constructor back within reach via
+/// `Object.getPrototypeOf(ArrayBuffer)`. Calling it directly with
+/// `{maxByteLength}` commits the buffer's *initial* length through V8's own
+/// page allocator at construction time, before `.resize()`/`.transfer()`
+/// (guarded since the second review round) are ever involved -- so that
+/// guard did not help here; the buffer never needs to grow.
+/// `BOOTSTRAP_GUARD_SCRIPT` no longer calls `Object.setPrototypeOf` on
+/// `Guarded` at all (see its updated doc comment); this test confirms the
+/// whole static prototype chain from `ArrayBuffer` upward, plus the two
+/// concrete repros the review named, plus the `constructor` property
+/// descriptor's shape.
+#[test]
+fn native_array_buffer_constructor_is_unreachable_via_prototype_chain() {
+    let cap_bytes = 1024 * 1024;
+    let limits = EngineLimits {
+        max_array_buffer_bytes: cap_bytes,
+        max_heap_bytes: 64 * 1024 * 1024,
+    };
+    let module = r#"
+        if (Object.getPrototypeOf(ArrayBuffer) !== Function.prototype) {
+            throw new Error("Object.getPrototypeOf(ArrayBuffer) must be Function.prototype");
+        }
+        if (Reflect.getPrototypeOf(ArrayBuffer) !== Function.prototype) {
+            throw new Error("Reflect.getPrototypeOf(ArrayBuffer) must be Function.prototype");
+        }
+
+        // Function.prototype itself must not be usable as a constructor at
+        // all (it has no [[Construct]] internal method), closing the
+        // review's exact repro: `new (Object.getPrototypeOf(ArrayBuffer))(...)`.
+        let threwOnDirectCall = false;
+        try {
+            new (Object.getPrototypeOf(ArrayBuffer))(256 * 1024 * 1024, {
+                maxByteLength: 256 * 1024 * 1024,
+            });
+        } catch (e) {
+            threwOnDirectCall = true;
+        }
+        if (!threwOnDirectCall) {
+            throw new Error("Function.prototype must not be constructible");
+        }
+
+        // The review's second named repro: the prototype.constructor route
+        // (native TypedArray construction reaches the native ArrayBuffer
+        // constructor directly) must resolve to the guarded constructor,
+        // not the native one, and a resizable buffer must not be
+        // constructible through it either. Uses length 0 (not 256 MiB):
+        // this route resolves to the *guarded* constructor (checked just
+        // above), which enforces the array-buffer-byte cap on an ordinary
+        // large fixed-length request too (covered by a different existing
+        // test) -- mixing that unrelated, legitimate cap-termination path
+        // into this resizability check would conflate two different
+        // findings.
+        const viaPrototype = new Uint8Array(4).buffer.constructor;
+        if (viaPrototype !== ArrayBuffer) {
+            throw new Error("new Uint8Array(4).buffer.constructor must be the guarded ArrayBuffer");
+        }
+        const viaPrototypeBuf = new viaPrototype(0, { maxByteLength: 256 * 1024 * 1024 });
+        if (viaPrototypeBuf.resizable) {
+            throw new Error("prototype.constructor route must not accept maxByteLength");
+        }
+
+        // Walk the whole static prototype chain from ArrayBuffer upward: it
+        // must terminate at Object.prototype -> null within a handful of
+        // hops, and never contain anything the native constructor could
+        // hide behind.
+        let walker = ArrayBuffer;
+        for (let hops = 0; walker !== null; hops++) {
+            if (hops > 10) {
+                throw new Error("prototype chain walk did not terminate");
+            }
+            walker = Object.getPrototypeOf(walker);
+        }
+
+        // The constructor property itself: non-writable, non-configurable,
+        // and pointing at the guarded constructor (globalThis.ArrayBuffer),
+        // not the native one.
+        const descriptor = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "constructor");
+        if (descriptor.value !== ArrayBuffer) {
+            throw new Error("ArrayBuffer.prototype.constructor must be the guarded ArrayBuffer");
+        }
+        if (descriptor.writable !== false || descriptor.configurable !== false) {
+            throw new Error("ArrayBuffer.prototype.constructor must be non-writable and non-configurable");
+        }
+    "#;
+    let usage = no_usage();
+
+    let result = run_spike_module_blocking(limits, module, &usage, Duration::from_secs(10));
+
+    assert!(
+        result.is_ok(),
+        "expected the native-constructor-unreachable checks to pass, got {result:?}"
+    );
+    let observed_usage = usage.load(Ordering::SeqCst);
+    assert_eq!(
+        observed_usage, 0,
+        "the capped allocator's own usage counter must have stayed at 0: no \
+         256 MiB resizable buffer's initial length may have been committed"
+    );
+}
+
+/// Static methods/properties user code depends on -- `ArrayBuffer.isView`,
+/// `ArrayBuffer[Symbol.species]` -- must keep working even though
+/// `BOOTSTRAP_GUARD_SCRIPT` no longer makes the native constructor reachable
+/// via `Object.setPrototypeOf` (see
+/// `native_array_buffer_constructor_is_unreachable_via_prototype_chain`'s
+/// doc comment): it copies them onto the guarded constructor as its own
+/// properties instead (`isView` wraps a captured reference to the native
+/// function; `[Symbol.species]` is a getter returning `this`, matching the
+/// spec's own definition).
 #[test]
 fn array_buffer_statics_are_preserved() {
     let module = r#"
@@ -394,6 +501,9 @@ fn array_buffer_statics_are_preserved() {
         }
         if (ArrayBuffer.isView({}) !== false) {
             throw new Error("ArrayBuffer.isView({}) must be false");
+        }
+        if (ArrayBuffer[Symbol.species] !== ArrayBuffer) {
+            throw new Error("ArrayBuffer[Symbol.species] must be ArrayBuffer itself");
         }
     "#;
 

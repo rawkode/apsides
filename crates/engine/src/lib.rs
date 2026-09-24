@@ -91,10 +91,25 @@ const SPIKE_V8_FLAGS: &str = "--jitless --enable-sharedarraybuffer-per-context";
 /// allocations: a *resizable* one (`new ArrayBuffer(0, {maxByteLength: N})`,
 /// then `.resize(N)`) is backed by memory V8 reserves/commits through its
 /// own page allocator, never calling into the custom
-/// `v8::ArrayBuffer::Allocator` vtable at all. There is no V8 build flag to
-/// disable resizable `ArrayBuffer`s in this pinned version (checked: no
-/// `resizable`/`growable`/`max_byte_length` flag exists in
-/// `v8-150.4.0/src/flags/flag-definitions.h`). This layer:
+/// `v8::ArrayBuffer::Allocator` vtable at all.
+///
+/// **No V8 build flag disables this**, confirmed two ways on this exact
+/// pinned build (not just by inspecting `flag-definitions.h`, which has no
+/// `resizable`/`growable`/`rab_gsab`/`max_byte_length` flag anywhere, nor
+/// any flag mentioned near the `RAB_GSAB_TYPED_ARRAYS`/
+/// `GrowableSharedArrayBufferByteLength` machinery in `src/objects/` and
+/// `src/runtime/` -- resizable buffers are unconditional, permanent, stable
+/// V8 behavior with no flag gate in this version, not merely a feature this
+/// crate forgot to disable): (1) `v8::V8::set_flags_from_string("--no-harmony-rab-gsab
+/// --harmony-rab-gsab=false")` (the review's suggested name and a plausible
+/// alternative) prints `Error: unrecognized flag --no-harmony-rab-gsab` to
+/// stderr -- V8 does not know this flag; (2) `v8::V8::set_flags_from_string("--help")`'s
+/// full flag dump (grepped for "resiz"/"array.?buffer"/"max.?byte") lists
+/// only unrelated flags (`--resize-large-object`, `--track-array-buffer-views`,
+/// `--concurrent-array-buffer-sweeping`, a test-only `--mock-arraybuffer-allocator`
+/// pair, `--js-immutable-arraybuffer`), none of which gate resizability.
+/// Since there is no structural fix available, this layer closes it at the
+/// JS level instead:
 ///   - Replaces the constructor with one that **never reads or forwards a
 ///     second (`options`) argument at all** (found in review: an earlier
 ///     version that read `options.maxByteLength` once and rejected it if
@@ -110,29 +125,41 @@ const SPIKE_V8_FLAGS: &str = "--jitless --enable-sharedarraybuffer-per-context";
 ///     instance's prototype chain (e.g. `new Uint8Array(1).buffer.constructor`),
 ///     since ordinary `TypedArray` construction allocates its backing
 ///     `ArrayBuffer` through an internal V8 builtin that never consults the
-///     JS-visible global binding.
-///   - Most importantly, replaces `NativeCtor.prototype.resize` with a
-///     function that **always throws, unconditionally, regardless of the
-///     receiver**, and `.transfer` with one that throws when `this.resizable`
-///     (`.transfer()` on a resizable buffer produces another resizable
-///     buffer, preserving resizability; `.transferToFixedLength()` is left
-///     alone, since it always produces a fixed buffer). Every `ArrayBuffer`
-///     instance in one realm, however it was constructed -- via this guarded
-///     constructor, via the raw native one if somehow still reachable, or
-///     via `Deno.core.deserialize` before Layer 1 ran -- shares this one
-///     `%ArrayBuffer.prototype%` object, so this is the layer that actually
-///     closes every construction route uniformly, including ones this
-///     review (or a future one) did not enumerate.
-///   - Sets `Guarded`'s own `[[Prototype]]` to `Native` (`Object.setPrototypeOf`),
-///     so static methods/properties users depend on --
-///     `ArrayBuffer.isView`, `ArrayBuffer[Symbol.species]` -- still resolve
-///     through the guarded constructor (found in review: without this,
-///     `Guarded.isView` would be `undefined`, since a plain function's own
-///     `[[Prototype]]` is `Function.prototype`, not `Native`).
+///     JS-visible global binding. The `constructor` property is defined
+///     non-writable and non-configurable.
+///   - Replaces `NativeCtor.prototype.resize` with a function that
+///     **always throws, unconditionally, regardless of the receiver**, and
+///     `.transfer` with one that throws when `this.resizable` (`.transfer()`
+///     on a resizable buffer produces another resizable buffer, preserving
+///     resizability; `.transferToFixedLength()` is left alone, since it
+///     always produces a fixed buffer). Every `ArrayBuffer` instance in one
+///     realm, however it was constructed, shares this one
+///     `%ArrayBuffer.prototype%` object, so this closes growth for any
+///     construction route uniformly -- **but does not by itself stop the
+///     *initial* length of a resizable buffer from being committed**: a
+///     third review round found that `Object.setPrototypeOf(Guarded, Native)`
+///     (an earlier version of the next bullet's static-preservation fix)
+///     put `Native` back within reach via `Object.getPrototypeOf(ArrayBuffer)`,
+///     and `new (that Native)(256 << 20, {maxByteLength: 256 << 20})`
+///     commits the *initial* 256 MiB through V8's page allocator at
+///     construction time, before `.resize()`/`.transfer()` are ever called
+///     -- so blocking those two methods did not help.
+///   - Copies exactly the two static members user code needs --
+///     `ArrayBuffer.isView` (wrapped: `Guarded.isView` calls a captured
+///     reference to `Native.isView`, never exposing `Native` itself) and
+///     `[Symbol.species]` (a getter returning `this`, matching the spec's
+///     own definition) -- as `Guarded`'s own properties, instead of
+///     (the review-flagged bug) making `Native` reachable at all via
+///     `Object.setPrototypeOf(Guarded, Native)`. `Guarded`'s own
+///     `[[Prototype]]` is left as the ordinary `Function.prototype`: nothing
+///     in this crate ever calls `Object.setPrototypeOf` on `Guarded`, and
+///     `Native` is not stored anywhere reachable from `globalThis` once this
+///     script returns (it lives only in `guardResizable`'s closure, captured
+///     by the handful of functions defined inside it).
 ///
-/// See `tests/spike.rs` for the regression tests: one per bypass route this
-/// and the prior review round found, plus the static-preservation and
-/// Deno-unreachability checks.
+/// See `tests/spike.rs` for the regression tests: one per bypass route the
+/// three review rounds found, plus the static-preservation, prototype-chain,
+/// and Deno-unreachability checks.
 const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
 (() => {
   // Layer 1: hide deno_core's own internals. Captures only the one op
@@ -162,9 +189,32 @@ const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
       return Reflect.construct(Native, [length], new.target);
     }
     Guarded.prototype = Native.prototype;
-    Object.setPrototypeOf(Guarded, Native);
     Object.defineProperty(Guarded, "name", { value: name, configurable: true });
     Object.defineProperty(Guarded, "length", { value: 1, configurable: true });
+    // Copies exactly the two statics user code needs, instead of making
+    // Native reachable via Object.setPrototypeOf(Guarded, Native) (the
+    // review-flagged bug: that put Native within reach via
+    // Object.getPrototypeOf(ArrayBuffer), and calling it directly with
+    // {maxByteLength} commits the buffer's *initial* length through V8's
+    // page allocator before .resize()/.transfer() are ever involved).
+    {
+      // `isView` is an `ArrayBuffer`-only static (`SharedArrayBuffer` has
+      // no such method), hence the guard.
+      if (typeof Native.isView === "function") {
+        const nativeIsView = Native.isView;
+        Object.defineProperty(Guarded, "isView", {
+          value: (arg) => nativeIsView(arg),
+          writable: false,
+          configurable: true,
+        });
+      }
+      Object.defineProperty(Guarded, Symbol.species, {
+        get() {
+          return this;
+        },
+        configurable: true,
+      });
+    }
     Object.defineProperty(Native.prototype, "constructor", {
       value: Guarded,
       writable: false,
@@ -547,6 +597,17 @@ pub fn run_spike_module_with_watchdog(
 
     install_heap_limit_callback(&mut runtime, isolate_handle.clone());
 
+    // Built *before* the watchdog thread is spawned below (found in review
+    // to need fixing: an earlier version spawned the watchdog first, then
+    // used `?` on this `build()` -- if it failed, that returned immediately
+    // with the watchdog thread already spawned and never joined). Ordered
+    // this way, a failure here returns before any thread but the caller's
+    // own exists, so there is nothing to join.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .map_err(SpikeRunError::Runtime)?;
+
     let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
     let watchdog = std::thread::spawn(move || {
         // `Timeout`: the deadline passed with the run still going --
@@ -562,10 +623,6 @@ pub fn run_spike_module_with_watchdog(
         }
     });
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .map_err(SpikeRunError::Runtime)?;
     let result = rt
         .block_on(drive_to_completion(&mut runtime, &specifier))
         .map_err(SpikeRunError::Engine);
