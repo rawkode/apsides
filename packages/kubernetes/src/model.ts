@@ -663,9 +663,9 @@ const DEFAULT_MIN_KUBERNETES_VERSION = `${MIN_KUBERNETES_VERSION_FLOOR.major}.${
 
 const validateMinKubernetesVersion = (value: unknown): string => {
   const provided = value === undefined ? DEFAULT_MIN_KUBERNETES_VERSION : boundedText(value, 16, "domain.minKubernetesVersion");
-  const match = /^([0-9]{1,9})\.([0-9]{1,9})$/.exec(provided);
+  const match = /^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$/.exec(provided);
   if (!match || match[1] === undefined || match[2] === undefined) {
-    throw new Error("domain.minKubernetesVersion must be formatted as MAJOR.MINOR");
+    throw new Error("domain.minKubernetesVersion must be formatted as canonical MAJOR.MINOR (no leading zeros)");
   }
   const major = Number(match[1]);
   const minor = Number(match[2]);

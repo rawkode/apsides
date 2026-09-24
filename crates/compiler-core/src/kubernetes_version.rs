@@ -15,17 +15,25 @@
 /// contract (`apply_absent_with_list_version`) is qualified for.
 pub const QUALIFIED_FLOOR: (u32, u32) = (1, 34);
 
-/// Parses a strict `"MAJOR.MINOR"` string: digits only, exactly one dot, no
-/// leading `+`/sign and no surrounding whitespace. Returns `None` for any
-/// other shape.
+/// True when `part` is a canonical decimal integer: `"0"`, or a nonempty
+/// digit string with no leading zero, at most 9 digits.
+fn is_canonical_integer(part: &str) -> bool {
+    !part.is_empty()
+        && part.len() <= 9
+        && part.bytes().all(|b| b.is_ascii_digit())
+        && (part == "0" || !part.starts_with('0'))
+}
+
+/// Parses a strict, canonical `"MAJOR.MINOR"` string.
+///
+/// Each part is `"0"` or a digit string with no leading zero, at most 9
+/// digits, exactly one dot, no leading `+`/sign and no surrounding
+/// whitespace. Returns `None` for any other shape (e.g. `"1.034"` or
+/// `"01.34"`).
 #[must_use]
 pub fn parse_min_version(value: &str) -> Option<(u32, u32)> {
     let (major, minor) = value.split_once('.')?;
-    if major.is_empty()
-        || minor.is_empty()
-        || !major.bytes().all(|b| b.is_ascii_digit())
-        || !minor.bytes().all(|b| b.is_ascii_digit())
-    {
+    if !is_canonical_integer(major) || !is_canonical_integer(minor) {
         return None;
     }
     Some((major.parse().ok()?, minor.parse().ok()?))
@@ -97,6 +105,31 @@ mod tests {
         assert_eq!(parse_min_version("1.34.3"), None);
         assert_eq!(parse_min_version("1"), None);
         assert_eq!(parse_min_version(""), None);
+        assert_eq!(
+            parse_min_version("1.034"),
+            None,
+            "leading zero on minor is not canonical"
+        );
+        assert_eq!(
+            parse_min_version("01.34"),
+            None,
+            "leading zero on major is not canonical"
+        );
+        assert_eq!(
+            parse_min_version("1.1234567890"),
+            None,
+            "minor exceeds 9 digits"
+        );
+        assert_eq!(
+            parse_min_version("1234567890.34"),
+            None,
+            "major exceeds 9 digits"
+        );
+        assert_eq!(
+            parse_min_version("1.0"),
+            Some((1, 0)),
+            "a bare 0 part is canonical"
+        );
         assert!(is_supported_min_version("1.34"));
         assert!(is_supported_min_version("1.40"));
         assert!(!is_supported_min_version("1.33"));

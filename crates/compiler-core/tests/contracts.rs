@@ -129,7 +129,18 @@ fn unsupported_effects_and_scope_cannot_cross_ir_boundary() -> TestResult {
 
 #[test]
 fn domain_min_kubernetes_version_requires_the_qualified_floor() -> TestResult {
-    for invalid in ["1.33", "1.34.3", "v1.34", "2.0", "34.1", "", "garbage"] {
+    for invalid in [
+        "1.33",
+        "1.34.3",
+        "v1.34",
+        "2.0",
+        "34.1",
+        "",
+        "garbage",
+        "1.034",
+        "01.34",
+        "1.1234567890",
+    ] {
         let mut value = fixture();
         value["domain"]["minKubernetesVersion"] = json!(invalid);
         assert!(

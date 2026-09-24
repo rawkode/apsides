@@ -15,7 +15,7 @@ mod types;
 mod validation;
 pub use types::*;
 
-pub const REVIEW_METADATA_SCHEMA: &str = "apsides.dev/review-metadata/v1";
+pub const REVIEW_METADATA_SCHEMA: &str = "apsides.dev/review-metadata/v2";
 pub const MAX_REVIEW_METADATA_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_REVIEW_SOURCE_ELEMENTS: usize = 100_000;
 pub const MAX_REVIEW_DECLARATIONS: usize = 256;

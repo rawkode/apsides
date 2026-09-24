@@ -355,8 +355,11 @@ throws(() => constrained.manage(new ConfigMap({ metadata: { name: "two", namespa
     budgets, provenance: { inputs: [{ path: "domain.ts", sha256 }] },
   };
   throws(() => defineDomain({ ...options, minKubernetesVersion: "1.33" }), "at least the qualified floor 1.34");
-  throws(() => defineDomain({ ...options, minKubernetesVersion: "1.34.3" }), "must be formatted as MAJOR.MINOR");
+  throws(() => defineDomain({ ...options, minKubernetesVersion: "1.34.3" }), "must be formatted as canonical MAJOR.MINOR");
   throws(() => defineDomain({ ...options, minKubernetesVersion: "2.0" }), "at least the qualified floor 1.34");
+  throws(() => defineDomain({ ...options, minKubernetesVersion: "1.034" }), "must be formatted as canonical MAJOR.MINOR");
+  throws(() => defineDomain({ ...options, minKubernetesVersion: "01.34" }), "must be formatted as canonical MAJOR.MINOR");
+  throws(() => defineDomain({ ...options, minKubernetesVersion: "1.1234567890" }), "must be formatted as canonical MAJOR.MINOR");
   const raised = defineDomain({ ...options, minKubernetesVersion: "1.35" });
   raised.manage(new ConfigMap({ metadata: { name: "config", namespace: "workload" } }), { source });
   equal(raised.toIR().domain.minKubernetesVersion, "1.35", "explicit minKubernetesVersion is retained");
