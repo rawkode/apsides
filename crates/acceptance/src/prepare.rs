@@ -38,11 +38,15 @@ const IMAGE_REPOSITORY: &str = "localhost/apsides/cnpg-controller";
 pub(crate) const BUILD_TIMEOUT: Duration = Duration::from_mins(45);
 /// Every program the scenarios deploy, by the directory prepare writes its
 /// release to, in the order `inputs.json` names them.
-const RELEASES: [(&str, &str); 4] = [
+const RELEASES: [(&str, &str); 5] = [
     ("initial", "examples/cnpg/initial/program.tsx"),
     ("successor", "examples/cnpg/program.tsx"),
     ("cleanup", "examples/cnpg/cleanup/program.tsx"),
     ("owner", "crates/acceptance/programs/cnpg-owner/program.tsx"),
+    (
+        "handlers",
+        "crates/acceptance/programs/handler-output/program.tsx",
+    ),
 ];
 
 /// Where prepare reads from and writes to.
@@ -135,6 +139,7 @@ pub async fn prepare(options: &Options) -> Result<Inputs> {
         successor_release,
         cleanup_release,
         owner_release,
+        handler_output_release,
     ] = releases.as_slice()
     else {
         return infrastructure("expected one release per program");
@@ -146,6 +151,7 @@ pub async fn prepare(options: &Options) -> Result<Inputs> {
         successor_release: successor_release.clone(),
         cleanup_release: cleanup_release.clone(),
         owner_release: owner_release.clone(),
+        handler_output_release: handler_output_release.clone(),
         trust_policy,
         operator_manifest,
         results: output.join("results"),

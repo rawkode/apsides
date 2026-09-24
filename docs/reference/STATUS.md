@@ -40,7 +40,9 @@ establish narrower properties.
   `cli` → `test-cluster` → `runtime` → `engine`). At most one invocation
   dispatches per reconcile cycle, at global concurrency 1; `apsides.fetch` is
   restricted to declared HTTPS egress hosts resolved through a dedicated
-  DNS resolver (never glibc `getaddrinfo`/`/etc/resolv.conf`); handler
+  DNS resolver built from `/etc/resolv.conf` (never glibc's own
+  `getaddrinfo`, and only when some declared handler has egress hosts);
+  handler
   output writes are buffered in memory for the invocation and committed as
   one server-side apply per declared output, under field manager
   `apsides-handler-<domainId>`, through the same authority/claim re-check

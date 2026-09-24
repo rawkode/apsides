@@ -34,7 +34,7 @@ use tokio::sync::{Mutex, RwLock, watch};
 
 use crate::{
     KubeRuntimeClient, Observation, RuntimeClient, RuntimeError, block_reason, insert_revision,
-    normalized_object, validate_exact_apply_owner,
+    manager_main_resource_entries, normalized_object, validate_exact_apply_owner,
 };
 
 const MAX_DIAGNOSTIC_CONDITIONS: usize = 256;
@@ -720,6 +720,14 @@ impl ProductionController {
         let mut applied = BTreeSet::new();
         let mut observations = validated_inventory_observations(inventory, verified)?;
         let mut conditions = Vec::new();
+        // The uid this very cycle's reconciler apply observed for each
+        // handler output, keyed by the output's resource id -- NOT
+        // re-derived from a later, separate GET. `commit_handler_outputs`
+        // binds its commit to this value so a handler output replaced
+        // (deleted and recreated under the same name) while the handler
+        // ran can never receive that handler's data; see the Apsides v0.3
+        // plan, Phase 5b runtime-integration review (uid-binding item).
+        let mut output_uids = BTreeMap::new();
 
         for resource in self
             .plan
@@ -730,6 +738,9 @@ impl ProductionController {
         {
             match self.apply(resource, &resource.desired, inventory).await {
                 Ok(observation) => {
+                    if resource.handler_output {
+                        output_uids.insert(resource.id.clone(), observation.uid.clone());
+                    }
                     observations.insert(observation.identity.clone(), observation);
                     applied.insert(resource.id.clone());
                 }
@@ -744,7 +755,14 @@ impl ProductionController {
         if let Some(handler_runtime) = &self.handler_runtime {
             let mut handler_runtime = handler_runtime.lock().await;
             let new_conditions = handler_runtime
-                .run_cycle(&self.plan, &current, &applied, &self.kube.client, self)
+                .run_cycle(
+                    &self.plan,
+                    &current,
+                    &applied,
+                    &output_uids,
+                    &self.kube.client,
+                    self,
+                )
                 .await?;
             conditions.extend(new_conditions);
         }
@@ -1232,10 +1250,24 @@ async fn apply_existing_claimed(
 /// Returns the committed `uid` of every output actually committed, keyed
 /// by output id, for the caller to refresh `HandlerState::output_uids`.
 ///
+/// `output_uids` binds each output to the uid *this reconcile cycle's own
+/// reconciler apply* observed for it (see `reconcile`'s `output_uids`
+/// map) -- never a uid re-derived from this function's own GET of the
+/// live object, which would make the uid precondition trivially true
+/// against itself. If the live object's uid no longer matches, the
+/// output was deleted and recreated (or otherwise replaced) while the
+/// handler ran, and the commit is refused with a
+/// `handler-output-replaced` error instead of silently writing the
+/// handler's data into the replacement object; the caller retries the
+/// same event next cycle, once the reconciler has observed the
+/// replacement afresh.
+///
 /// # Errors
 ///
 /// Returns `Err` if an output id is undeclared, has no backing resource,
-/// has no approved claim, or if any step of its commit fails --
+/// no approved claim or no bound uid from this cycle, if the live
+/// object's uid no longer matches that bound uid
+/// (`handler-output-replaced`), or if any step of its commit fails --
 /// including `RuntimeError::Terminating` if shutdown was requested.
 pub(crate) async fn commit_handler_outputs(
     controller: &ProductionController,
@@ -1244,6 +1276,7 @@ pub(crate) async fn commit_handler_outputs(
     field_manager: &str,
     written: &crate::handlers::BufferedWrites,
     revision: &str,
+    output_uids: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, RuntimeError> {
     let mut committed_uids = BTreeMap::new();
     for output_id in handler_outputs {
@@ -1264,6 +1297,15 @@ pub(crate) async fn commit_handler_outputs(
                     "no backing resource for handler output {output_id:?}"
                 ))
             })?;
+        let bound_uid = output_uids
+            .get(output_id)
+            .filter(|uid| !uid.is_empty())
+            .ok_or_else(|| {
+                RuntimeError::Kubernetes(format!(
+                    "handler-output-uid-unbound:{}/{}",
+                    resource.kind, resource.name
+                ))
+            })?;
         let api = controller.kube.resource_api(resource)?;
         // The raw `kube::Error` is discarded, not interpolated: an API
         // error body can echo back request/response content, and this
@@ -1277,24 +1319,21 @@ pub(crate) async fn commit_handler_outputs(
                 resource.kind, resource.name
             ))
         })?;
-        let uid = existing
-            .metadata
-            .uid
-            .clone()
-            .filter(|uid| !uid.is_empty())
-            .ok_or_else(|| RuntimeError::Kubernetes("handler output is missing a uid".into()))?;
-        let data: serde_json::Map<String, Value> = if let Some(keys) = written.get(output_id) {
-            keys.iter()
-                .map(|(key, value)| (key.clone(), Value::String(value.clone())))
-                .collect()
-        } else {
-            existing
-                .data
-                .get("data")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default()
-        };
+        if existing.metadata.uid.as_deref() != Some(bound_uid.as_str()) {
+            return Err(RuntimeError::Kubernetes(format!(
+                "handler-output-replaced:{}/{}",
+                resource.kind, resource.name
+            )));
+        }
+        let uid = bound_uid.clone();
+        let data: serde_json::Map<String, Value> = written.get(output_id).map_or_else(
+            || handler_owned_data_keys(&existing, field_manager),
+            |keys| {
+                keys.iter()
+                    .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+                    .collect()
+            },
+        );
         let desired = serde_json::json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
@@ -1332,6 +1371,41 @@ pub(crate) async fn commit_handler_outputs(
         committed_uids.insert(output_id.clone(), applied_uid);
     }
     Ok(committed_uids)
+}
+
+/// The subset of `existing`'s live `data` map that `field_manager`
+/// currently owns, read from `existing`'s own `managedFields` rather than
+/// assumed -- the actual writeOutput contract (see
+/// `docs/reference/IR-CONTRACT.md`): re-applying an output a handler did
+/// not write this invocation re-asserts only the handler's own
+/// previously-written keys, never a foreign field manager's keys, so the
+/// handler never becomes a co-owner of data another writer put there.
+///
+/// Empty (no keys, or no matching `Apply` entry) when the handler has
+/// never written this output before -- there is nothing yet for it to
+/// own.
+fn handler_owned_data_keys(
+    existing: &DynamicObject,
+    field_manager: &str,
+) -> serde_json::Map<String, Value> {
+    let owned_keys: BTreeSet<String> =
+        manager_main_resource_entries(existing, field_manager, "Apply")
+            .into_iter()
+            .filter_map(|entry| entry.fields_v1.as_ref())
+            .filter_map(|fields| fields.0.get("f:data"))
+            .filter_map(Value::as_object)
+            .flat_map(serde_json::Map::keys)
+            .filter_map(|key| key.strip_prefix("f:"))
+            .map(str::to_owned)
+            .collect();
+    let live_data = existing.data.get("data").and_then(Value::as_object);
+    owned_keys
+        .into_iter()
+        .filter_map(|key| {
+            let value = live_data?.get(&key)?.clone();
+            Some((key, value))
+        })
+        .collect()
 }
 
 fn approved_claim<'a>(
@@ -2842,6 +2916,7 @@ mod tests {
                 "flags".to_owned(),
                 BTreeMap::from([("value".to_owned(), "on".to_owned())]),
             );
+            let output_uids = BTreeMap::from([("flags".to_owned(), "flags-uid".to_owned())]);
             let committed = commit_handler_outputs(
                 &controller,
                 &["flags".to_owned()],
@@ -2849,6 +2924,7 @@ mod tests {
                 "apsides-handler-example",
                 &written,
                 "rev-1",
+                &output_uids,
             )
             .await?;
             assert_eq!(
@@ -2889,6 +2965,61 @@ mod tests {
                 .filter(|(method, uri, _)| *method == Method::PATCH && !uri.contains("dryRun"))
                 .count();
             assert_eq!(real_patch_count, 1);
+            Ok(())
+        }
+
+        /// The BLOCKING uid-binding regression test (Phase 5b
+        /// runtime-integration re-review): if the live object's uid no
+        /// longer matches the uid this cycle's own reconciler apply
+        /// observed for it (bound via `output_uids`), the commit MUST
+        /// refuse with `handler-output-replaced` and MUST NOT issue any
+        /// PATCH -- proving the uid precondition is checked against an
+        /// externally-bound value, never re-derived from the very GET
+        /// it's supposed to guard.
+        #[tokio::test]
+        async fn commit_refuses_an_output_replaced_since_the_reconciler_observed_it() -> TestResult
+        {
+            let plan = handler_plan()?;
+            let policy = policy(&plan);
+            let activation = handler_activation(&plan, &policy, &["flags"])?;
+            // The live object now has a different uid than the reconciler's
+            // own apply observed earlier this cycle -- as if it was deleted
+            // and recreated under the same name while the handler ran.
+            let existing_flags = json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"flags","namespace":"workload","uid":"flags-uid-replaced","resourceVersion":"1"},
+                "data":{},
+            });
+            let (client, calls) = wire(vec![existing_flags]);
+            let controller = controller(&plan, &activation, client)?;
+            let mut written: crate::handlers::BufferedWrites = BTreeMap::new();
+            written.insert(
+                "flags".to_owned(),
+                BTreeMap::from([("value".to_owned(), "on".to_owned())]),
+            );
+            let output_uids = BTreeMap::from([("flags".to_owned(), "flags-uid".to_owned())]);
+            let outcome = commit_handler_outputs(
+                &controller,
+                &["flags".to_owned()],
+                &outputs_by_id(&plan),
+                "apsides-handler-example",
+                &written,
+                "rev-1",
+                &output_uids,
+            )
+            .await;
+            let Err(error) = outcome else {
+                return Err("a replaced output must refuse the commit".into());
+            };
+            assert!(
+                error.to_string().contains("handler-output-replaced"),
+                "unexpected error: {error}"
+            );
+            let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
+            assert!(
+                calls.iter().all(|(method, _, _)| *method != Method::PATCH),
+                "a replaced output must never be written to"
+            );
             Ok(())
         }
 
@@ -2935,10 +3066,22 @@ mod tests {
             });
             let existing_b = json!({
                 "apiVersion":"v1","kind":"ConfigMap",
-                "metadata":{"name":"flags-b","namespace":"workload","uid":"flags-b-uid","resourceVersion":"9"},
+                "metadata":{"name":"flags-b","namespace":"workload","uid":"flags-b-uid","resourceVersion":"9",
+                    "annotations":{"apsides.dev/handler-input-revision":"rev-0"},
+                    "managedFields":[{"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:data":{"f:previous":{}},"f:metadata":{"f:annotations":{}}},"manager":"apsides-handler-example","operation":"Apply"}]},
                 "data":{"previous":"kept-value"},
             });
-            let projected_b = existing_b.clone();
+            // The dry-run projection reflects the new revision annotation
+            // ("rev-1") even though `data` is unchanged, so the commit
+            // cannot early-exit on "nothing changed" here -- it still owes
+            // flags-b a real PATCH to stamp the new revision.
+            let projected_b = json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"flags-b","namespace":"workload","uid":"flags-b-uid","resourceVersion":"9",
+                    "annotations":{"apsides.dev/handler-input-revision":"rev-1"},
+                    "managedFields":[{"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:data":{"f:previous":{}},"f:metadata":{"f:annotations":{}}},"manager":"apsides-handler-example","operation":"Apply"}]},
+                "data":{"previous":"kept-value"},
+            });
             let applied_b = json!({
                 "apiVersion":"v1","kind":"ConfigMap",
                 "metadata":{"name":"flags-b","namespace":"workload","uid":"flags-b-uid","resourceVersion":"10",
@@ -2964,6 +3107,10 @@ mod tests {
                 BTreeMap::from([("value".to_owned(), "written".to_owned())]),
             );
             // "flags-b" is declared but deliberately absent from `written`.
+            let output_uids = BTreeMap::from([
+                ("flags-a".to_owned(), "flags-a-uid".to_owned()),
+                ("flags-b".to_owned(), "flags-b-uid".to_owned()),
+            ]);
             let committed = commit_handler_outputs(
                 &controller,
                 &["flags-a".to_owned(), "flags-b".to_owned()],
@@ -2971,6 +3118,7 @@ mod tests {
                 "apsides-handler-example",
                 &written,
                 "rev-1",
+                &output_uids,
             )
             .await?;
             assert_eq!(committed.len(), 2);
