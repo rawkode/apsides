@@ -8,6 +8,9 @@ mod rollout;
 mod schema;
 mod semantic;
 mod surface;
+mod surface_diff;
+mod surface_diff_markdown;
+mod surface_policy;
 mod test_plan;
 mod validate;
 
@@ -25,6 +28,16 @@ pub use surface::{
     SURFACE_SCHEMA, Surface, SurfaceDomain, SurfaceImage, SurfaceInput, SurfaceKubernetes,
     SurfacePermission, SurfaceReaction, SurfaceResource, SurfaceSecretRead, SurfaceVerb,
     derive_surface,
+};
+pub use surface_diff::{
+    DomainChange, ImageChange, ImagesDiff, InputChange, InputsDiff, KubernetesChange,
+    PermissionChange, PermissionVerbChange, PermissionsDiff, ReactionsDiff, ResourceChange,
+    ResourcesDiff, SURFACE_DIFF_SCHEMA, SecretsReadDiff, StringSetDiff, SurfaceDiff, ValueChange,
+    diff_surfaces,
+};
+pub use surface_diff_markdown::render_markdown;
+pub use surface_policy::{
+    PolicyRule, SURFACE_POLICY_SCHEMA, SurfacePolicy, evaluate_policy, parse_policy,
 };
 pub use validate::{validate, validate_ceiling};
 

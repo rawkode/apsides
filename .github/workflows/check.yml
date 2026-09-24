@@ -49,6 +49,8 @@ jobs:
           cuenv task authorCompilerCheck
       - name: Check CNPG editor completion
         run: cuenv task authoringEditorCheck
+      - name: Check aps diff against the CNPG examples
+        run: cuenv task surfaceDiffCheck
       - name: Run Rust tests
         run: |
           cuenv task registryTest

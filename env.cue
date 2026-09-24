@@ -33,6 +33,15 @@ tasks: {
 		command: "deno"
 		args: ["run", "--allow-all", "packages/compiler/src/crds.ts", "https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_clusters.yaml", "Cluster", "examples/cnpg/.aps/crds/cnpg.ts", "v1"]
 	}
+	// Compiles the CNPG initial and upgraded examples and exercises `aps
+	// diff` between them: a clean diff (no policy) exits 0, and a policy
+	// requiring `permissions.added` exits 1. Needs network to fetch the
+	// pinned CNPG CRD (see scripts/surface_diff_check.sh).
+	surfaceDiffCheck: {
+		dependsOn: [build, install]
+		command: "sh"
+		args: ["scripts/surface_diff_check.sh", "work/surface-diff-check"]
+	}
 	releaseTest: {command: "cargo", args: ["test", "--locked", "-p", "release"]}
 	releaseCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "release", "--all-targets", "--", "-D", "warnings"]}
 	coordinationTest: {command: "cargo", args: ["test", "--locked", "-p", "coordination"]}

@@ -12,6 +12,7 @@ const pages = [
   ["guides/typescript-authoring.md", "guides/typescript-authoring.md"],
   ["guides/build-and-deploy.md", "guides/build-and-deploy.md"],
   ["guides/custom-resources.md", "guides/custom-resources.md"],
+  ["guides/surface-diff.md", "guides/surface-diff.md"],
   ["reference/index.md", "reference/index.md"],
 ];
 
