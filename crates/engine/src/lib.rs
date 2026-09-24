@@ -42,9 +42,16 @@
 
 mod net;
 mod ops;
+#[cfg(feature = "test-util")]
+pub mod test_support;
 mod v8_alloc;
 
-pub use net::EgressResolver;
+pub use net::{EgressResolver, ResolveError, resolver_config_from_resolv_conf};
+/// Mirrored by `compiler_core::HANDLER_FETCH_REQUEST_BODY_BYTES` for the
+/// controller-pod memory formula -- see that constant's doc comment. A
+/// cross-crate test in `runtime` (which depends on both crates) asserts
+/// the two stay equal.
+pub use ops::MAX_FETCH_REQUEST_BODY_BYTES;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -456,6 +463,24 @@ const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
         body: outcome.body,
       };
     },
+    /**
+     * Writes `key` of declared output `id`. `data` must be a `string` or a
+     * `Uint8Array` of **valid UTF-8 text** -- the value lands in the output
+     * ConfigMap's `data` field (never `binaryData`), and Kubernetes
+     * ConfigMap `data` values are themselves required to be UTF-8, so a
+     * `data` argument that is not valid UTF-8 throws synchronously here,
+     * before anything is buffered or written. Buffered in memory for the
+     * rest of this invocation and committed to Kubernetes only after the
+     * handler returns successfully, as one server-side apply per declared
+     * output containing that output's complete data map (see
+     * IR-CONTRACT.md, "Handlers and outputs").
+     * @param {string} id a declared output id
+     * @param {string} key `[-._a-zA-Z0-9]+`, at most 253 characters, never
+     *   exactly `.` or `..`
+     * @param {string | Uint8Array} data valid UTF-8 text
+     * @throws {Error} `OUTPUT_UNDECLARED`, `INVALID_KEY`, `OUTPUT_TOO_LARGE`,
+     *   or if `data` is not valid UTF-8
+     */
     writeOutput: (id, key, data) => {
       const outcome = opOutputWrite(id, key, toBytes(data));
       throwIfError(outcome);
@@ -1089,17 +1114,20 @@ fn handler_module_specifier() -> Result<ModuleSpecifier, EngineError> {
     ModuleSpecifier::parse("file:///apsides-engine/handler.js").map_err(EngineError::Specifier)
 }
 
-/// Bytes of heap-limit headroom granted per call by
-/// [`install_heap_limit_callback`], up to [`HEAP_LIMIT_TERMINATION_HEADROOM_TOTAL_CAP_BYTES`]
-/// in total.
-const HEAP_LIMIT_TERMINATION_HEADROOM_STEP_BYTES: usize = 8 * 1024 * 1024;
+/// Bytes of heap-limit headroom granted per call.
+///
+/// Granted by [`install_heap_limit_callback`], up to
+/// [`HEAP_LIMIT_TERMINATION_HEADROOM_TOTAL_CAP_BYTES`] in total.
+pub const HEAP_LIMIT_TERMINATION_HEADROOM_STEP_BYTES: usize = 8 * 1024 * 1024;
 
-/// Hard total cap on cumulative headroom [`install_heap_limit_callback`]
-/// will ever grant one isolate, across every call. Bounds how long
-/// termination can be deferred while still giving V8 a few chances (not
-/// just one) to unwind cleanly; see that function's doc comment for why one
-/// grant was found, in review, not always to be enough.
-const HEAP_LIMIT_TERMINATION_HEADROOM_TOTAL_CAP_BYTES: usize =
+/// Hard total cap on cumulative heap-limit-termination headroom.
+///
+/// [`install_heap_limit_callback`] will ever grant one isolate, across
+/// every call. Bounds how long termination can be deferred while still
+/// giving V8 a few chances (not just one) to unwind cleanly; see that
+/// function's doc comment for why one grant was found, in review, not
+/// always to be enough.
+pub const HEAP_LIMIT_TERMINATION_HEADROOM_TOTAL_CAP_BYTES: usize =
     4 * HEAP_LIMIT_TERMINATION_HEADROOM_STEP_BYTES;
 
 /// Installs the near-heap-limit callback that terminates `runtime`'s

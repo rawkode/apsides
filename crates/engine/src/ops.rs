@@ -25,6 +25,7 @@ use std::time::Instant;
 
 use deno_core::OpState;
 use deno_core::{JsBuffer, ToJsBuffer, op2};
+use hickory_resolver::TokioResolver;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -49,6 +50,15 @@ pub(crate) struct EngineOpState {
     pub outputs_written: HashMap<String, HashMap<String, usize>>,
     pub sink: Arc<dyn OutputSink>,
     pub resolver: Option<Arc<EgressResolver>>,
+    /// The real `TokioResolver` [`resolver`](Self::resolver)'s config
+    /// builds, lazily, the first time this invocation actually needs to
+    /// resolve a host -- see `EgressResolver`'s doc comment on why this
+    /// crate never builds one before that point, and never reuses one
+    /// across invocations. `None` until the first `apsides.fetch` call
+    /// that needs real DNS resolution; built once per invocation and
+    /// reused for every later call within the *same* invocation (still the
+    /// same runtime the whole time).
+    pub built_resolver: Option<TokioResolver>,
     /// Absolute deadline for the whole invocation (`Instant::now() +
     /// Limits::timeout` at invocation start), forwarded to DNS resolution
     /// and `net::FetchLimits::deadline` so a fetch's own "total time <=
@@ -121,7 +131,7 @@ const MAX_LOG_LINE_BYTES: usize = 4 * 1024;
 /// See the plan's `op_apsides_log` rule.
 const MAX_LOG_LINES: usize = 64;
 /// See the plan's `op_apsides_fetch` rule.
-const MAX_FETCH_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+pub const MAX_FETCH_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 /// See the plan's `op_apsides_fetch` rule.
 const MAX_FETCH_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// Output key length cap (review round 5, B7).
@@ -623,20 +633,42 @@ async fn fetch(
 
     let body_len = body.len();
 
-    // Read-only snapshot: `closed`, plus the policy/deadline/resolver this
-    // call needs for URL/host validation and (later) DNS resolution.
-    // Deliberately reserves nothing yet.
-    let (egress, deadline, resolver) = {
+    // Read-only snapshot: `closed`, plus the policy/deadline this call
+    // needs for URL/host validation. Deliberately reserves nothing yet.
+    // The resolver itself is handled separately below (lazily built, then
+    // cloned out) -- see `EgressResolver`'s doc comment on why it cannot be
+    // built once and reused across invocations.
+    let (egress, deadline) = {
         let mut state_ref = state.borrow_mut();
         let engine_state = state_ref.borrow_mut::<EngineOpState>();
         if engine_state.closed {
             return Err(FetchError::OpsClosed);
         }
-        (
-            engine_state.egress.clone(),
-            engine_state.deadline,
-            engine_state.resolver.clone(),
-        )
+        (engine_state.egress.clone(), engine_state.deadline)
+    };
+
+    // Lazily build this invocation's own `TokioResolver`, on this
+    // invocation's own current tokio runtime, the first time any call
+    // within it actually needs real DNS resolution -- never once up front,
+    // never shared with any other invocation. Cloning a `TokioResolver` out
+    // (it wraps `Arc`-shared internals; see `hickory_resolver::Resolver`'s
+    // own `#[derive(Clone)]`) lets this scope end, and the `RefCell`
+    // borrow with it, before the `.await` below -- holding a `RefCell`
+    // borrow across an `.await` point risks a panic if another op call
+    // interleaves on the same single-threaded isolate.
+    let resolver = {
+        let mut state_ref = state.borrow_mut();
+        let engine_state = state_ref.borrow_mut::<EngineOpState>();
+        if engine_state.closed {
+            return Err(FetchError::OpsClosed);
+        }
+        if engine_state.built_resolver.is_none()
+            && let Some(handle) = engine_state.resolver.clone()
+        {
+            let built = handle.build().map_err(FetchError::DnsResolutionFailed)?;
+            engine_state.built_resolver = Some(built);
+        }
+        engine_state.built_resolver.clone()
     };
 
     let parsed = deno_core::url::Url::parse(&request.url)
@@ -712,7 +744,7 @@ async fn fetch(
     let candidates = net::resolve_host(
         &host,
         egress.resolver_override.as_ref(),
-        resolver.as_deref(),
+        resolver.as_ref(),
         deadline,
     )
     .await?;
@@ -825,6 +857,7 @@ deno_core::extension!(
             outputs_written: HashMap::new(),
             sink: options.sink,
             resolver: options.resolver,
+            built_resolver: None,
             deadline: options.fetch_budget.deadline,
             max_fetch_bytes_total: options.fetch_budget.max_fetch_bytes_total,
             fetch_bytes_reserved: 0,

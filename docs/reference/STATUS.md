@@ -34,8 +34,17 @@ establish narrower properties.
 - Complete builds produce a Linux controller binary, OCI archive, SBOM, compiler
   closure, build-input record, and integrity manifest.
 - The native controller reconciles its fixed resource set through conditional
-  Server-Side Apply. It has no JavaScript evaluator and cannot expand its
-  approved scope.
+  Server-Side Apply. It cannot expand its approved scope.
+- Declared handlers run as bundled TypeScript, one fresh V8 isolate per
+  invocation, in the `engine` crate embedded by `runtime` (dependency chain
+  `cli` → `test-cluster` → `runtime` → `engine`). At most one invocation
+  dispatches per reconcile cycle, at global concurrency 1; `apsides.fetch` is
+  restricted to declared HTTPS egress hosts resolved through a dedicated
+  DNS resolver (never glibc `getaddrinfo`/`/etc/resolv.conf`); handler
+  output writes are buffered in memory for the invocation and committed as
+  one server-side apply per declared output, under field manager
+  `apsides-handler-<domainId>`, through the same authority/claim re-check
+  reconciler mutations use.
 - Protected platform policy can supply registry Secret references for controller
   and proxy image pulls, without granting runtime Secret access. References bind
   to the policy and staged Pod templates; credentials remain platform-owned.

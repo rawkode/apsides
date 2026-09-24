@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+mod handler_budgets;
 mod json;
 mod kubernetes_version;
 mod model;
@@ -14,6 +15,12 @@ mod surface_policy;
 mod test_plan;
 mod validate;
 
+pub use handler_budgets::{
+    HANDLER_ARRAY_BUFFER_CAP_BYTES, HANDLER_FETCH_BUDGET_TOTAL_BYTES,
+    HANDLER_FETCH_REQUEST_BODY_BYTES, HANDLER_HEAP_HEADROOM_TOTAL_BYTES,
+    HANDLER_MAX_CONCURRENT_FETCHES, POD_MEMORY_BASELINE_BYTES, POD_MEMORY_SLACK_BYTES,
+    array_buffer_cap_bytes, controller_memory_limit_bytes,
+};
 pub use json::{canonical_bytes, digest, parse_strict};
 pub use kubernetes_version::{
     QUALIFIED_FLOOR as KUBERNETES_QUALIFIED_FLOOR, is_supported_min_version, parse_min_version,

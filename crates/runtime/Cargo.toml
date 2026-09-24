@@ -37,3 +37,7 @@ workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# `engine::test_support::HttpsFixtureServer` -- see the Apsides v0.3 plan,
+# Phase 5b review item 4's two-invocation `EgressResolver` runtime-affinity
+# test in `handlers.rs`.
+engine = { path = "../engine", features = ["test-util"] }

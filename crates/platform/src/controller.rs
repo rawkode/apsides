@@ -487,20 +487,19 @@ fn startup_config(binding: &RuntimeBinding, control_namespace: &str) -> Value {
     json!({"mode":"production","apiAccess":"proxy","controlNamespace":control_namespace,"binding":binding,"pollIntervalMillis":1_000,"baseBackoffMillis":500,"maxBackoffMillis":30_000,"minMutationIntervalMillis":100,"diagnosticsBind":"0.0.0.0:8080"})
 }
 
-/// The controller pod's memory limit, as a whole `"<N>Mi"` quantity: a fixed
-/// 256Mi reconciler/runtime baseline, plus the largest `maxHeapBytes` any one
-/// declared handler needs (0 for a domain with no handlers), plus a fixed
-/// 32Mi allowance for the V8 platform/isolate bookkeeping and the bundle(s)
-/// embedded alongside it. `max_handler_heap_bytes` is a *ceiling* (handlers
-/// run one at a time, one isolate per invocation -- see the Apsides v0.3
-/// plan, Phase 5b), not a sum over every declared handler, so this scales
-/// with the domain's single largest handler, never with how many it has.
+/// The controller pod's memory limit, as a whole `"<N>Mi"` quantity, from
+/// `compiler_core::controller_memory_limit_bytes` -- the single shared
+/// formula `runtime` (`engine::Limits`) and this function both derive from,
+/// so the two cannot drift apart. See the Apsides v0.3 plan, Phase 5b
+/// review item C, and that function's doc comment for the formula itself.
+/// `max_handler_heap_bytes` is a *ceiling* (handlers run one at a time, one
+/// isolate per invocation), not a sum over every declared handler, so this
+/// scales with the domain's single largest handler, never with how many it
+/// has.
 fn controller_memory_limit_mi(binding: &RuntimeBinding) -> String {
-    const BASELINE_MI: u64 = 256;
-    const ENGINE_OVERHEAD_MI: u64 = 32;
     const BYTES_PER_MI: u64 = 1024 * 1024;
-    let handler_mi = binding.max_handler_heap_bytes.div_ceil(BYTES_PER_MI);
-    format!("{}Mi", BASELINE_MI + handler_mi + ENGINE_OVERHEAD_MI)
+    let bytes = compiler_core::controller_memory_limit_bytes(binding.max_handler_heap_bytes);
+    format!("{}Mi", bytes.div_ceil(BYTES_PER_MI))
 }
 
 fn controller_deployment(

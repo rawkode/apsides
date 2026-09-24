@@ -51,6 +51,10 @@ pub enum ApiAccess {
 const PROXY_CA_PATH: &str = "/etc/apsides/proxy/ca.crt";
 const PROXY_CERT_PATH: &str = "/etc/apsides/proxy/tls.crt";
 const PROXY_KEY_PATH: &str = "/etc/apsides/proxy/tls.key";
+/// Read once, at `HandlerRuntime` construction, only when some declared
+/// handler has egress hosts -- see the Apsides v0.3 plan, Phase 5b review
+/// item 3.
+const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 
 /// Explicit production startup data. None of these values grants authority;
 /// protected platform records must independently match the binding.
@@ -280,7 +284,7 @@ impl Diagnostics {
     }
 }
 
-struct ProductionController {
+pub(crate) struct ProductionController {
     plan: CompiledPlan,
     config: ProductionConfig,
     kube: KubeRuntimeClient,
@@ -388,14 +392,30 @@ async fn run_production_with_client(
     let handler_runtime = if plan.ir.handlers.is_empty() {
         None
     } else {
+        // Only read `/etc/resolv.conf` when some declared handler actually
+        // has egress hosts -- see the Apsides v0.3 plan, Phase 5b review
+        // item 3; `HandlerRuntime::new` itself never reads the file, only
+        // parses contents it is handed (so Phase 5c can read it before a
+        // Landlock lockdown and pass the bytes in here instead).
+        let resolv_conf_contents = if plan
+            .ir
+            .handlers
+            .iter()
+            .any(|handler| !handler.egress.is_empty())
+        {
+            Some(std::fs::read_to_string(RESOLV_CONF_PATH).map_err(|error| {
+                RuntimeError::Configuration(format!("failed to read {RESOLV_CONF_PATH}: {error}"))
+            })?)
+        } else {
+            None
+        };
         let mut runtime = crate::handlers::HandlerRuntime::new(
             plan,
             handlers,
-            client.clone(),
             crate::handlers::handler_field_manager(&plan.ir.domain.id),
-            Duration::from_millis(config.min_mutation_interval_millis),
             Duration::from_millis(config.base_backoff_millis),
             Duration::from_millis(config.max_backoff_millis),
+            resolv_conf_contents.as_deref(),
         )?;
         runtime.seed_from_annotations(plan, &client).await;
         Some(Mutex::new(runtime))
@@ -453,6 +473,15 @@ fn validate_production_config(
 }
 
 impl ProductionController {
+    /// Whether shutdown has been requested -- checked by
+    /// `handlers::HandlerRuntime` (which does not otherwise touch this
+    /// struct's fields) immediately before dispatching a handler
+    /// invocation, so a shutdown in progress never starts a new one (see
+    /// the Apsides v0.3 plan, Phase 5b review item E).
+    pub(crate) fn is_terminating(&self) -> bool {
+        self.terminating.load(Ordering::Acquire)
+    }
+
     async fn run(&self, mut shutdown: watch::Receiver<bool>) -> Result<(), RuntimeError> {
         let mut attempt = 0_u32;
         let mut last_reason: Option<String> = None;
@@ -714,11 +743,10 @@ impl ProductionController {
         let current = crate::collect_observations(&self.plan, &applied, &self.kube).await?;
         if let Some(handler_runtime) = &self.handler_runtime {
             let mut handler_runtime = handler_runtime.lock().await;
-            conditions.extend(
-                handler_runtime
-                    .run_cycle(&self.plan, &current, &applied)
-                    .await,
-            );
+            let new_conditions = handler_runtime
+                .run_cycle(&self.plan, &current, &applied, &self.kube.client, self)
+                .await?;
+            conditions.extend(new_conditions);
         }
         for resource in self
             .plan
@@ -1006,6 +1034,7 @@ async fn apply_preflight_result(
         approved,
         expected_uid,
         existing,
+        &controller.kube.field_manager,
     )
     .await?;
     Ok((object, false))
@@ -1063,6 +1092,26 @@ async fn apply_absent_claimed(
     Ok(created)
 }
 
+/// The authority/claim re-check reconciler mutations use before their real
+/// (non-dry-run) SSA write: re-verify the activation, and confirm the
+/// claim this write was approved under has not changed since. Generalized
+/// over `field_manager` (rather than always using
+/// `controller.kube.field_manager`) so `commit_handler_outputs` can reuse
+/// this exact path, under the distinct `apsides-handler-<domainId>`
+/// manager, instead of duplicating it -- see the Apsides v0.3 plan, Phase
+/// 5b review item E.
+///
+/// `last_successful_apply`'s cache-skip is keyed only by resource identity,
+/// not by `field_manager`, so a resource written by two different managers
+/// (a handler output: metadata by the reconciler, `data` by the handler)
+/// shares one cache slot -- interleaving between the two managers just
+/// occasionally misses the early-exit and falls through to an extra
+/// dry-run round-trip; `already_owned`/the dry-run-vs-existing comparison
+/// below are both scoped to `field_manager` and stay correct regardless.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct, independently-owned piece of one write's identity/claim/precondition state; bundling them into a struct would only move the same field list one level up"
+)]
 async fn apply_existing_claimed(
     controller: &ProductionController,
     api: &kube::Api<DynamicObject>,
@@ -1071,6 +1120,7 @@ async fn apply_existing_claimed(
     approved: &ApprovedClaim,
     expected_uid: &str,
     existing: DynamicObject,
+    field_manager: &str,
 ) -> Result<DynamicObject, RuntimeError> {
     if existing.metadata.name.as_deref() != Some(resource.name.as_str())
         || existing.metadata.namespace.as_deref() != Some(resource.namespace.as_str())
@@ -1092,13 +1142,8 @@ async fn apply_existing_claimed(
                 resource.kind, resource.name
             ))
         })?;
-    let already_owned = validate_exact_apply_owner(
-        &existing,
-        resource,
-        &controller.kube.field_manager,
-        "claim preflight",
-    )
-    .is_ok();
+    let already_owned =
+        validate_exact_apply_owner(&existing, resource, field_manager, "claim preflight").is_ok();
     if already_owned
         && controller
             .successful_apply_is_current(resource, desired, &existing)
@@ -1110,7 +1155,7 @@ async fn apply_existing_claimed(
         desired,
         &resource.name,
         &resource.namespace,
-        &controller.kube.field_manager,
+        field_manager,
         resource.force,
         ApplyPrecondition::Existing {
             uid: expected_uid,
@@ -1145,17 +1190,148 @@ async fn apply_existing_claimed(
             resource.kind, resource.name
         )));
     }
-    validate_exact_apply_owner(
-        &applied,
-        resource,
-        &controller.kube.field_manager,
-        "conditional claim SSA",
-    )?;
+    validate_exact_apply_owner(&applied, resource, field_manager, "conditional claim SSA")?;
     controller
         .diagnostics
         .mutations
         .fetch_add(1, Ordering::Relaxed);
     Ok(applied)
+}
+
+/// Commits one successful handler invocation's buffered output writes.
+///
+/// One server-side apply per output the handler *declared*
+/// (`handler_outputs`, not just the ones it actually wrote this
+/// invocation), each containing that output's *complete* `data` map plus
+/// the `apsides.dev/handler-input-revision` annotation -- see the Apsides
+/// v0.3 plan, Phase 5b review item 1. An output the handler wrote this
+/// invocation gets exactly the keys `written` holds for it; an output it
+/// did **not** write is left untouched *and* re-applied with its own
+/// current live `data` unchanged, so the annotation stamp never drops data
+/// a previous invocation already wrote there.
+///
+/// Every commit goes through [`apply_existing_claimed`] -- the SAME
+/// authority/claim re-check reconciler mutations use -- under
+/// `field_manager` (`apsides-handler-<domainId>`, distinct from the
+/// reconciler's own manager), so a handler commit can never bypass that
+/// re-check (review item E; "reuse that path, don't duplicate it").
+/// `controller.is_terminating()` is checked before each output's commit,
+/// not just once for the whole batch, so a shutdown mid-commit stops as
+/// early as possible.
+///
+/// If any output's commit fails, the whole invocation counts as failed
+/// (the caller does not advance `known_revision` or clear backoff) --
+/// outputs already committed earlier in this same call keep whatever they
+/// were just given, rather than being rolled back. That does not leave a
+/// silently-inconsistent "done" state: every declared output must record
+/// the *same* revision for the handler to ever be treated as up to date
+/// again (`HandlerRuntime::seed_from_annotations`/`outputs_still_agree`),
+/// so a partial commit here always shows up as "must re-run", not as
+/// success.
+///
+/// Returns the committed `uid` of every output actually committed, keyed
+/// by output id, for the caller to refresh `HandlerState::output_uids`.
+///
+/// # Errors
+///
+/// Returns `Err` if an output id is undeclared, has no backing resource,
+/// has no approved claim, or if any step of its commit fails --
+/// including `RuntimeError::Terminating` if shutdown was requested.
+pub(crate) async fn commit_handler_outputs(
+    controller: &ProductionController,
+    handler_outputs: &[String],
+    outputs_by_id: &BTreeMap<String, compiler_core::Output>,
+    field_manager: &str,
+    written: &crate::handlers::BufferedWrites,
+    revision: &str,
+) -> Result<BTreeMap<String, String>, RuntimeError> {
+    let mut committed_uids = BTreeMap::new();
+    for output_id in handler_outputs {
+        if controller.terminating.load(Ordering::Acquire) {
+            return Err(RuntimeError::Terminating);
+        }
+        let output = outputs_by_id.get(output_id).ok_or_else(|| {
+            RuntimeError::Plan(format!("undeclared handler output id {output_id:?}"))
+        })?;
+        let resource = controller
+            .plan
+            .ir
+            .resources
+            .iter()
+            .find(|resource| resource.id == *output_id)
+            .ok_or_else(|| {
+                RuntimeError::Plan(format!(
+                    "no backing resource for handler output {output_id:?}"
+                ))
+            })?;
+        let api = controller.kube.resource_api(resource)?;
+        // The raw `kube::Error` is discarded, not interpolated: an API
+        // error body can echo back request/response content, and this
+        // reason ends up in the world-readable diagnostics conditions
+        // list -- the same discipline `write_api_error` and the
+        // reconciler's own ownership-preflight GET/LIST calls already
+        // apply to every other Kubernetes error this crate surfaces.
+        let existing = api.get(&output.name).await.map_err(|_error| {
+            RuntimeError::Kubernetes(format!(
+                "handler-output-read-failed:{}/{}",
+                resource.kind, resource.name
+            ))
+        })?;
+        let uid = existing
+            .metadata
+            .uid
+            .clone()
+            .filter(|uid| !uid.is_empty())
+            .ok_or_else(|| RuntimeError::Kubernetes("handler output is missing a uid".into()))?;
+        let data: serde_json::Map<String, Value> = if let Some(keys) = written.get(output_id) {
+            keys.iter()
+                .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+                .collect()
+        } else {
+            existing
+                .data
+                .get("data")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let desired = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": output.name,
+                "namespace": output.namespace,
+                "annotations": {
+                    crate::handlers::HANDLER_INPUT_REVISION_ANNOTATION: revision,
+                },
+            },
+            "data": Value::Object(data),
+        });
+        let initial = controller.authority.verify(&controller.plan).await?;
+        let approved = approved_claim(&initial, resource)?.clone();
+        let applied = apply_existing_claimed(
+            controller,
+            &api,
+            resource,
+            &desired,
+            &approved,
+            &uid,
+            existing,
+            field_manager,
+        )
+        .await?;
+        controller
+            .remember_successful_apply(resource, &desired, &applied)
+            .await?;
+        let applied_uid = applied
+            .metadata
+            .uid
+            .clone()
+            .filter(|uid| !uid.is_empty())
+            .unwrap_or(uid);
+        committed_uids.insert(output_id.clone(), applied_uid);
+    }
+    Ok(committed_uids)
 }
 
 fn approved_claim<'a>(
@@ -2489,5 +2665,344 @@ mod tests {
             3
         );
         Ok(())
+    }
+
+    /// Phase 5b review items 1 and E: `commit_handler_outputs` is the fix
+    /// for "the SSA writes delete each other" (each declared output gets
+    /// exactly one server-side apply, carrying its complete `data` map),
+    /// and it must go through the exact same authority/claim re-check
+    /// (`apply_existing_claimed`) reconciler mutations use.
+    mod handler_commit {
+        use super::*;
+
+        fn handler_plan() -> TestResult<CompiledPlan> {
+            Ok(parse_and_validate(&json!({
+                "schemaVersion":"apsides.dev/ir/v2", "testOnly":false,
+                "domain":{"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound","minKubernetesVersion":"1.34","budgets":{"maxResources":8,"maxInputs":8,"maxReactions":8,"maxObjectBytes":262_144,"maxQueueDepth":8,"maxConcurrentRequests":2}},
+                "resources":[{
+                    "id":"flags","apiVersion":"v1","kind":"ConfigMap","name":"flags","namespace":"workload",
+                    "handlerOutput":true,
+                    "desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"flags","namespace":"workload","labels":{"apsides.dev/handler-output":"flags"}}},
+                    "lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"program.ts","line":1,"column":1}
+                }],
+                "inputs":[
+                    {"id":"settings","apiVersion":"v1","kind":"ConfigMap","name":"settings","namespace":"workload","mode":"observed","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}},
+                    {"id":"flags-output","apiVersion":"v1","kind":"ConfigMap","name":"flags","namespace":"workload","mode":"output","managedResourceId":"flags","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}}
+                ],
+                "reactions":[],
+                "handlers":[{
+                    "id":"sync-flags","module":"handlers/sync-flags.ts","export":"syncFlags",
+                    "trigger":{"kind":"input-changed","input":"settings"},
+                    "inputs":["settings"],"egress":[],"outputs":["flags"],
+                    "timeoutMillis":5_000,"maxHeapBytes":8_388_608,
+                    "bundleSha256": "0".repeat(64),"source":{"file":"program.ts","line":1,"column":1}
+                }],
+                "outputs":[{"id":"flags","name":"flags","namespace":"workload"}],
+                "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.ts","sha256":"0".repeat(64)},{"path":"handlers/sync-flags.ts","sha256":"1".repeat(64)}]}
+            }).to_string())?)
+        }
+
+        /// Two declared outputs, `flags-a`/`flags-b`, on the same handler --
+        /// for the "untouched output keeps its own data" test.
+        fn handler_plan_two_outputs() -> TestResult<CompiledPlan> {
+            Ok(parse_and_validate(&json!({
+                "schemaVersion":"apsides.dev/ir/v2", "testOnly":false,
+                "domain":{"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound","minKubernetesVersion":"1.34","budgets":{"maxResources":8,"maxInputs":8,"maxReactions":8,"maxObjectBytes":262_144,"maxQueueDepth":8,"maxConcurrentRequests":2}},
+                "resources":[
+                    {"id":"flags-a","apiVersion":"v1","kind":"ConfigMap","name":"flags-a","namespace":"workload","handlerOutput":true,
+                     "desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"flags-a","namespace":"workload","labels":{"apsides.dev/handler-output":"flags-a"}}},
+                     "lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"program.ts","line":1,"column":1}},
+                    {"id":"flags-b","apiVersion":"v1","kind":"ConfigMap","name":"flags-b","namespace":"workload","handlerOutput":true,
+                     "desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"flags-b","namespace":"workload","labels":{"apsides.dev/handler-output":"flags-b"}}},
+                     "lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"program.ts","line":1,"column":1}}
+                ],
+                "inputs":[
+                    {"id":"settings","apiVersion":"v1","kind":"ConfigMap","name":"settings","namespace":"workload","mode":"observed","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}},
+                    {"id":"flags-a-output","apiVersion":"v1","kind":"ConfigMap","name":"flags-a","namespace":"workload","mode":"output","managedResourceId":"flags-a","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}},
+                    {"id":"flags-b-output","apiVersion":"v1","kind":"ConfigMap","name":"flags-b","namespace":"workload","mode":"output","managedResourceId":"flags-b","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}}
+                ],
+                "reactions":[],
+                "handlers":[{
+                    "id":"sync-flags","module":"handlers/sync-flags.ts","export":"syncFlags",
+                    "trigger":{"kind":"input-changed","input":"settings"},
+                    "inputs":["settings"],"egress":[],"outputs":["flags-a","flags-b"],
+                    "timeoutMillis":5_000,"maxHeapBytes":8_388_608,
+                    "bundleSha256": "0".repeat(64),"source":{"file":"program.ts","line":1,"column":1}
+                }],
+                "outputs":[{"id":"flags-a","name":"flags-a","namespace":"workload"},{"id":"flags-b","name":"flags-b","namespace":"workload"}],
+                "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.ts","sha256":"0".repeat(64)},{"path":"handlers/sync-flags.ts","sha256":"1".repeat(64)}]}
+            }).to_string())?)
+        }
+
+        fn handler_activation(
+            plan: &CompiledPlan,
+            policy: &PolicyState,
+            output_names: &[&str],
+        ) -> TestResult<ActivationState> {
+            let approved_claims = output_names
+                .iter()
+                .map(|name| ApprovedClaim {
+                    claim: ProtectedClaim {
+                        identity: ResourceIdentity {
+                            api_group: String::new(),
+                            resource: "configmaps".into(),
+                            namespace: "workload".into(),
+                            name: (*name).to_owned(),
+                        },
+                        domain_id: "example".into(),
+                        generation_id: "generation-a".into(),
+                        transition_id: "transition-a".into(),
+                        state: ClaimState::Active,
+                        uid: Some(format!("{name}-uid")),
+                    },
+                    deletion_policy: compiler_core::DeletionPolicy::Orphan,
+                    allow_create: false,
+                })
+                .collect();
+            Ok(ActivationState {
+                schema_version: SCHEMA_VERSION.into(),
+                binding: RuntimeBinding {
+                    domain_id: "example".into(),
+                    cluster_binding: "cluster-a".into(),
+                    generation_id: "generation-a".into(),
+                    build_digest: format!("sha256:{}", "a".repeat(64)),
+                    ir_digest: plan.ir_digest.clone(),
+                    policy_digest: digest(policy)?,
+                    capability_digest: digest(&plan.capabilities)?,
+                    service_account_name: "apsides-example-generation-a".into(),
+                    controller_image: format!(
+                        "example.invalid/controller@sha256:{}",
+                        "b".repeat(64)
+                    ),
+                    max_handler_heap_bytes: 8 * 1024 * 1024,
+                },
+                status: ActivationStatus::Active,
+                approved_claims,
+                rollout_key_id: None,
+            })
+        }
+
+        fn outputs_by_id(plan: &CompiledPlan) -> BTreeMap<String, compiler_core::Output> {
+            plan.ir
+                .outputs
+                .iter()
+                .map(|output| (output.id.clone(), output.clone()))
+                .collect()
+        }
+
+        /// The critical regression test for review item 1: a single SSA per
+        /// output carries the handler's *complete* written data map plus
+        /// the revision annotation, not a series of field-clobbering
+        /// partial writes.
+        #[tokio::test]
+        async fn commit_writes_the_complete_data_map_and_annotation_in_one_apply() -> TestResult {
+            let plan = handler_plan()?;
+            let policy = policy(&plan);
+            let activation = handler_activation(&plan, &policy, &["flags"])?;
+            let existing_flags = json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"flags","namespace":"workload","uid":"flags-uid","resourceVersion":"5"},
+                "data":{},
+            });
+            let projected_flags = json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"flags","namespace":"workload","uid":"flags-uid","resourceVersion":"5"},
+                "data":{"value":"on"},
+            });
+            let applied_flags = json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"flags","namespace":"workload","uid":"flags-uid","resourceVersion":"6",
+                    "annotations":{"apsides.dev/handler-input-revision":"rev-1"},
+                    "managedFields":[{"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:data":{},"f:metadata":{"f:annotations":{}}},"manager":"apsides-handler-example","operation":"Apply"}]},
+                "data":{"value":"on","other":"kept"},
+            });
+            let responses = vec![
+                existing_flags,
+                control_object(
+                    "apsides-activation-example",
+                    &activation,
+                    "activation-uid",
+                    "20",
+                )?,
+                control_object("apsides-policy-example", &policy, "policy-uid", "19")?,
+                projected_flags,
+                control_object(
+                    "apsides-activation-example",
+                    &activation,
+                    "activation-uid",
+                    "20",
+                )?,
+                control_object("apsides-policy-example", &policy, "policy-uid", "19")?,
+                applied_flags,
+            ];
+            let (client, calls) = wire(responses);
+            let controller = controller(&plan, &activation, client)?;
+            let mut written: crate::handlers::BufferedWrites = BTreeMap::new();
+            written.insert(
+                "flags".to_owned(),
+                BTreeMap::from([("value".to_owned(), "on".to_owned())]),
+            );
+            let committed = commit_handler_outputs(
+                &controller,
+                &["flags".to_owned()],
+                &outputs_by_id(&plan),
+                "apsides-handler-example",
+                &written,
+                "rev-1",
+            )
+            .await?;
+            assert_eq!(
+                committed.get("flags").map(String::as_str),
+                Some("flags-uid")
+            );
+
+            let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
+            assert_eq!(calls.len(), 7);
+            let real_patch = calls
+                .iter()
+                .rev()
+                .find(|(method, uri, _)| *method == Method::PATCH && !uri.contains("dryRun"))
+                .ok_or("expected exactly one real (non-dry-run) PATCH")?;
+            assert_eq!(
+                real_patch.2.pointer("/data/value").and_then(Value::as_str),
+                Some("on"),
+                "the real SSA must carry the written key"
+            );
+            let annotations = real_patch
+                .2
+                .get("metadata")
+                .and_then(|metadata| metadata.get("annotations"))
+                .ok_or("expected annotations on the real SSA payload")?;
+            assert_eq!(
+                annotations
+                    .get(crate::handlers::HANDLER_INPUT_REVISION_ANNOTATION)
+                    .and_then(Value::as_str),
+                Some("rev-1"),
+                "the real SSA must carry the revision annotation alongside the data"
+            );
+            // Exactly one real PATCH is sent for this one output -- not one
+            // per key plus a separate stamp (the bug this test guards
+            // against: separate SSAs under the same field manager delete
+            // each other's fields).
+            let real_patch_count = calls
+                .iter()
+                .filter(|(method, uri, _)| *method == Method::PATCH && !uri.contains("dryRun"))
+                .count();
+            assert_eq!(real_patch_count, 1);
+            Ok(())
+        }
+
+        /// One `authority.verify()` round-trip's worth of wire responses
+        /// (activation, then policy) -- `commit_handler_outputs`/
+        /// `apply_existing_claimed` each call `verify()` once, so this
+        /// appears twice per committed output.
+        fn verify_responses(
+            activation: &ActivationState,
+            policy: &PolicyState,
+        ) -> TestResult<Vec<Value>> {
+            Ok(vec![
+                control_object(
+                    "apsides-activation-example",
+                    activation,
+                    "activation-uid",
+                    "20",
+                )?,
+                control_object("apsides-policy-example", policy, "policy-uid", "19")?,
+            ])
+        }
+
+        /// Review item 1's recommended contract: an output the handler did
+        /// *not* write this invocation is still stamped with the revision
+        /// annotation, but its existing live `data` is carried forward
+        /// unchanged in that same SSA -- never dropped.
+        #[tokio::test]
+        async fn commit_preserves_untouched_output_data_when_stamping() -> TestResult {
+            let plan = handler_plan_two_outputs()?;
+            let policy = policy(&plan);
+            let activation = handler_activation(&plan, &policy, &["flags-a", "flags-b"])?;
+            let existing_a = json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"flags-a","namespace":"workload","uid":"flags-a-uid","resourceVersion":"5"},
+                "data":{},
+            });
+            let projected_a = existing_a.clone();
+            let applied_a = json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"flags-a","namespace":"workload","uid":"flags-a-uid","resourceVersion":"6",
+                    "annotations":{"apsides.dev/handler-input-revision":"rev-1"},
+                    "managedFields":[{"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:data":{},"f:metadata":{"f:annotations":{}}},"manager":"apsides-handler-example","operation":"Apply"}]},
+                "data":{"value":"written"},
+            });
+            let existing_b = json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"flags-b","namespace":"workload","uid":"flags-b-uid","resourceVersion":"9"},
+                "data":{"previous":"kept-value"},
+            });
+            let projected_b = existing_b.clone();
+            let applied_b = json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"flags-b","namespace":"workload","uid":"flags-b-uid","resourceVersion":"10",
+                    "annotations":{"apsides.dev/handler-input-revision":"rev-1"},
+                    "managedFields":[{"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:data":{},"f:metadata":{"f:annotations":{}}},"manager":"apsides-handler-example","operation":"Apply"}]},
+                "data":{"previous":"kept-value"},
+            });
+            let mut responses = vec![existing_a];
+            responses.extend(verify_responses(&activation, &policy)?);
+            responses.push(projected_a);
+            responses.extend(verify_responses(&activation, &policy)?);
+            responses.push(applied_a);
+            responses.push(existing_b);
+            responses.extend(verify_responses(&activation, &policy)?);
+            responses.push(projected_b);
+            responses.extend(verify_responses(&activation, &policy)?);
+            responses.push(applied_b);
+            let (client, calls) = wire(responses);
+            let controller = controller(&plan, &activation, client)?;
+            let mut written: crate::handlers::BufferedWrites = BTreeMap::new();
+            written.insert(
+                "flags-a".to_owned(),
+                BTreeMap::from([("value".to_owned(), "written".to_owned())]),
+            );
+            // "flags-b" is declared but deliberately absent from `written`.
+            let committed = commit_handler_outputs(
+                &controller,
+                &["flags-a".to_owned(), "flags-b".to_owned()],
+                &outputs_by_id(&plan),
+                "apsides-handler-example",
+                &written,
+                "rev-1",
+            )
+            .await?;
+            assert_eq!(committed.len(), 2);
+
+            let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
+            let flags_b_real_patch = calls
+                .iter()
+                .rev()
+                .filter(|(method, uri, _)| *method == Method::PATCH && !uri.contains("dryRun"))
+                .find(|(_, uri, _)| uri.contains("flags-b"))
+                .ok_or("expected a real PATCH for flags-b")?;
+            assert_eq!(
+                flags_b_real_patch
+                    .2
+                    .pointer("/data/previous")
+                    .and_then(Value::as_str),
+                Some("kept-value"),
+                "an output the handler did not write must keep its existing data, not lose it"
+            );
+            let annotations = flags_b_real_patch
+                .2
+                .get("metadata")
+                .and_then(|metadata| metadata.get("annotations"))
+                .ok_or("expected annotations on flags-b's real SSA payload")?;
+            assert_eq!(
+                annotations
+                    .get(crate::handlers::HANDLER_INPUT_REVISION_ANNOTATION)
+                    .and_then(Value::as_str),
+                Some("rev-1"),
+                "flags-b must still be stamped with the revision even though it was not written"
+            );
+            Ok(())
+        }
     }
 }
