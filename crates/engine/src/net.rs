@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use hickory_resolver::TokioResolver;
-use hickory_resolver::config::{LookupIpStrategy, ResolveHosts, ResolverConfig};
+use hickory_resolver::config::{LookupIpStrategy, NameServerConfig, ResolveHosts, ResolverConfig};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::client::conn::http1;
@@ -168,53 +168,120 @@ pub enum ResolveError {
     LookupFailed(String, String),
     #[error("DNS lookup for {0:?} returned no addresses")]
     NoAddresses(String),
+    #[error("no `nameserver` line was found in resolv.conf")]
+    NoNameserversConfigured,
 }
 
-/// A reusable DNS resolver handle for `apsides.fetch`.
+/// An immutable DNS resolver *configuration* for `apsides.fetch`.
 ///
 /// Built **once**, by the caller, before any Landlock lockdown is applied
-/// (`hickory-resolver`'s socket setup needs network access that a later
-/// deny-all lockdown would refuse) -- not per invocation, and not per
-/// `apsides.fetch` call. One `EgressResolver` is shared (via `Arc`) across
-/// every `HandlerInvocation` for the process's lifetime.
+/// (see [`resolver_config_from_resolv_conf`]'s doc comment). One
+/// `EgressResolver` is shared (via `Arc`) across every `HandlerInvocation`
+/// for the process's lifetime.
 ///
-/// This crate deliberately offers **no** constructor that reads the host's
-/// system DNS configuration (`/etc/resolv.conf`): `nameservers` must be
-/// supplied explicitly by the caller (e.g. the cluster's DNS service
-/// address, or a public resolver such as `hickory_resolver::config::GOOGLE`),
-/// matching the same "no glibc `getaddrinfo`, no `/etc/resolv.conf`" stance
-/// this crate's own tests already establish for the same reason: a
-/// container that has already applied its own filesystem lockdown, or that
-/// simply has no meaningful `/etc/resolv.conf`, must not depend on one
-/// existing.
-///
-/// Internally pins `ResolverOpts::use_hosts_file = ResolveHosts::Never`
-/// (`/etc/hosts` is never consulted either) and
-/// `ResolverOpts::ip_strategy = LookupIpStrategy::Ipv4thenIpv6`, so a
-/// lookup's results are always IPv4 addresses first, then IPv6 -- see
-/// [`resolve_host`]/`ops::fetch`'s "try every vetted candidate in order"
-/// dialing.
-pub struct EgressResolver(TokioResolver);
+/// This deliberately holds only the *configuration*, never a built
+/// `TokioResolver` -- `hickory-resolver`'s `TokioRuntimeProvider` spawns
+/// its background connection-management tasks onto whichever tokio runtime
+/// is current *when those tasks are actually driven*, not merely the one
+/// current when the resolver was constructed. Each [`HandlerInvocation`]
+/// (see `lib.rs`) runs on its own dedicated, short-lived current-thread
+/// runtime that is torn down when the invocation finishes; a `TokioResolver`
+/// built once (e.g. on the process's main runtime) and then reused, via this
+/// `Arc`, from inside a *different*, later-dropped invocation runtime would
+/// have cached connections/background tasks tied to a runtime that may
+/// already be gone by the time they are next driven -- silently breaking
+/// resolution for every invocation after the first. [`ops::fetch`] instead
+/// calls [`EgressResolver::build`] lazily, the first time a given invocation
+/// actually needs to resolve a host, from *inside* that invocation's own
+/// runtime (see that function's doc comment) -- so the real `TokioResolver`
+/// this struct's config produces is always built fresh, on the runtime that
+/// will actually drive it, once per invocation, not once per process.
+pub struct EgressResolver {
+    config: ResolverConfig,
+}
 
 impl EgressResolver {
+    #[must_use]
+    pub const fn new(config: ResolverConfig) -> Self {
+        Self { config }
+    }
+
+    /// Builds a fresh `TokioResolver` from this handle's configuration.
+    /// Must be called from inside the tokio runtime that will actually
+    /// drive the returned resolver's lookups -- see the struct's doc
+    /// comment.
+    ///
+    /// Pins `ResolverOpts::use_hosts_file = ResolveHosts::Never`
+    /// (`/etc/hosts` is never consulted) and `ResolverOpts::ip_strategy =
+    /// LookupIpStrategy::Ipv4thenIpv6`, so a lookup's results are always
+    /// IPv4 addresses first, then IPv6 -- see
+    /// [`resolve_host`]/`ops::fetch`'s "try every vetted candidate in
+    /// order" dialing.
+    ///
     /// # Errors
     ///
     /// Returns `Err` if the resolver fails to build (e.g. `nameservers` is
     /// empty).
-    pub fn new(nameservers: ResolverConfig) -> Result<Self, ResolveError> {
-        let mut builder =
-            TokioResolver::builder_with_config(nameservers, TokioRuntimeProvider::default());
+    pub fn build(&self) -> Result<TokioResolver, ResolveError> {
+        let mut builder = TokioResolver::builder_with_config(
+            self.config.clone(),
+            TokioRuntimeProvider::default(),
+        );
         builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4thenIpv6;
         builder.options_mut().use_hosts_file = ResolveHosts::Never;
         builder
             .build()
-            .map(Self)
             .map_err(|err| ResolveError::ResolverBuild(err.to_string()))
     }
 }
 
+/// Parses every `nameserver <ip>` line out of `contents`.
+///
+/// `contents` is the verbatim text of a `resolv.conf`-shaped file, per
+/// `resolv.conf(5)`: one directive per line, `;`/`#` start a comment that
+/// runs to the end of the line, blank lines and unrecognized directives are
+/// ignored. Returns a [`ResolverConfig`] with no search list and no base
+/// domain -- every hostname `apsides.fetch` is ever asked to resolve is
+/// already validated (at compile time, from the IR's `egress` declarations)
+/// to be a lowercase FQDN-shaped DNS name, so there is nothing for
+/// `ndots`/search-domain expansion to ever usefully do here, and leaving it
+/// configured would only be one more way a malformed local `resolv.conf`
+/// could change resolution behavior in a way this crate does not intend.
+///
+/// This function itself performs **no I/O**: the caller reads the file (see
+/// [`EgressResolver`]'s doc comment on why this crate never reads it
+/// itself) and passes the contents in -- deliberately, so a caller that
+/// must read the file *before* applying a filesystem lockdown (Landlock)
+/// can do so and hand the already-read bytes to this pure function
+/// afterward, with no code path here that could ever need file access of
+/// its own.
+///
+/// # Errors
+///
+/// Returns `Err` if no line yields a `nameserver` directive with a
+/// parseable IP address.
+pub fn resolver_config_from_resolv_conf(contents: &str) -> Result<ResolverConfig, ResolveError> {
+    let ips: Vec<IpAddr> = contents
+        .lines()
+        .filter_map(|line| {
+            let uncommented = line.split(['#', ';']).next().unwrap_or("");
+            let mut tokens = uncommented.split_whitespace();
+            if tokens.next() != Some("nameserver") {
+                return None;
+            }
+            let address = tokens.next()?;
+            address.parse::<IpAddr>().ok()
+        })
+        .collect();
+    if ips.is_empty() {
+        return Err(ResolveError::NoNameserversConfigured);
+    }
+    let name_servers = ips.into_iter().map(NameServerConfig::udp_and_tcp).collect();
+    Ok(ResolverConfig::from_parts(None, vec![], name_servers))
+}
+
 /// Resolves `host` to every candidate [`IpAddr`] hickory returns (IPv4
-/// first, per [`EgressResolver::new`]'s pinned strategy), or to a
+/// first, per [`EgressResolver::build`]'s pinned strategy), or to a
 /// fixture-mode `overrides` entry when one is configured -- no real DNS
 /// lookup at all in that case. Bounded by `deadline`: a real lookup is
 /// wrapped in `tokio::time::timeout`, so a slow/hanging resolver cannot
@@ -227,6 +294,12 @@ impl EgressResolver {
 /// misconfigured answer with a bogus first record the power to block a
 /// request a later, legitimate record would have served.
 ///
+/// `resolver`, when given, must already have been built (via
+/// [`EgressResolver::build`]) on the tokio runtime that is currently
+/// driving this call -- see [`EgressResolver`]'s doc comment. This function
+/// never builds one itself; `ops::fetch` owns that lazily-on-first-use
+/// step.
+///
 /// # Errors
 ///
 /// Returns `Err` if `overrides` is `Some` and has no (non-empty) entry for
@@ -236,7 +309,7 @@ impl EgressResolver {
 pub async fn resolve_host(
     host: &str,
     overrides: Option<&HashMap<String, Vec<IpAddr>>>,
-    resolver: Option<&EgressResolver>,
+    resolver: Option<&TokioResolver>,
     deadline: Instant,
 ) -> Result<Vec<IpAddr>, ResolveError> {
     if let Some(map) = overrides {
@@ -250,7 +323,7 @@ pub async fn resolve_host(
 
     let resolver = resolver.ok_or(ResolveError::NoResolverConfigured)?;
     let budget = remaining(deadline).map_err(|()| ResolveError::Timeout(host.to_owned()))?;
-    let lookup = tokio::time::timeout(budget, resolver.0.lookup_ip(host))
+    let lookup = tokio::time::timeout(budget, resolver.lookup_ip(host))
         .await
         .map_err(|_elapsed| ResolveError::Timeout(host.to_owned()))?
         .map_err(|err| ResolveError::LookupFailed(host.to_owned(), err.to_string()))?;
@@ -572,8 +645,64 @@ pub async fn https_request(
 
 #[cfg(test)]
 mod tests {
-    use super::is_global_unicast;
+    use super::{is_global_unicast, resolver_config_from_resolv_conf};
     use std::net::IpAddr;
+
+    #[test]
+    fn resolv_conf_parser_reads_every_nameserver_line_in_order() -> Result<(), String> {
+        let contents = "domain example.com\nnameserver 10.0.0.1\nsearch example.com\nnameserver 10.0.0.2 # trailing comment\nnameserver ::1\n";
+        let config = resolver_config_from_resolv_conf(contents)
+            .map_err(|err| format!("expected a parsed config: {err}"))?;
+        let ips: Vec<IpAddr> = config
+            .name_servers()
+            .iter()
+            .map(|server| server.ip)
+            .collect();
+        assert_eq!(
+            ips,
+            vec![
+                "10.0.0.1".parse::<IpAddr>().map_err(|e| e.to_string())?,
+                "10.0.0.2".parse::<IpAddr>().map_err(|e| e.to_string())?,
+                "::1".parse::<IpAddr>().map_err(|e| e.to_string())?,
+            ]
+        );
+        assert!(config.domain().is_none());
+        assert!(config.search().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resolv_conf_parser_ignores_comments_and_unrelated_directives() -> Result<(), String> {
+        let contents =
+            "; a fully-commented line\n# another comment\noptions ndots:5\nnameserver 1.2.3.4\n";
+        let config = resolver_config_from_resolv_conf(contents)
+            .map_err(|err| format!("expected a parsed config: {err}"))?;
+        assert_eq!(config.name_servers().len(), 1);
+        assert_eq!(
+            config.name_servers()[0].ip,
+            "1.2.3.4".parse::<IpAddr>().map_err(|e| e.to_string())?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolv_conf_parser_skips_a_malformed_nameserver_value_and_keeps_valid_ones()
+    -> Result<(), String> {
+        let config = resolver_config_from_resolv_conf("nameserver not-an-ip\nnameserver 9.9.9.9\n")
+            .map_err(|err| format!("expected a parsed config: {err}"))?;
+        assert_eq!(config.name_servers().len(), 1);
+        assert_eq!(
+            config.name_servers()[0].ip,
+            "9.9.9.9".parse::<IpAddr>().map_err(|e| e.to_string())?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolv_conf_parser_fails_closed_with_no_nameserver_lines_at_all() {
+        let result = resolver_config_from_resolv_conf("search example.com\noptions ndots:5\n");
+        assert!(result.is_err());
+    }
 
     /// `s.parse()` on a fixed literal below never actually fails; returning
     /// `Result` and propagating with `?` (rather than `.unwrap()`/
