@@ -132,12 +132,30 @@ pub trait RuntimeClient: Send + Sync {
 /// accepts only an explicit in-cluster transport configuration. Fixture mode
 /// requires a dedicated absolute kubeconfig path.
 ///
+/// `handlers` is the `(id, bundle source)` pair for every declared event
+/// handler, embedded by the generated controller via `include_str!` next to
+/// its `ir.json`. This increment records that the bundles are compiled into
+/// the image; it does not execute them (the V8 event-plane engine is a later
+/// phase, in a separate crate).
+///
 /// # Errors
 ///
 /// Returns an error for invalid IR or startup configuration, failed protected
 /// activation, or a Kubernetes operation failure.
-pub async fn run(ir_json: &'static str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run(
+    ir_json: &'static str,
+    handlers: &'static [(&'static str, &'static str)],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let plan = parse_and_validate(ir_json)?;
+    if handlers.len() != plan.ir.handlers.len()
+        || !handlers
+            .iter()
+            .all(|(id, _)| plan.ir.handlers.iter().any(|handler| handler.id == *id))
+    {
+        return Err(Box::new(RuntimeError::Plan(
+            "embedded handler bundles do not match the validated IR's declared handlers".into(),
+        )));
+    }
     let path = env::var(CONFIG_PATH_ENV)
         .map_err(|_| RuntimeError::Configuration(format!("{CONFIG_PATH_ENV} is required")))?;
     let startup = read_startup(Path::new(&path))?;
@@ -369,7 +387,7 @@ pub async fn reconcile_once<C: RuntimeClient>(
                                 .iter()
                                 .find(|input| input.id == *id)
                                 .is_none_or(|input| {
-                                    input.mode == InputMode::Observed
+                                    matches!(input.mode, InputMode::Observed | InputMode::Output)
                                         || input.managed_resource_id.as_ref().is_some_and(
                                             |resource| successfully_applied.contains(resource),
                                         )
@@ -435,7 +453,7 @@ async fn collect_observations<C: RuntimeClient>(
 ) -> Result<BTreeMap<String, Observation>, RuntimeError> {
     let mut observed = BTreeMap::new();
     for input in &plan.ir.inputs {
-        let observation = if input.mode == InputMode::Observed {
+        let observation = if matches!(input.mode, InputMode::Observed | InputMode::Output) {
             client.observe_named(input).await?
         } else {
             let id = input.managed_resource_id.as_ref().ok_or_else(|| {
@@ -785,7 +803,7 @@ impl RuntimeClient for KubeRuntimeClient {
         // have no external watch capability. Periodic reconciliation still runs.
         let inputs = inputs
             .iter()
-            .filter(|input| input.mode == InputMode::Observed)
+            .filter(|input| matches!(input.mode, InputMode::Observed | InputMode::Output))
             .collect::<Vec<_>>();
         if inputs.is_empty() {
             tokio::time::sleep(timeout).await;
@@ -1182,6 +1200,7 @@ mod tests {
                 line: 1,
                 column: 1,
             },
+            handler_output: false,
         }
     }
 

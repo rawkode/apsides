@@ -311,7 +311,7 @@ fn applicability(plan: &CompiledPlan, case: &TestCase) -> Applicability {
     let modes = inputs
         .iter()
         .map(|input| match input.mode {
-            InputMode::Observed => "observed".to_owned(),
+            InputMode::Observed | InputMode::Output => "observed".to_owned(),
             InputMode::Managed => "managed".to_owned(),
         })
         .collect::<BTreeSet<_>>();

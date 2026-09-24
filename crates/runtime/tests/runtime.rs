@@ -8,14 +8,14 @@ use serde_json::Value;
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const IR: &str = r#"{
-  "schemaVersion":"apsides.dev/ir/v1",
+  "schemaVersion":"apsides.dev/ir/v2",
   "domain":{"id":"example","namespace":"workload","controlNamespace":"apsides-system","clusterBinding":"fixture","policyRef":"platform/example","enforcement":"api-bound","minKubernetesVersion":"1.34","budgets":{"maxResources":8,"maxInputs":8,"maxReactions":8,"maxObjectBytes":262144,"maxQueueDepth":8,"maxConcurrentRequests":2}},
   "resources":[
     {"id":"deployment","apiVersion":"apps/v1","kind":"Deployment","name":"api","namespace":"workload","desired":{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"api","namespace":"workload"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"api"}},"template":{"metadata":{"labels":{"app":"api"}},"spec":{"containers":[{"name":"api","image":"fixture.invalid/api@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","imagePullPolicy":"Never"}]}}}},"lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"controller.ts","line":1,"column":1}}
   ],
   "inputs":[{"id":"config","apiVersion":"v1","kind":"ConfigMap","name":"input","namespace":"workload","mode":"observed","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"controller.ts","line":2,"column":1}}],
   "reactions":[{"id":"rollout","op":"rollout","inputs":["config"],"target":"deployment","source":{"file":"controller.ts","line":3,"column":1}}],
-  "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"controller.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
+  "handlers":[],"outputs":[],"provenance":{"compiler":"apsides/0.1","inputs":[{"path":"controller.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
 }"#;
 
 #[derive(Default)]

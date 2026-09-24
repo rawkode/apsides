@@ -100,7 +100,9 @@ pub fn expected_revision(
                 .iter()
                 .find(|resource| input.managed_resource_id.as_ref() == Some(&resource.id))
                 .map_or(Value::Null, |resource| resource.desired["data"].clone()),
-            InputMode::Observed => observed.get(id).cloned().unwrap_or(Value::Null),
+            InputMode::Observed | InputMode::Output => {
+                observed.get(id).cloned().unwrap_or(Value::Null)
+            }
         };
         let data = if data.is_null() { json!({}) } else { data };
         projections.insert(id.clone(), data);

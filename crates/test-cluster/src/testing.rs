@@ -10,7 +10,7 @@ pub fn ir() -> Value {
     let source = json!({"file": "program.tsx", "line": 1, "column": 1});
     json!({
         "testOnly": true,
-        "schemaVersion": "apsides.dev/ir/v1",
+        "schemaVersion": "apsides.dev/ir/v2",
         "domain": {"id": "unit", "namespace": "work", "controlNamespace": "control",
             "clusterBinding": "unit-fixture", "policyRef": "platform/unit", "enforcement": "api-bound",
             "minKubernetesVersion": "1.34",
@@ -53,7 +53,7 @@ pub fn ir() -> Value {
             {"id": "rollout-credentials", "op": "rollout", "inputs": ["observed-credentials"],
              "target": "deployment-api", "source": source},
         ],
-        "provenance": {"compiler": "apsides/0.1", "inputs": [{"path": "program.tsx",
+        "handlers":[],"outputs":[],"provenance": {"compiler": "apsides/0.1", "inputs": [{"path": "program.tsx",
             "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}]},
     })
 }
@@ -95,7 +95,7 @@ pub fn fixture_documents(plan: &CompiledPlan) -> Result<(Value, Value, Value)> {
                     let modes = inputs
                         .iter()
                         .map(|input| match input.mode {
-                            InputMode::Observed => "observed",
+                            InputMode::Observed | InputMode::Output => "observed",
                             InputMode::Managed => "managed",
                         })
                         .collect::<std::collections::BTreeSet<_>>();
