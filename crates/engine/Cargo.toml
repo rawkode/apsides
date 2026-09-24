@@ -26,15 +26,34 @@ publish = false
 # transitive V8 bump cannot silently change flag/ABI behavior validated here.
 deno_core = "=0.412.0"
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "macros", "time"] }
-
-[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Phase 5b `op_apsides_fetch`: promoted from dev-dependencies (Phase 5a used
+# these only in tests/common/mod.rs's `https_get_via_hickory` spike helper).
+# hickory-resolver: explicit-nameserver DNS resolution (no glibc
+# getaddrinfo/`/etc/resolv.conf`) so a resolved address can be vetted before
+# connecting; rustls/tokio-rustls/webpki-roots: a dedicated TLS client
+# config (compiled-in root store, no native OS trust store, no client
+# auth), never the OS proxy/trust configuration.
 hickory-resolver = { version = "0.26", default-features = false, features = ["tokio"] }
-landlock = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"
+
+[dev-dependencies]
+landlock = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+# Local HTTPS test-server fixture for the `op_apsides_fetch` "allowed"
+# tests only (tests/common/https_fixture.rs): generates a throwaway
+# self-signed CA + leaf certificate in-process. Default features
+# (`crypto`, `pem`, `ring`) match the `ring` crypto backend already chosen
+# for `rustls`/`tokio-rustls` above; no other TLS/crypto backend is pulled
+# in. rcgen's own `[target."cfg(unix)".dev-dependencies]` on `openssl` (used
+# only to build *rcgen's own* examples, never a dependency of the `rcgen`
+# library target or anything that reaches this crate) was checked against
+# rcgen 0.14.10's upstream `rcgen/Cargo.toml` before adding this.
+rcgen = "0.14"
 
 # `harness = false`: this binary's `fn main()` controls thread creation
 # order itself (Landlock deny-all on the main thread, *then* V8 platform
