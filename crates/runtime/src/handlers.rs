@@ -1,4 +1,4 @@
-//! Wires the Phase 5b `engine` crate (a fresh V8 isolate per invocation, no
+//! Wires the `engine` crate (a fresh V8 isolate per invocation, no
 //! filesystem/net access except through its own typed, capability-checked
 //! ops) into the reconcile cycle: computes each handler's input revision
 //! each cycle, enqueues, and dispatches at most one handler invocation per
@@ -10,7 +10,7 @@
 //! re-check reconciler mutations use, under field manager
 //! `apsides-handler-<domainId>`.
 //!
-//! See the Apsides v0.3 plan, Phase 5b. `HandlerRuntime` is driven only by
+//! `HandlerRuntime` is driven only by
 //! [`crate::production::ProductionController`]: fixture mode verifies the
 //! embedded bundles against the IR but never executes them (see
 //! `crate::run_locked`). See this module's own tests (a fake `kube::Client`

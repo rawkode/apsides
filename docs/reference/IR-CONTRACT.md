@@ -78,7 +78,7 @@ This is the `ir.json` that `aps compile` writes for `crates/acceptance/programs/
   "reactions": [],
   "handlers": [
     {
-      "id": "handler-derive-eys---handlers-derive-keys-ts-c9d54577a4",
+      "id": "handler-derivekeys---handlers-derive-keys-ts-c9d54577a4",
       "module": "handlers/derive-keys.ts",
       "export": "deriveKeys",
       "trigger": {"kind": "input-changed", "input": "handler-source"},

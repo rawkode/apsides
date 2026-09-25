@@ -83,8 +83,9 @@ target/debug/aps diff --base work/events-compiled --head work/events-edited
 
 Adding a second host to `egress`, for example, reports
 `+ egress status.example.com:443 <- handler sync-flags`. With a `--policy` whose
-`requireApproval` names `egress.added` or `handlers.added`, `aps diff` exits 1
-to mark the change as needing approval (see the [surface diff guide](../../docs/guides/surface-diff.md)).
+`requireApproval` names `egress.added`, `aps diff` exits 1 to mark the change
+as needing approval; `handlers.added` matches only a newly declared handler,
+not new egress on an existing one (see the [surface diff guide](../../docs/guides/surface-diff.md)).
 
 After editing either source file, refresh the source lock:
 

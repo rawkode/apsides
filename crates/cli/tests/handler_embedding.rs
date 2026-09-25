@@ -1,6 +1,6 @@
 //! `aps compile` embeds each declared handler's bundle into the generated
-//! controller so `include_str!` compiles it into the image, exactly as
-//! Phase 4 of the event plane requires — without executing it: only the
+//! controller so `include_str!` compiles it into the image, without
+//! executing it at compile time: only the
 //! compiled controller runs it, through the `engine` crate, in production
 //! mode.
 use serde_json::Value;

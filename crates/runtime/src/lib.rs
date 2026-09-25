@@ -228,8 +228,7 @@ pub(crate) async fn run_locked(
 /// `bundleSha256`. Cheap (one hash per handler, at most `MAX_HANDLERS` of
 /// them), and it makes the image self-checking: a build that embedded the
 /// wrong bundle, dropped one, or duplicated an id fails closed at startup
-/// rather than silently running mismatched code once a later phase adds
-/// execution.
+/// instead of running mismatched handler code.
 pub(crate) fn verify_embedded_handlers(
     plan: &CompiledPlan,
     handlers: &[(&'static str, &'static str)],

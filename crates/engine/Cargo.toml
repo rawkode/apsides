@@ -6,8 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
-# Phase 5a spike gate (see the Apsides v0.3 plan, "Phase 5 -> 5a. Spike
-# gate"): this crate exists separately from `runtime` because
+# This crate exists separately from `runtime` because
 # `runtime/src/lib.rs` carries `#![forbid(unsafe_code)]` (forbid, not deny —
 # it cannot be locally re-allowed by any module). Embedding deno_core/V8
 # requires one unavoidable unsafe call site (`v8::new_rust_allocator`), so it

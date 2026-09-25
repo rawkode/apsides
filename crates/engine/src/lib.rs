@@ -1,10 +1,8 @@
-//! The Apsides handler engine (see the Apsides v0.3 plan, "Phase 5"):
-//! embeds a pinned `deno_core`/V8 to run one untrusted ES module handler
-//! per invocation, in a fresh isolate, with no filesystem access and no
-//! network access except through the three typed, capability-checked ops
-//! in [`ops`]. Grew out of the Phase 5a spike gate, which proved the
-//! embedding itself was feasible; this is now the real Phase 5b engine
-//! API ([`invoke_handler`] and friends), IR-agnostic: `runtime`'s
+//! The Apsides handler engine: embeds a pinned `deno_core`/V8 to run one
+//! untrusted ES module handler per invocation, in a fresh isolate, with no
+//! filesystem access and no network access except through the three
+//! typed, capability-checked ops in [`ops`]. The API ([`invoke_handler`]
+//! and friends) is IR-agnostic: `runtime`'s
 //! `handlers` module maps each IR handler onto an invocation and drives it
 //! through [`invoke_handler_with_watchdog`] in production mode.
 //!

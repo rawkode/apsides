@@ -213,9 +213,13 @@ budgets.
   invocation replace the handler's previous keys; keys other managers own are
   never touched; an output the invocation did not write keeps the handler's
   existing keys.
-- **Failure.** A throw, timeout, limit breach or commit failure commits
-  nothing, reports `handler-invocation-failed:<CODE>` and retries the same
-  event with exponential backoff.
+- **Failure.** A throw, timeout or limit breach commits nothing. A commit
+  failure stops at the failing output: outputs committed earlier in the same
+  attempt keep their new keys and revision, so a workload that rolls out on
+  one of them can see the partial result. Either way the controller reports
+  `handler-invocation-failed:<CODE>` and retries the same event with
+  exponential backoff, and the handler stays pending until every output
+  records the same revision.
 - **Restarts.** After a restart the controller reads the recorded revision
   from the outputs and runs a handler only if its revision differs, or if its
   outputs disagree. A handler that declares no outputs has nothing to record a
