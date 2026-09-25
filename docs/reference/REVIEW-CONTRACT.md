@@ -1,6 +1,6 @@
 # Deployment review contract
 
-Status: **partially implemented**. Deployment review v5 combines authenticated initial and upgrade declaration metadata with explicitly approved live impact, using protected registry v8 references. Actual issued-credential SSA qualification remains outstanding. The report does not yet satisfy every requirement in [specification v0.2, section 25](SPEC-v0.2.md).
+Status: **partially implemented**. Deployment review v5 combines authenticated initial and upgrade declaration metadata with explicitly approved live impact, using protected registry v8 references. Actual issued-credential SSA qualification remains outstanding. The report does not yet satisfy every requirement in [specification section 25](SPEC.md#25-review-diagnostics-and-observability).
 
 ## Implemented declaration report
 

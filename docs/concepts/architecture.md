@@ -8,7 +8,7 @@ data. Rust validates that data, derives the allowed effects and performs the
 Kubernetes operations.
 
 <div class="architecture-flow">
-  <div><strong>Authoring</strong><span><code>@apsides/kubernetes</code> builds a domain, resources, observations and reactions.</span></div>
+  <div><strong>Authoring</strong><span><code>@apsides/kubernetes</code> builds a domain, resources, observations, reactions and event handlers.</span></div>
   <div><strong>Compiler</strong><span>Oxc, Rolldown, restricted Deno evaluation and Rust validation emit canonical IR.</span></div>
   <div><strong>Release</strong><span>A native binary, OCI image, SBOM, compiler closure and signed provenance are bound together.</span></div>
   <div><strong>Runtime</strong><span>A generation-specific controller reconciles only its approved plan through a constrained proxy.</span></div>
@@ -26,6 +26,11 @@ IR in Rust.
 This is deliberately smaller than general React or an unrestricted Kubernetes
 SDK. Unknown fields and unsupported resource shapes fail compilation.
 
+An `<On>` element names an event handler: a locked TypeScript module export
+with declared inputs, HTTPS egress hosts and output `ConfigMap`s. The compiler
+bundles the module and records its digest; it does not run it. See
+[Event handlers](/guides/event-handlers/).
+
 ## Compiler and release boundary
 
 The compiler produces canonical resource and reaction plans, capabilities,
@@ -39,55 +44,46 @@ prior state.
 
 ## Runtime boundary
 
-The controller has no JavaScript evaluator and cannot expand its resource set.
-It uses strict Kubernetes Server-Side Apply only. There is no client-side apply,
-merge patch, strategic merge patch, full-object replacement or delete/recreate
-fallback for managed-resource reconciliation.
+The controller cannot expand its resource set. It uses strict Kubernetes
+Server-Side Apply only. There is no client-side apply, merge patch, strategic
+merge patch, full-object replacement or delete/recreate fallback for
+managed-resource reconciliation.
+
+The only code the controller runs besides its own is the set of declared
+event handler bundles embedded in its binary, checked against the digests in
+its validated IR at startup. Each invocation runs in a fresh V8 isolate from
+the `engine` crate, with no filesystem, no Kubernetes credential, bounded time
+and memory, and three operations: HTTPS `fetch` to the handler's declared
+hosts, `writeOutput` to its declared outputs, and `log`. Handler output writes
+use their own field manager and the same authority checks as reconciler
+writes.
 
 Each controller generation receives only its approved runtime capabilities.
 Privileged CI owns Roles, RoleBindings, the controller image, activation and
 retirement of the previous writer. A generation-specific proxy and protected
 coordination records form the writer-quiescence boundary.
 
-The generated controller intentionally reads the filesystem only during a
-short, synchronous startup: it reads its startup config, the proxy client
-identity (or the fixture kubeconfig), `/etc/resolv.conf`, and
-`available_parallelism()`'s cgroup-aware CPU count, converts them into
-in-memory values, then applies a deny-all Landlock ruleset to the process's
-main thread before any other thread exists and before the V8 platform or the
-tokio runtime is initialised. Threads created afterward -- V8's worker pool,
-the tokio runtime's own workers -- inherit that restriction. The production
-kube client reaches the proxy Service by its original hostname (resolved
-through `resolv.conf`'s own `search`/`ndots` directives, read before
-lockdown) through a dedicated `hickory-resolver`-backed connector rather than
-glibc's `getaddrinfo`, so a proxy reconnect never needs a file again, and V8's
-platform and per-isolate RNGs are seeded from `getrandom(2)` directly rather
-than a `/dev/urandom` read Landlock would deny. `strace` against the locked
-down process still shows several glibc/V8-internal reads after lockdown --
-glibc's own CPU-count path, a new thread's stack-bounds probe, and a TSC
-calibration probe -- each denied and each already falling back to a working,
-file-free alternative (the process's CPU affinity mask, `__libc_stack_end`,
-and a harmless ignored failure, respectively) with no code here involved.
-One of those reads is `/proc/self/cgroup`, and it is *not* fully eliminated:
-the tokio runtime's own worker count reads it before lockdown instead (once,
-passed into the runtime builder), but V8's own worker-pool sizing --
-`deno_core::runtime::setup::init_v8`'s internal `available_parallelism()`
-call, made whenever `JsRuntime::init_platform` is given `None` -- is a
-separate call this crate does not control and still reads it after lockdown,
-falling back the same way glibc's own CPU-count path does. Supplying an
-explicit, pre-sized `v8::Platform` instead would skip that call, but
-replicating deno_core's own platform needs `DenoPlatformImpl` and the
-foreground-task queue it feeds, both private to `deno_core::runtime::setup`,
-so an externally-built platform risks breaking the JS event loop rather than
-just changing a thread-pool size -- this crate leaves the internal call
-in place instead. An unenforced Landlock lockdown fails startup closed in
-production; a `PartiallyEnforced` kernel -- ABI V7, the effective ABI on
-every kernel older than Linux 7.1, which lacks only `ResolveUnix` (added in
-ABI V9) of the requested rights, so this is the normal state on most kernels
-in the wild today, not an old-ABI edge case -- still counts as enforced,
-reported distinctly at `/status`. A fixture-only `allowNoLandlock` escape
-hatch exists for disposable-cluster testing and is structurally unavailable
-in production mode.
+The generated controller reads the filesystem only during a short, synchronous
+startup. It reads its startup configuration, the proxy client identity (or the
+fixture kubeconfig) and `/etc/resolv.conf`, converts them into in-memory
+values, and sizes the async runtime from the cgroup-aware CPU count. It then
+applies a deny-all Landlock ruleset on the main thread while no other thread
+exists, and only afterwards starts the V8 platform and the tokio runtime, whose
+threads inherit the restriction. The production Kubernetes client reaches the
+proxy Service by hostname through a `hickory-resolver` connector configured
+from the `resolv.conf` contents read before lockdown, so reconnects never
+open a file. V8's random number generators are seeded from the `getrandom(2)`
+system call rather than `/dev/urandom`.
+
+A kernel that cannot enforce Landlock stops the controller at startup. A
+partially enforced ruleset (the normal state on kernels older than Linux 7.1,
+whose Landlock ABI lacks only the `ResolveUnix` right) counts as enforced and is
+reported separately at `/status` as `landlock-partial`. Only a fixture-mode
+configuration for disposable clusters can opt out with `allowNoLandlock`;
+production configuration has no such field. Some glibc and V8 internal reads
+still happen after lockdown, such as CPU-count and thread stack probes; each is
+denied and falls back to a file-free source. The
+[implementation status](/reference/status/) lists them.
 
 ## Policy and force
 
@@ -121,8 +117,8 @@ See
 | `compiler-core` | strict IR validation, canonical identity, capabilities and policy checks |
 | `deploy` | provider-neutral lifecycle planning and transition reduction |
 | `platform` | protected Kubernetes state, proxy transport and generation lifecycle |
-| `runtime` | native fixed-plan reconciliation |
-| `engine` | Phase 5a spike gate for the embedded `deno_core`/V8 handler engine (feasibility evidence only, not yet wired into `runtime` or `aps build`) |
+| `runtime` | native fixed-plan reconciliation, handler dispatch and output commit, and the synchronous startup with Landlock lockdown |
+| `engine` | the embedded `deno_core`/V8 handler sandbox: isolate limits, the `apsides` operations, egress address vetting and the Landlock primitives |
 | `release` | release integrity, signed provenance, compiler closure and OCI verification |
 | `inventory` | metadata-only snapshots and SQLite storage |
 | `coordination` | typed immutable stores for claims, transition audits and review metadata |

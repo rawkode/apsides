@@ -80,7 +80,14 @@ authorize adoption.
 The runtime receives no source checkout: its configuration names only the compiled
 IR identity, immutable native image, activation bindings, and bounded runtime
 settings. Startup uses `APSIDES_RUNTIME_CONFIG_PATH=/etc/apsides/config.json`, with no
-extra executable arguments. Initial activation persists the initial quiescence
+extra executable arguments. The controller reads that configuration, its proxy client
+identity and `/etc/resolv.conf` once, then applies a deny-all Landlock
+filesystem ruleset before starting any other thread; see
+[Architecture](/concepts/architecture/#runtime-boundary). The controller
+container's memory limit is 288 MiB (`256Mi` baseline plus `32Mi` slack) and,
+when the domain declares event handlers, adds the largest handler's
+`maxHeapBytes` and its per-invocation `ArrayBuffer`, `fetch` and heap-headroom
+budgets (`compiler_core::controller_memory_limit_bytes`). Initial activation persists the initial quiescence
 state, active claims and history, then the protected active marker before starting
 the Deployment. Resume uses the same recorded executor, UID and object resource
 versions. `Committed` records deployment transition completion, not workload

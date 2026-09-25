@@ -46,6 +46,7 @@ export default defineConfig({
             { label: "TypeScript authoring", slug: "guides/typescript-authoring" },
             { label: "Build and deploy", slug: "guides/build-and-deploy" },
             { label: "Custom resources", slug: "guides/custom-resources" },
+            { label: "Event handlers", slug: "guides/event-handlers" },
             { label: "Surface diff in CI", slug: "guides/surface-diff" },
           ],
         },
@@ -53,7 +54,7 @@ export default defineConfig({
           label: "Reference",
           items: [
             { label: "Reference map", slug: "reference" },
-            { label: "Specification 0.2", slug: "reference/spec-v0-2" },
+            { label: "Specification", slug: "reference/spec" },
             { label: "Acceptance suite", slug: "reference/acceptance" },
             { label: "IR contract", slug: "reference/ir-contract" },
             { label: "Platform contract", slug: "reference/platform-contract" },

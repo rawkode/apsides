@@ -8,7 +8,7 @@ review. The guide pages explain the main path; they do not replace these
 contracts.
 
 <div class="contract-grid">
-  <a href="/reference/spec-v0-2/">Specification 0.2</a>
+  <a href="/reference/spec/">Specification</a>
   <a href="/reference/status/">Implementation status</a>
   <a href="/reference/acceptance/">Acceptance suite</a>
   <a href="/reference/ir-contract/">IR contract</a>
@@ -29,7 +29,8 @@ contracts.
 
 | Question | Read |
 | --- | --- |
-| What is the intended v0.2 system? | [Specification 0.2](/reference/spec-v0-2/) |
+| What is the intended system? | [Specification](/reference/spec/) |
+| How do event handlers run, and what can they reach? | [Event handlers](/guides/event-handlers/) and the [IR contract](/reference/ir-contract/#handlers-and-outputs) |
 | What works today, and what remains open? | [Implementation status](/reference/status/) |
 | How is the implementation accepted against the examples? | [Acceptance suite](/reference/acceptance/) |
 | What TypeScript can compile into IR? | [IR contract](/reference/ir-contract/) |

@@ -3,13 +3,20 @@ title: Surface diff in CI
 description: Post a deployment surface diff as a PR comment and require approval for reviewable changes.
 ---
 
-`aps diff` compares two `surface.json` deployment surfaces (the reviewable
-projection of a compiled program: permissions, secrets read, managed
-resources, inputs, reactions, images, known risks, and — since Phase 4 —
-declared event handlers, their egress hosts, and their outputs) and reports
-what changed between a pull request's base and head commit. An optional
-review policy names the diff conditions a human must approve before the
-change can be treated as reviewed.
+`aps diff` compares two `surface.json` deployment surfaces and reports what
+changed between a pull request's base and head commit. An optional review
+policy names the diff conditions a human must approve before the change can be
+treated as reviewed.
+
+`aps compile` writes `surface.json` (schema `apsides.dev/surface/v1`), the
+reviewable projection of a compiled program. It holds the domain identity,
+`kubernetes` (`minVersion`, the domain's declared minimum, and `qualifiedOn`,
+the version the version-dependent create contract is qualified on),
+`permissions`, `secretsRead`, `resources`, `inputs`, `reactions`, `images`,
+`handlers`, `egress`, `outputs`, `risks` and `enforcementGaps`. It never holds
+desired values, `ConfigMap` data, source locations or handler code. Every
+section is sorted, so the same program always produces the same bytes. See
+[Event handlers](/guides/event-handlers/#review) for the handler sections.
 
 ## Command
 

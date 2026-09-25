@@ -12,6 +12,10 @@ Apsides reuses established tooling for language processing, Kubernetes transport
 | Kubernetes API types and transport | k8s-openapi and kube-rs |
 | Field ownership, merge, defaults and admission dry-run | Kubernetes server-side apply |
 | Hashes and keyed sensitive projections | RustCrypto SHA-256 and HMAC |
+| Event handler bundles | Oxc and Rolldown, one closed ES module per handler from locked modules only |
+| Event handler runtime | `deno_core` with V8 from a pinned, SHA-256-verified `rusty_v8` static archive |
+| Handler egress DNS and TLS | `hickory-resolver`, `hyper` HTTP/1.1 and `rustls` with WebPKI roots |
+| Controller filesystem lockdown | Linux Landlock through the `landlock` crate |
 | Native dependency preparation | Cargo lockfiles and Cargo vendor |
 | OCI build and export | Docker BuildKit |
 

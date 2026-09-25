@@ -1,7 +1,7 @@
 # Acceptance suite
 
 The acceptance suite (`crates/acceptance`) accepts the Apsides implementation
-against the example programs, as [specification §28](/reference/spec-v0-2/#28-initial-release-acceptance-criteria)
+against the example programs, as [specification §28](/reference/spec/#28-initial-release-acceptance-criteria)
 requires. It deploys signed releases with the public `aps deploy` command on
 disposable kind clusters and checks what each §28 row demands. It does not
 accept an individual user's release; `aps test` does that before signing.
@@ -15,17 +15,24 @@ on `PATH` and these images in the local Docker image store, because neither
 - the builder, `rust@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922`;
 - the runtime base named in `scripts/runtime-base/reference`;
 - the kind node, `kindest/node:v1.34.3@sha256:08497ee19eace7b4b5348db5c6a1591d7752b164530a36f855cb0f2bdcbadd48`,
-  the only Kubernetes version `aps deploy` accepts.
+  the Kubernetes version the absent-only create contract is qualified on.
+  `aps deploy` accepts any server at or above a domain's
+  `minKubernetesVersion`, but the suite runs only this one.
+
+The host kernel must list `landlock` in `/sys/kernel/security/lsm`: kind nodes
+share it, and every controller applies a Landlock lockdown at startup. Each
+scenario checks this before creating its cluster.
 
 ```sh
-cuenv task acceptancePrepare   # build, release and sign the four releases
+cuenv task acceptancePrepare   # build, release and sign the five releases
 cuenv task acceptanceTest      # run every scenario, one kind cluster each
 cuenv task acceptanceCheck     # Clippy for the suite
 ```
 
 `acceptancePrepare` generates the CloudNativePG types, builds releases of
-`examples/cnpg/initial`, `examples/cnpg`, `examples/cnpg/cleanup` and
-`crates/acceptance/programs/cnpg-owner` with `aps build` and `aps release`,
+`examples/cnpg/initial`, `examples/cnpg`, `examples/cnpg/cleanup`,
+`crates/acceptance/programs/cnpg-owner` and
+`crates/acceptance/programs/handler-output` with `aps build` and `aps release`,
 signs each release's provenance with an OpenSSH key generated for that run
 (the private key is deleted once all are signed), and writes a trust policy
 approving only that key, the releases' compiler digests and `/usr/bin/ssh-keygen`.
@@ -39,7 +46,8 @@ CI prepares once in the `acceptance-prepare` job and hands the releases, with
 the `aps` that built them, to four `acceptance` matrix jobs, each running one
 cuenv task with `--test-threads=1`: `acceptanceUpgradeTest` (P0, uncertain
 writer, ownership collision with live preview), `acceptancePhasesTest`,
-`acceptanceCleanupTest` and `acceptanceCredentialsTest`.
+`acceptanceCleanupTest` and `acceptanceCredentialsTest` (which also runs the
+handler scenario).
 
 Each scenario creates its own cluster named `aps-acc-…` with a kubeconfig in a
 private temporary directory, and deletes it when it ends, including on failure.
@@ -82,6 +90,7 @@ files before they are written. CI uploads only this directory.
 | | (d) A `SubjectAccessReview` of every distinct request, for the user and groups the `TokenReview` returned, gives the same answer | Exercise the runtime credential outside scope |
 | | (e) The disclosed `sensitive-revision-change-observable` gap holds: adding a key to the observed Secret rolls the API out to a new revision and removing it restores the original one | Exercise the runtime credential outside scope (the disclosed profile) |
 | | (f), (g) The proxy Pod and `ServiceAccount` are unchanged throughout, and the token, the pull secret and every other Secret value or rollout key appear nowhere in `aps` output, controller logs or the inventory database | Inspect artifacts, logs, metrics, and inventory |
+| `handlers::a_handler_commits_exactly_its_owned_keys_and_seeds_across_a_restart` | Deploys `crates/acceptance/programs/handler-output`, whose one handler (no egress) copies every key of the observed `handler-source` `ConfigMap` into its output `handler-derived`. (1) The first invocation writes exactly the input's keys, with the `apsides.dev/handler-input-revision` annotation; the handler field manager owns those keys and the annotation, and the reconciler's manager owns the labels. (2) Changing the input drops the key the handler no longer writes and changes the revision. (3) A key another field manager adds survives the next commit and is never co-owned by the handler manager. (4) Deleting the controller Pod leaves the output's `resourceVersion` unchanged: the restarted controller seeds the revision from the annotation and rewrites nothing | Change a handler's trigger input and restart the controller |
 
 ### Which interruption points are proven
 
@@ -150,6 +159,9 @@ depend on the Docker driver, the image store or the wall clock.
 ## Limits
 
 - One single-node kind cluster per scenario, Kubernetes v1.34.3 only.
+- The handler scenario's handler makes no `apsides.fetch` call, so live egress
+  is not exercised; the engine's own tests cover `fetch` against local fixture
+  servers.
 - The release signer is synthetic: an ephemeral OpenSSH key trusted only by the
   scenario's own policy. The GitHub Actions attestation path of the trust policy
   is not exercised.
