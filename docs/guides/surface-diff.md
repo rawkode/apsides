@@ -231,3 +231,16 @@ hand reproduces exactly what the job saw. See
 [build and deploy](/guides/build-and-deploy/) for what `aps compile` and `aps
 build` each establish, and the [reference map](/reference/) for the deployment
 review contract a signed release's `aps deploy` performs separately.
+
+This PR-time diff and the deploy-time review are separate mechanisms that end
+up checking the same surface two different ways: this workflow's `aps diff`
+compares two independently compiled `surface.json` files as a merge gate,
+while `aps deploy`'s reviewed `ReviewMetadata` (`apsides.dev/review-metadata/v3`)
+carries its own `surfaceDigest` — the sha256 of the canonical `surface.json`
+bytes, derived by the same `derive_surface` function — plus its own
+`handlers`/`egress`/`outputs` catalogs. `aps deploy` independently recomputes
+that digest from the release actually being deployed and requires it to equal
+both the release's recorded `surface.json` digest and the reviewed
+`surfaceDigest`; a merged PR whose surface diff was approved here still gets
+an independent surface-binding check at deploy time, on the exact release
+artifact, not on this workflow's compiled copies.

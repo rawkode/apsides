@@ -164,6 +164,16 @@ so a signing workflow can check a release before handing it to deployment. A
 release carries no test results: run `aps test` for the program before signing
 it.
 
+`aps deploy` also binds the deployment to the exact surface that was
+reviewed: it independently recomputes the deployment surface from the
+verified release's own IR and requires that digest to equal both the
+release's recorded `surface.json` digest and the `surfaceDigest` the
+reviewed, authenticated metadata carries. Either mismatch fails the deploy
+with a clear error naming the disagreeing digests; there is no override
+flag. This also covers a resumed transition: resume revalidates the exact
+authenticated review metadata against a fresh projection of the plan, so a
+surface that changed after review is refused there too.
+
 ## Deployment inputs
 
 `aps deploy` reads `dist/apsides` by default or accepts exactly one current
@@ -208,7 +218,10 @@ any new execution authority. Identity, policy, transport and permission failures
 remain errors. Without opt-in, the report explicitly says preview was not approved.
 
 The review lists supplemental preview permissions separately and keeps observed
-values out of its output. The final result retains the captured review, and an
+values out of its output. It also lists the program's `surfaceDigest`, handlers,
+egress hosts and outputs next to permissions and secrets, so the reviewer sees
+exactly which egress hosts, handlers, outputs, secrets and permissions they are
+approving. The final result retains the captured review, and an
 already-committed retry performs no live preview. See the
 [deployment review contract](/reference/review-contract/) for evidence limits;
 the acceptance suite runs a live preview of one absent `ConfigMap`.
