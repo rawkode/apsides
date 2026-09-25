@@ -1,5 +1,5 @@
 //! Ephemeral live evidence; never added to durable declaration metadata.
-use coordination::{ReviewMetadataV1, ReviewRef};
+use coordination::{ReviewMetadata, ReviewRef};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -46,7 +46,7 @@ impl LiveReview {
 
     pub(crate) fn fresh(
         plan: &deploy::TransitionPlan,
-        previous: Option<&ReviewMetadataV1>,
+        previous: Option<&ReviewMetadata>,
         report: platform::LivePreviewReport,
     ) -> crate::Result<Self> {
         let next = platform::project_review_metadata(plan)?;
@@ -57,7 +57,7 @@ impl LiveReview {
             pending_binding: None,
             binding: Box::new(CaptureBinding {
                 next: next.reference()?,
-                previous: previous.map(ReviewMetadataV1::reference).transpose()?,
+                previous: previous.map(ReviewMetadata::reference).transpose()?,
             }),
         };
         result.validate(plan, previous, &next)?;
@@ -122,15 +122,15 @@ impl LiveReview {
     pub(super) fn validate(
         &self,
         plan: &deploy::TransitionPlan,
-        previous: Option<&ReviewMetadataV1>,
-        next: &ReviewMetadataV1,
+        previous: Option<&ReviewMetadata>,
+        next: &ReviewMetadata,
     ) -> crate::Result<()> {
         if let Self::Available {
             report, binding, ..
         } = self
             && (report.plan_digest != plan.plan_digest
                 || binding.next != next.reference()?
-                || binding.previous != previous.map(ReviewMetadataV1::reference).transpose()?)
+                || binding.previous != previous.map(ReviewMetadata::reference).transpose()?)
         {
             return Err("live preview differs from the resolved declaration review".into());
         }

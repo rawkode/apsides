@@ -66,10 +66,10 @@ pub trait ReviewStore: Send + Sync {
     /// Publish an immutable body addressed by its scope and metadata digest.
     /// # Errors
     /// Rejects invalid metadata, corrupt exact-reference rows and backend failures.
-    async fn put_review(&self, metadata: &ReviewMetadataV1) -> Result<ReviewRef>;
+    async fn put_review(&self, metadata: &ReviewMetadata) -> Result<ReviewRef>;
 
     /// Read the exact validated scope-bound metadata. Only absent rows return `None`.
     /// # Errors
     /// Rejects invalid references, substituted or corrupt data and backend failures.
-    async fn read_review(&self, reference: &ReviewRef) -> Result<Option<ReviewMetadataV1>>;
+    async fn read_review(&self, reference: &ReviewRef) -> Result<Option<ReviewMetadata>>;
 }

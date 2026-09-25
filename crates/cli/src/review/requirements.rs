@@ -1,7 +1,7 @@
 //! Exact permission and compatibility deltas from authenticated review metadata.
 use super::declarations::Changes;
 use coordination::{
-    ReviewCapability, ReviewCreationTarget, ReviewMetadataV1, ReviewResourceAccess,
+    ReviewCapability, ReviewCreationTarget, ReviewMetadata, ReviewResourceAccess,
     ReviewRoleDelegation,
 };
 use serde::Serialize;
@@ -34,8 +34,8 @@ pub(super) struct Permissions<'a> {
 }
 impl<'a> Permissions<'a> {
     pub(super) fn new(
-        before: Option<&'a ReviewMetadataV1>,
-        next: &'a ReviewMetadataV1,
+        before: Option<&'a ReviewMetadata>,
+        next: &'a ReviewMetadata,
     ) -> crate::Result<Self> {
         let prior_runtime = before.map(|value| value.runtime_permissions.as_slice());
         let prior_cleanup = before.map(|value| value.cleanup_permissions.as_slice());

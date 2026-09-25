@@ -1,6 +1,9 @@
 //! Complete metadata projection; canonicality alone is not release or registry authority.
 use crate::{Result, invalid};
-use coordination::{ClaimScope, REVIEW_METADATA_SCHEMA, ReviewMetadataV1, ReviewScope};
+use coordination::{
+    ClaimScope, REVIEW_METADATA_SCHEMA, ReviewEgress, ReviewHandler, ReviewMetadata, ReviewOutput,
+    ReviewScope,
+};
 use deploy::TransitionPlan;
 
 #[path = "review_projection_declarations.rs"]
@@ -14,7 +17,7 @@ mod permissions;
 /// protected allocation before publishing or binding the returned metadata.
 /// # Errors
 /// Rejects noncanonical plans, unsupported semantics or incomplete/oversized metadata.
-pub fn project_review_metadata(plan: &TransitionPlan) -> Result<ReviewMetadataV1> {
+pub fn project_review_metadata(plan: &TransitionPlan) -> Result<ReviewMetadata> {
     let canonical = deploy::plan_transition(&plan.request)
         .map_err(|_| invalid("review projection requires a canonical transition plan"))?;
     if canonical != *plan {
@@ -48,12 +51,52 @@ pub fn project_review_metadata(plan: &TransitionPlan) -> Result<ReviewMetadataV1
     let deployment_permissions = permissions::deployment(&derived)?;
     let runtime_permissions = permissions::capabilities(&plan.request.next.compiled.capabilities);
     let cleanup_permissions = permissions::capabilities(&plan.cleanup_capabilities);
-    let metadata = ReviewMetadataV1 {
+    // The surface is derived by the same `derive_surface` function and
+    // canonical JSON `aps deploy` will independently recompute from the
+    // release it is binding to, never a second implementation, so
+    // `surfaceDigest` and the handler/egress/output catalogs below are
+    // guaranteed consistent with `surface.json`.
+    let surface = compiler_core::derive_surface(&plan.request.next.compiled);
+    let surface_digest = compiler_core::digest(&surface)
+        .map_err(|_| invalid("review projection surface digest failed"))?;
+    let handlers = surface
+        .handlers
+        .iter()
+        .map(|handler| ReviewHandler {
+            id: handler.id.clone(),
+            trigger: handler.trigger.clone(),
+            inputs: handler.inputs.clone(),
+            outputs: handler.outputs.clone(),
+        })
+        .collect();
+    let egress = surface
+        .egress
+        .iter()
+        .map(|egress| ReviewEgress {
+            host: egress.host.clone(),
+            port: egress.port,
+            handler: egress.handler.clone(),
+        })
+        .collect();
+    let outputs = surface
+        .outputs
+        .iter()
+        .map(|output| ReviewOutput {
+            id: output.id.clone(),
+            name: output.name.clone(),
+            namespace: output.namespace.clone(),
+        })
+        .collect();
+    let metadata = ReviewMetadata {
         schema_version: REVIEW_METADATA_SCHEMA.into(),
         scope,
+        surface_digest,
         resources: catalogs.resources,
         inputs: catalogs.inputs,
         reactions: catalogs.reactions,
+        handlers,
+        egress,
+        outputs,
         compatibility: permissions::compatibility(
             &domain.budgets,
             &domain.min_kubernetes_version,

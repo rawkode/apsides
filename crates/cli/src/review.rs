@@ -7,7 +7,7 @@ mod resources;
 
 pub(crate) use live::LiveReview;
 
-use coordination::{ReviewMetadataV1, ReviewRef};
+use coordination::{ReviewMetadata, ReviewRef};
 use declarations::{Changes, Declarations};
 use serde::Serialize;
 use serde_json::Value;
@@ -31,7 +31,7 @@ pub(crate) fn transition_review(
 /// The predecessor body must have been loaded through its protected active reference.
 pub(crate) fn preflight(
     plan: &deploy::TransitionPlan,
-    previous: Option<&ReviewMetadataV1>,
+    previous: Option<&ReviewMetadata>,
     live: &LiveReview,
 ) -> crate::Result<()> {
     let next = platform::project_review_metadata(plan)?;
@@ -46,7 +46,7 @@ pub(crate) fn transition_review_fixture(
     current: &platform::StoredTransition,
     plan: &deploy::TransitionPlan,
     transition: &str,
-    previous: Option<&ReviewMetadataV1>,
+    previous: Option<&ReviewMetadata>,
 ) -> crate::Result<Value> {
     transition_review_fixture_with_live(
         current,
@@ -62,7 +62,7 @@ pub(crate) fn transition_review_fixture_with_live(
     current: &platform::StoredTransition,
     plan: &deploy::TransitionPlan,
     transition: &str,
-    previous: Option<&ReviewMetadataV1>,
+    previous: Option<&ReviewMetadata>,
     live: &LiveReview,
 ) -> crate::Result<Value> {
     let next = platform::project_review_metadata(plan)?;
@@ -73,8 +73,8 @@ fn render_review(
     current: &platform::StoredTransition,
     plan: &deploy::TransitionPlan,
     transition: &str,
-    next: &ReviewMetadataV1,
-    previous: Option<&ReviewMetadataV1>,
+    next: &ReviewMetadata,
+    previous: Option<&ReviewMetadata>,
     live: &LiveReview,
 ) -> crate::Result<Value> {
     if plan.request.transition_id != transition
@@ -100,17 +100,17 @@ fn render_review(
     })
 }
 
-fn reference(value: Option<&ReviewMetadataV1>) -> crate::Result<Option<ReviewRef>> {
+fn reference(value: Option<&ReviewMetadata>) -> crate::Result<Option<ReviewRef>> {
     value
-        .map(ReviewMetadataV1::reference)
+        .map(ReviewMetadata::reference)
         .transpose()
         .map_err(Into::into)
 }
 
 fn validate_metadata(
     plan: &deploy::TransitionPlan,
-    previous: Option<&ReviewMetadataV1>,
-    next: &ReviewMetadataV1,
+    previous: Option<&ReviewMetadata>,
+    next: &ReviewMetadata,
 ) -> crate::Result<()> {
     next.validate()?;
     if platform::project_review_metadata(plan)? != *next {
@@ -234,6 +234,10 @@ struct Report<'a> {
     source_locations: Changes<'a, declarations::SourceEntry<'a>>,
     permissions: requirements::Permissions<'a>,
     policy: Policy<'a>,
+    surface_digest: &'a str,
+    handlers: Changes<'a, coordination::ReviewHandler>,
+    egress: Changes<'a, coordination::ReviewEgress>,
+    outputs: Changes<'a, coordination::ReviewOutput>,
     enforcement: Changes<'a, coordination::ReviewEnforcement>,
     enforcement_gaps: &'a [String],
     indirect_privileges: &'a [String],
@@ -261,8 +265,8 @@ fn singleton_changes<'a, T: PartialEq + Serialize>(
 
 fn review_resources<'a>(
     plan: &'a deploy::TransitionPlan,
-    previous: Option<&'a ReviewMetadataV1>,
-    next: &'a ReviewMetadataV1,
+    previous: Option<&'a ReviewMetadata>,
+    next: &'a ReviewMetadata,
 ) -> crate::Result<(Vec<resources::ResourceChange<'a>>, Vec<OwnershipIntent<'a>>)> {
     let resources = resources::resources(
         previous,
@@ -271,6 +275,37 @@ fn review_resources<'a>(
         &plan.request.ownership_intents,
     )?;
     Ok((resources, ownership_intents(plan)))
+}
+
+/// Handler, egress and output declaration deltas: what a program's handlers
+/// read and write, and which hosts they may reach, next to the resources,
+/// permissions and secrets rendered elsewhere in the report.
+struct EventPlaneChanges<'a> {
+    handlers: Changes<'a, coordination::ReviewHandler>,
+    egress: Changes<'a, coordination::ReviewEgress>,
+    outputs: Changes<'a, coordination::ReviewOutput>,
+}
+fn event_plane_changes<'a>(
+    previous: Option<&'a ReviewMetadata>,
+    next: &'a ReviewMetadata,
+) -> crate::Result<EventPlaneChanges<'a>> {
+    Ok(EventPlaneChanges {
+        handlers: Changes::keyed(
+            previous.map(|value| value.handlers.as_slice()),
+            &next.handlers,
+            |value| value.id.clone(),
+        )?,
+        egress: Changes::keyed(
+            previous.map(|value| value.egress.as_slice()),
+            &next.egress,
+            |value| (value.host.clone(), value.port, value.handler.clone()),
+        )?,
+        outputs: Changes::keyed(
+            previous.map(|value| value.outputs.as_slice()),
+            &next.outputs,
+            |value| value.id.clone(),
+        )?,
+    })
 }
 
 const fn expected_interruption(initial: bool) -> &'static str {
@@ -283,8 +318,8 @@ const fn expected_interruption(initial: bool) -> &'static str {
 
 fn with_report<T>(
     plan: &deploy::TransitionPlan,
-    previous: Option<&ReviewMetadataV1>,
-    next: &ReviewMetadataV1,
+    previous: Option<&ReviewMetadata>,
+    next: &ReviewMetadata,
     live: &LiveReview,
     consume: impl FnOnce(&Report<'_>) -> crate::Result<T>,
 ) -> crate::Result<T> {
@@ -330,6 +365,7 @@ fn with_report<T>(
         "compatibility",
     )?;
     let permissions = requirements::Permissions::new(previous, next)?;
+    let event_plane = event_plane_changes(previous, next)?;
     let enforcement = singleton_changes(
         previous.map(|value| &value.enforcement),
         &next.enforcement,
@@ -358,6 +394,10 @@ fn with_report<T>(
             runtime_ceiling: &next.enforcement.runtime_ceiling,
             decision: "approved-by-transition-planner",
         },
+        surface_digest: &next.surface_digest,
+        handlers: event_plane.handlers,
+        egress: event_plane.egress,
+        outputs: event_plane.outputs,
         enforcement,
         enforcement_gaps: &next.enforcement.gaps,
         indirect_privileges: &next.enforcement.indirect_risks,

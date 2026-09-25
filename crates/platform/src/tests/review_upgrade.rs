@@ -1,5 +1,5 @@
 use super::*;
-use coordination::ReviewMetadataV1;
+use coordination::ReviewMetadata;
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -8,8 +8,8 @@ struct PrunedUpgrade {
     committed: Versioned<NamespaceRegistry>,
     next: deploy::GenerationPlan,
     inventory: MemoryInventoryStore,
-    previous_review: ReviewMetadataV1,
-    next_review: ReviewMetadataV1,
+    previous_review: ReviewMetadata,
+    next_review: ReviewMetadata,
     policy: PolicyState,
 }
 

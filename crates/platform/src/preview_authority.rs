@@ -1,13 +1,13 @@
 use crate::{IssuedDeployment, PolicyState, Result, Versioned, invalid};
-use coordination::{ReviewMetadataV1, ReviewRef};
+use coordination::{ReviewMetadata, ReviewRef};
 use deploy::{DeploymentRequest, TransitionPlan};
 use inventory::InventoryStore;
 use serde_json::Value;
 
 pub(super) struct Context {
     pub plan: TransitionPlan,
-    pub next: ReviewMetadataV1,
-    pub previous: Option<ReviewMetadataV1>,
+    pub next: ReviewMetadata,
+    pub previous: Option<ReviewMetadata>,
     previous_reference: Option<ReviewRef>,
     policy: Versioned<PolicyState>,
     trust: Versioned<Value>,

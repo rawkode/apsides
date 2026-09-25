@@ -1,6 +1,6 @@
 //! Review blobs describe declarations; only protected registry references select them.
 use crate::{NamespaceRegistry, PlatformClient, Result, invalid};
-use coordination::{ClaimScope, ReviewMetadataV1, ReviewRef, ReviewStore};
+use coordination::{ClaimScope, ReviewMetadata, ReviewRef, ReviewStore};
 use deploy::{GenerationAllocation, Phase};
 
 impl PlatformClient {
@@ -13,7 +13,7 @@ impl PlatformClient {
     pub(crate) async fn read_review_metadata(
         &self,
         reference: &ReviewRef,
-    ) -> Result<ReviewMetadataV1> {
+    ) -> Result<ReviewMetadata> {
         reference.validate()?;
         let metadata = self
             .review_backend()?
@@ -34,7 +34,7 @@ impl PlatformClient {
     #[cfg(feature = "deployer")]
     pub(crate) async fn publish_review_metadata(
         &self,
-        metadata: &ReviewMetadataV1,
+        metadata: &ReviewMetadata,
     ) -> Result<ReviewRef> {
         metadata.validate()?;
         let expected = metadata.reference()?;
@@ -54,7 +54,7 @@ impl PlatformClient {
         domain: &str,
         expected_registry_uid: &str,
         expected_registry_revision: &str,
-    ) -> Result<Option<ReviewMetadataV1>> {
+    ) -> Result<Option<ReviewMetadata>> {
         let registry = self.load_registry().await?;
         if registry.uid != expected_registry_uid
             || registry.resource_version != expected_registry_revision
@@ -74,7 +74,7 @@ impl PlatformClient {
         &self,
         registry: &NamespaceRegistry,
         plan: &deploy::TransitionPlan,
-    ) -> Result<(ReviewMetadataV1, Option<ReviewRef>)> {
+    ) -> Result<(ReviewMetadata, Option<ReviewRef>)> {
         self.review_backend()?;
         let next = crate::project_review_metadata(plan)?;
         validate_reference(

@@ -1,4 +1,4 @@
-use super::{MAX_REVIEW_METADATA_BYTES, MAX_REVIEW_SOURCE_ELEMENTS, ReviewMetadataV1, ReviewRef};
+use super::{MAX_REVIEW_METADATA_BYTES, MAX_REVIEW_SOURCE_ELEMENTS, ReviewMetadata, ReviewRef};
 use crate::{Error, Result};
 use std::io::{self, Write};
 
@@ -11,7 +11,7 @@ pub(super) fn valid_digest(value: &str) -> bool {
     })
 }
 
-pub(super) fn validate_size(value: &ReviewMetadataV1) -> Result<()> {
+pub(super) fn validate_size(value: &ReviewMetadata) -> Result<()> {
     let mut count = 0usize;
     let d = &value.deployment_permissions;
     let c = &value.compatibility;
@@ -20,6 +20,9 @@ pub(super) fn validate_size(value: &ReviewMetadataV1) -> Result<()> {
         value.resources.len(),
         value.inputs.len(),
         value.reactions.len(),
+        value.handlers.len(),
+        value.egress.len(),
+        value.outputs.len(),
         value.runtime_permissions.len(),
         value.cleanup_permissions.len(),
         d.required_resources.len(),
@@ -48,6 +51,12 @@ pub(super) fn validate_size(value: &ReviewMetadataV1) -> Result<()> {
                 .iter()
                 .flat_map(|r| [r.input_ids.len(), r.effect_fields.len()]),
         )
+        .chain(
+            value
+                .handlers
+                .iter()
+                .flat_map(|h| [h.inputs.len(), h.outputs.len()]),
+        )
         .chain(value.runtime_permissions.iter().map(|c| c.names.len()))
         .chain(value.cleanup_permissions.iter().map(|c| c.names.len()))
         .chain(e.runtime_ceiling.capabilities.iter().map(|c| c.names.len()))
@@ -73,7 +82,7 @@ pub(super) fn validate_size(value: &ReviewMetadataV1) -> Result<()> {
         .map_err(|_| Error::Invalid("review metadata size"))?;
     Ok(())
 }
-impl ReviewMetadataV1 {
+impl ReviewMetadata {
     /// Derive the domain-separated reference to exactly this validated metadata.
     /// # Errors
     /// Rejects invalid or oversized metadata and encoding failures.

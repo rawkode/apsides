@@ -1,5 +1,5 @@
 //! Declaration deltas derived only from authenticated, value-free review metadata.
-use coordination::{ReviewMetadataV1, ReviewPrimitive, ReviewSource};
+use coordination::{ReviewMetadata, ReviewPrimitive, ReviewSource};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -107,7 +107,7 @@ pub(super) struct Declarations<'a> {
     pub sources: Vec<SourceEntry<'a>>,
 }
 impl<'a> Declarations<'a> {
-    pub(super) fn new(metadata: &'a ReviewMetadataV1) -> Self {
+    pub(super) fn new(metadata: &'a ReviewMetadata) -> Self {
         let mut effects = Vec::with_capacity(metadata.resources.len() + metadata.reactions.len());
         effects.extend(metadata.resources.iter().map(|resource| Effect {
             id: format!("resource:{}", resource.id),

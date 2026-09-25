@@ -1,13 +1,13 @@
-use coordination::{ReviewMetadataV1, ReviewRef, ReviewStore};
+use coordination::{ReviewMetadata, ReviewRef, ReviewStore};
 use std::{collections::BTreeMap, sync::Mutex};
 
 #[derive(Default)]
 pub struct MemoryReviewStore {
-    rows: Mutex<BTreeMap<String, ReviewMetadataV1>>,
+    rows: Mutex<BTreeMap<String, ReviewMetadata>>,
 }
 
 impl MemoryReviewStore {
-    pub fn seed(&self, metadata: ReviewMetadataV1) -> coordination::Result<ReviewRef> {
+    pub fn seed(&self, metadata: ReviewMetadata) -> coordination::Result<ReviewRef> {
         let reference = metadata.reference()?;
         let mut rows = self
             .rows
@@ -25,7 +25,7 @@ impl MemoryReviewStore {
         Ok(reference)
     }
 
-    pub fn read(&self, reference: &ReviewRef) -> coordination::Result<Option<ReviewMetadataV1>> {
+    pub fn read(&self, reference: &ReviewRef) -> coordination::Result<Option<ReviewMetadata>> {
         reference.validate()?;
         let rows = self
             .rows
@@ -45,14 +45,14 @@ impl MemoryReviewStore {
 
 #[async_trait::async_trait]
 impl ReviewStore for MemoryReviewStore {
-    async fn put_review(&self, metadata: &ReviewMetadataV1) -> coordination::Result<ReviewRef> {
+    async fn put_review(&self, metadata: &ReviewMetadata) -> coordination::Result<ReviewRef> {
         self.seed(metadata.clone())
     }
 
     async fn read_review(
         &self,
         reference: &ReviewRef,
-    ) -> coordination::Result<Option<ReviewMetadataV1>> {
+    ) -> coordination::Result<Option<ReviewMetadata>> {
         self.read(reference)
     }
 }

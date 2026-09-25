@@ -33,7 +33,7 @@ fn custom_resource_risk_requires_explicit_ceiling_acceptance() -> Result<()> {
     Ok(())
 }
 
-fn metadata() -> Result<ReviewMetadataV1> {
+fn metadata() -> Result<ReviewMetadata> {
     let claim_scope = ClaimScope {
         registry_uid: "11111111-1111-4111-8111-111111111111".into(),
         cluster_binding: "cluster".into(),
@@ -52,9 +52,10 @@ fn metadata() -> Result<ReviewMetadataV1> {
         accepted_enforcement_gaps: vec![],
         accepted_indirect_risks: vec![],
     };
-    Ok(ReviewMetadataV1 {
+    Ok(ReviewMetadata {
         schema_version:REVIEW_METADATA_SCHEMA.into(),scope:ReviewScope {claim_scope,domain_id:"example".into(),transition_id:names.transition_id,sequence:1},
-        resources:vec![],inputs:vec![],reactions:vec![],runtime_permissions:vec![],cleanup_permissions:vec![],
+        surface_digest:format!("sha256:{}", "0".repeat(64)),
+        resources:vec![],inputs:vec![],reactions:vec![],handlers:vec![],egress:vec![],outputs:vec![],runtime_permissions:vec![],cleanup_permissions:vec![],
         deployment_permissions:ReviewDeploymentPermissions {required_resources:vec![],creation_targets:vec![],role_delegation:vec![],
             scope:ReviewDeploymentScope::IssuedDeployerOnly,authorization:ReviewAuthorization::RequiredAccessOnly,
             limitations:vec![ReviewDeploymentLimitation::CreateNamesRequireAdmission,ReviewDeploymentLimitation::GeneratedNamesRequireBroadAccess,
@@ -329,7 +330,7 @@ fn review_owned_schema_rejects_private_fields_and_bounded_overflow() -> Result<(
     let mut encoded = serde_json::to_value(&value).map_err(|_| Error::Invalid("test encoding"))?;
     encoded["enforcement"]["runtimeCeiling"]["privateValueHash"] =
         serde_json::json!("private-canary");
-    assert!(serde_json::from_value::<ReviewMetadataV1>(encoded).is_err());
+    assert!(serde_json::from_value::<ReviewMetadata>(encoded).is_err());
     let mut invalid = value;
     invalid.resources.push(resource("owned"));
     invalid.resources[0].apply_fields = vec!["/data/key".into(); MAX_REVIEW_SOURCE_ELEMENTS + 1];
@@ -412,8 +413,135 @@ fn review_source_paths_preserve_compiler_accepted_control_characters() -> Result
     value.validate()?;
     let encoded =
         compiler_core::canonical_bytes(&value).map_err(|_| Error::Invalid("test encoding"))?;
-    let decoded: ReviewMetadataV1 =
+    let decoded: ReviewMetadata =
         serde_json::from_slice(&encoded).map_err(|_| Error::Invalid("test decoding"))?;
     assert_eq!(decoded, value);
+    Ok(())
+}
+
+fn handler_input(id: &str) -> ReviewInput {
+    ReviewInput {
+        id: id.into(),
+        api_version: "v1".into(),
+        kind: "ConfigMap".into(),
+        name: id.into(),
+        namespace: "workload".into(),
+        mode: ReviewInputMode::Observed,
+        managed_resource_id: None,
+        projection: vec!["data".into()],
+        sensitive: false,
+        missing: "block-dependent-mutations".into(),
+        source: ReviewSource {
+            file: "source.tsx".into(),
+            line: 1,
+            column: 1,
+        },
+    }
+}
+
+#[test]
+fn review_metadata_v3_round_trips_handlers_egress_and_outputs() -> Result<()> {
+    let mut value = metadata()?;
+    value.surface_digest = format!("sha256:{}", "1".repeat(64));
+    value.inputs = vec![handler_input("settings")];
+    value.outputs = vec![ReviewOutput {
+        id: "flags".into(),
+        name: "flags".into(),
+        namespace: "workload".into(),
+    }];
+    value.handlers = vec![ReviewHandler {
+        id: "sync-flags".into(),
+        trigger: "settings".into(),
+        inputs: vec!["settings".into()],
+        outputs: vec!["flags".into()],
+    }];
+    value.egress = vec![ReviewEgress {
+        host: "api.example.com".into(),
+        port: 443,
+        handler: "sync-flags".into(),
+    }];
+    value.validate()?;
+    let encoded =
+        compiler_core::canonical_bytes(&value).map_err(|_| Error::Invalid("test encoding"))?;
+    let decoded: ReviewMetadata =
+        serde_json::from_slice(&encoded).map_err(|_| Error::Invalid("test decoding"))?;
+    assert_eq!(decoded, value);
+    Ok(())
+}
+
+#[test]
+fn review_handler_and_egress_links_are_not_inferred() -> Result<()> {
+    let mut value = metadata()?;
+    value.inputs = vec![handler_input("settings")];
+    value.outputs = vec![ReviewOutput {
+        id: "flags".into(),
+        name: "flags".into(),
+        namespace: "workload".into(),
+    }];
+    value.handlers = vec![ReviewHandler {
+        id: "sync-flags".into(),
+        trigger: "settings".into(),
+        inputs: vec!["settings".into()],
+        outputs: vec!["flags".into()],
+    }];
+    value.egress = vec![ReviewEgress {
+        host: "api.example.com".into(),
+        port: 443,
+        handler: "sync-flags".into(),
+    }];
+    value.validate()?;
+
+    let mut invalid = value.clone();
+    invalid.handlers[0].trigger = "unknown".into();
+    assert!(invalid.validate().is_err());
+
+    invalid = value.clone();
+    invalid.handlers[0].outputs = vec!["unknown".into()];
+    assert!(invalid.validate().is_err());
+
+    invalid = value.clone();
+    invalid.egress[0].handler = "unknown".into();
+    assert!(invalid.validate().is_err());
+
+    invalid = value.clone();
+    invalid.handlers[0].inputs = vec![];
+    assert!(invalid.validate().is_err());
+
+    invalid = value;
+    invalid.outputs.push(ReviewOutput {
+        id: "flags".into(),
+        name: "duplicate".into(),
+        namespace: "workload".into(),
+    });
+    assert!(invalid.validate().is_err());
+    Ok(())
+}
+
+#[test]
+fn review_metadata_v2_is_rejected() -> Result<()> {
+    let value = metadata()?;
+    let encoded = serde_json::to_value(&value).map_err(|_| Error::Invalid("test encoding"))?;
+
+    // A genuine v2 row lacks surfaceDigest, handlers, egress and outputs
+    // entirely, and strict `deny_unknown_fields` schema equality rejects it
+    // outright, never silently accepting a legacy shape.
+    let mut v2 = encoded;
+    {
+        let map = v2.as_object_mut().ok_or(Error::Invalid("test shape"))?;
+        map.insert(
+            "schemaVersion".into(),
+            serde_json::json!("apsides.dev/review-metadata/v2"),
+        );
+        for field in ["surfaceDigest", "handlers", "egress", "outputs"] {
+            map.remove(field);
+        }
+    }
+    assert!(serde_json::from_value::<ReviewMetadata>(v2).is_err());
+
+    // Even a row that carries every v3 field is rejected by the explicit
+    // schema-version check if it still claims to be v2.
+    let mut still_versioned_as_v2 = value;
+    still_versioned_as_v2.schema_version = "apsides.dev/review-metadata/v2".into();
+    assert!(still_versioned_as_v2.validate().is_err());
     Ok(())
 }

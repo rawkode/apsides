@@ -1,10 +1,10 @@
 use super::*;
-use coordination::ReviewMetadataV1;
+use coordination::ReviewMetadata;
 
 pub(super) fn upgrade(
     before: &Value,
     after: &Value,
-) -> Result<(StoredTransition, deploy::TransitionPlan, ReviewMetadataV1)> {
+) -> Result<(StoredTransition, deploy::TransitionPlan, ReviewMetadata)> {
     upgrade_with_ceiling(before, after, 0)
 }
 
@@ -32,7 +32,7 @@ pub(super) fn upgrade_with_ceiling(
     before: &Value,
     after: &Value,
     count: usize,
-) -> Result<(StoredTransition, deploy::TransitionPlan, ReviewMetadataV1)> {
+) -> Result<(StoredTransition, deploy::TransitionPlan, ReviewMetadata)> {
     let (mut stored, mut old) = transition(before)?;
     add_ceiling_names(&mut old.request, count);
     old = plan_transition(&old.request)?;

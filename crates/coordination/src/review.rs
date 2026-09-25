@@ -15,7 +15,7 @@ mod types;
 mod validation;
 pub use types::*;
 
-pub const REVIEW_METADATA_SCHEMA: &str = "apsides.dev/review-metadata/v2";
+pub const REVIEW_METADATA_SCHEMA: &str = "apsides.dev/review-metadata/v3";
 pub const MAX_REVIEW_METADATA_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_REVIEW_SOURCE_ELEMENTS: usize = 100_000;
 pub const MAX_REVIEW_DECLARATIONS: usize = 256;
@@ -245,14 +245,25 @@ pub struct ReviewEnforcement {
 
 /// This transition's planned declaration and policy metadata, not execution evidence.
 /// Desired values, source bodies, private-value hashes and build commitments are excluded.
+///
+/// `surface_digest` and the `handlers`/`egress`/`outputs` catalogs bind this
+/// review to the exact `surface.json` a deploy will independently recompute
+/// and require to match (see `compiler_core::surface::derive_surface`):
+/// a reviewer sees exactly which egress hosts, handlers, outputs, secrets and
+/// permissions they are approving, and a later surface change is detected as
+/// a metadata mismatch rather than silently deployed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ReviewMetadataV1 {
+pub struct ReviewMetadata {
     pub schema_version: String,
     pub scope: ReviewScope,
+    pub surface_digest: String,
     pub resources: Vec<ReviewResource>,
     pub inputs: Vec<ReviewInput>,
     pub reactions: Vec<ReviewReaction>,
+    pub handlers: Vec<ReviewHandler>,
+    pub egress: Vec<ReviewEgress>,
+    pub outputs: Vec<ReviewOutput>,
     pub runtime_permissions: Vec<ReviewCapability>,
     pub cleanup_permissions: Vec<ReviewCapability>,
     pub deployment_permissions: ReviewDeploymentPermissions,
@@ -289,7 +300,7 @@ impl ReviewRef {
         Ok(())
     }
 }
-impl ReviewMetadataV1 {
+impl ReviewMetadata {
     /// Validate canonical, bounded, internally coherent metadata. Publication must
     /// separately compare this body to the trusted complete platform projection.
     /// # Errors

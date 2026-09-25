@@ -29,9 +29,9 @@ fn permission_ceiling(policy_ref: &str) -> ReviewCeiling {
     }
 }
 
-fn review(policy_ref: &str) -> TestResult<ReviewMetadataV1> {
+fn review(policy_ref: &str) -> TestResult<ReviewMetadata> {
     let names = deploy::allocation_names(REGISTRY_UID, 1)?;
-    Ok(ReviewMetadataV1 {
+    Ok(ReviewMetadata {
         schema_version: REVIEW_METADATA_SCHEMA.to_owned(),
         scope: ReviewScope {
             claim_scope: claim_scope(),
@@ -39,9 +39,13 @@ fn review(policy_ref: &str) -> TestResult<ReviewMetadataV1> {
             transition_id: names.transition_id,
             sequence: 1,
         },
+        surface_digest: format!("sha256:{}", "0".repeat(64)),
         resources: Vec::new(),
         inputs: Vec::new(),
         reactions: Vec::new(),
+        handlers: Vec::new(),
+        egress: Vec::new(),
+        outputs: Vec::new(),
         runtime_permissions: Vec::new(),
         cleanup_permissions: Vec::new(),
         deployment_permissions: ReviewDeploymentPermissions {

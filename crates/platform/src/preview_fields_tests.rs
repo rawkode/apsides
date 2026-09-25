@@ -3,7 +3,7 @@ use crate::Result;
 use coordination::*;
 use serde_json::json;
 
-fn metadata() -> Result<ReviewMetadataV1> {
+fn metadata() -> Result<ReviewMetadata> {
     let claim_scope = ClaimScope {
         registry_uid: "11111111-1111-4111-8111-111111111111".into(),
         cluster_binding: "cluster".into(),
@@ -22,9 +22,10 @@ fn metadata() -> Result<ReviewMetadataV1> {
         accepted_enforcement_gaps: vec![],
         accepted_indirect_risks: vec![],
     };
-    Ok(ReviewMetadataV1 {
+    Ok(ReviewMetadata {
         schema_version:REVIEW_METADATA_SCHEMA.into(),scope:ReviewScope {claim_scope,domain_id:"example".into(),transition_id:names.transition_id,sequence:1},
-        resources:vec![],inputs:vec![],reactions:vec![],runtime_permissions:vec![],cleanup_permissions:vec![],
+        surface_digest:format!("sha256:{}", "0".repeat(64)),
+        resources:vec![],inputs:vec![],reactions:vec![],handlers:vec![],egress:vec![],outputs:vec![],runtime_permissions:vec![],cleanup_permissions:vec![],
         deployment_permissions:ReviewDeploymentPermissions {required_resources:vec![],creation_targets:vec![],role_delegation:vec![],
             scope:ReviewDeploymentScope::IssuedDeployerOnly,authorization:ReviewAuthorization::RequiredAccessOnly,
             limitations:vec![ReviewDeploymentLimitation::CreateNamesRequireAdmission,ReviewDeploymentLimitation::GeneratedNamesRequireBroadAccess,
@@ -90,7 +91,7 @@ fn object(data: Value) -> Value {
     value["data"] = data;
     value
 }
-fn next_generation(old: &ReviewMetadataV1) -> Result<ReviewMetadataV1> {
+fn next_generation(old: &ReviewMetadata) -> Result<ReviewMetadata> {
     let mut next = old.clone();
     next.scope.sequence = 3;
     next.scope.transition_id =
@@ -234,7 +235,7 @@ fn private_fields_v1_suffixes_and_managers_never_escape() -> Result<()> {
     Ok(())
 }
 
-fn rollout_metadata() -> Result<ReviewMetadataV1> {
+fn rollout_metadata() -> Result<ReviewMetadata> {
     let mut metadata = metadata()?;
     let mut target = resource("a");
     target.api_version = "apps/v1".into();

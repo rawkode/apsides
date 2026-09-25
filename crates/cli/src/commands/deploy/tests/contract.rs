@@ -34,6 +34,43 @@ fn declaration(private: &str) -> Result<Value> {
     Ok(ir)
 }
 
+/// Extends [`declaration`] with one handler (`sync-flags`, triggered by a
+/// new non-sensitive `settings` input) that reads `settings`, reaches
+/// `api.example.com:443`, and writes one output (`flags`, backed by its own
+/// `handlerOutput` `ConfigMap` resource) — the same shape as
+/// `compiler-core/tests/handlers.rs`'s fixture.
+fn handler_declaration(private: &str) -> Result<Value> {
+    let mut ir = declaration(private)?;
+    ir["provenance"]["inputs"]
+        .as_array_mut()
+        .ok_or("provenance inputs missing")?
+        .push(json!({"path":"handlers/sync-flags.ts","sha256":"1".repeat(64)}));
+    ir["resources"]
+        .as_array_mut()
+        .ok_or("resources missing")?
+        .push(json!({
+            "id":"output-flags","apiVersion":"v1","kind":"ConfigMap","name":"flags","namespace":"workload",
+            "desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"flags","namespace":"workload","labels":{"apsides.dev/handler-output":"output-flags"}}},
+            "lifecycle":{"deletionPolicy":"orphan"},"source":source(13),"handlerOutput":true
+        }));
+    ir["inputs"]
+        .as_array_mut()
+        .ok_or("inputs missing")?
+        .extend([
+            json!({"id":"settings","apiVersion":"v1","kind":"ConfigMap","name":"settings","namespace":"workload","mode":"observed","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":source(14)}),
+            json!({"id":"output-flags-input","apiVersion":"v1","kind":"ConfigMap","name":"flags","namespace":"workload","mode":"output","managedResourceId":"output-flags","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":source(15)}),
+        ]);
+    ir["handlers"] = json!([{
+        "id":"sync-flags","module":"handlers/sync-flags.ts","export":"syncFlags",
+        "trigger":{"kind":"input-changed","input":"settings"},
+        "inputs":["settings"],"egress":[{"host":"api.example.com","port":443}],
+        "outputs":["output-flags"],"timeoutMillis":30_000,"maxHeapBytes":67_108_864,
+        "bundleSha256":"1".repeat(64),"source":source(16)
+    }]);
+    ir["outputs"] = json!([{"id":"output-flags","name":"flags","namespace":"workload"}]);
+    Ok(ir)
+}
+
 fn transition(ir: &Value) -> Result<(StoredTransition, deploy::TransitionPlan)> {
     let (registry, base) = registry()?;
     let mut stored = registry.transition(TRANSITION_1)?.clone();
@@ -54,6 +91,55 @@ fn transition(ir: &Value) -> Result<(StoredTransition, deploy::TransitionPlan)> 
 fn report(ir: &Value) -> Result<Value> {
     let (stored, plan) = transition(ir)?;
     crate::review::transition_review_fixture(&stored, &plan, TRANSITION_1, None)
+}
+
+#[test]
+fn report_lists_handlers_egress_and_outputs_next_to_permissions_and_secrets() -> Result<()> {
+    let ir = handler_declaration("private-value-canary")?;
+    let (stored, plan) = transition(&ir)?;
+    let report = crate::review::transition_review_fixture(&stored, &plan, TRANSITION_1, None)?;
+    let surface = compiler_core::derive_surface(&plan.request.next.compiled);
+    assert_eq!(
+        report["surfaceDigest"],
+        json!(compiler_core::digest(&surface)?)
+    );
+    let handlers = report["handlers"]["after"]
+        .as_array()
+        .ok_or("handlers missing")?;
+    assert_eq!(handlers.len(), 1);
+    assert_eq!(handlers[0]["id"], "sync-flags");
+    assert_eq!(handlers[0]["trigger"], "settings");
+    assert_eq!(handlers[0]["inputs"], json!(["settings"]));
+    assert_eq!(handlers[0]["outputs"], json!(["output-flags"]));
+    assert_eq!(report["handlers"]["added"], report["handlers"]["after"]);
+
+    let egress = report["egress"]["after"]
+        .as_array()
+        .ok_or("egress missing")?;
+    assert_eq!(egress.len(), 1);
+    assert_eq!(egress[0]["host"], "api.example.com");
+    assert_eq!(egress[0]["port"], 443);
+    assert_eq!(egress[0]["handler"], "sync-flags");
+
+    let outputs = report["outputs"]["after"]
+        .as_array()
+        .ok_or("outputs missing")?;
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0]["id"], "output-flags");
+    assert_eq!(outputs[0]["name"], "flags");
+    assert_eq!(outputs[0]["namespace"], "workload");
+
+    // Rendered next to the existing permissions and secrets (secrets appear
+    // as sensitive-kind rows in the input-authority catalog).
+    assert!(report["permissions"]["runtime"]["after"].is_array());
+    let secrets = report["inputAuthority"]["after"]
+        .as_array()
+        .ok_or("inputs missing")?
+        .iter()
+        .filter(|input| input["kind"] == "Secret")
+        .count();
+    assert!(secrets > 0);
+    Ok(())
 }
 
 #[test]

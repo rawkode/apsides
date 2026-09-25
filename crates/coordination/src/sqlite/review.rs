@@ -1,7 +1,7 @@
 //! Strict content-addressed review publication and lookup.
 
 use super::SqliteCoordination;
-use crate::{Error, MAX_REVIEW_METADATA_BYTES, Result, ReviewMetadataV1, ReviewRef, ReviewStore};
+use crate::{Error, MAX_REVIEW_METADATA_BYTES, Result, ReviewMetadata, ReviewRef, ReviewStore};
 use async_trait::async_trait;
 use rusqlite::{Connection, TransactionBehavior, named_params, params};
 
@@ -119,7 +119,7 @@ fn validate_table_schema(connection: &Connection) -> Result<()> {
 
 #[async_trait]
 impl ReviewStore for SqliteCoordination {
-    async fn put_review(&self, metadata: &ReviewMetadataV1) -> Result<ReviewRef> {
+    async fn put_review(&self, metadata: &ReviewMetadata) -> Result<ReviewRef> {
         if self.read_only {
             return Err(Error::Invalid("read-only coordination store"));
         }
@@ -176,7 +176,7 @@ impl ReviewStore for SqliteCoordination {
         Ok(reference)
     }
 
-    async fn read_review(&self, reference: &ReviewRef) -> Result<Option<ReviewMetadataV1>> {
+    async fn read_review(&self, reference: &ReviewRef) -> Result<Option<ReviewMetadata>> {
         reference.validate()?;
         let target = reference.clone();
         self.with_connection(move |connection| read_bytes(connection, &target))
@@ -185,7 +185,7 @@ impl ReviewStore for SqliteCoordination {
                 if digest != reference.digest {
                     return Err(Error::Invalid("review reference mismatch"));
                 }
-                ReviewMetadataV1::decode(&bytes, reference)
+                ReviewMetadata::decode(&bytes, reference)
             })
             .transpose()
     }

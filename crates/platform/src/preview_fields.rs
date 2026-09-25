@@ -4,7 +4,7 @@
 //! observation/dry-run interval before using evidence. This module neither
 //! performs SSA nor establishes transport or ownership authority.
 use crate::{Result, invalid, preview_limits};
-use coordination::{REVIEW_ROLLOUT_FIELD, ReviewIdentity, ReviewMetadataV1, ReviewResource};
+use coordination::{REVIEW_ROLLOUT_FIELD, ReviewIdentity, ReviewMetadata, ReviewResource};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -73,8 +73,8 @@ pub struct PreviewFieldImpact {
 /// Rejects invalid metadata/context, mismatched objects, paths crossing arrays,
 /// or explicit object/path/output limits. Authentication is the caller's duty.
 pub fn classify_preview_fields(
-    previous: Option<&ReviewMetadataV1>,
-    next: &ReviewMetadataV1,
+    previous: Option<&ReviewMetadata>,
+    next: &ReviewMetadata,
     identity: &ReviewIdentity,
     objects: PreviewObjects<'_>,
 ) -> Result<PreviewFieldImpact> {
@@ -129,7 +129,7 @@ pub fn classify_preview_fields(
     )
 }
 
-fn has_reaction(metadata: &ReviewMetadataV1, resource: &ReviewResource) -> bool {
+fn has_reaction(metadata: &ReviewMetadata, resource: &ReviewResource) -> bool {
     metadata
         .reactions
         .iter()

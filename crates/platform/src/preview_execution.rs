@@ -50,8 +50,8 @@ impl Observation {
 
 pub(super) struct Declarations<'a> {
     pub request: &'a DeploymentRequest,
-    pub next: &'a coordination::ReviewMetadataV1,
-    pub previous: Option<&'a coordination::ReviewMetadataV1>,
+    pub next: &'a coordination::ReviewMetadata,
+    pub previous: Option<&'a coordination::ReviewMetadata>,
 }
 
 pub(super) async fn preview_target(

@@ -1,6 +1,6 @@
 //! Kubernetes identity correlates declarations; declaration IDs remain visible across replacements.
 use coordination::{
-    ReviewDeletionPolicy, ReviewIdentity, ReviewLifecycle, ReviewMetadataV1, ReviewOwnershipPlan,
+    ReviewDeletionPolicy, ReviewIdentity, ReviewLifecycle, ReviewMetadata, ReviewOwnershipPlan,
     ReviewResource, ReviewSource,
 };
 use deploy::{OwnershipIntent, ResourceIdentity};
@@ -56,8 +56,8 @@ pub(super) struct ResourceChange<'a> {
 }
 
 pub(super) fn resources<'a>(
-    before: Option<&'a ReviewMetadataV1>,
-    next: &'a ReviewMetadataV1,
+    before: Option<&'a ReviewMetadata>,
+    next: &'a ReviewMetadata,
     predecessor_inventory: Option<&'a inventory::InventorySnapshot>,
     intents: &'a [OwnershipIntent],
 ) -> crate::Result<Vec<ResourceChange<'a>>> {
@@ -75,7 +75,7 @@ pub(super) fn resources<'a>(
 }
 
 fn inventory_map<'a>(
-    before: Option<&ReviewMetadataV1>,
+    before: Option<&ReviewMetadata>,
     inventory: Option<&'a inventory::InventorySnapshot>,
 ) -> crate::Result<BTreeMap<ReviewIdentity, &'a inventory::TrackedResource>> {
     let (previous, inventory) = match (before, inventory) {

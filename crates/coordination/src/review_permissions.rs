@@ -1,6 +1,6 @@
 use super::validation::{name, namespace, require, sorted, text};
 use super::{
-    ReviewApiRequirement, ReviewDeploymentLimitation, ReviewMetadataV1, ReviewQualifiedServer,
+    ReviewApiRequirement, ReviewDeploymentLimitation, ReviewMetadata, ReviewQualifiedServer,
 };
 use super::{ReviewCapability, ReviewCeiling};
 use crate::Result;
@@ -105,7 +105,7 @@ fn risk(value: &str) -> bool {
             && parts.next().is_none()
     })
 }
-fn ceiling(value: &ReviewCeiling, metadata: &ReviewMetadataV1) -> Result<()> {
+fn ceiling(value: &ReviewCeiling, metadata: &ReviewMetadata) -> Result<()> {
     let scope = &metadata.scope;
     require(
         text(&value.policy_ref, 256)
@@ -125,7 +125,7 @@ fn ceiling(value: &ReviewCeiling, metadata: &ReviewMetadataV1) -> Result<()> {
     )
 }
 
-pub(super) fn validate(value: &ReviewMetadataV1) -> Result<()> {
+pub(super) fn validate(value: &ReviewMetadata) -> Result<()> {
     capabilities(&value.runtime_permissions, CapabilityUse::Requested)?;
     capabilities(&value.cleanup_permissions, CapabilityUse::Requested)?;
     let scope = &value.scope.claim_scope;
@@ -164,7 +164,7 @@ pub(super) fn validate(value: &ReviewMetadataV1) -> Result<()> {
     deployment(value)?;
     compatibility(value)
 }
-fn deployment(value: &ReviewMetadataV1) -> Result<()> {
+fn deployment(value: &ReviewMetadata) -> Result<()> {
     let d = &value.deployment_permissions;
     require(sorted(&d.required_resources) && sorted(&d.creation_targets)
         && d.limitations == [ReviewDeploymentLimitation::CreateNamesRequireAdmission,
@@ -226,7 +226,7 @@ fn capability_apis(capabilities: &[ReviewCapability]) -> Vec<ReviewApiRequiremen
         .into_iter()
         .collect()
 }
-fn deployment_apis(value: &ReviewMetadataV1) -> Vec<ReviewApiRequirement> {
+fn deployment_apis(value: &ReviewMetadata) -> Vec<ReviewApiRequirement> {
     value
         .deployment_permissions
         .required_resources
@@ -250,7 +250,7 @@ fn deployment_apis(value: &ReviewMetadataV1) -> Vec<ReviewApiRequirement> {
         .into_iter()
         .collect()
 }
-fn compatibility(value: &ReviewMetadataV1) -> Result<()> {
+fn compatibility(value: &ReviewMetadata) -> Result<()> {
     let c = &value.compatibility;
     let b = &c.runtime_budgets;
     require(

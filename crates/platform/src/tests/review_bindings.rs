@@ -1,5 +1,5 @@
 use super::*;
-use coordination::{ReviewMetadataV1, ReviewRef, ReviewStore};
+use coordination::{ReviewMetadata, ReviewRef, ReviewStore};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -82,11 +82,11 @@ impl ClaimStore for CountingClaims {
 
 struct FaultyReview {
     mode: u8,
-    expected: ReviewMetadataV1,
+    expected: ReviewMetadata,
 }
 #[async_trait::async_trait]
 impl ReviewStore for FaultyReview {
-    async fn put_review(&self, metadata: &ReviewMetadataV1) -> coordination::Result<ReviewRef> {
+    async fn put_review(&self, metadata: &ReviewMetadata) -> coordination::Result<ReviewRef> {
         if self.mode == 0 {
             return Err(coordination::Error::Backend("injected publication failure"));
         }
@@ -96,7 +96,7 @@ impl ReviewStore for FaultyReview {
         }
         Ok(reference)
     }
-    async fn read_review(&self, _: &ReviewRef) -> coordination::Result<Option<ReviewMetadataV1>> {
+    async fn read_review(&self, _: &ReviewRef) -> coordination::Result<Option<ReviewMetadata>> {
         if self.mode == 2 {
             return Ok(None);
         }
@@ -258,6 +258,49 @@ async fn selected_sessions_reject_changed_references_and_backend_substitution() 
     let expected = crate::project_review_metadata(registry.plan(TRANSITION_A)?)?;
     let selected = selected.with_review_store(Arc::new(FaultyReview { mode: 3, expected }));
     assert!(selected.validate_selection(&protected).await.is_err());
+    assert!(calls.lock().map_err(|_| "calls lock")?.is_empty());
+    Ok(())
+}
+
+/// A review store that serves the exact projected metadata for the selected
+/// plan, except its `surfaceDigest` has drifted (simulating a release whose
+/// surface changed after the transition was reviewed). Resume revalidates
+/// every selected session against a fresh projection of the exact same
+/// plan, so this drift must be caught exactly like any other authenticated
+/// metadata mismatch, with no dedicated surface-comparison code needed.
+struct SurfaceDriftReview {
+    expected: ReviewMetadata,
+}
+#[async_trait::async_trait]
+impl ReviewStore for SurfaceDriftReview {
+    async fn put_review(&self, metadata: &ReviewMetadata) -> coordination::Result<ReviewRef> {
+        metadata.reference()
+    }
+    async fn read_review(&self, _: &ReviewRef) -> coordination::Result<Option<ReviewMetadata>> {
+        let mut metadata = self.expected.clone();
+        metadata.surface_digest = format!("sha256:{}", "d".repeat(64));
+        Ok(Some(metadata))
+    }
+}
+
+#[tokio::test]
+async fn resumed_session_rejects_a_review_whose_surface_digest_drifted() -> TestResult {
+    let (registry, _, _, _, _) = staged_initial_fixture()?;
+    let (client, calls) = wire(vec![])?;
+    let selected = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_A)?;
+    let protected = Versioned {
+        value: registry.registry.clone(),
+        uid: REGISTRY_UID.into(),
+        resource_version: "42".into(),
+    };
+    let expected = crate::project_review_metadata(registry.plan(TRANSITION_A)?)?;
+    let selected = selected.with_review_store(Arc::new(SurfaceDriftReview { expected }));
+    let error = selected
+        .validate_selection(&protected)
+        .await
+        .err()
+        .ok_or("expected a resumed session with a drifted surface digest to be rejected")?;
+    assert!(error.to_string().contains("review metadata"));
     assert!(calls.lock().map_err(|_| "calls lock")?.is_empty());
     Ok(())
 }
