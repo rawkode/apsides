@@ -1178,6 +1178,7 @@ const derivedId = (value: string): string => {
   if (value.length <= derivedIdLimit && dnsLabelPattern.test(value)) return value;
   const prefix = value
     .slice(0, derivedIdLimit - derivedIdHashLength - 1)
+    .toLowerCase()
     .replace(/[^a-z0-9-]/g, "-")
     .replace(/^-+|-+$/g, "");
   let hash = 0xcbf29ce484222325n;

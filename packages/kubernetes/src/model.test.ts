@@ -459,6 +459,24 @@ throws(() => constrained.manage(new ConfigMap({ metadata: { name: "two", namespa
 }
 
 {
+  // A derived handler id lowercases a camelCase export instead of turning
+  // each capital into a separator, so `syncFlags` stays readable.
+  const value = domain("derived-handler-id");
+  const settings = value.observe(ConfigMap, { name: "settings", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  defineHandler(value, {
+    module: "./handlers/sync-flags.ts",
+    export: "syncFlags",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id],
+    egress: [],
+    outputs: [],
+    source,
+  });
+  const id = value.toIR().handlers[0]!.id;
+  assert(/^handler-syncflags---handlers-sync-flags-ts-[0-9a-f]{10}$/.test(id), `derived handler id is readable: ${id}`);
+}
+
+{
   // A closure is never a valid handler reference at the runtime.ts JSX
   // layer; model.ts itself only ever accepts an already-split module/export
   // pair, so the "closures are rejected" contract is exercised in
