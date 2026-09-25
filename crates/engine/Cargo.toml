@@ -8,14 +8,12 @@ publish = false
 
 # Phase 5a spike gate (see the Apsides v0.3 plan, "Phase 5 -> 5a. Spike
 # gate"): this crate exists separately from `runtime` because
-# `runtime/src/lib.rs` carries
-# `#![forbid(unsafe_code)]` (forbid, not deny — it cannot be locally
-# re-allowed by any module) and documents "This crate deliberately has no
-# JavaScript engine." Embedding deno_core/V8 requires one unavoidable unsafe
-# call site (`v8::new_rust_allocator`), so it is confined here instead, in
-# `src/v8_alloc.rs`, under the workspace's `unsafe_code = "deny"` policy
-# (deny, not forbid), with a module-level `#[allow(unsafe_code)]` and
-# justification per the workspace hard rule.
+# `runtime/src/lib.rs` carries `#![forbid(unsafe_code)]` (forbid, not deny —
+# it cannot be locally re-allowed by any module). Embedding deno_core/V8
+# requires one unavoidable unsafe call site (`v8::new_rust_allocator`), so it
+# is confined here instead, in `src/v8_alloc.rs`, under the workspace's
+# `unsafe_code = "deny"` policy (deny, not forbid), with a module-level
+# `#[allow(unsafe_code)]` and justification per the workspace hard rule.
 [dependencies]
 # Pinned exact: deno_core 0.412.0 is the newest release on crates.io as of
 # this spike (2026-09-24) whose declared MSRV is compatible with the

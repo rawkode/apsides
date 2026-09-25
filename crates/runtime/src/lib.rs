@@ -1,9 +1,13 @@
 #![forbid(unsafe_code)]
 //! Native execution of the finite Apsides IR.
 //!
-//! This crate deliberately has no JavaScript engine. Production execution uses
-//! a fixed in-cluster identity and protected platform activation; fixture
-//! execution remains a separately acknowledged disposable-cluster mode.
+//! Production execution uses a fixed in-cluster identity and protected
+//! platform activation, and runs the program's declared event handlers from
+//! their embedded, locked bundles through the `engine` crate's sandboxed V8
+//! isolate (see `handlers.rs`); the engine, and its one unsafe call site,
+//! stay outside this crate. Fixture execution remains a separately
+//! acknowledged disposable-cluster mode: it verifies the embedded handler
+//! bundles against the validated IR but never executes them.
 
 mod handlers;
 mod kube_connector;

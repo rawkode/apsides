@@ -429,10 +429,10 @@ impl Live<'_> {
 
     /// Simulate a handler's own write to its output: an SSA apply of exactly
     /// the changed `data` key, under the handler field manager
-    /// (`apsides-handler-<domainId>`), never forced. This increment has no
-    /// handler execution runtime yet (`IR-CONTRACT.md`'s "Runtime execution
-    /// of a handler's bundle … is a later phase"), so the fixture stands in
-    /// for it to exercise a `rolloutOn` reaction on an output end to end; the
+    /// (`apsides-handler-<domainId>`), never forced. Fixture mode verifies
+    /// embedded handler bundles but never executes them (see `runtime`'s
+    /// `run_locked`), so the fixture stands in for the handler to exercise
+    /// a `rolloutOn` reaction on an output end to end; the
     /// reconciler's own manager (`apsides-<domainId>`) never claims `data` on
     /// a handler output (see `preview_execution.rs::require_apply_owner`),
     /// so this distinct manager owns it without conflict.

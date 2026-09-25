@@ -10,10 +10,10 @@
 //! re-check reconciler mutations use, under field manager
 //! `apsides-handler-<domainId>`.
 //!
-//! See the Apsides v0.3 plan, Phase 5b. `HandlerRuntime` is driven by
-//! [`crate::production::ProductionController`] (production mode) and by
-//! the fixture controller (`crate::fixture`, gated the same way as its own
-//! egress override); see this module's own tests (a fake `kube::Client`
+//! See the Apsides v0.3 plan, Phase 5b. `HandlerRuntime` is driven only by
+//! [`crate::production::ProductionController`]: fixture mode verifies the
+//! embedded bundles against the IR but never executes them (see
+//! `crate::run_locked`). See this module's own tests (a fake `kube::Client`
 //! built the same way `production.rs`'s own test module builds one) for
 //! coverage of the dispatch, queue, backoff, and revision-computation
 //! behavior in isolation from that larger harness, and `production.rs`'s

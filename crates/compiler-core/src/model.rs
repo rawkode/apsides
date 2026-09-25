@@ -182,9 +182,9 @@ pub struct EgressHost {
 ///
 /// A bundled TypeScript module invoked when its trigger input's revision
 /// changes, reading declared inputs, reaching declared egress hosts, and
-/// writing declared outputs. Runtime execution is out of scope for this IR:
-/// the compiled bundle is embedded in the controller image for a later phase
-/// to run.
+/// writing declared outputs. The IR only describes the handler: the compiled
+/// bundle is embedded in the controller image, where the runtime runs it
+/// through the `engine` crate in production mode.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Handler {

@@ -9,8 +9,8 @@
 //! the canonical bytes.
 //!
 //! The surface deliberately excludes desired values, `ConfigMap` data, and
-//! source file locations: it is meant to be shared and diffed (a future
-//! `aps diff`), not to reproduce the program. It does include every secret
+//! source file locations: it is meant to be shared and diffed (`aps diff`),
+//! not to reproduce the program. It does include every secret
 //! the reconciler reads, including its own rollout-key secret — an internal
 //! mechanism, but still real read authority a reviewer should see.
 
@@ -81,8 +81,8 @@ pub struct SurfaceVerb {
 pub struct SurfaceSecretRead {
     pub namespace: String,
     pub name: String,
-    /// `"reconcile"` for the controller's own reconcile loop; a handler id
-    /// once Phase 4/5 add handlers that read secrets.
+    /// `"reconcile"` for the controller's own reconcile loop, the only
+    /// Secret reader: a handler can only read `ConfigMap` inputs.
     pub reader: String,
 }
 

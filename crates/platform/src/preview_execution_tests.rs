@@ -63,7 +63,7 @@ fn handler_output_resource() -> Resource {
 /// the reconciler's own SSA of it, under field manager `apsides-<domain>`, never
 /// claims `data`, so it still passes `require_apply_owner` on the strength of the
 /// reserved label alone, while a distinct field manager (`apsides-handler-<domain>`,
-/// where a later phase attributes handler writes) separately owns `data` without
+/// under which the runtime commits handler writes) separately owns `data` without
 /// conflict.
 #[test]
 fn handler_output_apply_evidence_never_claims_data_which_a_distinct_manager_owns() -> Result<()> {

@@ -1,11 +1,10 @@
-//! Shared sizing constants for the Phase 5b handler engine.
+//! Shared sizing constants for the handler engine.
 //!
 //! Used by both `runtime` (to build `engine::Limits` for one invocation)
 //! and `platform` (to size the controller pod's memory limit), so the two
-//! formulas cannot silently drift apart -- see the Apsides v0.3 plan,
-//! Phase 5b review item C. `engine` itself cannot depend on this crate (it
-//! is deliberately IR-agnostic -- see its own crate doc comment), so its
-//! two internal constants that also feed this formula
+//! formulas cannot silently drift apart. `engine` itself cannot depend on
+//! this crate (it is deliberately IR-agnostic -- see its own crate doc
+//! comment), so its two internal constants that also feed this formula
 //! (`HEAP_LIMIT_TERMINATION_HEADROOM_TOTAL_CAP_BYTES` and
 //! `ops::MAX_FETCH_REQUEST_BODY_BYTES`, both in `crates/engine/src`) are
 //! mirrored here rather than imported; `runtime` (which depends on both
@@ -52,11 +51,10 @@ pub const HANDLER_HEAP_HEADROOM_TOTAL_BYTES: u64 = 32 * BYTES_PER_MI;
 /// `heap_bytes` of V8 heap: at most half the heap, and never more than
 /// [`HANDLER_ARRAY_BUFFER_CAP_BYTES`].
 ///
-/// See the Apsides v0.3 plan, Phase 5b review item C: an uncapped
-/// `max_array_buffer_bytes` (formerly set equal to the whole declared
-/// heap) let `ArrayBuffer` allocations alone approach the full declared
-/// heap *on top of* the heap itself, doubling worst-case process memory
-/// rather than sharing a bound with it.
+/// `ArrayBuffer` backing stores live outside the V8 heap the heap limit
+/// watches, so an uncapped `max_array_buffer_bytes` would let them alone
+/// approach the full declared heap *on top of* the heap itself, doubling
+/// worst-case process memory rather than sharing a bound with it.
 #[must_use]
 pub const fn array_buffer_cap_bytes(heap_bytes: u64) -> u64 {
     let half = heap_bytes / 2;

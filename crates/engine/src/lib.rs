@@ -4,8 +4,9 @@
 //! network access except through the three typed, capability-checked ops
 //! in [`ops`]. Grew out of the Phase 5a spike gate, which proved the
 //! embedding itself was feasible; this is now the real Phase 5b engine
-//! API ([`invoke_handler`] and friends), IR-agnostic and not yet wired
-//! into `runtime` (that waits for Phase 4's handler IR).
+//! API ([`invoke_handler`] and friends), IR-agnostic: `runtime`'s
+//! `handlers` module maps each IR handler onto an invocation and drives it
+//! through [`invoke_handler_with_watchdog`] in production mode.
 //!
 //! Every invocation gets: a capped `ArrayBuffer` allocator, a heap limit
 //! whose near-heap-limit callback requests isolate termination on
@@ -490,8 +491,10 @@ const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
      * @param {string} key `[-._a-zA-Z0-9]+`, at most 253 characters, never
      *   exactly `.` or `..`
      * @param {string | Uint8Array} data valid UTF-8 text
-     * @throws {Error} `OUTPUT_UNDECLARED`, `INVALID_KEY`, `OUTPUT_TOO_LARGE`,
-     *   or if `data` is not valid UTF-8
+     * @throws {Error} with `.code` `UNDECLARED_OUTPUT_ID`, `INVALID_KEY`,
+     *   `DATA_TOO_LARGE`, `OPS_CLOSED` (called after the handler returned),
+     *   or `SINK_REJECTED` (the controller's sink refuses `data` that is not
+     *   valid UTF-8)
      */
     writeOutput: (id, key, data) => {
       const outcome = opOutputWrite(id, key, toBytes(data));
@@ -833,11 +836,12 @@ pub const FIXTURE_ACKNOWLEDGEMENT: &str = "disposable-cluster-only";
 /// `acknowledgement` is set to anything else, including an empty string or
 /// a close-but-wrong value.
 ///
-/// `crates/runtime` (once Phase 4 wires this crate in) must construct a
-/// `FixtureEgressOverride` only from its own fixture-mode startup config --
-/// the same posture as `runtime`'s own `FIXTURE_ACKNOWLEDGEMENT` constant
-/// and `allowNoLandlock` escape hatch -- never from anything a request or
-/// a handler's own event payload could influence.
+/// `crates/runtime`'s production path never constructs a
+/// `FixtureEgressOverride` at all (its `production_egress_policy` has no
+/// config surface that could supply one), and nothing may ever build one
+/// from anything a request or a handler's own event payload could
+/// influence -- the same posture as `runtime`'s own
+/// `FIXTURE_ACKNOWLEDGEMENT` constant and `allowNoLandlock` escape hatch.
 #[derive(Debug, Clone)]
 pub struct FixtureEgressOverride {
     pub acknowledgement: String,

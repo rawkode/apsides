@@ -110,7 +110,7 @@ pub fn emit(plan: &CompiledPlan, output: &Path, stage: &Path) -> Result<()> {
         main_rs.as_bytes(),
         &mut files,
     )?;
-    let boundary = b"This is a local native compilation artifact. It is not a production OCI bundle.\nDeployment remains blocked until provenance, image identity, platform ceiling, claims, short-lived credentials, and generation transition gates pass.\nThe generated Rust embeds validated IR; it never evaluates TypeScript or loads JavaScript.\nCargo dependencies currently resolve from the prepared local cache. Cross-host reproducibility is not yet established.\n";
+    let boundary = b"This is a local native compilation artifact. It is not a production OCI bundle.\nDeployment remains blocked until provenance, image identity, platform ceiling, claims, short-lived credentials, and generation transition gates pass.\nThe generated Rust embeds validated IR and the program's locked, bundled handler modules. Only the controller's embedded handler engine evaluates those bundles; the TSX program itself is never evaluated at runtime.\nCargo dependencies currently resolve from the prepared local cache. Cross-host reproducibility is not yet established.\n";
     write(output, "BOUNDARY.txt", boundary, &mut files)?;
     let manifest = Manifest {
         schema_version: "apsides.dev/local-artifact/v1".into(),

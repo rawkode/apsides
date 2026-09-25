@@ -1,6 +1,6 @@
 # `@apsides/kubernetes`
 
-Apsides uses TSX components and hooks to describe a fixed Kubernetes controller. Components execute only during isolated compilation. The compiler lowers their tree into the existing validated native IR; runtime reconciliation executes no JavaScript callbacks.
+Apsides uses TSX components and hooks to describe a fixed Kubernetes controller. Components execute only during isolated compilation. The compiler lowers their tree into the existing validated native IR; runtime reconciliation never calls back into them. A controller runs JavaScript only for the handler modules `<On>` elements declare: each is bundled at compile time and executed in production mode by the controller's embedded engine, with access only to its declared inputs, egress hosts and outputs.
 
 ```tsx
 const Api = () => {
