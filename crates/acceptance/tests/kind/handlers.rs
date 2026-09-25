@@ -302,12 +302,22 @@ async fn assert_restart_seeds_and_rewrites_nothing(
         "{}-process",
         checkpoint.runtime_binding.service_account_name
     );
-    let controller_pod = objects
+    let listed = objects
         .list("v1", "Pod", Some(CONTROL_NAMESPACE), None)
         .await?
         .into_iter()
         .find(|pod| text(pod, "/spec/serviceAccountName") == account)
         .ok_or_else(|| Error::Check("the controller Pod is absent".into()))?;
+    // List items carry no apiVersion or kind, which `Objects::delete`
+    // needs, so fetch the Pod itself as the other scenarios do.
+    let controller_pod = objects
+        .require(
+            "v1",
+            "Pod",
+            Some(CONTROL_NAMESPACE),
+            text(&listed, "/metadata/name"),
+        )
+        .await?;
     ensure(
         has_container(&controller_pod, "controller"),
         "the selected Pod must run the controller container, not the proxy",
