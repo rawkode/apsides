@@ -1,9 +1,9 @@
 use crate::{
     Capability, CompiledPlan, Effect, Error, HANDLER_OUTPUT_LABEL, HANDLER_TRIGGER_INPUT_CHANGED,
-    Handler, IR_SCHEMA, Input, InputMode, Ir, MAX_EGRESS_HOSTS, MAX_HANDLER_HEAP_BYTES,
-    MAX_HANDLER_TIMEOUT_MILLIS, MAX_HANDLERS, Output, PermissionCeiling, Provenance, Request,
-    Resource, Result, SourceLocation, TestCase, canonical_bytes, digest, parse_strict,
-    resolve_resource_api,
+    Handler, IR_SCHEMA, Input, InputMode, Ir, MAX_EGRESS_HOSTS, MAX_EGRESS_ROWS,
+    MAX_HANDLER_HEAP_BYTES, MAX_HANDLER_TIMEOUT_MILLIS, MAX_HANDLERS, Output, PermissionCeiling,
+    Provenance, Request, Resource, Result, SourceLocation, TestCase, canonical_bytes, digest,
+    parse_strict, resolve_resource_api,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -814,6 +814,7 @@ fn validate_handlers(
     )?;
     let mut handler_ids = BTreeSet::new();
     let mut egress_hosts = BTreeSet::new();
+    let mut total_egress_rows: usize = 0;
     let mut claimed_outputs: BTreeSet<&str> = BTreeSet::new();
     for handler in &ir.handlers {
         require(
@@ -822,6 +823,12 @@ fn validate_handlers(
         )?;
         validate_handler_shape(ir, handler)?;
         validate_handler_edges(handler, inputs, outputs, &mut egress_hosts)?;
+        // Each (host, port) pair within one handler is already required
+        // unique by `validate_handler_edges`, and two different handlers'
+        // rows are never equal (they carry different `handler` ids), so
+        // this raw sum is exactly the row count `derive_surface` (and the
+        // review metadata catalog projected from it) will carry.
+        total_egress_rows += handler.egress.len();
         // Each output has exactly one writer handler: two handlers claiming
         // the same output would both SSA-apply `data` under the same field
         // manager (`apsides-handler-<domainId>`) and silently drop each
@@ -836,6 +843,10 @@ fn validate_handlers(
     require(
         egress_hosts.len() <= MAX_EGRESS_HOSTS,
         format!("domain exceeds maxEgressHosts budget of {MAX_EGRESS_HOSTS}"),
+    )?;
+    require(
+        total_egress_rows <= MAX_EGRESS_ROWS,
+        format!("domain exceeds maxEgressRows budget of {MAX_EGRESS_ROWS}"),
     )?;
     validate_handler_graph(ir, inputs, &handler_ids)
 }

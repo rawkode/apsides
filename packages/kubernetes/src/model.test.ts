@@ -435,6 +435,30 @@ throws(() => constrained.manage(new ConfigMap({ metadata: { name: "two", namespa
 }
 
 {
+  // 16 distinct hosts (at, not over, MAX_EGRESS_HOSTS) times 17 distinct
+  // ports each: 272 rows, over MAX_EGRESS_ROWS (256) despite never
+  // tripping the distinct-host budget.
+  const value = domain("egress-rows");
+  const settings = value.observe(ConfigMap, { name: "settings", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  const egress: string[] = [];
+  for (let hostIndex = 0; hostIndex < 16; hostIndex++) {
+    for (let portOffset = 0; portOffset < 17; portOffset++) {
+      egress.push(`host-${String(hostIndex)}.example.com:${String(443 + portOffset)}`);
+    }
+  }
+  equal(egress.length, 272, "272 egress rows constructed");
+  throws(() => defineHandler(value, {
+    module: "./handlers/bad.ts",
+    export: "bad",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id],
+    egress,
+    outputs: [],
+    source,
+  }), "maxEgressRows");
+}
+
+{
   // A closure is never a valid handler reference at the runtime.ts JSX
   // layer; model.ts itself only ever accepts an already-split module/export
   // pair, so the "closures are rejected" contract is exercised in

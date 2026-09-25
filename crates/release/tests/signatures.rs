@@ -382,6 +382,37 @@ async fn tampered_surface_document_is_rejected_even_when_resigned() -> TestResul
     Ok(())
 }
 
+/// A `surface.json` that is semantically identical to what the compiler
+/// derives -- same parsed value, just pretty-printed rather than canonical
+/// -- is still rejected. The value-equality check above alone would accept
+/// it (it compares parsed JSON), so this exercises the separate,
+/// canonical-bytes digest check `aps deploy`'s independent surface
+/// recomputation relies on: `manifest.files["surface.json"]` must equal
+/// `compiler_core::digest` of the derived surface, not merely a digest of
+/// *some* byte encoding of an equal value.
+#[tokio::test]
+async fn noncanonical_surface_document_is_rejected_even_when_semantically_equal() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let policy = release(root.path())?;
+    let surface: Value = serde_json::from_slice(&fs::read(root.path().join("surface.json"))?)?;
+    let bytes = serde_json::to_vec_pretty(&surface)?;
+    assert_ne!(
+        bytes,
+        canonical_bytes(&surface)?,
+        "pretty-printed bytes must actually differ from canonical bytes"
+    );
+    fs::write(root.path().join("surface.json"), &bytes)?;
+    let mut manifest: Value = serde_json::from_slice(&fs::read(root.path().join("release.json"))?)?;
+    manifest["files"]["surface.json"] = json!(hash(&bytes));
+    write_json(root.path(), "release.json", &manifest)?;
+    resign(root.path())?;
+    assert_eq!(
+        rejection(root.path(), &policy).await?,
+        "release rejected: release surface.json is not canonical JSON"
+    );
+    Ok(())
+}
+
 fn write_oci(root: &Path, binary: &[u8], ir_digest: &str) -> TestResult<String> {
     write_oci_with_base(root, binary, ir_digest, Base::Approved)
 }

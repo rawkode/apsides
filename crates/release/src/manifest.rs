@@ -263,6 +263,22 @@ fn validate_compilation(root: &Path, manifest: &ReleaseManifest) -> Result<Compi
                 "release review document differs from trusted derivation: {name}"
             ));
         }
+        // `surface.json`'s recorded manifest digest binds `aps deploy`'s
+        // independent surface recomputation (see
+        // `commands::deploy::surface::verify_surface_binding`). The value
+        // check above alone is not enough: it compares parsed JSON, so a
+        // re-signed release whose `surface.json` bytes are semantically
+        // equal but not the canonical encoding `aps compile` writes (e.g.
+        // pretty-printed) would still pass it, yet its recorded digest
+        // would then differ from `compiler_core::digest`'s canonical-bytes
+        // recomputation. Require the recorded digest to equal the exact
+        // canonical-bytes digest so that gap cannot exist.
+        if name == "surface.json" {
+            let canonical_digest = digest(&expected)?;
+            if manifest.files.get(name) != Some(&canonical_digest) {
+                return reject("release surface.json is not canonical JSON");
+            }
+        }
     }
     let test_plan = json(
         &bounded_read(&contained(root, "test-plan.json")?, MAX_DOCUMENT)?,

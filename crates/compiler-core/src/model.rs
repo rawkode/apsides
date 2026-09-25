@@ -16,6 +16,15 @@ pub const MAX_HANDLER_HEAP_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_HANDLERS: usize = 16;
 /// At most 16 distinct egress hosts across every handler in a domain.
 pub const MAX_EGRESS_HOSTS: usize = 16;
+/// At most 256 total `(host, port, handler)` egress rows across every
+/// handler in a domain.
+///
+/// `MAX_HANDLERS` handlers each declaring up to `MAX_EGRESS_HOSTS` hosts at
+/// several distinct ports can otherwise exceed the review metadata
+/// catalog's own row budget (`coordination`'s `MAX_REVIEW_DECLARATIONS`,
+/// also 256): this bound makes that a clear compile-time error instead of
+/// an opaque review-time rejection.
+pub const MAX_EGRESS_ROWS: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

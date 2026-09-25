@@ -9,6 +9,15 @@ export const MAX_HANDLER_TIMEOUT_MILLIS = 30_000;
 export const MAX_HANDLER_HEAP_BYTES = 64 * 1024 * 1024;
 export const MAX_HANDLERS = 16;
 export const MAX_EGRESS_HOSTS = 16;
+/**
+ * At most 256 total `(host, port, handler)` egress rows across every
+ * handler in a domain. `MAX_HANDLERS` handlers each declaring up to
+ * `MAX_EGRESS_HOSTS` hosts at several distinct ports can otherwise exceed
+ * the review metadata catalog's own row budget (Rust `coordination`'s
+ * `MAX_REVIEW_DECLARATIONS`, also 256): this bound makes that a clear
+ * authoring-time error instead of an opaque review-time rejection.
+ */
+export const MAX_EGRESS_ROWS = 256;
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
@@ -728,6 +737,14 @@ export class Domain {
     const existingHosts = [...this.#state.handlers.values()].flatMap((handler) => handler.egress.map((entry) => entry.host));
     const totalEgressHosts = new Set([...existingHosts, ...egress.map((entry) => entry.host)]);
     if (totalEgressHosts.size > MAX_EGRESS_HOSTS) throw new Error(`domain exceeds maxEgressHosts budget of ${MAX_EGRESS_HOSTS}`);
+    // Each (host, port) pair within one handler is already required unique
+    // above, and two different handlers' rows are never equal (they carry
+    // different handler ids), so this raw sum is exactly the row count the
+    // derived surface (and the review metadata catalog projected from it)
+    // will carry.
+    const existingEgressRows = [...this.#state.handlers.values()].reduce((sum, handler) => sum + handler.egress.length, 0);
+    const totalEgressRows = existingEgressRows + egress.length;
+    if (totalEgressRows > MAX_EGRESS_ROWS) throw new Error(`domain exceeds maxEgressRows budget of ${MAX_EGRESS_ROWS}`);
     const source = validateSource(options.source, "handler.source");
     const declaration = freeze(canonical({
       id,

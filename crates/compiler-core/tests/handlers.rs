@@ -287,6 +287,26 @@ fn max_egress_hosts_budget_is_sixteen() -> TestResult {
 }
 
 #[test]
+fn max_egress_rows_budget_is_two_hundred_fifty_six() -> TestResult {
+    let mut value = fixture();
+    // 16 distinct hosts (at, not over, `maxEgressHosts`) times 17 distinct
+    // ports each: 272 rows, over `maxEgressRows` (256) despite never
+    // tripping the distinct-host budget.
+    let mut rows = Vec::new();
+    for host_index in 0..16 {
+        for port_offset in 0..17_u16 {
+            rows.push(json!({
+                "host": format!("host-{host_index}.example.com"),
+                "port": 443 + port_offset,
+            }));
+        }
+    }
+    assert_eq!(rows.len(), 272);
+    value["handlers"][0]["egress"] = json!(rows);
+    expect_err(&value, "maxEgressRows")
+}
+
+#[test]
 fn handler_module_must_be_a_declared_build_input() -> TestResult {
     let mut value = fixture();
     value["handlers"][0]["module"] = json!("handlers/unlocked.ts");

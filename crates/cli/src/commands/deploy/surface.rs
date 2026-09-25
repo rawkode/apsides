@@ -17,18 +17,24 @@ pub(super) enum SurfaceBindingError {
     /// The surface recomputed from the verified release's own IR does not
     /// match the digest `release.json` recorded for `surface.json`.
     ///
-    /// `release::read_release` already checks `surface.json`'s content
-    /// against a fresh derivation and its bytes against the recorded
-    /// digest, so this should never trigger in practice; it exists as an
-    /// explicit, independent deploy-level assertion rather than an implicit
-    /// consequence of release parsing.
+    /// `release::read_release` already requires the recorded digest to
+    /// equal the canonical-bytes digest of a fresh derivation, so this
+    /// should be unreachable for any release that passed verification; it
+    /// exists as an explicit, independent deploy-level assertion of that
+    /// guarantee rather than an implicit consequence of release parsing.
     ReleaseMismatch {
         recomputed: String,
         recorded: String,
     },
     /// The surface recomputed from the verified release's own IR does not
-    /// match the `surfaceDigest` the reviewed, approved metadata carries:
-    /// the release being deployed is not the release that was reviewed.
+    /// match the `surfaceDigest` the reviewed, authenticated metadata
+    /// carries.
+    ///
+    /// `platform::transition_session`'s `authenticate_reviews` already
+    /// requires the served review body to equal a fresh projection of the
+    /// exact plan `verified` binds, so this should also be unreachable when
+    /// `verified` and `reviewed` come from the same session; it exists as
+    /// an explicit, independent deploy-level assertion of that guarantee.
     ReviewMismatch {
         recomputed: String,
         reviewed: String,
@@ -77,15 +83,23 @@ pub(super) fn verify_surface_binding(
 
 /// The pure comparison at the heart of [`verify_surface_binding`], isolated
 /// so its two failure modes are directly unit-testable without a signed
-/// release fixture: `release::read_release` (which every real `recorded`
-/// digest already passed through) independently guarantees `recomputed ==
-/// recorded` for any real [`release::IntegrityVerifiedCandidate`] — see
-/// `crates/release/tests/signatures.rs`'s
-/// `tampered_surface_document_is_rejected_even_when_resigned`, which proves
-/// that guarantee holds even across a re-sign — so `ReleaseMismatch` here is
-/// a defense-in-depth assertion, while `ReviewMismatch` is the new check
-/// this phase adds: the release actually being deployed may still disagree
-/// with what was reviewed.
+/// release fixture. Neither branch should be reachable given the rest of
+/// the system's own guarantees, and both are kept anyway as named,
+/// defense-in-depth assertions rather than trusted-by-construction:
+///
+/// - `release::read_release` already requires `recorded` to equal
+///   `compiler_core::digest` of the derived surface's *canonical* bytes,
+///   not merely a value-equal document, so `recomputed == recorded` holds
+///   for any real [`release::IntegrityVerifiedCandidate`] — see
+///   `crates/release/tests/signatures.rs`'s
+///   `tampered_surface_document_is_rejected_even_when_resigned` and
+///   `noncanonical_surface_document_is_rejected_even_when_semantically_equal`.
+/// - `reviewed` is authenticated by `platform::transition_session`'s
+///   `authenticate_reviews`, which already requires the stored review body
+///   to equal a fresh `project_review_metadata` of the exact same plan
+///   `verified` binds — the same `derive_surface` call this function's
+///   caller makes — so `recomputed == reviewed` holds whenever `verified`
+///   and the session that authenticated `reviewed` share one release.
 fn check(recomputed: &str, recorded: &str, reviewed: &str) -> Result<()> {
     if recomputed != recorded {
         return Err(Box::new(SurfaceBindingError::ReleaseMismatch {

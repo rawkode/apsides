@@ -263,13 +263,15 @@ async fn selected_sessions_reject_changed_references_and_backend_substitution() 
 }
 
 /// A review store that serves the exact projected metadata for the selected
-/// plan, except its `surfaceDigest` has drifted (simulating a release whose
-/// surface changed after the transition was reviewed). Resume revalidates
-/// every selected session against a fresh projection of the exact same
-/// plan, so this drift must be caught exactly like any other authenticated
-/// metadata mismatch, with no dedicated surface-comparison code needed.
+/// plan, optionally with only its `surfaceDigest` changed (simulating a
+/// release whose surface changed after the transition was reviewed).
+/// Resume revalidates every selected session against a fresh projection of
+/// the exact same plan, so this drift must be caught exactly like any other
+/// authenticated metadata mismatch, with no dedicated surface-comparison
+/// code needed.
 struct SurfaceDriftReview {
     expected: ReviewMetadata,
+    tamper: bool,
 }
 #[async_trait::async_trait]
 impl ReviewStore for SurfaceDriftReview {
@@ -278,23 +280,55 @@ impl ReviewStore for SurfaceDriftReview {
     }
     async fn read_review(&self, _: &ReviewRef) -> coordination::Result<Option<ReviewMetadata>> {
         let mut metadata = self.expected.clone();
-        metadata.surface_digest = format!("sha256:{}", "d".repeat(64));
+        if self.tamper {
+            metadata.surface_digest = format!("sha256:{}", "d".repeat(64));
+        }
         Ok(Some(metadata))
     }
 }
 
+/// `validate_selection`'s rejection on a metadata mismatch
+/// (`"selected transition review metadata changed"`) is a generic
+/// whole-body comparison and does not name which field differed, so this
+/// cannot assert the error text mentions `surfaceDigest` specifically.
+/// Instead it isolates the field by construction and contrast: the control
+/// case serves the exact projected metadata back unmodified and the
+/// resumed session is accepted; changing only `surfaceDigest` (every other
+/// field, including `scope` and every resource/input/handler/egress/output
+/// row, stays identical) and nothing else about the fixture is what turns
+/// that same session into a rejection.
 #[tokio::test]
-async fn resumed_session_rejects_a_review_whose_surface_digest_drifted() -> TestResult {
-    let (registry, _, _, _, _) = staged_initial_fixture()?;
-    let (client, calls) = wire(vec![])?;
-    let selected = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_A)?;
+async fn resumed_session_accepts_an_unchanged_review_and_rejects_only_a_drifted_surface_digest()
+-> TestResult {
+    let (registry, _, policy, _, _) = staged_initial_fixture()?;
     let protected = Versioned {
         value: registry.registry.clone(),
         uid: REGISTRY_UID.into(),
         resource_version: "42".into(),
     };
     let expected = crate::project_review_metadata(registry.plan(TRANSITION_A)?)?;
-    let selected = selected.with_review_store(Arc::new(SurfaceDriftReview { expected }));
+
+    let (client, calls) = wire(vec![object("policy", &policy, "policy-uid", "40")?])?;
+    let selected = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_A)?;
+    let selected = selected.with_review_store(Arc::new(SurfaceDriftReview {
+        expected: expected.clone(),
+        tamper: false,
+    }));
+    selected.validate_selection(&protected).await?;
+    assert!(
+        calls
+            .lock()
+            .map_err(|_| "calls lock")?
+            .iter()
+            .all(|(method, _, _)| method == "GET")
+    );
+
+    let (client, calls) = wire(vec![])?;
+    let selected = registry.bind(client, "control", "workload", "cluster-a", TRANSITION_A)?;
+    let selected = selected.with_review_store(Arc::new(SurfaceDriftReview {
+        expected,
+        tamper: true,
+    }));
     let error = selected
         .validate_selection(&protected)
         .await
