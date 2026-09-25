@@ -52,7 +52,7 @@ different one; see `crates/release/tests/signatures.rs`'s
 `aps deploy` also, independently, recomputes the same surface digest from the
 verified release's own IR and requires it to equal both the release's
 recorded `surface.json` digest and the `surfaceDigest` the reviewed,
-authenticated metadata carries (see [REVIEW-CONTRACT.md](REVIEW-CONTRACT.md)),
+authenticated metadata carries (see [the review contract](/reference/review-contract/)),
 failing with a typed error naming the disagreeing digests on either mismatch,
 with no override flag. Given the two guarantees above, neither mismatch
 should be reachable in practice; this check exists as an explicit,

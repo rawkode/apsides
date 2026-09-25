@@ -36,7 +36,7 @@ pub async fn platform(objects: &Objects) -> Result<String> {
 ///
 /// # Errors
 /// Fails when the reference is not digest-pinned, the pull fails or the CRI
-/// does not resolve the reference afterwards.
+/// does not resolve the reference within [`CRI_SYNC`] afterwards.
 pub async fn pull(node: &str, reference: &str, platform: &str) -> Result {
     let pinned = reference.rsplit_once('@').map_or("", |(_, pinned)| pinned);
     ensure(
@@ -50,15 +50,28 @@ pub async fn pull(node: &str, reference: &str, platform: &str) -> Result {
         .timeout(Duration::from_secs(600))
         .run()
         .await?;
-    let inspected = Invocation::new("docker")
-        .args(["exec", node, "crictl", "inspecti", "-o", "json", reference])
-        .output()
-        .await?;
-    ensure(
-        inspected.success,
-        format!("the node does not resolve {reference} after pulling it"),
+    // `ctr` writes containerd's image store directly; the CRI plugin learns
+    // of the image from containerd's event stream, so it can lag the pull.
+    crate::wait::until(
+        &format!("the node to resolve {reference} after pulling it"),
+        CRI_SYNC,
+        async || {
+            let inspected = Invocation::new("docker")
+                .args(["exec", node, "crictl", "inspecti", "-o", "json", reference])
+                .output()
+                .await?;
+            if inspected.success {
+                Ok(Some(()))
+            } else {
+                infrastructure(format!("crictl: {}", inspected.stderr.trim()))
+            }
+        },
     )
+    .await
 }
+
+/// How long the CRI plugin may take to see an image `ctr` just pulled.
+const CRI_SYNC: Duration = Duration::from_secs(60);
 
 /// Import a release's controller image archive and require the node to
 /// resolve the release's image reference to it.
