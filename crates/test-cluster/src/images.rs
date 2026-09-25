@@ -138,24 +138,40 @@ pub async fn import(node: &str, archive: &Path, repository: &str, platform: &str
     Ok(())
 }
 
-/// Fail unless the node's CRI resolves `reference` to the image `config`.
+/// How long the CRI plugin may take to see an image `ctr` just wrote. `ctr`
+/// writes containerd's image store directly and the CRI plugin learns of the
+/// change from containerd's event stream, so its image cache can lag.
+const CRI_SYNC: Duration = Duration::from_secs(60);
+
+/// Fail unless the node's CRI resolves `reference` to the image `config`
+/// within [`CRI_SYNC`].
 ///
 /// # Errors
-/// Fails when the reference is unknown to the node or names another image.
+/// Fails when the reference stays unknown to the node or names another image.
 pub async fn require_resolves(node: &str, reference: &str, config: &str) -> Result<()> {
-    let output = Invocation::new("docker")
-        .args(["exec", node, "crictl", "inspecti", "-o", "json", reference])
-        .output()
-        .await?;
-    let resolved = serde_json::from_str::<Value>(&output.stdout)
-        .ok()
-        .and_then(|value| value["status"]["id"].as_str().map(str::to_owned));
-    if !output.success || resolved.as_deref() != Some(config) {
-        return infrastructure(format!(
-            "the node does not resolve {reference} to the imported image {config}"
-        ));
+    let deadline = tokio::time::Instant::now() + CRI_SYNC;
+    loop {
+        let output = Invocation::new("docker")
+            .args(["exec", node, "crictl", "inspecti", "-o", "json", reference])
+            .output()
+            .await?;
+        let resolved = serde_json::from_str::<Value>(&output.stdout)
+            .ok()
+            .and_then(|value| value["status"]["id"].as_str().map(str::to_owned));
+        if output.success && resolved.as_deref() == Some(config) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let found = resolved.map_or_else(
+                || format!("crictl: {}", output.stderr.trim()),
+                |id| format!("it resolves to {id}"),
+            );
+            return infrastructure(format!(
+                "the node does not resolve {reference} to the imported image {config} ({found})"
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    Ok(())
 }
 
 /// The fully qualified repository containerd records for `reference`, which
