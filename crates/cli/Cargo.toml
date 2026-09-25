@@ -31,6 +31,12 @@ clap = { version = "4.6.6", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+# `tests/events_example.rs` runs `examples/events`' compiled handler bundle
+# through the same engine the generated controller embeds, against
+# `engine::test_support::HttpsFixtureServer`. `engine` is already in this
+# crate's graph (through `test-cluster` -> `runtime`); `test-util` only adds
+# the fixture server.
+engine = { path = "../engine", features = ["test-util"] }
 
 [lints]
 workspace = true

@@ -1,0 +1,14 @@
+{
+  "entry": "program.tsx",
+  "inputs": [
+    {
+      "path": "handlers/sync-flags.ts",
+      "sha256": "06d88bf07e5a232721ffde20189b8ce89590ab53a174686e9803fed82fab8e5e"
+    },
+    {
+      "path": "program.tsx",
+      "sha256": "8a365d531abedd91f0a793af6fc1b5f3438e4938a8177420f37f70c0be7f9409"
+    }
+  ],
+  "schemaVersion": "apsides.dev/source-lock/v1"
+}

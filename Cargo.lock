@@ -480,6 +480,7 @@ dependencies = [
  "compiler-core",
  "coordination",
  "deploy",
+ "engine",
  "inventory 0.1.0",
  "k8s-openapi",
  "kube",
