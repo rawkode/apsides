@@ -97,7 +97,7 @@ pub(super) async fn reserve_new_transition(
 struct Planned {
     request: DeploymentRequest,
     plan: deploy::TransitionPlan,
-    previous_review: Option<coordination::ReviewMetadataV1>,
+    previous_review: Option<coordination::ReviewMetadata>,
 }
 
 /// Every refusal that needs no protected write: request preparation, the

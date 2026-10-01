@@ -6,9 +6,11 @@ import os
 from pathlib import Path
 import subprocess
 
+import diagnostics
 from extract_binary import extract
 from finalize_inputs import finalize
 from package_oci import prepare, build, verify_context
+import rusty_v8
 from sbom import generate
 from toolchain_snapshot import capture as capture_tools, verify as verify_tools
 
@@ -20,7 +22,7 @@ def assemble(artifact, source, profile_path, *, no_cache=False):
     fields = {"schemaVersion", "builderImage", "runtimeImage", "platform", "sbomTool", "sbomToolSha256", "sourceDateEpoch"}
     if set(profile) != fields or profile["schemaVersion"] != "apsides.dev/build-profile/v1":
         raise ValueError("build profile has unknown or missing fields")
-    targets = {"linux/arm64": "aarch64-unknown-linux-gnu", "linux/amd64": "x86_64-unknown-linux-gnu"}
+    targets = rusty_v8.PLATFORM_TARGETS
     if profile["platform"] not in targets:
         raise ValueError("build platform must be linux/arm64 or linux/amd64")
     if type(profile["sourceDateEpoch"]) is not int or profile["sourceDateEpoch"] < 0:
@@ -35,7 +37,9 @@ def assemble(artifact, source, profile_path, *, no_cache=False):
     if metadata["builder"]["platform"] != profile["platform"]:
         raise ValueError("cached builder platform differs from build profile")
     base = artifact / "runtime-base.tar"
-    subprocess.run(["docker", "image", "save", "-o", str(base), profile["runtimeImage"]], check=True)
+    save = subprocess.run(["docker", "image", "save", "-o", str(base), profile["runtimeImage"]], text=True, capture_output=True)
+    if save.returncode:
+        raise diagnostics.SubprocessFailure("docker image save failed", save.stderr)
     image_digest = build(context, profile["runtimeImage"], base, image, no_cache=no_cache)
     binary_digest = extract(image, artifact / "linux-binary")
     sbom_digest = generate(context, tool, profile["sbomToolSha256"], targets[profile["platform"]], artifact / "sbom")
@@ -62,5 +66,5 @@ if __name__ == "__main__":
         parser.add_argument("--no-cache", action="store_true")
         args = parser.parse_args()
         print(json.dumps(assemble(args.artifact, args.source_output, args.profile, no_cache=args.no_cache), sort_keys=True))
-    except Exception:
-        raise SystemExit("apsides: image build failed") from None
+    except Exception as error:
+        raise SystemExit(diagnostics.failure_message("image build", error)) from None

@@ -11,7 +11,8 @@ running the deployment protocol.
 
 | Command | Establishes | Does not establish |
 | --- | --- | --- |
-| `aps compile` | validated IR, plan, capabilities and generated controller source | deployable image or signed release |
+| `aps compile` | validated IR, plan, capabilities, `surface.json`, handler bundles and generated controller source | deployable image or signed release |
+| `aps diff` | what changed between two `surface.json` files, and which review-policy rules the change triggers | that the head surface is the one later deployed |
 | `aps build` | pinned Linux binary, OCI archive, SBOM and compiler closure | approved provenance or deployment authorization |
 | `aps test` | the program's generated semantic scenarios; cases that need a cluster are reported unsupported | cluster behaviour or release trust |
 | `aps test --cluster` | every generated reactor case of a fixture release, run against its controller on a disposable, egress-denied kind cluster | production image behaviour, application behaviour or release trust |
@@ -37,10 +38,22 @@ target/debug/aps build \
 target/debug/aps verify --artifact work/apsides-native
 ```
 
+`aps compile` also writes `surface.json`, the reviewable deployment surface:
+permissions, Secrets read, managed resources, inputs, reactions, images,
+event handlers, their egress hosts and outputs, risks and the domain's minimum
+Kubernetes version. Compare two of them with `aps diff`; see
+[Surface diff in CI](/guides/surface-diff/). Each declared
+[event handler](/guides/event-handlers/) is bundled into
+`controller/src/handlers/` and embedded in the controller binary.
+
 Every output directory must be fresh. A build profile is not checked in: prepare
 one with the exact fields documented in [OCI packaging](/reference/oci-packaging/#complete-cli-build).
 The complete build also requires matching locally cached builder/runtime images,
-offline Cargo inputs, Docker BuildKit and the configured `cargo-cyclonedx` executable. It emits
+offline Cargo inputs, Docker BuildKit and the configured `cargo-cyclonedx` executable.
+The controller embeds V8 through `deno_core`; the build fetches the pinned
+`rusty_v8` static archive once, verifies its SHA-256, and records it in the
+build inputs and SBOM, because the BuildKit compile step has no network. See
+[OCI packaging](/reference/oci-packaging/#the-pinned-rusty_v8-archive). It emits
 `build-result.json`, `image/controller.oci.tar`,
 `linux-binary/apsides-controller`, `sbom/sbom.json` and `build-inputs.json`.
 
@@ -70,6 +83,13 @@ is fetched during the run. Images are imported into the node by digest, and the
 controller runs in fixture mode with a token for its generated `ServiceAccount`
 that expires shortly after the run's own deadline. Programs that manage custom
 resources pass each CRD manifest with its own `--crd` flag.
+
+Before creating the cluster the runner requires the host kernel to list
+`landlock` in `/sys/kernel/security/lsm`: kind nodes share the host kernel, and
+every generated controller locks itself down with Landlock at startup. The
+controller runs in fixture mode, which checks its embedded event handler
+bundles but does not execute handlers, so these cases do not exercise handler
+behaviour.
 
 ### The offline gate
 
@@ -164,6 +184,16 @@ so a signing workflow can check a release before handing it to deployment. A
 release carries no test results: run `aps test` for the program before signing
 it.
 
+`aps deploy` also binds the deployment to the exact surface that was
+reviewed: it independently recomputes the deployment surface from the
+verified release's own IR and requires that digest to equal both the
+release's recorded `surface.json` digest and the `surfaceDigest` the
+reviewed, authenticated metadata carries. Either mismatch fails the deploy
+with a clear error naming the disagreeing digests; there is no override
+flag. This also covers a resumed transition: resume revalidates the exact
+authenticated review metadata against a fresh projection of the plan, so a
+surface that changed after review is refused there too.
+
 ## Deployment inputs
 
 `aps deploy` reads `dist/apsides` by default or accepts exactly one current
@@ -181,7 +211,10 @@ tags or make OCI mandatory.
 
 The trusted CI job must also provide:
 
-- Kubernetes authentication for an HTTPS API endpoint;
+- Kubernetes authentication for an HTTPS API endpoint whose server version is
+  at least the domain's `minKubernetesVersion` (`1.34` unless the program
+  raises it); `aps deploy` reads the server's discovery version and refuses an
+  older server before any lifecycle work;
 - platform trust, policy ceiling, generation identity and proxy qualification;
 - an executor identity, supplied explicitly for trusted local jobs or derived
   from the supported GitHub Actions run identity;
@@ -208,7 +241,10 @@ any new execution authority. Identity, policy, transport and permission failures
 remain errors. Without opt-in, the report explicitly says preview was not approved.
 
 The review lists supplemental preview permissions separately and keeps observed
-values out of its output. The final result retains the captured review, and an
+values out of its output. It also lists the program's `surfaceDigest`, handlers,
+egress hosts and outputs next to permissions and secrets, so the reviewer sees
+exactly which egress hosts, handlers, outputs, secrets and permissions they are
+approving. The final result retains the captured review, and an
 already-committed retry performs no live preview. See the
 [deployment review contract](/reference/review-contract/) for evidence limits;
 the acceptance suite runs a live preview of one absent `ConfigMap`.

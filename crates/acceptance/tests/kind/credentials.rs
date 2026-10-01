@@ -136,7 +136,7 @@ async fn deploy_with_pull_secret(
         &successor.release_digest,
         &successor.manifest.ir_digest,
     )?;
-    let checkpoint = writer_checkpoint(&platform.registry().await?)?.clone();
+    let checkpoint = writer_checkpoint(&platform.registry().await?, DOMAIN)?.clone();
     note("(a) checking the staged writers carry the policy's pull secret");
     let pulls = pull_secrets(&objects, &checkpoint).await?;
     scenario.recorder.check(

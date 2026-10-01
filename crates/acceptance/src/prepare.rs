@@ -38,11 +38,15 @@ const IMAGE_REPOSITORY: &str = "localhost/apsides/cnpg-controller";
 pub(crate) const BUILD_TIMEOUT: Duration = Duration::from_mins(45);
 /// Every program the scenarios deploy, by the directory prepare writes its
 /// release to, in the order `inputs.json` names them.
-const RELEASES: [(&str, &str); 4] = [
+const RELEASES: [(&str, &str); 5] = [
     ("initial", "examples/cnpg/initial/program.tsx"),
     ("successor", "examples/cnpg/program.tsx"),
     ("cleanup", "examples/cnpg/cleanup/program.tsx"),
     ("owner", "crates/acceptance/programs/cnpg-owner/program.tsx"),
+    (
+        "handlers",
+        "crates/acceptance/programs/handler-output/program.tsx",
+    ),
 ];
 
 /// Where prepare reads from and writes to.
@@ -108,6 +112,7 @@ pub async fn prepare(options: &Options) -> Result<Inputs> {
         .await?;
         sign(&key, &release).await?;
         releases.push(release);
+        reclaim_build_cache(&directory).await?;
     }
     std::fs::remove_file(&key)?;
 
@@ -135,6 +140,7 @@ pub async fn prepare(options: &Options) -> Result<Inputs> {
         successor_release,
         cleanup_release,
         owner_release,
+        handler_output_release,
     ] = releases.as_slice()
     else {
         return infrastructure("expected one release per program");
@@ -146,6 +152,7 @@ pub async fn prepare(options: &Options) -> Result<Inputs> {
         successor_release: successor_release.clone(),
         cleanup_release: cleanup_release.clone(),
         owner_release: owner_release.clone(),
+        handler_output_release: handler_output_release.clone(),
         trust_policy,
         operator_manifest,
         results: output.join("results"),
@@ -247,6 +254,58 @@ async fn build_release(build: &Build<'_>) -> Result<PathBuf> {
     Ok(release)
 }
 
+/// Reclaim disk after one program's release is built and signed, before the
+/// next program's `aps build` compiles the whole dependency graph again.
+///
+/// [`RELEASES`] builds several programs in the same job. Every one of them
+/// depends on the same `runtime` crate, so every `aps build` recompiles
+/// `crates/engine`'s `deno_core`/`v8` from scratch inside a fresh, `RUN
+/// --network=none cargo build --release` `BuildKit` layer (each program's
+/// differing `controller/src` invalidates `Docker`'s layer cache for every
+/// build after it, by design -- see `scripts/package_oci.py`'s `build()`).
+/// Neither that layer's build cache nor `aps build`'s own
+/// `<artifact>.oci-context` staging directory (which holds `cargo vendor`'s
+/// output -- routinely 700+ MB once `deno_core` is in the dependency graph)
+/// is ever consulted again once `aps release` has copied what it needs out
+/// of `artifact` into `release`: nothing downstream reads `build/` or
+/// `build.oci-context/` (`check.yml`'s "Pack the prepared inputs" step packs
+/// only each program's `release/` directory). Left in place across five
+/// sequential full builds, they are large enough on their own to exhaust a
+/// hosted runner's disk before every program has an image -- observed
+/// directly in CI (`No space left on device` mid-`cargo build`, on a run
+/// whose `reactor` job, building only one program, otherwise passed).
+///
+/// # Errors
+/// Fails if a spawned cleanup command cannot run or a directory removal
+/// fails for a reason other than the path already being gone.
+async fn reclaim_build_cache(directory: &Path) -> Result {
+    remove_build_artifacts(directory)?;
+    // The default (non---all) prune only removes cache unreferenced by any
+    // image, which is every layer these `--output type=local` builds
+    // produce (they never tag or push an image), not the base images
+    // "Pull pinned build images" already fetched once for the whole job.
+    Invocation::new("docker")
+        .args(["buildx", "prune", "--force"])
+        .timeout(Duration::from_mins(5))
+        .run()
+        .await?;
+    Ok(())
+}
+
+/// The filesystem half of [`reclaim_build_cache`], split out so it is
+/// testable without a `Docker` daemon: removes `build/` and
+/// `build.oci-context/` under `directory` if present, leaving `release/`
+/// (and anything else) untouched.
+fn remove_build_artifacts(directory: &Path) -> Result {
+    for name in ["build", "build.oci-context"] {
+        let path = directory.join(name);
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Sign `release/provenance.json` into `release/provenance.sig`.
 async fn sign(key: &Path, release: &Path) -> Result {
     let statement = release.join("provenance.json");
@@ -342,20 +401,47 @@ pub(crate) fn absolute(path: &Path) -> Result<PathBuf> {
 }
 
 /// Variables `aps build` needs beyond the inherited allowlist: where Cargo,
-/// rustup and Deno keep their caches.
+/// rustup and Deno keep their caches, and where `scripts/rusty_v8.py`
+/// caches the pinned `rusty_v8` archive it fetches before the `--network=none`
+/// Cargo build (`APSIDES_RUSTY_V8_CACHE`; see `scripts/rusty_v8.py`'s
+/// `default_cache_dir()`). Without forwarding it, `Invocation::start`'s
+/// `env_clear()` drops it, `aps build` falls back to its own default
+/// (`$HOME/.cache/apsides/rusty-v8`, still inherited and so not itself
+/// wrong), and CI's cache step (keyed to the same path this crate's caller
+/// sets `APSIDES_RUSTY_V8_CACHE` to) ends up caching a directory nothing
+/// ever writes to.
+const BUILD_ENV_NAMES: [&str; 5] = [
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "DENO_DIR",
+    "APSIDES_RUSTY_V8_CACHE",
+];
+
 pub(crate) trait BuildEnvironment {
     fn envs_for_build(self) -> Self;
 }
 
 impl BuildEnvironment for Invocation {
     fn envs_for_build(self) -> Self {
-        ["CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "DENO_DIR"]
-            .into_iter()
-            .fold(self, |invocation, name| match std::env::var_os(name) {
-                Some(value) => invocation.env(name, value),
-                None => invocation,
-            })
+        envs_for_build_via(self, |name| std::env::var_os(name))
     }
+}
+
+/// `envs_for_build`'s forwarding logic, taking its environment lookup as a
+/// parameter so a test can supply a fixed one instead of mutating this
+/// process's real environment (`std::env::set_var` is `unsafe` under the
+/// 2024 edition, denied workspace-wide).
+fn envs_for_build_via(
+    invocation: Invocation,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Invocation {
+    BUILD_ENV_NAMES
+        .into_iter()
+        .fold(invocation, |invocation, name| match lookup(name) {
+            Some(value) => invocation.env(name, value),
+            None => invocation,
+        })
 }
 
 #[cfg(test)]
@@ -365,6 +451,80 @@ mod tests {
     #[test]
     fn the_host_platform_is_a_linux_platform() -> Result {
         assert!(host_platform()?.starts_with("linux/"));
+        Ok(())
+    }
+
+    #[test]
+    fn build_env_names_forward_the_rusty_v8_cache_directory() {
+        assert!(BUILD_ENV_NAMES.contains(&"APSIDES_RUSTY_V8_CACHE"));
+    }
+
+    /// `remove_build_artifacts` deletes `build/` and `build.oci-context/`
+    /// (the `cargo vendor` staging directory `aps build` never needs again
+    /// once `aps release` has copied what it needs into `release/`) without
+    /// touching `release/` or anything else -- the fix for the acceptance
+    /// matrix's five sequential full `deno_core`/`v8` compiles exhausting a
+    /// hosted runner's disk before every program has an image.
+    #[test]
+    fn remove_build_artifacts_deletes_only_the_build_staging_directories() -> Result {
+        let program = tempfile::tempdir()?;
+        let program = program.path();
+        std::fs::create_dir_all(program.join("build/image"))?;
+        std::fs::write(program.join("build/build-result.json"), b"{}")?;
+        std::fs::create_dir_all(program.join("build.oci-context/vendor/example"))?;
+        std::fs::write(program.join("build.oci-context/context.json"), b"{}")?;
+        std::fs::create_dir_all(program.join("release"))?;
+        std::fs::write(program.join("release/release.json"), b"{}")?;
+
+        remove_build_artifacts(program)?;
+
+        assert!(!program.join("build").exists());
+        assert!(!program.join("build.oci-context").exists());
+        assert!(program.join("release/release.json").exists());
+        Ok(())
+    }
+
+    /// Neither directory need exist -- a program whose build already failed,
+    /// or one `reclaim_build_cache` already ran for, is not an error.
+    #[test]
+    fn remove_build_artifacts_tolerates_directories_that_are_already_gone() -> Result {
+        let program = tempfile::tempdir()?;
+        remove_build_artifacts(program.path())?;
+        remove_build_artifacts(program.path())?;
+        Ok(())
+    }
+
+    /// `envs_for_build`'s real lookup is `std::env::var_os`, which this
+    /// process's own environment cannot be mutated to test (`set_var` is
+    /// `unsafe` under the 2024 edition, denied workspace-wide): a fixed
+    /// lookup closure exercises the same forwarding fold, and actually
+    /// running the invocation proves `Invocation::env` really reaches a
+    /// spawned child (`Invocation::start`'s `env_clear()` would otherwise
+    /// drop it, exactly the `acceptance-prepare` bug this fixes).
+    #[tokio::test]
+    async fn envs_for_build_via_forwards_the_rusty_v8_cache_when_set() -> Result {
+        let invocation = Invocation::new("sh")
+            .args(["-c", "printf '%s' \"$APSIDES_RUSTY_V8_CACHE\""])
+            .timeout(Duration::from_secs(10));
+        let output = envs_for_build_via(invocation, |name| {
+            (name == "APSIDES_RUSTY_V8_CACHE")
+                .then(|| std::ffi::OsString::from("/example/rusty-v8-cache"))
+        })
+        .output()
+        .await?;
+        assert!(output.success, "stderr: {}", output.stderr);
+        assert_eq!(output.stdout, "/example/rusty-v8-cache");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn envs_for_build_via_omits_unset_variables() -> Result {
+        let invocation = Invocation::new("sh")
+            .args(["-c", "printf '%s' \"${APSIDES_RUSTY_V8_CACHE:-unset}\""])
+            .timeout(Duration::from_secs(10));
+        let output = envs_for_build_via(invocation, |_| None).output().await?;
+        assert!(output.success, "stderr: {}", output.stderr);
+        assert_eq!(output.stdout, "unset");
         Ok(())
     }
 }

@@ -15,6 +15,11 @@ pub struct RuntimeBinding {
     pub capability_digest: String,
     pub service_account_name: String,
     pub controller_image: String,
+    /// The largest `maxHeapBytes` declared by any of the domain's handlers
+    /// (0 when the domain declares none). Sizes the controller pod's memory
+    /// limit alongside the fixed reconciler/sidecar overhead -- see
+    /// `controller.rs`'s `controller_memory_limit_mi`.
+    pub max_handler_heap_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

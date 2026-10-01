@@ -118,6 +118,7 @@ fn inputs(compiled: &CompiledPlan) -> Vec<ReviewInput> {
             mode: match i.mode {
                 compiler_core::InputMode::Managed => ReviewInputMode::Managed,
                 compiler_core::InputMode::Observed => ReviewInputMode::Observed,
+                compiler_core::InputMode::Output => ReviewInputMode::Output,
             },
             managed_resource_id: i.managed_resource_id.clone(),
             projection: i.projection.clone(),

@@ -72,7 +72,7 @@ try {
   assert.ok(bundleMap.sources.includes("apsides:/source/program.tsx"));
 
   const inputs = JSON.parse(await readFile(join(first.output, "build-inputs.json"), "utf8"));
-  assert.deepEqual(inputs.sdk.files.map((file: { path: string }) => file.path), ["compiler.ts", "index.ts", "jsx-dev-runtime.ts", "jsx-runtime.ts", "model.ts", "runtime.ts"]);
+  assert.deepEqual(inputs.sdk.files.map((file: { path: string }) => file.path), ["compiler.ts", "handler.ts", "index.ts", "jsx-dev-runtime.ts", "jsx-runtime.ts", "model.ts", "runtime.ts"]);
   assert.deepEqual(inputs.toolchain.oxc.options.jsx, { development: true, importSource: "@apsides/kubernetes", runtime: "automatic" });
   assert.equal(inputs.toolchain.oxc.options.filename, "apsides:/source/<logical-path>");
   assert.deepEqual(inputs.typecheck.config, { importMap: "generated-local-sdk-only", jsx: "react-jsxdev", jsxImportSource: "@apsides/kubernetes" });
@@ -105,12 +105,143 @@ export default async () => {
   const plainTs = await fixture({ "program.ts": `export default {};\n` }, "program.ts");
   await assert.rejects(compileApsides(plainTs.sourcePath, plainTs.output), /source entry must be a \.tsx program/, "TSX is the only authoring entry");
 
+  // Neither case is about the schema version itself (both use the current
+  // schema, "apsides.dev/ir/v2"): a plain-object export of already-compiled
+  // IR, or an already-wrapped production-IR payload, must still be rejected
+  // for bypassing the TSX renderer, regardless of the schema version it names.
   for (const [name, source] of [
-    ["raw IR", `export default {schemaVersion:"apsides.dev/ir/v1"};\n`],
-    ["production IR wrapper", `export default {productionIR:{schemaVersion:"apsides.dev/ir/v1"},fixtures:null};\n`],
+    ["raw IR", `export default {schemaVersion:"apsides.dev/ir/v2"};\n`],
+    ["production IR wrapper", `export default {productionIR:{schemaVersion:"apsides.dev/ir/v2"},fixtures:null};\n`],
   ] as const) {
     const obsolete = await fixture({ "program.tsx": source }, "program.tsx");
     await assert.rejects(compileApsides(obsolete.sourcePath, obsolete.output), `${name} exports must not bypass the TSX renderer`);
+  }
+
+  const handlerProgram = `import { Controller, On, useConfigMap, useHandlerOutput } from "@apsides/kubernetes";
+const HandlerApp = () => {
+  const settings = useConfigMap({ id: "settings", name: "settings" });
+  const flags = useHandlerOutput({ id: "flags", name: "flags" });
+  return <On trigger={settings.changed} handler="./handlers/sync-flags.ts#syncFlags" inputs={[settings]} egress={["api.example.com"]} outputs={[flags]} />;
+};
+export default (
+  <Controller id="handlers" namespace="workload" controlNamespace="apsides-system" clusterBinding="fixture" policyRef="platform/test" enforcement="api-bound" budgets={{maxResources:8,maxInputs:8,maxReactions:8,maxObjectBytes:32768,maxQueueDepth:8,maxConcurrentRequests:2}}>
+    <HandlerApp />
+  </Controller>
+);
+`;
+  const handlerModule = `import type { HandlerEvent } from "@apsides/kubernetes/handler";
+
+export async function syncFlags(event: HandlerEvent<"settings">) {
+  const environment = event.inputs.settings.data.environment ?? "production";
+  queueMicrotask(() => {});
+  apsides.writeOutput("flags", "environment", environment);
+  return event.id;
+}
+`;
+
+  {
+    // Bundle determinism: two independent compiles of the same program with
+    // the same handler module produce byte-identical handlers/<id>.js and an
+    // identical bundleSha256 in ir.json.
+    const files = { "program.tsx": handlerProgram, "handlers/sync-flags.ts": handlerModule };
+    const first = await fixture(files, "program.tsx");
+    const second = await fixture(files, "program.tsx");
+    await compileApsides(first.sourcePath, first.output);
+    await compileApsides(second.sourcePath, second.output);
+
+    const ir = JSON.parse(await readFile(join(first.output, "ir.json"), "utf8"));
+    assert.equal(ir.handlers.length, 1, "one handler declared");
+    const handler = ir.handlers[0];
+    assert.equal(handler.module, "handlers/sync-flags.ts", "handler module is normalized");
+    assert.equal(handler.export, "syncFlags", "handler export parsed from the module reference string");
+    assert.match(handler.bundleSha256, /^[0-9a-f]{64}$/, "bundleSha256 is a lowercase sha256 digest");
+    assert.equal(ir.outputs.length, 1, "one output declared");
+
+    const bundlePath = join(first.output, "handlers", `${handler.id}.js`);
+    const bundleCode = await readFile(bundlePath, "utf8");
+    assert.equal(digest(bundleCode), handler.bundleSha256, "ir.json bundleSha256 matches the written handler bundle");
+    assert.match(bundleCode, /syncFlags/, "the handler bundle contains the exported function");
+
+    const secondBundleCode = await readFile(join(second.output, "handlers", `${handler.id}.js`), "utf8");
+    assert.equal(bundleCode, secondBundleCode, "two independent compiles produce a byte-identical handler bundle");
+    const secondIr = JSON.parse(await readFile(join(second.output, "ir.json"), "utf8"));
+    assert.equal(secondIr.handlers[0].bundleSha256, handler.bundleSha256, "two independent compiles produce an identical bundleSha256");
+
+    const buildInputs = JSON.parse(await readFile(join(first.output, "build-inputs.json"), "utf8"));
+    assert.deepEqual(buildInputs.handlers, [{ id: handler.id, path: `handlers/${handler.id}.js`, sha256: handler.bundleSha256 }]);
+  }
+
+  {
+    // Handler modules are type-checked against the ECMAScript library and
+    // the SDK's handler declarations only, and the type-only SDK import
+    // never reaches the bundle.
+    const typed = await fixture({ "program.tsx": handlerProgram, "handlers/sync-flags.ts": handlerModule }, "program.tsx");
+    await compileApsides(typed.sourcePath, typed.output);
+    const ir = JSON.parse(await readFile(join(typed.output, "ir.json"), "utf8"));
+    const bundle = await readFile(join(typed.output, "handlers", `${ir.handlers[0].id}.js`), "utf8");
+    assert.doesNotMatch(bundle, /@apsides\/kubernetes/, "the type-only SDK import is erased from the handler bundle");
+    const inputs = JSON.parse(await readFile(join(typed.output, "build-inputs.json"), "utf8"));
+    assert.deepEqual(inputs.typecheck.handlers, { checkJs: true, declarations: "@apsides/kubernetes/handler", lib: ["esnext"], strict: true, unavailableGlobals: ["SharedArrayBuffer"], verbatimModuleSyntax: true, eventContracts: true });
+
+    const rejected: [string, string, string][] = [
+      ["a type error", handlerModule.replace(`"environment", environment`, `"environment", 42`), "a wrong argument type fails the build"],
+      ["a misspelled apsides member", handlerModule.replace("apsides.writeOutput(", "apsides.writeOutpt("), "an unknown apsides member fails the build"],
+      ["a host global", handlerModule.replace("queueMicrotask(() => {});", "console.log(environment);"), "console does not exist in the engine"],
+      ["a Deno global", handlerModule.replace("queueMicrotask(() => {});", "Deno.env.get(\"HOME\");"), "Deno does not exist in the engine"],
+      ["an implicit any", "export async function syncFlags(event) { return event; }\n", "strict mode rejects an untyped event"],
+      ["a type used through a value import", handlerModule.replace("import type { HandlerEvent }", "import { HandlerEvent }"), "verbatimModuleSyntax requires import type for types"],
+      ["an input the <On> does not declare", `import type { HandlerEvent } from "@apsides/kubernetes/handler";\nexport async function syncFlags(event: HandlerEvent<"other">) { return event.inputs.other.data; }\n`, "the event contract rejects an undeclared input id"],
+      ["an extra input id", `import type { HandlerEvent } from "@apsides/kubernetes/handler";\nexport async function syncFlags(event: HandlerEvent<"settings" | "extra">) { return event.inputs.settings.data; }\n`, "the event contract rejects an input id the handler is not given"],
+      ["a missing export", handlerModule.replace("export async function syncFlags", "export async function syncFlag"), "the event contract requires the declared export"],
+    ];
+    for (const [label, source, message] of rejected) {
+      const broken = await fixture({ "program.tsx": handlerProgram, "handlers/sync-flags.ts": source }, "program.tsx");
+      await assert.rejects(compileApsides(broken.sourcePath, broken.output), /deno failed/, `${message} (${label})`);
+    }
+
+    // A locked module that only supplies types to a handler is reachable
+    // through its erased import type, not an unreachable lock entry.
+    const typesOnly = await fixture({
+      "program.tsx": handlerProgram,
+      "handlers/sync-flags.ts": `import type { Environment } from "./types.ts";\nimport type { HandlerEvent } from "@apsides/kubernetes/handler";\nexport async function syncFlags(event: HandlerEvent<"settings">): Promise<Environment> { return event.inputs.settings.data.environment ?? "production"; }\n`,
+      "handlers/types.ts": `export type Environment = string;\nexport type Names = { SharedArrayBuffer: string };\n`,
+    }, "program.tsx");
+    await compileApsides(typesOnly.sourcePath, typesOnly.output);
+
+    // SharedArrayBuffer type-checks under lib esnext but the engine does
+    // not install it; a reference to it, directly or through globalThis,
+    // fails the build. A property named SharedArrayBuffer (above) does not.
+    for (const reference of ["new SharedArrayBuffer(8);", "globalThis.SharedArrayBuffer;"]) {
+      const shared = await fixture({ "program.tsx": handlerProgram, "handlers/sync-flags.ts": handlerModule.replace("queueMicrotask(() => {});", reference) }, "program.tsx");
+      await assert.rejects(compileApsides(shared.sourcePath, shared.output), /uses SharedArrayBuffer, which the handler engine does not provide/, `SharedArrayBuffer is rejected (${reference})`);
+    }
+
+    // JavaScript is checked too: a .js helper a handler imports cannot use
+    // a global the engine does not have.
+    const jsHelper = await fixture({
+      "program.tsx": handlerProgram,
+      "handlers/sync-flags.ts": `import { describe } from "./describe.js";\nimport type { HandlerEvent } from "@apsides/kubernetes/handler";\nexport async function syncFlags(event: HandlerEvent<"settings">) { return describe(event.id); }\n`,
+      "handlers/describe.js": `export function describe(id) { console.log(id); return id; }\n`,
+    }, "program.tsx");
+    await assert.rejects(compileApsides(jsHelper.sourcePath, jsHelper.output), /deno failed/, "a JavaScript helper using console fails the handler check");
+
+    const valueImport = await fixture({
+      "program.tsx": handlerProgram,
+      "handlers/sync-flags.ts": `import { HandlerEvent } from "@apsides/kubernetes/handler";\nexport async function syncFlags(event: HandlerEvent) { return [event.id, HandlerEvent]; }\n`,
+    }, "program.tsx");
+    await assert.rejects(compileApsides(valueImport.sourcePath, valueImport.output), /deno failed|undeclared package/, "a value import of the SDK cannot reach a handler bundle");
+  }
+
+  {
+    // A handler module absent from apsides.lock.json is rejected: it is
+    // never bundled from the filesystem outside the locked closure.
+    const unlockedProgram = handlerProgram.replace("./handlers/sync-flags.ts", "./handlers/unlocked.ts");
+    const unlocked = await fixture({ "program.tsx": unlockedProgram, "handlers/sync-flags.ts": handlerModule }, "program.tsx");
+    await assert.rejects(
+      compileApsides(unlocked.sourcePath, unlocked.output),
+      /handler module is absent from the source lock/,
+      "an unlocked handler module must be rejected before bundling",
+    );
   }
 
   console.log("Apsides TSX source build passed: development JSX lowering, multi-source reproducibility, source provenance, SDK closure, isolated Deno config, and synchronous rendering.");

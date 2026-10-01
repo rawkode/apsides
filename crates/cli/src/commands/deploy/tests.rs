@@ -63,10 +63,11 @@ fn routing_executor_binding(scope: coordination::ClaimScope) -> platform::Execut
 
 fn registry() -> Result<(NamespaceRegistry, deploy::TransitionPlan)> {
     let compiled = compiler_core::parse_and_validate(&json!({
-        "testOnly":false,"schemaVersion":"apsides.dev/ir/v1",
+        "testOnly":false,"schemaVersion":"apsides.dev/ir/v2",
         "domain":{"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound",
+        "minKubernetesVersion":"1.34",
         "budgets":{"maxResources":16,"maxInputs":16,"maxReactions":16,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},
-        "resources":[],"inputs":[],"reactions":[],"provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
+        "resources":[],"inputs":[],"reactions":[],"handlers":[],"outputs":[],"provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
     }).to_string())?;
     let ceiling = compiler_core::PermissionCeiling {
         policy_ref: "platform/example".into(),
@@ -129,6 +130,7 @@ fn registry() -> Result<(NamespaceRegistry, deploy::TransitionPlan)> {
             capability_digest: BUILD.into(),
             service_account_name: SERVICE_ACCOUNT_1.into(),
             controller_image: "image".into(),
+            max_handler_heap_bytes: 0,
         }),
         staged_trust_policy_digest: None,
         staged_provenance_digest: None,
@@ -411,6 +413,7 @@ fn review_checkpoint(
             capability_digest: BUILD.into(),
             service_account_name: name.clone(),
             controller_image: format!("registry.example/controller@{BUILD}"),
+            max_handler_heap_bytes: 0,
         },
         request_drain_qualification: platform::RequestDrainQualification::IsolatedEnvoy {
             qualification_digest: BUILD.into(),

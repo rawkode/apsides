@@ -5,7 +5,7 @@
 //! observation interval.
 use crate::{Result, invalid, preview_limits};
 use compiler_core::REVISION_ANNOTATION;
-use coordination::{ReviewIdentity, ReviewMetadataV1, ReviewResource};
+use coordination::{ReviewIdentity, ReviewMetadata, ReviewResource};
 use serde_json::{Map, Value};
 
 const MAX_OBJECT_BYTES: usize = 4 * 1024 * 1024;
@@ -64,7 +64,7 @@ impl PreviewComposition {
 /// Rejects mismatched metadata/objects, invalid UIDs, author-supplied reserved
 /// annotations, malformed or foreign contributions, and explicit size limits.
 pub fn compose_preview(
-    metadata: &ReviewMetadataV1,
+    metadata: &ReviewMetadata,
     identity: &ReviewIdentity,
     desired: &Value,
     before: Option<PreviewLiveObject<'_>>,

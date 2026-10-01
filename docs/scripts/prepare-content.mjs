@@ -12,6 +12,8 @@ const pages = [
   ["guides/typescript-authoring.md", "guides/typescript-authoring.md"],
   ["guides/build-and-deploy.md", "guides/build-and-deploy.md"],
   ["guides/custom-resources.md", "guides/custom-resources.md"],
+  ["guides/surface-diff.md", "guides/surface-diff.md"],
+  ["guides/event-handlers.md", "guides/event-handlers.md"],
   ["reference/index.md", "reference/index.md"],
 ];
 
@@ -27,7 +29,7 @@ const references = [
   ["reference/OCI-PACKAGING.md", "reference/oci-packaging.md", "Native controller OCI packaging"],
   ["reference/PLATFORM-CONTRACT.md", "reference/platform-contract.md", "Platform contract"],
   ["reference/REVIEW-CONTRACT.md", "reference/review-contract.md", "Deployment review contract"],
-  ["reference/SPEC-v0.2.md", "reference/spec-v0-2.md", "Apsides specification 0.2"],
+  ["reference/SPEC.md", "reference/spec.md", "Apsides specification"],
   ["reference/STATE-CAPACITY.md", "reference/state-capacity.md", "State capacity admission"],
   ["reference/STATUS.md", "reference/status.md", "Apsides implementation status"],
   ["reference/TOOLCHAIN.md", "reference/toolchain.md", "Toolchain choices"],
@@ -37,8 +39,8 @@ const withFrontmatter = (source, title) => {
   const withoutHeading = source
     .replace(/^# .+\n+/, "")
     .replace(
-      /\]\(SPEC-v0\.2\.md(#[^)]+)?\)/g,
-      (_, fragment = "") => `](../spec-v0-2/${fragment})`,
+      /\]\(SPEC\.md(#[^)]+)?\)/g,
+      (_, fragment = "") => `](../spec/${fragment})`,
     )
     .replace(
       /\]\(CLI-DISTRIBUTION\.md(#[^)]+)?\)/g,
@@ -47,6 +49,10 @@ const withFrontmatter = (source, title) => {
     .replace(
       /\]\(STATUS\.md(#[^)]+)?\)/g,
       (_, fragment = "") => `](../status/${fragment})`,
+    )
+    .replace(
+      /\]\(OCI-PACKAGING\.md(#[^)]+)?\)/g,
+      (_, fragment = "") => `](../oci-packaging/${fragment})`,
     )
     .replace(
       /\]\(\.\.\/\.\.\/examples\/cnpg\/cleanup\/README\.md\)/g,

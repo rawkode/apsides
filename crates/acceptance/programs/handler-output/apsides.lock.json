@@ -1,0 +1,18 @@
+{
+  "entry": "program.tsx",
+  "inputs": [
+    {
+      "path": "handlers/derive-keys.ts",
+      "sha256": "dafb1ac90f274c44cf148603d135cdca7be0daa563a0c163b049adb0982a9da1"
+    },
+    {
+      "path": "handlers/summarize-entries.ts",
+      "sha256": "de4edf15a8a6597586e33c3314b10f77cc4ec4b1d87927c4174f84809a22d6d5"
+    },
+    {
+      "path": "program.tsx",
+      "sha256": "ca8d6a508290c7fddac076ca3150fc7130d282b4158709412455fd107ce6581f"
+    }
+  ],
+  "schemaVersion": "apsides.dev/source-lock/v1"
+}

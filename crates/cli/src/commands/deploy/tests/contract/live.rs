@@ -1,5 +1,5 @@
 use super::*;
-use coordination::{ReviewCapability, ReviewMetadataV1};
+use coordination::{ReviewCapability, ReviewMetadata};
 use platform::{
     LivePreviewReport, PreviewCondition, PreviewInterval,
     preview_fields::{PreviewObjects, classify_preview_fields},
@@ -7,7 +7,7 @@ use platform::{
 
 fn live_report(
     plan: &deploy::TransitionPlan,
-    previous: Option<&ReviewMetadataV1>,
+    previous: Option<&ReviewMetadata>,
 ) -> Result<LivePreviewReport> {
     let next = platform::project_review_metadata(plan)?;
     let mut resources = Vec::with_capacity(next.resources.len());
@@ -153,7 +153,7 @@ fn v5_opt_out_is_explicitly_unavailable() -> Result<()> {
     Ok(())
 }
 
-fn amplified_previous(base: &ReviewMetadataV1, names: &[String], count: usize) -> ReviewMetadataV1 {
+fn amplified_previous(base: &ReviewMetadata, names: &[String], count: usize) -> ReviewMetadata {
     let mut previous = base.clone();
     if count > 0 {
         let mut capabilities = previous.enforcement.runtime_ceiling.capabilities.clone();

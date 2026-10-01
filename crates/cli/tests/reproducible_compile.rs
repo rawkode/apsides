@@ -18,10 +18,11 @@ use std::{
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Files a compilation must write, each of which must match byte for byte.
-const BOUND: [&str; 5] = [
+const BOUND: [&str; 6] = [
     "ir.json",
     "plan.json",
     "manifest.json",
+    "surface.json",
     "source/build-inputs.json",
     "controller/Cargo.lock",
 ];

@@ -33,6 +33,15 @@ tasks: {
 		command: "deno"
 		args: ["run", "--allow-all", "packages/compiler/src/crds.ts", "https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_clusters.yaml", "Cluster", "examples/cnpg/.aps/crds/cnpg.ts", "v1"]
 	}
+	// Compiles the CNPG initial and upgraded examples and exercises `aps
+	// diff` between them: a clean diff (no policy) exits 0, and a policy
+	// requiring `permissions.added` exits 1. Needs network to fetch the
+	// pinned CNPG CRD (see scripts/surface_diff_check.sh).
+	surfaceDiffCheck: {
+		dependsOn: [build, install]
+		command: "sh"
+		args: ["scripts/surface_diff_check.sh", "work/surface-diff-check"]
+	}
 	releaseTest: {command: "cargo", args: ["test", "--locked", "-p", "release"]}
 	releaseCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "release", "--all-targets", "--", "-D", "warnings"]}
 	coordinationTest: {command: "cargo", args: ["test", "--locked", "-p", "coordination"]}
@@ -64,8 +73,9 @@ tasks: {
 		args: ["-c", "sh scripts/reactor_fixture.sh examples/web-application/program.tsx work/reactor && rm -rf work/reactor/results && target/debug/aps test --cluster --release work/reactor/release --fixture-image work/reactor/fixture-image.tar --output work/reactor/results"]
 	}
 	// Builds and signs the releases the acceptance suite deploys (the CNPG
-	// initial, successor and cleanup examples and the cnpg-owner program),
-	// fetches the pinned CNPG operator manifest and writes
+	// initial, successor and cleanup examples, the cnpg-owner program and the
+	// handler-output program), fetches the pinned CNPG operator manifest and
+	// writes
 	// work/acceptance/inputs.json. Generates the CNPG types itself rather than
 	// depending on the types tasks: a dependency chain two tasks deep makes
 	// cuenv's module evaluation time out. Needs Docker, cargo-cyclonedx on
@@ -97,7 +107,7 @@ tasks: {
 	}
 	acceptanceCredentialsTest: {
 		command: "sh"
-		args: ["-c", "APSIDES_ACCEPTANCE_INPUTS=\"$PWD/work/acceptance/inputs.json\" cargo test --locked -p acceptance --test kind -- --ignored --test-threads=1 --nocapture credentials::"]
+		args: ["-c", "APSIDES_ACCEPTANCE_INPUTS=\"$PWD/work/acceptance/inputs.json\" cargo test --locked -p acceptance --test kind -- --ignored --test-threads=1 --nocapture credentials:: handlers::"]
 	}
 	// Builds examples/web-application twice with `aps build --cache disabled`
 	// and requires identical outputs, file for file (spec §28

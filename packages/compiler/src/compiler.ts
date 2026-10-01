@@ -14,19 +14,23 @@ const OXC_VERSION = "0.58.0";
 const ROLLDOWN_VERSION = "1.0.0-beta.35";
 const SES_VERSION = "2.3.0";
 export const SOURCE_LOCK_SCHEMA = "apsides.dev/source-lock/v1";
-export const COMPILER_CLOSURE_SCHEMA = "apsides.dev/compiler-closure/v2";
+export const COMPILER_CLOSURE_SCHEMA = "apsides.dev/compiler-closure/v3";
 const MAX_MODULES = 128;
 const MAX_MODULE_BYTES = 1024 * 1024;
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const executionEnvironment = Object.freeze({ TZ: "UTC", LANG: "C", LC_ALL: "C" });
 const SDK_PACKAGE = "@apsides/kubernetes";
-const SDK_FILES = ["index.ts", "model.ts", "runtime.ts", "compiler.ts", "jsx-runtime.ts", "jsx-dev-runtime.ts"] as const;
+const SDK_FILES = ["index.ts", "model.ts", "runtime.ts", "compiler.ts", "jsx-runtime.ts", "jsx-dev-runtime.ts", "handler.ts"] as const;
 const SDK_PUBLIC_IMPORTS = new Map<string, string>([
   [SDK_PACKAGE, "index.ts"],
   [`${SDK_PACKAGE}/jsx-runtime`, "jsx-runtime.ts"],
   [`${SDK_PACKAGE}/jsx-dev-runtime`, "jsx-dev-runtime.ts"],
 ]);
 const SDK_COMPILER_IMPORT = `${SDK_PACKAGE}/compiler`;
+/** Type-only declarations a handler module may `import type`; erased before bundling. */
+const SDK_HANDLER_IMPORT = `${SDK_PACKAGE}/handler`;
+/** The compiler options handler modules are type-checked with; recorded in `build-inputs.json`. */
+const HANDLER_COMPILER_OPTIONS = { lib: ["esnext"], strict: true, checkJs: true, verbatimModuleSyntax: true };
 const GENERATED_ENTRY = "apsides:/compiler/entry.ts";
 const sha256 = (value: string | Uint8Array): string => createHash("sha256").update(value).digest("hex");
 const order = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
@@ -58,6 +62,7 @@ export interface CompilerClosure {
     readonly hostTools: readonly { readonly role: string; readonly sha256: string; readonly version: string }[];
     readonly trustedCliCodeSha256: string;
     readonly approvedRuntime: unknown;
+    readonly rustyV8: unknown;
   };
 }
 
@@ -127,6 +132,11 @@ export const compileApsides = async (sourceFile: string, output: string): Promis
   const ir = evaluated.productionIR;
   ir.provenance = { compiler: "apsides/0.1", inputs: provenanceInputs };
   validateSourceLocations(ir, author);
+  await typecheckHandlers(author, sdk, ir, deno);
+  const handlerBundles = await bundleHandlers(author, ir);
+  ir.handlers = handlerBundles.handlers;
+  const reachable = new Set([...first.loaded, ...handlerBundles.loaded, ...handlerImportClosure(author, ir.handlers.map(handler => handler.module))]);
+  for (const item of author.values()) if (!reachable.has(item.virtual)) throw new Error(`source lock contains unreachable module: ${item.logical}`);
   const fixture = buildFixtureOutputs(ir);
   validateSourceLocations(fixture.fixtureIr, author);
 
@@ -171,8 +181,9 @@ export const compileApsides = async (sourceFile: string, output: string): Promis
       scope: "Canonical author payload from the digest-locked TypeScript closure evaluated in a pinned SES Compartment with only the hardened declared build input, hosted by the recorded denied-permission Deno runtime.",
       limitation: "This is a bounded source-build contract, not a proof that arbitrary JavaScript is deterministic across unrecorded toolchains or architectures.",
     },
-    typecheck: { engine: "deno", status: "passed", remote: false, npm: false, config: { jsx: "react-jsxdev", jsxImportSource: SDK_PACKAGE, importMap: "generated-local-sdk-only" } },
+    typecheck: { engine: "deno", status: "passed", remote: false, npm: false, config: { jsx: "react-jsxdev", jsxImportSource: SDK_PACKAGE, importMap: "generated-local-sdk-only" }, handlers: { ...HANDLER_COMPILER_OPTIONS, declarations: SDK_HANDLER_IMPORT, unavailableGlobals: [...UNAVAILABLE_HANDLER_GLOBALS], eventContracts: true } },
     bundleSha256: sha256(emittedProgram), evaluationBundleSha256: sha256(first.evaluationBundle), evaluationSourceSha256: sha256(evaluateSource), bundleMapSha256: sha256(canonicalString(bundleMap)),
+    handlers: [...handlerBundles.files.entries()].map(([id, code]) => ({ id, path: `handlers/${id}.js`, sha256: sha256(code) })).sort((a,b) => order(a.id,b.id)),
   };
 
   for (const snapshot of author.values()) if (sha256(await readFile(snapshot.physical)) !== snapshot.sha256) throw new Error(`source input changed during build: ${snapshot.logical}`);
@@ -183,6 +194,10 @@ export const compileApsides = async (sourceFile: string, output: string): Promis
   if (canonicalString(await compilerIdentity()) !== canonicalString(compilerFiles) || canonicalString(await installedToolIdentity()) !== canonicalString(installedTools)) throw new Error("source compiler or installed tool closure changed during build");
 
   await mkdir(destination);
+  if (handlerBundles.files.size > 0) {
+    await mkdir(join(destination, "handlers"));
+    await Promise.all([...handlerBundles.files.entries()].map(([id, code]) => writeFile(join(destination, "handlers", `${id}.js`), code)));
+  }
   await Promise.all([
     writeJson(join(destination, "ir.json"), ir),
     writeFile(join(destination, "program.mjs"), emittedProgram),
@@ -198,7 +213,7 @@ export const compileApsides = async (sourceFile: string, output: string): Promis
   ]);
 };
 
-const bundleSnapshot = async (author: Map<string, Snapshot>, sdk: Map<string, Snapshot>, entry: string): Promise<{bundle: string; evaluationBundle: string; map: unknown}> => {
+const bundleSnapshot = async (author: Map<string, Snapshot>, sdk: Map<string, Snapshot>, entry: string): Promise<{bundle: string; evaluationBundle: string; map: unknown; loaded: Set<string>}> => {
   const loaded = new Set<string>();
   const all = new Map<string, Snapshot>([...author.values(), ...sdk.values()].map(value => [value.virtual, value]));
   const authorEntry = author.get(entry)!;
@@ -262,9 +277,8 @@ const bundleSnapshot = async (author: Map<string, Snapshot>, sdk: Map<string, Sn
     const evaluation = await build.generate({ format: "iife", name: "ApsidesProgram", exports: "named", sourcemap: false });
     const evaluationChunks = evaluation.output.filter(output => output.type === "chunk");
     if (evaluationChunks.length !== 1) throw new Error("evaluation build must emit one closed script");
-    for (const item of author.values()) if (!loaded.has(item.virtual)) throw new Error(`source lock contains unreachable module: ${item.logical}`);
     if (!loaded.has(sdk.get("compiler.ts")!.virtual)) throw new Error("source bundle does not use the trusted compiler wrapper");
-    return { bundle: chunks[0]!.code, evaluationBundle: evaluationChunks[0]!.code, map: chunks[0]!.map ?? null };
+    return { bundle: chunks[0]!.code, evaluationBundle: evaluationChunks[0]!.code, map: chunks[0]!.map ?? null, loaded };
   } finally { await build.close(); }
 };
 
@@ -294,6 +308,127 @@ const typecheckSnapshot = async (author: Map<string, Snapshot>, sdk: Map<string,
   } finally { await rm(stage, {recursive:true, force:true}); }
 };
 
+/**
+ * Type-check every declared handler module as the embedded engine runs it:
+ * the ECMAScript library only (no Deno, Node, DOM or Web API globals) plus
+ * the SDK's handler declarations, which describe the `apsides` global and
+ * `queueMicrotask`. Handler modules reach those declarations only through
+ * `import type` from `@apsides/kubernetes/handler`, which Oxc erases before
+ * {@link bundleHandlerModule} resolves anything.
+ */
+const typecheckHandlers = async (author: Map<string, Snapshot>, sdk: Map<string, Snapshot>, ir: ProductionIr, deno: string): Promise<void> => {
+  const modules = [...new Set(ir.handlers.map(handler => handler.module))].sort(order);
+  if (modules.length === 0) return;
+  for (const module of modules) if (!author.has(module)) throw new Error(`handler module is absent from the source lock (resolved from the lock root, apsides.lock.json's own directory): ${module}`);
+  const stage = await mkdtemp(join(tmpdir(), "apsides-handler-typecheck-"));
+  try {
+    const sourceDir = join(stage, "source");
+    const sdkDir = join(stage, "sdk");
+    await mkdir(sourceDir, { recursive: true }); await mkdir(sdkDir, { recursive: true });
+    for (const item of author.values()) { const target = join(sourceDir, item.logical); await mkdir(dirname(target), {recursive:true}); await writeFile(target, item.text); }
+    const declarations = join(sdkDir, sdk.get("handler.ts")!.logical);
+    await writeFile(declarations, sdk.get("handler.ts")!.text);
+    const denoConfig = join(stage, "deno.json");
+    await writeFile(denoConfig, JSON.stringify({ compilerOptions: HANDLER_COMPILER_OPTIONS, imports: { [SDK_HANDLER_IMPORT]: pathToFileURL(declarations).href } }));
+    const contracts = join(stage, "handler-contracts.ts");
+    await writeFile(contracts, handlerContracts(ir.handlers));
+    await run(deno, ["check", "--config", denoConfig, "--no-lock", "--no-npm", "--no-remote", "--deny-import", declarations, ...modules.map(module => join(sourceDir, module)), contracts], "", { ...executionEnvironment });
+  } finally { await rm(stage, {recursive:true, force:true}); }
+  rejectUnavailableGlobals(author, modules);
+};
+
+/**
+ * A module the handler type check includes: for every declared handler,
+ * an assignment of its export to a function taking exactly the event the
+ * runtime builds for it -- the `<On>` trigger's input id and every
+ * declared input id. A handler whose parameter names an input it is not
+ * given, or a different trigger, fails the check on that handler's line.
+ */
+const handlerContracts = (handlers: ProductionIr["handlers"]): string => {
+  const imports = handlers.map((handler, index) => `import { ${handler.export} as handler${index} } from ${JSON.stringify(`./source/${handler.module}`)};`);
+  const contracts = handlers.map((handler, index) => {
+    const inputs = handler.inputs.map(input => `readonly ${JSON.stringify(input)}: HandlerInput`).join("; ");
+    const event = `{ readonly id: string; readonly trigger: { readonly kind: "input-changed"; readonly input: ${JSON.stringify(handler.trigger.input)} }; readonly inputs: { ${inputs} } }`;
+    return `export const contract${index}: (event: ${event}) => unknown = handler${index}; // handler ${handler.id} (${handler.module}#${handler.export}) must accept the event its <On> declares`;
+  });
+  return `${[`import type { HandlerInput } from ${JSON.stringify(SDK_HANDLER_IMPORT)};`, ...imports, ...contracts].join("\n")}\n`;
+};
+
+/**
+ * Globals `lib: ["esnext"]` declares that the embedded engine does not
+ * install. The ECMAScript library cannot be narrowed without forking it,
+ * so a reference to one of these names passes `deno check` and is
+ * rejected here instead.
+ */
+const UNAVAILABLE_HANDLER_GLOBALS = new Set(["SharedArrayBuffer"]);
+
+/**
+ * Rejects any handler module, or module it imports, that names an
+ * {@link UNAVAILABLE_HANDLER_GLOBALS} entry as an identifier or as a
+ * `globalThis` property. Non-computed member properties and property,
+ * method and type-member keys are names, not references, and are allowed.
+ */
+const rejectUnavailableGlobals = (author: Map<string, Snapshot>, modules: string[]): void => {
+  const closure = handlerImportClosure(author, modules);
+  for (const snapshot of [...author.values()].sort((a, b) => order(a.logical, b.logical))) {
+    if (!closure.has(snapshot.virtual)) continue;
+    const name = findUnavailableGlobal(parseAst(snapshot.text, { lang: sourceLang(snapshot.logical), sourceType: "module" }));
+    if (name) throw new Error(`handler module ${snapshot.logical} uses ${name}, which the handler engine does not provide`);
+  }
+};
+
+const findUnavailableGlobal = (node: unknown): string | undefined => {
+  if (Array.isArray(node)) {
+    for (const child of node) { const found = findUnavailableGlobal(child); if (found) return found; }
+    return undefined;
+  }
+  if (!node || typeof node !== "object") return undefined;
+  const record = node as Record<string, unknown> & { type?: unknown; name?: unknown; computed?: unknown; shorthand?: unknown };
+  if (record.type === "Identifier" && typeof record.name === "string" && UNAVAILABLE_HANDLER_GLOBALS.has(record.name)) return record.name;
+  if (record.type === "MemberExpression" && record.computed !== true) {
+    const object = record.object as { type?: unknown; name?: unknown } | undefined;
+    const property = record.property as { name?: unknown } | undefined;
+    if (object?.type === "Identifier" && object.name === "globalThis" && typeof property?.name === "string" && UNAVAILABLE_HANDLER_GLOBALS.has(property.name)) return property.name;
+    return findUnavailableGlobal(record.object);
+  }
+  for (const [key, value] of Object.entries(record)) {
+    if (key === "key" && record.computed !== true && record.shorthand !== true) continue;
+    const found = findUnavailableGlobal(value);
+    if (found) return found;
+  }
+  return undefined;
+};
+
+const sourceLang = (logical: string): "tsx" | "ts" | "js" => logical.endsWith(".tsx") ? "tsx" : logical.endsWith(".ts") ? "ts" : "js";
+
+/**
+ * Every locked module a handler module reaches through static imports and
+ * re-exports, type-only ones included. Oxc erases `import type` before
+ * Rolldown sees it, so a module that only supplies types to a handler is
+ * never loaded by a bundle; the handler type check still reads it, so it
+ * counts as reachable for the source-lock closure check.
+ */
+const handlerImportClosure = (author: Map<string, Snapshot>, roots: string[]): Set<string> => {
+  const seen = new Set<string>();
+  const pending = [...roots];
+  while (pending.length > 0) {
+    const logical = pending.pop()!;
+    const snapshot = author.get(logical);
+    if (!snapshot || seen.has(snapshot.virtual)) continue;
+    seen.add(snapshot.virtual);
+    const body = (parseAst(snapshot.text, { lang: sourceLang(logical), sourceType: "module" }) as { body?: unknown[] }).body ?? [];
+    for (const node of body) {
+      if (!node || typeof node !== "object") continue;
+      const { type, source } = node as { type?: unknown; source?: { value?: unknown } | null };
+      if (type !== "ImportDeclaration" && type !== "ExportNamedDeclaration" && type !== "ExportAllDeclaration") continue;
+      const specifier = source?.value;
+      if (typeof specifier !== "string" || !specifier.startsWith(".")) continue;
+      pending.push(normalizeLogical(posix.join(posix.dirname(logical), specifier), `handler import ${specifier}`));
+    }
+  }
+  return seen;
+};
+
 const evaluator = (ses: string, bundle: string, buildContext: unknown): string => {
   const guest = `${bundle}\n; (async () => {\n  return {productionIR: ApsidesProgram.default(buildContext)};\n})()`;
   return `const emit = console.log.bind(console);
@@ -320,8 +455,74 @@ const parseEvaluation = (stdout: string): { productionIR: ProductionIr } => {
   return { productionIR: value.productionIR as ProductionIr };
 };
 
+/**
+ * Bundle every declared handler as its own deterministic, closed ESM entry
+ * (no externals: only other locked source modules may be imported, never an
+ * npm or remote specifier, never the authoring SDK), and fill in its
+ * `bundleSha256`. Each handler is bundled twice and compared byte-for-byte,
+ * matching the determinism guarantee the top-level program bundle already
+ * gets from `first`/`second` in {@link compileApsides}.
+ */
+const bundleHandlers = async (author: Map<string, Snapshot>, ir: ProductionIr): Promise<{ handlers: ProductionIr["handlers"]; files: Map<string, string>; loaded: Set<string> }> => {
+  const files = new Map<string, string>();
+  const handlers: ProductionIr["handlers"] = [];
+  const loaded = new Set<string>();
+  for (const handler of ir.handlers) {
+    if (!author.has(handler.module)) throw new Error(`handler module is absent from the source lock (resolved from the lock root, apsides.lock.json's own directory): ${handler.module}`);
+    const first = await bundleHandlerModule(author, handler.module);
+    const second = await bundleHandlerModule(author, handler.module);
+    if (first.code !== second.code) throw new Error(`independent handler bundles for ${handler.id} were not byte-identical`);
+    if (Buffer.byteLength(first.code) > MAX_OUTPUT_BYTES) throw new Error(`handler ${handler.id} bundle exceeds its output budget`);
+    files.set(handler.id, first.code);
+    for (const id of first.loaded) loaded.add(id);
+    handlers.push({ ...handler, bundleSha256: sha256(first.code) });
+  }
+  return { handlers, files, loaded };
+};
+
+const bundleHandlerModule = async (author: Map<string, Snapshot>, entry: string): Promise<{ code: string; loaded: Set<string> }> => {
+  const entrySnapshot = author.get(entry)!;
+  const loaded = new Set<string>();
+  const build = await rolldown({
+    input: entrySnapshot.virtual,
+    treeshake: false,
+    plugins: [{
+      name: "apsides-locked-handler-closure",
+      resolveId(specifier, importer) {
+        if (!importer) {
+          if (specifier === entrySnapshot.virtual) return specifier;
+          throw new Error("undeclared handler entrypoint");
+        }
+        if (!specifier.startsWith(".")) throw new Error(`handler module cannot import an undeclared package: ${specifier}`);
+        if (!importer.startsWith("apsides:/source/")) throw new Error("handler bundling is restricted to locked source modules");
+        const importerPath = importer.slice("apsides:/source/".length);
+        const logical = normalizeLogical(posix.join(posix.dirname(importerPath), specifier), `handler import ${specifier}`);
+        const snapshot = author.get(logical);
+        if (!snapshot) throw new Error(`handler import is absent from the source lock: ${logical}`);
+        return snapshot.virtual;
+      },
+      load(id) {
+        const snapshot = [...author.values()].find(value => value.virtual === id);
+        if (!snapshot) throw new Error(`undeclared handler bundle input: ${id}`);
+        loaded.add(id);
+        const lang = snapshot.logical.endsWith(".tsx") ? "tsx" : snapshot.logical.endsWith(".ts") ? "ts" : "js";
+        const compiled = transform(snapshot.virtual, snapshot.text, { lang, sourcemap: false });
+        if (compiled.errors.length) throw new Error(`Oxc rejected ${snapshot.logical}: ${compiled.errors.map(error => error.message).join("; ")}`);
+        return { code: compiled.code };
+      },
+      resolveDynamicImport() { throw new Error("handler dynamic imports are not declared build inputs"); },
+    }],
+  });
+  try {
+    const result = await build.generate({ format: "esm", sourcemap: false });
+    const chunks = result.output.filter(output => output.type === "chunk");
+    if (chunks.length !== 1) throw new Error("handler build must emit one closed module");
+    return { code: chunks[0]!.code, loaded };
+  } finally { await build.close(); }
+};
+
 const validateSourceLocations = (ir: ProductionIr, author: Map<string, Snapshot>): void => {
-  for (const declaration of [...ir.resources, ...ir.inputs, ...ir.reactions]) {
+  for (const declaration of [...ir.resources, ...ir.inputs, ...ir.reactions, ...ir.handlers]) {
     const source = declaration.source;
     const file = author.get(source?.file);
     if (!file) throw new Error(`declaration ${declaration.id} source is not in the locked source closure: ${source?.file}`);
@@ -336,7 +537,8 @@ const buildDeclarationMap = (ir: ProductionIr, fixtures: {inputs:{inputId:string
     schemaVersion: "apsides.dev/source-map/v1", virtualRoot: "apsides:/source",
     declarations: [
       ...ir.resources.map(value => entry("resource", value.id, value.source)), ...ir.inputs.map(value => entry("input", value.id, value.source)),
-      ...ir.reactions.map(value => entry("reaction", value.id, value.source)), ...fixtures.inputs.map(value => entry("fixture-input", value.inputId, value.source)),
+      ...ir.reactions.map(value => entry("reaction", value.id, value.source)), ...ir.handlers.map(value => entry("handler", value.id, value.source)),
+      ...fixtures.inputs.map(value => entry("fixture-input", value.inputId, value.source)),
       ...fixtures.workloadSubstitutions.map(value => entry("fixture-workload", value.targetResourceId, value.source)),
     ].sort((a,b) => order(`${a.category}/${a.id}`, `${b.category}/${b.id}`)),
   };

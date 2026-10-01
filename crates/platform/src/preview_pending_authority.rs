@@ -40,12 +40,8 @@ impl PendingContext {
             ));
         }
         require_qualified_server(
-            &issued
-                .platform()
-                .client
-                .apiserver_version()
-                .await?
-                .git_version,
+            &issued.platform().client.apiserver_version().await?,
+            &next.compatibility.kubernetes_version.min_version,
         )?;
         let policy = issued.platform().load_policy(&next.scope.domain_id).await?;
         let trust = issued

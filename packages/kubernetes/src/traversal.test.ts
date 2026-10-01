@@ -1,4 +1,4 @@
-import { ConfigMap, Controller, Deployment, Fragment, defineNamespacedResource, useConfigMap, useResourceRef, useSecret, type DataProjection, type DomainOptions, type ApsidesIR } from "./index.ts";
+import { ConfigMap, Controller, Deployment, Fragment, On, defineNamespacedResource, useConfigMap, useHandlerOutput, useResourceRef, useSecret, type DataProjection, type DomainOptions, type ApsidesIR } from "./index.ts";
 import { jsxDEV } from "./jsx-dev-runtime.ts";
 import { renderExport } from "./compiler.ts";
 
@@ -148,3 +148,143 @@ throws(() => compile(element(Controller, { ...domain, provenance: context.proven
 throws(() => compile(controller(element(() => { throw new Error("component failed"); }, {}))), "component failed");
 throws(() => useConfigMap({ name: "after-error" }), "synchronous component");
 assert(compile(controller(element(ConfigMap, config))).resources.length === 1, "failed render leaves no active frame or graph");
+
+const waddleDeployment = {
+  metadata: { name: "waddle-server", namespace: "workload" },
+  spec: { selector: { matchLabels: { app: "waddle-server" } }, template: { metadata: { labels: { app: "waddle-server" } }, spec: { containers: [{ name: "server", image: "test/waddle:v1" }] } } },
+};
+const Waddle = () => {
+  const keypool = useSecret({ name: "waddle-clustering-keypool" });
+  const serverConfig = useResourceRef("ConfigMap");
+  return element(Fragment, { children: [
+    element(ConfigMap, { metadata: { name: "waddle-server-config", namespace: "workload" }, data: { level: "info" }, ref: serverConfig }, 50),
+    element(Deployment, { ...waddleDeployment, rolloutOn: [keypool.data, serverConfig.data] }, 60),
+  ] });
+};
+const waddleIR = compile(controller(element(Waddle, {}, 45)));
+const waddleRollouts = waddleIR.reactions.map((reaction) => reaction.id).sort();
+assert(
+  JSON.stringify(waddleRollouts) === JSON.stringify([
+    "rollout-managed-configmap-waddle-server-config-deplo-56bc032ca9",
+    "rollout-observed-secret-waddle-clustering-keypool-de-cb182e11f4",
+  ]),
+  `over-long derived rollout ids are bounded with a hash suffix; received ${waddleRollouts.join(",")}`,
+);
+assert(waddleRollouts.every((id) => id.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(id)), "bounded derived ids are DNS labels");
+assert(JSON.stringify(waddleIR.resources.map((resource) => resource.id).sort()) === JSON.stringify(["configmap-waddle-server-config", "deployment-waddle-server"]), "short derived resource ids are unchanged");
+assert(JSON.stringify(waddleIR.inputs.map((input) => input.id).sort()) === JSON.stringify(["managed-configmap-waddle-server-config", "observed-secret-waddle-clustering-keypool"]), "short derived input ids are unchanged");
+assert(waddleIR.reactions.every((reaction) => waddleIR.inputs.some((input) => input.id === reaction.inputs[0]) && reaction.target === "deployment-waddle-server"), "bounded reactions reference their inputs and target");
+assert(JSON.stringify(waddleIR) === JSON.stringify(compile(controller(element(Waddle, {}, 45)))), "bounded derived ids are deterministic");
+
+// Event handlers: <On> plus useHandlerOutput().
+const HandlerApp = () => {
+  const settings = useConfigMap({ name: "settings" });
+  const flags = useHandlerOutput({ name: "flags" });
+  return element(Fragment, {
+    children: [
+      element(On, {
+        trigger: settings.changed,
+        handler: "./handlers/sync-flags.ts#syncFlags",
+        inputs: [settings],
+        egress: ["api.example.com"],
+        outputs: [flags],
+      }, 70),
+      element(Deployment, { ...deployment, rolloutOn: [flags.data] }, 80),
+    ],
+  });
+};
+const handlerIR = compile(controller(element(HandlerApp, {}, 65)));
+assert(handlerIR.handlers.length === 1, "one handler declared");
+assert(handlerIR.handlers[0]!.module === "handlers/sync-flags.ts", "handler module is normalized");
+assert(handlerIR.handlers[0]!.export === "syncFlags", "handler export parsed from the module reference string");
+assert(handlerIR.handlers[0]!.egress.length === 1 && handlerIR.handlers[0]!.egress[0]!.host === "api.example.com", "handler egress lowered");
+assert(handlerIR.handlers[0]!.source.line === 70, "handler source retains its JSX location");
+assert(handlerIR.outputs.length === 1 && handlerIR.outputs[0]!.name === "flags", "one output declared");
+const handlerOutputResource = handlerIR.resources.find((resource) => resource.id === handlerIR.outputs[0]!.id);
+assert(handlerOutputResource?.handlerOutput === true, "output resource is flagged handlerOutput");
+assert(handlerIR.reactions.some((reaction) => handlerIR.inputs.some((input) => input.id === reaction.inputs[0] && input.mode === "output")), "output projection works in rolloutOn");
+
+// Passing a function as `handler` is a compile error, never silently accepted.
+throws(() => compile(controller(element(() => {
+  const settings = useConfigMap({ name: "settings" });
+  return element(On, {
+    trigger: settings.changed,
+    handler: (() => {}) as unknown as string,
+    inputs: [settings],
+    outputs: [],
+  }, 10);
+}, {}))), "not a function");
+
+// A sensitive (Secret) input is rejected, never silently accepted.
+throws(() => compile(controller(element(() => {
+  const credentials = useSecret({ name: "credentials" });
+  return element(On, {
+    trigger: credentials.changed,
+    handler: "./handlers/leak.ts#leak",
+    inputs: [credentials],
+    outputs: [],
+  }, 10);
+}, {}))), "non-sensitive ConfigMap input");
+
+// Handler chaining: a handler output's `.changed` triggers, and the output
+// itself is an input of, a downstream `<On>`; both lower to the output's
+// Output-mode input.
+const ChainApp = () => {
+  const settings = useConfigMap({ name: "settings" });
+  const raw = useHandlerOutput({ id: "raw-flags", name: "raw-flags" });
+  const derived = useHandlerOutput({ id: "derived", name: "derived" });
+  return element(Fragment, {
+    children: [
+      element(On, { id: "fetch-raw", trigger: settings.changed, handler: "./a.ts#fetchRaw", inputs: [settings], egress: ["flags.example.com"], outputs: [raw] }, 90),
+      element(On, { id: "derive", trigger: raw.changed, handler: "./b.ts#derive", inputs: [raw], outputs: [derived] }, 91),
+    ],
+  });
+};
+const chainIR = compile(controller(element(ChainApp, {}, 85)));
+const rawInput = chainIR.inputs.find((input) => input.mode === "output" && input.managedResourceId === "raw-flags");
+assert(rawInput !== undefined, "the upstream output has an Output-mode input");
+const derive = chainIR.handlers.find((handler) => handler.id === "derive");
+assert(derive?.trigger.input === rawInput.id, "the downstream trigger lowers to the upstream output's Output-mode input id");
+assert(JSON.stringify(derive.inputs) === JSON.stringify([rawInput.id]), "the downstream inputs include the upstream output's Output-mode input");
+assert(JSON.stringify(derive.outputs) === JSON.stringify(["derived"]), "the downstream writes its own output");
+assert(chainIR.handlers.find((handler) => handler.id === "fetch-raw")?.outputs[0] === "raw-flags", "the upstream writes the chained output");
+
+// A handler triggering on (or reading) its own output is rejected at its JSX location.
+throws(() => compile(controller(element(() => {
+  const settings = useConfigMap({ name: "settings" });
+  const flags = useHandlerOutput({ name: "flags" });
+  return element(On, { trigger: flags.changed, handler: "./a.ts#loop", inputs: [settings, flags], outputs: [flags] }, 12);
+}, {}))), "may not trigger on or read its own output (app.tsx:12:1)");
+
+// Closing a two-handler cycle is rejected at the closing handler's JSX location.
+throws(() => compile(controller(element(() => {
+  const settings = useConfigMap({ name: "settings" });
+  const left = useHandlerOutput({ name: "left" });
+  const right = useHandlerOutput({ name: "right" });
+  return element(Fragment, {
+    children: [
+      element(On, { id: "west", trigger: settings.changed, handler: "./a.ts#west", inputs: [settings, right], outputs: [left] }, 20),
+      element(On, { id: "east", trigger: left.changed, handler: "./b.ts#east", inputs: [left], outputs: [right] }, 21),
+    ],
+  });
+}, {}))), "closes a handler graph cycle through input-changed triggers: east -> west -> east (app.tsx:21:1)");
+
+// The trigger must be a `.changed` event: a data projection, an output ref
+// itself, or a plain value is rejected, as is a non-reference input.
+for (const pick of [
+  (flags: ReturnType<typeof useHandlerOutput>) => flags.data,
+  (flags: ReturnType<typeof useHandlerOutput>) => flags,
+  () => ({}),
+]) {
+  throws(() => compile(controller(element(() => {
+    const settings = useConfigMap({ name: "settings" });
+    const flags = useHandlerOutput({ name: "flags" });
+    return element(On, { trigger: pick(flags) as unknown as DataProjection, handler: "./a.ts#run", inputs: [settings, flags], outputs: [] }, 30);
+  }, {}))), "On.trigger requires a `.changed` event");
+}
+for (const input of [{ data: {} }, "settings", null]) {
+  throws(() => compile(controller(element(() => {
+    const settings = useConfigMap({ name: "settings" });
+    return element(On, { trigger: settings.changed, handler: "./a.ts#run", inputs: [settings, input], outputs: [] }, 31);
+  }, {}))), "On.inputs requires a reference from this Controller");
+}

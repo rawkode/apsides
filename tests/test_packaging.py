@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -15,11 +16,39 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
+# package_oci.py now imports sibling modules (diagnostics, rusty_v8) itself,
+# so scripts/ must be on sys.path before it is exec'd below, not only before
+# the sibling imports further down.
+sys.path.insert(0, str(ROOT / "scripts"))
 spec = importlib.util.spec_from_file_location("apsides_package_oci", ROOT / "scripts/package_oci.py")
 packaging = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(packaging)
-sys.path.insert(0, str(ROOT / "scripts"))
+import diagnostics  # noqa: E402
 import extract_binary  # noqa: E402
+# The real-name `package_oci` module (as sbom.py/finalize_inputs.py import
+# it), a *separate* load from `packaging` above (which is exec'd under the
+# alias "apsides_package_oci" so its own tests can freely patch it without
+# perturbing sibling scripts' imports of the real name). Patching a function
+# defined in one does not affect the other; tests that exercise sbom.py's
+# `from package_oci import verify_context` patch attributes on this module,
+# not on `packaging`.
+import finalize_inputs  # noqa: E402
+import package_oci  # noqa: E402
+import rusty_v8  # noqa: E402
+import sbom  # noqa: E402
+
+
+class _FakeProcess:
+    """A minimal `subprocess.Popen`-shaped fake: `stdout` behaves like a
+    real text-mode pipe (iterable for lines, closeable), `wait()` returns
+    `returncode`."""
+
+    def __init__(self, lines=(), returncode=0):
+        self.stdout = io.StringIO("".join(lines))
+        self.returncode = returncode
+
+    def wait(self):
+        return self.returncode
 
 
 class PackagingTests(unittest.TestCase):
@@ -36,8 +65,7 @@ class PackagingTests(unittest.TestCase):
         (self.artifact / "controller/Cargo.lock").write_bytes(lock)
         path = str(self.repo / "crates/runtime")
         self.manifest = ('[package]\nname="controller"\nversion="0.1.0"\nedition="2024"\n'
-                         '[workspace]\n[dependencies]\nruntime={path=' + json.dumps(path) + '}\n'
-                         'tokio={version="1", features=["macros", "rt-multi-thread"]}\n')
+                         '[workspace]\n[dependencies]\nruntime={path=' + json.dumps(path) + '}\n')
         (self.artifact / "controller/Cargo.toml").write_text(self.manifest)
         (self.artifact / "manifest.json").write_text(json.dumps({"irDigest": "sha256:" + "a" * 64,
             "files": {"controller/Cargo.lock": packaging.sha256(lock)}}))
@@ -52,12 +80,25 @@ class PackagingTests(unittest.TestCase):
         self.base_config = image_config([BASE_LAYER])
         self.base_archive, _ = classic_save(self.root / "runtime-base.tar", self.base_config, [BASE_LAYER])
         self.pins, self.runtime_image, _, _ = write_pins(self.root / "pins", self.base_config, [BASE_LAYER])
+        # A fake rusty_v8 archive, so `prepare()`'s fetch never touches the
+        # network in a test: `fake_rusty_v8_resolve` hands back this local
+        # file (with a pin whose sha256 matches it) for whatever target the
+        # inspected builder platform asks for.
+        self.rusty_v8_archive = self.root / "fake-rusty-v8.a.gz"
+        self.rusty_v8_archive.write_bytes(b"fake rusty_v8 static archive bytes")
+        self.rusty_v8_sha256 = hashlib.sha256(self.rusty_v8_archive.read_bytes()).hexdigest()
 
     def tearDown(self):
         self.temporary.cleanup()
 
-    def build(self, destination, run, no_cache=False):
-        with patch.object(packaging, "command", self.fake_command), patch.object(packaging.subprocess, "run", run):
+    def fake_rusty_v8_resolve(self, target, **kwargs):
+        return self.rusty_v8_archive, {
+            "target": target, "name": "librusty_v8", "version": "150.4.0",
+            "url": f"https://example.invalid/rusty-v8/{target}.a.gz", "sha256": self.rusty_v8_sha256,
+        }
+
+    def build(self, destination, popen, no_cache=False):
+        with patch.object(packaging, "command", self.fake_command), patch.object(packaging.subprocess, "Popen", popen):
             return packaging.build(self.output, self.runtime_image, self.base_archive, destination,
                                    no_cache=no_cache, pins=self.pins)
 
@@ -96,7 +137,7 @@ class PackagingTests(unittest.TestCase):
         return "{}"
 
     def prepare(self):
-        with patch.object(packaging, "command", self.fake_command):
+        with patch.object(packaging, "command", self.fake_command), patch.object(rusty_v8, "resolve", self.fake_rusty_v8_resolve):
             return packaging.prepare(self.artifact, self.output, repository=self.repo)
 
     def verify(self):
@@ -142,7 +183,7 @@ class PackagingTests(unittest.TestCase):
                     shutil.rmtree(self.output)
                 self.prepare()
                 destination = self.root / ("image-source" if target.endswith("main.rs") else "image-metadata")
-                def fake_build(argv, check):
+                def fake_build(argv, **kwargs):
                     path = self.output / target
                     if target == "context.json":
                         metadata = json.loads(path.read_text())
@@ -150,6 +191,7 @@ class PackagingTests(unittest.TestCase):
                         path.write_text(json.dumps(metadata))
                     else:
                         path.write_text("// source changed during image build\n")
+                    return _FakeProcess(["Compiling controller v0.1.0\n"])
                 with self.assertRaisesRegex(ValueError, "changed"):
                     self.build(destination, fake_build)
                 self.assertFalse((destination / "packaging-inputs.json").exists())
@@ -160,15 +202,18 @@ class PackagingTests(unittest.TestCase):
         destination = self.root / "image"
         with self.assertRaisesRegex(ValueError, "outside"):
             packaging.build(self.output, self.runtime_image, self.base_archive, self.output / "image")
-        def fake_build(argv, check):
+        def fake_build(argv, **kwargs):
             self.assertIn("--network=none", argv)
             self.assertIn("--pull=false", argv)
             self.assertIn("--no-cache", argv)
             self.assertFalse(any("RUNTIME_IMAGE" in argument for argument in argv))
+            self.assertEqual(kwargs.get("stdout"), subprocess.PIPE)
+            self.assertEqual(kwargs.get("stderr"), subprocess.STDOUT)
             [output] = [argument for argument in argv if argument.startswith("type=local,dest=")]
             exported = Path(output.removeprefix("type=local,dest="))
             exported.mkdir(parents=True)
             (exported / "apsides-controller").write_bytes(ELF)
+            return _FakeProcess(["Compiling controller v0.1.0\n"])
         digest = self.build(destination, fake_build, no_cache=True)
         receipt = json.loads((destination / "packaging-inputs.json").read_text())
         self.assertEqual(receipt["contextDigest"], packaging.sha256(initial))
@@ -183,7 +228,7 @@ class PackagingTests(unittest.TestCase):
         self.base_config = image_config([CONTROLLER_LAYER])
         self.base_archive.unlink()
         classic_save(self.base_archive, self.base_config, [CONTROLLER_LAYER])
-        def compile_(argv, check):
+        def compile_(argv, **kwargs):
             raise AssertionError("BuildKit must not run for an unpinned base")
         with self.assertRaisesRegex(ValueError, "pinned manifest"):
             self.build(self.root / "image", compile_)
@@ -191,11 +236,12 @@ class PackagingTests(unittest.TestCase):
 
     def test_build_rejects_anything_but_the_binary_from_the_exporter(self):
         self.prepare()
-        def fake_build(argv, check):
+        def fake_build(argv, **kwargs):
             [output] = [argument for argument in argv if argument.startswith("type=local,dest=")]
             exported = Path(output.removeprefix("type=local,dest="))
             (exported / "etc").mkdir(parents=True)
             (exported / "apsides-controller").write_bytes(ELF)
+            return _FakeProcess(["Compiling controller v0.1.0\n"])
         with self.assertRaisesRegex(ValueError, "more or less than the controller"):
             self.build(self.root / "image", fake_build)
         self.assertFalse((self.root / "image/packaging-inputs.json").exists())
@@ -206,7 +252,7 @@ class PackagingTests(unittest.TestCase):
             if argv[:2] == ["cargo", "vendor"]:
                 (cwd / "controller/Cargo.lock").write_text("changed")
             return result
-        with patch.object(packaging, "command", mutate):
+        with patch.object(packaging, "command", mutate), patch.object(rusty_v8, "resolve", self.fake_rusty_v8_resolve):
             with self.assertRaisesRegex(ValueError, "changed Cargo.lock"):
                 packaging.prepare(self.artifact, self.output, repository=self.repo)
         self.assertFalse(self.output.exists())
@@ -232,6 +278,160 @@ class PackagingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "not cached"):
                 packaging.prepare(self.artifact, self.output, repository=self.repo)
         self.assertFalse(self.output.exists())
+
+    def test_prepared_context_records_a_verifiable_rusty_v8_component(self):
+        result = self.prepare()
+        archive = result["rustyV8"]["archive"]
+        self.assertEqual(archive["name"], "librusty_v8")
+        self.assertEqual(archive["version"], "150.4.0")
+        self.assertIn(archive["target"], rusty_v8.PLATFORM_TARGETS.values())
+        self.assertTrue(archive["url"].startswith("https://"))
+        self.assertEqual(archive["sha256"], "sha256:" + self.rusty_v8_sha256)
+        self.assertEqual(archive["path"], rusty_v8.CONTEXT_RELATIVE_PATH)
+        self.assertIsNone(result["rustyV8"]["bindingFile"])
+        # This is exactly the record scripts/finalize_inputs.py carries
+        # verbatim into build-inputs.json's compilerClosure.nativeCompiler.
+        self.assertIn(rusty_v8.CONTEXT_RELATIVE_PATH, result["files"])
+        self.assertEqual(result["files"][rusty_v8.CONTEXT_RELATIVE_PATH], archive["sha256"])
+        self.assertEqual((self.output / rusty_v8.CONTEXT_RELATIVE_PATH).read_bytes(), self.rusty_v8_archive.read_bytes())
+        self.assertEqual(result, self.verify())
+
+    def _relock(self, v8_version):
+        """Rewrite the artifact's Cargo.lock (and its recorded manifest
+        digest) so `prepare()`'s real `rusty_v8.resolve()` -- not
+        `fake_rusty_v8_resolve` -- sees a controller/Cargo.lock that locks
+        the `v8` crate at `v8_version`."""
+        lock = f'version = 4\n\n[[package]]\nname = "v8"\nversion = "{v8_version}"\n'.encode()
+        (self.artifact / "controller/Cargo.lock").write_bytes(lock)
+        manifest = json.loads((self.artifact / "manifest.json").read_text())
+        manifest["files"]["controller/Cargo.lock"] = packaging.sha256(lock)
+        (self.artifact / "manifest.json").write_text(json.dumps(manifest))
+
+    def test_prepare_reports_an_actionable_error_when_no_cache_directory_can_be_determined(self):
+        # scripts/rusty-v8/pins.json's real v8CrateVersion, so resolve()
+        # reaches default_cache_dir() instead of failing the pin/lock check
+        # first.
+        self._relock("150.4.0")
+        with patch.object(packaging, "command", self.fake_command), \
+             patch.dict(os.environ, {"APSIDES_RUSTY_V8_CACHE": "", "XDG_CACHE_HOME": "", "HOME": ""}):
+            with self.assertRaises(diagnostics.ActionableError) as failure:
+                packaging.prepare(self.artifact, self.output, repository=self.repo)
+        # Goes through failure_message(), the same as build.py's __main__:
+        # the remedy must survive to the user-facing text, not be dropped
+        # behind a bare "apsides: image build failed".
+        message = diagnostics.failure_message("image build", failure.exception)
+        self.assertTrue(message.startswith("apsides: image build failed\n"))
+        self.assertIn("APSIDES_RUSTY_V8_CACHE", message)
+
+    def test_prepare_reports_an_actionable_error_on_a_pin_lock_version_mismatch(self):
+        self._relock("999.0.0")
+        with patch.object(packaging, "command", self.fake_command):
+            with self.assertRaises(diagnostics.ActionableError) as failure:
+                packaging.prepare(self.artifact, self.output, repository=self.repo)
+        message = diagnostics.failure_message("image build", failure.exception)
+        self.assertTrue(message.startswith("apsides: image build failed\n"))
+        self.assertIn("pins.json", message)
+        self.assertIn("999.0.0", message)
+
+    def test_verify_context_rejects_a_rusty_v8_record_inconsistent_with_its_staged_file(self):
+        self.prepare()
+        path = self.output / "context.json"
+        original = json.loads(path.read_text())
+        cases = [
+            ("sha256", "sha256:" + "0" * 64),
+            ("target", "x86_64-pc-windows-msvc"),
+            ("url", None),
+            ("name", None),
+        ]
+        for field, value in cases:
+            with self.subTest(field=field):
+                metadata = json.loads(json.dumps(original))
+                metadata["rustyV8"]["archive"][field] = value
+                path.write_text(json.dumps(metadata))
+                with self.assertRaisesRegex(ValueError, "rusty_v8 archive record"):
+                    self.verify()
+        path.write_text(json.dumps(original))
+
+    def test_finalize_inputs_packaging_sources_include_the_new_scripts(self):
+        self.assertIn("scripts/diagnostics.py", finalize_inputs.PACKAGING_SOURCES)
+        self.assertIn("scripts/rusty_v8.py", finalize_inputs.PACKAGING_SOURCES)
+
+    def test_finalize_inputs_requires_the_matching_source_closure_schema(self):
+        finalize_inputs.ensure_source_closure_schema({"schemaVersion": "apsides.dev/compiler-closure/v3"})
+        with self.assertRaisesRegex(ValueError, "unexpected schema version"):
+            finalize_inputs.ensure_source_closure_schema({"schemaVersion": "apsides.dev/compiler-closure/v2"})
+        with self.assertRaisesRegex(ValueError, "unexpected schema version"):
+            finalize_inputs.ensure_source_closure_schema({})
+        # crates/release/src/compiler.rs's COMPILER_CLOSURE_SCHEMA and
+        # packages/compiler/src/compiler.ts's COMPILER_CLOSURE_SCHEMA must
+        # both agree with this, one version end to end.
+        self.assertEqual(finalize_inputs.SOURCE_CLOSURE_SCHEMA, "apsides.dev/compiler-closure/v3")
+
+    def test_build_raises_subprocess_failure_with_a_bounded_raw_tail_on_compile_failure(self):
+        self.prepare()
+        lines = [f"line {i}\n" for i in range(250)] + ["error: token=SEKRET1234567890\n"]
+        def fake_popen(argv, **kwargs):
+            self.assertEqual(kwargs.get("stdout"), subprocess.PIPE)
+            self.assertEqual(kwargs.get("stderr"), subprocess.STDOUT)
+            return _FakeProcess(lines, returncode=1)
+        with self.assertRaises(diagnostics.SubprocessFailure) as failure:
+            self.build(self.root / "image-compile-failure", fake_popen)
+        # Raw and unbounded-by-redaction at this layer -- diagnostics.
+        # failure_message() is the only place that redacts -- but already
+        # bounded to the last diagnostics.DEFAULT_TAIL_LINES lines, since
+        # stream() never buffers the whole (potentially huge) build log.
+        self.assertIn("SEKRET1234567890", failure.exception.output)
+        self.assertNotIn("line 0\n", failure.exception.output)
+        self.assertIn("line 249", failure.exception.output)
+        self.assertEqual(failure.exception.output.count("\n"), diagnostics.DEFAULT_TAIL_LINES - 1)
+        self.assertFalse((self.root / "image-compile-failure/packaging-inputs.json").exists())
+
+    def test_build_echoes_redacted_output_to_stderr_as_it_streams(self):
+        self.prepare()
+        def fake_popen(argv, **kwargs):
+            [output] = [argument for argument in argv if argument.startswith("type=local,dest=")]
+            exported = Path(output.removeprefix("type=local,dest="))
+            exported.mkdir(parents=True)
+            (exported / "apsides-controller").write_bytes(ELF)
+            return _FakeProcess(["Compiling controller v0.1.0\n", "token=SEKRET1234567890\n"])
+        captured = io.StringIO()
+        with patch.object(sys, "stderr", captured):
+            self.build(self.root / "image-echo", fake_popen)
+        echoed = captured.getvalue()
+        self.assertIn("Compiling controller v0.1.0", echoed)
+        self.assertIn("token=[REDACTED]", echoed)
+        self.assertNotIn("SEKRET1234567890", echoed)
+
+    def test_sbom_adds_rusty_v8_manual_components_from_the_verified_context(self):
+        self.prepare()
+        tool = self.root / "cargo-cyclonedx"
+        tool.write_bytes(b"#!/bin/sh\necho fake cargo-cyclonedx\n")
+        tool_sha256 = packaging.sha256(tool.read_bytes())
+        def fake_cyclonedx(argv, cwd=None, env=None, check=None, timeout=None, stdout=None, stderr=None, text=None):
+            self.assertEqual(stdout, subprocess.PIPE)
+            self.assertEqual(stderr, subprocess.STDOUT)
+            document = {
+                "bomFormat": "CycloneDX", "specVersion": "1.5",
+                "components": [{"type": "library", "bom-ref": "pkg:cargo/tokio@1.0.0", "name": "tokio", "version": "1.0.0"}],
+                "dependencies": [{"ref": "pkg:cargo/tokio@1.0.0"}],
+            }
+            (cwd / "controller/controller.cdx.json").write_text(json.dumps(document))
+            return subprocess.CompletedProcess(argv, 0, stdout="")
+        output = self.root / "sbom"
+        with patch.object(package_oci, "command", self.fake_command), patch.object(subprocess, "run", fake_cyclonedx):
+            digest = sbom.generate(self.output, tool, tool_sha256, "aarch64-unknown-linux-gnu", output)
+        written = json.loads((output / "sbom.json").read_bytes())
+        self.assertEqual(packaging.sha256(json.dumps(written, sort_keys=True, separators=(",", ":")).encode()), digest)
+        names = {component["name"] for component in written["components"]}
+        self.assertEqual(names, {"tokio", "librusty_v8"})
+        [manual] = [component for component in written["components"] if component["name"] == "librusty_v8"]
+        self.assertEqual(manual["version"], "150.4.0")
+        self.assertEqual(manual["hashes"], [{"alg": "SHA-256", "content": self.rusty_v8_sha256}])
+        self.assertIn("download_url=", manual["purl"])
+        self.assertIn(f"checksum=sha256:{self.rusty_v8_sha256}", manual["purl"])
+        self.assertEqual(manual["externalReferences"], [{"type": "distribution", "url": manual["externalReferences"][0]["url"]}])
+        generation = json.loads((output / "sbom-generation.json").read_text())
+        self.assertEqual(generation["manualComponents"], [manual["bom-ref"]])
 
 
 def layer_tar(entries):
@@ -527,6 +727,323 @@ class CommandBoundaryTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(result.stderr, f"apsides: {label} failed\n")
+
+
+class _FakeResponse:
+    """A minimal `urllib.request.urlopen`-shaped context manager over fixed bytes."""
+
+    def __init__(self, data):
+        self.data = data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def read(self):
+        return self.data
+
+
+class RustyV8Tests(unittest.TestCase):
+    """`scripts/rusty_v8.py`'s fetch/verify/cache logic, entirely offline."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="apsides-rusty-v8-test-")
+        self.root = Path(self.temporary.name).resolve()
+        self.cache = self.root / "cache"
+        self.data = b"a fake rusty_v8 prebuilt static archive\n"
+        self.sha256 = hashlib.sha256(self.data).hexdigest()
+        self.pins = {
+            "v8CrateVersion": "150.4.0",
+            "bindingFile": {"required": False},
+            "archives": {
+                "x86_64-unknown-linux-gnu": {
+                    "url": "https://example.invalid/rusty-v8/x86_64.a.gz",
+                    "sha256": self.sha256,
+                },
+            },
+        }
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def pin(self, **overrides):
+        pins = {**self.pins, "archives": {"x86_64-unknown-linux-gnu": {**self.pins["archives"]["x86_64-unknown-linux-gnu"], **overrides}}}
+        return rusty_v8.archive_pin("x86_64-unknown-linux-gnu", pins)
+
+    def test_fetch_verifies_and_caches_the_pinned_archive_then_never_refetches_it(self):
+        calls = []
+        def opener(url, timeout=None):
+            calls.append(url)
+            return _FakeResponse(self.data)
+        path = rusty_v8.fetch(self.pin(), cache_dir=self.cache, opener=opener)
+        self.assertEqual(path.read_bytes(), self.data)
+        self.assertEqual(calls, [self.pin()["url"]])
+        def must_not_be_called(url, timeout=None):
+            raise AssertionError("a valid cache hit must not be refetched")
+        again = rusty_v8.fetch(self.pin(), cache_dir=self.cache, opener=must_not_be_called)
+        self.assertEqual(again, path)
+
+    def test_fetch_rejects_a_wrong_sha256_as_a_hard_failure_and_caches_nothing(self):
+        def opener(url, timeout=None):
+            return _FakeResponse(self.data)
+        wrong = self.pin(sha256="0" * 64)
+        with self.assertRaisesRegex(ValueError, "sha256 verification"):
+            rusty_v8.fetch(wrong, cache_dir=self.cache, opener=opener)
+        self.assertEqual(list(self.cache.glob("**/*")) if self.cache.exists() else [], [])
+
+    def test_fetch_fails_clearly_when_offline_and_the_cache_is_empty(self):
+        def offline(url, timeout=None):
+            raise OSError("network is unreachable")
+        with self.assertRaisesRegex(ValueError, "is not cached under.*failed"):
+            rusty_v8.fetch(self.pin(), cache_dir=self.cache, opener=offline)
+
+    def test_a_corrupted_cache_entry_is_refetched_rather_than_trusted(self):
+        pin = self.pin()
+        self.cache.mkdir(parents=True)
+        (self.cache / f"{pin['sha256']}.a.gz").write_bytes(b"corrupted, not the real archive")
+        path = rusty_v8.fetch(pin, cache_dir=self.cache, opener=lambda url, timeout=None: _FakeResponse(self.data))
+        self.assertEqual(path.read_bytes(), self.data)
+
+    def test_load_pins_fails_closed_once_a_binding_file_becomes_required(self):
+        path = self.root / "pins.json"
+        path.write_text(json.dumps({**self.pins, "bindingFile": {"required": True}}))
+        with self.assertRaisesRegex(ValueError, "binding file"):
+            rusty_v8.load_pins(path)
+
+    def test_archive_pin_rejects_an_unknown_target_or_a_malformed_pin(self):
+        with self.assertRaisesRegex(ValueError, "no pinned"):
+            rusty_v8.archive_pin("x86_64-pc-windows-msvc", self.pins)
+        with self.assertRaisesRegex(ValueError, "https URL"):
+            self.pin(url="http://insecure.example/archive.gz")
+        with self.assertRaisesRegex(ValueError, "64 lowercase hex"):
+            self.pin(sha256="not-hex")
+
+    def test_resolve_loads_pins_from_disk_and_fetches_by_target(self):
+        path = self.root / "pins.json"
+        path.write_text(json.dumps(self.pins))
+        fetched, pin = rusty_v8.resolve(
+            "x86_64-unknown-linux-gnu", cache_dir=self.cache, pins_path=path,
+            opener=lambda url, timeout=None: _FakeResponse(self.data),
+        )
+        self.assertEqual(fetched.read_bytes(), self.data)
+        self.assertEqual(pin["sha256"], self.sha256)
+
+    def test_fetch_maps_a_filesystem_error_creating_the_cache_directory_to_a_clear_error(self):
+        # A privilege-independent way to force a real OSError from mkdir()
+        # (chmod alone would not: this sandbox runs as root, which bypasses
+        # permission bits): the cache path has a regular file, not a
+        # directory, as one of its own parent components.
+        blocking_file = self.root / "not-a-directory"
+        blocking_file.write_text("occupies the path a cache directory would need")
+        with self.assertRaisesRegex(ValueError, "cannot create the rusty_v8 archive cache directory"):
+            rusty_v8.fetch(self.pin(), cache_dir=blocking_file / "nested", opener=lambda url, timeout=None: _FakeResponse(self.data))
+
+    def test_locked_version_reads_the_pinned_v8_crate_version(self):
+        lock = b'[[package]]\nname = "v8"\nversion = "150.4.0"\n\n[[package]]\nname = "other"\nversion = "1.0.0"\n'
+        self.assertEqual(rusty_v8.locked_version(lock), "150.4.0")
+        self.assertIsNone(rusty_v8.locked_version(b'[[package]]\nname = "other"\nversion = "1.0.0"\n'))
+        duplicated = b'[[package]]\nname = "v8"\nversion = "150.4.0"\n\n[[package]]\nname = "v8"\nversion = "150.4.1"\n'
+        with self.assertRaisesRegex(ValueError, "more than one v8 crate version"):
+            rusty_v8.locked_version(duplicated)
+
+    def test_ensure_pin_matches_lock_fails_closed_on_a_version_mismatch(self):
+        lock = b'[[package]]\nname = "v8"\nversion = "150.4.0"\n'
+        rusty_v8.ensure_pin_matches_lock(lock, self.pins)  # matches; must not raise
+        with self.assertRaisesRegex(ValueError, "pins v8 crate version"):
+            rusty_v8.ensure_pin_matches_lock(lock, {**self.pins, "v8CrateVersion": "150.4.1"})
+        with self.assertRaisesRegex(ValueError, "does not lock the v8 crate"):
+            rusty_v8.ensure_pin_matches_lock(b'[[package]]\nname = "other"\nversion = "1.0.0"\n', self.pins)
+
+    def test_resolve_cross_checks_lock_bytes_against_the_pin_when_given(self):
+        path = self.root / "pins.json"
+        path.write_text(json.dumps(self.pins))
+        matching = b'[[package]]\nname = "v8"\nversion = "150.4.0"\n'
+        rusty_v8.resolve(
+            "x86_64-unknown-linux-gnu", lock_bytes=matching, cache_dir=self.cache, pins_path=path,
+            opener=lambda url, timeout=None: _FakeResponse(self.data),
+        )
+        mismatched = b'[[package]]\nname = "v8"\nversion = "999.0.0"\n'
+        def must_not_be_called(url, timeout=None):
+            raise AssertionError("a mismatched pin must fail before any fetch")
+        with self.assertRaisesRegex(ValueError, "pins v8 crate version"):
+            rusty_v8.resolve(
+                "x86_64-unknown-linux-gnu", lock_bytes=mismatched, cache_dir=self.cache, pins_path=path,
+                opener=must_not_be_called,
+            )
+
+
+class DiagnosticsTests(unittest.TestCase):
+    """`scripts/diagnostics.py`'s redaction, bounding and failure-message shaping."""
+
+    def test_redact_removes_common_credential_shapes_but_keeps_ordinary_text(self):
+        cases = [
+            ("Authorization: Bearer abc123.def456ghi", "Authorization: Bearer [REDACTED]"),
+            ("https://user:hunterpassword@example.invalid/path", "https://[REDACTED]@example.invalid/path"),
+            ("token=sekret-value-1234567890", "token=[REDACTED]"),
+            ("PASSWORD: hunter2value", "PASSWORD: [REDACTED]"),
+            ("ghp_" + "a" * 36, "[REDACTED]"),
+            ("AKIAABCDEFGHIJKLMNOP", "[REDACTED]"),
+            ("https://example.invalid/x?sig=abcDEF123%3D&other=1", "sig=[REDACTED]&other=1"),
+        ]
+        for original, expected_fragment in cases:
+            with self.subTest(original=original):
+                self.assertIn(expected_fragment, diagnostics.redact(original))
+        ordinary = "cargo build --release --manifest-path controller/Cargo.toml\nCompiling engine v0.1.0"
+        self.assertEqual(diagnostics.redact(ordinary), ordinary)
+
+    def test_bounded_keeps_only_the_configured_last_lines(self):
+        text = "\n".join(f"line {i}" for i in range(500))
+        result = diagnostics.bounded(text, lines=200)
+        self.assertEqual(result.count("\n"), 199)
+        self.assertNotIn("line 0", result.splitlines())
+        self.assertTrue(result.endswith("line 499"))
+        short = "only\ntwo lines"
+        self.assertEqual(diagnostics.bounded(short, lines=200), short)
+
+    def test_failure_message_is_plain_for_non_subprocess_errors(self):
+        self.assertEqual(diagnostics.failure_message("image build", ValueError("bad input")), "apsides: image build failed")
+        self.assertEqual(diagnostics.failure_message("image build", FileNotFoundError(2, "No such file")), "apsides: image build failed")
+
+    def test_failure_message_appends_a_bounded_redacted_diagnostic_for_subprocess_failures(self):
+        lines = [f"line {i}" for i in range(250)] + ["Authorization: Bearer sekret-token-value-should-not-leak"]
+        error = diagnostics.SubprocessFailure("cargo build failed", "\n".join(lines))
+        message = diagnostics.failure_message("image build", error)
+        self.assertTrue(message.startswith("apsides: image build failed\n"))
+        self.assertNotIn("sekret-token-value-should-not-leak", message)
+        self.assertIn("Authorization: Bearer [REDACTED]", message)
+        self.assertNotIn("line 0\n", message)
+        self.assertIn("line 249", message)
+        self.assertEqual(message.count("\n"), 200)
+
+    def test_failure_message_omits_the_diagnostic_block_when_output_is_empty(self):
+        error = diagnostics.SubprocessFailure("docker build failed", "")
+        self.assertEqual(diagnostics.failure_message("image build", error), "apsides: image build failed")
+
+    def test_actionable_error_is_a_value_error_so_existing_catches_still_match(self):
+        self.assertIsInstance(diagnostics.ActionableError("set FOO"), ValueError)
+
+    def test_failure_message_always_appends_an_actionable_errors_own_message(self):
+        error = diagnostics.ActionableError(
+            "cannot determine a rusty_v8 archive cache directory: set APSIDES_RUSTY_V8_CACHE "
+            "(or XDG_CACHE_HOME, or HOME) to a writable directory"
+        )
+        message = diagnostics.failure_message("image build", error)
+        self.assertEqual(message, f"apsides: image build failed\n{error}")
+        self.assertIn("APSIDES_RUSTY_V8_CACHE", message)
+
+    def test_failure_message_redacts_an_actionable_errors_message_too(self):
+        error = diagnostics.ActionableError("update pins.json: token=SEKRET1234567890")
+        message = diagnostics.failure_message("image build", error)
+        self.assertNotIn("SEKRET1234567890", message)
+        self.assertIn("token=[REDACTED]", message)
+
+    def test_failure_message_omits_the_block_for_an_empty_actionable_error(self):
+        self.assertEqual(diagnostics.failure_message("image build", diagnostics.ActionableError("")), "apsides: image build failed")
+
+
+class SubprocessDiagnosticIntegrationTests(unittest.TestCase):
+    """`command()` raises `SubprocessFailure` carrying the real, unredacted
+    stderr; redaction and bounding happen only once, in `failure_message()`."""
+
+    def test_command_helper_raises_subprocess_failure_with_raw_captured_stderr(self):
+        def fake_run(argv, cwd=None, check=False, text=True, capture_output=True, timeout=180):
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="cargo error: token=SEKRET1234567890\n")
+        with patch.object(subprocess, "run", fake_run):
+            with self.assertRaises(diagnostics.SubprocessFailure) as failure:
+                packaging.command(["cargo", "vendor", "--locked"])
+        # Raw and unbounded at this layer: SEKRET1234567890 is redacted only
+        # when diagnostics.failure_message() builds the final message.
+        self.assertIn("SEKRET1234567890", failure.exception.output)
+        message = diagnostics.failure_message("image build", failure.exception)
+        self.assertNotIn("SEKRET1234567890", message)
+        self.assertIn("token=[REDACTED]", message)
+
+
+class DockerfileWiringTests(unittest.TestCase):
+    """The committed Dockerfile itself wires RUSTY_V8_ARCHIVE for the
+    network-less build, at the fixed path `prepare()` always stages the
+    fetched archive at."""
+
+    def test_dockerfile_sets_rusty_v8_archive_before_the_network_less_build(self):
+        text = (ROOT / "scripts/Dockerfile").read_text()
+        self.assertIn(f"ENV RUSTY_V8_ARCHIVE=/build/{rusty_v8.CONTEXT_RELATIVE_PATH}", text)
+        self.assertIn("COPY rusty-v8 rusty-v8", text)
+        run_index = text.index("RUN --network=none")
+        self.assertLess(text.index("ENV RUSTY_V8_ARCHIVE="), run_index)
+        self.assertLess(text.index("COPY rusty-v8 rusty-v8"), run_index)
+
+
+class DistributionLayoutTests(unittest.TestCase):
+    """The rusty_v8 archive cache must never resolve under an installed CLI
+    distribution's verified asset tree.
+
+    `crates/cli/src/assets.rs`'s `assets::root()` hash-checks the entire
+    `<prefix>/share/apsides` tree (where `scripts/` lives in a distribution)
+    against a manifest on every `aps` invocation; a cache directory
+    `rusty_v8.py`'s own `ROOT` (`scripts/`'s parent) that landed inside that
+    tree would make every `aps` command after the first `aps build` fail
+    with "distribution assets do not match this binary" -- or, on a
+    read-only installation prefix, fail immediately with a raw
+    PermissionError. This copies the real scripts into a temporary
+    `<prefix>/share/apsides/scripts/` layout (as `package_cli.py` would
+    install them) and imports that copy fresh, so `ROOT` genuinely resolves
+    to the simulated prefix, the same way it would for an installed CLI.
+    """
+
+    def test_default_cache_dir_and_a_real_fetch_never_write_under_the_prefix(self):
+        with tempfile.TemporaryDirectory(prefix="apsides-distribution-test-") as temporary:
+            temporary = Path(temporary).resolve()
+            prefix = temporary / "prefix"
+            assets = prefix / "share/apsides"
+            scripts_dir = assets / "scripts"
+            scripts_dir.mkdir(parents=True)
+            # rusty_v8.py imports diagnostics, so a real distribution would
+            # install both (scripts/diagnostics.py is in package_cli.py's
+            # STATIC_SOURCES); copied here for the same reason, even though
+            # this process already has the real diagnostics module cached
+            # under that name and would reuse it either way -- it is pure
+            # and stateless, so nothing about the property under test
+            # (nothing lands under the prefix) depends on which copy runs.
+            shutil.copy(ROOT / "scripts/rusty_v8.py", scripts_dir / "rusty_v8.py")
+            shutil.copy(ROOT / "scripts/diagnostics.py", scripts_dir / "diagnostics.py")
+            before = sorted(path.relative_to(prefix) for path in prefix.rglob("*"))
+            home = temporary / "home"
+            home.mkdir()
+            spec = importlib.util.spec_from_file_location("apsides_distribution_rusty_v8", scripts_dir / "rusty_v8.py")
+            distributed = importlib.util.module_from_spec(spec)
+            # Simulates an installed distribution's environment: HOME is the
+            # only thing naming a cache location (no APSIDES_RUSTY_V8_CACHE
+            # or XDG_CACHE_HOME override, which would trivially pass this).
+            # dont_write_bytecode matches crates/cli/src/commands/compile.rs
+            # setting PYTHONDONTWRITEBYTECODE=1 for the real invocation, so
+            # this doesn't fail on an unrelated __pycache__ artifact of
+            # exec'ing the copy directly (a subprocess launch, unlike this,
+            # reads that env var at interpreter startup).
+            with patch.dict(os.environ, {"HOME": str(home), "XDG_CACHE_HOME": "", "APSIDES_RUSTY_V8_CACHE": ""}), \
+                 patch.object(sys, "dont_write_bytecode", True):
+                spec.loader.exec_module(distributed)
+                self.assertEqual(distributed.ROOT, assets.resolve())
+                cache_dir = distributed.default_cache_dir()
+                self.assertEqual(cache_dir, home / ".cache/apsides/rusty-v8")
+                self.assertFalse(str(cache_dir).startswith(str(prefix)))
+                data = b"a fake distributed rusty_v8 archive\n"
+                pin = {
+                    "target": "x86_64-unknown-linux-gnu", "name": "librusty_v8", "version": "150.4.0",
+                    "url": "https://example.invalid/a.gz", "sha256": hashlib.sha256(data).hexdigest(),
+                }
+                fetched = distributed.fetch(pin, opener=lambda url, timeout=None: _FakeResponse(data))
+            self.assertTrue(str(fetched).startswith(str(home)))
+            self.assertEqual(fetched.read_bytes(), data)
+            after = sorted(path.relative_to(prefix) for path in prefix.rglob("*"))
+            self.assertEqual(before, after, "a real fetch must not add, remove or change anything under the prefix")
+
+    def test_default_cache_dir_fails_closed_without_any_usable_environment(self):
+        with tempfile.TemporaryDirectory(prefix="apsides-distribution-test-") as temporary:
+            with patch.dict(os.environ, {"APSIDES_RUSTY_V8_CACHE": "", "XDG_CACHE_HOME": "", "HOME": ""}):
+                with self.assertRaisesRegex(ValueError, "cannot determine a rusty_v8 archive cache directory"):
+                    rusty_v8.default_cache_dir()
 
 
 if __name__ == "__main__":

@@ -1,10 +1,14 @@
 use super::*;
 use coordination::{ReviewOwnershipPlan, ReviewPrimitive};
 
-fn projected(private: &str) -> Result<(deploy::TransitionPlan, coordination::ReviewMetadataV1)> {
-    let (_, plan) = transition(&declaration(private)?)?;
+fn projected_from(ir: &Value) -> Result<(deploy::TransitionPlan, coordination::ReviewMetadata)> {
+    let (_, plan) = transition(ir)?;
     let metadata = platform::project_review_metadata(&plan)?;
     Ok((plan, metadata))
+}
+
+fn projected(private: &str) -> Result<(deploy::TransitionPlan, coordination::ReviewMetadata)> {
+    projected_from(&declaration(private)?)
 }
 
 fn strictly_sorted<T: Ord>(values: &[T]) -> bool {
@@ -13,7 +17,7 @@ fn strictly_sorted<T: Ord>(values: &[T]) -> bool {
 
 fn assert_declaration_catalogs(
     plan: &deploy::TransitionPlan,
-    metadata: &coordination::ReviewMetadataV1,
+    metadata: &coordination::ReviewMetadata,
 ) -> Result<()> {
     let compiled = &plan.request.next.compiled;
     assert_eq!(metadata.resources.len(), compiled.ir.resources.len());
@@ -69,7 +73,7 @@ fn assert_declaration_catalogs(
 
 fn assert_permission_catalogs(
     plan: &deploy::TransitionPlan,
-    metadata: &coordination::ReviewMetadataV1,
+    metadata: &coordination::ReviewMetadata,
 ) -> Result<()> {
     let compiled = &plan.request.next.compiled;
     let domain = &compiled.ir.domain;
@@ -280,5 +284,36 @@ fn projector_links_the_canonical_adoption_approval_without_private_payloads() ->
     assert!(!encoded.contains("approved-private-value"));
     assert!(!encoded.contains("permittedApply"));
     assert!(!encoded.contains("priorManagedFieldsDigest"));
+    Ok(())
+}
+
+#[test]
+fn projection_fills_handlers_egress_outputs_and_the_surface_digest() -> Result<()> {
+    let (plan, metadata) = projected_from(&handler_declaration("private-value-canary")?)?;
+
+    // `surfaceDigest` is filled by the same `derive_surface` function and
+    // canonical JSON `aps deploy` will independently recompute, never a
+    // second implementation.
+    let surface = compiler_core::derive_surface(&plan.request.next.compiled);
+    assert_eq!(metadata.surface_digest, compiler_core::digest(&surface)?);
+
+    assert_eq!(metadata.handlers.len(), 1);
+    let handler = &metadata.handlers[0];
+    assert_eq!(handler.id, "sync-flags");
+    assert_eq!(handler.trigger, "settings");
+    assert_eq!(handler.inputs, ["settings"]);
+    assert_eq!(handler.outputs, ["output-flags"]);
+
+    assert_eq!(metadata.egress.len(), 1);
+    let egress = &metadata.egress[0];
+    assert_eq!(egress.host, "api.example.com");
+    assert_eq!(egress.port, 443);
+    assert_eq!(egress.handler, "sync-flags");
+
+    assert_eq!(metadata.outputs.len(), 1);
+    let output = &metadata.outputs[0];
+    assert_eq!(output.id, "output-flags");
+    assert_eq!(output.name, "flags");
+    assert_eq!(output.namespace, "workload");
     Ok(())
 }

@@ -132,6 +132,7 @@ fn projection_excludes_private_values_and_rejects_unknown_fields() -> TestResult
             line: 1,
             column: 1,
         },
+        handler_output: false,
     };
     let tracked = TrackedResource::from_resource(&resource, "secrets".into(), Some("uid".into()));
     let serialized = serde_json::to_string(&tracked)?;

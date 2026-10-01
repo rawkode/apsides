@@ -11,8 +11,8 @@ const LIMIT: &str = "deployment review incomplete: metadata projection limit exc
 
 pub(super) fn count(
     plan: &deploy::TransitionPlan,
-    previous: Option<&coordination::ReviewMetadataV1>,
-    next: &coordination::ReviewMetadataV1,
+    previous: Option<&coordination::ReviewMetadata>,
+    next: &coordination::ReviewMetadata,
 ) -> crate::Result<()> {
     let mut count = 0usize;
     let lengths = [
@@ -37,10 +37,7 @@ pub(super) fn count(
     count_metadata(&mut count, next)
 }
 
-fn count_metadata(
-    count: &mut usize,
-    metadata: &coordination::ReviewMetadataV1,
-) -> crate::Result<()> {
+fn count_metadata(count: &mut usize, metadata: &coordination::ReviewMetadata) -> crate::Result<()> {
     let deployment = &metadata.deployment_permissions;
     let compatibility = &metadata.compatibility;
     let enforcement = &metadata.enforcement;
@@ -48,6 +45,9 @@ fn count_metadata(
         metadata.resources.len(),
         metadata.inputs.len(),
         metadata.reactions.len(),
+        metadata.handlers.len(),
+        metadata.egress.len(),
+        metadata.outputs.len(),
         metadata.runtime_permissions.len(),
         metadata.cleanup_permissions.len(),
         deployment.required_resources.len(),
@@ -57,7 +57,6 @@ fn count_metadata(
         compatibility.required_runtime_apis.len(),
         compatibility.required_cleanup_apis.len(),
         compatibility.required_deployment_apis.len(),
-        compatibility.qualified_create_precondition_servers.len(),
         enforcement.gaps.len(),
         enforcement.indirect_risks.len(),
         enforcement.runtime_ceiling.capabilities.len(),
@@ -73,6 +72,8 @@ fn count_metadata(
         .chain(metadata.inputs.iter().map(|i| i.projection.len()))
         .chain(metadata.reactions.iter().map(|r| r.input_ids.len()))
         .chain(metadata.reactions.iter().map(|r| r.effect_fields.len()))
+        .chain(metadata.handlers.iter().map(|h| h.inputs.len()))
+        .chain(metadata.handlers.iter().map(|h| h.outputs.len()))
         .chain(metadata.runtime_permissions.iter().map(|c| c.names.len()))
         .chain(metadata.cleanup_permissions.iter().map(|c| c.names.len()))
         .chain(

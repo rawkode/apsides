@@ -1,0 +1,131 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# This crate exists separately from `runtime` because
+# `runtime/src/lib.rs` carries `#![forbid(unsafe_code)]` (forbid, not deny —
+# it cannot be locally re-allowed by any module). Embedding deno_core/V8
+# requires one unavoidable unsafe call site (`v8::new_rust_allocator`), so it
+# is confined here instead, in `src/v8_alloc.rs`, under the workspace's
+# `unsafe_code = "deny"` policy (deny, not forbid), with a module-level
+# `#[allow(unsafe_code)]` and justification per the workspace hard rule.
+[dependencies]
+# Pinned exact: deno_core 0.412.0 is the newest release on crates.io as of
+# this spike (2026-09-24) whose declared MSRV is compatible with the
+# workspace's rust-toolchain.toml (1.98.0). deno_core itself declares no
+# explicit rust-version in this release; its `v8` (published as `deno_v8`,
+# re-exporting the `v8`/rusty_v8 crate) dependency pins to `v8 150.4.0`,
+# which also has no stated MSRV floor above 1.98. Exact-pinned (not `^`) so a
+# transitive V8 bump cannot silently change flag/ABI behavior validated here.
+deno_core = "=0.412.0"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `ensure_platform_initialized` installs this as V8's entropy source
+# (`v8::V8::set_entropy_source`), so `Math.random`/the internal
+# string-hash seed/the platform RNG never fall back to a time-based seed
+# under Landlock lockdown, which denies `/dev/urandom` like every other
+# path (see the Apsides v0.3 plan, Phase 5c). On this pinned version's
+# Linux backend for `x86_64`/`aarch64`-class targets
+# (`linux_android_with_fallback`), `getrandom::fill` calls the
+# `getrandom(2)` syscall directly and only touches `/dev/urandom` if that
+# syscall itself is unavailable, which Landlock does not make it -- so
+# this needs no file access under lockdown. No non-default features:
+# the syscall backend is already the default for these targets.
+getrandom = "0.3"
+# Phase 5b `op_apsides_fetch`: promoted from dev-dependencies (Phase 5a used
+# these only in tests/common/mod.rs's `https_get_via_hickory` spike helper).
+# hickory-resolver: explicit-nameserver DNS resolution (no glibc
+# getaddrinfo/`/etc/resolv.conf`) so a resolved address can be vetted before
+# connecting; rustls/tokio-rustls/webpki-roots: a dedicated TLS client
+# config (compiled-in root store, no native OS trust store, no client
+# auth), never the OS proxy/trust configuration.
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "io-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+# Review round 5 (B2): replaces the hand-rolled HTTP/1.1 parser, whose
+# manual request assembly (format!/push_str, no method/header validation)
+# allowed CRLF/request-line injection. hyper/hyper-util/http/http-body-util
+# are already in Cargo.lock (pulled in transitively through `kube` in other
+# workspace crates), so this only adds feature requests, not new crates to
+# the dependency graph -- versions pinned to match what is already locked.
+bytes = "1"
+http = "=1.5.0"
+http-body-util = "=0.1.5"
+# `server`: not used to serve anything -- this crate is HTTP/1.1 client-only
+# -- but `hyper::Error::is_parse_too_large()` (used to classify a response
+# whose headers hyper itself refused to buffer) is gated behind
+# `all(feature = "http1", feature = "server")` in hyper 1.11.1, seemingly a
+# quirk of how hyper shares its header-parsing error classification between
+# both sides rather than an actual server-only capability. No server-side
+# API from this crate is ever called.
+hyper = { version = "=1.11.1", features = ["client", "http1", "server"] }
+hyper-util = { version = "=0.1.20", features = ["tokio"] }
+# Optional, enabled only by `test-util` (see below): `src/test_support.rs`'s
+# `HttpsFixtureServer`, a local in-process HTTPS test server other crates'
+# own tests (e.g. `runtime`'s -- see the Apsides v0.3 plan, Phase 5b review
+# item 4) reuse rather than re-implementing their own self-signed-cert
+# fixture. Default features (`crypto`, `pem`, `ring`) match the `ring`
+# crypto backend already chosen for `rustls`/`tokio-rustls` above.
+rcgen = { version = "0.14", optional = true }
+# Phase 5c filesystem lockdown (see the Apsides v0.3 plan, "5c. Filesystem
+# lockdown"): promoted from `[dev-dependencies]` (where the Phase 5a spike
+# gate first proved the deny-all-before-any-thread ordering in
+# `tests/landlock_order.rs`/`tests/landlock_fs.rs`) to a normal dependency,
+# so `src/lockdown.rs` can expose the same, now-production, lockdown
+# primitives for `runtime::start` to call. Needs no `unsafe` (confirmed by
+# the crate's own docs and this crate's own workspace-lint-clean use of it),
+# so it does not touch the `unsafe_code = "deny"` policy.
+landlock = "0.4"
+
+[features]
+# Review round 5 (decision): the only entry point exposed without this
+# feature is `invoke_handler_with_watchdog` (the plan's watchdog-enforced
+# production API). `invoke_handler`/`invoke_handler_blocking` exist for
+# this crate's own tests, which want an `.await`able or a
+# `tokio::time::timeout`-wrapped form without a watchdog thread getting in
+# the way of asserting on the underlying error shape -- gated behind this
+# feature rather than made `pub(crate)` so tests/*.rs (separate,
+# external-crate integration test binaries) can still reach them. Enabled
+# automatically for `cargo test`/`cargo clippy --tests` via the self
+# dev-dependency below; never enabled for an ordinary `cargo build`.
+#
+# rcgen's own `[target."cfg(unix)".dev-dependencies]` on `openssl` (used
+# only to build *rcgen's own* examples, never a dependency of the `rcgen`
+# library target or anything that reaches this crate) was checked against
+# rcgen 0.14.10's upstream `rcgen/Cargo.toml` before adding it above.
+test-util = ["dep:rcgen"]
+
+[dev-dependencies]
+engine = { path = ".", features = ["test-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+
+# `harness = false`: this binary's `fn main()` controls thread creation
+# order itself (Landlock deny-all on the main thread, *then* V8 platform
+# init, *then* the tokio runtime -- see the file for why), which libtest's
+# default per-`#[test]`-thread harness would not let it guarantee.
+[[test]]
+name = "landlock_order"
+path = "tests/landlock_order.rs"
+harness = false
+
+# `harness = false`: this binary's `fn main()` re-execs itself as a child
+# process that applies a real Landlock lockdown on its own main thread --
+# see the file for why two separate processes, not just two isolates in
+# one, and why that rules out mutating this process's own environment
+# (`std::env::set_var` is `unsafe` as of the 2024 edition, which the
+# workspace's `unsafe_code = "deny"` lint applies to every target of this
+# crate with no exception).
+[[test]]
+name = "entropy_source"
+path = "tests/entropy_source.rs"
+harness = false
+
+[lints]
+workspace = true

@@ -1,6 +1,6 @@
 use super::{
     MAX_REVIEW_DECLARATIONS, REVIEW_METADATA_SCHEMA, REVIEW_ROLLOUT_FIELD,
-    ReviewApiResourceMapping, ReviewApiResourceScope, ReviewMetadataV1, ReviewOwnershipPlan,
+    ReviewApiResourceMapping, ReviewApiResourceScope, ReviewMetadata, ReviewOwnershipPlan,
     ReviewResource,
 };
 use super::{ReviewInputMode, ReviewSource};
@@ -107,13 +107,17 @@ fn resource_api(resource: &ReviewResource) -> Result<compiler_core::ResolvedApiR
         .map_err(|_| Error::Invalid("review resource API"))
 }
 
-pub(super) fn validate(value: &ReviewMetadataV1) -> Result<()> {
+pub(super) fn validate(value: &ReviewMetadata) -> Result<()> {
     require(
         value.schema_version == REVIEW_METADATA_SCHEMA
             && value.resources.len() <= MAX_REVIEW_DECLARATIONS
             && value.inputs.len() <= MAX_REVIEW_DECLARATIONS
-            && value.reactions.len() <= MAX_REVIEW_DECLARATIONS,
-        "review schema or declaration count",
+            && value.reactions.len() <= MAX_REVIEW_DECLARATIONS
+            && value.handlers.len() <= MAX_REVIEW_DECLARATIONS
+            && value.egress.len() <= MAX_REVIEW_DECLARATIONS
+            && value.outputs.len() <= MAX_REVIEW_DECLARATIONS
+            && super::encoding::valid_digest(&value.surface_digest),
+        "review schema, declaration count or surface digest",
     )?;
     let scope = &value.scope.claim_scope;
     let mut ids = BTreeMap::new();
@@ -156,7 +160,61 @@ pub(super) fn validate(value: &ReviewMetadataV1) -> Result<()> {
         }
     }
     validate_inputs(value, &ids)?;
-    validate_reactions(value, &ids)
+    validate_reactions(value, &ids)?;
+    let input_ids: BTreeSet<_> = value.inputs.iter().map(|input| &input.id).collect();
+    let output_ids = validate_outputs(value)?;
+    let handler_ids = validate_handlers(value, &input_ids, &output_ids)?;
+    validate_egress(value, &handler_ids)
+}
+fn validate_outputs(value: &ReviewMetadata) -> Result<BTreeSet<&String>> {
+    let mut previous = None;
+    let mut ids = BTreeSet::new();
+    for output in &value.outputs {
+        require(
+            namespace(&output.id)
+                && previous.is_none_or(|old| old < &output.id)
+                && ids.insert(&output.id)
+                && name(&output.name)
+                && output.namespace == value.scope.claim_scope.workload_namespace,
+            "review output identity or order",
+        )?;
+        previous = Some(&output.id);
+    }
+    Ok(ids)
+}
+fn validate_handlers<'a>(
+    value: &'a ReviewMetadata,
+    input_ids: &BTreeSet<&String>,
+    output_ids: &BTreeSet<&String>,
+) -> Result<BTreeSet<&'a String>> {
+    let mut previous = None;
+    let mut ids = BTreeSet::new();
+    for handler in &value.handlers {
+        require(
+            namespace(&handler.id)
+                && previous.is_none_or(|old| old < &handler.id)
+                && ids.insert(&handler.id)
+                && !handler.inputs.is_empty()
+                && sorted(&handler.inputs)
+                && handler.inputs.iter().all(|id| input_ids.contains(id))
+                && handler.inputs.contains(&handler.trigger)
+                && sorted(&handler.outputs)
+                && handler.outputs.iter().all(|id| output_ids.contains(id)),
+            "review handler links or order",
+        )?;
+        previous = Some(&handler.id);
+    }
+    Ok(ids)
+}
+fn validate_egress(value: &ReviewMetadata, handler_ids: &BTreeSet<&String>) -> Result<()> {
+    require(sorted(&value.egress), "review egress order")?;
+    for egress in &value.egress {
+        require(
+            name(&egress.host) && egress.port >= 1 && handler_ids.contains(&egress.handler),
+            "review egress host, port or handler link",
+        )?;
+    }
+    Ok(())
 }
 fn version(value: &str) -> bool {
     !value.is_empty()
@@ -165,7 +223,7 @@ fn version(value: &str) -> bool {
         && value.bytes().all(|b| b.is_ascii_graphic())
 }
 fn validate_inputs(
-    value: &ReviewMetadataV1,
+    value: &ReviewMetadata,
     resources: &BTreeMap<&String, &super::ReviewResource>,
 ) -> Result<()> {
     let mut previous = None;
@@ -206,12 +264,26 @@ fn validate_inputs(
                         .any(|r| r.kind == input.kind && r.identity.name == input.name),
                 "review observed input aliases managed identity",
             )?,
+            ReviewInputMode::Output => {
+                let resource = input
+                    .managed_resource_id
+                    .as_ref()
+                    .and_then(|id| resources.get(id))
+                    .ok_or(Error::Invalid("review output input association"))?;
+                require(
+                    input.kind == "ConfigMap"
+                        && resource.kind == input.kind
+                        && resource.identity.name == input.name
+                        && resource.identity.namespace == input.namespace,
+                    "review output input association",
+                )?;
+            }
         }
     }
     Ok(())
 }
 fn validate_reactions(
-    value: &ReviewMetadataV1,
+    value: &ReviewMetadata,
     resources: &BTreeMap<&String, &super::ReviewResource>,
 ) -> Result<()> {
     let input_ids: BTreeSet<_> = value.inputs.iter().map(|input| &input.id).collect();

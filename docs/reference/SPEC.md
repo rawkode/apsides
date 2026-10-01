@@ -1,14 +1,14 @@
 Specification: Compiled Reactive GitOps
 
-Version: 0.2
+Version: 0.3
 Status: Proposed architecture and implementation contract
-Date: 5 September 2026
+Date: 25 September 2026
 
 This specification defines required behaviour, security limits, implementation scope, and acceptance criteria. Code examples define the required DSL shape; the current implementation boundary is documented separately. Requirements marked as future work do not belong to the initial release.
 
 ## 1. Overview
 
-Compiled Reactive GitOps compiles declarative infrastructure programs into purpose-built Kubernetes controllers. Each controller continuously reconciles a defined domain and evaluates a statically declared set of infrastructure reactions.
+Compiled Reactive GitOps compiles declarative infrastructure programs into purpose-built Kubernetes controllers. Each controller continuously reconciles a defined domain, evaluates a statically declared set of infrastructure reactions, and runs a statically declared set of sandboxed event handlers.
 
 The architecture has three operational stages:
 
@@ -39,6 +39,9 @@ MUST and MUST NOT identify mandatory requirements. SHOULD identifies a recommend
 |API capability    |An authorized Kubernetes request scope: API resource, subresource, verb, namespace, and applicable names.  |
 |Input projection  |The selected, typed fields of a declared input used by a computation.                                      |
 |Reaction          |A constrained computation contributing desired state to one or more declared targets.                      |
+|Event handler     |A build-time-bundled module export the controller runs in a sandbox when a declared input changes.         |
+|Handler output    |A managed ConfigMap whose data only its one declared writer handler supplies.                              |
+|Egress host       |A DNS name and port a handler may reach over HTTPS, declared at build time.                                |
 |Inventory         |Durable records of managed identities, observed UIDs, lifecycle decisions, and transition progress.        |
 |Permission ceiling|Platform-owned policy limiting the authority a domain may receive.                                         |
 
@@ -54,6 +57,7 @@ The system MUST provide:
 - Capability derivation from the actual generated runtime request plan.
 - Policy-checked deployment using short-lived credentials.
 - Continuous drift correction and declarative infrastructure reactions.
+- Declared event handlers with fixed inputs, outputs and HTTPS egress, run in a resource-limited sandbox (section 17.1).
 - Recovery from missed notifications, restarts, retries, and watch expiration.
 - Explicit adoption, deletion, orphaning, upgrade, and rollback semantics.
 - Reviewable resource, reaction, permission, and lifecycle changes.
@@ -62,7 +66,7 @@ The system MUST provide:
 
 The architecture MUST support repositories that emit one or several domains. A domain MAY span several namespaces in a later implementation. One controller per application is not required. Domains SHOULD align with trust boundaries; a single organisation-wide domain deliberately combines the authority of its contents.
 
-The initial release MUST NOT provide arbitrary runtime TypeScript, shell hooks, dynamic plugins, general workflow execution, business-event processing, automated database failover, runtime RBAC administration, or arbitrary runtime target creation.
+The initial release MUST NOT provide shell hooks, dynamic plugins, general workflow execution, business-event processing, automated database failover, runtime RBAC administration, or arbitrary runtime target creation. Runtime TypeScript is limited to declared event handlers: modules fixed at build time, compiled into the controller image, and restricted to their declared inputs, outputs and egress hosts. Handlers receive no Kubernetes credential and cannot create targets or read Secrets.
 
 The initial release supports fixed names within one workload namespace per domain. This is an implementation boundary, not a restriction on the long-term domain model.
 
@@ -85,9 +89,9 @@ flowchart TD
     T --> R
 ```
 
-The Rust compiler MAY share an audited runtime library across generated binaries. It SHOULD specialize resource plans, projections, indexes, and reaction code where beneficial. It MUST NOT require source checkout, package installation, source evaluation, or arbitrary code loading inside reconciliation loops.
+The Rust compiler MAY share an audited runtime library across generated binaries. It SHOULD specialize resource plans, projections, indexes, and reaction code where beneficial. It MUST NOT require source checkout, package installation, source evaluation, or arbitrary code loading inside reconciliation loops. Event handler bundles are produced at build time, embedded in the controller binary, and checked against the digests the validated IR records before the controller starts; the controller loads no other code.
 
-New effects, watched API types, or authorization scopes require a new build and deployment. Changes to already declared external input values do not require a rebuild.
+New effects, watched API types, handlers, egress hosts, or authorization scopes require a new build and deployment. Changes to already declared external input values do not require a rebuild.
 
 ## 5. Threat model and enforcement profiles
 
@@ -235,6 +239,25 @@ Image tags above are illustrative. Production policy SHOULD require immutable wo
 
 Resource elements such as `ConfigMap`, `Deployment`, and `Service` grant lifecycle intent only for the declared object and fields. Observation hooks such as `useConfigMap` and `useSecret` grant no mutation intent. There is no generic runtime callback escape hatch.
 
+Event handlers are declared with the `On` element and a handler output with `useHandlerOutput`:
+
+```tsx
+const settings = useConfigMap({ id: "feature-settings", name: "feature-settings" });
+const flags = useHandlerOutput({ id: "resolved-flags", name: "resolved-flags" });
+
+<On
+  id="resolve-flags"
+  trigger={settings.changed}
+  handler="./handlers/resolve-flags.ts#resolveFlags"
+  inputs={[settings]}
+  egress={["flags.example.com"]}
+  outputs={[flags]}
+/>
+<Deployment metadata={{ name: "api", namespace }} rolloutOn={[flags.data]} spec={apiSpec} />
+```
+
+`handler` MUST be a module reference string, never a function: the module runs in a separate sandbox and cannot capture build-time closures or values. The module MUST be part of the locked source closure and MAY import only other locked modules, plus erased type-only imports of the SDK's handler declarations. The compiler MUST type-check every handler module in strict mode against the ECMAScript library and those declarations only, and MUST reject any remaining reference to a library global the sandbox does not install, so a handler that uses a global the sandbox does not provide fails the build. `useHandlerOutput` declares a managed ConfigMap that only its handler writes; its `.data` projection MAY feed `rolloutOn` like any other input projection. An `On` element grants no Kubernetes authority beyond the named reads and output writes the compiler derives from it.
+
 ## 9. Intermediate representation
 
 The IR MUST be versioned, canonicalizable, and reject unknown operations. It MUST include:
@@ -249,15 +272,17 @@ The IR MUST be versioned, canonicalizable, and reject unknown operations. It MUS
 |Effect       |Target, field paths, operation, permitted value shape, source location.                             |
 |Dependency   |Creation prerequisite, readiness predicate, or data dependency.                                     |
 |Reaction     |Input projections, contribution to desired state, stable identity.                                  |
+|Handler      |Module and export, bundle digest, trigger input, inputs, egress hosts, outputs, time and heap limits.|
+|Output       |Identity of a handler-written managed ConfigMap and its single writer.                              |
 |Runtime plan |Request strategy, watches, queues, indexes, state requirements.                                     |
 |Test contract|Fixture requirements, supported stimuli, expected primitive invariants, and test-only substitutions.|
 |Provenance   |Source map, dependency digests, schemas, compiler configuration.                                    |
 
-The compiler MUST recompute effects and permissions from validated operations; it MUST NOT trust an author-supplied permission summary. Raw HTTP, arbitrary API paths, unbounded recursion, dynamic code, and opaque side effects MUST be rejected.
+The compiler MUST recompute effects and permissions from validated operations; it MUST NOT trust an author-supplied permission summary. Raw HTTP, arbitrary API paths, unbounded recursion, dynamic code, and opaque side effects MUST be rejected in resource, input and reaction declarations. A handler is the only declaration that carries code; its reachable network is its declared egress list and its only writable state is its declared outputs, both part of the reviewed IR.
 
 A finite IR does not imply a fixed runtime object set. V1 MUST reject runtime-derived target names and namespaces. Future template instantiation requires separate bounds for allowed namespaces, names, cardinality, cleanup, and indirect privileges.
 
-Runtime-observed data MUST NOT select additional API permissions, identities, or undeclared mutation targets. Sensitive inputs MUST retain their classification through derived expressions.
+Runtime-observed data MUST NOT select additional API permissions, identities, egress hosts, or undeclared mutation targets. Sensitive inputs MUST retain their classification through derived expressions. Handler inputs MUST be non-sensitive; Secret inputs cannot be passed to a handler.
 
 ## 10. Effective desired state and source precedence
 
@@ -277,8 +302,11 @@ Each field has an explicit source category:
 |Derived field       |Deterministic function of declared inputs.                              |
 |Delegated field     |Managed by a named external contract, such as HPA ownership of replicas.|
 |Server-managed field|Excluded from the controller’s desired writes.                          |
+|Handler-written data|`data` of a handler output, written only by its declared handler.       |
 
 For a managed ConfigMap, compiled data is authoritative. An out-of-band edit is drift, not an accepted new configuration revision. Dependent rollout computation MUST use the authoritative desired projection and wait until the corresponding source application succeeds. Persistent external interference is reported as non-convergence.
+
+A handler output's desired state carries only its identity and reserved label; the reconciler never writes its `data`. The handler's written keys are observed live through the output's own input and MAY contribute rollout revisions like observed data.
 
 For an observed ConfigMap or Secret, current external data is an authorized input. Its writers can influence the declared reactions, which MUST be disclosed in the capability report. This does not authorize arbitrary target selection.
 
@@ -335,6 +363,7 @@ Within its declared model, the compiler MUST detect:
 - Unresolved references and unavailable field projections.
 - Incompatible field writers and lifecycle owners.
 - Explicit reaction feedback cycles.
+- Handler feedback cycles, where a handler's output reaches its own inputs directly or through other handlers.
 - Cyclic readiness prerequisites.
 - Unbounded or unsupported computations and target derivation.
 - Effects outside domain policy or unsupported enforcement requests.
@@ -349,7 +378,7 @@ Every mutation target MUST have an explicit lifecycle owner and field contract. 
 
 Ownership metadata is provenance, not authorization. In the API-bound profile, runtime ownership checks prevent cooperative mistakes but do not constrain a stolen token beyond API enforcement.
 
-The controller MUST use a stable field-manager name across generations. It MUST omit delegated and server-managed fields from its apply representation. Conflicts default to a blocked reconciliation with diagnostics. Adoption or forced ownership requires a separately authorized transition plan, never a blanket runtime force option. Server-Side Apply supplies field tracking and conflict handling. Server-Side Apply
+The controller MUST use a stable field-manager name across generations. Handler output writes MUST use a separate stable field manager, so handler-written keys and reconciler-written fields never share ownership. It MUST omit delegated and server-managed fields from its apply representation. Conflicts default to a blocked reconciliation with diagnostics. Adoption or forced ownership requires a separately authorized transition plan, never a blanket runtime force option. Server-Side Apply supplies field tracking and conflict handling. Server-Side Apply
 
 V1 ownership coordination MUST use a protected, platform-provisioned registry per workload namespace. Trusted deployment jobs reserve resource keys atomically using conditional updates. Runtime identities MUST NOT write the registry. A reservation records its domain, transition identifier, and state. Stale reservations require recovery of the owning transition, not blind expiry-based takeover.
 
@@ -375,6 +404,7 @@ The compiler MUST derive permissions from the selected runtime operations, inclu
 The report MUST separately enumerate:
 
 - Declared reads and effects, with source locations.
+- Declared event handlers, their triggers, inputs and outputs, and every egress host and port each handler may reach.
 - Actual runtime authorization rules.
 - Control-state, rollout-key, and optional leader-election requirements.
 - Deployment and transition-cleanup permissions.
@@ -386,6 +416,8 @@ Capabilities MUST include namespace, resource, subresource, verb, and names wher
 For the chosen apply strategy, request requirements MUST match actual API behaviour. Server-Side Apply requires patch for existing resources and create when creating them. Apply permissions
 
 The compiler MUST NOT broaden read authorization merely to share an informer. A broad Secret watch exposes data, not just notifications. Opaque custom-resource effects MUST be classified as unknown unless a trusted platform contract describes the downstream operator’s authority. Unknown does not mean harmless.
+
+A handler output adds the named read capabilities of its own input and the same apply capabilities as any managed ConfigMap. Egress hosts are not Kubernetes capabilities; they are enforced by the runtime sandbox and MUST be reported alongside permissions.
 
 Risk classification MUST cover workload mutation, Secret access, service-account choice, privileged host access, exec, impersonation, RBAC administration, webhook changes, and other platform-defined escalation paths. Indirect-risk analysis is required from v1, although complete inference over arbitrary operators is not promised.
 
@@ -450,6 +482,22 @@ The controller MUST tolerate API timeouts, conflicts, transient authorization pr
 Immutable-field differences MUST produce a clear blocked plan. V1 MUST NOT silently delete and recreate an object to resolve such a difference. Resource replacement requires an explicit lifecycle transition.
 
 A missing managed object is recreated only when creation is authorized and its desired state is evaluable. A missing required input blocks dependent changes. Stable field projections MUST exclude irrelevant metadata and other controllers’ status updates from unnecessary reconciliation.
+
+The controller process MUST read every file it needs during a synchronous startup phase, then restrict itself before any other thread exists. The implementation reads its startup configuration, credentials and resolver configuration into memory, applies a deny-all Landlock filesystem ruleset on the main thread, and only then starts the V8 platform and the async runtime, whose threads inherit the restriction. A kernel that cannot enforce Landlock MUST fail startup; only a fixture-mode configuration for disposable test clusters MAY opt out. The controller MUST report the effective lockdown state in its diagnostics.
+
+### 17.1 Event handlers
+
+A handler invocation is triggered when the revision of its trigger input changes. The revision covers the handler identity, its bundle digest and export, its outputs and the current data of every declared input. A handler whose declared inputs are not all available is not invoked. Handler delivery MUST be level-based: coalesce repeated changes to the latest revision, recompute pending work after restart from the revision recorded on the handler's outputs, and never promise one invocation per intermediate value. Delivery is at least once; a handler MUST tolerate being invoked again for a revision it already processed.
+
+Each invocation MUST run in a fresh isolate with no filesystem, no process environment, no Kubernetes credential and no network access except through the declared operations:
+
+- `fetch`: HTTPS only, to a declared host and port, after DNS resolution, connecting only to global unicast addresses, never following redirects, with bounded request and response sizes, concurrency and total bytes.
+- `writeOutput`: UTF-8 key/value data for a declared output only, buffered in memory and committed only if the invocation succeeds.
+- `log`: bounded structured log lines tagged with the handler and invocation identity. It MUST be the handler's only output channel; no console or other path to the controller's own streams may be reachable.
+
+Each invocation MUST have a wall-clock timeout enforced even against code that never yields, and bounded heap and array-buffer memory. Invocation failures MUST surface as conditions and retry with bounded backoff. Committing an output MUST use Server-Side Apply under the handler field manager, through the same authority and claim checks as reconciler mutations, and MUST record the input revision the output reflects. A handler MUST NOT be invoked while any of its outputs has not been applied in the current cycle. A handler that reads another handler's output MUST NOT be invoked until that upstream handler is settled: not pending or failing, and with every one of its outputs recording the same revision, which is its current one whenever its own inputs are available, so a downstream handler never observes a partially committed upstream. The queue MUST be able to hold every handler at once, so a held downstream can never take the slot its upstream needs.
+
+The runtime MUST bound handler work so that reconciliation is never starved: queue depth is bounded by the domain budget, and a full queue reports an overflow condition rather than growing.
 
 ## 18. Inventory and control state
 
@@ -538,18 +586,22 @@ Uninstall is an explicit transition covering all claims and resource policies. D
 |Ownership or field conflict                         |Stop affected mutations and report the conflict.                                                                                            |
 |Controller/node termination uncertain during upgrade|Block activation of a competing generation.                                                                                                 |
 |Control inventory corrupt or unavailable            |Suspend affected lifecycle work; do not guess ownership.                                                                                    |
+|Handler throws, times out or exceeds a limit        |Commit nothing for that invocation, report a condition, and retry the latest revision with bounded backoff.                                 |
+|Handler egress host unreachable or refused          |The `fetch` call fails inside the handler; the handler decides whether the invocation fails.                                                |
+|Handler output deleted or recreated                 |Treat its recorded revision as unknown and invoke the handler again once its inputs are available.                                          |
 
 The architecture separates steady-state reconciliation from CI availability. It does not promise uninterrupted reconciliation through a partially completed deployment.
 
 ## 22. Event-driven infrastructure use cases
 
-The following use cases describe intended semantics and release scope. Future cases MUST use the same input/effect contracts rather than arbitrary callbacks.
+The following use cases describe intended semantics and release scope. Future cases MUST use the same input/effect contracts rather than arbitrary callbacks. Event handlers are such a contract: a declared module with declared inputs, egress and outputs, never an unrestricted callback.
 
 |Use case                         |Declared input and output                                                                         |Requirements and scope                                                                                                                                                            |
 |---------------------------------|--------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 |Managed ConfigMap rollout        |Authoritative configuration data contributes a Pod-template revision.                             |V1. Correct drift first; repeated reconciliation with the same data creates no new rollout.                                                                                       |
 |External ConfigMap rollout       |Observed configuration data contributes a Pod-template revision.                                  |V1. External writers are explicitly trusted to influence this rollout.                                                                                                            |
 |Secret rotation rollout          |Observed Secret data contributes a protected revision.                                            |V1. Report Secret-read authority; no plaintext data or unkeyed secret digest in outputs.                                                                                          |
+|External data propagation        |A ConfigMap change triggers a handler that fetches from a declared HTTPS host and writes a handler output that rolls a workload out.|Current. Only `input-changed` triggers on non-sensitive ConfigMap inputs; requests are unauthenticated; egress is enforced by the sandbox, not by generated `NetworkPolicy`.|
 |Database endpoint propagation    |Named operator-produced input binds an allowed endpoint field or triggers a workload rollout.     |Later binding extension. Validate the value and destination; missing input blocks dependent changes. Referencing a Secret directly may already satisfy the application need.      |
 |Certificate propagation          |Consume the actual issued TLS output or revision required by a gateway integration.               |Later integration. Reapplying unchanged Gateway fields is not a propagation mechanism. Avoid duplicate work where the gateway already watches the referenced Secret.              |
 |CRD-driven readiness             |Observe a declared condition on a custom resource and evaluate a dependent target.                |Later integration. Define freshness and relevant observed-generation checks; do not treat all status changes as meaningful.                                                       |
@@ -567,13 +619,15 @@ Node GPU capacity and allocatable values do not represent ordinary allocation an
 
 ## 23. Deterministic builds and artifact identity
 
-Reproducibility requires identical source and all declared inputs, including dependency locks, frontend/compiler/runtime versions, target architecture, schemas, configuration, Rust toolchain, linker, and build environment.
+Reproducibility requires identical source and all declared inputs, including dependency locks, frontend/compiler/runtime versions, target architecture, schemas, configuration, Rust toolchain, linker, prebuilt native libraries such as the pinned V8 static archive, and build environment.
 
 The reproducible build mode MUST prohibit undeclared network access, clock/randomness dependencies, ambient environment reads, and mutable filesystem inputs during evaluation. Inputs acquired earlier MUST be recorded and addressed by digest. Repeating arbitrary TypeScript execution does not itself establish determinism.
 
 Build outputs MUST include:
 
 - Canonical IR and source map.
+- Event handler bundles, each bound to the IR by its digest.
+- Deployment surface (`surface.json`): the reviewable projection of permissions, secrets read, resources, inputs, reactions, images, handlers, egress hosts, outputs, risks and the minimum Kubernetes version.
 - Controller binary and immutable OCI image reference.
 - Runtime Deployment, ServiceAccount, and RBAC manifests.
 - Effects, API capabilities, enforcement gaps, and risk classifications.
@@ -592,6 +646,8 @@ Secret values and runtime rollout keys MUST NOT be compiled into these artifacts
 
 The compiler MUST pin the schemas and supported API versions it uses. Deployment MUST verify required API resources, scope, subresources, and relevant admission prerequisites before activation.
 
+Each domain declares a minimum Kubernetes version as `MAJOR.MINOR` (`minKubernetesVersion` on the Controller, default `1.34`). It MUST NOT be below the implementation's qualified floor (1.34); a domain MAY raise it. Deployment and live preview MUST read the server's discovery version and refuse a server below the declared minimum. The declared minimum is not a qualification claim: the report MUST also state the exact server version the version-dependent mechanisms, such as the absent-only conditional create, were qualified on (currently v1.34.3).
+
 V1 does not install arbitrary CRDs or webhooks as domain-managed resources. Later custom-resource support MUST declare schema and operator assumptions separately; schemas do not describe all controller side effects.
 
 Runtime discovery, if needed, MUST appear in the request plan. Discovery MUST NOT expand authority or introduce new runtime behaviour. Unsupported API removal, schema changes, or policy changes MUST fail visibly rather than falling back to an unreviewed generic operation.
@@ -606,7 +662,11 @@ Each deployment report MUST show:
 - Runtime, deployment, and cleanup permission changes separately.
 - Enforcement gaps, indirect privileges, and policy-ceiling decisions.
 - Retained or deleted resources and irreversible operations.
-- Compatibility changes and expected reconciliation interruption.
+- Compatibility changes, including the minimum Kubernetes version, and expected reconciliation interruption.
+- Event handler, egress host and handler output changes, next to permission and Secret-read changes.
+- The digest of the deployment surface being approved.
+
+The deployment surface MUST be derived by a pure function of the compiled plan, with stable ordering, so independent derivations are byte-identical. Pull-request review MAY compare two surfaces and require approval for selected changes, such as new egress, new handlers, new Secret reads or widened permissions. Deployment MUST bind to the reviewed surface: it recomputes the surface from the verified release's IR and refuses to proceed unless that digest equals both the release's recorded surface digest and the digest carried by the reviewed deployment metadata.
 
 The controller MUST expose liveness, cache synchronization, active generation, reconciliation status, blocked dependencies, field conflicts, watch recovery, queue saturation, and mutation/error counters. Startup readiness MUST be distinguishable from application workload health.
 
@@ -770,6 +830,7 @@ These criteria accept the V1 implementation, not an individual user release. V1 
 |Reconcile a fixture-substituted workload                         |The controller retains the declared test fixture instead of restoring an unavailable production image.   |
 |Attempt to promote a fixture build                               |The production deployment verifier rejects the test-only artifact.                                       |
 |Remove a reaction contribution in a mutation check               |The relevant generated test fails.                                                                       |
+|Change a handler's trigger input and restart the controller      |The output holds exactly the keys of the latest invocation, foreign keys survive, and a restart rewrites nothing.|
 
 ## 29. Delivery sequence and extension gates
 
@@ -777,7 +838,7 @@ These criteria accept the V1 implementation, not an individual user release. V1 
 2. Reconciliation and test core: Deployment/Service/ConfigMap management, named external ConfigMap/Secret observation, effective-state composition, deterministic rollout, field conflicts, watch recovery, synthetic inputs, fixture images, and generated scenario/assertion plans.
 3. Deployment lifecycle: protected claims, durable control state, generation identities, conservative handoff, explicit orphaning and UID-checked cleanup.
 4. Implementation acceptance: an automated suite that runs credential-based authorization tests, full-cluster fixture tests, offline execution, failure injection, reproducibility verification, and scoped performance comparisons against the example programs.
-5. Extensions: multi-namespace domains, typed data bindings, custom resources, and richer readiness rules after their contracts pass equivalent tests.
+5. Extensions: multi-namespace domains, typed data bindings, custom resources, event handlers, and richer readiness rules after their contracts pass equivalent tests.
 
 Dynamic resource templates, cross-domain field sharing, concurrent generations, effect-bound enforcement, and automated failover each require a separate design review and explicit acceptance criteria. They MUST NOT be introduced through an unrestricted callback or generic patch escape hatch.
 
@@ -790,6 +851,8 @@ The default delivery path pushes controller generations from CI. It preserves de
 The following guarantees are explicitly excluded:
 
 - Exactly-once execution of historical Kubernetes transitions.
+- Exactly-once handler invocation, or an invocation for every intermediate input value.
+- Egress containment by the network: handler egress is enforced by the controller's sandbox, not by cluster network policy.
 - Globally atomic multi-resource updates or snapshots.
 - Global convergence in the presence of incompatible external writers.
 - Field-level containment supplied by RBAC alone.

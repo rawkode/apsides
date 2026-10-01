@@ -10,9 +10,10 @@ pub fn ir() -> Value {
     let source = json!({"file": "program.tsx", "line": 1, "column": 1});
     json!({
         "testOnly": true,
-        "schemaVersion": "apsides.dev/ir/v1",
+        "schemaVersion": "apsides.dev/ir/v2",
         "domain": {"id": "unit", "namespace": "work", "controlNamespace": "control",
             "clusterBinding": "unit-fixture", "policyRef": "platform/unit", "enforcement": "api-bound",
+            "minKubernetesVersion": "1.34",
             "budgets": {"maxResources": 8, "maxInputs": 8, "maxReactions": 8,
                 "maxObjectBytes": 262_144, "maxQueueDepth": 8, "maxConcurrentRequests": 2}},
         "resources": [
@@ -52,7 +53,7 @@ pub fn ir() -> Value {
             {"id": "rollout-credentials", "op": "rollout", "inputs": ["observed-credentials"],
              "target": "deployment-api", "source": source},
         ],
-        "provenance": {"compiler": "apsides/0.1", "inputs": [{"path": "program.tsx",
+        "handlers":[],"outputs":[],"provenance": {"compiler": "apsides/0.1", "inputs": [{"path": "program.tsx",
             "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}]},
     })
 }
@@ -64,6 +65,12 @@ pub fn plan() -> Result<CompiledPlan> {
 /// The fixtures, overlay and coverage documents the compiler would stage for
 /// [`plan`].
 pub fn fixture_documents(plan: &CompiledPlan) -> Result<(Value, Value, Value)> {
+    // `Output`-mode inputs get no synthetic fixture: unlike an `Observed`
+    // input, there is no "present"/"missing" presence state to synthesize —
+    // the reconciler itself creates the handler-output `ConfigMap`
+    // absent-only every cycle, before anything observes it, so
+    // `missing-input`/`input-returned`-style presence scenarios never apply
+    // to an output (see `test_plan.rs`'s `OUTPUT` scenario set).
     let fixtures = json!({
         "schemaVersion": "apsides.dev/fixtures/v1", "testOnly": true, "productionReady": false,
         "inputs": plan.ir.inputs.iter()
@@ -95,6 +102,7 @@ pub fn fixture_documents(plan: &CompiledPlan) -> Result<(Value, Value, Value)> {
                         .iter()
                         .map(|input| match input.mode {
                             InputMode::Observed => "observed",
+                            InputMode::Output => "output",
                             InputMode::Managed => "managed",
                         })
                         .collect::<std::collections::BTreeSet<_>>();

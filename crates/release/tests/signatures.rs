@@ -84,16 +84,19 @@ struct Documents {
     files: BTreeMap<String, String>,
 }
 
-fn write_documents(root: &Path) -> TestResult<Documents> {
+/// `padding_entries` inflates `build-inputs.json` with that many extra
+/// synthetic `buildContextFiles` entries (see `compiler_inputs`); `0` for
+/// the ordinary fixture.
+fn write_documents_with_padding(root: &Path, padding_entries: usize) -> TestResult<Documents> {
     let ir = json!({
-        "schemaVersion":"apsides.dev/ir/v1","testOnly":false,
-        "domain":{"id":"example","namespace":"workload","controlNamespace":"apsides-system","clusterBinding":"test-cluster","policyRef":"platform/example","enforcement":"api-bound","budgets":{"maxResources":64,"maxInputs":64,"maxReactions":64,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},
+        "schemaVersion":"apsides.dev/ir/v2","testOnly":false,
+        "domain":{"id":"example","namespace":"workload","controlNamespace":"apsides-system","clusterBinding":"test-cluster","policyRef":"platform/example","enforcement":"api-bound","minKubernetesVersion":"1.34","budgets":{"maxResources":64,"maxInputs":64,"maxReactions":64,"maxObjectBytes":262_144,"maxQueueDepth":128,"maxConcurrentRequests":4}},
         "resources":[{"id":"config","apiVersion":"v1","kind":"ConfigMap","name":"config","namespace":"workload","desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"config","namespace":"workload"},"data":{"hello":"world"}},"lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"controller.ts","line":1,"column":1}}],
         "inputs":[],"reactions":[],
-        "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"controller.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
+        "handlers":[],"outputs":[],"provenance":{"compiler":"apsides/0.1","inputs":[{"path":"controller.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
     });
     let plan = parse_and_validate(&ir.to_string())?;
-    let (inputs, compiler) = compiler_inputs()?;
+    let (inputs, compiler) = compiler_inputs(padding_entries)?;
     // Verifier test payloads only; nothing here is compiled or executed.
     let mut files = BTreeMap::new();
     for (name, value) in [
@@ -128,12 +131,21 @@ fn write_documents(root: &Path) -> TestResult<Documents> {
 }
 
 fn release(root: &Path) -> TestResult<TrustPolicy> {
+    release_with_padding(root, 0)
+}
+
+/// `padding_entries` inflates `build-inputs.json` well past
+/// `compiler_core::MAX_IR_BYTES` (4 MiB), the way a real one now does once
+/// `crates/engine`'s `deno_core` is in the vendored dependency closure, but
+/// stays a fully valid, digest-consistent, signed release: every digest
+/// here is computed from the actual (inflated) document, not hardcoded.
+fn release_with_padding(root: &Path, padding_entries: usize) -> TestResult<TrustPolicy> {
     let Documents {
         plan,
         inputs,
         compiler,
         mut files,
-    } = write_documents(root)?;
+    } = write_documents_with_padding(root, padding_entries)?;
     // Minimal architecture header exercises metadata verification, not execution.
     let mut binary = vec![0_u8; 64];
     binary[..6].copy_from_slice(b"\x7fELF\x02\x01");
@@ -217,6 +229,60 @@ async fn actual_openssh_signature_is_required_and_policy_bound() -> TestResult {
     Ok(())
 }
 
+/// A `build-inputs.json` over `compiler_core::MAX_IR_BYTES` (4 MiB) -- as a
+/// real one now is, once `crates/engine`'s `deno_core` dependency inflates
+/// the vendored source closure `compilerClosure.nativeCompiler.
+/// buildContextFiles` records into the thousands of files -- must still
+/// verify: it has its own, larger budget (`MAX_BUILD_INPUTS_BYTES`), not
+/// IR's.
+#[tokio::test]
+async fn an_oversized_but_valid_build_inputs_document_still_verifies() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let padding_entries = 30_000;
+    let policy = release_with_padding(root.path(), padding_entries)?;
+    let build_inputs_bytes = fs::metadata(root.path().join("build-inputs.json"))?.len();
+    assert!(
+        build_inputs_bytes > compiler_core::MAX_IR_BYTES as u64,
+        "fixture must actually exceed the IR budget to exercise the fix; got {build_inputs_bytes} bytes"
+    );
+    assert!(
+        build_inputs_bytes < compiler_core::MAX_BUILD_INPUTS_BYTES as u64,
+        "fixture must still fit build-inputs.json's own budget; got {build_inputs_bytes} bytes"
+    );
+    let verified = verify_candidate(root.path(), &policy).await?;
+    assert_eq!(verified.manifest().source.repository, policy.repository);
+    Ok(())
+}
+
+/// A `build-inputs.json` over even its own, larger budget
+/// (`MAX_BUILD_INPUTS_BYTES`, matching this crate's own `MAX_DOCUMENT`) is
+/// still rejected here -- at the raw byte-read cap the release verifier
+/// already applied to every document before this change, not a newly
+/// misleading "IR exceeds 4 MiB" for a document that was never IR.
+/// `crates/cli/src/commands/release.rs`'s own `read_build_inputs` (unit
+/// tests in that file) is the parse-time bound named specifically after
+/// `build-inputs.json`, reached because that reader has no separate raw
+/// byte-read cap ahead of it the way this crate's `bounded_read` does.
+#[tokio::test]
+async fn a_build_inputs_document_over_its_own_larger_budget_is_still_rejected() -> TestResult {
+    let root = tempfile::tempdir()?;
+    // ~152 bytes/padding entry; comfortably over MAX_BUILD_INPUTS_BYTES (8 MiB).
+    let policy = release_with_padding(root.path(), 60_000)?;
+    let build_inputs_bytes = fs::metadata(root.path().join("build-inputs.json"))?.len();
+    assert!(
+        build_inputs_bytes > compiler_core::MAX_BUILD_INPUTS_BYTES as u64,
+        "fixture must actually exceed build-inputs.json's own budget; got {build_inputs_bytes} bytes"
+    );
+    let error = verify_candidate(root.path(), &policy)
+        .await
+        .err()
+        .ok_or("expected an oversized build-inputs.json to be rejected")?
+        .to_string();
+    assert!(error.contains("exceeds"), "{error}");
+    assert!(!error.contains("IR exceeds"), "{error}");
+    Ok(())
+}
+
 #[tokio::test]
 async fn altered_payload_and_unsigned_manifest_cannot_be_promoted() -> TestResult {
     let root = tempfile::tempdir()?;
@@ -291,6 +357,59 @@ async fn embedded_fixture_marker_survives_manifest_mode_changes() -> TestResult 
     write_json(root.path(), "release.json", &manifest)?;
     resign(root.path())?;
     assert_eq!(rejection(root.path(), &policy).await?, FIXTURE_REJECTED);
+    Ok(())
+}
+
+/// A `surface.json` edited to claim a risk the compiler never derived is
+/// rejected even when the tamperer keeps `release.json`'s recorded digest
+/// and the outer signature self-consistent: `read_release` recomputes the
+/// surface from the trusted IR rather than trusting whatever is on disk.
+#[tokio::test]
+async fn tampered_surface_document_is_rejected_even_when_resigned() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let policy = release(root.path())?;
+    let mut surface: Value = serde_json::from_slice(&fs::read(root.path().join("surface.json"))?)?;
+    surface["risks"] = json!(["fabricated-risk-not-derived-by-the-compiler"]);
+    let bytes = write_json(root.path(), "surface.json", &surface)?;
+    let mut manifest: Value = serde_json::from_slice(&fs::read(root.path().join("release.json"))?)?;
+    manifest["files"]["surface.json"] = json!(hash(&bytes));
+    write_json(root.path(), "release.json", &manifest)?;
+    resign(root.path())?;
+    assert_eq!(
+        rejection(root.path(), &policy).await?,
+        "release rejected: release review document differs from trusted derivation: surface.json"
+    );
+    Ok(())
+}
+
+/// A `surface.json` that is semantically identical to what the compiler
+/// derives -- same parsed value, just pretty-printed rather than canonical
+/// -- is still rejected. The value-equality check above alone would accept
+/// it (it compares parsed JSON), so this exercises the separate,
+/// canonical-bytes digest check `aps deploy`'s independent surface
+/// recomputation relies on: `manifest.files["surface.json"]` must equal
+/// `compiler_core::digest` of the derived surface, not merely a digest of
+/// *some* byte encoding of an equal value.
+#[tokio::test]
+async fn noncanonical_surface_document_is_rejected_even_when_semantically_equal() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let policy = release(root.path())?;
+    let surface: Value = serde_json::from_slice(&fs::read(root.path().join("surface.json"))?)?;
+    let bytes = serde_json::to_vec_pretty(&surface)?;
+    assert_ne!(
+        bytes,
+        canonical_bytes(&surface)?,
+        "pretty-printed bytes must actually differ from canonical bytes"
+    );
+    fs::write(root.path().join("surface.json"), &bytes)?;
+    let mut manifest: Value = serde_json::from_slice(&fs::read(root.path().join("release.json"))?)?;
+    manifest["files"]["surface.json"] = json!(hash(&bytes));
+    write_json(root.path(), "release.json", &manifest)?;
+    resign(root.path())?;
+    assert_eq!(
+        rejection(root.path(), &policy).await?,
+        "release rejected: release surface.json is not canonical JSON"
+    );
     Ok(())
 }
 
@@ -385,25 +504,44 @@ fn write_oci_with_base(
     Ok(hash(&manifest))
 }
 
-fn compiler_inputs() -> TestResult<(Value, String)> {
-    let build_context_files = json!([
-        {"path":".cargo/config.toml","sha256":format!("sha256:{}", "1".repeat(64))},
-        {"path":"Dockerfile","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"controller/Cargo.lock","sha256":format!("sha256:{}", "3".repeat(64))},
-        {"path":"controller/Cargo.toml","sha256":format!("sha256:{}", "4".repeat(64))},
-        {"path":"controller/src/ir.json","sha256":format!("sha256:{}", "5".repeat(64))},
-        {"path":"controller/src/main.rs","sha256":format!("sha256:{}", "6".repeat(64))},
-        {"path":"vendor/example/src/lib.rs","sha256":format!("sha256:{}", "7".repeat(64))},
-        {"path":"workspace/Cargo.toml","sha256":format!("sha256:{}", "8".repeat(64))}
-    ]);
+/// `padding_entries` extra, unique, correctly sorted `vendor/` file entries,
+/// so a test can build a `build-inputs.json` document as large as a real
+/// one gets once `crates/engine`'s `deno_core` inflates the vendored
+/// dependency closure into the thousands of files -- without needing a real
+/// `cargo vendor` run.
+fn compiler_inputs(padding_entries: usize) -> TestResult<(Value, String)> {
+    let mut build_context_files = vec![
+        json!({"path":".cargo/config.toml","sha256":format!("sha256:{}", "1".repeat(64))}),
+        json!({"path":"Dockerfile","sha256":format!("sha256:{}", "2".repeat(64))}),
+        json!({"path":"controller/Cargo.lock","sha256":format!("sha256:{}", "3".repeat(64))}),
+        json!({"path":"controller/Cargo.toml","sha256":format!("sha256:{}", "4".repeat(64))}),
+        json!({"path":"controller/src/ir.json","sha256":format!("sha256:{}", "5".repeat(64))}),
+        json!({"path":"controller/src/main.rs","sha256":format!("sha256:{}", "6".repeat(64))}),
+        json!({"path":"rusty-v8/librusty_v8.a.gz","sha256":format!("sha256:{}", "9".repeat(64))}),
+        json!({"path":"vendor/example/src/lib.rs","sha256":format!("sha256:{}", "7".repeat(64))}),
+    ];
+    // Sorts after "vendor/example/..." ('e' < 's') and before
+    // "workspace/..." ('v' < 'w'), keeping buildContextFiles sorted as
+    // validate_files requires.
+    for index in 0..padding_entries {
+        build_context_files.push(json!({
+            "path": format!("vendor/synthetic-package-{index:06}/src/generated/module.rs"),
+            "sha256": format!("sha256:{index:064x}"),
+        }));
+    }
+    build_context_files
+        .push(json!({"path":"workspace/Cargo.toml","sha256":format!("sha256:{}", "8".repeat(64))}));
+    let build_context_files = Value::Array(build_context_files);
     let packaging_files = json!([
         {"path":"crates/cli/Cargo.toml","sha256":format!("sha256:{}", "1".repeat(64))},
         {"path":"crates/cli/src/main.rs","sha256":format!("sha256:{}", "1".repeat(64))},
         {"path":"scripts/Dockerfile","sha256":format!("sha256:{}", "2".repeat(64))},
         {"path":"scripts/build.py","sha256":format!("sha256:{}", "2".repeat(64))},
+        {"path":"scripts/diagnostics.py","sha256":format!("sha256:{}", "2".repeat(64))},
         {"path":"scripts/extract_binary.py","sha256":format!("sha256:{}", "2".repeat(64))},
         {"path":"scripts/finalize_inputs.py","sha256":format!("sha256:{}", "2".repeat(64))},
         {"path":"scripts/package_oci.py","sha256":format!("sha256:{}", "2".repeat(64))},
+        {"path":"scripts/rusty_v8.py","sha256":format!("sha256:{}", "2".repeat(64))},
         {"path":"scripts/sbom.py","sha256":format!("sha256:{}", "2".repeat(64))},
         {"path":"scripts/toolchain_snapshot.py","sha256":format!("sha256:{}", "2".repeat(64))}
     ]);
@@ -425,8 +563,16 @@ fn compiler_inputs() -> TestResult<(Value, String)> {
             json!({"role":role,"sha256":format!("sha256:{}", "6".repeat(64)),"version":"1.0"})
         })
         .collect();
+    let rusty_v8 = json!({
+        "archive": {
+            "name": "librusty_v8", "version": "150.4.0", "target": "aarch64-unknown-linux-gnu",
+            "url": "https://github.com/denoland/rusty_v8/releases/download/v150.4.0/librusty_v8_simdutf_release_aarch64-unknown-linux-gnu.a.gz",
+            "sha256": format!("sha256:{}", "9".repeat(64)), "path": "rusty-v8/librusty_v8.a.gz",
+        },
+        "bindingFile": Value::Null,
+    });
     let closure = json!({
-        "schemaVersion":"apsides.dev/compiler-closure/v2",
+        "schemaVersion":"apsides.dev/compiler-closure/v3",
         "authoringCompiler":{"sdk":{"identity":"@apsides/kubernetes","sha256":"sdk"},"toolchain":{"deno":"pinned"}},
         "nativeCompiler":{
             "builderImage":{"reference":format!("example.invalid/builder@sha256:{}", "3".repeat(64)),"platform":"linux/arm64"},
@@ -436,7 +582,8 @@ fn compiler_inputs() -> TestResult<(Value, String)> {
             "buildProfileSha256":format!("sha256:{}", "5".repeat(64)),
             "hostTools":host_tools,
             "trustedCliCodeSha256":digest(&cli)?,
-            "approvedRuntime":approved_runtime
+            "approvedRuntime":approved_runtime,
+            "rustyV8":rusty_v8
         }
     });
     let identity = digest(&closure)?;

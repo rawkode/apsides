@@ -49,7 +49,7 @@ export const generateCrdTypes = async (text: string, kind: string, version?: str
   if (!object(schema.properties) || !object(schema.properties.spec)) throw new Error("CRD has no spec schema");
   schemaData(schema);
   const declaration = await compile(schema.properties.spec as JSONSchema, `${kind}Spec`, {
-    bannerComment: "", additionalProperties: false, unknownAny: true,
+    bannerComment: "", additionalProperties: false, unknownAny: true, ignoreMinAndMaxItems: true,
     $refOptions: { resolve: { external: false } },
   });
   const descriptor = {

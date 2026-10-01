@@ -4,12 +4,13 @@ use deploy::{OwnershipAction, OwnershipApproval, OwnershipIntent, ResourceIdenti
 fn adoption_compiled() -> Result<CompiledPlan> {
     Ok(compiler_core::parse_and_validate(
         &json!({
-            "schemaVersion":"apsides.dev/ir/v1",
+            "schemaVersion":"apsides.dev/ir/v2",
             "testOnly":false,
             "domain":{
                 "id":"example","namespace":"workload","controlNamespace":"control",
                 "clusterBinding":"cluster-a","policyRef":"platform/example",
                 "enforcement":"api-bound",
+                "minKubernetesVersion":"1.34",
                 "budgets":{
                     "maxResources":16,"maxInputs":16,"maxReactions":16,
                     "maxObjectBytes":262_144,"maxQueueDepth":128,
@@ -41,7 +42,7 @@ fn adoption_compiled() -> Result<CompiledPlan> {
                 }
             ],
             "inputs":[],"reactions":[],
-            "provenance":{
+            "handlers":[],"outputs":[],"provenance":{
                 "compiler":"apsides/0.1",
                 "inputs":[{
                     "path":"program.tsx",

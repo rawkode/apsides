@@ -38,4 +38,29 @@ the platform trust policy. `aps verify-release` runs the same release checks
 offline. Neither reads test results from the release; per-program behaviour is
 checked by `aps test` before signing.
 
+`aps deploy` binds the deployment to the reviewed surface. Release verification
+(`release::read_release`, run by both `aps verify-release` and `aps deploy`)
+recomputes `surface.json` from the release's trusted IR with
+`compiler_core::surface::derive_surface` and requires the release's recorded
+`surface.json` digest to equal `compiler_core::digest` of that fresh
+derivation's canonical bytes exactly — not merely a parsed-value comparison,
+so a re-signed release whose `surface.json` is semantically equal but encoded
+differently (e.g. pretty-printed) is rejected too, never only a semantically
+different one; see `crates/release/tests/signatures.rs`'s
+`tampered_surface_document_is_rejected_even_when_resigned` and
+`noncanonical_surface_document_is_rejected_even_when_semantically_equal`.
+`aps deploy` also, independently, recomputes the same surface digest from the
+verified release's own IR and requires it to equal both the release's
+recorded `surface.json` digest and the `surfaceDigest` the reviewed,
+authenticated metadata carries (see [the review contract](/reference/review-contract/)),
+failing with a typed error naming the disagreeing digests on either mismatch,
+with no override flag. Given the two guarantees above, neither mismatch
+should be reachable in practice; this check exists as an explicit,
+independently testable assertion of those guarantees rather than an implicit
+consequence of release and review verification. This also covers resuming a
+pending transition: resume revalidates the exact same authenticated review
+metadata against a fresh projection of the plan, so a surface that changed
+after review is refused there too, with no separate surface-specific resume
+check.
+
 The artifact verifier enforces provenance/signatures and digest-bound OCI integrity; the platform adapter enforces policy identities, bounded credentials, protected CAS and API UID preconditions. The generation proxy provides the writer-quiescence boundary. Exact Apsides Role checks do not establish total effective authority in the presence of additive platform RBAC. The [acceptance suite](/reference/acceptance/) exercises this lifecycle through `aps deploy` on kind, including a stop after each stored phase, lost termination evidence and cleanup refusals; its reference lists exactly which interruption points it proves. Within-phase interruption, executor takeover, production workflow integration, operational recovery and independent final review remain open; see STATUS.md.

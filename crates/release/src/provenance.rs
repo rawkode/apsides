@@ -321,7 +321,7 @@ async fn verify_ssh(
         manifest::bounded_read(&manifest::contained(root, "provenance.json")?, MAX_DOCUMENT)?;
     let signature =
         manifest::bounded_read(&manifest::contained(root, "provenance.sig")?, 64 * 1024)?;
-    let statement = manifest::json(&statement_bytes)?;
+    let statement = manifest::json(&statement_bytes, "provenance.json")?;
     check_statement(&statement, release_digest)?;
     let external = &statement["predicate"]["buildDefinition"]["externalParameters"];
     if external["repository"] != release.source.repository

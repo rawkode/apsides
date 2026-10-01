@@ -63,7 +63,7 @@ try {
   assert.equal(inputs.evaluation.sandbox.moduleLoader, false);
   assert.equal(inputs.evaluation.sandbox.lockdown.localeTaming, "safe");
   assert.equal(inputs.evaluation.sandbox.lockdown.errorTaming, "safe");
-  assert.equal(inputs.compilerClosure.schemaVersion, "apsides.dev/compiler-closure/v2");
+  assert.equal(inputs.compilerClosure.schemaVersion, "apsides.dev/compiler-closure/v3");
   assert.deepEqual(inputs.compilerClosure.authoringCompiler.sdk, inputs.sdk);
   assert.deepEqual(inputs.compilerClosure.authoringCompiler.toolchain, inputs.toolchain);
   assert.equal(inputs.compilerClosure.nativeCompiler, null, "native packaging must finalize the compiler closure");
@@ -168,6 +168,41 @@ try {
   // The diagnostic names the missing module and the importing source line,
   // and the build stops at typecheck, before evaluation.
   await rejectsWith(compileApsides(undeclared.sourcePath,undeclared.output), /TS2307 \[ERROR\]: Cannot find module '[^'\n]*\/dependency\.ts'\.\n\s+at [^\n]*\/source\.tsx:1:\d+/, "undeclared import", /error: Uncaught/);
+  // Handler chaining compiles end to end: a handler output's `.changed`
+  // type-checks as an <On trigger> and the output itself as an <On inputs>
+  // entry, and both lower to that output's Output-mode input.
+  const chained = `import { Controller, On, useConfigMap, useHandlerOutput } from "@apsides/kubernetes";
+const Chain = () => {
+  const settings = useConfigMap({ name: "settings" });
+  const raw = useHandlerOutput({ id: "raw-flags", name: "raw-flags" });
+  const derived = useHandlerOutput({ id: "derived", name: "derived" });
+  return <>
+    <On id="fetch-raw" trigger={settings.changed} handler="./a.ts#fetchRaw" inputs={[settings]} egress={["flags.example.com"]} outputs={[raw]} />
+    <On id="derive" trigger={raw.changed} handler="./b.ts#derive" inputs={[raw]} outputs={[derived]} />
+  </>;
+};
+export default () => {
+  return <Controller id="chain" namespace="workload" controlNamespace="apsides-system" clusterBinding="fixture" policyRef="platform/test" enforcement="api-bound" budgets={{maxResources:8,maxInputs:8,maxReactions:8,maxObjectBytes:32768,maxQueueDepth:8,maxConcurrentRequests:2}}><Chain /></Controller>;
+};
+`;
+  const chainModules = [
+    {path:"a.ts",source:"export async function fetchRaw(): Promise<void> {}\n",declared:true},
+    {path:"b.ts",source:"export async function derive(): Promise<void> {}\n",declared:true},
+  ];
+  const chain = await fixture(chained, digest(chained), chainModules);
+  await compileApsides(chain.sourcePath,chain.output);
+  const chainIR = JSON.parse(await readFile(join(chain.output,"ir.json"),"utf8"));
+  const rawInput = chainIR.inputs.find((input: {mode:string;managedResourceId?:string}) => input.mode === "output" && input.managedResourceId === "raw-flags");
+  assert.ok(rawInput, "the upstream output has an Output-mode input");
+  const derive = chainIR.handlers.find((handler: {id:string}) => handler.id === "derive");
+  assert.equal(derive.trigger.input, rawInput.id, "the downstream trigger is the upstream output's Output-mode input");
+  assert.deepEqual(derive.inputs, [rawInput.id], "the downstream reads the upstream output");
+  assert.deepEqual(derive.outputs, ["derived"]);
+  assert.deepEqual(chainIR.handlers.find((handler: {id:string}) => handler.id === "fetch-raw").outputs, ["raw-flags"]);
+  const looped = chained.replace("trigger={raw.changed} handler=\"./b.ts#derive\" inputs={[raw]}", "trigger={derived.changed} handler=\"./b.ts#derive\" inputs={[raw, derived]}");
+  assert.notEqual(looped, chained, "the self-trigger rewrite applies");
+  const loop = await fixture(looped, digest(looped), chainModules);
+  await rejectsWith(compileApsides(loop.sourcePath,loop.output), /handler derive may not trigger on or read its own output \(source\.tsx:8:\d+\)/, "self-triggering handler");
   const tamed = await fixture(valid.replace("return <Controller", "if ('b'.localeCompare('a') <= 0 || new Error().stack !== '') throw new Error('unsafe SES taming'); return <Controller"));
   await compileApsides(tamed.sourcePath,tamed.output);
   console.log("Apsides source build passed: locked snapshots, Deno typecheck, declared-input closure and denied capabilities with their diagnostics, two-build/two-evaluation equality, source maps, generated fixtures, preservation diff, and scenario coverage.");

@@ -10,7 +10,8 @@
     "paths": {
       "@apsides/kubernetes": ["./.aps/sdk/index.ts"],
       "@apsides/kubernetes/jsx-runtime": ["./.aps/sdk/jsx-runtime.ts"],
-      "@apsides/kubernetes/jsx-dev-runtime": ["./.aps/sdk/jsx-dev-runtime.ts"]
+      "@apsides/kubernetes/jsx-dev-runtime": ["./.aps/sdk/jsx-dev-runtime.ts"],
+      "@apsides/kubernetes/handler": ["./.aps/sdk/handler.ts"]
     },
     "strict": true,
     "target": "ES2022"

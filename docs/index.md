@@ -30,9 +30,9 @@ remain active wire names. TypeScript authoring uses `@apsides/kubernetes`.
 ## The working model
 
 <div class="architecture-flow">
-  <div><strong>Declare</strong><span>TSX components describe fixed resources, selected observations and rollout reactions.</span></div>
+  <div><strong>Declare</strong><span>TSX components describe fixed resources, selected observations, rollout reactions and sandboxed event handlers.</span></div>
   <div><strong>Compile</strong><span>The source closure is evaluated with denied host permissions and becomes validated IR.</span></div>
-  <div><strong>Review</strong><span>Capabilities, force risks, lifecycle policy, release integrity and provenance are checked.</span></div>
+  <div><strong>Review</strong><span>Capabilities, handler egress, force risks, lifecycle policy, release integrity and provenance are checked, and deployment binds to the reviewed surface.</span></div>
   <div><strong>Deploy</strong><span>Privileged CI stages a native controller generation, quiesces the old writer and publishes inventory.</span></div>
 </div>
 

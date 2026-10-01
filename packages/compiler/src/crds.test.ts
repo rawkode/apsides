@@ -24,6 +24,16 @@ assert.match(generated, /"plural": "clusters"/);
 await assert.rejects(generateCrdTypes(JSON.stringify({ ...fixture, spec: { ...fixture.spec, scope: "Cluster" } }), "Cluster"));
 await assert.rejects(generateCrdTypes(JSON.stringify(fixture), "Cluster", "v2"));
 await assert.rejects(generateCrdTypes(`${JSON.stringify(fixture)}\n---\n${JSON.stringify(fixture)}`, "Cluster"));
+// Gateway API's HTTPRoute nests bounded arrays (rules, matches, headers). Item
+// bounds must stay arrays: tuple expansion of each bound overflows the generator.
+const bounded = (items: unknown) => ({ type: "array", minItems: 1, maxItems: 64, items });
+const routes = structuredClone(fixture);
+Object.assign(routes.spec.versions[0]?.schema.openAPIV3Schema.properties.spec.properties ?? {}, {
+  rules: bounded({ type: "object", properties: { matches: bounded({ type: "object", properties: {
+    headers: bounded({ type: "object", properties: { name: { type: "string" } } }),
+  } }) } }),
+});
+assert.match(await generateCrdTypes(JSON.stringify(routes), "Cluster", "v1"), /name\?: string;\n\s*\}\[\];/);
 const unsafe = structuredClone(fixture);
 Object.assign(unsafe.spec.versions[0]?.schema.openAPIV3Schema.properties.spec ?? {}, { tsType: "arbitrary code" });
 await assert.rejects(generateCrdTypes(JSON.stringify(unsafe), "Cluster"));

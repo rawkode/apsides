@@ -38,4 +38,8 @@ pub(super) const SDK_FILES: &[(&str, &str)] = &[
         "jsx-dev-runtime.ts",
         include_str!("../../../../../packages/kubernetes/src/jsx-dev-runtime.ts"),
     ),
+    (
+        "handler.ts",
+        include_str!("../../../../../packages/kubernetes/src/handler.ts"),
+    ),
 ];

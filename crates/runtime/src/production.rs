@@ -1,8 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
-    net::SocketAddr,
-    path::PathBuf,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -10,10 +9,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::Engine as _;
 use compiler_core::{
     CompiledPlan, InputMode, InputSnapshot, Resource, RolloutKey, RolloutOutcome, evaluate_rollout,
 };
 use deploy::{ResourceIdentity, RuntimeObservation};
+use hickory_resolver::config::{NameServerConfig, ResolverConfig};
 use http_body_util::Full;
 use hyper::{Request, Response, StatusCode, body::Bytes, service::service_fn};
 use hyper_util::rt::TokioIo;
@@ -26,15 +27,15 @@ use platform::{
     RuntimeCondition, RuntimeInventory, SCHEMA_VERSION, VerifiedActivation, Versioned,
     conditional_apply_request,
 };
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::Write as _;
 use tokio::sync::{Mutex, RwLock, watch};
 
 use crate::{
-    KubeRuntimeClient, Observation, RuntimeClient, RuntimeError, block_reason, insert_revision,
-    normalized_object, validate_exact_apply_owner,
+    KubeRuntimeClient, LockdownState, Observation, RuntimeClient, RuntimeError, block_reason,
+    insert_revision, manager_main_resource_entries, normalized_object, validate_exact_apply_owner,
 };
 
 const MAX_DIAGNOSTIC_CONDITIONS: usize = 256;
@@ -51,6 +52,23 @@ pub enum ApiAccess {
 const PROXY_CA_PATH: &str = "/etc/apsides/proxy/ca.crt";
 const PROXY_CERT_PATH: &str = "/etc/apsides/proxy/tls.crt";
 const PROXY_KEY_PATH: &str = "/etc/apsides/proxy/tls.key";
+/// Read once, in `read_production_startup_files`, during `startup::start`'s
+/// synchronous phase, before Landlock lockdown -- see the Apsides v0.3
+/// plan, Phase 5c. Every production startup reads this file: the proxy
+/// Service is reached by hostname (`apsides-proxy-<generation>.<namespace>.svc`),
+/// so DNS is needed on every (re)connect, independent of whether any
+/// declared handler also has egress hosts.
+const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
+
+/// Small, fixed upper bounds for each proxy identity file -- a CA bundle,
+/// leaf certificate or private key is at most a few KiB in practice; these
+/// are generous enough for a multi-certificate chain while still bounding
+/// how much of `read_production_startup_files`'s one-shot pre-lockdown read
+/// budget any single file can consume.
+const PROXY_CA_MAX_BYTES: u64 = 64 * 1024;
+const PROXY_CERT_MAX_BYTES: u64 = 64 * 1024;
+const PROXY_KEY_MAX_BYTES: u64 = 64 * 1024;
+const RESOLV_CONF_MAX_BYTES: u64 = 64 * 1024;
 
 /// Explicit production startup data. None of these values grants authority;
 /// protected platform records must independently match the binding.
@@ -74,10 +92,21 @@ struct DiagnosticSnapshot {
     domain: String,
     build_digest: String,
     generation: String,
+    /// The effective filesystem-lockdown state established at startup
+    /// (`startup::start`, before this controller's diagnostics server ever
+    /// binds) -- see the Apsides v0.3 plan, Phase 5c. Always
+    /// `LockdownState::Landlock` or `LockdownState::LandlockPartial` in
+    /// practice, never `NoneFixture`: `start` fails closed before reaching
+    /// `run_production` at all when the kernel enforces nothing, since
+    /// production mode never accepts the fixture-only `allowNoLandlock`
+    /// escape hatch. Exposed anyway so the fail-closed contract is directly
+    /// observable, not merely asserted by tests elsewhere.
+    lockdown: LockdownState,
     phase: DiagnosticPhase,
     cache: CacheState,
     blocked_targets: usize,
     conditions: Vec<DiagnosticCondition>,
+    handlers: Vec<HandlerDiagnostic>,
     field_or_version_conflicts: usize,
     last_reason_code: Option<String>,
     reconciliations: u64,
@@ -97,6 +126,19 @@ struct DiagnosticSnapshot {
 struct DiagnosticCondition {
     reason_code: String,
     resource_id: Option<String>,
+}
+
+/// One declared handler's dispatch status -- see the Apsides v0.3 plan,
+/// Phase 5b, "Conditions and observability". `queue_depth` is 0 or 1: the
+/// queue coalesces per handler (see `handlers::HandlerRuntime::enqueue`),
+/// so at most one event is ever pending for a given handler at once.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HandlerDiagnostic {
+    id: String,
+    last_run_millis_ago: Option<u64>,
+    last_error_code: Option<String>,
+    queue_depth: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
@@ -131,17 +173,19 @@ struct Diagnostics {
 }
 
 impl Diagnostics {
-    fn new(binding: &RuntimeBinding) -> Self {
+    fn new(binding: &RuntimeBinding, lockdown: LockdownState) -> Self {
         Self {
             snapshot: RwLock::new(DiagnosticSnapshot {
                 schema_version: "apsides.dev/runtime-status/v1",
                 domain: binding.domain_id.clone(),
                 build_digest: binding.build_digest.clone(),
                 generation: binding.generation_id.clone(),
+                lockdown,
                 phase: DiagnosticPhase::Starting,
                 cache: CacheState::Pending,
                 blocked_targets: 0,
                 conditions: Vec::new(),
+                handlers: Vec::new(),
                 field_or_version_conflicts: 0,
                 last_reason_code: None,
                 reconciliations: 0,
@@ -218,6 +262,10 @@ impl Diagnostics {
             self.trigger_to_cycle_micros_max.load(Ordering::Relaxed);
     }
 
+    async fn set_handlers(&self, handlers: Vec<HandlerDiagnostic>) {
+        self.snapshot.write().await.handlers = handlers;
+    }
+
     async fn current_snapshot(&self) -> DiagnosticSnapshot {
         let mut snapshot = self.snapshot.read().await.clone();
         self.copy_counters(&mut snapshot);
@@ -261,7 +309,7 @@ impl Diagnostics {
     }
 }
 
-struct ProductionController {
+pub(crate) struct ProductionController {
     plan: CompiledPlan,
     config: ProductionConfig,
     kube: KubeRuntimeClient,
@@ -270,6 +318,13 @@ struct ProductionController {
     terminating: Arc<AtomicBool>,
     last_mutation: Mutex<Option<Instant>>,
     last_successful_apply: Mutex<BTreeMap<ResourceIdentity, (String, String)>>,
+    /// `None` for a domain with no declared handlers (no isolate, no
+    /// background writer task, no DNS resolver ever built). `Some` is
+    /// behind a `Mutex` for interior mutability -- every `&self` reconcile
+    /// method needs `&mut` access to run one dispatch cycle, and handler
+    /// dispatch is itself serialized to global concurrency 1 (see the
+    /// Apsides v0.3 plan, Phase 5b), so the lock is never contended.
+    handler_runtime: Option<Mutex<crate::handlers::HandlerRuntime>>,
 }
 
 struct CycleResult {
@@ -283,23 +338,82 @@ enum CycleControl {
     Retry(&'static str),
 }
 
-pub(crate) async fn run_production(
-    plan: &CompiledPlan,
-    config: ProductionConfig,
-) -> Result<(), RuntimeError> {
-    validate_production_config(plan, &config)?;
-    crate::install_rustls_provider()?;
-    let mut kube_config = production_kube_config(&config)?;
-    kube_config.connect_timeout = Some(Duration::from_secs(5));
-    kube_config.read_timeout = Some(Duration::from_secs(15));
-    kube_config.write_timeout = Some(Duration::from_secs(15));
-    kube_config.default_retry = false;
-    let client = Client::try_from(kube_config)
-        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-    run_production_with_client(plan, config, client).await
+/// Everything `read_production_startup_files` reads from the filesystem and
+/// derives from those bytes, during `startup::start`'s synchronous
+/// pre-lockdown phase: the proxy client identity, already converted into
+/// the exact in-memory shapes `kube::Config` takes (never a file path), and
+/// the DNS material `kube_connector::build_client` needs to reach the proxy
+/// Service by hostname without glibc's `getaddrinfo`.
+pub(crate) struct ProductionStartupFiles {
+    /// `PROXY_CA_PATH`'s PEM bundle, parsed into DER certificates --
+    /// `kube::Config::root_cert`'s exact shape. `root_cert_file` is never
+    /// set: the file is read exactly once, here.
+    root_cert_der: Vec<Vec<u8>>,
+    /// `PROXY_CERT_PATH`'s PEM bytes, base64-encoded --
+    /// `kube::Config::auth_info::client_certificate_data`'s exact shape
+    /// (`kube-client` base64-decodes it straight back to these same bytes;
+    /// see `AuthInfo::load_client_certificate`). `client_certificate` (the
+    /// file-path field) is never set.
+    client_certificate_data: String,
+    /// `PROXY_KEY_PATH`'s PEM bytes, base64-encoded, the same way as
+    /// `client_certificate_data` above.
+    client_key_data: SecretString,
+    /// The proxy's certificate SAN / mTLS SNI, and (unlike the brief
+    /// Phase 5c revision this replaces) `cluster_url`'s host too --
+    /// `apsides-proxy-<generation>.<namespace>.svc`, unchanged from before
+    /// Phase 5c. This is not itself a resolvable DNS record; real cluster
+    /// DNS only serves the fully-qualified `<name>.<namespace>.svc.<cluster-domain>`
+    /// form, reached the same way glibc's `getaddrinfo` always reached it
+    /// here: `resolv.conf`'s `search`-list expansion, gated by `ndots` --
+    /// see `kube_resolver_config`/`kube_resolver_ndots` and
+    /// `kube_connector::build_resolver`. Deriving the cluster domain
+    /// ourselves from a single assumed `resolv.conf` line (the previous
+    /// revision's approach) broke wherever the node's search list carries
+    /// extra, cloud-injected suffixes after the three standard Kubernetes
+    /// ones (EKS appends `ec2.internal`, GKE appends `c.<project>.internal
+    /// google.internal`, GitHub Actions runners append an Azure suffix --
+    /// see `crates/test-cluster/src/manifests.rs`'s `sentinel_host`, which
+    /// works around the identical problem for an unrelated probe): the
+    /// *real* cluster domain is not reliably the search list's last entry
+    /// once another suffix follows it. Replicating full search-list
+    /// expansion has no such assumption to get wrong.
+    server_name: String,
+    /// `https://<server_name>:8443` -- the same short, non-FQDN host
+    /// `server_name` names. Resolved through `kube_resolver_config`'s
+    /// search list, exactly as glibc resolved it before Phase 5c.
+    cluster_url: http::Uri,
+    /// `RESOLV_CONF_PATH`'s `nameserver` *and* `search` lines, for
+    /// `kube_connector::build_client`'s own hickory resolver --
+    /// deliberately including the search list (unlike
+    /// `engine::resolver_config_from_resolv_conf`, used only for
+    /// already-FQDN handler egress hosts, which must never have a search
+    /// list applied to them).
+    kube_resolver_config: ResolverConfig,
+    /// `RESOLV_CONF_PATH`'s `options ndots:N` value (glibc/hickory's
+    /// shared default, 1, if absent or malformed) -- see
+    /// `kube_connector::build_resolver`.
+    kube_resolver_ndots: usize,
+    /// `RESOLV_CONF_PATH`'s raw contents, for `HandlerRuntime::new`'s own
+    /// (separately built, handler-egress-only) resolver config -- see the
+    /// Apsides v0.3 plan, Phase 5b.
+    resolv_conf_contents: String,
 }
 
-fn production_kube_config(config: &ProductionConfig) -> Result<Config, RuntimeError> {
+/// Reads every file `ProductionConfig` needs and converts each into the
+/// in-memory shape its consumer takes -- see [`ProductionStartupFiles`].
+/// Called once, by `startup::start`, before Landlock lockdown; nothing
+/// downstream of it (`run_production` and everything it calls) ever opens
+/// a file again.
+///
+/// # Errors
+///
+/// Returns an error if the generation identifier is not a DNS label, if
+/// any required file is missing, oversized or not UTF-8 (`resolv.conf`
+/// only) or not valid PEM (the CA bundle only), or if `resolv.conf` has no
+/// `nameserver` line.
+pub(crate) fn read_production_startup_files(
+    config: &ProductionConfig,
+) -> Result<ProductionStartupFiles, RuntimeError> {
     let ApiAccess::Proxy = config.api_access;
     let generation = &config.binding.generation_id;
     if !valid_dns_label(generation) {
@@ -311,15 +425,192 @@ fn production_kube_config(config: &ProductionConfig) -> Result<Config, RuntimeEr
         "apsides-proxy-{generation}.{}.svc",
         config.control_namespace
     );
-    let uri = format!("https://{server_name}:8443")
+
+    let ca_pem = crate::read_bounded_file(
+        std::path::Path::new(PROXY_CA_PATH),
+        PROXY_CA_MAX_BYTES,
+        "proxy client CA",
+    )?;
+    let cert_pem = crate::read_bounded_file(
+        std::path::Path::new(PROXY_CERT_PATH),
+        PROXY_CERT_MAX_BYTES,
+        "proxy client certificate",
+    )?;
+    let key_pem = crate::read_bounded_file(
+        std::path::Path::new(PROXY_KEY_PATH),
+        PROXY_KEY_MAX_BYTES,
+        "proxy client key",
+    )?;
+    let resolv_conf_bytes = crate::read_bounded_file(
+        std::path::Path::new(RESOLV_CONF_PATH),
+        RESOLV_CONF_MAX_BYTES,
+        "resolv.conf",
+    )?;
+    let resolv_conf_contents = String::from_utf8(resolv_conf_bytes)
+        .map_err(|_error| RuntimeError::Configuration("resolv.conf is not UTF-8".into()))?;
+
+    let root_cert_der = parse_ca_der(&ca_pem)?;
+    let client_certificate_data = base64::engine::general_purpose::STANDARD.encode(&cert_pem);
+    let client_key_data =
+        SecretString::from(base64::engine::general_purpose::STANDARD.encode(&key_pem));
+
+    let (kube_resolver_config, kube_resolver_ndots) = proxy_resolver_config(&resolv_conf_contents)?;
+    let cluster_url = format!("https://{server_name}:8443")
         .parse()
         .map_err(|_| RuntimeError::Configuration("invalid fixed proxy API URL".into()))?;
-    let mut kube_config = Config::new(uri);
-    kube_config.root_cert_file = Some(PathBuf::from(PROXY_CA_PATH));
-    kube_config.auth_info.client_certificate = Some(PROXY_CERT_PATH.into());
-    kube_config.auth_info.client_key = Some(PROXY_KEY_PATH.into());
-    kube_config.tls_server_name = Some(server_name);
-    Ok(kube_config)
+
+    Ok(ProductionStartupFiles {
+        root_cert_der,
+        client_certificate_data,
+        client_key_data,
+        server_name,
+        cluster_url,
+        kube_resolver_config,
+        kube_resolver_ndots,
+        resolv_conf_contents,
+    })
+}
+
+/// Parses a PEM bundle into the DER-encoded `CERTIFICATE` blocks it
+/// contains, in file order -- `kube::Config::root_cert`'s exact shape.
+/// Mirrors `kube_client::config::certs` (which is `pub(crate)` to that
+/// crate, not reusable directly).
+///
+/// # Errors
+///
+/// Returns an error if the bytes are not valid PEM, or contain no
+/// `CERTIFICATE` block at all.
+fn parse_ca_der(pem_bytes: &[u8]) -> Result<Vec<Vec<u8>>, RuntimeError> {
+    let blocks = pem::parse_many(pem_bytes)
+        .map_err(|error| RuntimeError::Configuration(format!("proxy client CA: {error}")))?;
+    let der: Vec<Vec<u8>> = blocks
+        .into_iter()
+        .filter(|block| block.tag() == "CERTIFICATE")
+        .map(pem::Pem::into_contents)
+        .collect();
+    if der.is_empty() {
+        return Err(RuntimeError::Configuration(
+            "proxy client CA contains no CERTIFICATE PEM blocks".into(),
+        ));
+    }
+    Ok(der)
+}
+
+/// Parses `nameserver`, `search`, and `options ndots:N` directives out of
+/// `resolv.conf`-shaped `contents` into a hickory [`ResolverConfig`]
+/// (nameservers *and* the search list) and the `ndots` value -- together,
+/// the exact glibc `getaddrinfo` search-list-expansion inputs the proxy's
+/// short, non-FQDN hostname (`apsides-proxy-<generation>.<namespace>.svc`)
+/// depended on before Phase 5c (see [`ProductionStartupFiles::server_name`]'s
+/// doc comment for why deriving a single assumed "cluster domain" instead
+/// is not equivalent). `ndots` defaults to `1` -- glibc's and hickory's
+/// shared default -- if `resolv.conf` sets no `options ndots:N` at all;
+/// Kubernetes pods normally set `ndots:5`.
+///
+/// Deliberately separate from `engine::resolver_config_from_resolv_conf`
+/// (used only for already-FQDN handler egress hosts, which must never
+/// have this search list applied to them -- see that function's own doc
+/// comment on why a handler-egress lookup has nothing for `ndots`/search
+/// expansion to usefully do). Only the *last* `search` line counts, the
+/// same way `resolv.conf(5)` documents for `search`/`domain` (kubelet
+/// only ever writes one, but a hand-edited or multi-source file could
+/// have more).
+///
+/// This function performs no I/O: the caller reads `resolv.conf` and hands
+/// the contents in (see `read_production_startup_files`), the same
+/// discipline `engine::resolver_config_from_resolv_conf` documents for the
+/// same reason.
+///
+/// # Errors
+///
+/// Returns `Err` if no `nameserver` line yields a parseable IP address.
+fn proxy_resolver_config(contents: &str) -> Result<(ResolverConfig, usize), RuntimeError> {
+    let mut ips: Vec<IpAddr> = Vec::new();
+    let mut search: Vec<hickory_proto::rr::Name> = Vec::new();
+    let mut ndots: usize = 1;
+    for line in contents.lines() {
+        let uncommented = line.split(['#', ';']).next().unwrap_or("");
+        let mut tokens = uncommented.split_whitespace();
+        match tokens.next() {
+            Some("nameserver") => {
+                if let Some(ip) = tokens.next().and_then(|token| token.parse::<IpAddr>().ok()) {
+                    ips.push(ip);
+                }
+            }
+            Some("search") => {
+                search = tokens
+                    .filter_map(|domain| hickory_proto::rr::Name::from_ascii(domain).ok())
+                    .collect();
+            }
+            Some("options") => {
+                for option in tokens {
+                    if let Some(value) = option
+                        .strip_prefix("ndots:")
+                        .and_then(|value| value.parse::<usize>().ok())
+                    {
+                        ndots = value;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if ips.is_empty() {
+        return Err(RuntimeError::Configuration(
+            "resolv.conf has no nameserver line".into(),
+        ));
+    }
+    let name_servers = ips.into_iter().map(NameServerConfig::udp_and_tcp).collect();
+    Ok((
+        ResolverConfig::from_parts(None, search, name_servers),
+        ndots,
+    ))
+}
+
+pub(crate) async fn run_production(
+    plan: &CompiledPlan,
+    config: ProductionConfig,
+    files: ProductionStartupFiles,
+    handlers: &'static [(&'static str, &'static str)],
+    lockdown: LockdownState,
+) -> Result<(), RuntimeError> {
+    validate_production_config(plan, &config)?;
+    crate::install_rustls_provider()?;
+    let mut kube_config = production_kube_config(&files);
+    kube_config.connect_timeout = Some(Duration::from_secs(5));
+    kube_config.read_timeout = Some(Duration::from_secs(15));
+    kube_config.write_timeout = Some(Duration::from_secs(15));
+    kube_config.default_retry = false;
+    let client = crate::kube_connector::build_client(
+        &kube_config,
+        files.kube_resolver_config.clone(),
+        files.kube_resolver_ndots,
+    )?;
+    run_production_with_client(
+        plan,
+        config,
+        client,
+        &files.resolv_conf_contents,
+        handlers,
+        lockdown,
+    )
+    .await
+}
+
+/// Builds the `kube::Config` for the proxy connection entirely from
+/// already-in-memory data (see [`ProductionStartupFiles`]): `root_cert` as
+/// DER certificates, `auth_info.client_certificate_data`/`client_key_data`
+/// as base64 PEM. `root_cert_file`, `auth_info.client_certificate` and
+/// `auth_info.client_key` (the file-path fields) are never set -- nothing
+/// this `Config` is used to build ever opens a file, including on
+/// reconnect (see `kube_connector::build_client`).
+fn production_kube_config(files: &ProductionStartupFiles) -> Config {
+    let mut kube_config = Config::new(files.cluster_url.clone());
+    kube_config.root_cert = Some(files.root_cert_der.clone());
+    kube_config.auth_info.client_certificate_data = Some(files.client_certificate_data.clone());
+    kube_config.auth_info.client_key_data = Some(files.client_key_data.clone());
+    kube_config.tls_server_name = Some(files.server_name.clone());
+    kube_config
 }
 
 fn valid_dns_label(value: &str) -> bool {
@@ -342,13 +633,16 @@ async fn run_production_with_client(
     plan: &CompiledPlan,
     config: ProductionConfig,
     client: Client,
+    resolv_conf_contents: &str,
+    handlers: &'static [(&'static str, &'static str)],
+    lockdown: LockdownState,
 ) -> Result<(), RuntimeError> {
     let authority = RuntimeAuthority::new(
         client.clone(),
         &config.control_namespace,
         config.binding.clone(),
     )?;
-    let diagnostics = Arc::new(Diagnostics::new(&config.binding));
+    let diagnostics = Arc::new(Diagnostics::new(&config.binding, lockdown));
     let listener = tokio::net::TcpListener::bind(config.diagnostics_bind)
         .await
         .map_err(|error| RuntimeError::Configuration(format!("diagnostics listener: {error}")))?;
@@ -356,6 +650,26 @@ async fn run_production_with_client(
     spawn_diagnostics(listener, diagnostics.clone(), shutdown_rx.clone());
     let terminating = Arc::new(AtomicBool::new(false));
     spawn_shutdown_listener(shutdown_tx.clone(), terminating.clone());
+
+    let handler_runtime = if plan.ir.handlers.is_empty() {
+        None
+    } else {
+        // `resolv_conf_contents` was already read once, before Landlock
+        // lockdown, by `read_production_startup_files` -- `HandlerRuntime::new`
+        // itself never reads the file, only parses the contents it is
+        // handed. See the Apsides v0.3 plan, Phase 5b review item 3 and
+        // Phase 5c.
+        let mut runtime = crate::handlers::HandlerRuntime::new(
+            plan,
+            handlers,
+            crate::handlers::handler_field_manager(&plan.ir.domain.id),
+            Duration::from_millis(config.base_backoff_millis),
+            Duration::from_millis(config.max_backoff_millis),
+            Some(resolv_conf_contents),
+        )?;
+        runtime.seed_from_annotations(plan, &client).await;
+        Some(Mutex::new(runtime))
+    };
 
     let controller = ProductionController {
         plan: plan.clone(),
@@ -369,6 +683,7 @@ async fn run_production_with_client(
         terminating,
         last_mutation: Mutex::new(None),
         last_successful_apply: Mutex::new(BTreeMap::new()),
+        handler_runtime,
         config,
     };
     let result = controller.run(shutdown_rx).await;
@@ -408,6 +723,15 @@ fn validate_production_config(
 }
 
 impl ProductionController {
+    /// Whether shutdown has been requested -- checked by
+    /// `handlers::HandlerRuntime` (which does not otherwise touch this
+    /// struct's fields) immediately before dispatching a handler
+    /// invocation, so a shutdown in progress never starts a new one (see
+    /// the Apsides v0.3 plan, Phase 5b review item E).
+    pub(crate) fn is_terminating(&self) -> bool {
+        self.terminating.load(Ordering::Acquire)
+    }
+
     async fn run(&self, mut shutdown: watch::Receiver<bool>) -> Result<(), RuntimeError> {
         let mut attempt = 0_u32;
         let mut last_reason: Option<String> = None;
@@ -549,6 +873,22 @@ impl ProductionController {
                 reason.as_deref(),
             )
             .await;
+        if let Some(handler_runtime) = &self.handler_runtime {
+            let statuses = handler_runtime.lock().await.statuses();
+            self.diagnostics
+                .set_handlers(
+                    statuses
+                        .into_iter()
+                        .map(|status| HandlerDiagnostic {
+                            id: status.id,
+                            last_run_millis_ago: status.last_run_millis_ago,
+                            last_error_code: status.last_error_code,
+                            queue_depth: status.queue_depth,
+                        })
+                        .collect(),
+                )
+                .await;
+        }
         if reason != *last_reason {
             let _ = writeln!(
                 std::io::stderr().lock(),
@@ -630,6 +970,14 @@ impl ProductionController {
         let mut applied = BTreeSet::new();
         let mut observations = validated_inventory_observations(inventory, verified)?;
         let mut conditions = Vec::new();
+        // The uid this very cycle's reconciler apply observed for each
+        // handler output, keyed by the output's resource id -- NOT
+        // re-derived from a later, separate GET. `commit_handler_outputs`
+        // binds its commit to this value so a handler output replaced
+        // (deleted and recreated under the same name) while the handler
+        // ran can never receive that handler's data; see the Apsides v0.3
+        // plan, Phase 5b runtime-integration review (uid-binding item).
+        let mut output_uids = BTreeMap::new();
 
         for resource in self
             .plan
@@ -640,6 +988,9 @@ impl ProductionController {
         {
             match self.apply(resource, &resource.desired, inventory).await {
                 Ok(observation) => {
+                    if resource.handler_output {
+                        output_uids.insert(resource.id.clone(), observation.uid.clone());
+                    }
                     observations.insert(observation.identity.clone(), observation);
                     applied.insert(resource.id.clone());
                 }
@@ -651,6 +1002,20 @@ impl ProductionController {
         }
 
         let current = crate::collect_observations(&self.plan, &applied, &self.kube).await?;
+        if let Some(handler_runtime) = &self.handler_runtime {
+            let mut handler_runtime = handler_runtime.lock().await;
+            let new_conditions = handler_runtime
+                .run_cycle(
+                    &self.plan,
+                    &current,
+                    &applied,
+                    &output_uids,
+                    &self.kube.client,
+                    self,
+                )
+                .await?;
+            conditions.extend(new_conditions);
+        }
         for resource in self
             .plan
             .ir
@@ -937,6 +1302,7 @@ async fn apply_preflight_result(
         approved,
         expected_uid,
         existing,
+        &controller.kube.field_manager,
     )
     .await?;
     Ok((object, false))
@@ -994,6 +1360,26 @@ async fn apply_absent_claimed(
     Ok(created)
 }
 
+/// The authority/claim re-check reconciler mutations use before their real
+/// (non-dry-run) SSA write: re-verify the activation, and confirm the
+/// claim this write was approved under has not changed since. Generalized
+/// over `field_manager` (rather than always using
+/// `controller.kube.field_manager`) so `commit_handler_outputs` can reuse
+/// this exact path, under the distinct `apsides-handler-<domainId>`
+/// manager, instead of duplicating it -- see the Apsides v0.3 plan, Phase
+/// 5b review item E.
+///
+/// `last_successful_apply`'s cache-skip is keyed only by resource identity,
+/// not by `field_manager`, so a resource written by two different managers
+/// (a handler output: metadata by the reconciler, `data` by the handler)
+/// shares one cache slot -- interleaving between the two managers just
+/// occasionally misses the early-exit and falls through to an extra
+/// dry-run round-trip; `already_owned`/the dry-run-vs-existing comparison
+/// below are both scoped to `field_manager` and stay correct regardless.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct, independently-owned piece of one write's identity/claim/precondition state; bundling them into a struct would only move the same field list one level up"
+)]
 async fn apply_existing_claimed(
     controller: &ProductionController,
     api: &kube::Api<DynamicObject>,
@@ -1002,6 +1388,7 @@ async fn apply_existing_claimed(
     approved: &ApprovedClaim,
     expected_uid: &str,
     existing: DynamicObject,
+    field_manager: &str,
 ) -> Result<DynamicObject, RuntimeError> {
     if existing.metadata.name.as_deref() != Some(resource.name.as_str())
         || existing.metadata.namespace.as_deref() != Some(resource.namespace.as_str())
@@ -1023,13 +1410,8 @@ async fn apply_existing_claimed(
                 resource.kind, resource.name
             ))
         })?;
-    let already_owned = validate_exact_apply_owner(
-        &existing,
-        resource,
-        &controller.kube.field_manager,
-        "claim preflight",
-    )
-    .is_ok();
+    let already_owned =
+        validate_exact_apply_owner(&existing, resource, field_manager, "claim preflight").is_ok();
     if already_owned
         && controller
             .successful_apply_is_current(resource, desired, &existing)
@@ -1041,7 +1423,7 @@ async fn apply_existing_claimed(
         desired,
         &resource.name,
         &resource.namespace,
-        &controller.kube.field_manager,
+        field_manager,
         resource.force,
         ApplyPrecondition::Existing {
             uid: expected_uid,
@@ -1076,17 +1458,204 @@ async fn apply_existing_claimed(
             resource.kind, resource.name
         )));
     }
-    validate_exact_apply_owner(
-        &applied,
-        resource,
-        &controller.kube.field_manager,
-        "conditional claim SSA",
-    )?;
+    validate_exact_apply_owner(&applied, resource, field_manager, "conditional claim SSA")?;
     controller
         .diagnostics
         .mutations
         .fetch_add(1, Ordering::Relaxed);
     Ok(applied)
+}
+
+/// Commits one successful handler invocation's buffered output writes.
+///
+/// One server-side apply per output the handler *declared*
+/// (`handler_outputs`, not just the ones it actually wrote this
+/// invocation), each containing that output's *complete* `data` map plus
+/// the `apsides.dev/handler-input-revision` annotation -- see the Apsides
+/// v0.3 plan, Phase 5b review item 1. An output the handler wrote this
+/// invocation gets exactly the keys `written` holds for it; an output it
+/// did **not** write is left untouched *and* re-applied with its own
+/// current live `data` unchanged, so the annotation stamp never drops data
+/// a previous invocation already wrote there.
+///
+/// Every commit goes through [`apply_existing_claimed`] -- the SAME
+/// authority/claim re-check reconciler mutations use -- under
+/// `field_manager` (`apsides-handler-<domainId>`, distinct from the
+/// reconciler's own manager), so a handler commit can never bypass that
+/// re-check (review item E; "reuse that path, don't duplicate it").
+/// `controller.is_terminating()` is checked before each output's commit,
+/// not just once for the whole batch, so a shutdown mid-commit stops as
+/// early as possible.
+///
+/// If any output's commit fails, the whole invocation counts as failed
+/// (the caller does not advance `known_revision` or clear backoff) --
+/// outputs already committed earlier in this same call keep whatever they
+/// were just given, rather than being rolled back. That does not leave a
+/// silently-inconsistent "done" state: every declared output must record
+/// the *same* revision for the handler to ever be treated as up to date
+/// again (`HandlerRuntime::seed_from_annotations`/`outputs_still_agree`),
+/// so a partial commit here always shows up as "must re-run", not as
+/// success.
+///
+/// Returns the committed `uid` of every output actually committed, keyed
+/// by output id, for the caller to refresh `HandlerState::output_uids`.
+///
+/// `output_uids` binds each output to the uid *this reconcile cycle's own
+/// reconciler apply* observed for it (see `reconcile`'s `output_uids`
+/// map) -- never a uid re-derived from this function's own GET of the
+/// live object, which would make the uid precondition trivially true
+/// against itself. If the live object's uid no longer matches, the
+/// output was deleted and recreated (or otherwise replaced) while the
+/// handler ran, and the commit is refused with a
+/// `handler-output-replaced` error instead of silently writing the
+/// handler's data into the replacement object; the caller retries the
+/// same event next cycle, once the reconciler has observed the
+/// replacement afresh.
+///
+/// # Errors
+///
+/// Returns `Err` if an output id is undeclared, has no backing resource,
+/// no approved claim or no bound uid from this cycle, if the live
+/// object's uid no longer matches that bound uid
+/// (`handler-output-replaced`), or if any step of its commit fails --
+/// including `RuntimeError::Terminating` if shutdown was requested.
+pub(crate) async fn commit_handler_outputs(
+    controller: &ProductionController,
+    handler_outputs: &[String],
+    outputs_by_id: &BTreeMap<String, compiler_core::Output>,
+    field_manager: &str,
+    written: &crate::handlers::BufferedWrites,
+    revision: &str,
+    output_uids: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, RuntimeError> {
+    let mut committed_uids = BTreeMap::new();
+    for output_id in handler_outputs {
+        if controller.terminating.load(Ordering::Acquire) {
+            return Err(RuntimeError::Terminating);
+        }
+        let output = outputs_by_id.get(output_id).ok_or_else(|| {
+            RuntimeError::Plan(format!("undeclared handler output id {output_id:?}"))
+        })?;
+        let resource = controller
+            .plan
+            .ir
+            .resources
+            .iter()
+            .find(|resource| resource.id == *output_id)
+            .ok_or_else(|| {
+                RuntimeError::Plan(format!(
+                    "no backing resource for handler output {output_id:?}"
+                ))
+            })?;
+        let bound_uid = output_uids
+            .get(output_id)
+            .filter(|uid| !uid.is_empty())
+            .ok_or_else(|| {
+                RuntimeError::Kubernetes(format!(
+                    "handler-output-uid-unbound:{}/{}",
+                    resource.kind, resource.name
+                ))
+            })?;
+        let api = controller.kube.resource_api(resource)?;
+        // The raw `kube::Error` is discarded, not interpolated: an API
+        // error body can echo back request/response content, and this
+        // reason ends up in the world-readable diagnostics conditions
+        // list -- the same discipline `write_api_error` and the
+        // reconciler's own ownership-preflight GET/LIST calls already
+        // apply to every other Kubernetes error this crate surfaces.
+        let existing = api.get(&output.name).await.map_err(|_error| {
+            RuntimeError::Kubernetes(format!(
+                "handler-output-read-failed:{}/{}",
+                resource.kind, resource.name
+            ))
+        })?;
+        if existing.metadata.uid.as_deref() != Some(bound_uid.as_str()) {
+            return Err(RuntimeError::Kubernetes(format!(
+                "handler-output-replaced:{}/{}",
+                resource.kind, resource.name
+            )));
+        }
+        let uid = bound_uid.clone();
+        let data: serde_json::Map<String, Value> = written.get(output_id).map_or_else(
+            || handler_owned_data_keys(&existing, field_manager),
+            |keys| {
+                keys.iter()
+                    .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+                    .collect()
+            },
+        );
+        let desired = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": output.name,
+                "namespace": output.namespace,
+                "annotations": {
+                    crate::handlers::HANDLER_INPUT_REVISION_ANNOTATION: revision,
+                },
+            },
+            "data": Value::Object(data),
+        });
+        let initial = controller.authority.verify(&controller.plan).await?;
+        let approved = approved_claim(&initial, resource)?.clone();
+        let applied = apply_existing_claimed(
+            controller,
+            &api,
+            resource,
+            &desired,
+            &approved,
+            &uid,
+            existing,
+            field_manager,
+        )
+        .await?;
+        controller
+            .remember_successful_apply(resource, &desired, &applied)
+            .await?;
+        let applied_uid = applied
+            .metadata
+            .uid
+            .clone()
+            .filter(|uid| !uid.is_empty())
+            .unwrap_or(uid);
+        committed_uids.insert(output_id.clone(), applied_uid);
+    }
+    Ok(committed_uids)
+}
+
+/// The subset of `existing`'s live `data` map that `field_manager`
+/// currently owns, read from `existing`'s own `managedFields` rather than
+/// assumed -- the actual writeOutput contract (see
+/// `docs/reference/IR-CONTRACT.md`): re-applying an output a handler did
+/// not write this invocation re-asserts only the handler's own
+/// previously-written keys, never a foreign field manager's keys, so the
+/// handler never becomes a co-owner of data another writer put there.
+///
+/// Empty (no keys, or no matching `Apply` entry) when the handler has
+/// never written this output before -- there is nothing yet for it to
+/// own.
+fn handler_owned_data_keys(
+    existing: &DynamicObject,
+    field_manager: &str,
+) -> serde_json::Map<String, Value> {
+    let owned_keys: BTreeSet<String> =
+        manager_main_resource_entries(existing, field_manager, "Apply")
+            .into_iter()
+            .filter_map(|entry| entry.fields_v1.as_ref())
+            .filter_map(|fields| fields.0.get("f:data"))
+            .filter_map(Value::as_object)
+            .flat_map(serde_json::Map::keys)
+            .filter_map(|key| key.strip_prefix("f:"))
+            .map(str::to_owned)
+            .collect();
+    let live_data = existing.data.get("data").and_then(Value::as_object);
+    owned_keys
+        .into_iter()
+        .filter_map(|key| {
+            let value = live_data?.get(&key)?.clone();
+            Some((key, value))
+        })
+        .collect()
 }
 
 fn approved_claim<'a>(
@@ -1145,7 +1714,7 @@ fn snapshots(
                         .iter()
                         .find(|input| input.id == *id)
                         .is_none_or(|input| {
-                            input.mode == InputMode::Observed
+                            matches!(input.mode, InputMode::Observed | InputMode::Output)
                                 || input
                                     .managed_resource_id
                                     .as_ref()
@@ -1400,10 +1969,10 @@ mod tests {
 
     fn plan() -> TestResult<CompiledPlan> {
         Ok(parse_and_validate(&json!({
-            "schemaVersion":"apsides.dev/ir/v1", "testOnly":false,
-            "domain":{"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound","budgets":{"maxResources":8,"maxInputs":8,"maxReactions":8,"maxObjectBytes":262_144,"maxQueueDepth":8,"maxConcurrentRequests":2}},
+            "schemaVersion":"apsides.dev/ir/v2", "testOnly":false,
+            "domain":{"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound","minKubernetesVersion":"1.34","budgets":{"maxResources":8,"maxInputs":8,"maxReactions":8,"maxObjectBytes":262_144,"maxQueueDepth":8,"maxConcurrentRequests":2}},
             "resources":[{"id":"config","apiVersion":"v1","kind":"ConfigMap","name":"config","namespace":"workload","desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"config","namespace":"workload"},"data":{"value":"approved"}},"lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"program.ts","line":1,"column":1}}],
-            "inputs":[],"reactions":[],"provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
+            "inputs":[],"reactions":[],"handlers":[],"outputs":[],"provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.ts","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}
         }).to_string())?)
     }
 
@@ -1444,6 +2013,7 @@ mod tests {
                 capability_digest: digest(&plan.capabilities)?,
                 service_account_name: "apsides-example-generation-a".into(),
                 controller_image: format!("example.invalid/controller@sha256:{}", "b".repeat(64)),
+                max_handler_heap_bytes: 0,
             },
             status: ActivationStatus::Active,
             approved_claims: vec![ApprovedClaim {
@@ -1608,10 +2178,14 @@ mod tests {
                 activation.binding.clone(),
             )?,
             kube: KubeRuntimeClient::from_client(client, 2, "example"),
-            diagnostics: Arc::new(Diagnostics::new(&activation.binding)),
+            diagnostics: Arc::new(Diagnostics::new(
+                &activation.binding,
+                LockdownState::Landlock,
+            )),
             terminating: Arc::new(AtomicBool::new(false)),
             last_mutation: Mutex::new(None),
             last_successful_apply: Mutex::new(BTreeMap::new()),
+            handler_runtime: None,
             config,
         })
     }
@@ -1631,41 +2205,279 @@ mod tests {
         assert!(serde_json::from_str::<ApiAccess>("{\"proxy\":\"https://example\"}").is_err());
     }
 
-    #[tokio::test]
-    async fn proxy_access_uses_only_fixed_mtls_identity() -> TestResult {
-        let plan = plan()?;
-        let policy = policy(&plan);
-        let activation = activation(&plan, &policy, None)?;
-        let controller = controller(&plan, &activation, wire(vec![]).0)?;
-        let config = production_kube_config(&controller.config)?;
+    /// A syntactically valid, arbitrary (not cryptographically real) PEM
+    /// `CERTIFICATE` block -- `parse_ca_der` only checks PEM structure and
+    /// the block tag, never certificate validity (the same as
+    /// `kube::Config::root_cert`'s own contract: it is trusted TLS
+    /// material, not independently re-validated at `Config`-construction
+    /// time).
+    const TEST_CA_PEM: &str =
+        "-----BEGIN CERTIFICATE-----\nZmFrZS1jYS1kYXRh\n-----END CERTIFICATE-----\n";
+
+    fn test_startup_files() -> TestResult<ProductionStartupFiles> {
+        Ok(ProductionStartupFiles {
+            root_cert_der: parse_ca_der(TEST_CA_PEM.as_bytes())?,
+            client_certificate_data: base64::engine::general_purpose::STANDARD
+                .encode(b"fake-cert-pem"),
+            client_key_data: SecretString::from(
+                base64::engine::general_purpose::STANDARD.encode(b"fake-key-pem"),
+            ),
+            server_name: "apsides-proxy-generation-a.control.svc".into(),
+            cluster_url: "https://apsides-proxy-generation-a.control.svc:8443"
+                .parse()
+                .map_err(|error| format!("{error}"))?,
+            kube_resolver_config: ResolverConfig::from_parts(
+                None,
+                vec![
+                    hickory_proto::rr::Name::from_ascii("control.svc.cluster.local")
+                        .map_err(|error| error.to_string())?,
+                ],
+                vec![hickory_resolver::config::NameServerConfig::udp_and_tcp(
+                    "127.0.0.1"
+                        .parse::<std::net::IpAddr>()
+                        .map_err(|e| e.to_string())?,
+                )],
+            ),
+            kube_resolver_ndots: 5,
+            resolv_conf_contents: "nameserver 127.0.0.1\n".into(),
+        })
+    }
+
+    /// `production_kube_config` builds a `kube::Config` entirely from
+    /// [`ProductionStartupFiles`]'s in-memory fields: `root_cert` as DER,
+    /// `client_certificate_data`/`client_key_data` as base64 PEM, and
+    /// (critically for the Apsides v0.3 plan, Phase 5c) never sets
+    /// `root_cert_file`, `auth_info.client_certificate` or
+    /// `auth_info.client_key` -- the three file-path fields that would
+    /// make `kube-client` open a file again after Landlock lockdown.
+    #[test]
+    fn production_kube_config_uses_only_in_memory_mtls_identity() -> TestResult {
+        let files = test_startup_files()?;
+        let config = production_kube_config(&files);
         assert_eq!(
             config.cluster_url.to_string(),
             "https://apsides-proxy-generation-a.control.svc:8443/"
         );
-        assert_eq!(config.root_cert_file, Some(PathBuf::from(PROXY_CA_PATH)));
         assert_eq!(
-            config.auth_info.client_certificate.as_deref(),
-            Some(PROXY_CERT_PATH)
+            config.tls_server_name.as_deref(),
+            Some("apsides-proxy-generation-a.control.svc")
         );
-        assert_eq!(config.auth_info.client_key.as_deref(), Some(PROXY_KEY_PATH));
+        assert!(config.root_cert_file.is_none());
+        assert!(config.auth_info.client_certificate.is_none());
+        assert!(config.auth_info.client_key.is_none());
+        assert_eq!(config.root_cert, Some(vec![b"fake-ca-data".to_vec()]));
+        assert_eq!(
+            config.auth_info.client_certificate_data.as_deref(),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(b"fake-cert-pem")
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            config
+                .auth_info
+                .client_key_data
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(b"fake-key-pem")
+                    .as_str()
+            )
+        );
         assert!(config.auth_info.token.is_none());
         assert!(config.auth_info.token_file.is_none());
         Ok(())
     }
 
+    #[test]
+    fn parse_ca_der_extracts_only_certificate_blocks() -> TestResult {
+        let der = parse_ca_der(TEST_CA_PEM.as_bytes())?;
+        assert_eq!(der, vec![b"fake-ca-data".to_vec()]);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_ca_der_rejects_a_bundle_with_no_certificate_block() {
+        let key_only = "-----BEGIN PRIVATE KEY-----\nZmFrZQ==\n-----END PRIVATE KEY-----\n";
+        assert!(parse_ca_der(key_only.as_bytes()).is_err());
+    }
+
+    /// A plain Kubernetes-standard resolv.conf: no cloud-injected search
+    /// suffixes, `ndots:5`.
+    #[test]
+    fn proxy_resolver_config_reads_plain_kubernetes_search_and_ndots() -> TestResult {
+        let contents = "nameserver 10.0.0.10\nsearch control.svc.cluster.local svc.cluster.local cluster.local\noptions ndots:5\n";
+        let (config, ndots) = proxy_resolver_config(contents)?;
+        assert_eq!(ndots, 5);
+        assert_eq!(
+            search_strings(&config),
+            vec![
+                "control.svc.cluster.local",
+                "svc.cluster.local",
+                "cluster.local"
+            ]
+        );
+        Ok(())
+    }
+
+    /// EKS appends `ec2.internal` after the three standard Kubernetes
+    /// search domains.
+    #[test]
+    fn proxy_resolver_config_keeps_the_eks_search_suffix() -> TestResult {
+        let contents = "nameserver 10.0.0.10\nsearch control.svc.cluster.local svc.cluster.local cluster.local ec2.internal\noptions ndots:5\n";
+        let (config, ndots) = proxy_resolver_config(contents)?;
+        assert_eq!(ndots, 5);
+        assert_eq!(
+            search_strings(&config),
+            vec![
+                "control.svc.cluster.local",
+                "svc.cluster.local",
+                "cluster.local",
+                "ec2.internal",
+            ]
+        );
+        Ok(())
+    }
+
+    /// GKE appends two extra search domains.
+    #[test]
+    fn proxy_resolver_config_keeps_the_gke_search_suffixes() -> TestResult {
+        let contents = "nameserver 10.0.0.10\nsearch control.svc.cluster.local svc.cluster.local cluster.local c.my-project.internal google.internal\noptions ndots:5\n";
+        let (config, ndots) = proxy_resolver_config(contents)?;
+        assert_eq!(ndots, 5);
+        assert_eq!(
+            search_strings(&config),
+            vec![
+                "control.svc.cluster.local",
+                "svc.cluster.local",
+                "cluster.local",
+                "c.my-project.internal",
+                "google.internal",
+            ]
+        );
+        Ok(())
+    }
+
+    /// GitHub Actions runners (and other Azure-hosted nodes) append an
+    /// Azure-assigned search suffix -- see
+    /// `crates/test-cluster/src/manifests.rs`'s `sentinel_host`, which
+    /// works around this exact same shape for an unrelated probe.
+    #[test]
+    fn proxy_resolver_config_keeps_the_azure_search_suffix() -> TestResult {
+        let contents = "nameserver 10.0.0.10\nsearch control.svc.cluster.local svc.cluster.local cluster.local xy0123456789abcdefghijklmnop.bx.internal.cloudapp.net\noptions ndots:5\n";
+        let (config, ndots) = proxy_resolver_config(contents)?;
+        assert_eq!(ndots, 5);
+        assert_eq!(
+            search_strings(&config),
+            vec![
+                "control.svc.cluster.local",
+                "svc.cluster.local",
+                "cluster.local",
+                "xy0123456789abcdefghijklmnop.bx.internal.cloudapp.net",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_resolver_config_defaults_ndots_to_one_without_an_options_line() -> TestResult {
+        let (_, ndots) = proxy_resolver_config("nameserver 10.0.0.10\nsearch example.\n")?;
+        assert_eq!(ndots, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_resolver_config_fails_closed_with_no_nameserver_line() {
+        assert!(proxy_resolver_config("search example.\noptions ndots:5\n").is_err());
+    }
+
+    /// The handler-egress resolver config (`engine::resolver_config_from_resolv_conf`,
+    /// built separately by `HandlerRuntime::new` from the same
+    /// `resolv_conf_contents` this struct also carries) must never see a
+    /// search list -- handler hosts are always already-FQDN. Proves the
+    /// two configs built from one `resolv.conf` genuinely differ, not just
+    /// that each looks right read in isolation.
+    #[test]
+    fn proxy_resolver_config_has_a_search_list_the_handler_egress_config_must_not() -> TestResult {
+        let contents = "nameserver 10.0.0.10\nsearch control.svc.cluster.local svc.cluster.local cluster.local\noptions ndots:5\n";
+        let (proxy_config, _) = proxy_resolver_config(contents)?;
+        assert!(!search_strings(&proxy_config).is_empty());
+        let handler_config = engine::resolver_config_from_resolv_conf(contents)
+            .map_err(|error| error.to_string())?;
+        assert!(handler_config.search().is_empty());
+        assert!(handler_config.domain().is_none());
+        Ok(())
+    }
+
+    fn search_strings(config: &ResolverConfig) -> Vec<String> {
+        config
+            .search()
+            .iter()
+            .map(|name| name.to_ascii().trim_end_matches('.').to_owned())
+            .collect()
+    }
+
+    /// `startup_reads_before_lock` (see the Apsides v0.3 plan, Phase 5c):
+    /// `/etc/apsides/proxy/ca.crt` does not exist in this test environment
+    /// (nothing in this repository's test suites creates it -- only a real
+    /// platform executor does, inside a real pod), so this exercises the
+    /// real, unmocked read path and its real fail-closed error, not a
+    /// simulated one. Proves the read happens (and fails clearly) entirely
+    /// independent of Landlock: nothing about this test applies any
+    /// lockdown at all.
+    #[test]
+    fn read_production_startup_files_fails_clearly_when_the_proxy_ca_is_missing() -> TestResult {
+        let plan = plan()?;
+        let config = ProductionConfig {
+            api_access: ApiAccess::Proxy,
+            control_namespace: plan.ir.domain.control_namespace.clone(),
+            binding: RuntimeBinding {
+                domain_id: plan.ir.domain.id.clone(),
+                cluster_binding: plan.ir.domain.cluster_binding.clone(),
+                generation_id: "generation-a".into(),
+                build_digest: format!("sha256:{}", "1".repeat(64)),
+                ir_digest: plan.ir_digest,
+                policy_digest: format!("sha256:{}", "3".repeat(64)),
+                capability_digest: format!("sha256:{}", "4".repeat(64)),
+                service_account_name: "controller".into(),
+                controller_image: format!("example/controller@sha256:{}", "5".repeat(64)),
+                max_handler_heap_bytes: 0,
+            },
+            poll_interval_millis: 1_000,
+            base_backoff_millis: 100,
+            max_backoff_millis: 1_000,
+            min_mutation_interval_millis: 10,
+            diagnostics_bind: "127.0.0.1:0".parse().map_err(|e| format!("{e}"))?,
+        };
+        let error = read_production_startup_files(&config)
+            .err()
+            .ok_or("expected a missing-file error")?;
+        assert!(
+            error.to_string().contains("proxy client CA"),
+            "expected the error to name the missing file: {error}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn diagnostics_never_include_input_values_or_key_material() -> TestResult {
-        let diagnostics = Arc::new(Diagnostics::new(&RuntimeBinding {
-            domain_id: "domain".into(),
-            cluster_binding: "cluster".into(),
-            generation_id: "generation".into(),
-            build_digest: format!("sha256:{}", "1".repeat(64)),
-            ir_digest: format!("sha256:{}", "2".repeat(64)),
-            policy_digest: format!("sha256:{}", "3".repeat(64)),
-            capability_digest: format!("sha256:{}", "4".repeat(64)),
-            service_account_name: "controller".into(),
-            controller_image: format!("example/controller@sha256:{}", "5".repeat(64)),
-        }));
+        let diagnostics = Arc::new(Diagnostics::new(
+            &RuntimeBinding {
+                domain_id: "domain".into(),
+                cluster_binding: "cluster".into(),
+                generation_id: "generation".into(),
+                build_digest: format!("sha256:{}", "1".repeat(64)),
+                ir_digest: format!("sha256:{}", "2".repeat(64)),
+                policy_digest: format!("sha256:{}", "3".repeat(64)),
+                capability_digest: format!("sha256:{}", "4".repeat(64)),
+                service_account_name: "controller".into(),
+                controller_image: format!("example/controller@sha256:{}", "5".repeat(64)),
+                max_handler_heap_bytes: 0,
+            },
+            LockdownState::Landlock,
+        ));
         diagnostics
             .update(
                 DiagnosticPhase::Ready,
@@ -1893,6 +2705,188 @@ mod tests {
             {
                 return Err("inactive diagnostic state retained old conditions".into());
             }
+        }
+        Ok(())
+    }
+
+    fn handler_output_plan() -> TestResult<CompiledPlan> {
+        Ok(parse_and_validate(&json!({
+            "schemaVersion": compiler_core::IR_SCHEMA, "testOnly": false,
+            "domain": {"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound","minKubernetesVersion":"1.34","budgets":{"maxResources":8,"maxInputs":8,"maxReactions":8,"maxObjectBytes":262_144,"maxQueueDepth":8,"maxConcurrentRequests":2}},
+            "resources":[{"id":"flags","apiVersion":"v1","kind":"ConfigMap","name":"flags","namespace":"workload","handlerOutput":true,"desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"flags","namespace":"workload","labels":{"apsides.dev/handler-output":"flags"}}},"lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"program.ts","line":1,"column":1}}],
+            "inputs":[{"id":"flags","apiVersion":"v1","kind":"ConfigMap","name":"flags","namespace":"workload","mode":"output","managedResourceId":"flags","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}}],
+            "reactions":[],"handlers":[],"outputs":[{"id":"flags","name":"flags","namespace":"workload"}],
+            "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.ts","sha256":"0".repeat(64)}]},
+        }).to_string())?)
+    }
+
+    fn handler_output_activation(
+        plan: &CompiledPlan,
+        policy: &PolicyState,
+    ) -> TestResult<ActivationState> {
+        Ok(ActivationState {
+            schema_version: SCHEMA_VERSION.into(),
+            binding: RuntimeBinding {
+                domain_id: "example".into(),
+                cluster_binding: "cluster-a".into(),
+                generation_id: "generation-a".into(),
+                build_digest: format!("sha256:{}", "a".repeat(64)),
+                ir_digest: plan.ir_digest.clone(),
+                policy_digest: digest(policy)?,
+                capability_digest: digest(&plan.capabilities)?,
+                service_account_name: "apsides-example-generation-a".into(),
+                controller_image: format!("example.invalid/controller@sha256:{}", "b".repeat(64)),
+                max_handler_heap_bytes: 0,
+            },
+            status: ActivationStatus::Active,
+            approved_claims: vec![ApprovedClaim {
+                claim: ProtectedClaim {
+                    identity: ResourceIdentity {
+                        api_group: String::new(),
+                        resource: "configmaps".into(),
+                        namespace: "workload".into(),
+                        name: "flags".into(),
+                    },
+                    domain_id: "example".into(),
+                    generation_id: "generation-a".into(),
+                    transition_id: "transition-a".into(),
+                    state: ClaimState::Active,
+                    uid: None,
+                },
+                deletion_policy: compiler_core::DeletionPolicy::Orphan,
+                allow_create: true,
+            }],
+            rollout_key_id: None,
+        })
+    }
+
+    fn handler_output_object(uid: &str, rv: &str) -> Value {
+        json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"flags","namespace":"workload","uid":uid,"resourceVersion":rv,
+            "labels":{"apsides.dev/handler-output":"flags"},
+            "managedFields":[{"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:metadata":{"f:labels":{}}},"manager":"apsides-example","operation":"Apply"}]}})
+    }
+
+    fn handler_output_inventory(
+        binding: &RuntimeBinding,
+        activation_uid: &str,
+        activation_rv: &str,
+        observations: Vec<RuntimeObservation>,
+    ) -> RuntimeInventory {
+        RuntimeInventory {
+            schema_version: SCHEMA_VERSION.into(),
+            binding: binding.clone(),
+            activation_uid: activation_uid.into(),
+            activation_resource_version: activation_rv.into(),
+            observations,
+            conditions: vec![],
+            drained: false,
+        }
+    }
+
+    /// The Apsides v0.3 plan, Phase 5b: "The reconciler's own SSA of
+    /// outputs must still never claim `data`." Drives `apply()` -- the
+    /// reconciler's real apply path, the same one `reconcile()`'s
+    /// `ConfigMap` loop uses for every handler-output resource -- against a
+    /// handler-output resource whose `desired` carries only `metadata`
+    /// (as the compiler always emits for one; see `validate.rs`'s
+    /// `validate_handler_output_label`), and asserts every request body
+    /// this crate ever sends for it lacks a `data` key, using field
+    /// manager `apsides-<domainId>` (the reconciler's own), never
+    /// `apsides-handler-<domainId>`.
+    #[tokio::test]
+    async fn reconcilers_own_apply_of_a_handler_output_never_claims_data() -> TestResult {
+        let plan = handler_output_plan()?;
+        let policy = policy(&plan);
+        let activation = handler_output_activation(&plan, &policy)?;
+        let previous_value =
+            handler_output_inventory(&activation.binding, "activation-uid", "19", vec![]);
+        let mut previous = versioned_inventory(previous_value.clone(), "18");
+        let observation = RuntimeObservation {
+            identity: ResourceIdentity {
+                api_group: String::new(),
+                resource: "configmaps".into(),
+                namespace: "workload".into(),
+                name: "flags".into(),
+            },
+            uid: "flags-uid".into(),
+        };
+        let next_value = handler_output_inventory(
+            &activation.binding,
+            "activation-uid",
+            "20",
+            vec![observation],
+        );
+        let responses = vec![
+            control_object(
+                "apsides-activation-example",
+                &activation,
+                "activation-uid",
+                "20",
+            )?,
+            control_object("apsides-policy-example", &policy, "policy-uid", "19")?,
+            target_list(&[], "30"),
+            handler_output_object("flags-uid", "31"),
+            control_object(
+                "apsides-activation-example",
+                &activation,
+                "activation-uid",
+                "20",
+            )?,
+            control_object("apsides-policy-example", &policy, "policy-uid", "19")?,
+            handler_output_object("flags-uid", "32"),
+            control_object(
+                "apsides-activation-example",
+                &activation,
+                "activation-uid",
+                "20",
+            )?,
+            control_object(
+                "apsides-inventory-example",
+                &previous_value,
+                "inventory-uid",
+                "18",
+            )?,
+            control_object(
+                "apsides-inventory-example",
+                &next_value,
+                "inventory-uid",
+                "21",
+            )?,
+        ];
+        let (client, calls) = wire(responses);
+        let controller = controller(&plan, &activation, client)?;
+        let observed = controller
+            .apply(
+                &plan.ir.resources[0],
+                &plan.ir.resources[0].desired,
+                &mut previous,
+            )
+            .await?;
+        assert_eq!(observed.uid, "flags-uid");
+        let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
+        let patches: Vec<_> = calls
+            .iter()
+            .filter(|call| call.0 == Method::PATCH)
+            .collect();
+        assert_eq!(
+            patches.len(),
+            2,
+            "expected exactly the dry-run and real create PATCH"
+        );
+        for (method, query, body) in &patches {
+            let _ = method;
+            assert!(
+                query.contains("fieldManager=apsides-example"),
+                "handler-output resources are still owned by the reconciler's own field manager, query={query}"
+            );
+            assert!(
+                !query.contains("apsides-handler"),
+                "the reconciler's own apply must never use the handler field manager, query={query}"
+            );
+            assert!(
+                body.get("data").is_none(),
+                "the reconciler's own SSA of a handler output must never claim data, body={body}"
+            );
         }
         Ok(())
     }
@@ -2235,5 +3229,788 @@ mod tests {
             3
         );
         Ok(())
+    }
+
+    /// Phase 5b review items 1 and E: `commit_handler_outputs` is the fix
+    /// for "the SSA writes delete each other" (each declared output gets
+    /// exactly one server-side apply, carrying its complete `data` map),
+    /// and it must go through the exact same authority/claim re-check
+    /// (`apply_existing_claimed`) reconciler mutations use.
+    mod handler_commit {
+        use super::*;
+
+        fn handler_plan() -> TestResult<CompiledPlan> {
+            Ok(parse_and_validate(&json!({
+                "schemaVersion":"apsides.dev/ir/v2", "testOnly":false,
+                "domain":{"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound","minKubernetesVersion":"1.34","budgets":{"maxResources":8,"maxInputs":8,"maxReactions":8,"maxObjectBytes":262_144,"maxQueueDepth":8,"maxConcurrentRequests":2}},
+                "resources":[{
+                    "id":"flags","apiVersion":"v1","kind":"ConfigMap","name":"flags","namespace":"workload",
+                    "handlerOutput":true,
+                    "desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"flags","namespace":"workload","labels":{"apsides.dev/handler-output":"flags"}}},
+                    "lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"program.ts","line":1,"column":1}
+                }],
+                "inputs":[
+                    {"id":"settings","apiVersion":"v1","kind":"ConfigMap","name":"settings","namespace":"workload","mode":"observed","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}},
+                    {"id":"flags","apiVersion":"v1","kind":"ConfigMap","name":"flags","namespace":"workload","mode":"output","managedResourceId":"flags","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}}
+                ],
+                "reactions":[],
+                "handlers":[{
+                    "id":"sync-flags","module":"handlers/sync-flags.ts","export":"syncFlags",
+                    "trigger":{"kind":"input-changed","input":"settings"},
+                    "inputs":["settings"],"egress":[],"outputs":["flags"],
+                    "timeoutMillis":5_000,"maxHeapBytes":8_388_608,
+                    "bundleSha256": "0".repeat(64),"source":{"file":"program.ts","line":1,"column":1}
+                }],
+                "outputs":[{"id":"flags","name":"flags","namespace":"workload"}],
+                "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.ts","sha256":"0".repeat(64)},{"path":"handlers/sync-flags.ts","sha256":"1".repeat(64)}]}
+            }).to_string())?)
+        }
+
+        /// Two declared outputs, `flags-a`/`flags-b`, on the same handler --
+        /// for the "untouched output keeps its own data" test.
+        fn handler_plan_two_outputs() -> TestResult<CompiledPlan> {
+            Ok(parse_and_validate(&json!({
+                "schemaVersion":"apsides.dev/ir/v2", "testOnly":false,
+                "domain":{"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound","minKubernetesVersion":"1.34","budgets":{"maxResources":8,"maxInputs":8,"maxReactions":8,"maxObjectBytes":262_144,"maxQueueDepth":8,"maxConcurrentRequests":2}},
+                "resources":[
+                    {"id":"flags-a","apiVersion":"v1","kind":"ConfigMap","name":"flags-a","namespace":"workload","handlerOutput":true,
+                     "desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"flags-a","namespace":"workload","labels":{"apsides.dev/handler-output":"flags-a"}}},
+                     "lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"program.ts","line":1,"column":1}},
+                    {"id":"flags-b","apiVersion":"v1","kind":"ConfigMap","name":"flags-b","namespace":"workload","handlerOutput":true,
+                     "desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"flags-b","namespace":"workload","labels":{"apsides.dev/handler-output":"flags-b"}}},
+                     "lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"program.ts","line":1,"column":1}}
+                ],
+                "inputs":[
+                    {"id":"settings","apiVersion":"v1","kind":"ConfigMap","name":"settings","namespace":"workload","mode":"observed","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}},
+                    {"id":"flags-a","apiVersion":"v1","kind":"ConfigMap","name":"flags-a","namespace":"workload","mode":"output","managedResourceId":"flags-a","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}},
+                    {"id":"flags-b","apiVersion":"v1","kind":"ConfigMap","name":"flags-b","namespace":"workload","mode":"output","managedResourceId":"flags-b","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}}
+                ],
+                "reactions":[],
+                "handlers":[{
+                    "id":"sync-flags","module":"handlers/sync-flags.ts","export":"syncFlags",
+                    "trigger":{"kind":"input-changed","input":"settings"},
+                    "inputs":["settings"],"egress":[],"outputs":["flags-a","flags-b"],
+                    "timeoutMillis":5_000,"maxHeapBytes":8_388_608,
+                    "bundleSha256": "0".repeat(64),"source":{"file":"program.ts","line":1,"column":1}
+                }],
+                "outputs":[{"id":"flags-a","name":"flags-a","namespace":"workload"},{"id":"flags-b","name":"flags-b","namespace":"workload"}],
+                "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.ts","sha256":"0".repeat(64)},{"path":"handlers/sync-flags.ts","sha256":"1".repeat(64)}]}
+            }).to_string())?)
+        }
+
+        fn handler_activation(
+            plan: &CompiledPlan,
+            policy: &PolicyState,
+            output_names: &[&str],
+        ) -> TestResult<ActivationState> {
+            let approved_claims = output_names
+                .iter()
+                .map(|name| ApprovedClaim {
+                    claim: ProtectedClaim {
+                        identity: ResourceIdentity {
+                            api_group: String::new(),
+                            resource: "configmaps".into(),
+                            namespace: "workload".into(),
+                            name: (*name).to_owned(),
+                        },
+                        domain_id: "example".into(),
+                        generation_id: "generation-a".into(),
+                        transition_id: "transition-a".into(),
+                        state: ClaimState::Active,
+                        uid: Some(format!("{name}-uid")),
+                    },
+                    deletion_policy: compiler_core::DeletionPolicy::Orphan,
+                    allow_create: false,
+                })
+                .collect();
+            Ok(ActivationState {
+                schema_version: SCHEMA_VERSION.into(),
+                binding: RuntimeBinding {
+                    domain_id: "example".into(),
+                    cluster_binding: "cluster-a".into(),
+                    generation_id: "generation-a".into(),
+                    build_digest: format!("sha256:{}", "a".repeat(64)),
+                    ir_digest: plan.ir_digest.clone(),
+                    policy_digest: digest(policy)?,
+                    capability_digest: digest(&plan.capabilities)?,
+                    service_account_name: "apsides-example-generation-a".into(),
+                    controller_image: format!(
+                        "example.invalid/controller@sha256:{}",
+                        "b".repeat(64)
+                    ),
+                    max_handler_heap_bytes: 8 * 1024 * 1024,
+                },
+                status: ActivationStatus::Active,
+                approved_claims,
+                rollout_key_id: None,
+            })
+        }
+
+        fn outputs_by_id(plan: &CompiledPlan) -> BTreeMap<String, compiler_core::Output> {
+            plan.ir
+                .outputs
+                .iter()
+                .map(|output| (output.id.clone(), output.clone()))
+                .collect()
+        }
+
+        /// The critical regression test for review item 1: a single SSA per
+        /// output carries the handler's *complete* written data map plus
+        /// the revision annotation, not a series of field-clobbering
+        /// partial writes.
+        #[tokio::test]
+        async fn commit_writes_the_complete_data_map_and_annotation_in_one_apply() -> TestResult {
+            let plan = handler_plan()?;
+            let policy = policy(&plan);
+            let activation = handler_activation(&plan, &policy, &["flags"])?;
+            let existing_flags = json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"flags","namespace":"workload","uid":"flags-uid","resourceVersion":"5"},
+                "data":{},
+            });
+            let projected_flags = json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"flags","namespace":"workload","uid":"flags-uid","resourceVersion":"5"},
+                "data":{"value":"on"},
+            });
+            let applied_flags = json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"flags","namespace":"workload","uid":"flags-uid","resourceVersion":"6",
+                    "annotations":{"apsides.dev/handler-input-revision":"rev-1"},
+                    "managedFields":[{"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:data":{},"f:metadata":{"f:annotations":{}}},"manager":"apsides-handler-example","operation":"Apply"}]},
+                "data":{"value":"on","other":"kept"},
+            });
+            let responses = vec![
+                existing_flags,
+                control_object(
+                    "apsides-activation-example",
+                    &activation,
+                    "activation-uid",
+                    "20",
+                )?,
+                control_object("apsides-policy-example", &policy, "policy-uid", "19")?,
+                projected_flags,
+                control_object(
+                    "apsides-activation-example",
+                    &activation,
+                    "activation-uid",
+                    "20",
+                )?,
+                control_object("apsides-policy-example", &policy, "policy-uid", "19")?,
+                applied_flags,
+            ];
+            let (client, calls) = wire(responses);
+            let controller = controller(&plan, &activation, client)?;
+            let mut written: crate::handlers::BufferedWrites = BTreeMap::new();
+            written.insert(
+                "flags".to_owned(),
+                BTreeMap::from([("value".to_owned(), "on".to_owned())]),
+            );
+            let output_uids = BTreeMap::from([("flags".to_owned(), "flags-uid".to_owned())]);
+            let committed = commit_handler_outputs(
+                &controller,
+                &["flags".to_owned()],
+                &outputs_by_id(&plan),
+                "apsides-handler-example",
+                &written,
+                "rev-1",
+                &output_uids,
+            )
+            .await?;
+            assert_eq!(
+                committed.get("flags").map(String::as_str),
+                Some("flags-uid")
+            );
+
+            let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
+            assert_eq!(calls.len(), 7);
+            let real_patch = calls
+                .iter()
+                .rev()
+                .find(|(method, uri, _)| *method == Method::PATCH && !uri.contains("dryRun"))
+                .ok_or("expected exactly one real (non-dry-run) PATCH")?;
+            assert_eq!(
+                real_patch.2.pointer("/data/value").and_then(Value::as_str),
+                Some("on"),
+                "the real SSA must carry the written key"
+            );
+            let annotations = real_patch
+                .2
+                .get("metadata")
+                .and_then(|metadata| metadata.get("annotations"))
+                .ok_or("expected annotations on the real SSA payload")?;
+            assert_eq!(
+                annotations
+                    .get(crate::handlers::HANDLER_INPUT_REVISION_ANNOTATION)
+                    .and_then(Value::as_str),
+                Some("rev-1"),
+                "the real SSA must carry the revision annotation alongside the data"
+            );
+            // Exactly one real PATCH is sent for this one output -- not one
+            // per key plus a separate stamp (the bug this test guards
+            // against: separate SSAs under the same field manager delete
+            // each other's fields).
+            let real_patch_count = calls
+                .iter()
+                .filter(|(method, uri, _)| *method == Method::PATCH && !uri.contains("dryRun"))
+                .count();
+            assert_eq!(real_patch_count, 1);
+            Ok(())
+        }
+
+        /// The BLOCKING uid-binding regression test (Phase 5b
+        /// runtime-integration re-review): if the live object's uid no
+        /// longer matches the uid this cycle's own reconciler apply
+        /// observed for it (bound via `output_uids`), the commit MUST
+        /// refuse with `handler-output-replaced` and MUST NOT issue any
+        /// PATCH -- proving the uid precondition is checked against an
+        /// externally-bound value, never re-derived from the very GET
+        /// it's supposed to guard.
+        #[tokio::test]
+        async fn commit_refuses_an_output_replaced_since_the_reconciler_observed_it() -> TestResult
+        {
+            let plan = handler_plan()?;
+            let policy = policy(&plan);
+            let activation = handler_activation(&plan, &policy, &["flags"])?;
+            // The live object now has a different uid than the reconciler's
+            // own apply observed earlier this cycle -- as if it was deleted
+            // and recreated under the same name while the handler ran.
+            let existing_flags = json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"flags","namespace":"workload","uid":"flags-uid-replaced","resourceVersion":"1"},
+                "data":{},
+            });
+            let (client, calls) = wire(vec![existing_flags]);
+            let controller = controller(&plan, &activation, client)?;
+            let mut written: crate::handlers::BufferedWrites = BTreeMap::new();
+            written.insert(
+                "flags".to_owned(),
+                BTreeMap::from([("value".to_owned(), "on".to_owned())]),
+            );
+            let output_uids = BTreeMap::from([("flags".to_owned(), "flags-uid".to_owned())]);
+            let outcome = commit_handler_outputs(
+                &controller,
+                &["flags".to_owned()],
+                &outputs_by_id(&plan),
+                "apsides-handler-example",
+                &written,
+                "rev-1",
+                &output_uids,
+            )
+            .await;
+            let Err(error) = outcome else {
+                return Err("a replaced output must refuse the commit".into());
+            };
+            assert!(
+                error.to_string().contains("handler-output-replaced"),
+                "unexpected error: {error}"
+            );
+            let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
+            assert!(
+                calls.iter().all(|(method, _, _)| *method != Method::PATCH),
+                "a replaced output must never be written to"
+            );
+            Ok(())
+        }
+
+        /// One `authority.verify()` round-trip's worth of wire responses
+        /// (activation, then policy) -- `commit_handler_outputs`/
+        /// `apply_existing_claimed` each call `verify()` once, so this
+        /// appears twice per committed output.
+        fn verify_responses(
+            activation: &ActivationState,
+            policy: &PolicyState,
+        ) -> TestResult<Vec<Value>> {
+            Ok(vec![
+                control_object(
+                    "apsides-activation-example",
+                    activation,
+                    "activation-uid",
+                    "20",
+                )?,
+                control_object("apsides-policy-example", policy, "policy-uid", "19")?,
+            ])
+        }
+
+        /// Review item 1's recommended contract: an output the handler did
+        /// *not* write this invocation is still stamped with the revision
+        /// annotation, but its existing live `data` is carried forward
+        /// unchanged in that same SSA -- never dropped.
+        #[tokio::test]
+        async fn commit_preserves_untouched_output_data_when_stamping() -> TestResult {
+            let plan = handler_plan_two_outputs()?;
+            let policy = policy(&plan);
+            let activation = handler_activation(&plan, &policy, &["flags-a", "flags-b"])?;
+            let existing_a = json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"flags-a","namespace":"workload","uid":"flags-a-uid","resourceVersion":"5"},
+                "data":{},
+            });
+            let projected_a = existing_a.clone();
+            let applied_a = json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"flags-a","namespace":"workload","uid":"flags-a-uid","resourceVersion":"6",
+                    "annotations":{"apsides.dev/handler-input-revision":"rev-1"},
+                    "managedFields":[{"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:data":{},"f:metadata":{"f:annotations":{}}},"manager":"apsides-handler-example","operation":"Apply"}]},
+                "data":{"value":"written"},
+            });
+            let existing_b = json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"flags-b","namespace":"workload","uid":"flags-b-uid","resourceVersion":"9",
+                    "annotations":{"apsides.dev/handler-input-revision":"rev-0"},
+                    "managedFields":[{"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:data":{"f:previous":{}},"f:metadata":{"f:annotations":{}}},"manager":"apsides-handler-example","operation":"Apply"}]},
+                "data":{"previous":"kept-value"},
+            });
+            // The dry-run projection reflects the new revision annotation
+            // ("rev-1") even though `data` is unchanged, so the commit
+            // cannot early-exit on "nothing changed" here -- it still owes
+            // flags-b a real PATCH to stamp the new revision.
+            let projected_b = json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"flags-b","namespace":"workload","uid":"flags-b-uid","resourceVersion":"9",
+                    "annotations":{"apsides.dev/handler-input-revision":"rev-1"},
+                    "managedFields":[{"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:data":{"f:previous":{}},"f:metadata":{"f:annotations":{}}},"manager":"apsides-handler-example","operation":"Apply"}]},
+                "data":{"previous":"kept-value"},
+            });
+            let applied_b = json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"flags-b","namespace":"workload","uid":"flags-b-uid","resourceVersion":"10",
+                    "annotations":{"apsides.dev/handler-input-revision":"rev-1"},
+                    "managedFields":[{"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:data":{},"f:metadata":{"f:annotations":{}}},"manager":"apsides-handler-example","operation":"Apply"}]},
+                "data":{"previous":"kept-value"},
+            });
+            let mut responses = vec![existing_a];
+            responses.extend(verify_responses(&activation, &policy)?);
+            responses.push(projected_a);
+            responses.extend(verify_responses(&activation, &policy)?);
+            responses.push(applied_a);
+            responses.push(existing_b);
+            responses.extend(verify_responses(&activation, &policy)?);
+            responses.push(projected_b);
+            responses.extend(verify_responses(&activation, &policy)?);
+            responses.push(applied_b);
+            let (client, calls) = wire(responses);
+            let controller = controller(&plan, &activation, client)?;
+            let mut written: crate::handlers::BufferedWrites = BTreeMap::new();
+            written.insert(
+                "flags-a".to_owned(),
+                BTreeMap::from([("value".to_owned(), "written".to_owned())]),
+            );
+            // "flags-b" is declared but deliberately absent from `written`.
+            let output_uids = BTreeMap::from([
+                ("flags-a".to_owned(), "flags-a-uid".to_owned()),
+                ("flags-b".to_owned(), "flags-b-uid".to_owned()),
+            ]);
+            let committed = commit_handler_outputs(
+                &controller,
+                &["flags-a".to_owned(), "flags-b".to_owned()],
+                &outputs_by_id(&plan),
+                "apsides-handler-example",
+                &written,
+                "rev-1",
+                &output_uids,
+            )
+            .await?;
+            assert_eq!(committed.len(), 2);
+
+            let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
+            let flags_b_real_patch = calls
+                .iter()
+                .rev()
+                .filter(|(method, uri, _)| *method == Method::PATCH && !uri.contains("dryRun"))
+                .find(|(_, uri, _)| uri.contains("flags-b"))
+                .ok_or("expected a real PATCH for flags-b")?;
+            assert_eq!(
+                flags_b_real_patch
+                    .2
+                    .pointer("/data/previous")
+                    .and_then(Value::as_str),
+                Some("kept-value"),
+                "an output the handler did not write must keep its existing data, not lose it"
+            );
+            let annotations = flags_b_real_patch
+                .2
+                .get("metadata")
+                .and_then(|metadata| metadata.get("annotations"))
+                .ok_or("expected annotations on flags-b's real SSA payload")?;
+            assert_eq!(
+                annotations
+                    .get(crate::handlers::HANDLER_INPUT_REVISION_ANNOTATION)
+                    .and_then(Value::as_str),
+                Some("rev-1"),
+                "flags-b must still be stamped with the revision even though it was not written"
+            );
+            Ok(())
+        }
+
+        /// Full-pipeline regression test for a CI-only acceptance failure
+        /// (`handlers::
+        /// a_handler_commits_exactly_its_owned_keys_and_seeds_across_a_restart`,
+        /// assertion 1: `Deadline("the output to reflect {a,b}")`, the output
+        /// carrying its revision annotation but no data keys). Drives
+        /// `HandlerRuntime::run_cycle` -- the exact `detect_triggers` ->
+        /// `dispatch_ready` -> `invoke` -> `commit_handler_outputs` path
+        /// `reconcile()` itself uses -- with a realistic observed snapshot and
+        /// the REAL `handlers/derive-keys.ts` bundle (the same bytes as
+        /// `handlers::tests::derive_keys_real_bundle`, which isolates the
+        /// event-construction/engine half of this same question; this test
+        /// isolates everything downstream of it instead: `HandlerRuntime`'s
+        /// queueing, `commit_handler_outputs`'s uid binding and untouched-key
+        /// handling, and the real SSA request this crate builds from the
+        /// sink's buffered writes), and inspects the actual wire PATCH body
+        /// `commit_handler_outputs` sends.
+        mod handler_full_cycle_real_bundle {
+            use super::*;
+
+            /// See `handlers::tests::derive_keys_real_bundle::DERIVE_KEYS_BUNDLE`
+            /// for how this was captured.
+            const DERIVE_KEYS_BUNDLE: &str = r#"
+//#region apsides:/source/handlers/derive-keys.ts
+async function deriveKeys(event) {
+	const data = event.inputs["handler-source"]?.data ?? {};
+	const keys = Object.keys(data).sort();
+	for (const key of keys) {
+		apsides.writeOutput("handler-derived", key, data[key] ?? "");
+	}
+	return { keys };
+}
+
+//#endregion
+export { deriveKeys };
+"#;
+            const HANDLERS: &[(&str, &str)] = &[("derive-keys", DERIVE_KEYS_BUNDLE)];
+
+            fn real_plan() -> TestResult<CompiledPlan> {
+                Ok(parse_and_validate(&json!({
+                "schemaVersion":"apsides.dev/ir/v2", "testOnly":false,
+                "domain":{"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound","minKubernetesVersion":"1.34","budgets":{"maxResources":8,"maxInputs":8,"maxReactions":8,"maxObjectBytes":262_144,"maxQueueDepth":8,"maxConcurrentRequests":2}},
+                "resources":[{
+                    "id":"handler-derived","apiVersion":"v1","kind":"ConfigMap","name":"handler-derived","namespace":"workload",
+                    "handlerOutput":true,
+                    "desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"handler-derived","namespace":"workload","labels":{"apsides.dev/handler-output":"handler-derived"}}},
+                    "lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"program.tsx","line":1,"column":1}
+                }],
+                "inputs":[
+                    {"id":"handler-source","apiVersion":"v1","kind":"ConfigMap","name":"handler-source","namespace":"workload","mode":"observed","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.tsx","line":1,"column":1}},
+                    {"id":"handler-derived","apiVersion":"v1","kind":"ConfigMap","name":"handler-derived","namespace":"workload","mode":"output","managedResourceId":"handler-derived","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.tsx","line":1,"column":1}}
+                ],
+                "reactions":[],
+                "handlers":[{
+                    "id":"derive-keys","module":"handlers/derive-keys.ts","export":"deriveKeys",
+                    "trigger":{"kind":"input-changed","input":"handler-source"},
+                    "inputs":["handler-source"],"egress":[],"outputs":["handler-derived"],
+                    "timeoutMillis":5_000,"maxHeapBytes":8_388_608,
+                    "bundleSha256": "0".repeat(64),"source":{"file":"program.tsx","line":1,"column":1}
+                }],
+                "outputs":[{"id":"handler-derived","name":"handler-derived","namespace":"workload"}],
+                "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.tsx","sha256":"0".repeat(64)},{"path":"handlers/derive-keys.ts","sha256":"1".repeat(64)}]}
+            }).to_string())?)
+            }
+
+            /// `existing` (before any handler commit), `projected` (the dry-run
+            /// response) and `applied` (the real commit response) for
+            /// `handler-derived`, plus the two `authority.verify()` round-trips
+            /// `commit_handler_outputs`/`apply_existing_claimed` each need --
+            /// see `run_cycle_commits_the_real_bundles_written_keys`.
+            fn commit_wire_responses(
+                activation: &ActivationState,
+                policy: &PolicyState,
+            ) -> TestResult<Vec<Value>> {
+                let existing = json!({
+                    "apiVersion":"v1","kind":"ConfigMap",
+                    "metadata":{"name":"handler-derived","namespace":"workload","uid":"handler-derived-uid","resourceVersion":"5",
+                        "labels":{"apsides.dev/handler-output":"handler-derived"},
+                        "managedFields":[{"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:metadata":{"f:labels":{}}},"manager":"apsides-example","operation":"Apply"}]},
+                    "data":{},
+                });
+                let projected = json!({
+                    "apiVersion":"v1","kind":"ConfigMap",
+                    "metadata":{"name":"handler-derived","namespace":"workload","uid":"handler-derived-uid","resourceVersion":"5",
+                        "labels":{"apsides.dev/handler-output":"handler-derived"},
+                        "annotations":{"apsides.dev/handler-input-revision":"placeholder"}},
+                    "data":{"a":"1","b":"2"},
+                });
+                let applied = json!({
+                    "apiVersion":"v1","kind":"ConfigMap",
+                    "metadata":{"name":"handler-derived","namespace":"workload","uid":"handler-derived-uid","resourceVersion":"6",
+                        "labels":{"apsides.dev/handler-output":"handler-derived"},
+                        "annotations":{"apsides.dev/handler-input-revision":"placeholder"},
+                        "managedFields":[
+                            {"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:metadata":{"f:labels":{}}},"manager":"apsides-example","operation":"Apply"},
+                            {"apiVersion":"v1","fieldsType":"FieldsV1","fieldsV1":{"f:data":{},"f:metadata":{"f:annotations":{}}},"manager":"apsides-handler-example","operation":"Apply"}
+                        ]},
+                    "data":{"a":"1","b":"2"},
+                });
+                Ok(vec![
+                    existing,
+                    control_object(
+                        "apsides-activation-example",
+                        activation,
+                        "activation-uid",
+                        "20",
+                    )?,
+                    control_object("apsides-policy-example", policy, "policy-uid", "19")?,
+                    projected,
+                    control_object(
+                        "apsides-activation-example",
+                        activation,
+                        "activation-uid",
+                        "20",
+                    )?,
+                    control_object("apsides-policy-example", policy, "policy-uid", "19")?,
+                    applied,
+                ])
+            }
+
+            #[tokio::test]
+            async fn run_cycle_commits_the_real_bundles_written_keys() -> TestResult {
+                let plan = real_plan()?;
+                let policy = policy(&plan);
+                let activation = handler_activation(&plan, &policy, &["handler-derived"])?;
+                let (client, calls) = wire(commit_wire_responses(&activation, &policy)?);
+                let controller = controller(&plan, &activation, client)?;
+                let (unused_client, _unused_calls) = wire(vec![]);
+
+                let mut handler_runtime = crate::handlers::HandlerRuntime::new(
+                    &plan,
+                    HANDLERS,
+                    "apsides-handler-example".into(),
+                    Duration::from_millis(1),
+                    Duration::from_millis(10),
+                    None,
+                )?;
+
+                let mut observations = BTreeMap::new();
+                observations.insert(
+                    "handler-source".to_owned(),
+                    Observation::Available {
+                        data: BTreeMap::from([
+                            ("a".to_owned(), "1".to_owned()),
+                            ("b".to_owned(), "2".to_owned()),
+                        ]),
+                        resource_version: "1".into(),
+                    },
+                );
+                let applied_set = BTreeSet::from(["handler-derived".to_owned()]);
+                let output_uids = BTreeMap::from([(
+                    "handler-derived".to_owned(),
+                    "handler-derived-uid".to_owned(),
+                )]);
+
+                let conditions = handler_runtime
+                    .run_cycle(
+                        &plan,
+                        &observations,
+                        &applied_set,
+                        &output_uids,
+                        &unused_client,
+                        &controller,
+                    )
+                    .await?;
+                assert!(
+                    conditions.is_empty(),
+                    "the handler invocation must succeed with no conditions: {conditions:?}"
+                );
+
+                let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
+                let real_patch = calls
+                    .iter()
+                    .rev()
+                    .find(|(method, uri, _)| *method == Method::PATCH && !uri.contains("dryRun"))
+                    .ok_or("expected exactly one real (non-dry-run) PATCH")?;
+                assert_eq!(
+                    real_patch.2.get("data"),
+                    Some(&json!({"a": "1", "b": "2"})),
+                    "the real SSA the runtime sends for handler-derived must carry both keys the \
+                 real bundle wrote -- this is the exact request body a CI-only failure showed \
+                 empty"
+                );
+                Ok(())
+            }
+
+            /// Handler chaining through the whole `run_cycle` path:
+            /// `consume` reads `derive-keys`' output. In the first cycle
+            /// both are queued; `consume` is held with
+            /// `handler-upstream-pending` (its upstream is queued at the
+            /// start of the cycle) and `derive-keys` runs and commits. In
+            /// the second cycle the upstream's output agrees with its
+            /// current revision, so `consume` -- re-coalesced onto the
+            /// committed data -- is dispatched.
+            mod handler_chain_dispatch {
+                use super::*;
+
+                const CONSUME_BUNDLE: &str = r"
+async function consume(event) {
+	return { keys: Object.keys(event.inputs['handler-derived'].data) };
+}
+export { consume };
+";
+                const CHAIN_HANDLERS: &[(&str, &str)] = &[
+                    ("consume", CONSUME_BUNDLE),
+                    ("derive-keys", DERIVE_KEYS_BUNDLE),
+                ];
+
+                fn chain_plan() -> TestResult<CompiledPlan> {
+                    let mut ir: Value =
+                        serde_json::from_str(&serde_json::to_string(&real_plan()?.ir)?)?;
+                    let source = json!({"file":"program.tsx","line":1,"column":1});
+                    ir["handlers"].as_array_mut().ok_or("handlers")?.insert(
+                        0,
+                        json!({
+                            "id":"consume","module":"handlers/consume.ts","export":"consume",
+                            "trigger":{"kind":"input-changed","input":"handler-derived"},
+                            "inputs":["handler-derived"],"egress":[],"outputs":[],
+                            "timeoutMillis":5_000,"maxHeapBytes":8_388_608,
+                            "bundleSha256":"0".repeat(64),"source":source,
+                        }),
+                    );
+                    ir["provenance"]["inputs"]
+                        .as_array_mut()
+                        .ok_or("provenance")?
+                        .insert(
+                            0,
+                            json!({"path":"handlers/consume.ts","sha256":"2".repeat(64)}),
+                        );
+                    Ok(parse_and_validate(&ir.to_string())?)
+                }
+
+                fn derived_observation(data: &[(&str, &str)]) -> Observation {
+                    Observation::Available {
+                        data: data
+                            .iter()
+                            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                            .collect(),
+                        resource_version: "1".into(),
+                    }
+                }
+
+                fn status(
+                    runtime: &crate::handlers::HandlerRuntime,
+                    id: &str,
+                ) -> TestResult<(Option<u64>, usize)> {
+                    let status = runtime
+                        .statuses()
+                        .into_iter()
+                        .find(|status| status.id == id)
+                        .ok_or("handler status must exist")?;
+                    Ok((status.last_run_millis_ago, status.queue_depth))
+                }
+
+                /// The revision the upstream's real (non-dry-run) commit
+                /// PATCH stamped onto its output.
+                fn committed_revision(calls: &Calls) -> TestResult<String> {
+                    let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
+                    let real_patch = calls
+                        .iter()
+                        .rev()
+                        .find(|(method, uri, _)| {
+                            *method == Method::PATCH && !uri.contains("dryRun")
+                        })
+                        .ok_or("expected the upstream's real commit PATCH")?;
+                    Ok(real_patch.2["metadata"]["annotations"]
+                        [crate::handlers::HANDLER_INPUT_REVISION_ANNOTATION]
+                        .as_str()
+                        .ok_or("the commit stamps the upstream's revision")?
+                        .to_owned())
+                }
+
+                /// The upstream's committed output as `outputs_still_agree`
+                /// re-reads it: same uid, stamped with `revision`.
+                fn agreeing_output(revision: &str) -> Value {
+                    json!({
+                        "apiVersion":"v1","kind":"ConfigMap",
+                        "metadata":{"name":"handler-derived","namespace":"workload","uid":"handler-derived-uid","resourceVersion":"6",
+                            "annotations":{crate::handlers::HANDLER_INPUT_REVISION_ANNOTATION: revision}},
+                        "data":{"a":"1","b":"2"},
+                    })
+                }
+
+                #[tokio::test]
+                async fn a_downstream_handler_waits_for_its_settled_upstream() -> TestResult {
+                    let plan = chain_plan()?;
+                    let policy = policy(&plan);
+                    let activation = handler_activation(&plan, &policy, &["handler-derived"])?;
+                    let (client, calls) = wire(commit_wire_responses(&activation, &policy)?);
+                    let controller = controller(&plan, &activation, client)?;
+                    let mut handler_runtime = crate::handlers::HandlerRuntime::new(
+                        &plan,
+                        CHAIN_HANDLERS,
+                        "apsides-handler-example".into(),
+                        Duration::from_millis(1),
+                        Duration::from_millis(10),
+                        None,
+                    )?;
+                    let applied_set = BTreeSet::from(["handler-derived".to_owned()]);
+                    let output_uids = BTreeMap::from([(
+                        "handler-derived".to_owned(),
+                        "handler-derived-uid".to_owned(),
+                    )]);
+                    let mut observations = BTreeMap::from([
+                        (
+                            "handler-source".to_owned(),
+                            derived_observation(&[("a", "1"), ("b", "2")]),
+                        ),
+                        ("handler-derived".to_owned(), derived_observation(&[])),
+                    ]);
+
+                    let (unused_client, _unused_calls) = wire(vec![]);
+                    let conditions = handler_runtime
+                        .run_cycle(
+                            &plan,
+                            &observations,
+                            &applied_set,
+                            &output_uids,
+                            &unused_client,
+                            &controller,
+                        )
+                        .await?;
+                    assert_eq!(
+                        conditions,
+                        [RuntimeCondition {
+                            reason_code: "handler-upstream-pending".into(),
+                            resource_name: Some("consume".into()),
+                        }],
+                        "only the downstream is held, while its upstream runs"
+                    );
+                    assert_eq!(
+                        status(&handler_runtime, "consume")?,
+                        (None, 1),
+                        "held, still queued, never run"
+                    );
+                    assert!(
+                        status(&handler_runtime, "derive-keys")?.0.is_some(),
+                        "the upstream ran"
+                    );
+
+                    observations.insert(
+                        "handler-derived".to_owned(),
+                        derived_observation(&[("a", "1"), ("b", "2")]),
+                    );
+                    let (agree_client, _agree_calls) =
+                        wire(vec![agreeing_output(&committed_revision(&calls)?)]);
+                    let conditions = handler_runtime
+                        .run_cycle(
+                            &plan,
+                            &observations,
+                            &applied_set,
+                            &output_uids,
+                            &agree_client,
+                            &controller,
+                        )
+                        .await?;
+                    assert!(
+                        conditions.is_empty(),
+                        "the downstream runs cleanly: {conditions:?}"
+                    );
+                    let (last_run, queue_depth) = status(&handler_runtime, "consume")?;
+                    assert!(
+                        last_run.is_some(),
+                        "the downstream ran once its upstream settled"
+                    );
+                    assert_eq!(queue_depth, 0);
+                    Ok(())
+                }
+            }
+        }
     }
 }

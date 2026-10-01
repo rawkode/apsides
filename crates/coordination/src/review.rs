@@ -15,7 +15,7 @@ mod types;
 mod validation;
 pub use types::*;
 
-pub const REVIEW_METADATA_SCHEMA: &str = "apsides.dev/review-metadata/v1";
+pub const REVIEW_METADATA_SCHEMA: &str = "apsides.dev/review-metadata/v3";
 pub const MAX_REVIEW_METADATA_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_REVIEW_SOURCE_ELEMENTS: usize = 100_000;
 pub const MAX_REVIEW_DECLARATIONS: usize = 256;
@@ -180,10 +180,23 @@ pub enum ReviewSchemaMinor {
     #[serde(rename = "1.36")]
     V136,
 }
+/// The exact server version the absent-only conditional SSA create contract
+/// (`apply_absent_with_list_version`) is qualified against.
+///
+/// This is independent of a domain's own declared `minKubernetesVersion`
+/// floor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ReviewQualifiedServer {
     #[serde(rename = "v1.34.3")]
     V1343,
+}
+/// A domain's declared minimum Kubernetes version alongside the exact
+/// server version the create-precondition mechanism is qualified against.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewKubernetesVersion {
+    pub min_version: String,
+    pub qualified_on: ReviewQualifiedServer,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewFieldValidation {
@@ -204,7 +217,7 @@ pub struct ReviewCompatibility {
     pub required_cleanup_apis: Vec<ReviewApiRequirement>,
     pub required_deployment_apis: Vec<ReviewApiRequirement>,
     pub deployment_api_scope: ReviewDeploymentScope,
-    pub qualified_create_precondition_servers: Vec<ReviewQualifiedServer>,
+    pub kubernetes_version: ReviewKubernetesVersion,
     pub field_validation: ReviewFieldValidation,
     pub transition_plan_schema: ReviewTransitionSchema,
     pub runtime_replicas: u8,
@@ -232,14 +245,25 @@ pub struct ReviewEnforcement {
 
 /// This transition's planned declaration and policy metadata, not execution evidence.
 /// Desired values, source bodies, private-value hashes and build commitments are excluded.
+///
+/// `surface_digest` and the `handlers`/`egress`/`outputs` catalogs bind this
+/// review to the exact `surface.json` a deploy will independently recompute
+/// and require to match (see `compiler_core::surface::derive_surface`):
+/// a reviewer sees exactly which egress hosts, handlers, outputs, secrets and
+/// permissions they are approving, and a later surface change is detected as
+/// a metadata mismatch rather than silently deployed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ReviewMetadataV1 {
+pub struct ReviewMetadata {
     pub schema_version: String,
     pub scope: ReviewScope,
+    pub surface_digest: String,
     pub resources: Vec<ReviewResource>,
     pub inputs: Vec<ReviewInput>,
     pub reactions: Vec<ReviewReaction>,
+    pub handlers: Vec<ReviewHandler>,
+    pub egress: Vec<ReviewEgress>,
+    pub outputs: Vec<ReviewOutput>,
     pub runtime_permissions: Vec<ReviewCapability>,
     pub cleanup_permissions: Vec<ReviewCapability>,
     pub deployment_permissions: ReviewDeploymentPermissions,
@@ -276,7 +300,7 @@ impl ReviewRef {
         Ok(())
     }
 }
-impl ReviewMetadataV1 {
+impl ReviewMetadata {
     /// Validate canonical, bounded, internally coherent metadata. Publication must
     /// separately compare this body to the trusted complete platform projection.
     /// # Errors

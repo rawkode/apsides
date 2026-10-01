@@ -1,18 +1,26 @@
 #![forbid(unsafe_code)]
 //! Native execution of the finite Apsides IR.
 //!
-//! This crate deliberately has no JavaScript engine. Production execution uses
-//! a fixed in-cluster identity and protected platform activation; fixture
-//! execution remains a separately acknowledged disposable-cluster mode.
+//! Production execution uses a fixed in-cluster identity and protected
+//! platform activation, and runs the program's declared event handlers from
+//! their embedded, locked bundles through the `engine` crate's sandboxed V8
+//! isolate (see `handlers.rs`); the engine, and its one unsafe call site,
+//! stay outside this crate. Fixture execution remains a separately
+//! acknowledged disposable-cluster mode: it verifies the embedded handler
+//! bundles against the validated IR but never executes them.
 
+mod handlers;
+mod kube_connector;
 mod production;
+mod startup;
 
 pub use production::{ApiAccess, ProductionConfig};
+pub use startup::start;
 
 use std::io::Write as _;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    fs,
     io::Read,
     net::IpAddr,
     path::{Path, PathBuf},
@@ -22,7 +30,7 @@ use std::{
 use async_trait::async_trait;
 use compiler_core::{
     BlockReason, CompiledPlan, Input, InputMode, InputSnapshot, REVISION_ANNOTATION, Resource,
-    RolloutKey, RolloutOutcome, evaluate_rollout, parse_and_validate,
+    RolloutKey, RolloutOutcome, evaluate_rollout,
 };
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use kube::{
@@ -35,6 +43,7 @@ use kube::{
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const CONFIG_PATH_ENV: &str = "APSIDES_RUNTIME_CONFIG_PATH";
@@ -58,6 +67,34 @@ pub enum RuntimeError {
     Platform(#[from] platform::Error),
 }
 
+/// The controller's effective filesystem-lockdown state.
+///
+/// Set at the end of `startup::start`'s synchronous startup phase (see the
+/// Apsides v0.3 plan, Phase 5c). `NoneFixture` is reachable only when
+/// Landlock was not enforced by the running kernel *and* the fixture-only
+/// `allowNoLandlock` escape hatch was set -- `start` fails closed before
+/// ever reaching `run_locked` for every other case, including every
+/// production-mode startup where the kernel enforces nothing at all, so a
+/// production `ProductionController` can only ever report `Landlock` or
+/// `LandlockPartial`, never `NoneFixture`. `LandlockPartial` reports
+/// `engine::LockdownOutcome::PartiallyEnforced` distinctly rather than
+/// folding it into `Landlock` -- real enforcement on a best-effort basis
+/// (ABI V7, which every kernel older than Linux 7.1 reports as its
+/// effective ABI, lacks only `ResolveUnix` of the rights this crate
+/// requests -- so `LandlockPartial` is the normal state on most kernels in
+/// the wild today, not an old-ABI edge case), not a fail-closed condition,
+/// but worth surfacing rather than silently reporting as full enforcement.
+/// Serializes to
+/// exactly the lowercase, hyphenated values the plan names for `/status`:
+/// `"landlock"`, `"landlock-partial"`, and `"none-fixture"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LockdownState {
+    Landlock,
+    LandlockPartial,
+    NoneFixture,
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
 enum StartupConfig {
@@ -77,6 +114,13 @@ pub struct FixtureConfig {
     pub max_watch_cycles: usize,
     #[serde(default)]
     pub rollout_key: Option<FixtureRolloutKey>,
+    /// Accepts an unenforced Landlock lockdown (see `startup::start`)
+    /// instead of failing closed. Defaults to `false`. Structurally only
+    /// ever reachable in fixture mode: `ProductionConfig` has no such
+    /// field, and `StartupConfig`'s `deny_unknown_fields` rejects it there
+    /// -- see the Apsides v0.3 plan, Phase 5c.
+    #[serde(default)]
+    pub allow_no_landlock: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -126,36 +170,47 @@ pub trait RuntimeClient: Send + Sync {
     ) -> Result<(), RuntimeError>;
 }
 
-/// Entrypoint used by generated native controllers.
+/// Runs the finite plan once startup has already read every file it needs
+/// (see `startup::start`, the crate's real entrypoint) and Landlock
+/// lockdown is already in effect on this thread and every thread the tokio
+/// runtime driving this call creates.
 ///
-/// The sole startup input is a path to an explicit mode document. Production
-/// accepts only an explicit in-cluster transport configuration. Fixture mode
-/// requires a dedicated absolute kubeconfig path.
+/// `handlers` is the `(id, bundle source)` pair for every declared event
+/// handler, embedded by the generated controller via `include_str!` next to
+/// its `ir.json`. In production mode these are wired into the `engine`
+/// crate's V8 isolate and actually run (see `handlers.rs` and the Apsides
+/// v0.3 plan, Phase 5b); fixture mode still only records that the embedded
+/// bundles match the validated IR (`verify_embedded_handlers`, above) and
+/// does not execute them.
 ///
 /// # Errors
 ///
-/// Returns an error for invalid IR or startup configuration, failed protected
+/// Returns an error for invalid startup configuration, failed protected
 /// activation, or a Kubernetes operation failure.
-pub async fn run(ir_json: &'static str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let plan = parse_and_validate(ir_json)?;
-    let path = env::var(CONFIG_PATH_ENV)
-        .map_err(|_| RuntimeError::Configuration(format!("{CONFIG_PATH_ENV} is required")))?;
-    let startup = read_startup(Path::new(&path))?;
-    match startup {
-        StartupConfig::Production(config) => {
-            production::run_production(&plan, config).await?;
-            Ok(())
+pub(crate) async fn run_locked(
+    plan: &CompiledPlan,
+    prepared: startup::PreparedStartup,
+    handlers: &'static [(&'static str, &'static str)],
+    lockdown: LockdownState,
+) -> Result<(), RuntimeError> {
+    match prepared {
+        startup::PreparedStartup::Production { config, files } => {
+            production::run_production(plan, config, *files, handlers, lockdown).await
         }
-        StartupConfig::Fixture(config) => {
-            validate_fixture_config(&plan, &config)?;
+        startup::PreparedStartup::Fixture {
+            config,
+            kubeconfig_bytes,
+        } => {
+            validate_fixture_config(plan, &config)?;
             install_rustls_provider()?;
-            let client = KubeRuntimeClient::from_fixture_config(
+            let client = KubeRuntimeClient::from_fixture_config_bytes(
+                &kubeconfig_bytes,
                 &config,
                 plan.ir.domain.budgets.max_concurrent_requests,
                 &plan.ir.domain.id,
             )
             .await?;
-            let report = run_fixture_with_client(&plan, &config, &client).await?;
+            let report = run_fixture_with_client(plan, &config, &client).await?;
             writeln!(
                 std::io::stdout().lock(),
                 "{}",
@@ -165,6 +220,49 @@ pub async fn run(ir_json: &'static str) -> Result<(), Box<dyn std::error::Error 
             Ok(())
         }
     }
+}
+
+/// Cross-check the embedded `(id, bundle source)` pairs against the
+/// validated IR's own declared handlers: no duplicate id, the id sets match
+/// exactly, and each bundle's actual sha256 matches the IR's own recorded
+/// `bundleSha256`. Cheap (one hash per handler, at most `MAX_HANDLERS` of
+/// them), and it makes the image self-checking: a build that embedded the
+/// wrong bundle, dropped one, or duplicated an id fails closed at startup
+/// instead of running mismatched handler code.
+pub(crate) fn verify_embedded_handlers(
+    plan: &CompiledPlan,
+    handlers: &[(&'static str, &'static str)],
+) -> Result<(), RuntimeError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for (id, source) in handlers {
+        if !seen.insert(*id) {
+            return Err(RuntimeError::Plan(format!(
+                "embedded handler bundles contain a duplicate id: {id}"
+            )));
+        }
+        let declared = plan
+            .ir
+            .handlers
+            .iter()
+            .find(|handler| handler.id == *id)
+            .ok_or_else(|| {
+                RuntimeError::Plan(format!(
+                    "embedded handler bundle {id} is not declared in the validated IR"
+                ))
+            })?;
+        let actual = format!("{:x}", Sha256::digest(source.as_bytes()));
+        if actual != declared.bundle_sha256 {
+            return Err(RuntimeError::Plan(format!(
+                "embedded handler bundle {id} does not match its declared bundleSha256"
+            )));
+        }
+    }
+    if seen.len() != plan.ir.handlers.len() {
+        return Err(RuntimeError::Plan(
+            "embedded handler bundles do not match the validated IR's declared handlers".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn install_rustls_provider() -> Result<(), RuntimeError> {
@@ -177,7 +275,7 @@ pub(crate) fn strict_apply_params(manager: &str, force: bool) -> PatchParams {
     if force { params.force() } else { params }
 }
 
-fn read_startup(path: &Path) -> Result<StartupConfig, RuntimeError> {
+pub(crate) fn read_startup(path: &Path) -> Result<StartupConfig, RuntimeError> {
     if !path.is_absolute() {
         return Err(RuntimeError::Configuration(
             "runtime config path must be absolute".into(),
@@ -191,7 +289,11 @@ fn read_startup(path: &Path) -> Result<StartupConfig, RuntimeError> {
     serde_json::from_value(value).map_err(|error| RuntimeError::Configuration(error.to_string()))
 }
 
-fn read_bounded_file(path: &Path, limit: u64, label: &str) -> Result<Vec<u8>, RuntimeError> {
+pub(crate) fn read_bounded_file(
+    path: &Path,
+    limit: u64,
+    label: &str,
+) -> Result<Vec<u8>, RuntimeError> {
     let file = fs::File::open(path)
         .map_err(|error| RuntimeError::Configuration(format!("{label}: {error}")))?;
     let metadata = file
@@ -214,7 +316,7 @@ fn read_bounded_file(path: &Path, limit: u64, label: &str) -> Result<Vec<u8>, Ru
     Ok(bytes)
 }
 
-fn validate_fixture_config(
+pub(crate) fn validate_fixture_config(
     plan: &CompiledPlan,
     config: &FixtureConfig,
 ) -> Result<(), RuntimeError> {
@@ -369,7 +471,7 @@ pub async fn reconcile_once<C: RuntimeClient>(
                                 .iter()
                                 .find(|input| input.id == *id)
                                 .is_none_or(|input| {
-                                    input.mode == InputMode::Observed
+                                    matches!(input.mode, InputMode::Observed | InputMode::Output)
                                         || input.managed_resource_id.as_ref().is_some_and(
                                             |resource| successfully_applied.contains(resource),
                                         )
@@ -435,7 +537,7 @@ async fn collect_observations<C: RuntimeClient>(
 ) -> Result<BTreeMap<String, Observation>, RuntimeError> {
     let mut observed = BTreeMap::new();
     for input in &plan.ir.inputs {
-        let observation = if input.mode == InputMode::Observed {
+        let observation = if matches!(input.mode, InputMode::Observed | InputMode::Output) {
             client.observe_named(input).await?
         } else {
             let id = input.managed_resource_id.as_ref().ok_or_else(|| {
@@ -518,17 +620,18 @@ pub struct KubeRuntimeClient {
 }
 
 impl KubeRuntimeClient {
-    async fn from_fixture_config(
+    /// Builds the fixture-mode client from a dedicated kubeconfig's bytes,
+    /// already read (and bounded to [`KUBECONFIG_MAX_BYTES`]) by
+    /// `startup::start`'s synchronous, pre-Landlock-lockdown phase -- this
+    /// function itself never touches the filesystem. See the Apsides v0.3
+    /// plan, Phase 5c.
+    pub(crate) async fn from_fixture_config_bytes(
+        kubeconfig_bytes: &[u8],
         config: &FixtureConfig,
         max_concurrent: usize,
         domain_id: &str,
     ) -> Result<Self, RuntimeError> {
-        let bytes = read_bounded_file(
-            &config.kubeconfig,
-            KUBECONFIG_MAX_BYTES,
-            "dedicated kubeconfig",
-        )?;
-        let text = std::str::from_utf8(&bytes)
+        let text = std::str::from_utf8(kubeconfig_bytes)
             .map_err(|_| RuntimeError::Configuration("dedicated kubeconfig is not UTF-8".into()))?;
         let kubeconfig = Kubeconfig::from_yaml(text).map_err(|error| {
             RuntimeError::Configuration(format!("dedicated kubeconfig: {error}"))
@@ -785,7 +888,7 @@ impl RuntimeClient for KubeRuntimeClient {
         // have no external watch capability. Periodic reconciliation still runs.
         let inputs = inputs
             .iter()
-            .filter(|input| input.mode == InputMode::Observed)
+            .filter(|input| matches!(input.mode, InputMode::Observed | InputMode::Output))
             .collect::<Vec<_>>();
         if inputs.is_empty() {
             tokio::time::sleep(timeout).await;
@@ -1008,7 +1111,7 @@ pub(crate) fn validate_exact_apply_owner(
     }
 }
 
-fn manager_main_resource_entries<'a>(
+pub(crate) fn manager_main_resource_entries<'a>(
     object: &'a DynamicObject,
     manager: &str,
     operation: &str,
@@ -1090,6 +1193,7 @@ mod tests {
     use super::*;
     use compiler_core::{
         ApiResourceMapping, ApiResourceScope, DeletionPolicy, Lifecycle, SourceLocation,
+        parse_and_validate,
     };
     use http::{Method, Request, Response, StatusCode, header::CONTENT_TYPE};
     use http_body_util::BodyExt;
@@ -1182,6 +1286,7 @@ mod tests {
                 line: 1,
                 column: 1,
             },
+            handler_output: false,
         }
     }
 
@@ -1278,7 +1383,8 @@ mod tests {
             name: name.into(),
             namespace: "workload".into(),
             mode,
-            managed_resource_id: (mode == InputMode::Managed).then(|| name.into()),
+            managed_resource_id: matches!(mode, InputMode::Managed | InputMode::Output)
+                .then(|| name.into()),
             projection: vec!["data".into()],
             sensitive: false,
             missing: "block-dependent-mutations".into(),
@@ -1313,6 +1419,44 @@ mod tests {
         for call in calls.iter() {
             assert_eq!(call.method, Method::GET);
             assert!(call.uri.contains("fieldSelector=metadata.name%3Dobserved"));
+            assert!(!call.uri.contains("managed"));
+        }
+        assert!(!calls[0].uri.contains("watch=true"));
+        assert!(calls[1].uri.contains("watch=true"));
+        assert!(calls[1].uri.contains("resourceVersion=10"));
+        Ok(())
+    }
+
+    /// A handler output's `Output`-mode input is observed live exactly like
+    /// an `Observed` one (see `InputMode::Output`): it is named-listed and
+    /// joins the watch group, never treated as the reconciler's own
+    /// authoritative desired state the way a `Managed` input is.
+    #[tokio::test]
+    async fn named_watch_scopes_list_and_watch_to_output_inputs_too()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut changed = object("changed", "11", "handler-example");
+        changed["metadata"]["name"] = Value::String("output-flags".into());
+        let (client, calls) = wire_client(vec![
+            object_list(&[], "10"),
+            serde_json::json!({"type":"ADDED","object":changed}),
+        ]);
+        client
+            .wait_for_named_change(
+                &[
+                    watch_input("managed", InputMode::Managed),
+                    watch_input("output-flags", InputMode::Output),
+                ],
+                Duration::from_secs(1),
+            )
+            .await?;
+        let calls = calls.lock().map_err(|_| "wire calls lock poisoned")?;
+        assert_eq!(calls.len(), 2);
+        for call in calls.iter() {
+            assert_eq!(call.method, Method::GET);
+            assert!(
+                call.uri
+                    .contains("fieldSelector=metadata.name%3Doutput-flags")
+            );
             assert!(!call.uri.contains("managed"));
         }
         assert!(!calls[0].uri.contains("watch=true"));
@@ -1676,6 +1820,37 @@ mod tests {
         Ok(())
     }
 
+    /// See the Apsides v0.3 plan, Phase 5c review: fixture mode's kube
+    /// client keeps the stock `kube-client` connector (glibc
+    /// `getaddrinfo`, via `Config::from_custom_kubeconfig`/`Client::try_from`),
+    /// unlike production's dedicated hickory connector -- fine for a
+    /// loopback IP literal, which never needs DNS at all, but a hostname
+    /// server would need `/etc/resolv.conf`/`/etc/hosts` on every
+    /// reconnect, exactly what Landlock denies after lockdown. Requiring a
+    /// loopback IP literal (already covered, among other rejected shapes,
+    /// by `fixture_kubeconfig_accepts_only_inline_token_and_ca`'s
+    /// `"https://localhost:6443"` case) is what rules this out
+    /// structurally; this test names that property on its own, with a
+    /// second, more realistic-looking hostname shape.
+    #[test]
+    fn fixture_kubeconfig_rejects_a_hostname_server() -> TestResult {
+        let valid = fixture_kubeconfig();
+        for server in [
+            "https://localhost:6443",
+            "https://kind-control-plane:6443",
+            "https://api.cluster.example:6443",
+        ] {
+            let mut candidate = valid.clone();
+            candidate["clusters"][0]["cluster"]["server"] = Value::String(server.into());
+            let parsed = Kubeconfig::from_yaml(&candidate.to_string())?;
+            let error = validate_fixture_kubeconfig(&parsed, "kind-fixture")
+                .err()
+                .ok_or_else(|| format!("hostname server {server:?} must be rejected"))?;
+            assert!(error.to_string().contains("loopback"), "{error}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn startup_reader_rejects_duplicate_keys_and_oversized_files() -> TestResult {
         let base = std::env::temp_dir().join(format!(
@@ -1697,6 +1872,133 @@ mod tests {
     fn rustls_ring_provider_is_explicitly_available() -> TestResult {
         install_rustls_provider()?;
         install_rustls_provider()?;
+        Ok(())
+    }
+
+    fn handler_source() -> Value {
+        json!({"file": "program.tsx", "line": 1, "column": 1})
+    }
+
+    /// A validated plan with one declared handler `sync-flags`, bundle sha256
+    /// of the fixed literal `"const bundle = 1;"`.
+    fn plan_with_one_handler() -> TestResult<compiler_core::CompiledPlan> {
+        let bundle = "const bundle = 1;";
+        let bundle_sha256 = format!("{:x}", Sha256::digest(bundle.as_bytes()));
+        let ir = json!({
+            "schemaVersion": compiler_core::IR_SCHEMA,
+            "domain": {
+                "id": "example", "namespace": "workload", "controlNamespace": "apsides-system",
+                "clusterBinding": "test-cluster", "policyRef": "platform/example", "enforcement": "api-bound",
+                "minKubernetesVersion": "1.34",
+                "budgets": {"maxResources": 8, "maxInputs": 8, "maxReactions": 8, "maxObjectBytes": 262_144, "maxQueueDepth": 8, "maxConcurrentRequests": 2},
+            },
+            "resources": [],
+            "inputs": [{"id": "settings", "apiVersion": "v1", "kind": "ConfigMap", "name": "settings", "namespace": "workload", "mode": "observed", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": handler_source()}],
+            "reactions": [],
+            "handlers": [{
+                "id": "sync-flags", "module": "handlers/sync-flags.ts", "export": "syncFlags",
+                "trigger": {"kind": "input-changed", "input": "settings"},
+                "inputs": ["settings"], "egress": [], "outputs": [],
+                "timeoutMillis": 30_000, "maxHeapBytes": 67_108_864,
+                "bundleSha256": bundle_sha256, "source": handler_source(),
+            }],
+            "outputs": [],
+            "provenance": {"compiler": "apsides/0.1", "inputs": [{"path": "program.tsx", "sha256": "0".repeat(64)}, {"path": "handlers/sync-flags.ts", "sha256": "1".repeat(64)}]},
+        });
+        Ok(parse_and_validate(&ir.to_string())?)
+    }
+
+    #[test]
+    fn verify_embedded_handlers_accepts_a_matching_bundle() -> TestResult {
+        let plan = plan_with_one_handler()?;
+        verify_embedded_handlers(&plan, &[("sync-flags", "const bundle = 1;")])?;
+        Ok(())
+    }
+
+    #[test]
+    fn verify_embedded_handlers_rejects_a_tampered_bundle() -> TestResult {
+        let plan = plan_with_one_handler()?;
+        let error = verify_embedded_handlers(&plan, &[("sync-flags", "const bundle = 2;")])
+            .err()
+            .ok_or("tampered bundle was accepted")?;
+        assert!(error.to_string().contains("bundleSha256"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn verify_embedded_handlers_rejects_a_duplicate_id() -> TestResult {
+        let plan = plan_with_one_handler()?;
+        let error = verify_embedded_handlers(
+            &plan,
+            &[
+                ("sync-flags", "const bundle = 1;"),
+                ("sync-flags", "const bundle = 1;"),
+            ],
+        )
+        .err()
+        .ok_or("duplicate embedded id was accepted")?;
+        assert!(error.to_string().contains("duplicate id"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn verify_embedded_handlers_rejects_a_missing_or_extra_bundle() -> TestResult {
+        let plan = plan_with_one_handler()?;
+        let missing = verify_embedded_handlers(&plan, &[])
+            .err()
+            .ok_or("missing embedded bundle was accepted")?;
+        assert!(missing.to_string().contains("do not match"), "{missing}");
+        let extra = verify_embedded_handlers(
+            &plan,
+            &[
+                ("sync-flags", "const bundle = 1;"),
+                ("other", "const bundle = 1;"),
+            ],
+        )
+        .err()
+        .ok_or("undeclared embedded bundle was accepted")?;
+        assert!(extra.to_string().contains("not declared"), "{extra}");
+        Ok(())
+    }
+
+    /// Regression test for a CI-only acceptance failure (`handlers::
+    /// a_handler_commits_exactly_its_owned_keys_and_seeds_across_a_restart`,
+    /// assertion 1): closes the one link in that investigation neither
+    /// `handlers::tests::derive_keys_real_bundle` nor
+    /// `production::tests::handler_commit::handler_full_cycle_real_bundle`
+    /// covers, both of which hand-build an `Observation::Available`
+    /// directly rather than deriving it from a real Kubernetes response.
+    /// Parses a realistic `ConfigMap` JSON body -- as `kube`'s own
+    /// `Api<DynamicObject>::get_opt` would deserialize one off the wire,
+    /// through `DynamicObject`'s `#[serde(flatten)]` catch-all field, not
+    /// a hand-built `DynamicObject` value -- and requires
+    /// `observation_from_object` to read back exactly the `ConfigMap`'s own
+    /// `data` map, proving the JSON-to-`Observation` conversion this
+    /// crate's event-construction tests assume is itself correct.
+    #[test]
+    fn observation_from_object_reads_a_realistic_configmaps_data() -> TestResult {
+        let object: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": "handler-source", "namespace": "default", "uid": "source-uid", "resourceVersion": "617"},
+            "data": {"a": "1", "b": "2"},
+        }))?;
+        let Observation::Available {
+            data,
+            resource_version,
+        } = observation_from_object(&object)?
+        else {
+            return Err("expected an Available observation".into());
+        };
+        assert_eq!(resource_version, "617");
+        assert_eq!(
+            data,
+            BTreeMap::from([
+                ("a".to_owned(), "1".to_owned()),
+                ("b".to_owned(), "2".to_owned())
+            ]),
+            "observation_from_object must read back the ConfigMap's own data map, not an \
+             empty one, from a realistically-shaped Kubernetes response"
+        );
         Ok(())
     }
 }

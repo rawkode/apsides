@@ -5,6 +5,8 @@ import {
   Secret,
   Service,
   defineDomain,
+  defineHandler,
+  defineHandlerOutput,
   fixtureInputData,
   watch,
   type ContainerDefinition,
@@ -110,13 +112,16 @@ const first = build("service-first");
 const second = build("service-last");
 const ir = first.toIR();
 equal(JSON.stringify(ir), JSON.stringify(second.toIR()), "declaration order must not affect IR");
-equal(ir.schemaVersion, "apsides.dev/ir/v1", "schema version");
+equal(ir.schemaVersion, "apsides.dev/ir/v2", "schema version");
+equal(ir.handlers.length, 0, "no handlers declared");
+equal(ir.outputs.length, 0, "no outputs declared");
 equal(ir.testOnly, false, "author IR is production-marked");
 equal(ir.resources.map((resource) => resource.id).join(","), "api,config,service", "resources sorted by stable ID");
 equal(ir.inputs.length, 2, "managed and observed inputs emitted");
 equal(ir.inputs.find((input) => input.kind === "Secret")?.sensitive, true, "Secret sensitivity retained");
 equal(ir.reactions.length, 2, "rollout reactions emitted");
 equal(ir.provenance.compiler, "apsides/0.1", "compiler provenance fixed by SDK");
+equal(ir.domain.minKubernetesVersion, "1.34", "minKubernetesVersion defaults to the qualified floor");
 assert(!("requestPlan" in ir) && !("testPlan" in ir) && !("capabilities" in ir), "derived compiler output must not be author-supplied");
 assert(!containsFunction(ir), "IR must contain no runtime callbacks");
 assert(Object.isFrozen(ir) && Object.isFrozen(ir.resources), "IR snapshots must be immutable");
@@ -315,4 +320,302 @@ throws(() => constrained.manage(new ConfigMap({ metadata: { name: "two", namespa
   equal(output.resources[1]!.lifecycle.deletionPolicy, "orphan", "explicit lifecycle overrides prune");
   equal("force" in output.domain, false, "force default is not ambient runtime configuration");
   equal("prune" in output.domain, false, "prune default is not retroactive cleanup authority");
+}
+
+{
+  const labelPattern = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
+  const value = domain("derived-ids");
+  const longName = `${"a".repeat(60)}.example.test`;
+  const shared = "x".repeat(70);
+  const target = value.manage(deployment("api"), { source });
+  const first = value.observe(ConfigMap, { name: `${shared}-first`, namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  const second = value.observe(ConfigMap, { name: `${shared}-second`, namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  const dotted = value.manage(new ConfigMap({ metadata: { name: longName, namespace: "workload" } }), { source });
+  const short = value.observe(Secret, { name: "short", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  watch(first).project("data").rollout(target, { source });
+  watch(dotted).project("data").rollout(target, { source });
+  watch(short).project("data").rollout(target, { source });
+  const output = value.toIR();
+  const ids = [...output.resources, ...output.inputs, ...output.reactions].map((declaration) => declaration.id);
+  assert(ids.every((id) => id.length <= 63 && labelPattern.test(id)), `derived ids must be bounded DNS labels: ${ids.join(",")}`);
+  assert(first.id !== second.id, "long derivations sharing a prefix remain distinct");
+  equal(second.id, "observed-configmap-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-5474b7ed12", "bounded ids keep the readable derived prefix");
+  equal(first.id, "observed-configmap-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-2d719c957c", "bounded observed id carries a hash of the full derivation");
+  equal(dotted.id, "configmap-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-b045bae0c1", "dotted derived resource id is bounded");
+  equal(short.id, "observed-secret-short", "short derived id is unchanged");
+  equal(output.reactions.find((reaction) => reaction.inputs[0] === short.id)?.id, "rollout-observed-secret-short-api", "short derived rollout id is unchanged");
+  equal(output.inputs.find((input) => input.mode === "managed")?.id, "managed-configmap-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-b9487f1d3e", "derived managed input id is bounded");
+  throws(() => value.observe(ConfigMap, { id: "x".repeat(64), name: "explicit", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source }), "observe.id exceeds 63 characters");
+  throws(() => value.manage(new ConfigMap({ id: "c".repeat(64), metadata: { name: "explicit", namespace: "workload" } }), { source }), "manage.id exceeds 63 characters");
+  throws(() => watch(short).project("data").rollout(target, { id: `rollout-${"r".repeat(60)}`, source }), "rollout.id exceeds 63 characters");
+  throws(() => watch(short).project("data").rollout(target, { id: "Rollout.Bad", source }), "rollout.id must be a lowercase DNS label");
+  throws(() => watch(short).project("data").rollout(target, { source }), "duplicate reaction id: rollout-observed-secret-short-api");
+}
+
+{
+  const options = {
+    id: "min-version", namespace: "workload", controlNamespace: "apsides-system",
+    clusterBinding: "local-fixture", policyRef: "platform/test", enforcement: "api-bound" as const,
+    budgets, provenance: { inputs: [{ path: "domain.ts", sha256 }] },
+  };
+  throws(() => defineDomain({ ...options, minKubernetesVersion: "1.33" }), "at least the qualified floor 1.34");
+  throws(() => defineDomain({ ...options, minKubernetesVersion: "1.34.3" }), "must be formatted as canonical MAJOR.MINOR");
+  throws(() => defineDomain({ ...options, minKubernetesVersion: "2.0" }), "at least the qualified floor 1.34");
+  throws(() => defineDomain({ ...options, minKubernetesVersion: "1.034" }), "must be formatted as canonical MAJOR.MINOR");
+  throws(() => defineDomain({ ...options, minKubernetesVersion: "01.34" }), "must be formatted as canonical MAJOR.MINOR");
+  throws(() => defineDomain({ ...options, minKubernetesVersion: "1.1234567890" }), "must be formatted as canonical MAJOR.MINOR");
+  const raised = defineDomain({ ...options, minKubernetesVersion: "1.35" });
+  raised.manage(new ConfigMap({ metadata: { name: "config", namespace: "workload" } }), { source });
+  equal(raised.toIR().domain.minKubernetesVersion, "1.35", "explicit minKubernetesVersion is retained");
+}
+
+{
+  // Handler outputs: an Output-mode input usable in rolloutOn, plus a
+  // declared handler triggering on a sensitive-free ConfigMap input.
+  const value = domain("handlers");
+  const target = value.manage(deployment("api"), { source });
+  const settings = value.observe(ConfigMap, { name: "settings", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  const flags = defineHandlerOutput(value, { name: "flags", source });
+  watch(flags).project("data").rollout(target, { id: "rollout-flags", source });
+  defineHandler(value, {
+    id: "sync-flags",
+    module: "./handlers/sync-flags.ts",
+    export: "syncFlags",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id],
+    egress: ["api.example.com", "other.example.com:8443"],
+    outputs: [flags.outputId],
+    source,
+  });
+  const output = value.toIR();
+  equal(output.outputs.length, 1, "one output declared");
+  equal(output.outputs[0]!.name, "flags", "output name preserved");
+  const outputResource = output.resources.find((resource) => resource.id === flags.outputId);
+  assert(outputResource !== undefined, "output resource declared");
+  equal(outputResource!.handlerOutput, true, "output resource is flagged handlerOutput");
+  equal((outputResource!.desired as unknown as { data?: unknown }).data, undefined, "output resource desired carries no data");
+  equal(
+    (outputResource!.desired as unknown as { metadata: { labels: Record<string, string> } }).metadata.labels["apsides.dev/handler-output"],
+    flags.outputId,
+    "reserved handler-output label carries the output id",
+  );
+  equal(output.handlers.length, 1, "one handler declared");
+  equal(output.handlers[0]!.module, "handlers/sync-flags.ts", "handler module is normalized (leading ./ stripped)");
+  equal(output.handlers[0]!.export, "syncFlags", "handler export preserved");
+  equal(output.handlers[0]!.egress.length, 2, "handler egress hosts preserved");
+  equal(output.handlers[0]!.egress[1]!.port, 8443, "explicit egress port preserved");
+  equal(output.handlers[0]!.egress[0]!.port, 443, "egress port defaults to 443");
+  equal(output.handlers[0]!.bundleSha256, "", "SDK emits an empty bundleSha256 placeholder for the compiler to fill");
+  assert(
+    output.inputs.some((input) => input.mode === "output" && input.id === flags.outputId && input.managedResourceId === flags.outputId),
+    "an Output-mode input with the output's own id backs the handler output",
+  );
+
+  // That id is the output's, so an author input cannot reuse it.
+  const clash = domain("handler-id-clash");
+  clash.observe(ConfigMap, { id: "flags", name: "external-flags", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  throws(() => defineHandlerOutput(clash, { id: "flags", name: "flags", source }), "duplicate input id: flags");
+
+  // An output declared first under a managed input's derived id cannot stand in
+  // for that managed ConfigMap's watch input.
+  const takeover = domain("handler-managed-takeover");
+  defineHandlerOutput(takeover, { id: "managed-settings", name: "derived", source });
+  const managedSettings = takeover.manage(new ConfigMap({ id: "settings", metadata: { name: "settings", namespace: "workload" }, data: { a: "1" } }), { source });
+  const api = takeover.manage(deployment("api"), { source });
+  throws(() => watch(managedSettings).project("data").rollout(api, { id: "rollout-settings", source }), "duplicate input id: managed-settings");
+
+  throws(() => defineHandler(value, {
+    id: "sync-flags",
+    module: "./handlers/other.ts",
+    export: "other",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id],
+    egress: [],
+    outputs: [],
+    source,
+  }), "duplicate handler id");
+
+  // Each output has exactly one writer handler.
+  throws(() => defineHandler(value, {
+    module: "./handlers/other.ts",
+    export: "other",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id],
+    egress: [],
+    outputs: [flags.outputId],
+    source,
+  }), "already has a writer handler");
+}
+
+{
+  // 16 distinct hosts (at, not over, MAX_EGRESS_HOSTS) times 17 distinct
+  // ports each: 272 rows, over MAX_EGRESS_ROWS (256) despite never
+  // tripping the distinct-host budget.
+  const value = domain("egress-rows");
+  const settings = value.observe(ConfigMap, { name: "settings", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  const egress: string[] = [];
+  for (let hostIndex = 0; hostIndex < 16; hostIndex++) {
+    for (let portOffset = 0; portOffset < 17; portOffset++) {
+      egress.push(`host-${String(hostIndex)}.example.com:${String(443 + portOffset)}`);
+    }
+  }
+  equal(egress.length, 272, "272 egress rows constructed");
+  throws(() => defineHandler(value, {
+    module: "./handlers/bad.ts",
+    export: "bad",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id],
+    egress,
+    outputs: [],
+    source,
+  }), "maxEgressRows");
+}
+
+{
+  // maxQueueDepth must hold every handler: each handler keeps at most one
+  // queue slot, and a smaller queue could fill with downstream handlers
+  // held for an upstream that then can never enqueue.
+  const value = defineDomain({
+    id: "queue-depth", namespace: "workload", controlNamespace: "apsides-system", clusterBinding: "local-fixture",
+    policyRef: "platform/test", enforcement: "api-bound", budgets: { ...budgets, maxQueueDepth: 1 },
+    provenance: { inputs: [{ path: "domain.ts", sha256 }] },
+  });
+  const settings = value.observe(ConfigMap, { name: "settings", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  const handler = (id: string) => ({
+    id, module: "./handlers/notify.ts", export: "notify",
+    trigger: { kind: "input-changed" as const, input: settings.id }, inputs: [settings.id], egress: [], outputs: [], source,
+  });
+  defineHandler(value, handler("notify-a"));
+  throws(() => defineHandler(value, handler("notify-b")), "cannot hold every handler");
+}
+
+{
+  // A derived handler id lowercases a camelCase export instead of turning
+  // each capital into a separator, so `syncFlags` stays readable.
+  const value = domain("derived-handler-id");
+  const settings = value.observe(ConfigMap, { name: "settings", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  defineHandler(value, {
+    module: "./handlers/sync-flags.ts",
+    export: "syncFlags",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id],
+    egress: [],
+    outputs: [],
+    source,
+  });
+  const id = value.toIR().handlers[0]!.id;
+  assert(/^handler-syncflags---handlers-sync-flags-ts-[0-9a-f]{10}$/.test(id), `derived handler id is readable: ${id}`);
+}
+
+{
+  // A closure is never a valid handler reference at the runtime.ts JSX
+  // layer; model.ts itself only ever accepts an already-split module/export
+  // pair, so the "closures are rejected" contract is exercised in
+  // traversal.test.ts against the `<On>` element.
+  const value = domain("handler-rules");
+  const secret = value.observe(Secret, { name: "credentials", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  throws(() => defineHandler(value, {
+    module: "./handlers/leak.ts",
+    export: "leak",
+    trigger: { kind: "input-changed", input: secret.id },
+    inputs: [secret.id],
+    egress: [],
+    outputs: [],
+    source,
+  }), "non-sensitive ConfigMap input");
+
+  const settings = value.observe(ConfigMap, { name: "settings", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  throws(() => defineHandler(value, {
+    module: "../outside/handler.ts",
+    export: "bad",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id],
+    egress: [],
+    outputs: [],
+    source,
+  }), "normalized relative path");
+  throws(() => defineHandler(value, {
+    module: "./handlers/bad.ts",
+    export: "bad",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id],
+    egress: ["10.0.0.1"],
+    outputs: [],
+    source,
+  }), "IP literal");
+  throws(() => defineHandler(value, {
+    module: "./handlers/bad.ts",
+    export: "bad",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id],
+    egress: ["*.example.com"],
+    outputs: [],
+    source,
+  }), "wildcard");
+  for (const host of ["127.1", "2130706433", "0x7f.1", "0177.0.0.1", "1.2.3.04", "example.123", "localhost", "internal", "foo.localhost", "bar.foo.localhost"]) {
+    throws(() => defineHandler(value, {
+      module: "./handlers/bad.ts",
+      export: "bad",
+      trigger: { kind: "input-changed", input: settings.id },
+      inputs: [settings.id],
+      egress: [host],
+      outputs: [],
+      source,
+    }), "lowercase DNS name");
+  }
+  // A host whose last label is a real TLD is accepted even when an earlier
+  // label happens to be all digits: only the *last* label decides "ends in
+  // a number".
+  defineHandler(value, {
+    id: "numeric-label-ok",
+    module: "./handlers/ok.ts",
+    export: "ok",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id],
+    egress: ["203.example.com"],
+    outputs: [],
+    source,
+  });
+
+  const selfOutput = defineHandlerOutput(value, { name: "self-flags", source });
+  throws(() => defineHandler(value, {
+    module: "./handlers/self.ts",
+    export: "self",
+    trigger: { kind: "input-changed", input: settings.id },
+    inputs: [settings.id, selfOutput.id],
+    egress: [],
+    outputs: [selfOutput.outputId],
+    source,
+  }), "may not trigger on or read its own output");
+}
+
+{
+  // Handler chaining mirrors compiler-core's handler-graph check: the graph
+  // is acyclic before each `defineHandler` call, so the call that closes a
+  // cycle is the one rejected, naming the cycle and its source location.
+  const value = domain("handler-chain");
+  const settings = value.observe(ConfigMap, { name: "settings", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  const raw = defineHandlerOutput(value, { name: "raw", source });
+  const derived = defineHandlerOutput(value, { name: "derived", source });
+  const summary = defineHandlerOutput(value, { name: "summary", source });
+  const handler = (id: string, trigger: string, inputs: readonly string[], outputs: readonly string[], line = 1) => defineHandler(value, {
+    id,
+    module: `./handlers/${id}.ts`,
+    export: "run",
+    trigger: { kind: "input-changed", input: trigger },
+    inputs,
+    egress: [],
+    outputs,
+    source: { ...source, line },
+  });
+  handler("fetch-raw", settings.id, [settings.id, summary.id], [raw.outputId]);
+  handler("derive", raw.id, [raw.id], [derived.outputId]);
+  const chained = value.toIR().handlers.find((entry) => entry.id === "derive")!;
+  equal(chained.trigger.input, raw.id, "a chained trigger lowers to the upstream output's Output-mode input");
+  throws(() => handler("summarize", derived.id, [derived.id], [summary.outputId], 9), "closes a handler graph cycle through input-changed triggers: summarize -> fetch-raw -> derive -> summarize");
+  throws(() => handler("summarize", derived.id, [derived.id], [summary.outputId], 9), `(${source.file}:9:${String(source.column)})`);
+  const own = defineHandlerOutput(value, { name: "own", source });
+  throws(() => handler("loop", own.id, [own.id], [own.outputId], 4), `may not trigger on or read its own output (${source.file}:4:${String(source.column)})`);
+  handler("summarize", derived.id, [derived.id], []);
+  equal(value.toIR().handlers.length, 3, "a rejected handler leaves no trace; the acyclic chain is kept");
 }

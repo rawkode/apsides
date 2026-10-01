@@ -37,7 +37,7 @@ pub fn build(arguments: &cli::Build) -> Result<()> {
 }
 
 fn emit(plan: &CompiledPlan, output: &Path, stage: &Path) -> Result<()> {
-    artifact::emit(plan, output)?;
+    artifact::emit(plan, output, stage)?;
     artifact::prepare_lock(output)?;
     artifact::record_source(output, stage)
 }

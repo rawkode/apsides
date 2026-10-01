@@ -1,5 +1,5 @@
 use crate::{Result, reject};
-use compiler_core::{CompiledPlan, canonical_bytes, digest, parse_and_validate, parse_strict};
+use compiler_core::{CompiledPlan, canonical_bytes, digest, parse_and_validate, parse_bounded};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -103,10 +103,16 @@ pub(crate) fn bounded_read(path: &Path, max: u64) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
-pub(crate) fn json(bytes: &[u8]) -> Result<Value> {
+/// `document` names what is being parsed (e.g. `"build-inputs.json"`), so a
+/// document other than IR that exceeds `MAX_DOCUMENT` gets an error that
+/// says so, rather than a misleading IR-specific one regardless of which
+/// document actually exceeded its limit.
+pub(crate) fn json(bytes: &[u8], document: &str) -> Result<Value> {
     let input = std::str::from_utf8(bytes)
         .map_err(|_| crate::Error::Rejected("document is not UTF-8".into()))?;
-    Ok(parse_strict(input)?)
+    let max = usize::try_from(MAX_DOCUMENT)
+        .map_err(|_| crate::Error::Rejected("document size limit overflow".into()))?;
+    Ok(parse_bounded(input, max, document)?)
 }
 pub(crate) fn contained(root: &Path, name: &str) -> Result<std::path::PathBuf> {
     if name.is_empty()
@@ -137,7 +143,7 @@ pub(crate) fn contained(root: &Path, name: &str) -> Result<std::path::PathBuf> {
 /// Rejects malformed, missing, altered, or inconsistent release payloads.
 pub fn read_release(root: &Path) -> Result<(ReleaseManifest, CompiledPlan, Vec<u8>)> {
     let bytes = bounded_read(&contained(root, "release.json")?, MAX_DOCUMENT)?;
-    let value = json(&bytes)?;
+    let value = json(&bytes, "release.json")?;
     if canonical_bytes(&value)? != bytes {
         return reject("release.json is not canonical JSON");
     }
@@ -195,6 +201,7 @@ pub fn read_release(root: &Path) -> Result<(ReleaseManifest, CompiledPlan, Vec<u
         "test-plan.json",
         "capabilities.json",
         "ir-source-map.json",
+        "surface.json",
         "apsides-controller",
         "controller.oci.tar",
     ] {
@@ -232,7 +239,7 @@ pub fn read_release(root: &Path) -> Result<(ReleaseManifest, CompiledPlan, Vec<u
 fn validate_compilation(root: &Path, manifest: &ReleaseManifest) -> Result<CompiledPlan> {
     let ir = bounded_read(&contained(root, "ir.json")?, MAX_DOCUMENT)?;
     if manifest.mode == ReleaseMode::Production
-        && json(&ir)?.get("testOnly") != Some(&Value::Bool(false))
+        && json(&ir, "ir.json")?.get("testOnly") != Some(&Value::Bool(false))
     {
         return reject("production IR must explicitly contain testOnly:false");
     }
@@ -242,29 +249,48 @@ fn validate_compilation(root: &Path, manifest: &ReleaseManifest) -> Result<Compi
     if compiled.ir_digest != manifest.ir_digest {
         return reject("release IR identity mismatch");
     }
-    let plan = json(&bounded_read(&contained(root, "plan.json")?, MAX_DOCUMENT)?)?;
+    let plan = json(
+        &bounded_read(&contained(root, "plan.json")?, MAX_DOCUMENT)?,
+        "plan.json",
+    )?;
     if serde_json::to_value(&compiled)? != plan {
         return reject("release plan differs from trusted compiler output");
     }
     for (name, expected) in compiler_core::review_documents(&compiled) {
-        let actual = json(&bounded_read(&contained(root, name)?, MAX_DOCUMENT)?)?;
+        let actual = json(&bounded_read(&contained(root, name)?, MAX_DOCUMENT)?, name)?;
         if actual != expected {
             return reject(format!(
                 "release review document differs from trusted derivation: {name}"
             ));
         }
+        // `surface.json`'s recorded manifest digest binds `aps deploy`'s
+        // independent surface recomputation (see
+        // `commands::deploy::surface::verify_surface_binding`). The value
+        // check above alone is not enough: it compares parsed JSON, so a
+        // re-signed release whose `surface.json` bytes are semantically
+        // equal but not the canonical encoding `aps compile` writes (e.g.
+        // pretty-printed) would still pass it, yet its recorded digest
+        // would then differ from `compiler_core::digest`'s canonical-bytes
+        // recomputation. Require the recorded digest to equal the exact
+        // canonical-bytes digest so that gap cannot exist.
+        if name == "surface.json" {
+            let canonical_digest = digest(&expected)?;
+            if manifest.files.get(name) != Some(&canonical_digest) {
+                return reject("release surface.json is not canonical JSON");
+            }
+        }
     }
-    let test_plan = json(&bounded_read(
-        &contained(root, "test-plan.json")?,
-        MAX_DOCUMENT,
-    )?)?;
+    let test_plan = json(
+        &bounded_read(&contained(root, "test-plan.json")?, MAX_DOCUMENT)?,
+        "test-plan.json",
+    )?;
     if test_plan != serde_json::to_value(&compiled.test_plan)? {
         return reject("release reactor test plan differs from trusted derivation");
     }
-    let inputs = json(&bounded_read(
-        &contained(root, "build-inputs.json")?,
-        MAX_DOCUMENT,
-    )?)?;
+    let inputs = json(
+        &bounded_read(&contained(root, "build-inputs.json")?, MAX_DOCUMENT)?,
+        "build-inputs.json",
+    )?;
     if digest(&inputs)? != manifest.source.inputs_digest {
         return reject("declared build inputs digest mismatch");
     }

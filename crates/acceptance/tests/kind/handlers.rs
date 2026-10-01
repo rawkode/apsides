@@ -1,0 +1,540 @@
+//! The handler commit path end to end, on a real cluster: the uid-bound
+//! commit, per-key Server-Side-Apply ownership of a handler output,
+//! chaining one handler on another's output, and seeding across a
+//! controller restart.
+//!
+//! Deploys `crates/acceptance/programs/handler-output`: one domain, one
+//! observed `ConfigMap` input (`handler-source`, created and updated by
+//! this test, never managed by the domain), one handler with no egress
+//! that copies every key of the input's `data` into its declared output
+//! (`handler-derived`), and a second handler, triggered by that output,
+//! that writes its whole `data` as one `entries` key of `handler-summary`.
+//! See docs/reference/ACCEPTANCE.md and docs/reference/IR-CONTRACT.md,
+//! "Handlers and outputs".
+
+use crate::support::writer_checkpoint;
+use acceptance::{
+    Error, Result, aps, ensure,
+    objects::{Objects, pod_ready, text},
+    pair::{CONTROL_NAMESPACE, Candidate, WORKLOAD_NAMESPACE, policy},
+    scenario::{self, Scenario, note},
+    wait,
+};
+use serde_json::{Value, json};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
+
+/// The domain `crates/acceptance/programs/handler-output/program.tsx`
+/// declares.
+const DOMAIN: &str = "handler-output";
+/// The observed input this test creates and updates directly.
+const SOURCE_NAME: &str = "handler-source";
+/// The first handler's one declared output.
+const OUTPUT_NAME: &str = "handler-derived";
+/// The chained handler's one declared output.
+const SUMMARY_NAME: &str = "handler-summary";
+/// Mirrors `runtime::handlers::HANDLER_INPUT_REVISION_ANNOTATION`
+/// (crate-private to `runtime`; this is the wire-level annotation key
+/// IR-CONTRACT.md documents).
+const REVISION_ANNOTATION: &str = "apsides.dev/handler-input-revision";
+/// How long one handler dispatch (at most one per reconcile cycle) may
+/// take to land.
+const DISPATCH: Duration = Duration::from_secs(180);
+
+/// Spec's handler runtime acceptance row (see docs/reference/ACCEPTANCE.md
+/// and the Apsides v0.3 plan, Phase 5b runtime-integration review):
+///
+/// 1. The first invocation's written keys land exactly, with the revision
+///    annotation and the expected field managers.
+/// 2. Changing the input drops a key the handler no longer writes and
+///    changes the revision.
+/// 3. A key a different field manager owns survives the next handler
+///    commit and is never co-owned by the handler's own manager.
+/// 4. Restarting the controller Pod rewrites nothing: neither output's
+///    `resourceVersion` changes, proving seeding from the stamped
+///    annotations.
+///
+/// After each of (1)-(3), the chained handler's `handler-summary` output
+/// reflects exactly the `handler-derived` data that step settled on.
+#[tokio::test]
+#[ignore = "creates a kind cluster; needs Docker, kind and `cuenv task acceptancePrepare`"]
+async fn a_handler_commits_exactly_its_owned_keys_and_seeds_across_a_restart() -> Result {
+    scenario::run("handler-output", async |scenario| {
+        let candidate = Candidate::read(&scenario.inputs.handler_output_release)?;
+        exercise(scenario, &candidate).await
+    })
+    .await
+}
+
+async fn exercise(scenario: &mut Scenario<'_>, candidate: &Candidate) -> Result {
+    let objects = scenario.objects.clone();
+    let policies = BTreeMap::from([(DOMAIN.to_owned(), policy(&candidate.plan))]);
+    let platform = scenario.prepare(&[candidate], &policies).await?;
+
+    note("creating the observed input");
+    objects
+        .create(&json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": SOURCE_NAME, "namespace": WORKLOAD_NAMESPACE},
+            "data": {"a": "1", "b": "2"},
+        }))
+        .await?;
+
+    note("deploying the handler-output domain");
+    let run = scenario
+        .deploy(&platform, &candidate.root, "handler-output-initial")
+        .await?;
+    aps::committed(
+        &run,
+        &candidate.release_digest,
+        &candidate.manifest.ir_digest,
+    )?;
+
+    let managers = Managers {
+        handler: format!("apsides-handler-{DOMAIN}"),
+        reconciler: format!("apsides-{DOMAIN}"),
+    };
+    let first = assert_first_invocation(scenario, &objects, &managers).await?;
+    let second = assert_input_change_drops_a_key(scenario, &objects, &managers, &first).await?;
+    assert_foreign_key_survives(scenario, &objects, &managers, &second).await?;
+    assert_restart_seeds_and_rewrites_nothing(scenario, &objects, &platform).await
+}
+
+/// The handler's and the reconciler's own field managers for this domain.
+struct Managers {
+    handler: String,
+    reconciler: String,
+}
+
+/// On a wait timeout, appends the live `handler-derived` output's data
+/// keys (never values -- redaction stays consistent with the diagnostics
+/// collector's own discipline even though this output holds no secret),
+/// revision annotation and `managedFields` managers/operations to the
+/// error, so a `Deadline` is never as opaque as the CI-only failure this
+/// diagnostic was added for: the acceptance report's own redacted
+/// `diagnostics.json` strips both `data` and `managedFields` from every
+/// object on purpose, so it alone could not show whether the output's
+/// data was actually empty or the harness's own capture was misleading.
+/// Only ever fetched after a real failure, never on the hot path.
+async fn describe_deadline(objects: &Objects, name: &str, error: Error) -> Error {
+    let Error::Deadline(message) = &error else {
+        return error;
+    };
+    let Ok(output) = objects
+        .require("v1", "ConfigMap", Some(WORKLOAD_NAMESPACE), name)
+        .await
+    else {
+        return error;
+    };
+    let keys: Vec<String> = data_of(&output).into_keys().collect();
+    let revision = revision_of(&output).to_owned();
+    let managers: Vec<Value> = output["metadata"]["managedFields"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| json!({"manager": entry["manager"], "operation": entry["operation"]}))
+        .collect();
+    Error::Check(format!(
+        "{message}; live {name}: dataKeys={keys:?} revision={revision:?} \
+         managedFields={managers:?}"
+    ))
+}
+
+/// The revision annotation of `output`.
+///
+/// Indexes directly, never through `text`'s RFC 6901 JSON Pointer:
+/// `REVISION_ANNOTATION` contains `/` (`apsides.dev/handler-input-
+/// revision`), which a pointer reads as nested segments
+/// (`annotations["apsides.dev"]["handler-input-revision"]`, always
+/// absent) unless escaped as `~1` -- see
+/// `workload.rs`'s own `apsides.dev~1revision` for the same escape.
+/// Unescaped, this always returns `""`, so the assertions that depend on
+/// a non-empty revision can never pass -- the actual root cause of a
+/// CI-only `Deadline` this test previously misattributed to the
+/// controller.
+fn revision_of(output: &Value) -> &str {
+    output["metadata"]["annotations"][REVISION_ANNOTATION]
+        .as_str()
+        .unwrap_or_default()
+}
+
+/// (1) The first invocation's written keys land exactly, with the revision
+/// annotation and the expected field managers.
+async fn assert_first_invocation(
+    scenario: &mut Scenario<'_>,
+    objects: &Objects,
+    managers: &Managers,
+) -> Result<Value> {
+    note("(1) the first invocation writes exactly {a,b}");
+    let first = match wait::until("the output to reflect {a,b}", DISPATCH, async || {
+        let output = objects
+            .require("v1", "ConfigMap", Some(WORKLOAD_NAMESPACE), OUTPUT_NAME)
+            .await?;
+        Ok((data_of(&output)
+            == BTreeMap::from([("a".into(), "1".into()), ("b".into(), "2".into())])
+            && !revision_of(&output).is_empty())
+        .then_some(output))
+    })
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return Err(describe_deadline(objects, OUTPUT_NAME, error).await),
+    };
+    ensure(
+        owned_data_keys(&first, &managers.handler)
+            == BTreeSet::from(["a".to_owned(), "b".to_owned()]),
+        "the handler manager must own exactly a and b in managedFields",
+    )?;
+    ensure(
+        manager_owns(&first, &managers.reconciler, &["f:metadata", "f:labels"]),
+        "the reconciler's own manager must own the output's labels",
+    )?;
+    ensure(
+        manager_owns(&first, &managers.handler, &["f:metadata", "f:annotations"]),
+        "the handler manager must own the revision annotation",
+    )?;
+    scenario.recorder.check(
+        "1-first-invocation-writes-exactly-its-keys",
+        &json!({"data": first["data"], "revision": revision_of(&first)}),
+    );
+    let summary = await_summary(objects, "a=1;b=2").await?;
+    ensure(
+        owned_data_keys(&summary, &managers.handler) == BTreeSet::from(["entries".to_owned()]),
+        "the handler manager must own exactly the summary's entries key",
+    )?;
+    scenario.recorder.check(
+        "1-chained-handler-summarizes-the-committed-output",
+        &json!({"entries": summary["data"]["entries"], "revision": revision_of(&summary)}),
+    );
+    Ok(first)
+}
+
+/// (2) Changing the input drops a key the handler no longer writes and
+/// changes the revision.
+async fn assert_input_change_drops_a_key(
+    scenario: &mut Scenario<'_>,
+    objects: &Objects,
+    managers: &Managers,
+    first: &Value,
+) -> Result<Value> {
+    note("(2) changing the input drops the key it no longer writes");
+    let first_revision = revision_of(first).to_owned();
+    update_source(objects, BTreeMap::from([("b", "2"), ("c", "3")])).await?;
+    let second = match wait::until("the output to reflect {b,c}", DISPATCH, async || {
+        let output = objects
+            .require("v1", "ConfigMap", Some(WORKLOAD_NAMESPACE), OUTPUT_NAME)
+            .await?;
+        Ok((data_of(&output)
+            == BTreeMap::from([("b".into(), "2".into()), ("c".into(), "3".into())])
+            && revision_of(&output) != first_revision
+            && !revision_of(&output).is_empty())
+        .then_some(output))
+    })
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return Err(describe_deadline(objects, OUTPUT_NAME, error).await),
+    };
+    ensure(
+        owned_data_keys(&second, &managers.handler)
+            == BTreeSet::from(["b".to_owned(), "c".to_owned()]),
+        "a is no longer among the handler manager's owned keys",
+    )?;
+    scenario.recorder.check(
+        "2-changed-input-drops-the-key-it-no-longer-writes",
+        &json!({"data": second["data"], "revision": revision_of(&second)}),
+    );
+    let summary = await_summary(objects, "b=2;c=3").await?;
+    scenario.recorder.check(
+        "2-chained-handler-follows-the-changed-output",
+        &json!({"entries": summary["data"]["entries"]}),
+    );
+    Ok(second)
+}
+
+/// (3) A key a different field manager owns survives the next handler
+/// commit and is never co-owned by the handler's own manager.
+async fn assert_foreign_key_survives(
+    scenario: &mut Scenario<'_>,
+    objects: &Objects,
+    managers: &Managers,
+    second: &Value,
+) -> Result {
+    note("(3) a foreign field manager's key survives the next commit");
+    let second_revision = revision_of(second).to_owned();
+    add_foreign_key(objects, second, "foreign", "kept-value").await?;
+    update_source(objects, BTreeMap::from([("b", "2"), ("c", "4")])).await?;
+    let third = match wait::until(
+        "the output to reflect {b,c} with c changed",
+        DISPATCH,
+        async || {
+            let output = objects
+                .require("v1", "ConfigMap", Some(WORKLOAD_NAMESPACE), OUTPUT_NAME)
+                .await?;
+            Ok((data_of(&output)
+                == BTreeMap::from([
+                    ("b".into(), "2".into()),
+                    ("c".into(), "4".into()),
+                    ("foreign".into(), "kept-value".into()),
+                ])
+                && revision_of(&output) != second_revision
+                && !revision_of(&output).is_empty())
+            .then_some(output))
+        },
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return Err(describe_deadline(objects, OUTPUT_NAME, error).await),
+    };
+    ensure(
+        owned_data_keys(&third, &managers.handler)
+            == BTreeSet::from(["b".to_owned(), "c".to_owned()]),
+        "the handler manager must never become a co-owner of the foreign key",
+    )?;
+    scenario.recorder.check(
+        "3-foreign-key-survives-and-is-never-co-owned",
+        &json!({"data": third["data"], "handlerOwnedKeys": ["b", "c"]}),
+    );
+    let summary = await_summary(objects, "b=2;c=4;foreign=kept-value").await?;
+    scenario.recorder.check(
+        "3-chained-handler-reads-the-whole-output",
+        &json!({"entries": summary["data"]["entries"]}),
+    );
+    Ok(())
+}
+
+/// (4) Restarting the controller Pod rewrites nothing: neither output's
+/// `resourceVersion` changes, proving seeding from the stamped
+/// annotations.
+async fn assert_restart_seeds_and_rewrites_nothing(
+    scenario: &mut Scenario<'_>,
+    objects: &Objects,
+    platform: &acceptance::bootstrap::Platform,
+) -> Result {
+    note("(4) restarting the controller Pod rewrites nothing");
+    let before_restart = objects
+        .require("v1", "ConfigMap", Some(WORKLOAD_NAMESPACE), OUTPUT_NAME)
+        .await?;
+    let before_version = text(&before_restart, "/metadata/resourceVersion").to_owned();
+    let summary_before = objects
+        .require("v1", "ConfigMap", Some(WORKLOAD_NAMESPACE), SUMMARY_NAME)
+        .await?;
+    let summary_version = text(&summary_before, "/metadata/resourceVersion").to_owned();
+    let checkpoint = writer_checkpoint(&platform.registry().await?, DOMAIN)?.clone();
+    // The controller Pod's own service account, `{runtime}-process` (see
+    // `platform::controller::controller_deployment`) -- NOT
+    // `runtime_binding.service_account_name` alone, which is the Envoy
+    // proxy Pod's account (`platform::proxy_stage`). Deleting the proxy
+    // Pod instead would never exercise a controller restart at all.
+    let account = format!(
+        "{}-process",
+        checkpoint.runtime_binding.service_account_name
+    );
+    let listed = objects
+        .list("v1", "Pod", Some(CONTROL_NAMESPACE), None)
+        .await?
+        .into_iter()
+        .find(|pod| text(pod, "/spec/serviceAccountName") == account)
+        .ok_or_else(|| Error::Check("the controller Pod is absent".into()))?;
+    // List items carry no apiVersion or kind, which `Objects::delete`
+    // needs, so fetch the Pod itself as the other scenarios do.
+    let controller_pod = objects
+        .require(
+            "v1",
+            "Pod",
+            Some(CONTROL_NAMESPACE),
+            text(&listed, "/metadata/name"),
+        )
+        .await?;
+    ensure(
+        has_container(&controller_pod, "controller"),
+        "the selected Pod must run the controller container, not the proxy",
+    )?;
+    let old_uid = text(&controller_pod, "/metadata/uid").to_owned();
+    objects.delete(&controller_pod).await?;
+    let replacement = wait::until(
+        "a replacement controller Pod to become ready",
+        DISPATCH,
+        async || {
+            let pods = objects
+                .list("v1", "Pod", Some(CONTROL_NAMESPACE), None)
+                .await?;
+            Ok(pods.into_iter().find(|pod| {
+                text(pod, "/spec/serviceAccountName") == account
+                    && text(pod, "/metadata/uid") != old_uid
+                    && pod_ready(pod)
+            }))
+        },
+    )
+    .await?;
+    ensure(
+        has_container(&replacement, "controller"),
+        "the restarted Pod must still run the controller container",
+    )?;
+    // No new revision to react to and the previous invocation's revision
+    // is already seeded from the stamped annotation -- give the restarted
+    // controller several reconcile cycles to prove it stays idle, then
+    // require the output's resourceVersion to be exactly what it was
+    // before the restart.
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let after_restart = objects
+        .require("v1", "ConfigMap", Some(WORKLOAD_NAMESPACE), OUTPUT_NAME)
+        .await?;
+    ensure(
+        text(&after_restart, "/metadata/resourceVersion") == before_version,
+        "the output must not be rewritten across a controller restart (seeding)",
+    )?;
+    let summary_after = objects
+        .require("v1", "ConfigMap", Some(WORKLOAD_NAMESPACE), SUMMARY_NAME)
+        .await?;
+    ensure(
+        text(&summary_after, "/metadata/resourceVersion") == summary_version,
+        "the chained output must not be rewritten across a controller restart (seeding)",
+    )?;
+    scenario.recorder.check(
+        "4-restart-seeds-and-rewrites-nothing",
+        &json!({"resourceVersion": before_version, "summaryResourceVersion": summary_version}),
+    );
+    Ok(())
+}
+
+/// Waits until the chained handler's `handler-summary` output records
+/// exactly `entries` under a revision annotation, and returns it.
+async fn await_summary(objects: &Objects, entries: &str) -> Result<Value> {
+    let expected = BTreeMap::from([("entries".to_owned(), entries.to_owned())]);
+    match wait::until(
+        &format!("the summary to record {entries}"),
+        DISPATCH,
+        async || {
+            let summary = objects
+                .require("v1", "ConfigMap", Some(WORKLOAD_NAMESPACE), SUMMARY_NAME)
+                .await?;
+            Ok(
+                (data_of(&summary) == expected && !revision_of(&summary).is_empty())
+                    .then_some(summary),
+            )
+        },
+    )
+    .await
+    {
+        Ok(summary) => Ok(summary),
+        Err(error) => Err(describe_deadline(objects, SUMMARY_NAME, error).await),
+    }
+}
+
+/// Replace the observed input's `data` with exactly `data`.
+async fn update_source(objects: &Objects, data: BTreeMap<&str, &str>) -> Result {
+    let mut current = objects
+        .require("v1", "ConfigMap", Some(WORKLOAD_NAMESPACE), SOURCE_NAME)
+        .await?;
+    current["data"] = json!(data);
+    objects.replace(&current).await?;
+    Ok(())
+}
+
+/// Add `key`/`value` to `output`'s live `data` with a plain (non-apply)
+/// replace, as `kubectl edit`/`kubectl apply` (never server-side apply)
+/// would -- the field manager this lands under is whatever the client's
+/// own default is, distinct from both the reconciler's and the handler's
+/// own named managers either way.
+async fn add_foreign_key(objects: &Objects, output: &Value, key: &str, value: &str) -> Result {
+    let mut current = objects
+        .require("v1", "ConfigMap", Some(WORKLOAD_NAMESPACE), OUTPUT_NAME)
+        .await?;
+    ensure(
+        current["metadata"]["resourceVersion"] == output["metadata"]["resourceVersion"],
+        "the output changed before the foreign key could be added",
+    )?;
+    current["data"][key] = json!(value);
+    objects.replace(&current).await?;
+    Ok(())
+}
+
+/// Whether `pod` declares a container named `name`.
+fn has_container(pod: &Value, name: &str) -> bool {
+    pod["spec"]["containers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|container| container["name"] == name)
+}
+
+/// `object`'s `data` map as owned strings, for exact comparison.
+fn data_of(object: &Value) -> BTreeMap<String, String> {
+    object["data"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_owned())))
+        .collect()
+}
+
+/// The subset of `object`'s live `data` keys that `manager` owns, read
+/// from its own `managedFields` `Apply` entry -- mirrors
+/// `runtime::production::handler_owned_data_keys`.
+fn owned_data_keys(object: &Value, manager: &str) -> BTreeSet<String> {
+    object["metadata"]["managedFields"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["manager"] == manager && entry["operation"] == "Apply")
+        .filter_map(|entry| entry["fieldsV1"].get("f:data"))
+        .filter_map(Value::as_object)
+        .flat_map(|fields| fields.keys().cloned())
+        .filter_map(|key| key.strip_prefix("f:").map(str::to_owned))
+        .collect()
+}
+
+/// Whether `manager` has an `Apply` entry whose `fieldsV1` contains the
+/// nested path `path` (each segment already `f:`-prefixed).
+fn manager_owns(object: &Value, manager: &str, path: &[&str]) -> bool {
+    object["metadata"]["managedFields"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["manager"] == manager && entry["operation"] == "Apply")
+        .any(|entry| {
+            let mut cursor = &entry["fieldsV1"];
+            for segment in path {
+                cursor = &cursor[*segment];
+            }
+            !cursor.is_null()
+        })
+}
+
+/// Plain, non-`#[ignore]`d: runs under `cargo test -p acceptance` without a
+/// kind cluster. Regression test for the actual cause of a CI-only
+/// `Deadline` this scenario hit: `revision_of` used to read the revision
+/// annotation through `text`, an RFC 6901 JSON Pointer, with the raw
+/// (unescaped) annotation key `apsides.dev/handler-input-revision` --
+/// since that key itself contains `/`, the pointer read it as the nested
+/// path `annotations["apsides.dev"]["handler-input-revision"]`, always
+/// absent, so `revision_of` always returned `""` and assertions (1)-(3)
+/// could never pass no matter what the controller actually did. This
+/// confirms `revision_of` reads the real, dotted-and-slashed key
+/// directly, and that assertion (1)'s own predicate holds once it does.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revision_of_reads_the_dotted_and_slashed_annotation_key() {
+        let output = json!({
+            "metadata": {"annotations": {"apsides.dev/handler-input-revision": "sha256:x"}},
+            "data": {"a": "1", "b": "2"},
+        });
+        assert_eq!(revision_of(&output), "sha256:x");
+        assert!(
+            data_of(&output)
+                == BTreeMap::from([
+                    ("a".to_owned(), "1".to_owned()),
+                    ("b".to_owned(), "2".to_owned())
+                ])
+                && !revision_of(&output).is_empty(),
+            "assertion (1)'s own predicate must hold for a correctly-observed output"
+        );
+    }
+}

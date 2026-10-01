@@ -229,6 +229,11 @@ pub fn validate_ownership_intent(
         .ok_or_else(|| {
             Error::Plan("ownership intent target is outside the compiled plan".into())
         })?;
+    if resource.handler_output {
+        return Err(Error::Plan(
+            "ownership intents cannot target a handler output; it is created absent-only or already owned by this domain".into(),
+        ));
+    }
     if !valid_id(&intent.object_name)
         || !valid_id(&intent.object_uid)
         || !valid_version(&intent.object_resource_version)

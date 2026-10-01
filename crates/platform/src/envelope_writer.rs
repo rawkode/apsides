@@ -41,6 +41,7 @@ pub(crate) fn binding(stored: &StoredTransition) -> RuntimeBinding {
         service_account_name: allocation.service_account_name.clone(),
         // validate_binding permits 4096 raw bytes; escaping doubles the content.
         controller_image: "\"".repeat(4096),
+        max_handler_heap_bytes: 0,
     }
 }
 

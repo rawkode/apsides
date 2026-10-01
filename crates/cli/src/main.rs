@@ -53,6 +53,7 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Release(arguments) => commands::release::command(&arguments),
         Command::Deploy(arguments) => commands::deploy::command(&arguments),
         Command::Audit(arguments) => commands::audit::command(&arguments),
+        Command::Diff(arguments) => commands::diff::command(&arguments),
     }
 }
 

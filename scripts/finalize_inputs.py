@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import diagnostics
 from package_oci import ROOT, read_regular, runtime_closure, verify_context
 from toolchain_snapshot import public as public_tools, verify as verify_tools
 
@@ -19,12 +20,25 @@ def digest(data):
 PACKAGING_SOURCES = [
     "scripts/Dockerfile",
     "scripts/build.py",
+    "scripts/diagnostics.py",
     "scripts/extract_binary.py",
     "scripts/finalize_inputs.py",
     "scripts/package_oci.py",
+    "scripts/rusty_v8.py",
     "scripts/sbom.py",
     "scripts/toolchain_snapshot.py",
 ]
+
+# Must match packages/compiler/src/compiler.ts's COMPILER_CLOSURE_SCHEMA and
+# crates/release/src/compiler.rs's COMPILER_CLOSURE_SCHEMA: one compiler
+# closure schema version end to end, so the source (Deno/TS) and native
+# (this file) halves can never silently disagree.
+SOURCE_CLOSURE_SCHEMA = "apsides.dev/compiler-closure/v3"
+
+
+def ensure_source_closure_schema(closure):
+    if closure.get("schemaVersion") != SOURCE_CLOSURE_SCHEMA:
+        raise ValueError(f"source compiler closure has an unexpected schema version; expected {SOURCE_CLOSURE_SCHEMA}")
 
 
 def finalize(source, context, runtime_base, packaging_inputs, profile, tool_snapshot, output):
@@ -51,6 +65,11 @@ def finalize(source, context, runtime_base, packaging_inputs, profile, tool_snap
         raise ValueError("build profile differs from the executed packaging inputs")
     inputs=json.loads(read_regular(source))
     closure=inputs["compilerClosure"]
+    # Failing closed here catches source/native schema drift immediately,
+    # instead of silently overwriting whatever schemaVersion the source
+    # receipt carried (the previous behaviour), which let the two sides
+    # disagree unnoticed.
+    ensure_source_closure_schema(closure)
     if closure["nativeCompiler"] is not None:
         raise ValueError("source receipt already has a native compiler closure")
     build_context_files=[{"path":path,"sha256":sha} for path,sha in metadata["files"].items()]
@@ -64,7 +83,6 @@ def finalize(source, context, runtime_base, packaging_inputs, profile, tool_snap
     packaging_files.sort(key=lambda item:item["path"])
     cli=[entry for entry in packaging_files if entry["path"].startswith("crates/cli/")]
     cli.sort(key=lambda item:item["path"])
-    closure["schemaVersion"]="apsides.dev/compiler-closure/v2"
     closure["nativeCompiler"]={
         "builderImage":{key:metadata["builder"][key] for key in ["reference","platform"]},
         "cargoLockSha256":metadata["controllerLockDigest"],
@@ -72,6 +90,12 @@ def finalize(source, context, runtime_base, packaging_inputs, profile, tool_snap
         "buildProfileSha256":digest(profile_bytes),"hostTools":host_tools,
         "trustedCliCodeSha256":digest(canonical(cli)),
         "approvedRuntime":runtime_closure(runtime_base, packaging["runtime"]),
+        # The pinned rusty_v8 static archive scripts/package_oci.py fetched,
+        # verified and staged for the --network=none Cargo build (also
+        # present, as a plain file, in buildContextFiles above); recorded by
+        # identity here so the compiler closure states what it is, not just
+        # that some file with this hash exists at this path.
+        "rustyV8":metadata["rustyV8"],
     }
     inputs["compilerClosureDigest"]=digest(canonical(closure))
     if verify_context(context)!=metadata:
@@ -100,5 +124,5 @@ if __name__ == "__main__":
         args=parser.parse_args()
         snapshot=json.loads(read_regular(args.tool_snapshot))
         print(finalize(args.source,args.context,args.runtime_base,args.packaging_inputs,args.profile,snapshot,args.output))
-    except Exception:
-        raise SystemExit("apsides: build input finalization failed") from None
+    except Exception as error:
+        raise SystemExit(diagnostics.failure_message("build input finalization", error)) from None

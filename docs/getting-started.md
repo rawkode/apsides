@@ -42,9 +42,9 @@ target/debug/aps compile \
   --output work/apsides-compiled
 ```
 
-The output includes validated IR, a recomputed plan, capabilities, test
-scenarios, source mapping, generated Rust controller source and integrity
-metadata. Compilation alone does not create a deployable release.
+The output includes validated IR, a recomputed plan, capabilities, the
+`surface.json` deployment surface, test scenarios, source mapping, generated
+Rust controller source and integrity metadata. Compilation alone does not create a deployable release.
 
 ## Inspect and check the plan
 
@@ -71,5 +71,6 @@ image reproducibility, Kubernetes authorization, controller activation,
 workload readiness or upgrade recovery.
 
 Continue with [TypeScript authoring](/guides/typescript-authoring/), generate a
-[typed custom resource from a CRD](/guides/custom-resources/), then read the
+[typed custom resource from a CRD](/guides/custom-resources/), add an
+[event handler](/guides/event-handlers/), then read the
 [build and deployment boundaries](/guides/build-and-deploy/).

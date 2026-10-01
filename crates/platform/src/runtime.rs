@@ -289,6 +289,7 @@ pub(crate) fn validate_binding(binding: &RuntimeBinding) -> Result<()> {
             .is_some_and(|(name, hash)| !name.is_empty() && valid_digest(hash))
         || binding.controller_image.len() > 4096
         || binding.controller_image.chars().any(char::is_whitespace)
+        || binding.max_handler_heap_bytes > compiler_core::MAX_HANDLER_HEAP_BYTES
     {
         return Err(invalid(
             "invalid runtime binding or unpinned controller image",
@@ -370,6 +371,7 @@ mod binding_tests {
             capability_digest: digest,
             service_account_name: "controller".into(),
             controller_image: image,
+            max_handler_heap_bytes: 0,
         }
     }
 

@@ -9,6 +9,7 @@ mod cluster;
 mod outcome;
 mod protocol;
 mod request;
+mod surface;
 mod transition;
 
 use crate::{Result, cli, report};
@@ -108,7 +109,7 @@ async fn deploy(arguments: &cli::Deploy) -> Result<Value> {
     } else {
         (reserved, reserved_session)
     };
-    let review = review_transition(&session, inventory.as_ref(), &live).await?;
+    let review = review_transition(&session, inventory.as_ref(), &verified, &live).await?;
     let tracking = complete_transition(
         &session,
         &verified,

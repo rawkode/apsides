@@ -23,7 +23,7 @@ enum Side {
 struct Fixture {
     claims: ClaimSnapshotV1,
     claim_ref: ClaimRef,
-    review: ReviewMetadataV1,
+    review: ReviewMetadata,
     review_ref: ReviewRef,
     audit: TransitionAuditV1,
     audit_ref: AuditRef,
@@ -32,9 +32,9 @@ struct Fixture {
 struct RaceFixture {
     claims: ClaimSnapshotV1,
     claim_ref: ClaimRef,
-    left_review: ReviewMetadataV1,
+    left_review: ReviewMetadata,
     left_review_ref: ReviewRef,
-    right_review: ReviewMetadataV1,
+    right_review: ReviewMetadata,
     right_review_ref: ReviewRef,
     left_audit: TransitionAuditV1,
     left_audit_ref: AuditRef,
@@ -64,8 +64,8 @@ fn ceiling() -> ReviewCeiling {
     }
 }
 
-fn review(names: &deploy::AllocationNames, sequence: u64) -> ReviewMetadataV1 {
-    ReviewMetadataV1 {
+fn review(names: &deploy::AllocationNames, sequence: u64) -> ReviewMetadata {
+    ReviewMetadata {
         schema_version: REVIEW_METADATA_SCHEMA.to_owned(),
         scope: ReviewScope {
             claim_scope: scope(),
@@ -73,9 +73,13 @@ fn review(names: &deploy::AllocationNames, sequence: u64) -> ReviewMetadataV1 {
             transition_id: names.transition_id.clone(),
             sequence,
         },
+        surface_digest: format!("sha256:{}", "0".repeat(64)),
         resources: Vec::new(),
         inputs: Vec::new(),
         reactions: Vec::new(),
+        handlers: Vec::new(),
+        egress: Vec::new(),
+        outputs: Vec::new(),
         runtime_permissions: Vec::new(),
         cleanup_permissions: Vec::new(),
         deployment_permissions: ReviewDeploymentPermissions {
@@ -106,7 +110,10 @@ fn review(names: &deploy::AllocationNames, sequence: u64) -> ReviewMetadataV1 {
             required_cleanup_apis: Vec::new(),
             required_deployment_apis: Vec::new(),
             deployment_api_scope: ReviewDeploymentScope::IssuedDeployerOnly,
-            qualified_create_precondition_servers: vec![ReviewQualifiedServer::V1343],
+            kubernetes_version: ReviewKubernetesVersion {
+                min_version: "1.34".into(),
+                qualified_on: ReviewQualifiedServer::V1343,
+            },
             field_validation: ReviewFieldValidation::Strict,
             transition_plan_schema: ReviewTransitionSchema::V4,
             runtime_replicas: 1,

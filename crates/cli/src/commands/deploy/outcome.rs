@@ -7,10 +7,12 @@ use serde_json::{Value, json};
 pub(super) async fn review_transition(
     session: &platform::TransitionSession,
     inventory: &dyn inventory::InventoryStore,
+    verified: &release::IntegrityVerifiedCandidate,
     live: &crate::review::LiveReview,
 ) -> Result<Value> {
     let resolved = session.resolve().await?;
     crate::connection::require_request(inventory, &resolved.plan().request).await?;
+    super::surface::verify_surface_binding(verified, resolved.next_review_metadata())?;
     let review = crate::review::transition_review(&resolved, live)?;
     report::note(&review)?;
     Ok(review)
@@ -31,7 +33,9 @@ pub(super) async fn already_committed_report(
     let live = crate::review::LiveReview::Unavailable {
         reason: "committed-current-state-preview-not-run",
     };
-    let review = crate::review::transition_review(&session.resolve().await?, &live)?;
+    let resolved = session.resolve().await?;
+    super::surface::verify_surface_binding(verified, resolved.next_review_metadata())?;
+    let review = crate::review::transition_review(&resolved, &live)?;
     Ok(json!({
         "status": "already-committed", "transition": transition,
         "artifactTrust": "verified",

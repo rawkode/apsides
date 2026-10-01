@@ -3,7 +3,7 @@ use crate::{
     NamespaceRegistry, PlatformClient, Result, StoredTransition, TransitionInputs, Versioned,
     invalid,
 };
-use coordination::{ReviewMetadataV1, ReviewRef};
+use coordination::{ReviewMetadata, ReviewRef};
 use deploy::{
     DeploymentRequest, GenerationPlan, PredecessorGeneration, RegistrySnapshot, TransitionPlan,
 };
@@ -25,8 +25,8 @@ pub(crate) struct Selection {
 struct AuthenticatedReviews {
     next_reference: ReviewRef,
     previous_reference: Option<ReviewRef>,
-    next: Arc<ReviewMetadataV1>,
-    previous: Option<Arc<ReviewMetadataV1>>,
+    next: Arc<ReviewMetadata>,
+    previous: Option<Arc<ReviewMetadata>>,
 }
 
 /// A selected release capability. Every lifecycle reload revalidates its frozen inputs.
@@ -66,12 +66,12 @@ impl ResolvedTransition {
     }
     /// Return the selected release's complete authenticated declaration metadata.
     #[must_use]
-    pub fn next_review_metadata(&self) -> &ReviewMetadataV1 {
+    pub fn next_review_metadata(&self) -> &ReviewMetadata {
         &self.selected.reviews.next
     }
     /// Return the authenticated predecessor declaration when this is an upgrade.
     #[must_use]
-    pub fn previous_review_metadata(&self) -> Option<&ReviewMetadataV1> {
+    pub fn previous_review_metadata(&self) -> Option<&ReviewMetadata> {
         self.selected.reviews.previous.as_deref()
     }
 }
@@ -373,8 +373,8 @@ impl PlatformClient {
         plan: &TransitionPlan,
         previous: Option<&crate::WriterCheckpoint>,
         capacity: &crate::CapacityAdmission,
-        next_review_metadata: &ReviewMetadataV1,
-        previous_review_metadata: Option<&ReviewMetadataV1>,
+        next_review_metadata: &ReviewMetadata,
+        previous_review_metadata: Option<&ReviewMetadata>,
         executor_binding: &crate::ExecutorBinding,
     ) -> Result<Self> {
         let policy = crate::PolicyState {
@@ -399,7 +399,7 @@ impl PlatformClient {
         }
         let next_review_reference = next_review_metadata.reference()?;
         let previous_review_reference = previous_review_metadata
-            .map(ReviewMetadataV1::reference)
+            .map(ReviewMetadata::reference)
             .transpose()?;
         let reviews = AuthenticatedReviews {
             next_reference: next_review_reference,

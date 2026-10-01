@@ -11,6 +11,7 @@
 mod cleanup;
 mod collision;
 mod credentials;
+mod handlers;
 mod phases;
 mod support;
 mod uncertain;

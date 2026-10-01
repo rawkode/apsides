@@ -61,7 +61,7 @@ async fn uncertain_writer(scenario: &mut Scenario<'_>, pair: &Pair) -> Result {
     )?;
     cnpg::wait_ready(&objects, WORKLOAD_NAMESPACE).await?;
     create_api_settings(&objects).await?;
-    let predecessor = writer_checkpoint(&platform.registry().await?)?.clone();
+    let predecessor = writer_checkpoint(&platform.registry().await?, DOMAIN)?.clone();
 
     note("stopping the successor at Quiesced");
     let stopped = stop_at(

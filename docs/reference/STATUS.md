@@ -1,6 +1,6 @@
 # Apsides implementation status
 
-Apsides targets specification 0.2. Existing `apsides.dev` identifiers are its active wire names.
+Apsides targets the [specification](SPEC.md) (version 0.3). Existing `apsides.dev` identifiers are its active wire names.
 Apsides is **not ready for production use**. Unit tests, the reactor cases of
 `aps test --cluster` and the acceptance suite on disposable kind clusters
 establish narrower properties.
@@ -27,15 +27,95 @@ establish narrower properties.
   per-resource choice requiring explicit policy acceptance, including custom
   resources. Managed Secrets remain unsupported; Secret inputs are observed.
 - `@apsides/kubernetes` provides the bounded TSX authoring surface for Controllers,
-  ConfigMaps, Services, Deployments, declared inputs, and rollout reactions.
+  ConfigMaps, Services, Deployments, declared inputs, rollout reactions, and
+  event handlers (`<On>`, `useHandlerOutput`). IR schema `apsides.dev/ir/v2`
+  carries `handlers`, `outputs`, `output`-mode inputs and
+  `domain.minKubernetesVersion`; see the [IR contract](/reference/ir-contract/).
+- The compiler bundles each handler module from the source lock, twice, and
+  requires identical bytes; validation rejects Secret or sensitive handler
+  inputs, self-reads, cyclic handler graphs, second writers of an output,
+  invalid egress hosts and budget overruns (16 handlers, 16 egress hosts, 256
+  egress rows, 30 s, 64 MiB, and a `maxQueueDepth` below the handler count). `crates/compiler-core/tests/handlers.rs` covers
+  each rule. `aps compile` type-checks every handler module in strict mode
+  against the ECMAScript library and `@apsides/kubernetes/handler`'s
+  declarations, checks each export against the event its `<On>` produces,
+  rejects references to `SharedArrayBuffer`, and `crates/engine/tests/host_api.rs` pins the engine's
+  globals to those declarations.
 - The compiler locks the complete author module closure, typechecks it, evaluates
   it with denied ambient permissions, validates strict canonical IR, and derives
   effects, capabilities, source metadata, and required reactor cases.
 - Complete builds produce a Linux controller binary, OCI archive, SBOM, compiler
-  closure, build-input record, and integrity manifest.
+  closure, build-input record, and integrity manifest. The embedded V8 comes
+  from a pinned `rusty_v8` static archive fetched before the `--network=none`
+  BuildKit step, verified by SHA-256 and recorded in the SBOM and build inputs.
+- `aps compile` writes `surface.json` (`apsides.dev/surface/v1`), including
+  `handlers`, `egress`, `outputs` and `kubernetes.minVersion`. `aps diff`
+  compares two surfaces and applies an optional review policy
+  (`apsides.dev/surface-policy/v1`); `crates/compiler-core/tests/surface*.rs`
+  cover derivation, diffing, Markdown and policy rules.
 - The native controller reconciles its fixed resource set through conditional
-  Server-Side Apply. It has no JavaScript evaluator and cannot expand its
-  approved scope.
+  Server-Side Apply. It cannot expand its approved scope.
+- Declared handlers run in production mode in the `engine` crate, embedded by
+  `runtime`: one fresh, jitless V8 isolate per invocation, without WebAssembly
+  or `SharedArrayBuffer`, with heap and `ArrayBuffer` caps and a watchdog
+  timeout that also stops code that never yields. The only host API is
+  `apsides.fetch` (HTTPS to the handler's declared host and port, resolved by
+  a dedicated `hickory-resolver` and dialled only at global unicast addresses,
+  redirects returned rather than followed, size, concurrency and total-byte
+  caps), `apsides.writeOutput` and `apsides.log`. `crates/engine/tests` covers
+  the sandbox, the ops and the address classifier against local fixture
+  servers.
+- The runtime computes each handler's input revision every cycle, coalesces
+  queued events to the latest revision, dispatches at most one invocation per
+  cycle at global concurrency 1, and only once the handler's outputs were
+  applied in that cycle (`handler-output-not-ready` otherwise) and every
+  upstream handler whose output it reads is settled, with all of that
+  upstream's outputs recording one revision (`handler-upstream-pending`
+  otherwise). Handlers chain from TSX through a handler output's `.changed`
+  event and as `<On inputs>`. A full queue
+  reports `handler-queue-overflow`; failures report
+  `handler-invocation-failed:<CODE>` and retry with backoff (at-least-once
+  delivery). Output writes are buffered and committed after success as one
+  server-side apply per output under field manager
+  `apsides-handler-<domainId>`, UID-bound and through the same authority and
+  claim re-check reconciler mutations use, with the
+  `apsides.dev/handler-input-revision` annotation that seeds the revision after
+  a restart. The controller refuses to start unless its embedded bundles match
+  the IR. Fixture mode verifies bundles but does not execute handlers. The
+  controller Pod's memory limit is derived from the largest declared handler
+  heap.
+- The generated controller's `main` is synchronous: `runtime::start` reads
+  every file it will ever need (the startup config; the proxy client
+  CA/cert/key and `/etc/resolv.conf` in production, or the fixture
+  kubeconfig) and converts the proxy identity into the in-memory shapes
+  `kube::Config` takes, so no file path is handed to `kube`. It reads
+  `available_parallelism()` for the tokio worker count, then applies a
+  deny-all Landlock ruleset to the main thread, failing closed if more than one
+  thread already exists, and only then initialises the V8 platform (with
+  `v8::V8::set_entropy_source` wired to the `getrandom(2)` system call) and
+  builds the tokio runtime. The production Kubernetes client reaches the proxy
+  Service by its short hostname through a `hickory-resolver` connector
+  configured with `resolv.conf`'s `search`/`ndots` directives, read before
+  lockdown.
+- `strace` of a locked-down controller shows the remaining filesystem reads
+  after lockdown, each denied and each falling back to a file-free source:
+  glibc's CPU count (`/sys/devices/system/cpu/online`, then `/proc/stat`)
+  falls back to the CPU affinity mask; each new thread's stack-bounds probe
+  (`/proc/self/maps`) falls back to `__libc_stack_end`; a TSC calibration
+  probe (`/sys/devices/system/cpu/cpu0/tsc_freq_khz`) is ignored; and V8's own
+  worker-pool sizing inside `deno_core::runtime::setup::init_v8` reads
+  `/proc/self/cgroup` and falls back to the affinity mask. Replacing that last
+  call would need `deno_core`'s private platform internals, so it is left in
+  place.
+- An unsupported or unenforced Landlock lockdown fails startup closed; the
+  fixture-only `allowNoLandlock` startup-config flag is the sole exception and
+  does not exist in production configuration. A partially enforced ruleset --
+  the normal state on kernels older than Linux 7.1, whose effective ABI V7
+  lacks only `ResolveUnix` of the requested rights -- counts as enforced and is
+  reported at `/status` as `landlock-partial`, distinct from `landlock`.
+  `aps test --cluster` and the acceptance suite check the host kernel's
+  `/sys/kernel/security/lsm` for `landlock` before creating a kind cluster,
+  since kind nodes share the host kernel.
 - Protected platform policy can supply registry Secret references for controller
   and proxy image pulls, without granting runtime Secret access. References bind
   to the policy and staged Pod templates; credentials remain platform-owned.
@@ -60,6 +140,16 @@ establish narrower properties.
 - A release manifest (`apsides.dev/release/v2`) binds the compiler closure,
   native binary, OCI image, SBOM, production IR, reactor test plan, fixture
   coverage catalogue, and signed provenance. It carries no test results.
+- A release records the digest of its canonical `surface.json`; verification
+  recomputes the surface from the release's IR and rejects a differing or
+  non-canonical document even when re-signed. Review metadata
+  (`apsides.dev/review-metadata/v3`) carries `surfaceDigest` and the
+  `handlers`/`egress`/`outputs` catalogs, and `aps deploy` requires the
+  recomputed surface digest to equal both the release's and the reviewed one.
+- `aps deploy` and live preview require the server's discovery version to be at
+  least the domain's `minKubernetesVersion` (default `1.34`); they do not pin
+  one exact server version. The absent-only conditional create contract remains
+  qualified on v1.34.3 only.
 - `aps deploy` accepts a release only after checking payload integrity and
   signed provenance against the platform trust policy. `aps verify-release` runs
   the same checks offline. Both refuse fixture releases, and unit tests confirm
@@ -128,8 +218,8 @@ establish narrower properties.
 ## Verified boundaries
 
 The [acceptance suite](/reference/acceptance/) runs in CI and deploys signed
-releases of the CNPG examples with the public `aps deploy` on single-node kind
-clusters with a synthetic signer. Its reference lists each check and the §28
+releases of the CNPG examples and a handler program with the public
+`aps deploy` on single-node kind clusters with a synthetic signer. Its reference lists each check and the §28
 row it answers. In summary:
 
 - the upgrade scenario rejects a successor above the ceiling before any
@@ -149,6 +239,14 @@ row it answers. In summary:
   and shows that a live preview approved by the deployment identity changes no
   Kubernetes state before the reservation and is carried in the committed
   report;
+- the handler scenario deploys `crates/acceptance/programs/handler-output`
+  (two chained handlers with no egress) and shows that the first invocation
+  writes exactly its keys with the revision annotation and the expected field
+  managers, that a changed input drops a key the handler no longer writes,
+  that a key another field manager adds survives the next commit without
+  becoming co-owned, that the chained handler records exactly the output each
+  step settles on, and that restarting the controller rewrites neither
+  output;
 - the phase, uncertain-writer and cleanup scenarios stop `aps deploy` after each
   stored phase and resume it, block activation after the predecessor's
   termination evidence is lost, run last-type cleanup through an unresolved
@@ -190,6 +288,17 @@ records are described in [resource inventory](/reference/inventory/#current-limi
   acceptance suite with read-only repository permissions; the nightly workflow
   runs the native double build. Release signing and external
   OIDC-to-Kubernetes identity configuration remain separate unfinished work.
+- Event handlers: `input-changed` on non-sensitive `ConfigMap` inputs is the
+  only trigger; handlers cannot read Secrets, so `apsides.fetch` requests are
+  unauthenticated unless a handler embeds a credential in its own source;
+  egress is enforced only by the controller, with no generated
+  `NetworkPolicy`; fixture mode, and so `aps test --cluster`, does not execute
+  handlers; no live test performs a handler `fetch`; and the output id passed
+  to `apsides.writeOutput` is a plain string, so an undeclared one fails only
+  at run time (`UNDECLARED_OUTPUT_ID`).
+- Kind-based acceptance and `aps test --cluster` run only on the pinned
+  Kubernetes v1.34.3 node image. Servers above the declared minimum are
+  accepted but not qualified.
 - The runtime watches only observed inputs, matching compiled permissions;
   managed inputs retain periodic reconciliation. Database credential rotation
   is not tested.
@@ -210,6 +319,6 @@ records are described in [resource inventory](/reference/inventory/#current-limi
   schemas fail closed and do not infer missing authority or perform automatic
   conversion.
 
-Specification 0.2 remains the normative target. The contract pages describe the
+The [specification](SPEC.md) remains the normative target. The contract pages describe the
 implemented subset and explicitly identify boundaries that still require live
 qualification.

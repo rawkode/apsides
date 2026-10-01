@@ -33,6 +33,7 @@ fn snapshot(generation: &str, count: usize) -> InventorySnapshot {
             desired: serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":name,"namespace":"storage-test"},"data":{"value":PRIVATE}}),
             lifecycle: Lifecycle { deletion_policy: DeletionPolicy::Delete }, force: false,
             source: SourceLocation { file: "private-source-canary.tsx".into(), line: 1, column: 1 },
+            handler_output: false,
         };
         TrackedResource::from_resource(&resource, "configmaps".into(), Some(format!("uid-{index}")))
     }).collect();

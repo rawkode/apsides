@@ -8,7 +8,7 @@ data. Rust validates that data, derives the allowed effects and performs the
 Kubernetes operations.
 
 <div class="architecture-flow">
-  <div><strong>Authoring</strong><span><code>@apsides/kubernetes</code> builds a domain, resources, observations and reactions.</span></div>
+  <div><strong>Authoring</strong><span><code>@apsides/kubernetes</code> builds a domain, resources, observations, reactions and event handlers.</span></div>
   <div><strong>Compiler</strong><span>Oxc, Rolldown, restricted Deno evaluation and Rust validation emit canonical IR.</span></div>
   <div><strong>Release</strong><span>A native binary, OCI image, SBOM, compiler closure and signed provenance are bound together.</span></div>
   <div><strong>Runtime</strong><span>A generation-specific controller reconciles only its approved plan through a constrained proxy.</span></div>
@@ -26,6 +26,11 @@ IR in Rust.
 This is deliberately smaller than general React or an unrestricted Kubernetes
 SDK. Unknown fields and unsupported resource shapes fail compilation.
 
+An `<On>` element names an event handler: a locked TypeScript module export
+with declared inputs, HTTPS egress hosts and output `ConfigMap`s. The compiler
+bundles the module and records its digest; it does not run it. See
+[Event handlers](/guides/event-handlers/).
+
 ## Compiler and release boundary
 
 The compiler produces canonical resource and reaction plans, capabilities,
@@ -39,15 +44,46 @@ prior state.
 
 ## Runtime boundary
 
-The controller has no JavaScript evaluator and cannot expand its resource set.
-It uses strict Kubernetes Server-Side Apply only. There is no client-side apply,
-merge patch, strategic merge patch, full-object replacement or delete/recreate
-fallback for managed-resource reconciliation.
+The controller cannot expand its resource set. It uses strict Kubernetes
+Server-Side Apply only. There is no client-side apply, merge patch, strategic
+merge patch, full-object replacement or delete/recreate fallback for
+managed-resource reconciliation.
+
+The only code the controller runs besides its own is the set of declared
+event handler bundles embedded in its binary, checked against the digests in
+its validated IR at startup. Each invocation runs in a fresh V8 isolate from
+the `engine` crate, with no filesystem, no Kubernetes credential, bounded time
+and memory, and three operations: HTTPS `fetch` to the handler's declared
+hosts, `writeOutput` to its declared outputs, and `log`. Handler output writes
+use their own field manager and the same authority checks as reconciler
+writes.
 
 Each controller generation receives only its approved runtime capabilities.
 Privileged CI owns Roles, RoleBindings, the controller image, activation and
 retirement of the previous writer. A generation-specific proxy and protected
 coordination records form the writer-quiescence boundary.
+
+The generated controller reads the filesystem only during a short, synchronous
+startup. It reads its startup configuration, the proxy client identity (or the
+fixture kubeconfig) and `/etc/resolv.conf`, converts them into in-memory
+values, and sizes the async runtime from the cgroup-aware CPU count. It then
+applies a deny-all Landlock ruleset on the main thread while no other thread
+exists, and only afterwards starts the V8 platform and the tokio runtime, whose
+threads inherit the restriction. The production Kubernetes client reaches the
+proxy Service by hostname through a `hickory-resolver` connector configured
+from the `resolv.conf` contents read before lockdown, so reconnects never
+open a file. V8's random number generators are seeded from the `getrandom(2)`
+system call rather than `/dev/urandom`.
+
+A kernel that cannot enforce Landlock stops the controller at startup. A
+partially enforced ruleset (the normal state on kernels older than Linux 7.1,
+whose Landlock ABI lacks only the `ResolveUnix` right) counts as enforced and is
+reported separately at `/status` as `landlock-partial`. Only a fixture-mode
+configuration for disposable clusters can opt out with `allowNoLandlock`;
+production configuration has no such field. Some glibc and V8 internal reads
+still happen after lockdown, such as CPU-count and thread stack probes; each is
+denied and falls back to a file-free source. The
+[implementation status](/reference/status/) lists them.
 
 ## Policy and force
 
@@ -81,7 +117,8 @@ See
 | `compiler-core` | strict IR validation, canonical identity, capabilities and policy checks |
 | `deploy` | provider-neutral lifecycle planning and transition reduction |
 | `platform` | protected Kubernetes state, proxy transport and generation lifecycle |
-| `runtime` | native fixed-plan reconciliation |
+| `runtime` | native fixed-plan reconciliation, handler dispatch and output commit, and the synchronous startup with Landlock lockdown |
+| `engine` | the embedded `deno_core`/V8 handler sandbox: isolate limits, the `apsides` operations, egress address vetting and the Landlock primitives |
 | `release` | release integrity, signed provenance, compiler closure and OCI verification |
 | `inventory` | metadata-only snapshots and SQLite storage |
 | `coordination` | typed immutable stores for claims, transition audits and review metadata |

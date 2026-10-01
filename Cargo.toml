@@ -6,6 +6,7 @@ members = [
     "crates/compiler-core",
     "crates/coordination",
     "crates/deploy",
+    "crates/engine",
     "crates/inventory",
     "crates/platform",
     "crates/release",

@@ -168,6 +168,7 @@ mod tests {
                 max_queue_depth: 1,
                 max_concurrent_requests: 1,
             },
+            min_kubernetes_version: "1.34".into(),
         }
     }
 

@@ -71,7 +71,7 @@ async fn interrupt_every_phase(scenario: &mut Scenario<'_>, pair: &Pair) -> Resu
         if candidate.release_digest == pair.successor.release_digest {
             remove_orphaned_api(&objects, &platform).await?;
         }
-        let previous = writer_checkpoint(&platform.registry().await?)?
+        let previous = writer_checkpoint(&platform.registry().await?, DOMAIN)?
             .runtime_binding
             .service_account_name
             .clone();

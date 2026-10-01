@@ -22,6 +22,7 @@ fn resource(api_version: &str, kind: &str) -> Resource {
             line: 1,
             column: 1,
         },
+        handler_output: false,
     }
 }
 
