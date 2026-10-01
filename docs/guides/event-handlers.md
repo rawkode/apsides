@@ -56,9 +56,9 @@ const Api = () => {
 
 | Prop | Meaning |
 | --- | --- |
-| `trigger` | The `.changed` event of a `useConfigMap` observation or a `useResourceRef("ConfigMap")` reference. It must also appear in `inputs`. |
+| `trigger` | The `.changed` event of a `useConfigMap` observation, a `useResourceRef("ConfigMap")` reference or another handler's output. It must also appear in `inputs`. |
 | `handler` | `"<module path>#<export name>"`. The path is resolved from the directory holding `apsides.lock.json`, not from the file containing `<On>`. |
-| `inputs` | Nonempty list of non-sensitive `ConfigMap` references. `useSecret` observations are rejected. |
+| `inputs` | Nonempty list of non-sensitive `ConfigMap` references or other handlers' outputs. `useSecret` observations are rejected. |
 | `egress` | Hosts the handler may call over HTTPS, as `"host"` (port 443) or `"host:port"`. |
 | `outputs` | References returned by `useHandlerOutput`. Each output has exactly one writer handler. |
 | `id` | Optional stable handler id. Without it the compiler derives one from the export and module path. |
@@ -69,6 +69,28 @@ in the controller's namespace. The controller creates it with only its
 identity and the reserved `apsides.dev/handler-output` label; only the handler
 writes its `data`. Its `.data` projection works in `rolloutOn` like any other
 input projection.
+
+### Chaining handlers
+
+One handler's output can be another handler's input and trigger, through the
+output's `.changed` event:
+
+```tsx
+const raw = useHandlerOutput({ id: "raw-flags", name: "raw-flags" });
+const derived = useHandlerOutput({ id: "derived-flags", name: "derived-flags" });
+
+<On id="fetch-flags" trigger={settings.changed} handler="./handlers/fetch.ts#fetchFlags"
+    inputs={[settings]} egress={["flags.example.com"]} outputs={[raw]} />
+<On id="derive-flags" trigger={raw.changed} handler="./handlers/derive.ts#deriveFlags"
+    inputs={[raw]} outputs={[derived]} />
+```
+
+A downstream handler only ever sees a fully committed upstream. It waits,
+reporting `handler-upstream-pending`, while any handler that writes one of its
+inputs is queued, failing or retrying, or has outputs that do not all record
+the same revision, as after a partially failed commit or a restart that finds
+them disagreeing. Because at most one handler runs per reconcile cycle, a
+chain of N handlers takes at least N cycles to settle after a change.
 
 ### Handler modules
 
@@ -92,7 +114,8 @@ input projection.
   so on) fails the build.
 
 Validation also rejects a handler that triggers on or reads its own output, and
-any cycle in which handlers feed each other through their outputs. The
+any cycle in which handlers feed each other through their outputs; the SDK
+reports both with the source location of the `<On>` that closes the cycle. The
 [IR contract](/reference/ir-contract/#handlers-and-outputs) lists every rule.
 
 ### Egress hosts
@@ -210,9 +233,11 @@ budgets.
   the latest event. Intermediate values are not delivered.
 - **Dispatch.** At most one invocation starts per reconcile cycle, and
   handlers never run concurrently. A handler waits until all its outputs were
-  applied in that cycle; otherwise the controller reports
-  `handler-output-not-ready`. The queue holds at most `maxQueueDepth`
-  handlers; one more reports `handler-queue-overflow`.
+  applied in that cycle, reporting `handler-output-not-ready`, and a handler
+  that reads another handler's output waits until that upstream is settled,
+  reporting `handler-upstream-pending` (see
+  [Chaining handlers](#chaining-handlers)). The queue holds at most
+  `maxQueueDepth` handlers; one more reports `handler-queue-overflow`.
 - **Commit.** On success, each declared output is committed with one
   server-side apply under field manager `apsides-handler-<domainId>`, with the
   `apsides.dev/handler-input-revision` annotation. The keys written in that

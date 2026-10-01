@@ -98,7 +98,9 @@ const flags = useHandlerOutput({ id: "resolved-flags", name: "resolved-flags" })
   cannot reach a handler. The trigger must be one of the inputs.
 - `egress` lists the HTTPS hosts the handler may call; `outputs` lists the
   outputs it writes, and each output has exactly one writer.
-- `flags.data` can be used in a Deployment's `rolloutOn`.
+- `flags.data` can be used in a Deployment's `rolloutOn`, and `flags.changed`
+  can trigger another `<On>` that lists `flags` in its `inputs`, chaining
+  handlers.
 
 At runtime the export receives the current input data and may call
 `apsides.fetch`, `apsides.writeOutput` and `apsides.log`. See

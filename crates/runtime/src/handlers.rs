@@ -2,10 +2,13 @@
 //! filesystem/net access except through its own typed, capability-checked
 //! ops) into the reconcile cycle: computes each handler's input revision
 //! each cycle, enqueues, and dispatches at most one handler invocation per
-//! cycle at global concurrency 1. `apsides.writeOutput` calls are buffered
-//! in memory for the invocation's duration ([`BufferedOutputSink`]); once
-//! (and only if) the handler returns successfully, every declared output
-//! is committed with exactly one server-side apply each, through
+//! cycle at global concurrency 1, holding a handler that reads another
+//! handler's output until that upstream is settled (see
+//! `HandlerRuntime::upstream_gate_open`). `apsides.writeOutput` calls are
+//! buffered in memory for the invocation's duration
+//! ([`BufferedOutputSink`]); once (and only if) the handler returns
+//! successfully, every declared output is committed with exactly one
+//! server-side apply each, through
 //! `production::commit_handler_outputs` -- the same authority/claim
 //! re-check reconciler mutations use, under field manager
 //! `apsides-handler-<domainId>`.
@@ -24,7 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
-use compiler_core::{CompiledPlan, Handler, Output};
+use compiler_core::{CompiledPlan, Handler, InputMode, Output};
 use kube::Client;
 use kube::api::{Api, ApiResource, DynamicObject};
 use kube::core::GroupVersionKind;
@@ -180,6 +183,11 @@ struct HandlerState {
     /// last trusted, so it must not be treated as still agreeing with it
     /// even though nothing about the handler's *input* changed.
     output_uids: BTreeMap<String, String>,
+    /// The input revision computed from *this* cycle's observations by
+    /// [`HandlerRuntime::detect_triggers`]; `None` while any declared input
+    /// is not `Available`. Never persisted: a restart recomputes it on the
+    /// first cycle, before any dispatch.
+    current_revision: Option<String>,
     queued: Option<QueuedEvent>,
     backoff_until: Option<Instant>,
     attempt: u32,
@@ -458,6 +466,48 @@ fn agreed_revision(recorded: &[Option<String>]) -> Option<String> {
     })
 }
 
+/// The handlers whose outputs `handler` reads through an
+/// [`InputMode::Output`] input: its direct upstreams in the handler graph
+/// `compiler_core`'s validator already proved acyclic and free of
+/// self-loops.
+fn upstream_handlers<'plan>(plan: &'plan CompiledPlan, handler: &Handler) -> BTreeSet<&'plan str> {
+    let read_outputs: BTreeSet<&str> = plan
+        .ir
+        .inputs
+        .iter()
+        .filter(|input| input.mode == InputMode::Output && handler.inputs.contains(&input.id))
+        .filter_map(|input| input.managed_resource_id.as_deref())
+        .collect();
+    plan.ir
+        .handlers
+        .iter()
+        .filter(|writer| {
+            writer
+                .outputs
+                .iter()
+                .any(|output_id| read_outputs.contains(output_id.as_str()))
+        })
+        .map(|writer| writer.id.as_str())
+        .collect()
+}
+
+impl HandlerState {
+    /// Settled: nothing queued or failed, and every declared output agrees
+    /// on the revision this cycle's observations compute. `known_revision`
+    /// only ever holds a revision all outputs carried -- set after a fully
+    /// committed invocation, seeded from agreeing annotations, and cleared
+    /// by `detect_triggers` the moment `outputs_still_agree` fails -- so a
+    /// partial commit (`production::commit_handler_outputs` stops at the
+    /// first failing output) leaves its writer unsettled until a later
+    /// invocation commits every output.
+    fn is_settled(&self) -> bool {
+        self.queued.is_none()
+            && self.last_error_code.is_none()
+            && self.current_revision.is_some()
+            && self.known_revision == self.current_revision
+    }
+}
+
 pub(crate) struct HandlerRuntime {
     queue_capacity: usize,
     base_backoff: Duration,
@@ -669,13 +719,13 @@ impl HandlerRuntime {
         conditions: &mut Vec<RuntimeCondition>,
     ) {
         for handler in &plan.ir.handlers {
-            let Some(inputs) = handler_inputs_snapshot(handler, observations) else {
-                continue;
-            };
-            let Ok(revision) = compute_input_revision(handler, &inputs) else {
-                continue;
-            };
+            let snapshot = handler_inputs_snapshot(handler, observations)
+                .and_then(|inputs| Some((compute_input_revision(handler, &inputs).ok()?, inputs)));
             let state = self.states.entry(handler.id.clone()).or_default();
+            state.current_revision = snapshot.as_ref().map(|(revision, _)| revision.clone());
+            let Some((revision, inputs)) = snapshot else {
+                continue;
+            };
             let same_revision = state.known_revision.as_deref() == Some(revision.as_str());
             let already_queued_for_this_revision = state
                 .queued
@@ -745,10 +795,68 @@ impl HandlerRuntime {
         EnqueueOutcome::New
     }
 
+    /// The ids of every handler currently [`HandlerState::is_settled`].
+    fn settled_handlers(&self) -> BTreeSet<String> {
+        self.states
+            .iter()
+            .filter(|(_, state)| state.is_settled())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// The condition reason code that keeps queued `handler` from being
+    /// dispatched this cycle, or `None` when it may run: every declared
+    /// output must have been applied this cycle, and the upstream gate
+    /// ([`Self::upstream_gate_open`]) must be open.
+    fn dispatch_blocker(
+        &self,
+        plan: &CompiledPlan,
+        handler: &Handler,
+        applied: &BTreeSet<String>,
+        settled: &BTreeSet<String>,
+    ) -> Option<&'static str> {
+        if !handler.outputs.iter().all(|id| applied.contains(id)) {
+            return Some("handler-output-not-ready");
+        }
+        if !self.upstream_gate_open(plan, handler, settled) {
+            return Some("handler-upstream-pending");
+        }
+        None
+    }
+
+    /// Whether queued `handler` may run as far as its upstreams go: always
+    /// for a handler reading no other handler's output; otherwise only when
+    /// every upstream was settled at the start of this cycle (`settled`)
+    /// *and* the queued event was rebuilt or confirmed from this cycle's
+    /// observations -- an event left over from an earlier cycle (say, one
+    /// whose own inputs are not `Available` now) may hold a snapshot taken
+    /// while an upstream was only partially committed.
+    fn upstream_gate_open(
+        &self,
+        plan: &CompiledPlan,
+        handler: &Handler,
+        settled: &BTreeSet<String>,
+    ) -> bool {
+        let upstreams = upstream_handlers(plan, handler);
+        if upstreams.is_empty() {
+            return true;
+        }
+        let Some(state) = self.states.get(&handler.id) else {
+            return false;
+        };
+        let confirmed = state.queued.as_ref().is_some_and(|queued| {
+            state.current_revision.as_deref() == Some(queued.revision.as_str())
+        });
+        confirmed && upstreams.iter().all(|id| settled.contains(*id))
+    }
+
     /// Dispatches **at most one** ready queued handler this cycle (review
     /// item E) -- other ready/not-ready entries are still scanned (for
-    /// backoff/`handler-output-not-ready` bookkeeping) but never invoked
-    /// once one dispatch has already happened. Checks
+    /// backoff/`handler-output-not-ready`/`handler-upstream-pending`
+    /// bookkeeping) but never invoked once one dispatch has already
+    /// happened. A handler reading another handler's output stays queued,
+    /// reporting `handler-upstream-pending`, until [`Self::upstream_gate_open`]
+    /// admits it, so it never runs on a partially committed upstream. Checks
     /// `controller.is_terminating()` immediately before that one dispatch,
     /// so a shutdown in progress never starts a new invocation (the commit
     /// path inside `invoke` re-checks it again before each output's
@@ -762,6 +870,10 @@ impl HandlerRuntime {
         conditions: &mut Vec<RuntimeCondition>,
     ) -> Result<(), RuntimeError> {
         let ids: Vec<String> = self.queue_order.iter().cloned().collect();
+        // Taken before any dispatch: a handler dispatched in this same cycle
+        // stays unsettled for the rest of it, since this cycle's
+        // observations of its outputs predate its commit.
+        let settled = self.settled_handlers();
         let mut dispatched_one = false;
         for handler_id in ids {
             let Some(handler) = plan
@@ -781,10 +893,9 @@ impl HandlerRuntime {
             if blocked_by_backoff {
                 continue;
             }
-            let outputs_ready = handler.outputs.iter().all(|id| applied.contains(id));
-            if !outputs_ready {
+            if let Some(reason_code) = self.dispatch_blocker(plan, handler, applied, &settled) {
                 conditions.push(RuntimeCondition {
-                    reason_code: "handler-output-not-ready".into(),
+                    reason_code: reason_code.into(),
                     resource_name: Some(handler_id.clone()),
                 });
                 continue;
@@ -1386,7 +1497,7 @@ mod tests {
                 .body(Body::from(serde_json::to_vec(&response)?))?)
         }
 
-        fn wire(responses: Vec<Value>) -> (Client, Calls) {
+        pub(super) fn wire(responses: Vec<Value>) -> (Client, Calls) {
             let responses = Arc::new(StdMutex::new(VecDeque::from(responses)));
             let calls: Calls = Arc::default();
             let service = service_fn({
@@ -1410,7 +1521,12 @@ mod tests {
             (Client::new(service, "workload"), calls)
         }
 
-        fn flags_object(name: &str, uid: &str, rv: &str, revision: Option<&str>) -> Value {
+        pub(super) fn flags_object(
+            name: &str,
+            uid: &str,
+            rv: &str,
+            revision: Option<&str>,
+        ) -> Value {
             let mut annotations = Map::new();
             annotations.insert(
                 "apsides.dev/handler-output".into(),
@@ -1532,6 +1648,344 @@ mod tests {
                 state.queued.is_some(),
                 "a recreated output must force the handler back onto the queue, even though \
                  the input never changed and no restart happened"
+            );
+            Ok(())
+        }
+    }
+
+    /// Handler chaining: a downstream handler reading an upstream's output
+    /// is dispatched only while that upstream is settled -- never while it
+    /// is queued, failed, or its outputs disagree (a partial commit, or a
+    /// restart after one) -- and only with an event confirmed against the
+    /// current cycle's observations. `dispatch_blocker` is the exact check
+    /// `dispatch_ready` turns into a condition; `production.rs`'s
+    /// `handler_chain_dispatch` drives the same gate through `run_cycle`.
+    mod upstream_gate {
+        use super::seeding_and_drift::{flags_object, wire};
+        use super::*;
+        use compiler_core::parse_and_validate;
+
+        fn source() -> Value {
+            json!({"file": "program.tsx", "line": 1, "column": 1})
+        }
+
+        fn output_resource(id: &str) -> Value {
+            json!({"id": id, "apiVersion": "v1", "kind": "ConfigMap", "name": id, "namespace": "workload",
+                   "handlerOutput": true,
+                   "desired": {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": id, "namespace": "workload", "labels": {"apsides.dev/handler-output": id}}},
+                   "lifecycle": {"deletionPolicy": "orphan"}, "source": source()})
+        }
+
+        fn input(id: &str, name: &str, mode: &str) -> Value {
+            let mut value = json!({"id": id, "apiVersion": "v1", "kind": "ConfigMap", "name": name, "namespace": "workload", "mode": mode, "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source()});
+            if mode == "output" {
+                value["managedResourceId"] = json!(name);
+            }
+            value
+        }
+
+        /// `fetch-raw` (triggered by "settings") writes "raw-a" and
+        /// "raw-b"; `derive` triggers on "raw-a", reads both, and writes
+        /// "derived".
+        fn plan() -> TestResult<CompiledPlan> {
+            let ir = json!({
+                "schemaVersion": compiler_core::IR_SCHEMA,
+                "domain": {
+                    "id": "example", "namespace": "workload", "controlNamespace": "apsides-system",
+                    "clusterBinding": "test-cluster", "policyRef": "platform/example", "enforcement": "api-bound",
+                    "minKubernetesVersion": "1.34",
+                    "budgets": {"maxResources": 8, "maxInputs": 8, "maxReactions": 8, "maxObjectBytes": 262_144, "maxQueueDepth": 8, "maxConcurrentRequests": 2},
+                },
+                "resources": [output_resource("derived"), output_resource("raw-a"), output_resource("raw-b")],
+                "inputs": [
+                    input("derived-output", "derived", "output"),
+                    input("raw-a-output", "raw-a", "output"),
+                    input("raw-b-output", "raw-b", "output"),
+                    input("settings", "settings", "observed"),
+                ],
+                "reactions": [],
+                "handlers": [
+                    {"id": "derive", "module": "handlers/derive.ts", "export": "derive",
+                     "trigger": {"kind": "input-changed", "input": "raw-a-output"},
+                     "inputs": ["raw-a-output", "raw-b-output"], "egress": [], "outputs": ["derived"],
+                     "timeoutMillis": 5_000, "maxHeapBytes": 8_388_608, "bundleSha256": "0".repeat(64), "source": source()},
+                    {"id": "fetch-raw", "module": "handlers/fetch-raw.ts", "export": "fetchRaw",
+                     "trigger": {"kind": "input-changed", "input": "settings"},
+                     "inputs": ["settings"], "egress": [], "outputs": ["raw-a", "raw-b"],
+                     "timeoutMillis": 5_000, "maxHeapBytes": 8_388_608, "bundleSha256": "1".repeat(64), "source": source()},
+                ],
+                "outputs": [
+                    {"id": "derived", "name": "derived", "namespace": "workload"},
+                    {"id": "raw-a", "name": "raw-a", "namespace": "workload"},
+                    {"id": "raw-b", "name": "raw-b", "namespace": "workload"},
+                ],
+                "provenance": {"compiler": "apsides/0.1", "inputs": [
+                    {"path": "handlers/derive.ts", "sha256": "2".repeat(64)},
+                    {"path": "handlers/fetch-raw.ts", "sha256": "1".repeat(64)},
+                    {"path": "program.tsx", "sha256": "0".repeat(64)},
+                ]},
+            });
+            Ok(parse_and_validate(&ir.to_string())?)
+        }
+
+        fn runtime_for(plan: &CompiledPlan) -> TestResult<HandlerRuntime> {
+            Ok(HandlerRuntime::new(
+                plan,
+                &[],
+                "apsides-handler-example".into(),
+                Duration::from_millis(10),
+                Duration::from_millis(100),
+                None,
+            )?)
+        }
+
+        fn find<'plan>(plan: &'plan CompiledPlan, id: &str) -> TestResult<&'plan Handler> {
+            Ok(plan
+                .ir
+                .handlers
+                .iter()
+                .find(|handler| handler.id == id)
+                .ok_or("handler must be declared")?)
+        }
+
+        /// "settings" plus both upstream outputs, `raw_b` standing in for
+        /// whatever "raw-b" currently holds.
+        fn observations(raw_b: &str) -> BTreeMap<String, Observation> {
+            BTreeMap::from([
+                ("settings".to_owned(), available(&[("flag", "on")])),
+                ("raw-a-output".to_owned(), available(&[("value", "new")])),
+                ("raw-b-output".to_owned(), available(&[("value", raw_b)])),
+            ])
+        }
+
+        fn upstream_revision(plan: &CompiledPlan) -> TestResult<String> {
+            let inputs = BTreeMap::from([("settings".to_owned(), json!({"flag": "on"}))]);
+            Ok(compute_input_revision(find(plan, "fetch-raw")?, &inputs)?)
+        }
+
+        /// The reason code `dispatch_ready` would report for `derive` right
+        /// now, computed exactly as `dispatch_ready` computes it (every
+        /// output treated as applied, so only the upstream gate decides).
+        fn derive_blocker(
+            runtime: &HandlerRuntime,
+            plan: &CompiledPlan,
+        ) -> TestResult<Option<&'static str>> {
+            let applied: BTreeSet<String> = plan
+                .ir
+                .outputs
+                .iter()
+                .map(|output| output.id.clone())
+                .collect();
+            Ok(runtime.dispatch_blocker(
+                plan,
+                find(plan, "derive")?,
+                &applied,
+                &runtime.settled_handlers(),
+            ))
+        }
+
+        #[test]
+        fn upstreams_are_exactly_the_writers_of_the_outputs_a_handler_reads() -> TestResult {
+            let plan = plan()?;
+            assert_eq!(
+                upstream_handlers(&plan, find(&plan, "derive")?),
+                BTreeSet::from(["fetch-raw"])
+            );
+            assert!(upstream_handlers(&plan, find(&plan, "fetch-raw")?).is_empty());
+            Ok(())
+        }
+
+        /// The upstream is queued for a new revision (its input changed):
+        /// the downstream, also queued, is held with
+        /// `handler-upstream-pending` and stays queued, while the upstream
+        /// itself, reading no other handler's output, is never gated.
+        #[tokio::test]
+        async fn downstream_is_held_while_its_upstream_is_queued() -> TestResult {
+            let plan = plan()?;
+            let mut runtime = runtime_for(&plan)?;
+            let (client, calls) = wire(vec![]);
+            runtime
+                .detect_triggers(&plan, &observations("new"), &client, &mut Vec::new())
+                .await;
+            assert!(calls.lock().map_err(|_| "calls are poisoned")?.is_empty());
+            let upstream = runtime.states.get("fetch-raw").ok_or("upstream state")?;
+            assert!(upstream.queued.is_some(), "the upstream is queued");
+            assert_eq!(
+                derive_blocker(&runtime, &plan)?,
+                Some("handler-upstream-pending")
+            );
+            let applied: BTreeSet<String> = plan
+                .ir
+                .outputs
+                .iter()
+                .map(|output| output.id.clone())
+                .collect();
+            assert_eq!(
+                runtime.dispatch_blocker(
+                    &plan,
+                    find(&plan, "fetch-raw")?,
+                    &applied,
+                    &runtime.settled_handlers()
+                ),
+                None,
+                "the upstream itself is never held by the gate"
+            );
+            assert!(
+                runtime
+                    .states
+                    .get("derive")
+                    .ok_or("downstream state")?
+                    .queued
+                    .is_some(),
+                "a held downstream stays queued"
+            );
+            Ok(())
+        }
+
+        /// `commit_handler_outputs` committed "raw-a" for the upstream's new
+        /// revision, then failed on "raw-b": the upstream is re-queued in
+        /// backoff with `last_error_code` set and `known_revision` still the
+        /// previous one, and this cycle's observations show "raw-a" new and
+        /// "raw-b" stale. The downstream, re-coalesced onto that mixed
+        /// snapshot, must stay held.
+        #[tokio::test]
+        async fn downstream_is_held_after_a_partial_upstream_commit() -> TestResult {
+            let plan = plan()?;
+            let revision = upstream_revision(&plan)?;
+            let mut runtime = runtime_for(&plan)?;
+            let upstream = runtime.states.entry("fetch-raw".to_owned()).or_default();
+            upstream.known_revision = Some("previous-revision".to_owned());
+            upstream.attempt = 1;
+            upstream.backoff_until = Some(Instant::now() + Duration::from_secs(60));
+            upstream.last_error_code = Some("HANDLER_COMMIT_FAILED:conflict".to_owned());
+            assert_eq!(
+                runtime.enqueue("fetch-raw", revision, "event".into(), json!({})),
+                EnqueueOutcome::New
+            );
+            let (client, calls) = wire(vec![]);
+            runtime
+                .detect_triggers(&plan, &observations("stale"), &client, &mut Vec::new())
+                .await;
+            assert!(calls.lock().map_err(|_| "calls are poisoned")?.is_empty());
+            assert!(
+                runtime
+                    .states
+                    .get("derive")
+                    .ok_or("downstream state")?
+                    .queued
+                    .is_some()
+            );
+            assert_eq!(
+                derive_blocker(&runtime, &plan)?,
+                Some("handler-upstream-pending")
+            );
+            Ok(())
+        }
+
+        /// A restart after that same partial commit: "raw-a" records the
+        /// new revision, "raw-b" the previous one. Seeding finds no
+        /// agreement, so the upstream re-runs and the downstream is held
+        /// meanwhile.
+        #[tokio::test]
+        async fn downstream_is_held_after_a_restart_on_disagreeing_upstream_outputs() -> TestResult
+        {
+            let plan = plan()?;
+            let revision = upstream_revision(&plan)?;
+            let mut runtime = runtime_for(&plan)?;
+            let (client, _calls) = wire(vec![
+                flags_object("derived", "derived-uid", "3", None),
+                flags_object("raw-a", "raw-a-uid", "7", Some(&revision)),
+                flags_object("raw-b", "raw-b-uid", "4", Some("previous-revision")),
+            ]);
+            runtime.seed_from_annotations(&plan, &client).await;
+            assert_eq!(
+                runtime
+                    .states
+                    .get("fetch-raw")
+                    .ok_or("upstream state")?
+                    .known_revision,
+                None
+            );
+            runtime
+                .detect_triggers(&plan, &observations("stale"), &client, &mut Vec::new())
+                .await;
+            assert!(
+                runtime
+                    .states
+                    .get("fetch-raw")
+                    .ok_or("upstream state")?
+                    .queued
+                    .is_some()
+            );
+            assert_eq!(
+                derive_blocker(&runtime, &plan)?,
+                Some("handler-upstream-pending")
+            );
+            Ok(())
+        }
+
+        /// Both upstream outputs agree on the revision the upstream's
+        /// current input computes (seeded at restart and re-confirmed by
+        /// `outputs_still_agree`): the upstream is settled and the queued
+        /// downstream may run. A later cycle in which the downstream's own
+        /// event cannot be confirmed (one of its inputs is no longer
+        /// `Available`) holds it again, even though the upstream is still
+        /// settled.
+        #[tokio::test]
+        async fn downstream_runs_once_its_upstream_is_settled() -> TestResult {
+            let plan = plan()?;
+            let revision = upstream_revision(&plan)?;
+            let mut runtime = runtime_for(&plan)?;
+            let (client, _calls) = wire(vec![
+                // seed_from_annotations
+                flags_object("derived", "derived-uid", "3", None),
+                flags_object("raw-a", "raw-a-uid", "7", Some(&revision)),
+                flags_object("raw-b", "raw-b-uid", "8", Some(&revision)),
+                // first cycle's outputs_still_agree
+                flags_object("raw-a", "raw-a-uid", "7", Some(&revision)),
+                flags_object("raw-b", "raw-b-uid", "8", Some(&revision)),
+                // second cycle's outputs_still_agree
+                flags_object("raw-a", "raw-a-uid", "7", Some(&revision)),
+                flags_object("raw-b", "raw-b-uid", "8", Some(&revision)),
+            ]);
+            runtime.seed_from_annotations(&plan, &client).await;
+            runtime
+                .detect_triggers(&plan, &observations("new"), &client, &mut Vec::new())
+                .await;
+            let upstream = runtime.states.get("fetch-raw").ok_or("upstream state")?;
+            assert!(
+                upstream.queued.is_none() && upstream.is_settled(),
+                "the upstream is settled"
+            );
+            assert!(
+                runtime
+                    .states
+                    .get("derive")
+                    .ok_or("downstream state")?
+                    .queued
+                    .is_some()
+            );
+            assert_eq!(
+                derive_blocker(&runtime, &plan)?,
+                None,
+                "a settled upstream lets the downstream run"
+            );
+
+            let mut without_raw_b = observations("new");
+            without_raw_b.insert("raw-b-output".to_owned(), Observation::Missing);
+            runtime
+                .detect_triggers(&plan, &without_raw_b, &client, &mut Vec::new())
+                .await;
+            assert!(
+                runtime
+                    .states
+                    .get("fetch-raw")
+                    .ok_or("upstream state")?
+                    .is_settled()
+            );
+            assert_eq!(
+                derive_blocker(&runtime, &plan)?,
+                Some("handler-upstream-pending")
             );
             Ok(())
         }

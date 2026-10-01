@@ -225,3 +225,66 @@ throws(() => compile(controller(element(() => {
     outputs: [],
   }, 10);
 }, {}))), "non-sensitive ConfigMap input");
+
+// Handler chaining: a handler output's `.changed` triggers, and the output
+// itself is an input of, a downstream `<On>`; both lower to the output's
+// Output-mode input.
+const ChainApp = () => {
+  const settings = useConfigMap({ name: "settings" });
+  const raw = useHandlerOutput({ id: "raw-flags", name: "raw-flags" });
+  const derived = useHandlerOutput({ id: "derived", name: "derived" });
+  return element(Fragment, {
+    children: [
+      element(On, { id: "fetch-raw", trigger: settings.changed, handler: "./a.ts#fetchRaw", inputs: [settings], egress: ["flags.example.com"], outputs: [raw] }, 90),
+      element(On, { id: "derive", trigger: raw.changed, handler: "./b.ts#derive", inputs: [raw], outputs: [derived] }, 91),
+    ],
+  });
+};
+const chainIR = compile(controller(element(ChainApp, {}, 85)));
+const rawInput = chainIR.inputs.find((input) => input.mode === "output" && input.managedResourceId === "raw-flags");
+assert(rawInput !== undefined, "the upstream output has an Output-mode input");
+const derive = chainIR.handlers.find((handler) => handler.id === "derive");
+assert(derive?.trigger.input === rawInput.id, "the downstream trigger lowers to the upstream output's Output-mode input id");
+assert(JSON.stringify(derive.inputs) === JSON.stringify([rawInput.id]), "the downstream inputs include the upstream output's Output-mode input");
+assert(JSON.stringify(derive.outputs) === JSON.stringify(["derived"]), "the downstream writes its own output");
+assert(chainIR.handlers.find((handler) => handler.id === "fetch-raw")?.outputs[0] === "raw-flags", "the upstream writes the chained output");
+
+// A handler triggering on (or reading) its own output is rejected at its JSX location.
+throws(() => compile(controller(element(() => {
+  const settings = useConfigMap({ name: "settings" });
+  const flags = useHandlerOutput({ name: "flags" });
+  return element(On, { trigger: flags.changed, handler: "./a.ts#loop", inputs: [settings, flags], outputs: [flags] }, 12);
+}, {}))), "may not trigger on or read its own output (app.tsx:12:1)");
+
+// Closing a two-handler cycle is rejected at the closing handler's JSX location.
+throws(() => compile(controller(element(() => {
+  const settings = useConfigMap({ name: "settings" });
+  const left = useHandlerOutput({ name: "left" });
+  const right = useHandlerOutput({ name: "right" });
+  return element(Fragment, {
+    children: [
+      element(On, { id: "west", trigger: settings.changed, handler: "./a.ts#west", inputs: [settings, right], outputs: [left] }, 20),
+      element(On, { id: "east", trigger: left.changed, handler: "./b.ts#east", inputs: [left], outputs: [right] }, 21),
+    ],
+  });
+}, {}))), "closes a handler graph cycle through input-changed triggers: east -> west -> east (app.tsx:21:1)");
+
+// The trigger must be a `.changed` event: a data projection, an output ref
+// itself, or a plain value is rejected, as is a non-reference input.
+for (const pick of [
+  (flags: ReturnType<typeof useHandlerOutput>) => flags.data,
+  (flags: ReturnType<typeof useHandlerOutput>) => flags,
+  () => ({}),
+]) {
+  throws(() => compile(controller(element(() => {
+    const settings = useConfigMap({ name: "settings" });
+    const flags = useHandlerOutput({ name: "flags" });
+    return element(On, { trigger: pick(flags) as unknown as DataProjection, handler: "./a.ts#run", inputs: [settings, flags], outputs: [] }, 30);
+  }, {}))), "On.trigger requires a `.changed` event");
+}
+for (const input of [{ data: {} }, "settings", null]) {
+  throws(() => compile(controller(element(() => {
+    const settings = useConfigMap({ name: "settings" });
+    return element(On, { trigger: settings.changed, handler: "./a.ts#run", inputs: [settings, input], outputs: [] }, 31);
+  }, {}))), "On.inputs requires a reference from this Controller");
+}

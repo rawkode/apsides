@@ -17,9 +17,10 @@ export interface ResourceRef<K extends ResourceKind = ResourceKind> {
   readonly changed: K extends "ConfigMap" ? ChangeEvent : never;
 }
 export interface ObservedReference { readonly data: DataProjection; readonly changed: ChangeEvent }
-/** A handler-written managed ConfigMap output: usable as `<On outputs>` and,
- * via `.data`, in `rolloutOn`. */
-export interface HandlerOutputRef { readonly [handlerOutputBrand]: true; readonly data: DataProjection }
+/** A handler-written managed ConfigMap output: usable as `<On outputs>`,
+ * via `.data` in `rolloutOn`, and -- to chain handlers -- as another
+ * `<On>`'s input and, via `.changed`, its trigger. */
+export interface HandlerOutputRef { readonly [handlerOutputBrand]: true; readonly data: DataProjection; readonly changed: ChangeEvent }
 type ResourceKind = "ConfigMap" | "Deployment" | "Service";
 type LifecycleProps = { readonly deletionPolicy?: "orphan" | "delete"; readonly force?: boolean };
 export type ControllerProps = Omit<model.DomainOptions, "provenance"> & { readonly children?: ApsidesNode };
@@ -50,7 +51,7 @@ export interface HandlerProps {
   readonly id?: string;
   readonly trigger: ChangeEvent;
   readonly handler: string;
-  readonly inputs: readonly (ObservedReference | ResourceRef<"ConfigMap">)[];
+  readonly inputs: readonly (ObservedReference | ResourceRef<"ConfigMap"> | HandlerOutputRef)[];
   readonly egress?: readonly string[];
   readonly outputs?: readonly HandlerOutputRef[];
   readonly timeoutMillis?: number;
@@ -87,6 +88,7 @@ interface ProjectionState { readonly owner: RenderState; readonly ref?: Referenc
 const references = new WeakMap<object, ReferenceState>();
 const projections = new WeakMap<object, ProjectionState>();
 const handlerOutputs = new WeakMap<object, model.HandlerOutputInput>();
+const changeEvents = new WeakSet<object>();
 interface RenderState {
   readonly domain: model.Domain;
   readonly namespace: string;
@@ -133,6 +135,7 @@ const makeProjection = (state: ProjectionState): DataProjection => {
 const makeChangeEvent = (state: ProjectionState): ChangeEvent => {
   const value = Object.freeze(Object.create(null)) as ChangeEvent;
   projections.set(value, state);
+  changeEvents.add(value);
   return value;
 };
 export const useResourceRef = <K extends ResourceKind>(kind: K): ResourceRef<K> => {
@@ -156,14 +159,16 @@ export const useConfigMap = (options: ObserveProps): ObservedReference => { retu
 export const useSecret = (options: ObserveProps): ObservedReference => { return observe(model.Secret, options); };
 
 /** Declare a handler `Output`: a managed ConfigMap the handler writes to,
- * usable as `<On outputs>` and, through `.data`, in `rolloutOn`. */
+ * usable as `<On outputs>`, through `.data` in `rolloutOn`, and as another
+ * `<On>`'s input and (through `.changed`) trigger, lowered to the output's
+ * Output-mode input. */
 export const useHandlerOutput = (options: HandlerOutputProps): HandlerOutputRef => {
   const { state, source } = requireFrame();
   const raw = record(options, "handler output");
   for (const key of Object.keys(raw)) if (!["id", "name", "namespace"].includes(key)) throw new Error(`unsupported handler output field: ${key}`);
   const supplied = { ...raw, namespace: raw.namespace ?? state.namespace, source } as { readonly id?: string; readonly name: string; readonly namespace: string; readonly source: model.SourceLocation };
   const output = model.defineHandlerOutput(state.domain, supplied);
-  const value = Object.freeze({ data: makeProjection({ owner: state, observed: output }) }) as HandlerOutputRef;
+  const value = Object.freeze({ data: makeProjection({ owner: state, observed: output }), changed: makeChangeEvent({ owner: state, observed: output }) }) as HandlerOutputRef;
   handlerOutputs.set(value, output);
   return value;
 };
@@ -325,11 +330,13 @@ const declareHandlerFromProps = (owner: RenderState, props: HandlerProps, source
   const modulePath = raw.handler.slice(0, separator);
   const exportName = raw.handler.slice(separator + 1);
 
-  const triggerProjection = raw.trigger !== null && typeof raw.trigger === "object" ? projections.get(raw.trigger as object) : undefined;
-  const triggerTarget = resolveProjectionTarget(triggerProjection, owner, "On.trigger");
+  if (raw.trigger === null || typeof raw.trigger !== "object" || !changeEvents.has(raw.trigger)) {
+    throw new Error("On.trigger requires a `.changed` event of a ConfigMap reference or handler output");
+  }
+  const triggerTarget = resolveProjectionTarget(projections.get(raw.trigger), owner, "On.trigger");
   const triggerId = inputIdOf(triggerTarget);
 
-  if (!Array.isArray(raw.inputs) || raw.inputs.length === 0) throw new Error("On.inputs requires a non-empty array of ConfigMap references");
+  if (!Array.isArray(raw.inputs) || raw.inputs.length === 0) throw new Error("On.inputs requires a non-empty array of ConfigMap references or handler outputs");
   const inputIds = raw.inputs.map((entry) => {
     const dataValue = entry !== null && typeof entry === "object" ? (entry as { data?: unknown }).data : undefined;
     const projection = dataValue !== null && typeof dataValue === "object" ? projections.get(dataValue as object) : undefined;

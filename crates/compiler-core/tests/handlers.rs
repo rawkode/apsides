@@ -105,7 +105,17 @@ fn handler_may_not_trigger_on_or_read_its_own_output() -> TestResult {
 }
 
 #[test]
-fn two_handler_cycle_is_rejected() -> TestResult {
+fn handler_may_not_trigger_on_its_own_output() -> TestResult {
+    let mut value = fixture();
+    value["handlers"][0]["trigger"]["input"] = json!("output-flags-input");
+    value["handlers"][0]["inputs"] = json!(["output-flags-input"]);
+    expect_err(&value, "may not trigger on or read its own output")
+}
+
+/// `fixture()` plus a second output, "other" (resource `output-other`,
+/// Output-mode input `output-other-input`), and `handler-b`, which
+/// triggers on and reads `sync-flags`' output `flags` and writes "other".
+fn chained_fixture() -> TestResult<Value> {
     let mut value = fixture();
     value["resources"]
         .as_array_mut()
@@ -131,6 +141,26 @@ fn two_handler_cycle_is_rejected() -> TestResult {
         "inputs": ["output-flags-input"], "egress": [], "outputs": ["output-other"],
         "timeoutMillis": 30000, "maxHeapBytes": 67_108_864, "bundleSha256": "1".repeat(64), "source": source(),
     }));
+    Ok(value)
+}
+
+#[test]
+fn a_handler_may_trigger_on_and_read_another_handlers_output() -> TestResult {
+    let compiled = plan(&chained_fixture()?)?;
+    let downstream = compiled
+        .ir
+        .handlers
+        .iter()
+        .find(|handler| handler.id == "handler-b")
+        .ok_or("handler-b must be declared")?;
+    assert_eq!(downstream.trigger.input, "output-flags-input");
+    assert_eq!(downstream.inputs, ["output-flags-input"]);
+    Ok(())
+}
+
+#[test]
+fn two_handler_cycle_is_rejected() -> TestResult {
+    let mut value = chained_fixture()?;
     // handler-a (the original "sync-flags") now also reads handler-b's
     // output, closing the cycle: a -> flags -> b -> other -> a.
     value["handlers"][0]["inputs"] = json!(["settings", "output-other-input"]);

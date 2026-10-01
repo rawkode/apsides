@@ -3827,6 +3827,190 @@ export { deriveKeys };
                 );
                 Ok(())
             }
+
+            /// Handler chaining through the whole `run_cycle` path:
+            /// `consume` reads `derive-keys`' output. In the first cycle
+            /// both are queued; `consume` is held with
+            /// `handler-upstream-pending` (its upstream is queued at the
+            /// start of the cycle) and `derive-keys` runs and commits. In
+            /// the second cycle the upstream's output agrees with its
+            /// current revision, so `consume` -- re-coalesced onto the
+            /// committed data -- is dispatched.
+            mod handler_chain_dispatch {
+                use super::*;
+
+                const CONSUME_BUNDLE: &str = r"
+async function consume(event) {
+	return { keys: Object.keys(event.inputs['output-input-handler-derived'].data) };
+}
+export { consume };
+";
+                const CHAIN_HANDLERS: &[(&str, &str)] = &[
+                    ("consume", CONSUME_BUNDLE),
+                    ("derive-keys", DERIVE_KEYS_BUNDLE),
+                ];
+
+                fn chain_plan() -> TestResult<CompiledPlan> {
+                    let mut ir: Value =
+                        serde_json::from_str(&serde_json::to_string(&real_plan()?.ir)?)?;
+                    let source = json!({"file":"program.tsx","line":1,"column":1});
+                    ir["handlers"].as_array_mut().ok_or("handlers")?.insert(0, json!({
+                        "id":"consume","module":"handlers/consume.ts","export":"consume",
+                        "trigger":{"kind":"input-changed","input":"output-input-handler-derived"},
+                        "inputs":["output-input-handler-derived"],"egress":[],"outputs":[],
+                        "timeoutMillis":5_000,"maxHeapBytes":8_388_608,
+                        "bundleSha256":"0".repeat(64),"source":source,
+                    }));
+                    ir["provenance"]["inputs"]
+                        .as_array_mut()
+                        .ok_or("provenance")?
+                        .insert(
+                            0,
+                            json!({"path":"handlers/consume.ts","sha256":"2".repeat(64)}),
+                        );
+                    Ok(parse_and_validate(&ir.to_string())?)
+                }
+
+                fn derived_observation(data: &[(&str, &str)]) -> Observation {
+                    Observation::Available {
+                        data: data
+                            .iter()
+                            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                            .collect(),
+                        resource_version: "1".into(),
+                    }
+                }
+
+                fn status(
+                    runtime: &crate::handlers::HandlerRuntime,
+                    id: &str,
+                ) -> TestResult<(Option<u64>, usize)> {
+                    let status = runtime
+                        .statuses()
+                        .into_iter()
+                        .find(|status| status.id == id)
+                        .ok_or("handler status must exist")?;
+                    Ok((status.last_run_millis_ago, status.queue_depth))
+                }
+
+                /// The revision the upstream's real (non-dry-run) commit
+                /// PATCH stamped onto its output.
+                fn committed_revision(calls: &Calls) -> TestResult<String> {
+                    let calls = calls.lock().map_err(|_| "calls mutex is poisoned")?;
+                    let real_patch = calls
+                        .iter()
+                        .rev()
+                        .find(|(method, uri, _)| {
+                            *method == Method::PATCH && !uri.contains("dryRun")
+                        })
+                        .ok_or("expected the upstream's real commit PATCH")?;
+                    Ok(real_patch.2["metadata"]["annotations"]
+                        [crate::handlers::HANDLER_INPUT_REVISION_ANNOTATION]
+                        .as_str()
+                        .ok_or("the commit stamps the upstream's revision")?
+                        .to_owned())
+                }
+
+                /// The upstream's committed output as `outputs_still_agree`
+                /// re-reads it: same uid, stamped with `revision`.
+                fn agreeing_output(revision: &str) -> Value {
+                    json!({
+                        "apiVersion":"v1","kind":"ConfigMap",
+                        "metadata":{"name":"handler-derived","namespace":"workload","uid":"handler-derived-uid","resourceVersion":"6",
+                            "annotations":{crate::handlers::HANDLER_INPUT_REVISION_ANNOTATION: revision}},
+                        "data":{"a":"1","b":"2"},
+                    })
+                }
+
+                #[tokio::test]
+                async fn a_downstream_handler_waits_for_its_settled_upstream() -> TestResult {
+                    let plan = chain_plan()?;
+                    let policy = policy(&plan);
+                    let activation = handler_activation(&plan, &policy, &["handler-derived"])?;
+                    let (client, calls) = wire(commit_wire_responses(&activation, &policy)?);
+                    let controller = controller(&plan, &activation, client)?;
+                    let mut handler_runtime = crate::handlers::HandlerRuntime::new(
+                        &plan,
+                        CHAIN_HANDLERS,
+                        "apsides-handler-example".into(),
+                        Duration::from_millis(1),
+                        Duration::from_millis(10),
+                        None,
+                    )?;
+                    let applied_set = BTreeSet::from(["handler-derived".to_owned()]);
+                    let output_uids = BTreeMap::from([(
+                        "handler-derived".to_owned(),
+                        "handler-derived-uid".to_owned(),
+                    )]);
+                    let mut observations = BTreeMap::from([
+                        (
+                            "handler-source".to_owned(),
+                            derived_observation(&[("a", "1"), ("b", "2")]),
+                        ),
+                        (
+                            "output-input-handler-derived".to_owned(),
+                            derived_observation(&[]),
+                        ),
+                    ]);
+
+                    let (unused_client, _unused_calls) = wire(vec![]);
+                    let conditions = handler_runtime
+                        .run_cycle(
+                            &plan,
+                            &observations,
+                            &applied_set,
+                            &output_uids,
+                            &unused_client,
+                            &controller,
+                        )
+                        .await?;
+                    assert_eq!(
+                        conditions,
+                        [RuntimeCondition {
+                            reason_code: "handler-upstream-pending".into(),
+                            resource_name: Some("consume".into()),
+                        }],
+                        "only the downstream is held, while its upstream runs"
+                    );
+                    assert_eq!(
+                        status(&handler_runtime, "consume")?,
+                        (None, 1),
+                        "held, still queued, never run"
+                    );
+                    assert!(
+                        status(&handler_runtime, "derive-keys")?.0.is_some(),
+                        "the upstream ran"
+                    );
+
+                    observations.insert(
+                        "output-input-handler-derived".to_owned(),
+                        derived_observation(&[("a", "1"), ("b", "2")]),
+                    );
+                    let (agree_client, _agree_calls) =
+                        wire(vec![agreeing_output(&committed_revision(&calls)?)]);
+                    let conditions = handler_runtime
+                        .run_cycle(
+                            &plan,
+                            &observations,
+                            &applied_set,
+                            &output_uids,
+                            &agree_client,
+                            &controller,
+                        )
+                        .await?;
+                    assert!(
+                        conditions.is_empty(),
+                        "the downstream runs cleanly: {conditions:?}"
+                    );
+                    let (last_run, queue_depth) = status(&handler_runtime, "consume")?;
+                    assert!(
+                        last_run.is_some(),
+                        "the downstream ran once its upstream settled"
+                    );
+                    assert_eq!(queue_depth, 0);
+                    Ok(())
+                }
+            }
         }
     }
 }

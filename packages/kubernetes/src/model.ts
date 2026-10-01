@@ -720,11 +720,15 @@ export class Domain {
       if (!this.#state.outputs.has(outputId)) throw new Error(`handler ${id} has unresolved output ${outputId}`);
       if (this.#state.claimedOutputs.has(outputId)) throw new Error(`output ${outputId} already has a writer handler`);
     }
-    for (const inputId of inputs) {
-      const input = this.#state.inputs.get(inputId)!;
-      if (input.mode === "output" && input.managedResourceId !== undefined && outputs.includes(input.managedResourceId)) {
-        throw new Error(`handler ${id} may not trigger on or read its own output`);
-      }
+    const source = validateSource(options.source, "handler.source");
+    const at = `${source.file}:${String(source.line)}:${String(source.column)}`;
+    const read = this.#outputsReadThrough(inputs);
+    if (outputs.some((outputId) => read.has(outputId))) {
+      throw new Error(`handler ${id} may not trigger on or read its own output (${at})`);
+    }
+    const cycle = this.#handlerCycleThrough(id, outputs, read);
+    if (cycle !== undefined) {
+      throw new Error(`handler ${id} closes a handler graph cycle through input-changed triggers: ${cycle.join(" -> ")} (${at})`);
     }
     const egressSeen = new Set<string>();
     const egress = options.egress.map((host) => {
@@ -745,7 +749,6 @@ export class Domain {
     const existingEgressRows = [...this.#state.handlers.values()].reduce((sum, handler) => sum + handler.egress.length, 0);
     const totalEgressRows = existingEgressRows + egress.length;
     if (totalEgressRows > MAX_EGRESS_ROWS) throw new Error(`domain exceeds maxEgressRows budget of ${MAX_EGRESS_ROWS}`);
-    const source = validateSource(options.source, "handler.source");
     const declaration = freeze(canonical({
       id,
       module,
@@ -761,6 +764,40 @@ export class Domain {
     }) as unknown as HandlerDeclaration);
     this.#state.handlers.set(id, declaration);
     for (const outputId of outputs) this.#state.claimedOutputs.add(outputId);
+  }
+
+  /** The outputs read through the Output-mode inputs among `inputIds`. */
+  #outputsReadThrough(inputIds: readonly string[]): Set<string> {
+    const read = new Set<string>();
+    for (const inputId of inputIds) {
+      const input = this.#state.inputs.get(inputId);
+      if (input?.mode === "output" && input.managedResourceId !== undefined) read.add(input.managedResourceId);
+    }
+    return read;
+  }
+
+  /**
+   * Mirrors compiler-core's handler-graph acyclicity check incrementally:
+   * the graph was acyclic before handler `id` is added, so any new cycle
+   * runs through it. Returns that cycle's handler ids (`id` first and
+   * last) when an output `id` writes reaches, through other handlers'
+   * Output-mode inputs, a handler writing an output `id` reads.
+   */
+  #handlerCycleThrough(id: string, outputs: readonly string[], read: ReadonlySet<string>): readonly string[] | undefined {
+    const seen = new Set<string>();
+    const visit = (writes: readonly string[], path: readonly string[]): readonly string[] | undefined => {
+      for (const handler of this.#state.handlers.values()) {
+        if (seen.has(handler.id)) continue;
+        const consumes = this.#outputsReadThrough(handler.inputs);
+        if (!writes.some((outputId) => consumes.has(outputId))) continue;
+        seen.add(handler.id);
+        if (handler.outputs.some((outputId) => read.has(outputId))) return [...path, handler.id, id];
+        const found = visit(handler.outputs, [...path, handler.id]);
+        if (found !== undefined) return found;
+      }
+      return undefined;
+    };
+    return visit(outputs, [id]);
   }
 
   #addInput(input: InputDeclaration): InputDeclaration {

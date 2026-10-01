@@ -67,7 +67,11 @@ establish narrower properties.
 - The runtime computes each handler's input revision every cycle, coalesces
   queued events to the latest revision, dispatches at most one invocation per
   cycle at global concurrency 1, and only once the handler's outputs were
-  applied in that cycle (`handler-output-not-ready` otherwise). A full queue
+  applied in that cycle (`handler-output-not-ready` otherwise) and every
+  upstream handler whose output it reads is settled, with all of that
+  upstream's outputs recording one revision (`handler-upstream-pending`
+  otherwise). Handlers chain from TSX through a handler output's `.changed`
+  event and as `<On inputs>`. A full queue
   reports `handler-queue-overflow`; failures report
   `handler-invocation-failed:<CODE>` and retry with backoff (at-least-once
   delivery). Output writes are buffered and committed after success as one

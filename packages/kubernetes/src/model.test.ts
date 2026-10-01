@@ -558,8 +558,33 @@ throws(() => constrained.manage(new ConfigMap({ metadata: { name: "two", namespa
   }), "may not trigger on or read its own output");
 }
 
-// A two-handler cycle (A writes an output B reads, and B writes an output A
-// reads) is accepted by each individual `defineHandler` call above — the
-// cross-handler graph is only complete once every handler is declared — so
-// that whole-graph acyclicity is validated by compiler-core's `validate()`
-// (see crates/compiler-core/tests/handlers.rs), not the SDK.
+{
+  // Handler chaining mirrors compiler-core's handler-graph check: the graph
+  // is acyclic before each `defineHandler` call, so the call that closes a
+  // cycle is the one rejected, naming the cycle and its source location.
+  const value = domain("handler-chain");
+  const settings = value.observe(ConfigMap, { name: "settings", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  const raw = defineHandlerOutput(value, { name: "raw", source });
+  const derived = defineHandlerOutput(value, { name: "derived", source });
+  const summary = defineHandlerOutput(value, { name: "summary", source });
+  const handler = (id: string, trigger: string, inputs: readonly string[], outputs: readonly string[], line = 1) => defineHandler(value, {
+    id,
+    module: `./handlers/${id}.ts`,
+    export: "run",
+    trigger: { kind: "input-changed", input: trigger },
+    inputs,
+    egress: [],
+    outputs,
+    source: { ...source, line },
+  });
+  handler("fetch-raw", settings.id, [settings.id, summary.id], [raw.outputId]);
+  handler("derive", raw.id, [raw.id], [derived.outputId]);
+  const chained = value.toIR().handlers.find((entry) => entry.id === "derive")!;
+  equal(chained.trigger.input, raw.id, "a chained trigger lowers to the upstream output's Output-mode input");
+  throws(() => handler("summarize", derived.id, [derived.id], [summary.outputId], 9), "closes a handler graph cycle through input-changed triggers: summarize -> fetch-raw -> derive -> summarize");
+  throws(() => handler("summarize", derived.id, [derived.id], [summary.outputId], 9), `(${source.file}:9:${String(source.column)})`);
+  const own = defineHandlerOutput(value, { name: "own", source });
+  throws(() => handler("loop", own.id, [own.id], [own.outputId], 4), `may not trigger on or read its own output (${source.file}:4:${String(source.column)})`);
+  handler("summarize", derived.id, [derived.id], []);
+  equal(value.toIR().handlers.length, 3, "a rejected handler leaves no trace; the acyclic chain is kept");
+}
