@@ -106,7 +106,7 @@ fn events_example_surface_lists_its_handler_egress_output_and_rollout() -> Resul
     );
     assert_eq!(
         surface["reactions"],
-        json!([{"input": "output-input-feature-flags", "target": "deployment-storefront"}])
+        json!([{"input": "feature-flags", "target": "deployment-storefront"}])
     );
     Ok(())
 }

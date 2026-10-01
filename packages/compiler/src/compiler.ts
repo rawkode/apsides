@@ -181,7 +181,7 @@ export const compileApsides = async (sourceFile: string, output: string): Promis
       scope: "Canonical author payload from the digest-locked TypeScript closure evaluated in a pinned SES Compartment with only the hardened declared build input, hosted by the recorded denied-permission Deno runtime.",
       limitation: "This is a bounded source-build contract, not a proof that arbitrary JavaScript is deterministic across unrecorded toolchains or architectures.",
     },
-    typecheck: { engine: "deno", status: "passed", remote: false, npm: false, config: { jsx: "react-jsxdev", jsxImportSource: SDK_PACKAGE, importMap: "generated-local-sdk-only" }, handlers: { ...HANDLER_COMPILER_OPTIONS, declarations: SDK_HANDLER_IMPORT, unavailableGlobals: [...UNAVAILABLE_HANDLER_GLOBALS] } },
+    typecheck: { engine: "deno", status: "passed", remote: false, npm: false, config: { jsx: "react-jsxdev", jsxImportSource: SDK_PACKAGE, importMap: "generated-local-sdk-only" }, handlers: { ...HANDLER_COMPILER_OPTIONS, declarations: SDK_HANDLER_IMPORT, unavailableGlobals: [...UNAVAILABLE_HANDLER_GLOBALS], eventContracts: true } },
     bundleSha256: sha256(emittedProgram), evaluationBundleSha256: sha256(first.evaluationBundle), evaluationSourceSha256: sha256(evaluateSource), bundleMapSha256: sha256(canonicalString(bundleMap)),
     handlers: [...handlerBundles.files.entries()].map(([id, code]) => ({ id, path: `handlers/${id}.js`, sha256: sha256(code) })).sort((a,b) => order(a.id,b.id)),
   };
@@ -330,9 +330,28 @@ const typecheckHandlers = async (author: Map<string, Snapshot>, sdk: Map<string,
     await writeFile(declarations, sdk.get("handler.ts")!.text);
     const denoConfig = join(stage, "deno.json");
     await writeFile(denoConfig, JSON.stringify({ compilerOptions: HANDLER_COMPILER_OPTIONS, imports: { [SDK_HANDLER_IMPORT]: pathToFileURL(declarations).href } }));
-    await run(deno, ["check", "--config", denoConfig, "--no-lock", "--no-npm", "--no-remote", "--deny-import", declarations, ...modules.map(module => join(sourceDir, module))], "", { ...executionEnvironment });
+    const contracts = join(stage, "handler-contracts.ts");
+    await writeFile(contracts, handlerContracts(ir.handlers));
+    await run(deno, ["check", "--config", denoConfig, "--no-lock", "--no-npm", "--no-remote", "--deny-import", declarations, ...modules.map(module => join(sourceDir, module)), contracts], "", { ...executionEnvironment });
   } finally { await rm(stage, {recursive:true, force:true}); }
   rejectUnavailableGlobals(author, modules);
+};
+
+/**
+ * A module the handler type check includes: for every declared handler,
+ * an assignment of its export to a function taking exactly the event the
+ * runtime builds for it -- the `<On>` trigger's input id and every
+ * declared input id. A handler whose parameter names an input it is not
+ * given, or a different trigger, fails the check on that handler's line.
+ */
+const handlerContracts = (handlers: ProductionIr["handlers"]): string => {
+  const imports = handlers.map((handler, index) => `import { ${handler.export} as handler${index} } from ${JSON.stringify(`./source/${handler.module}`)};`);
+  const contracts = handlers.map((handler, index) => {
+    const inputs = handler.inputs.map(input => `readonly ${JSON.stringify(input)}: HandlerInput`).join("; ");
+    const event = `{ readonly id: string; readonly trigger: { readonly kind: "input-changed"; readonly input: ${JSON.stringify(handler.trigger.input)} }; readonly inputs: { ${inputs} } }`;
+    return `export const contract${index}: (event: ${event}) => unknown = handler${index}; // handler ${handler.id} (${handler.module}#${handler.export}) must accept the event its <On> declares`;
+  });
+  return `${[`import type { HandlerInput } from ${JSON.stringify(SDK_HANDLER_IMPORT)};`, ...imports, ...contracts].join("\n")}\n`;
 };
 
 /**

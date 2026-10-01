@@ -2714,7 +2714,7 @@ mod tests {
             "schemaVersion": compiler_core::IR_SCHEMA, "testOnly": false,
             "domain": {"id":"example","namespace":"workload","controlNamespace":"control","clusterBinding":"cluster-a","policyRef":"platform/example","enforcement":"api-bound","minKubernetesVersion":"1.34","budgets":{"maxResources":8,"maxInputs":8,"maxReactions":8,"maxObjectBytes":262_144,"maxQueueDepth":8,"maxConcurrentRequests":2}},
             "resources":[{"id":"flags","apiVersion":"v1","kind":"ConfigMap","name":"flags","namespace":"workload","handlerOutput":true,"desired":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"flags","namespace":"workload","labels":{"apsides.dev/handler-output":"flags"}}},"lifecycle":{"deletionPolicy":"orphan"},"source":{"file":"program.ts","line":1,"column":1}}],
-            "inputs":[{"id":"flags-output","apiVersion":"v1","kind":"ConfigMap","name":"flags","namespace":"workload","mode":"output","managedResourceId":"flags","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}}],
+            "inputs":[{"id":"flags","apiVersion":"v1","kind":"ConfigMap","name":"flags","namespace":"workload","mode":"output","managedResourceId":"flags","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}}],
             "reactions":[],"handlers":[],"outputs":[{"id":"flags","name":"flags","namespace":"workload"}],
             "provenance":{"compiler":"apsides/0.1","inputs":[{"path":"program.ts","sha256":"0".repeat(64)}]},
         }).to_string())?)
@@ -3251,7 +3251,7 @@ mod tests {
                 }],
                 "inputs":[
                     {"id":"settings","apiVersion":"v1","kind":"ConfigMap","name":"settings","namespace":"workload","mode":"observed","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}},
-                    {"id":"flags-output","apiVersion":"v1","kind":"ConfigMap","name":"flags","namespace":"workload","mode":"output","managedResourceId":"flags","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}}
+                    {"id":"flags","apiVersion":"v1","kind":"ConfigMap","name":"flags","namespace":"workload","mode":"output","managedResourceId":"flags","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}}
                 ],
                 "reactions":[],
                 "handlers":[{
@@ -3282,8 +3282,8 @@ mod tests {
                 ],
                 "inputs":[
                     {"id":"settings","apiVersion":"v1","kind":"ConfigMap","name":"settings","namespace":"workload","mode":"observed","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}},
-                    {"id":"flags-a-output","apiVersion":"v1","kind":"ConfigMap","name":"flags-a","namespace":"workload","mode":"output","managedResourceId":"flags-a","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}},
-                    {"id":"flags-b-output","apiVersion":"v1","kind":"ConfigMap","name":"flags-b","namespace":"workload","mode":"output","managedResourceId":"flags-b","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}}
+                    {"id":"flags-a","apiVersion":"v1","kind":"ConfigMap","name":"flags-a","namespace":"workload","mode":"output","managedResourceId":"flags-a","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}},
+                    {"id":"flags-b","apiVersion":"v1","kind":"ConfigMap","name":"flags-b","namespace":"workload","mode":"output","managedResourceId":"flags-b","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.ts","line":1,"column":1}}
                 ],
                 "reactions":[],
                 "handlers":[{
@@ -3692,7 +3692,7 @@ export { deriveKeys };
                 }],
                 "inputs":[
                     {"id":"handler-source","apiVersion":"v1","kind":"ConfigMap","name":"handler-source","namespace":"workload","mode":"observed","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.tsx","line":1,"column":1}},
-                    {"id":"output-input-handler-derived","apiVersion":"v1","kind":"ConfigMap","name":"handler-derived","namespace":"workload","mode":"output","managedResourceId":"handler-derived","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.tsx","line":1,"column":1}}
+                    {"id":"handler-derived","apiVersion":"v1","kind":"ConfigMap","name":"handler-derived","namespace":"workload","mode":"output","managedResourceId":"handler-derived","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":{"file":"program.tsx","line":1,"column":1}}
                 ],
                 "reactions":[],
                 "handlers":[{
@@ -3841,7 +3841,7 @@ export { deriveKeys };
 
                 const CONSUME_BUNDLE: &str = r"
 async function consume(event) {
-	return { keys: Object.keys(event.inputs['output-input-handler-derived'].data) };
+	return { keys: Object.keys(event.inputs['handler-derived'].data) };
 }
 export { consume };
 ";
@@ -3854,13 +3854,16 @@ export { consume };
                     let mut ir: Value =
                         serde_json::from_str(&serde_json::to_string(&real_plan()?.ir)?)?;
                     let source = json!({"file":"program.tsx","line":1,"column":1});
-                    ir["handlers"].as_array_mut().ok_or("handlers")?.insert(0, json!({
-                        "id":"consume","module":"handlers/consume.ts","export":"consume",
-                        "trigger":{"kind":"input-changed","input":"output-input-handler-derived"},
-                        "inputs":["output-input-handler-derived"],"egress":[],"outputs":[],
-                        "timeoutMillis":5_000,"maxHeapBytes":8_388_608,
-                        "bundleSha256":"0".repeat(64),"source":source,
-                    }));
+                    ir["handlers"].as_array_mut().ok_or("handlers")?.insert(
+                        0,
+                        json!({
+                            "id":"consume","module":"handlers/consume.ts","export":"consume",
+                            "trigger":{"kind":"input-changed","input":"handler-derived"},
+                            "inputs":["handler-derived"],"egress":[],"outputs":[],
+                            "timeoutMillis":5_000,"maxHeapBytes":8_388_608,
+                            "bundleSha256":"0".repeat(64),"source":source,
+                        }),
+                    );
                     ir["provenance"]["inputs"]
                         .as_array_mut()
                         .ok_or("provenance")?
@@ -3947,10 +3950,7 @@ export { consume };
                             "handler-source".to_owned(),
                             derived_observation(&[("a", "1"), ("b", "2")]),
                         ),
-                        (
-                            "output-input-handler-derived".to_owned(),
-                            derived_observation(&[]),
-                        ),
+                        ("handler-derived".to_owned(), derived_observation(&[])),
                     ]);
 
                     let (unused_client, _unused_calls) = wire(vec![]);
@@ -3983,7 +3983,7 @@ export { consume };
                     );
 
                     observations.insert(
-                        "output-input-handler-derived".to_owned(),
+                        "handler-derived".to_owned(),
                         derived_observation(&[("a", "1"), ("b", "2")]),
                     );
                     let (agree_client, _agree_calls) =

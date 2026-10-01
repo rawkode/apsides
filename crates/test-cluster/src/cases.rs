@@ -1730,7 +1730,7 @@ mod tests {
 
     fn output_input() -> Input {
         Input {
-            id: "output-flags-input".into(),
+            id: "output-flags".into(),
             api_version: "v1".into(),
             kind: "ConfigMap".into(),
             name: "flags".into(),
@@ -1799,12 +1799,12 @@ mod tests {
                 {"id": "settings", "apiVersion": "v1", "kind": "ConfigMap", "name": "settings", "namespace": "workload",
                     "mode": "observed", "projection": ["data"], "sensitive": false,
                     "missing": "block-dependent-mutations", "source": source},
-                {"id": "output-flags-input", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags", "namespace": "workload",
+                {"id": "output-flags", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags", "namespace": "workload",
                     "mode": "output", "managedResourceId": "output-flags", "projection": ["data"], "sensitive": false,
                     "missing": "block-dependent-mutations", "source": source},
             ],
             "reactions": [
-                {"id": "rollout-flags", "op": "rollout", "inputs": ["output-flags-input"], "target": "api", "source": source},
+                {"id": "rollout-flags", "op": "rollout", "inputs": ["output-flags"], "target": "api", "source": source},
             ],
             "handlers": [{
                 "id": "sync-flags", "module": "handlers/sync-flags.ts", "export": "syncFlags",
@@ -1856,7 +1856,7 @@ mod tests {
                         .iter()
                         .map(|input| input.id.as_str())
                         .collect::<Vec<_>>(),
-                    ["output-flags-input"],
+                    ["output-flags"],
                     "scenario {} resolved unexpected stimulus",
                     case.scenario
                 );

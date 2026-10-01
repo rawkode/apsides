@@ -58,7 +58,7 @@ fn handler_declaration(private: &str) -> Result<Value> {
         .ok_or("inputs missing")?
         .extend([
             json!({"id":"settings","apiVersion":"v1","kind":"ConfigMap","name":"settings","namespace":"workload","mode":"observed","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":source(14)}),
-            json!({"id":"output-flags-input","apiVersion":"v1","kind":"ConfigMap","name":"flags","namespace":"workload","mode":"output","managedResourceId":"output-flags","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":source(15)}),
+            json!({"id":"output-flags","apiVersion":"v1","kind":"ConfigMap","name":"flags","namespace":"workload","mode":"output","managedResourceId":"output-flags","projection":["data"],"sensitive":false,"missing":"block-dependent-mutations","source":source(15)}),
         ]);
     ir["handlers"] = json!([{
         "id":"sync-flags","module":"handlers/sync-flags.ts","export":"syncFlags",

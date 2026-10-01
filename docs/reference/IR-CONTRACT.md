@@ -62,7 +62,7 @@ This is the `ir.json` that `aps compile` writes for `crates/acceptance/programs/
       "source": {"file": "program.tsx", "line": 38, "column": 5}
     },
     {
-      "id": "output-input-handler-derived",
+      "id": "handler-derived",
       "apiVersion": "v1",
       "kind": "ConfigMap",
       "name": "handler-derived",
@@ -115,7 +115,7 @@ A resource may carry `handlerOutput: true` (default `false`): it is the managed 
 
 Inputs have `{id, apiVersion, kind, name, namespace, mode, managedResourceId?, projection, sensitive, missing, source}`. Kinds are `ConfigMap` or `Secret`, `apiVersion` is `v1`, mode is `managed`, `observed` or `output`, projection is exactly `["data"]`, and missing is exactly `block-dependent-mutations`. Managed inputs reference a declared ConfigMap with matching identity and use authoritative desired data. Observed inputs must not alias a managed resource. Secret inputs must be observed and sensitive. ConfigMap inputs are always non-sensitive, in every mode. Fixture values are external to production IR.
 
-`output`-mode inputs are created by `useHandlerOutput` for each handler output, with `managedResourceId` naming its `handlerOutput` resource. They are non-sensitive `ConfigMap` inputs, exempt from the observed/managed aliasing rule (their identity intentionally matches their own output resource), and are observed live the same way as `observed` inputs — never treated as the reconciler's own authoritative desired state. A `managed`-mode input may not reference a `handlerOutput` resource: it would read the reconciler's static desired value, which never carries `data`.
+`output`-mode inputs are created by `useHandlerOutput` for each handler output, with `managedResourceId` naming its `handlerOutput` resource and an `id` equal to that output's id, so a handler reads an output under the output's own id. They are non-sensitive `ConfigMap` inputs, exempt from the observed/managed aliasing rule (their identity intentionally matches their own output resource), and are observed live the same way as `observed` inputs — never treated as the reconciler's own authoritative desired state. A `managed`-mode input may not reference a `handlerOutput` resource: it would read the reconciler's static desired value, which never carries `data`.
 
 Reactions have `{id, op: "rollout", inputs: [inputId, ...], target: resourceId, source}`. Targets must be managed Deployments. Any input mode may feed a reaction, including an `output`-mode input, so a handler's written data can roll a Deployment out. Multiple reactions contributing to one target are combined into a single stable revision. Input IDs and reaction IDs are part of the canonical digest. The reserved annotation is `apsides.dev/revision`; source must not supply it. There are no generic expressions, callback operations, runtime names, adoption, delegated fields or readiness predicates; such requests fail validation.
 

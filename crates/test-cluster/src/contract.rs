@@ -452,11 +452,11 @@ mod tests {
             ],
             "inputs": [
                 {"id": "settings", "apiVersion": "v1", "kind": "ConfigMap", "name": "settings", "namespace": "workload", "mode": "observed", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source},
-                {"id": "output-flags-input", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags", "namespace": "workload", "mode": "output", "managedResourceId": "output-flags", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source},
+                {"id": "output-flags", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags", "namespace": "workload", "mode": "output", "managedResourceId": "output-flags", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source},
             ],
             "reactions": [
-                {"id": "output-only", "op": "rollout", "inputs": ["output-flags-input"], "target": "output-only", "source": source},
-                {"id": "rollout-mixed", "op": "rollout", "inputs": ["settings", "output-flags-input"], "target": "mixed", "source": source},
+                {"id": "output-only", "op": "rollout", "inputs": ["output-flags"], "target": "output-only", "source": source},
+                {"id": "rollout-mixed", "op": "rollout", "inputs": ["settings", "output-flags"], "target": "mixed", "source": source},
             ],
             "handlers": [{
                 "id": "sync-flags", "module": "handlers/sync-flags.ts", "export": "syncFlags",
@@ -568,7 +568,7 @@ await Deno.writeTextFile(`${{destination}}/fixture-coverage.json`, JSON.stringif
             .ok_or_else(|| crate::Error::Case("expected one projected-change row".into()))?;
         assert_eq!(
             projected.applicability.input_ids,
-            ["output-flags-input", "settings"]
+            ["output-flags", "settings"]
         );
         assert_eq!(projected.applicability.input_modes, ["observed", "output"]);
         Ok(())

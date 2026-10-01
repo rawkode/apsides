@@ -1484,8 +1484,8 @@ mod tests {
                 ],
                 "inputs": [
                     {"id": "settings", "apiVersion": "v1", "kind": "ConfigMap", "name": "settings", "namespace": "workload", "mode": "observed", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source()},
-                    {"id": "flags-a-output", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags-a", "namespace": "workload", "mode": "output", "managedResourceId": "flags-a", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source()},
-                    {"id": "flags-b-output", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags-b", "namespace": "workload", "mode": "output", "managedResourceId": "flags-b", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source()},
+                    {"id": "flags-a", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags-a", "namespace": "workload", "mode": "output", "managedResourceId": "flags-a", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source()},
+                    {"id": "flags-b", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags-b", "namespace": "workload", "mode": "output", "managedResourceId": "flags-b", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source()},
                 ],
                 "reactions": [],
                 "handlers": [{
@@ -1742,16 +1742,16 @@ mod tests {
                 },
                 "resources": [output_resource("derived"), output_resource("raw-a"), output_resource("raw-b")],
                 "inputs": [
-                    input("derived-output", "derived", "output"),
-                    input("raw-a-output", "raw-a", "output"),
-                    input("raw-b-output", "raw-b", "output"),
+                    input("derived", "derived", "output"),
+                    input("raw-a", "raw-a", "output"),
+                    input("raw-b", "raw-b", "output"),
                     input("settings", "settings", "observed"),
                 ],
                 "reactions": [],
                 "handlers": [
                     {"id": "derive", "module": "handlers/derive.ts", "export": "derive",
-                     "trigger": {"kind": "input-changed", "input": "raw-a-output"},
-                     "inputs": ["raw-a-output", "raw-b-output"], "egress": [], "outputs": ["derived"],
+                     "trigger": {"kind": "input-changed", "input": "raw-a"},
+                     "inputs": ["raw-a", "raw-b"], "egress": [], "outputs": ["derived"],
                      "timeoutMillis": 5_000, "maxHeapBytes": 8_388_608, "bundleSha256": "0".repeat(64), "source": source()},
                     {"id": "fetch-raw", "module": "handlers/fetch-raw.ts", "export": "fetchRaw",
                      "trigger": {"kind": "input-changed", "input": "settings"},
@@ -1797,8 +1797,8 @@ mod tests {
         fn observations(raw_b: &str) -> BTreeMap<String, Observation> {
             BTreeMap::from([
                 ("settings".to_owned(), available(&[("flag", "on")])),
-                ("raw-a-output".to_owned(), available(&[("value", "new")])),
-                ("raw-b-output".to_owned(), available(&[("value", raw_b)])),
+                ("raw-a".to_owned(), available(&[("value", "new")])),
+                ("raw-b".to_owned(), available(&[("value", raw_b)])),
             ])
         }
 
@@ -2016,7 +2016,7 @@ mod tests {
             );
 
             let mut without_raw_b = observations("new");
-            without_raw_b.insert("raw-b-output".to_owned(), Observation::Missing);
+            without_raw_b.insert("raw-b".to_owned(), Observation::Missing);
             runtime
                 .detect_triggers(&plan, &without_raw_b, &client, &mut Vec::new())
                 .await;

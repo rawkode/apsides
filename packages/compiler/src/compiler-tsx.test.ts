@@ -119,8 +119,8 @@ export default async () => {
 
   const handlerProgram = `import { Controller, On, useConfigMap, useHandlerOutput } from "@apsides/kubernetes";
 const HandlerApp = () => {
-  const settings = useConfigMap({ name: "settings" });
-  const flags = useHandlerOutput({ name: "flags" });
+  const settings = useConfigMap({ id: "settings", name: "settings" });
+  const flags = useHandlerOutput({ id: "flags", name: "flags" });
   return <On trigger={settings.changed} handler="./handlers/sync-flags.ts#syncFlags" inputs={[settings]} egress={["api.example.com"]} outputs={[flags]} />;
 };
 export default (
@@ -181,7 +181,7 @@ export async function syncFlags(event: HandlerEvent<"settings">) {
     const bundle = await readFile(join(typed.output, "handlers", `${ir.handlers[0].id}.js`), "utf8");
     assert.doesNotMatch(bundle, /@apsides\/kubernetes/, "the type-only SDK import is erased from the handler bundle");
     const inputs = JSON.parse(await readFile(join(typed.output, "build-inputs.json"), "utf8"));
-    assert.deepEqual(inputs.typecheck.handlers, { checkJs: true, declarations: "@apsides/kubernetes/handler", lib: ["esnext"], strict: true, unavailableGlobals: ["SharedArrayBuffer"], verbatimModuleSyntax: true });
+    assert.deepEqual(inputs.typecheck.handlers, { checkJs: true, declarations: "@apsides/kubernetes/handler", lib: ["esnext"], strict: true, unavailableGlobals: ["SharedArrayBuffer"], verbatimModuleSyntax: true, eventContracts: true });
 
     const rejected: [string, string, string][] = [
       ["a type error", handlerModule.replace(`"environment", environment`, `"environment", 42`), "a wrong argument type fails the build"],
@@ -190,6 +190,9 @@ export async function syncFlags(event: HandlerEvent<"settings">) {
       ["a Deno global", handlerModule.replace("queueMicrotask(() => {});", "Deno.env.get(\"HOME\");"), "Deno does not exist in the engine"],
       ["an implicit any", "export async function syncFlags(event) { return event; }\n", "strict mode rejects an untyped event"],
       ["a type used through a value import", handlerModule.replace("import type { HandlerEvent }", "import { HandlerEvent }"), "verbatimModuleSyntax requires import type for types"],
+      ["an input the <On> does not declare", `import type { HandlerEvent } from "@apsides/kubernetes/handler";\nexport async function syncFlags(event: HandlerEvent<"other">) { return event.inputs.other.data; }\n`, "the event contract rejects an undeclared input id"],
+      ["an extra input id", `import type { HandlerEvent } from "@apsides/kubernetes/handler";\nexport async function syncFlags(event: HandlerEvent<"settings" | "extra">) { return event.inputs.settings.data; }\n`, "the event contract rejects an input id the handler is not given"],
+      ["a missing export", handlerModule.replace("export async function syncFlags", "export async function syncFlag"), "the event contract requires the declared export"],
     ];
     for (const [label, source, message] of rejected) {
       const broken = await fixture({ "program.tsx": handlerProgram, "handlers/sync-flags.ts": source }, "program.tsx");

@@ -9,9 +9,9 @@
 import type { HandlerEvent } from "@apsides/kubernetes/handler";
 
 export async function summarizeEntries(
-  event: HandlerEvent<"output-input-handler-derived">,
+  event: HandlerEvent<"handler-derived">,
 ): Promise<{ entries: string }> {
-  const data = event.inputs["output-input-handler-derived"].data;
+  const data = event.inputs["handler-derived"].data;
   const entries = Object.keys(data)
     .sort()
     .map((key) => `${key}=${data[key]}`)

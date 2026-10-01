@@ -93,7 +93,8 @@ const flags = useHandlerOutput({ id: "resolved-flags", name: "resolved-flags" })
   (`aps lock --source program.tsx --modules handlers/resolve-flags.ts`) and
   may import only other locked modules through relative specifiers, plus
   `import type` from `@apsides/kubernetes/handler`. `aps compile` type-checks
-  it in strict mode against the ECMAScript library and those declarations.
+  it in strict mode against the ECMAScript library and those declarations,
+  and checks that the export accepts the event its `<On>` produces.
 - Inputs are non-sensitive `ConfigMap` observations or references; Secrets
   cannot reach a handler. The trigger must be one of the inputs.
 - `egress` lists the HTTPS hosts the handler may call; `outputs` lists the

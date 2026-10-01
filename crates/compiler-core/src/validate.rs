@@ -468,26 +468,35 @@ fn validate_inputs<'a>(
                     "observed input aliases a managed resource; use managed mode",
                 )?;
             }
-            InputMode::Output => {
-                require(!input.sensitive, "handler output input cannot be sensitive")?;
-                let resource = input
-                    .managed_resource_id
-                    .as_ref()
-                    .and_then(|id| resources.get(id))
-                    .ok_or_else(|| {
-                        Error::Invalid("output input requires an existing managedResourceId".into())
-                    })?;
-                require(
-                    input.kind == "ConfigMap"
-                        && resource.handler_output
-                        && resource.name == input.name
-                        && resource.namespace == input.namespace,
-                    "output input identity differs from its handler output resource",
-                )?;
-            }
+            InputMode::Output => validate_output_input(input, resources)?,
         }
     }
     Ok(inputs)
+}
+
+/// An `output`-mode input is the non-sensitive `ConfigMap` observation of
+/// one `handlerOutput` resource, with the same identity and the same id,
+/// so a handler reads an output under the output's own id.
+fn validate_output_input(input: &Input, resources: &BTreeMap<String, &Resource>) -> Result<()> {
+    require(!input.sensitive, "handler output input cannot be sensitive")?;
+    let resource = input
+        .managed_resource_id
+        .as_ref()
+        .and_then(|id| resources.get(id))
+        .ok_or_else(|| {
+            Error::Invalid("output input requires an existing managedResourceId".into())
+        })?;
+    require(
+        input.kind == "ConfigMap"
+            && resource.handler_output
+            && resource.name == input.name
+            && resource.namespace == input.namespace,
+        "output input identity differs from its handler output resource",
+    )?;
+    require(
+        input.managed_resource_id.as_deref() == Some(input.id.as_str()),
+        "output input id must equal its handler output id",
+    )
 }
 
 fn validate_reactions(

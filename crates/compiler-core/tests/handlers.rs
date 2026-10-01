@@ -37,7 +37,7 @@ fn fixture() -> Value {
         ],
         "inputs": [
             {"id": "settings", "apiVersion": "v1", "kind": "ConfigMap", "name": "settings", "namespace": "workload", "mode": "observed", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source()},
-            {"id": "output-flags-input", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags", "namespace": "workload", "mode": "output", "managedResourceId": "output-flags", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source()},
+            {"id": "output-flags", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags", "namespace": "workload", "mode": "output", "managedResourceId": "output-flags", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source()},
             {"id": "credentials", "apiVersion": "v1", "kind": "Secret", "name": "credentials", "namespace": "workload", "mode": "observed", "projection": ["data"], "sensitive": true, "missing": "block-dependent-mutations", "source": source()},
         ],
         "reactions": [],
@@ -100,20 +100,20 @@ fn handler_input_must_be_non_sensitive_configmap() -> TestResult {
 #[test]
 fn handler_may_not_trigger_on_or_read_its_own_output() -> TestResult {
     let mut value = fixture();
-    value["handlers"][0]["inputs"] = json!(["settings", "output-flags-input"]);
+    value["handlers"][0]["inputs"] = json!(["settings", "output-flags"]);
     expect_err(&value, "may not trigger on or read its own output")
 }
 
 #[test]
 fn handler_may_not_trigger_on_its_own_output() -> TestResult {
     let mut value = fixture();
-    value["handlers"][0]["trigger"]["input"] = json!("output-flags-input");
-    value["handlers"][0]["inputs"] = json!(["output-flags-input"]);
+    value["handlers"][0]["trigger"]["input"] = json!("output-flags");
+    value["handlers"][0]["inputs"] = json!(["output-flags"]);
     expect_err(&value, "may not trigger on or read its own output")
 }
 
 /// `fixture()` plus a second output, "other" (resource `output-other`,
-/// Output-mode input `output-other-input`), and `handler-b`, which
+/// Output-mode input `output-other`), and `handler-b`, which
 /// triggers on and reads `sync-flags`' output `flags` and writes "other".
 fn chained_fixture() -> TestResult<Value> {
     let mut value = fixture();
@@ -126,7 +126,7 @@ fn chained_fixture() -> TestResult<Value> {
             "lifecycle": {"deletionPolicy": "orphan"}, "source": source(), "handlerOutput": true,
         }));
     value["inputs"].as_array_mut().ok_or("not an array")?.push(json!({
-        "id": "output-other-input", "apiVersion": "v1", "kind": "ConfigMap", "name": "other", "namespace": "workload",
+        "id": "output-other", "apiVersion": "v1", "kind": "ConfigMap", "name": "other", "namespace": "workload",
         "mode": "output", "managedResourceId": "output-other", "projection": ["data"], "sensitive": false,
         "missing": "block-dependent-mutations", "source": source(),
     }));
@@ -137,8 +137,8 @@ fn chained_fixture() -> TestResult<Value> {
     // handler-b triggers on flags (handler-a's output) and writes "other".
     value["handlers"].as_array_mut().ok_or("not an array")?.push(json!({
         "id": "handler-b", "module": "handlers/sync-flags.ts", "export": "syncFlags",
-        "trigger": {"kind": "input-changed", "input": "output-flags-input"},
-        "inputs": ["output-flags-input"], "egress": [], "outputs": ["output-other"],
+        "trigger": {"kind": "input-changed", "input": "output-flags"},
+        "inputs": ["output-flags"], "egress": [], "outputs": ["output-other"],
         "timeoutMillis": 30000, "maxHeapBytes": 67_108_864, "bundleSha256": "1".repeat(64), "source": source(),
     }));
     Ok(value)
@@ -153,8 +153,8 @@ fn a_handler_may_trigger_on_and_read_another_handlers_output() -> TestResult {
         .iter()
         .find(|handler| handler.id == "handler-b")
         .ok_or("handler-b must be declared")?;
-    assert_eq!(downstream.trigger.input, "output-flags-input");
-    assert_eq!(downstream.inputs, ["output-flags-input"]);
+    assert_eq!(downstream.trigger.input, "output-flags");
+    assert_eq!(downstream.inputs, ["output-flags"]);
     Ok(())
 }
 
@@ -170,8 +170,8 @@ fn queue_depth_must_hold_every_handler() -> TestResult {
     for index in handlers.len()..=resources {
         handlers.push(json!({
             "id": format!("handler-reader-{index}"), "module": "handlers/sync-flags.ts", "export": "syncFlags",
-            "trigger": {"kind": "input-changed", "input": "output-flags-input"},
-            "inputs": ["output-flags-input"], "egress": [], "outputs": [],
+            "trigger": {"kind": "input-changed", "input": "output-flags"},
+            "inputs": ["output-flags"], "egress": [], "outputs": [],
             "timeoutMillis": 30000, "maxHeapBytes": 67_108_864, "bundleSha256": "2".repeat(64), "source": source(),
         }));
     }
@@ -188,7 +188,7 @@ fn two_handler_cycle_is_rejected() -> TestResult {
     let mut value = chained_fixture()?;
     // handler-a (the original "sync-flags") now also reads handler-b's
     // output, closing the cycle: a -> flags -> b -> other -> a.
-    value["handlers"][0]["inputs"] = json!(["settings", "output-other-input"]);
+    value["handlers"][0]["inputs"] = json!(["settings", "output-other"]);
     expect_err(&value, "cycle")
 }
 
@@ -432,7 +432,7 @@ fn two_handler_cycle_through_managed_aliases_is_rejected() -> TestResult {
         "lifecycle": {"deletionPolicy": "orphan"}, "source": source(), "handlerOutput": true,
     }));
     value["inputs"].as_array_mut().ok_or("not an array")?.push(json!({
-        "id": "output-other-input", "apiVersion": "v1", "kind": "ConfigMap", "name": "other", "namespace": "workload",
+        "id": "output-other", "apiVersion": "v1", "kind": "ConfigMap", "name": "other", "namespace": "workload",
         "mode": "output", "managedResourceId": "output-other", "projection": ["data"], "sensitive": false,
         "missing": "block-dependent-mutations", "source": source(),
     }));
@@ -471,7 +471,7 @@ fn output_with_no_watching_input_is_rejected() -> TestResult {
             .as_array()
             .ok_or("not an array")?
             .iter()
-            .filter(|input| input["id"] != "output-flags-input")
+            .filter(|input| input["id"] != "output-flags")
             .cloned()
             .collect(),
     );
@@ -484,11 +484,25 @@ fn output_with_no_watching_input_is_rejected() -> TestResult {
 fn output_with_two_watching_inputs_is_rejected() -> TestResult {
     let mut value = fixture();
     value["inputs"].as_array_mut().ok_or("not an array")?.push(json!({
-        "id": "output-flags-input-2", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags", "namespace": "workload",
+        "id": "output-flags", "apiVersion": "v1", "kind": "ConfigMap", "name": "flags", "namespace": "workload",
         "mode": "output", "managedResourceId": "output-flags", "projection": ["data"], "sensitive": false,
         "missing": "block-dependent-mutations", "source": source(),
     }));
-    expect_err(&value, "exactly one Output-mode input")
+    expect_err(&value, "duplicate input id")
+}
+
+/// A handler reads an output under the output's own id: an Output-mode
+/// input with any other id is rejected.
+#[test]
+fn output_input_id_must_equal_its_output_id() -> TestResult {
+    let mut value = fixture();
+    let inputs = value["inputs"].as_array_mut().ok_or("not an array")?;
+    let input = inputs
+        .iter_mut()
+        .find(|input| input["mode"] == "output")
+        .ok_or("no output input")?;
+    input["id"] = json!("flags-observed");
+    expect_err(&value, "output input id must equal its handler output id")
 }
 
 // --- One writer per output (binding decision): two handlers cannot declare
@@ -513,7 +527,7 @@ fn two_handlers_cannot_write_the_same_output() -> TestResult {
 fn output_rollout_test_plan_excludes_inapplicable_observed_scenarios() -> TestResult {
     let mut value = fixture();
     value["reactions"] = json!([{
-        "id": "rollout-flags", "op": "rollout", "inputs": ["output-flags-input"], "target": "api", "source": source(),
+        "id": "rollout-flags", "op": "rollout", "inputs": ["output-flags"], "target": "api", "source": source(),
     }]);
     let compiled = plan(&value)?;
     let scenarios: std::collections::BTreeSet<&str> = compiled
@@ -557,7 +571,7 @@ fn mixed_observed_and_output_reaction_has_one_row_per_scenario_covering_every_li
 -> TestResult {
     let mut value = fixture();
     value["reactions"] = json!([{
-        "id": "rollout-mixed", "op": "rollout", "inputs": ["settings", "output-flags-input"], "target": "api", "source": source(),
+        "id": "rollout-mixed", "op": "rollout", "inputs": ["settings", "output-flags"], "target": "api", "source": source(),
     }]);
     let compiled = plan(&value)?;
     let cases: Vec<_> = compiled
@@ -584,7 +598,7 @@ fn mixed_observed_and_output_reaction_has_one_row_per_scenario_covering_every_li
             .ok_or_else(|| format!("expected exactly one {shared} row"))?;
         assert_eq!(
             case.input_ids,
-            ["output-flags-input", "settings"],
+            ["output-flags", "settings"],
             "{shared} must cover every live input"
         );
     }
@@ -639,8 +653,8 @@ fn two_handler_two_output_fixture() -> Value {
         ],
         "inputs": [
             {"id": "settings", "apiVersion": "v1", "kind": "ConfigMap", "name": "settings", "namespace": "workload", "mode": "observed", "projection": ["data"], "sensitive": false, "missing": "block-dependent-mutations", "source": source()},
-            output_input("output-flags-input", "output-flags", "flags"),
-            output_input("output-metrics-input", "output-metrics", "metrics"),
+            output_input("output-flags", "output-flags", "flags"),
+            output_input("output-metrics", "output-metrics", "metrics"),
         ],
         "reactions": [],
         // "zeta-handler" is declared before "alpha-handler" to exercise sorting by id.

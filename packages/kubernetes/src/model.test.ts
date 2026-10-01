@@ -407,9 +407,14 @@ throws(() => constrained.manage(new ConfigMap({ metadata: { name: "two", namespa
   equal(output.handlers[0]!.egress[0]!.port, 443, "egress port defaults to 443");
   equal(output.handlers[0]!.bundleSha256, "", "SDK emits an empty bundleSha256 placeholder for the compiler to fill");
   assert(
-    output.inputs.some((input) => input.mode === "output" && input.managedResourceId === flags.outputId),
-    "an Output-mode input backs the handler output",
+    output.inputs.some((input) => input.mode === "output" && input.id === flags.outputId && input.managedResourceId === flags.outputId),
+    "an Output-mode input with the output's own id backs the handler output",
   );
+
+  // That id is the output's, so an author input cannot reuse it.
+  const clash = domain("handler-id-clash");
+  clash.observe(ConfigMap, { id: "flags", name: "external-flags", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  throws(() => defineHandlerOutput(clash, { id: "flags", name: "flags", source }), "duplicate input id: flags");
 
   throws(() => defineHandler(value, {
     id: "sync-flags",

@@ -670,9 +670,9 @@ export class Domain {
     this.#state.resources.set(id, resourceDeclaration);
     this.#state.identities.set(identity, id);
     this.#state.outputs.set(id, freeze({ id, name, namespace }));
-    const inputId = dnsLabel(derivedId(`output-input-${id}`), 63, "output input id");
+    // The output's own id, so a chained handler reads it as event.inputs[<output id>].
     const inputDeclaration = this.#addInput({
-      id: inputId,
+      id,
       apiVersion: "v1",
       kind: "ConfigMap",
       name,

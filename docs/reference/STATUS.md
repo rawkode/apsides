@@ -38,7 +38,8 @@ establish narrower properties.
   egress rows, 30 s, 64 MiB, and a `maxQueueDepth` below the handler count). `crates/compiler-core/tests/handlers.rs` covers
   each rule. `aps compile` type-checks every handler module in strict mode
   against the ECMAScript library and `@apsides/kubernetes/handler`'s
-  declarations, rejects references to `SharedArrayBuffer`, and `crates/engine/tests/host_api.rs` pins the engine's
+  declarations, checks each export against the event its `<On>` produces,
+  rejects references to `SharedArrayBuffer`, and `crates/engine/tests/host_api.rs` pins the engine's
   globals to those declarations.
 - The compiler locks the complete author module closure, typechecks it, evaluates
   it with denied ambient permissions, validates strict canonical IR, and derives

@@ -85,10 +85,9 @@ const derived = useHandlerOutput({ id: "derived-flags", name: "derived-flags" })
     inputs={[raw]} outputs={[derived]} />
 ```
 
-The downstream handler receives the upstream output under the input id
-`output-input-<output id>`, here `event.inputs["output-input-raw-flags"]`, so
-it is typed `HandlerEvent<"output-input-raw-flags">`. An output id longer than
-50 characters is shortened with a hash; `ir.json` lists the exact input id.
+The downstream handler receives the upstream output under the output's own
+id, here `event.inputs["raw-flags"]`, and is typed
+`HandlerEvent<"raw-flags">`.
 
 A downstream handler only ever sees a fully committed upstream. It waits,
 reporting `handler-upstream-pending`, while any handler that writes one of its
@@ -127,6 +126,10 @@ faster than the upstream can run.
   `setTimeout` and so on) fails the build. So does a reference to
   `SharedArrayBuffer`, which the ECMAScript library declares but the engine
   does not install.
+- The compiler also checks each export against the event its `<On>` produces:
+  its parameter type may not name a trigger or input id the `<On>` does not
+  declare. `HandlerEvent<"settings">` on a handler whose input is
+  `feature-settings`, or an export the module does not have, fails the build.
 
 Validation also rejects a handler that triggers on or reads its own output, and
 any cycle in which handlers feed each other through their outputs; the SDK

@@ -7,7 +7,7 @@
     },
     {
       "path": "handlers/summarize-entries.ts",
-      "sha256": "2c62cedb24f37f0460f471fc2ff5155c3d87db27a7d2abba8c71878b31d9f9e9"
+      "sha256": "de4edf15a8a6597586e33c3314b10f77cc4ec4b1d87927c4174f84809a22d6d5"
     },
     {
       "path": "program.tsx",
