@@ -16,7 +16,8 @@
  *
  * `aps compile` type-checks every handler module against these
  * declarations and the ECMAScript library only: the engine has no Deno,
- * Node, DOM or Web API globals besides `queueMicrotask`.
+ * Node, DOM or Web API globals besides `queueMicrotask`. It also narrows
+ * `writeOutput`'s output id to the outputs the handler's `<On>` declares.
  */
 
 /** The data of one declared input, as the handler sees it. */
@@ -55,17 +56,26 @@ export interface HandlerError extends Error {
   readonly code: string;
 }
 
+/**
+ * The output ids a handler may write. Any string in an editor; `aps compile`
+ * declares {@link ApsidesHandlerOutputs}' `ids` as the outputs each handler's
+ * `<On>` declares, so an id outside them fails the build.
+ */
+export type HandlerOutputId = ApsidesHandlerOutputs extends { readonly ids: infer Ids extends string } ? Ids : string;
+
 /** The frozen `apsides` global. */
 export interface HandlerApi {
   /** HTTPS only, to a host and port the handler declares in `egress`; redirects are returned, never followed. */
   fetch(url: string, options?: FetchOptions): Promise<FetchResponse>;
   /** Buffers one key of a declared output; committed only after the handler returns successfully. */
-  writeOutput(outputId: string, key: string, data: string | Uint8Array): void;
+  writeOutput(outputId: HandlerOutputId, key: string, data: string | Uint8Array): void;
   /** Writes one structured line to the controller's stderr; non-strings are JSON-encoded. */
   log(level: LogLevel, message: unknown): void;
 }
 
 declare global {
+  /** Augmented by `aps compile` with the checked handlers' output ids; see {@link HandlerOutputId}. */
+  interface ApsidesHandlerOutputs {}
   const apsides: HandlerApi;
   function queueMicrotask(callback: () => void): void;
 }

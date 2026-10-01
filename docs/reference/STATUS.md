@@ -39,6 +39,7 @@ establish narrower properties.
   each rule. `aps compile` type-checks every handler module in strict mode
   against the ECMAScript library and `@apsides/kubernetes/handler`'s
   declarations, checks each export against the event its `<On>` produces,
+  narrows `apsides.writeOutput`'s output id to the handler's declared outputs,
   rejects references to `SharedArrayBuffer`, and `crates/engine/tests/host_api.rs` pins the engine's
   globals to those declarations.
 - The compiler locks the complete author module closure, typechecks it, evaluates
@@ -293,9 +294,7 @@ records are described in [resource inventory](/reference/inventory/#current-limi
   unauthenticated unless a handler embeds a credential in its own source;
   egress is enforced only by the controller, with no generated
   `NetworkPolicy`; fixture mode, and so `aps test --cluster`, does not execute
-  handlers; no live test performs a handler `fetch`; and the output id passed
-  to `apsides.writeOutput` is a plain string, so an undeclared one fails only
-  at run time (`UNDECLARED_OUTPUT_ID`).
+  handlers; and no live test performs a handler `fetch`.
 - Kind-based acceptance and `aps test --cluster` run only on the pinned
   Kubernetes v1.34.3 node image. Servers above the declared minimum are
   accepted but not qualified.
