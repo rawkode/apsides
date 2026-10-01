@@ -204,6 +204,21 @@ export async function syncFlags(event: HandlerEvent<"settings">) {
     const undeclared = await fixture({ "program.tsx": handlerProgram, "handlers/sync-flags.ts": handlerModule.replace(`writeOutput("flags"`, `writeOutput("other"`) }, "program.tsx");
     await assert.rejects(compileApsides(undeclared.sourcePath, undeclared.output), /apsides\.writeOutput accepts flags\)/, "the failure names the handler's declared outputs");
 
+    // JavaScript handlers get the same output-id check under checkJs: a
+    // declared literal compiles; an undeclared literal, or an id widened to
+    // string, fails.
+    const jsProgram = handlerProgram.replace("./handlers/sync-flags.ts#syncFlags", "./handlers/sync-flags.js#syncFlags");
+    const jsWriter = (statement: string) => `/** @param {import("@apsides/kubernetes/handler").HandlerEvent<"settings">} event */\nexport async function syncFlags(event) {\n  const environment = event.inputs.settings.data.environment ?? "production";\n  ${statement}\n}\n`;
+    const jsValid = await fixture({ "program.tsx": jsProgram, "handlers/sync-flags.js": jsWriter(`apsides.writeOutput("flags", "environment", environment);`) }, "program.tsx");
+    await compileApsides(jsValid.sourcePath, jsValid.output);
+    for (const [label, statement] of [
+      ["an undeclared literal", `apsides.writeOutput("other", "environment", environment);`],
+      ["an id widened to string", `let id = "flags";\n  apsides.writeOutput(id, "environment", environment);`],
+    ] as const) {
+      const jsBroken = await fixture({ "program.tsx": jsProgram, "handlers/sync-flags.js": jsWriter(statement) }, "program.tsx");
+      await assert.rejects(compileApsides(jsBroken.sourcePath, jsBroken.output), /apsides\.writeOutput accepts flags\)/, `a JavaScript handler's output id is checked (${label})`);
+    }
+
     // A handler that declares no outputs cannot write one.
     const outputless = handlerProgram.replace(`  const flags = useHandlerOutput({ id: "flags", name: "flags" });\n`, "").replace(" outputs={[flags]}", "").replace("useConfigMap, useHandlerOutput", "useConfigMap");
     const noOutputs = await fixture({ "program.tsx": outputless, "handlers/sync-flags.ts": handlerModule }, "program.tsx");
