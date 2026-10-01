@@ -459,6 +459,24 @@ throws(() => constrained.manage(new ConfigMap({ metadata: { name: "two", namespa
 }
 
 {
+  // maxQueueDepth must hold every handler: each handler keeps at most one
+  // queue slot, and a smaller queue could fill with downstream handlers
+  // held for an upstream that then can never enqueue.
+  const value = defineDomain({
+    id: "queue-depth", namespace: "workload", controlNamespace: "apsides-system", clusterBinding: "local-fixture",
+    policyRef: "platform/test", enforcement: "api-bound", budgets: { ...budgets, maxQueueDepth: 1 },
+    provenance: { inputs: [{ path: "domain.ts", sha256 }] },
+  });
+  const settings = value.observe(ConfigMap, { name: "settings", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
+  const handler = (id: string) => ({
+    id, module: "./handlers/notify.ts", export: "notify",
+    trigger: { kind: "input-changed" as const, input: settings.id }, inputs: [settings.id], egress: [], outputs: [], source,
+  });
+  defineHandler(value, handler("notify-a"));
+  throws(() => defineHandler(value, handler("notify-b")), "cannot hold every handler");
+}
+
+{
   // A derived handler id lowercases a camelCase export instead of turning
   // each capital into a separator, so `syncFlags` stays readable.
   const value = domain("derived-handler-id");

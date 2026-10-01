@@ -181,7 +181,7 @@ export async function syncFlags(event: HandlerEvent<"settings">) {
     const bundle = await readFile(join(typed.output, "handlers", `${ir.handlers[0].id}.js`), "utf8");
     assert.doesNotMatch(bundle, /@apsides\/kubernetes/, "the type-only SDK import is erased from the handler bundle");
     const inputs = JSON.parse(await readFile(join(typed.output, "build-inputs.json"), "utf8"));
-    assert.deepEqual(inputs.typecheck.handlers, { declarations: "@apsides/kubernetes/handler", lib: ["esnext"] });
+    assert.deepEqual(inputs.typecheck.handlers, { checkJs: true, declarations: "@apsides/kubernetes/handler", lib: ["esnext"] });
 
     const rejected: [string, string, string][] = [
       ["a type error", handlerModule.replace(`"environment", environment`, `"environment", 42`), "a wrong argument type fails the build"],
@@ -194,6 +194,24 @@ export async function syncFlags(event: HandlerEvent<"settings">) {
       const broken = await fixture({ "program.tsx": handlerProgram, "handlers/sync-flags.ts": source }, "program.tsx");
       await assert.rejects(compileApsides(broken.sourcePath, broken.output), /deno failed/, `${message} (${label})`);
     }
+
+    // A locked module that only supplies types to a handler is reachable
+    // through its erased import type, not an unreachable lock entry.
+    const typesOnly = await fixture({
+      "program.tsx": handlerProgram,
+      "handlers/sync-flags.ts": `import type { Environment } from "./types.ts";\nimport type { HandlerEvent } from "@apsides/kubernetes/handler";\nexport async function syncFlags(event: HandlerEvent<"settings">): Promise<Environment> { return event.inputs.settings.data.environment ?? "production"; }\n`,
+      "handlers/types.ts": `export type Environment = string;\n`,
+    }, "program.tsx");
+    await compileApsides(typesOnly.sourcePath, typesOnly.output);
+
+    // JavaScript is checked too: a .js helper a handler imports cannot use
+    // a global the engine does not have.
+    const jsHelper = await fixture({
+      "program.tsx": handlerProgram,
+      "handlers/sync-flags.ts": `import { describe } from "./describe.js";\nimport type { HandlerEvent } from "@apsides/kubernetes/handler";\nexport async function syncFlags(event: HandlerEvent<"settings">) { return describe(event.id); }\n`,
+      "handlers/describe.js": `export function describe(id) { console.log(id); return id; }\n`,
+    }, "program.tsx");
+    await assert.rejects(compileApsides(jsHelper.sourcePath, jsHelper.output), /deno failed/, "a JavaScript helper using console fails the handler check");
 
     const valueImport = await fixture({
       "program.tsx": handlerProgram,

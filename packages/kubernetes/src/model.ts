@@ -702,6 +702,7 @@ export class Domain {
     const id = dnsLabel(optionalId(options.id, "handler.id") ?? derivedId(`handler-${options.export}-${options.module}`), 63, "handler.id");
     if (this.#state.handlers.has(id)) throw new Error(`duplicate handler id: ${id}`);
     if (this.#state.handlers.size >= MAX_HANDLERS) throw new Error(`domain exceeds maxHandlers budget of ${MAX_HANDLERS}`);
+    if (this.#state.handlers.size >= this.#state.options.budgets.maxQueueDepth) throw new Error("domain maxQueueDepth cannot hold every handler");
     const module = normalizedRelativePath(options.module, "handler.module");
     const exportName = jsIdentifier(options.export, "handler.export");
     const timeoutMillis = boundedInteger(options.timeoutMillis ?? MAX_HANDLER_TIMEOUT_MILLIS, 1, MAX_HANDLER_TIMEOUT_MILLIS, "handler.timeoutMillis");

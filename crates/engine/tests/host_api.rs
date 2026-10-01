@@ -88,3 +88,28 @@ fn handler_globals_match_the_sdk_declarations() -> Result<(), String> {
     }
     Ok(())
 }
+
+/// `apsides.log` accepts any value: one `JSON.stringify` cannot encode
+/// (`undefined`, a function, a `BigInt`, a cyclic object) is still logged
+/// rather than throwing out of the handler.
+#[test]
+fn log_accepts_values_json_cannot_encode() -> Result<(), String> {
+    let bundle = wrap_as_handler(
+        r#"
+        const cyclic = {};
+        cyclic.self = cyclic;
+        for (const value of [undefined, () => 1, 1n, cyclic, Symbol("s")]) {
+            apsides.log("info", value);
+        }
+        return "logged";
+    "#,
+    );
+    let report =
+        invoke_handler_with_watchdog(handler_invocation(&bundle), &Arc::new(AtomicUsize::new(0)));
+    match report.result {
+        Ok(value) if value == json!("logged") => Ok(()),
+        other => Err(format!(
+            "apsides.log threw on an unencodable value: {other:?}"
+        )),
+    }
+}

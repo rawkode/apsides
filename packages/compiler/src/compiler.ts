@@ -133,7 +133,7 @@ export const compileApsides = async (sourceFile: string, output: string): Promis
   await typecheckHandlers(author, sdk, ir, deno);
   const handlerBundles = await bundleHandlers(author, ir);
   ir.handlers = handlerBundles.handlers;
-  const reachable = new Set([...first.loaded, ...handlerBundles.loaded]);
+  const reachable = new Set([...first.loaded, ...handlerBundles.loaded, ...handlerImportClosure(author, ir.handlers.map(handler => handler.module))]);
   for (const item of author.values()) if (!reachable.has(item.virtual)) throw new Error(`source lock contains unreachable module: ${item.logical}`);
   const fixture = buildFixtureOutputs(ir);
   validateSourceLocations(fixture.fixtureIr, author);
@@ -179,7 +179,7 @@ export const compileApsides = async (sourceFile: string, output: string): Promis
       scope: "Canonical author payload from the digest-locked TypeScript closure evaluated in a pinned SES Compartment with only the hardened declared build input, hosted by the recorded denied-permission Deno runtime.",
       limitation: "This is a bounded source-build contract, not a proof that arbitrary JavaScript is deterministic across unrecorded toolchains or architectures.",
     },
-    typecheck: { engine: "deno", status: "passed", remote: false, npm: false, config: { jsx: "react-jsxdev", jsxImportSource: SDK_PACKAGE, importMap: "generated-local-sdk-only" }, handlers: { lib: ["esnext"], declarations: SDK_HANDLER_IMPORT } },
+    typecheck: { engine: "deno", status: "passed", remote: false, npm: false, config: { jsx: "react-jsxdev", jsxImportSource: SDK_PACKAGE, importMap: "generated-local-sdk-only" }, handlers: { lib: ["esnext"], checkJs: true, declarations: SDK_HANDLER_IMPORT } },
     bundleSha256: sha256(emittedProgram), evaluationBundleSha256: sha256(first.evaluationBundle), evaluationSourceSha256: sha256(evaluateSource), bundleMapSha256: sha256(canonicalString(bundleMap)),
     handlers: [...handlerBundles.files.entries()].map(([id, code]) => ({ id, path: `handlers/${id}.js`, sha256: sha256(code) })).sort((a,b) => order(a.id,b.id)),
   };
@@ -327,9 +327,38 @@ const typecheckHandlers = async (author: Map<string, Snapshot>, sdk: Map<string,
     const declarations = join(sdkDir, sdk.get("handler.ts")!.logical);
     await writeFile(declarations, sdk.get("handler.ts")!.text);
     const denoConfig = join(stage, "deno.json");
-    await writeFile(denoConfig, JSON.stringify({ compilerOptions: { lib: ["esnext"], strict: true }, imports: { [SDK_HANDLER_IMPORT]: pathToFileURL(declarations).href } }));
+    await writeFile(denoConfig, JSON.stringify({ compilerOptions: { lib: ["esnext"], strict: true, checkJs: true }, imports: { [SDK_HANDLER_IMPORT]: pathToFileURL(declarations).href } }));
     await run(deno, ["check", "--config", denoConfig, "--no-lock", "--no-npm", "--no-remote", "--deny-import", declarations, ...modules.map(module => join(sourceDir, module))], "", { ...executionEnvironment });
   } finally { await rm(stage, {recursive:true, force:true}); }
+};
+
+/**
+ * Every locked module a handler module reaches through static imports and
+ * re-exports, type-only ones included. Oxc erases `import type` before
+ * Rolldown sees it, so a module that only supplies types to a handler is
+ * never loaded by a bundle; the handler type check still reads it, so it
+ * counts as reachable for the source-lock closure check.
+ */
+const handlerImportClosure = (author: Map<string, Snapshot>, roots: string[]): Set<string> => {
+  const seen = new Set<string>();
+  const pending = [...roots];
+  while (pending.length > 0) {
+    const logical = pending.pop()!;
+    const snapshot = author.get(logical);
+    if (!snapshot || seen.has(snapshot.virtual)) continue;
+    seen.add(snapshot.virtual);
+    const lang = logical.endsWith(".tsx") ? "tsx" : logical.endsWith(".ts") ? "ts" : "js";
+    const body = (parseAst(snapshot.text, { lang, sourceType: "module" }) as { body?: unknown[] }).body ?? [];
+    for (const node of body) {
+      if (!node || typeof node !== "object") continue;
+      const { type, source } = node as { type?: unknown; source?: { value?: unknown } | null };
+      if (type !== "ImportDeclaration" && type !== "ExportNamedDeclaration" && type !== "ExportAllDeclaration") continue;
+      const specifier = source?.value;
+      if (typeof specifier !== "string" || !specifier.startsWith(".")) continue;
+      pending.push(normalizeLogical(posix.join(posix.dirname(logical), specifier), `handler import ${specifier}`));
+    }
+  }
+  return seen;
 };
 
 const evaluator = (ses: string, bundle: string, buildContext: unknown): string => {

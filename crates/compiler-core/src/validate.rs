@@ -812,6 +812,13 @@ fn validate_handlers(
         ir.handlers.len() <= MAX_HANDLERS,
         format!("domain exceeds maxHandlers budget of {MAX_HANDLERS}"),
     )?;
+    // Each handler holds at most one queue slot (events coalesce per
+    // handler). A queue smaller than the handler count could fill with
+    // downstream handlers held for an upstream that can then never enqueue.
+    require(
+        ir.handlers.len() <= ir.domain.budgets.max_queue_depth,
+        "domain maxQueueDepth cannot hold every handler",
+    )?;
     let mut handler_ids = BTreeSet::new();
     let mut egress_hosts = BTreeSet::new();
     let mut total_egress_rows: usize = 0;

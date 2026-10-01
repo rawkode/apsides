@@ -504,7 +504,21 @@ const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
           `apsides.log level must be one of "debug", "info", "warn", "error"; got ${level}`,
         );
       }
-      const text = typeof message === "string" ? message : NativeJSONStringify(message);
+      let text = message;
+      if (typeof message !== "string") {
+        // JSON.stringify returns undefined for `undefined`, functions and
+        // symbols and throws for BigInts and cycles; none of that may
+        // escape a log call. The fallback names only the value's type,
+        // which `typeof` reports and handler code cannot redefine.
+        try {
+          text = NativeJSONStringify(message);
+        } catch {
+          text = undefined;
+        }
+        if (typeof text !== "string") {
+          text = `[unserializable ${typeof message}]`;
+        }
+      }
       opLog(level, text);
     },
   });

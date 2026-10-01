@@ -500,11 +500,16 @@ impl HandlerState {
     /// partial commit (`production::commit_handler_outputs` stops at the
     /// first failing output) leaves its writer unsettled until a later
     /// invocation commits every output.
+    ///
+    /// An upstream whose own inputs are unavailable this cycle
+    /// (`current_revision` is `None`) stays settled on the last revision
+    /// every output recorded: it cannot run, and nothing it committed is
+    /// partial, so holding its downstream would protect nothing.
     fn is_settled(&self) -> bool {
         self.queued.is_none()
             && self.last_error_code.is_none()
-            && self.current_revision.is_some()
-            && self.known_revision == self.current_revision
+            && self.known_revision.is_some()
+            && (self.current_revision.is_none() || self.known_revision == self.current_revision)
     }
 }
 
@@ -1986,6 +1991,43 @@ mod tests {
             assert_eq!(
                 derive_blocker(&runtime, &plan)?,
                 Some("handler-upstream-pending")
+            );
+            Ok(())
+        }
+
+        /// An upstream that cannot run because its own input disappeared
+        /// still holds a full, agreeing commit on every output, so its
+        /// downstream is not held.
+        #[tokio::test]
+        async fn downstream_runs_while_its_settled_upstream_lacks_its_own_input() -> TestResult {
+            let plan = plan()?;
+            let revision = upstream_revision(&plan)?;
+            let mut runtime = runtime_for(&plan)?;
+            let (client, _calls) = wire(vec![
+                // seed_from_annotations
+                flags_object("derived", "derived-uid", "3", None),
+                flags_object("raw-a", "raw-a-uid", "7", Some(&revision)),
+                flags_object("raw-b", "raw-b-uid", "8", Some(&revision)),
+            ]);
+            runtime.seed_from_annotations(&plan, &client).await;
+            let mut without_settings = observations("new");
+            without_settings.insert("settings".to_owned(), Observation::Missing);
+            runtime
+                .detect_triggers(&plan, &without_settings, &client, &mut Vec::new())
+                .await;
+            let upstream = runtime.states.get("fetch-raw").ok_or("upstream state")?;
+            assert!(
+                upstream.current_revision.is_none(),
+                "the upstream cannot compute a revision"
+            );
+            assert!(
+                upstream.is_settled(),
+                "its last full commit still settles it"
+            );
+            assert_eq!(
+                derive_blocker(&runtime, &plan)?,
+                None,
+                "the downstream runs on the upstream's consistent outputs"
             );
             Ok(())
         }

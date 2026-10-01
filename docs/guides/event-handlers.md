@@ -89,8 +89,12 @@ A downstream handler only ever sees a fully committed upstream. It waits,
 reporting `handler-upstream-pending`, while any handler that writes one of its
 inputs is queued, failing or retrying, or has outputs that do not all record
 the same revision, as after a partially failed commit or a restart that finds
-them disagreeing. Because at most one handler runs per reconcile cycle, a
-chain of N handlers takes at least N cycles to settle after a change.
+them disagreeing. An upstream that cannot run because its own inputs are
+missing does not hold its downstream, since every one of its outputs still
+records its last full commit. Because at most one handler runs per reconcile
+cycle, a chain of N handlers takes at least N cycles to settle after a change,
+and a downstream waits for as long as its upstream's inputs keep changing
+faster than the upstream can run.
 
 ### Handler modules
 
@@ -124,7 +128,8 @@ Each egress host must be a lowercase DNS name with at least one dot. IP
 addresses, numeric shorthands such as `2130706433`, `localhost`, names under
 `.localhost`, single-label names and wildcards are rejected. A domain may
 declare at most 16 handlers, 16 distinct egress hosts and 256
-`(host, port, handler)` egress rows.
+`(host, port, handler)` egress rows, and its `maxQueueDepth` budget must be at
+least its number of handlers.
 
 ## The handler API
 
@@ -154,7 +159,9 @@ idempotency key.
 The handler's host API is one frozen global, `apsides`, declared by
 `@apsides/kubernetes/handler` along with `FetchResponse`, `HandlerError` and
 the other types below. Apart from it, a handler has the ECMAScript built-ins
-and `queueMicrotask`, nothing else. The embedding's own `Deno` object, `console`
+except `SharedArrayBuffer` and `WebAssembly`, plus `queueMicrotask`, nothing
+else. (`SharedArrayBuffer` still type-checks, because the ECMAScript library
+declares it, but it is absent at run time.) The embedding's own `Deno` object, `console`
 and bootstrap internals are deleted before the module runs, no Node or Deno
 runtime extensions are registered (so there is no `TextEncoder`), there is no
 filesystem and no environment, and the handler holds no Kubernetes credential.
@@ -199,7 +206,9 @@ carry a `code` such as `UNDECLARED_OUTPUT_ID`, `INVALID_KEY` or
 ### `apsides.log(level, message)`
 
 `level` is `debug`, `info`, `warn` or `error`; a non-string message is
-JSON-encoded. Each line is written to the controller's stderr as JSON tagged
+JSON-encoded, and a value JSON cannot encode (`undefined`, a function, a
+`BigInt`, a symbol or a cyclic object) is logged as `[unserializable <type>]`
+instead of throwing. Each line is written to the controller's stderr as JSON tagged
 with the handler and invocation ids.
 
 ### Limits
@@ -237,7 +246,9 @@ budgets.
   that reads another handler's output waits until that upstream is settled,
   reporting `handler-upstream-pending` (see
   [Chaining handlers](#chaining-handlers)). The queue holds at most
-  `maxQueueDepth` handlers; one more reports `handler-queue-overflow`.
+  `maxQueueDepth` handlers. Validation requires that budget to cover every
+  handler, so each handler always has a slot and a validated domain never
+  reports `handler-queue-overflow`.
 - **Commit.** On success, each declared output is committed with one
   server-side apply under field manager `apsides-handler-<domainId>`, with the
   `apsides.dev/handler-input-revision` annotation. The keys written in that

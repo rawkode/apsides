@@ -35,7 +35,7 @@ establish narrower properties.
   requires identical bytes; validation rejects Secret or sensitive handler
   inputs, self-reads, cyclic handler graphs, second writers of an output,
   invalid egress hosts and budget overruns (16 handlers, 16 egress hosts, 256
-  egress rows, 30 s, 64 MiB). `crates/compiler-core/tests/handlers.rs` covers
+  egress rows, 30 s, 64 MiB, and a `maxQueueDepth` below the handler count). `crates/compiler-core/tests/handlers.rs` covers
   each rule. `aps compile` type-checks every handler module in strict mode
   against the ECMAScript library and `@apsides/kubernetes/handler`'s
   declarations, and `crates/engine/tests/host_api.rs` pins the engine's

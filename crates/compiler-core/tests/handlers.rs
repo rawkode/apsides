@@ -159,6 +159,31 @@ fn a_handler_may_trigger_on_and_read_another_handlers_output() -> TestResult {
 }
 
 #[test]
+fn queue_depth_must_hold_every_handler() -> TestResult {
+    // More handlers than resources: a queue that fits every resource must
+    // still be rejected when it cannot hold every handler, or downstream
+    // handlers held for an upstream could take every slot that upstream
+    // needs to enqueue.
+    let mut value = chained_fixture()?;
+    let resources = value["resources"].as_array().ok_or("not an array")?.len();
+    let handlers = value["handlers"].as_array_mut().ok_or("not an array")?;
+    for index in handlers.len()..=resources {
+        handlers.push(json!({
+            "id": format!("handler-reader-{index}"), "module": "handlers/sync-flags.ts", "export": "syncFlags",
+            "trigger": {"kind": "input-changed", "input": "output-flags-input"},
+            "inputs": ["output-flags-input"], "egress": [], "outputs": [],
+            "timeoutMillis": 30000, "maxHeapBytes": 67_108_864, "bundleSha256": "2".repeat(64), "source": source(),
+        }));
+    }
+    let handler_count = handlers.len();
+    value["domain"]["budgets"]["maxQueueDepth"] = json!(resources);
+    expect_err(&value, "cannot hold every handler")?;
+    value["domain"]["budgets"]["maxQueueDepth"] = json!(handler_count);
+    plan(&value)?;
+    Ok(())
+}
+
+#[test]
 fn two_handler_cycle_is_rejected() -> TestResult {
     let mut value = chained_fixture()?;
     // handler-a (the original "sync-flags") now also reads handler-b's
