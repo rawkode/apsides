@@ -516,6 +516,10 @@ const BOOTSTRAP_GUARD_SCRIPT: &str = r#""use strict";
 
   delete globalThis.Deno;
   delete globalThis.__bootstrap;
+  // deno_core's own `console` prints straight to the controller's stdout,
+  // outside `apsides.log`'s per-line and per-invocation caps; a handler's
+  // only output channel is `apsides.log`.
+  delete globalThis.console;
 
   // Layer 2: make growing any ArrayBuffer/SharedArrayBuffer impossible,
   // regardless of construction route.

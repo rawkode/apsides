@@ -256,7 +256,7 @@ const flags = useHandlerOutput({ id: "resolved-flags", name: "resolved-flags" })
 <Deployment metadata={{ name: "api", namespace }} rolloutOn={[flags.data]} spec={apiSpec} />
 ```
 
-`handler` MUST be a module reference string, never a function: the module runs in a separate sandbox and cannot capture build-time closures or values. The module MUST be part of the locked source closure and MAY import only other locked modules. `useHandlerOutput` declares a managed ConfigMap that only its handler writes; its `.data` projection MAY feed `rolloutOn` like any other input projection. An `On` element grants no Kubernetes authority beyond the named reads and output writes the compiler derives from it.
+`handler` MUST be a module reference string, never a function: the module runs in a separate sandbox and cannot capture build-time closures or values. The module MUST be part of the locked source closure and MAY import only other locked modules, plus erased type-only imports of the SDK's handler declarations. The compiler MUST type-check every handler module in strict mode against the ECMAScript library and those declarations only, so a handler that uses a global the sandbox does not provide fails the build. `useHandlerOutput` declares a managed ConfigMap that only its handler writes; its `.data` projection MAY feed `rolloutOn` like any other input projection. An `On` element grants no Kubernetes authority beyond the named reads and output writes the compiler derives from it.
 
 ## 9. Intermediate representation
 
@@ -493,7 +493,7 @@ Each invocation MUST run in a fresh isolate with no filesystem, no process envir
 
 - `fetch`: HTTPS only, to a declared host and port, after DNS resolution, connecting only to global unicast addresses, never following redirects, with bounded request and response sizes, concurrency and total bytes.
 - `writeOutput`: UTF-8 key/value data for a declared output only, buffered in memory and committed only if the invocation succeeds.
-- `log`: bounded structured log lines tagged with the handler and invocation identity.
+- `log`: bounded structured log lines tagged with the handler and invocation identity. It MUST be the handler's only output channel; no console or other path to the controller's own streams may be reachable.
 
 Each invocation MUST have a wall-clock timeout enforced even against code that never yields, and bounded heap and array-buffer memory. Invocation failures MUST surface as conditions and retry with bounded backoff. Committing an output MUST use Server-Side Apply under the handler field manager, through the same authority and claim checks as reconciler mutations, and MUST record the input revision the output reflects. A handler MUST NOT be invoked while any of its outputs has not been applied in the current cycle.
 

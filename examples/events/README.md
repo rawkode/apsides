@@ -95,8 +95,9 @@ target/debug/aps lock \
   --modules examples/events/handlers/sync-flags.ts
 ```
 
-To type-check both files, including the handler, which the compiler bundles
-without type-checking:
+`aps compile` type-checks the handler against `@apsides/kubernetes/handler`'s
+declarations and fails the build on a type error. To check both files in an
+editor-style run:
 
 ```sh
 deno check --config examples/events/deno.json \

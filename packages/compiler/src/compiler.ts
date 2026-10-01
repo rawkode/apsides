@@ -20,13 +20,15 @@ const MAX_MODULE_BYTES = 1024 * 1024;
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const executionEnvironment = Object.freeze({ TZ: "UTC", LANG: "C", LC_ALL: "C" });
 const SDK_PACKAGE = "@apsides/kubernetes";
-const SDK_FILES = ["index.ts", "model.ts", "runtime.ts", "compiler.ts", "jsx-runtime.ts", "jsx-dev-runtime.ts"] as const;
+const SDK_FILES = ["index.ts", "model.ts", "runtime.ts", "compiler.ts", "jsx-runtime.ts", "jsx-dev-runtime.ts", "handler.ts"] as const;
 const SDK_PUBLIC_IMPORTS = new Map<string, string>([
   [SDK_PACKAGE, "index.ts"],
   [`${SDK_PACKAGE}/jsx-runtime`, "jsx-runtime.ts"],
   [`${SDK_PACKAGE}/jsx-dev-runtime`, "jsx-dev-runtime.ts"],
 ]);
 const SDK_COMPILER_IMPORT = `${SDK_PACKAGE}/compiler`;
+/** Type-only declarations a handler module may `import type`; erased before bundling. */
+const SDK_HANDLER_IMPORT = `${SDK_PACKAGE}/handler`;
 const GENERATED_ENTRY = "apsides:/compiler/entry.ts";
 const sha256 = (value: string | Uint8Array): string => createHash("sha256").update(value).digest("hex");
 const order = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
@@ -128,6 +130,7 @@ export const compileApsides = async (sourceFile: string, output: string): Promis
   const ir = evaluated.productionIR;
   ir.provenance = { compiler: "apsides/0.1", inputs: provenanceInputs };
   validateSourceLocations(ir, author);
+  await typecheckHandlers(author, sdk, ir, deno);
   const handlerBundles = await bundleHandlers(author, ir);
   ir.handlers = handlerBundles.handlers;
   const reachable = new Set([...first.loaded, ...handlerBundles.loaded]);
@@ -176,7 +179,7 @@ export const compileApsides = async (sourceFile: string, output: string): Promis
       scope: "Canonical author payload from the digest-locked TypeScript closure evaluated in a pinned SES Compartment with only the hardened declared build input, hosted by the recorded denied-permission Deno runtime.",
       limitation: "This is a bounded source-build contract, not a proof that arbitrary JavaScript is deterministic across unrecorded toolchains or architectures.",
     },
-    typecheck: { engine: "deno", status: "passed", remote: false, npm: false, config: { jsx: "react-jsxdev", jsxImportSource: SDK_PACKAGE, importMap: "generated-local-sdk-only" } },
+    typecheck: { engine: "deno", status: "passed", remote: false, npm: false, config: { jsx: "react-jsxdev", jsxImportSource: SDK_PACKAGE, importMap: "generated-local-sdk-only" }, handlers: { lib: ["esnext"], declarations: SDK_HANDLER_IMPORT } },
     bundleSha256: sha256(emittedProgram), evaluationBundleSha256: sha256(first.evaluationBundle), evaluationSourceSha256: sha256(evaluateSource), bundleMapSha256: sha256(canonicalString(bundleMap)),
     handlers: [...handlerBundles.files.entries()].map(([id, code]) => ({ id, path: `handlers/${id}.js`, sha256: sha256(code) })).sort((a,b) => order(a.id,b.id)),
   };
@@ -300,6 +303,32 @@ const typecheckSnapshot = async (author: Map<string, Snapshot>, sdk: Map<string,
     const imports = Object.fromEntries([...SDK_PUBLIC_IMPORTS].map(([specifier, logical]) => [specifier, pathToFileURL(join(sdkDir, logical)).href]));
     await writeFile(denoConfig, JSON.stringify({ compilerOptions: { jsx: "react-jsxdev", jsxImportSource: SDK_PACKAGE, strict: true }, imports }));
     await run(deno, ["check", "--config", denoConfig, "--no-lock", "--no-npm", "--no-remote", "--deny-import", join(sourceDir, entry)], "", { ...executionEnvironment });
+  } finally { await rm(stage, {recursive:true, force:true}); }
+};
+
+/**
+ * Type-check every declared handler module as the embedded engine runs it:
+ * the ECMAScript library only (no Deno, Node, DOM or Web API globals) plus
+ * the SDK's handler declarations, which describe the `apsides` global and
+ * `queueMicrotask`. Handler modules reach those declarations only through
+ * `import type` from `@apsides/kubernetes/handler`, which Oxc erases before
+ * {@link bundleHandlerModule} resolves anything.
+ */
+const typecheckHandlers = async (author: Map<string, Snapshot>, sdk: Map<string, Snapshot>, ir: ProductionIr, deno: string): Promise<void> => {
+  const modules = [...new Set(ir.handlers.map(handler => handler.module))].sort(order);
+  if (modules.length === 0) return;
+  for (const module of modules) if (!author.has(module)) throw new Error(`handler module is absent from the source lock (resolved from the lock root, apsides.lock.json's own directory): ${module}`);
+  const stage = await mkdtemp(join(tmpdir(), "apsides-handler-typecheck-"));
+  try {
+    const sourceDir = join(stage, "source");
+    const sdkDir = join(stage, "sdk");
+    await mkdir(sourceDir, { recursive: true }); await mkdir(sdkDir, { recursive: true });
+    for (const item of author.values()) { const target = join(sourceDir, item.logical); await mkdir(dirname(target), {recursive:true}); await writeFile(target, item.text); }
+    const declarations = join(sdkDir, sdk.get("handler.ts")!.logical);
+    await writeFile(declarations, sdk.get("handler.ts")!.text);
+    const denoConfig = join(stage, "deno.json");
+    await writeFile(denoConfig, JSON.stringify({ compilerOptions: { lib: ["esnext"], strict: true }, imports: { [SDK_HANDLER_IMPORT]: pathToFileURL(declarations).href } }));
+    await run(deno, ["check", "--config", denoConfig, "--no-lock", "--no-npm", "--no-remote", "--deny-import", declarations, ...modules.map(module => join(sourceDir, module))], "", { ...executionEnvironment });
   } finally { await rm(stage, {recursive:true, force:true}); }
 };
 

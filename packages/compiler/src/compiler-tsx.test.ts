@@ -72,7 +72,7 @@ try {
   assert.ok(bundleMap.sources.includes("apsides:/source/program.tsx"));
 
   const inputs = JSON.parse(await readFile(join(first.output, "build-inputs.json"), "utf8"));
-  assert.deepEqual(inputs.sdk.files.map((file: { path: string }) => file.path), ["compiler.ts", "index.ts", "jsx-dev-runtime.ts", "jsx-runtime.ts", "model.ts", "runtime.ts"]);
+  assert.deepEqual(inputs.sdk.files.map((file: { path: string }) => file.path), ["compiler.ts", "handler.ts", "index.ts", "jsx-dev-runtime.ts", "jsx-runtime.ts", "model.ts", "runtime.ts"]);
   assert.deepEqual(inputs.toolchain.oxc.options.jsx, { development: true, importSource: "@apsides/kubernetes", runtime: "automatic" });
   assert.equal(inputs.toolchain.oxc.options.filename, "apsides:/source/<logical-path>");
   assert.deepEqual(inputs.typecheck.config, { importMap: "generated-local-sdk-only", jsx: "react-jsxdev", jsxImportSource: "@apsides/kubernetes" });
@@ -129,8 +129,13 @@ export default (
   </Controller>
 );
 `;
-  const handlerModule = `export async function syncFlags(event) {
-  return event;
+  const handlerModule = `import type { HandlerEvent } from "@apsides/kubernetes/handler";
+
+export async function syncFlags(event: HandlerEvent<"settings">) {
+  const environment = event.inputs.settings.data.environment ?? "production";
+  queueMicrotask(() => {});
+  apsides.writeOutput("flags", "environment", environment);
+  return event.id;
 }
 `;
 
@@ -164,6 +169,37 @@ export default (
 
     const buildInputs = JSON.parse(await readFile(join(first.output, "build-inputs.json"), "utf8"));
     assert.deepEqual(buildInputs.handlers, [{ id: handler.id, path: `handlers/${handler.id}.js`, sha256: handler.bundleSha256 }]);
+  }
+
+  {
+    // Handler modules are type-checked against the ECMAScript library and
+    // the SDK's handler declarations only, and the type-only SDK import
+    // never reaches the bundle.
+    const typed = await fixture({ "program.tsx": handlerProgram, "handlers/sync-flags.ts": handlerModule }, "program.tsx");
+    await compileApsides(typed.sourcePath, typed.output);
+    const ir = JSON.parse(await readFile(join(typed.output, "ir.json"), "utf8"));
+    const bundle = await readFile(join(typed.output, "handlers", `${ir.handlers[0].id}.js`), "utf8");
+    assert.doesNotMatch(bundle, /@apsides\/kubernetes/, "the type-only SDK import is erased from the handler bundle");
+    const inputs = JSON.parse(await readFile(join(typed.output, "build-inputs.json"), "utf8"));
+    assert.deepEqual(inputs.typecheck.handlers, { declarations: "@apsides/kubernetes/handler", lib: ["esnext"] });
+
+    const rejected: [string, string, string][] = [
+      ["a type error", handlerModule.replace(`"environment", environment`, `"environment", 42`), "a wrong argument type fails the build"],
+      ["a misspelled apsides member", handlerModule.replace("apsides.writeOutput(", "apsides.writeOutpt("), "an unknown apsides member fails the build"],
+      ["a host global", handlerModule.replace("queueMicrotask(() => {});", "console.log(environment);"), "console does not exist in the engine"],
+      ["a Deno global", handlerModule.replace("queueMicrotask(() => {});", "Deno.env.get(\"HOME\");"), "Deno does not exist in the engine"],
+      ["an implicit any", "export async function syncFlags(event) { return event; }\n", "strict mode rejects an untyped event"],
+    ];
+    for (const [label, source, message] of rejected) {
+      const broken = await fixture({ "program.tsx": handlerProgram, "handlers/sync-flags.ts": source }, "program.tsx");
+      await assert.rejects(compileApsides(broken.sourcePath, broken.output), /deno failed/, `${message} (${label})`);
+    }
+
+    const valueImport = await fixture({
+      "program.tsx": handlerProgram,
+      "handlers/sync-flags.ts": `import { HandlerEvent } from "@apsides/kubernetes/handler";\nexport async function syncFlags(event: HandlerEvent) { return [event.id, HandlerEvent]; }\n`,
+    }, "program.tsx");
+    await assert.rejects(compileApsides(valueImport.sourcePath, valueImport.output), /deno failed|undeclared package/, "a value import of the SDK cannot reach a handler bundle");
   }
 
   {

@@ -12,24 +12,12 @@
  * runtime retries this event with backoff.
  */
 
-/** The handler globals the controller's embedded engine provides. */
-declare const apsides: {
-  fetch(
-    url: string,
-    options?: { readonly method?: string; readonly headers?: Readonly<Record<string, string>> },
-  ): Promise<{ readonly status: number; readonly body: Uint8Array }>;
-  writeOutput(id: string, key: string, data: string): void;
-  log(level: "debug" | "info" | "warn" | "error", message: string): void;
-};
+import type { FetchResponse, HandlerEvent } from "@apsides/kubernetes/handler";
 
 /** The only origin this handler reaches; `<On egress>` declares it. */
 const FLAG_SERVICE_ORIGIN = "https://flags.example.com";
 const ENVIRONMENT = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const FLAG_NAME = /^[a-z][a-z0-9-]{0,62}$/;
-
-interface SettingsEvent {
-  readonly inputs: { readonly [id: string]: { readonly data?: Readonly<Record<string, string>> } };
-}
 
 /** Decodes strict UTF-8; throws a `URIError` on invalid bytes. */
 const decodeUtf8 = (bytes: Uint8Array): string => {
@@ -58,13 +46,13 @@ const parseFlags = (text: string): [string, boolean][] => {
 
 const outputKey = (flag: string): string => `FEATURE_${flag.toUpperCase().replaceAll("-", "_")}`;
 
-export async function syncFlags(event: SettingsEvent): Promise<{ environment: string; flags: number }> {
-  const environment = event.inputs["feature-settings"]?.data?.["environment"];
+export async function syncFlags(event: HandlerEvent<"feature-settings">): Promise<{ environment: string; flags: number }> {
+  const environment = event.inputs["feature-settings"].data["environment"];
   if (environment === undefined || !ENVIRONMENT.test(environment)) {
     throw new Error("feature-settings must set environment to a lowercase DNS label");
   }
   const url = `${FLAG_SERVICE_ORIGIN}/v1/environments/${environment}/flags`;
-  let response: { readonly status: number; readonly body: Uint8Array };
+  let response: FetchResponse;
   try {
     response = await apsides.fetch(url, { headers: { accept: "application/json" } });
   } catch (error) {

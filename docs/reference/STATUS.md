@@ -36,7 +36,10 @@ establish narrower properties.
   inputs, self-reads, cyclic handler graphs, second writers of an output,
   invalid egress hosts and budget overruns (16 handlers, 16 egress hosts, 256
   egress rows, 30 s, 64 MiB). `crates/compiler-core/tests/handlers.rs` covers
-  each rule. Handler modules are not type-checked.
+  each rule. `aps compile` type-checks every handler module in strict mode
+  against the ECMAScript library and `@apsides/kubernetes/handler`'s
+  declarations, and `crates/engine/tests/host_api.rs` pins the engine's
+  globals to those declarations.
 - The compiler locks the complete author module closure, typechecks it, evaluates
   it with denied ambient permissions, validates strict canonical IR, and derives
   effects, capabilities, source metadata, and required reactor cases.
@@ -283,8 +286,7 @@ records are described in [resource inventory](/reference/inventory/#current-limi
   unauthenticated unless a handler embeds a credential in its own source;
   egress is enforced only by the controller, with no generated
   `NetworkPolicy`; fixture mode, and so `aps test --cluster`, does not execute
-  handlers; no live test performs a handler `fetch`; and handler modules are
-  not type-checked.
+  handlers; and no live test performs a handler `fetch`.
 - Kind-based acceptance and `aps test --cluster` run only on the pinned
   Kubernetes v1.34.3 node image. Servers above the declared minimum are
   accepted but not qualified.

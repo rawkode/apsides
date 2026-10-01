@@ -91,7 +91,9 @@ const flags = useHandlerOutput({ id: "resolved-flags", name: "resolved-flags" })
   is resolved from the directory holding `apsides.lock.json`.
 - The module must be listed in `apsides.lock.json`
   (`aps lock --source program.tsx --modules handlers/resolve-flags.ts`) and
-  may import only other locked modules through relative specifiers.
+  may import only other locked modules through relative specifiers, plus
+  `import type` from `@apsides/kubernetes/handler`. `aps compile` type-checks
+  it in strict mode against the ECMAScript library and those declarations.
 - Inputs are non-sensitive `ConfigMap` observations or references; Secrets
   cannot reach a handler. The trigger must be one of the inputs.
 - `egress` lists the HTTPS hosts the handler may call; `outputs` lists the

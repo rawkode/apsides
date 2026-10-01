@@ -44,6 +44,7 @@ STATIC_SOURCES = (
     "packages/compiler/src/source-lock.ts",
     "packages/kubernetes/deno.json",
     "packages/kubernetes/src/compiler.ts",
+    "packages/kubernetes/src/handler.ts",
     "packages/kubernetes/src/index.ts",
     "packages/kubernetes/src/jsx-dev-runtime.ts",
     "packages/kubernetes/src/jsx-runtime.ts",

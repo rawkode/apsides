@@ -24,7 +24,8 @@ export default (
   </Controller>
 );
 "#;
-const HANDLER_MODULE: &str = "export async function syncFlags(event) {\n  return event;\n}\n";
+const HANDLER_MODULE: &str =
+    "export async function syncFlags(event: { readonly id: string }) {\n  return event.id;\n}\n";
 
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))

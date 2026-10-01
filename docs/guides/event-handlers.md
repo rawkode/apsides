@@ -79,13 +79,17 @@ input projection.
   example `aps lock --source program.tsx --modules handlers/resolve-flags.ts`.
   Locked modules must live under the entry program's directory.
 - A handler module may import only other locked modules, through relative
-  specifiers. npm, `jsr:`, remote and SDK imports and dynamic `import()` fail
-  compilation.
+  specifiers, plus `import type` from `@apsides/kubernetes/handler`, which is
+  erased before bundling. npm, `jsr:`, remote and other SDK imports, value
+  imports of the handler types, and dynamic `import()` fail compilation.
 - The compiler bundles each handler into one closed ES module, twice, and
   requires byte-identical output. The bundle's SHA-256 is recorded in the IR
   and the bundle is embedded in the controller binary.
-- `aps compile` bundles handler modules but does not type-check them, and the
-  SDK ships no type declaration for the `apsides` global.
+- `aps compile` type-checks every handler module in strict mode, against the
+  ECMAScript library and the SDK's handler declarations only. A type error, an
+  untyped parameter, a misspelled `apsides` member or a host global the engine
+  does not have (`Deno`, `console`, `fetch`, `TextEncoder`, `setTimeout` and
+  so on) fails the build.
 
 Validation also rejects a handler that triggers on or reads its own output, and
 any cycle in which handlers feed each other through their outputs. The
@@ -101,14 +105,13 @@ declare at most 16 handlers, 16 distinct egress hosts and 256
 
 ## The handler API
 
-The export is called with one event argument and may be `async`:
+The export is called with one event argument and may be `async`. Type it with
+the SDK's `HandlerEvent`, naming the input ids the handler declares:
 
 ```ts
-export async function resolveFlags(event: {
-  id: string;
-  trigger: { kind: "input-changed"; input: string };
-  inputs: Record<string, { data: Record<string, string> }>;
-}) {
+import type { HandlerEvent } from "@apsides/kubernetes/handler";
+
+export async function resolveFlags(event: HandlerEvent<"feature-settings">) {
   const environment = event.inputs["feature-settings"].data.environment ?? "production";
   const response = await apsides.fetch(
     `https://flags.example.com/v1/flags?env=${environment}`,
@@ -125,11 +128,14 @@ input id. `event.id` is a digest of the handler id and the input revision; it
 stays the same when the same revision is delivered again, so use it as an
 idempotency key.
 
-The handler's host API is one frozen global, `apsides`. The embedding's own
-`Deno` object and bootstrap internals are deleted before the module runs, no
-Node or Deno runtime extensions are registered (so there is no `TextEncoder`),
-there is no filesystem and no environment, and the handler holds no Kubernetes
-credential.
+The handler's host API is one frozen global, `apsides`, declared by
+`@apsides/kubernetes/handler` along with `FetchResponse`, `HandlerError` and
+the other types below. Apart from it, a handler has the ECMAScript built-ins
+and `queueMicrotask`, nothing else. The embedding's own `Deno` object, `console`
+and bootstrap internals are deleted before the module runs, no Node or Deno
+runtime extensions are registered (so there is no `TextEncoder`), there is no
+filesystem and no environment, and the handler holds no Kubernetes credential.
+`apsides.log` is the only way to write output.
 
 ### `apsides.fetch(url, { method?, headers?, body? })`
 
@@ -280,7 +286,6 @@ release whose surface digest differs from the reviewed one; see
 - No `NetworkPolicy` is generated for egress.
 - Fixture-mode controllers, and therefore `aps test --cluster`, verify handler
   bundles but do not execute handlers.
-- Handler modules are not type-checked.
 - Live acceptance of handlers runs only on the pinned Kubernetes v1.34.3 kind
   node, with a handler that makes no `fetch` calls.
 

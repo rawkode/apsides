@@ -3,7 +3,7 @@
   "inputs": [
     {
       "path": "handlers/sync-flags.ts",
-      "sha256": "06d88bf07e5a232721ffde20189b8ce89590ab53a174686e9803fed82fab8e5e"
+      "sha256": "53918bcc7b985495ff11a7105d68d33717d0b0d25fe006f286ac717a97165dad"
     },
     {
       "path": "program.tsx",
