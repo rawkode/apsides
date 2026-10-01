@@ -181,7 +181,7 @@ export async function syncFlags(event: HandlerEvent<"settings">) {
     const bundle = await readFile(join(typed.output, "handlers", `${ir.handlers[0].id}.js`), "utf8");
     assert.doesNotMatch(bundle, /@apsides\/kubernetes/, "the type-only SDK import is erased from the handler bundle");
     const inputs = JSON.parse(await readFile(join(typed.output, "build-inputs.json"), "utf8"));
-    assert.deepEqual(inputs.typecheck.handlers, { checkJs: true, declarations: "@apsides/kubernetes/handler", lib: ["esnext"] });
+    assert.deepEqual(inputs.typecheck.handlers, { checkJs: true, declarations: "@apsides/kubernetes/handler", lib: ["esnext"], strict: true, unavailableGlobals: ["SharedArrayBuffer"], verbatimModuleSyntax: true });
 
     const rejected: [string, string, string][] = [
       ["a type error", handlerModule.replace(`"environment", environment`, `"environment", 42`), "a wrong argument type fails the build"],
@@ -189,6 +189,7 @@ export async function syncFlags(event: HandlerEvent<"settings">) {
       ["a host global", handlerModule.replace("queueMicrotask(() => {});", "console.log(environment);"), "console does not exist in the engine"],
       ["a Deno global", handlerModule.replace("queueMicrotask(() => {});", "Deno.env.get(\"HOME\");"), "Deno does not exist in the engine"],
       ["an implicit any", "export async function syncFlags(event) { return event; }\n", "strict mode rejects an untyped event"],
+      ["a type used through a value import", handlerModule.replace("import type { HandlerEvent }", "import { HandlerEvent }"), "verbatimModuleSyntax requires import type for types"],
     ];
     for (const [label, source, message] of rejected) {
       const broken = await fixture({ "program.tsx": handlerProgram, "handlers/sync-flags.ts": source }, "program.tsx");
@@ -200,9 +201,17 @@ export async function syncFlags(event: HandlerEvent<"settings">) {
     const typesOnly = await fixture({
       "program.tsx": handlerProgram,
       "handlers/sync-flags.ts": `import type { Environment } from "./types.ts";\nimport type { HandlerEvent } from "@apsides/kubernetes/handler";\nexport async function syncFlags(event: HandlerEvent<"settings">): Promise<Environment> { return event.inputs.settings.data.environment ?? "production"; }\n`,
-      "handlers/types.ts": `export type Environment = string;\n`,
+      "handlers/types.ts": `export type Environment = string;\nexport type Names = { SharedArrayBuffer: string };\n`,
     }, "program.tsx");
     await compileApsides(typesOnly.sourcePath, typesOnly.output);
+
+    // SharedArrayBuffer type-checks under lib esnext but the engine does
+    // not install it; a reference to it, directly or through globalThis,
+    // fails the build. A property named SharedArrayBuffer (above) does not.
+    for (const reference of ["new SharedArrayBuffer(8);", "globalThis.SharedArrayBuffer;"]) {
+      const shared = await fixture({ "program.tsx": handlerProgram, "handlers/sync-flags.ts": handlerModule.replace("queueMicrotask(() => {});", reference) }, "program.tsx");
+      await assert.rejects(compileApsides(shared.sourcePath, shared.output), /uses SharedArrayBuffer, which the handler engine does not provide/, `SharedArrayBuffer is rejected (${reference})`);
+    }
 
     // JavaScript is checked too: a .js helper a handler imports cannot use
     // a global the engine does not have.

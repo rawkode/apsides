@@ -29,6 +29,8 @@ const SDK_PUBLIC_IMPORTS = new Map<string, string>([
 const SDK_COMPILER_IMPORT = `${SDK_PACKAGE}/compiler`;
 /** Type-only declarations a handler module may `import type`; erased before bundling. */
 const SDK_HANDLER_IMPORT = `${SDK_PACKAGE}/handler`;
+/** The compiler options handler modules are type-checked with; recorded in `build-inputs.json`. */
+const HANDLER_COMPILER_OPTIONS = { lib: ["esnext"], strict: true, checkJs: true, verbatimModuleSyntax: true };
 const GENERATED_ENTRY = "apsides:/compiler/entry.ts";
 const sha256 = (value: string | Uint8Array): string => createHash("sha256").update(value).digest("hex");
 const order = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
@@ -179,7 +181,7 @@ export const compileApsides = async (sourceFile: string, output: string): Promis
       scope: "Canonical author payload from the digest-locked TypeScript closure evaluated in a pinned SES Compartment with only the hardened declared build input, hosted by the recorded denied-permission Deno runtime.",
       limitation: "This is a bounded source-build contract, not a proof that arbitrary JavaScript is deterministic across unrecorded toolchains or architectures.",
     },
-    typecheck: { engine: "deno", status: "passed", remote: false, npm: false, config: { jsx: "react-jsxdev", jsxImportSource: SDK_PACKAGE, importMap: "generated-local-sdk-only" }, handlers: { lib: ["esnext"], checkJs: true, declarations: SDK_HANDLER_IMPORT } },
+    typecheck: { engine: "deno", status: "passed", remote: false, npm: false, config: { jsx: "react-jsxdev", jsxImportSource: SDK_PACKAGE, importMap: "generated-local-sdk-only" }, handlers: { ...HANDLER_COMPILER_OPTIONS, declarations: SDK_HANDLER_IMPORT, unavailableGlobals: [...UNAVAILABLE_HANDLER_GLOBALS] } },
     bundleSha256: sha256(emittedProgram), evaluationBundleSha256: sha256(first.evaluationBundle), evaluationSourceSha256: sha256(evaluateSource), bundleMapSha256: sha256(canonicalString(bundleMap)),
     handlers: [...handlerBundles.files.entries()].map(([id, code]) => ({ id, path: `handlers/${id}.js`, sha256: sha256(code) })).sort((a,b) => order(a.id,b.id)),
   };
@@ -327,10 +329,58 @@ const typecheckHandlers = async (author: Map<string, Snapshot>, sdk: Map<string,
     const declarations = join(sdkDir, sdk.get("handler.ts")!.logical);
     await writeFile(declarations, sdk.get("handler.ts")!.text);
     const denoConfig = join(stage, "deno.json");
-    await writeFile(denoConfig, JSON.stringify({ compilerOptions: { lib: ["esnext"], strict: true, checkJs: true }, imports: { [SDK_HANDLER_IMPORT]: pathToFileURL(declarations).href } }));
+    await writeFile(denoConfig, JSON.stringify({ compilerOptions: HANDLER_COMPILER_OPTIONS, imports: { [SDK_HANDLER_IMPORT]: pathToFileURL(declarations).href } }));
     await run(deno, ["check", "--config", denoConfig, "--no-lock", "--no-npm", "--no-remote", "--deny-import", declarations, ...modules.map(module => join(sourceDir, module))], "", { ...executionEnvironment });
   } finally { await rm(stage, {recursive:true, force:true}); }
+  rejectUnavailableGlobals(author, modules);
 };
+
+/**
+ * Globals `lib: ["esnext"]` declares that the embedded engine does not
+ * install. The ECMAScript library cannot be narrowed without forking it,
+ * so a reference to one of these names passes `deno check` and is
+ * rejected here instead.
+ */
+const UNAVAILABLE_HANDLER_GLOBALS = new Set(["SharedArrayBuffer"]);
+
+/**
+ * Rejects any handler module, or module it imports, that names an
+ * {@link UNAVAILABLE_HANDLER_GLOBALS} entry as an identifier or as a
+ * `globalThis` property. Non-computed member properties and property,
+ * method and type-member keys are names, not references, and are allowed.
+ */
+const rejectUnavailableGlobals = (author: Map<string, Snapshot>, modules: string[]): void => {
+  const closure = handlerImportClosure(author, modules);
+  for (const snapshot of [...author.values()].sort((a, b) => order(a.logical, b.logical))) {
+    if (!closure.has(snapshot.virtual)) continue;
+    const name = findUnavailableGlobal(parseAst(snapshot.text, { lang: sourceLang(snapshot.logical), sourceType: "module" }));
+    if (name) throw new Error(`handler module ${snapshot.logical} uses ${name}, which the handler engine does not provide`);
+  }
+};
+
+const findUnavailableGlobal = (node: unknown): string | undefined => {
+  if (Array.isArray(node)) {
+    for (const child of node) { const found = findUnavailableGlobal(child); if (found) return found; }
+    return undefined;
+  }
+  if (!node || typeof node !== "object") return undefined;
+  const record = node as Record<string, unknown> & { type?: unknown; name?: unknown; computed?: unknown; shorthand?: unknown };
+  if (record.type === "Identifier" && typeof record.name === "string" && UNAVAILABLE_HANDLER_GLOBALS.has(record.name)) return record.name;
+  if (record.type === "MemberExpression" && record.computed !== true) {
+    const object = record.object as { type?: unknown; name?: unknown } | undefined;
+    const property = record.property as { name?: unknown } | undefined;
+    if (object?.type === "Identifier" && object.name === "globalThis" && typeof property?.name === "string" && UNAVAILABLE_HANDLER_GLOBALS.has(property.name)) return property.name;
+    return findUnavailableGlobal(record.object);
+  }
+  for (const [key, value] of Object.entries(record)) {
+    if (key === "key" && record.computed !== true && record.shorthand !== true) continue;
+    const found = findUnavailableGlobal(value);
+    if (found) return found;
+  }
+  return undefined;
+};
+
+const sourceLang = (logical: string): "tsx" | "ts" | "js" => logical.endsWith(".tsx") ? "tsx" : logical.endsWith(".ts") ? "ts" : "js";
 
 /**
  * Every locked module a handler module reaches through static imports and
@@ -347,8 +397,7 @@ const handlerImportClosure = (author: Map<string, Snapshot>, roots: string[]): S
     const snapshot = author.get(logical);
     if (!snapshot || seen.has(snapshot.virtual)) continue;
     seen.add(snapshot.virtual);
-    const lang = logical.endsWith(".tsx") ? "tsx" : logical.endsWith(".ts") ? "ts" : "js";
-    const body = (parseAst(snapshot.text, { lang, sourceType: "module" }) as { body?: unknown[] }).body ?? [];
+    const body = (parseAst(snapshot.text, { lang: sourceLang(logical), sourceType: "module" }) as { body?: unknown[] }).body ?? [];
     for (const node of body) {
       if (!node || typeof node !== "object") continue;
       const { type, source } = node as { type?: unknown; source?: { value?: unknown } | null };

@@ -90,8 +90,11 @@ reporting `handler-upstream-pending`, while any handler that writes one of its
 inputs is queued, failing or retrying, or has outputs that do not all record
 the same revision, as after a partially failed commit or a restart that finds
 them disagreeing. An upstream that cannot run because its own inputs are
-missing does not hold its downstream, since every one of its outputs still
-records its last full commit. Because at most one handler runs per reconcile
+missing does not hold its downstream while every one of its outputs still
+records its last full commit; the controller re-reads them each cycle, and an
+output that is deleted, recreated or rewritten, or cannot be read, holds the
+downstream for as long as that lasts. A recreated output holds it until the
+upstream runs again. Because at most one handler runs per reconcile
 cycle, a chain of N handlers takes at least N cycles to settle after a change,
 and a downstream waits for as long as its upstream's inputs keep changing
 faster than the upstream can run.
@@ -112,10 +115,13 @@ faster than the upstream can run.
   requires byte-identical output. The bundle's SHA-256 is recorded in the IR
   and the bundle is embedded in the controller binary.
 - `aps compile` type-checks every handler module in strict mode, against the
-  ECMAScript library and the SDK's handler declarations only. A type error, an
-  untyped parameter, a misspelled `apsides` member or a host global the engine
-  does not have (`Deno`, `console`, `fetch`, `TextEncoder`, `setTimeout` and
-  so on) fails the build.
+  ECMAScript library and the SDK's handler declarations only, with
+  `verbatimModuleSyntax`, so types are imported with `import type`. A type
+  error, an untyped parameter, a misspelled `apsides` member or a host global
+  the engine does not have (`Deno`, `console`, `fetch`, `TextEncoder`,
+  `setTimeout` and so on) fails the build. So does a reference to
+  `SharedArrayBuffer`, which the ECMAScript library declares but the engine
+  does not install.
 
 Validation also rejects a handler that triggers on or reads its own output, and
 any cycle in which handlers feed each other through their outputs; the SDK
@@ -160,8 +166,7 @@ The handler's host API is one frozen global, `apsides`, declared by
 `@apsides/kubernetes/handler` along with `FetchResponse`, `HandlerError` and
 the other types below. Apart from it, a handler has the ECMAScript built-ins
 except `SharedArrayBuffer` and `WebAssembly`, plus `queueMicrotask`, nothing
-else. (`SharedArrayBuffer` still type-checks, because the ECMAScript library
-declares it, but it is absent at run time.) The embedding's own `Deno` object, `console`
+else. The embedding's own `Deno` object, `console`
 and bootstrap internals are deleted before the module runs, no Node or Deno
 runtime extensions are registered (so there is no `TextEncoder`), there is no
 filesystem and no environment, and the handler holds no Kubernetes credential.

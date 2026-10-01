@@ -188,6 +188,11 @@ struct HandlerState {
     /// is not `Available`. Never persisted: a restart recomputes it on the
     /// first cycle, before any dispatch.
     current_revision: Option<String>,
+    /// While `current_revision` is `None`: whether this cycle's
+    /// [`HandlerRuntime::detect_triggers`] confirmed every live output
+    /// still carries `known_revision`. Recomputed every cycle, so a
+    /// transient read failure holds downstream handlers for one cycle only.
+    outputs_confirmed_without_inputs: bool,
     queued: Option<QueuedEvent>,
     backoff_until: Option<Instant>,
     attempt: u32,
@@ -496,20 +501,28 @@ impl HandlerState {
     /// on the revision this cycle's observations compute. `known_revision`
     /// only ever holds a revision all outputs carried -- set after a fully
     /// committed invocation, seeded from agreeing annotations, and cleared
-    /// by `detect_triggers` the moment `outputs_still_agree` fails -- so a
+    /// by `detect_triggers` the moment `outputs_still_agree` fails for the
+    /// revision this cycle computes -- so a
     /// partial commit (`production::commit_handler_outputs` stops at the
     /// first failing output) leaves its writer unsettled until a later
     /// invocation commits every output.
     ///
     /// An upstream whose own inputs are unavailable this cycle
     /// (`current_revision` is `None`) stays settled on the last revision
-    /// every output recorded: it cannot run, and nothing it committed is
-    /// partial, so holding its downstream would protect nothing.
+    /// every output recorded, as long as `detect_triggers` confirmed this
+    /// cycle that its live outputs still carry that revision: it cannot
+    /// run, and nothing it committed is partial, so holding its downstream
+    /// would protect nothing.
     fn is_settled(&self) -> bool {
         self.queued.is_none()
             && self.last_error_code.is_none()
             && self.known_revision.is_some()
-            && (self.current_revision.is_none() || self.known_revision == self.current_revision)
+            && self
+                .current_revision
+                .as_ref()
+                .map_or(self.outputs_confirmed_without_inputs, |current| {
+                    self.known_revision.as_ref() == Some(current)
+                })
     }
 }
 
@@ -644,11 +657,12 @@ impl HandlerRuntime {
     }
 
     /// Re-checks whether `handler`'s declared outputs still actually agree
-    /// with `revision` -- called only when the freshly-computed input
-    /// revision already matches the in-memory `known_revision` (the case
-    /// that would otherwise be skipped as unchanged), so this extra GET
-    /// round-trip per output is paid only for handlers already believed
-    /// idle, once per cycle each. See the Apsides v0.3 plan, Phase 5b
+    /// with `revision` -- called when the freshly-computed input revision
+    /// already matches the in-memory `known_revision` (the case that would
+    /// otherwise be skipped as unchanged), and by
+    /// [`Self::outputs_agree_without_inputs`] when no revision can be
+    /// computed, so this extra GET round-trip per output is paid only for
+    /// handlers already believed idle, once per cycle each. See the Apsides v0.3 plan, Phase 5b
     /// review item 5: an output recreated (its `uid` changed) or emptied
     /// (its annotation is gone) since it was last observed must force a
     /// re-run even though nothing about the handler's *input* changed.
@@ -686,6 +700,26 @@ impl HandlerRuntime {
             }
         }
         true
+    }
+
+    /// For a handler whose inputs are unavailable this cycle: whether its
+    /// live outputs still carry the revision it last committed.
+    /// `is_settled` treats such a handler as settled on that revision only
+    /// when this holds, so an output deleted, recreated or rewritten while
+    /// the handler cannot run never releases its downstream handlers onto
+    /// data it did not write. Skips the reads, answering `false`, when the
+    /// handler is unsettled regardless (queued or without a known revision).
+    async fn outputs_agree_without_inputs(&mut self, handler: &Handler, client: &Client) -> bool {
+        let Some(state) = self.states.get(&handler.id) else {
+            return false;
+        };
+        if state.queued.is_some() {
+            return false;
+        }
+        let Some(known) = state.known_revision.clone() else {
+            return false;
+        };
+        self.outputs_still_agree(handler, &known, client).await
     }
 
     /// Computes revisions, enqueues changed handlers, and dispatches at
@@ -729,6 +763,11 @@ impl HandlerRuntime {
             let state = self.states.entry(handler.id.clone()).or_default();
             state.current_revision = snapshot.as_ref().map(|(revision, _)| revision.clone());
             let Some((revision, inputs)) = snapshot else {
+                let confirmed = self.outputs_agree_without_inputs(handler, client).await;
+                self.states
+                    .entry(handler.id.clone())
+                    .or_default()
+                    .outputs_confirmed_without_inputs = confirmed;
                 continue;
             };
             let same_revision = state.known_revision.as_deref() == Some(revision.as_str());
@@ -2008,6 +2047,9 @@ mod tests {
                 flags_object("derived", "derived-uid", "3", None),
                 flags_object("raw-a", "raw-a-uid", "7", Some(&revision)),
                 flags_object("raw-b", "raw-b-uid", "8", Some(&revision)),
+                // detect_triggers re-reads the upstream's outputs
+                flags_object("raw-a", "raw-a-uid", "7", Some(&revision)),
+                flags_object("raw-b", "raw-b-uid", "8", Some(&revision)),
             ]);
             runtime.seed_from_annotations(&plan, &client).await;
             let mut without_settings = observations("new");
@@ -2029,6 +2071,76 @@ mod tests {
                 None,
                 "the downstream runs on the upstream's consistent outputs"
             );
+            Ok(())
+        }
+
+        /// The upstream cannot run (its input is missing) and one of its
+        /// outputs was rewritten underneath it since the seed: the live
+        /// annotation no longer matches the revision it last committed,
+        /// so it is not settled and the downstream stays held.
+        #[tokio::test]
+        async fn downstream_stays_held_when_an_idle_upstream_output_drifts() -> TestResult {
+            let plan = plan()?;
+            let revision = upstream_revision(&plan)?;
+            let mut runtime = runtime_for(&plan)?;
+            let (client, _calls) = wire(vec![
+                // seed_from_annotations
+                flags_object("derived", "derived-uid", "3", None),
+                flags_object("raw-a", "raw-a-uid", "7", Some(&revision)),
+                flags_object("raw-b", "raw-b-uid", "8", Some(&revision)),
+                // detect_triggers re-reads the upstream's outputs
+                flags_object("raw-a", "raw-a-uid", "7", Some(&revision)),
+                flags_object("raw-b", "raw-b-uid", "9", None),
+            ]);
+            runtime.seed_from_annotations(&plan, &client).await;
+            let mut without_settings = observations("edited");
+            without_settings.insert("settings".to_owned(), Observation::Missing);
+            runtime
+                .detect_triggers(&plan, &without_settings, &client, &mut Vec::new())
+                .await;
+            let upstream = runtime.states.get("fetch-raw").ok_or("upstream state")?;
+            assert!(!upstream.is_settled(), "a drifted output unsettles it");
+            assert_eq!(
+                derive_blocker(&runtime, &plan)?,
+                Some("handler-upstream-pending")
+            );
+            Ok(())
+        }
+
+        /// The check is per cycle: once the upstream's outputs read back
+        /// at its last revision again (a transient read failure, or the
+        /// output restored), the downstream is released without the
+        /// upstream having to run.
+        #[tokio::test]
+        async fn an_idle_upstream_resettles_when_its_outputs_agree_again() -> TestResult {
+            let plan = plan()?;
+            let revision = upstream_revision(&plan)?;
+            let mut runtime = runtime_for(&plan)?;
+            let (client, _calls) = wire(vec![
+                // seed_from_annotations
+                flags_object("derived", "derived-uid", "3", None),
+                flags_object("raw-a", "raw-a-uid", "7", Some(&revision)),
+                flags_object("raw-b", "raw-b-uid", "8", Some(&revision)),
+                // first cycle: raw-a reads back without the annotation
+                flags_object("raw-a", "raw-a-uid", "9", None),
+                // second cycle: both agree again
+                flags_object("raw-a", "raw-a-uid", "10", Some(&revision)),
+                flags_object("raw-b", "raw-b-uid", "8", Some(&revision)),
+            ]);
+            runtime.seed_from_annotations(&plan, &client).await;
+            let mut without_settings = observations("new");
+            without_settings.insert("settings".to_owned(), Observation::Missing);
+            runtime
+                .detect_triggers(&plan, &without_settings, &client, &mut Vec::new())
+                .await;
+            assert_eq!(
+                derive_blocker(&runtime, &plan)?,
+                Some("handler-upstream-pending")
+            );
+            runtime
+                .detect_triggers(&plan, &without_settings, &client, &mut Vec::new())
+                .await;
+            assert_eq!(derive_blocker(&runtime, &plan)?, None);
             Ok(())
         }
     }
