@@ -614,7 +614,11 @@ export class Domain {
     if (managed.kind !== "ConfigMap") throw new Error("only ConfigMap data can be watched in this release");
     const id = dnsLabel(derivedId(`managed-${managed.id}`), 63, "managed input id");
     const existing = this.#state.inputs.get(id);
-    if (existing !== undefined) return existing;
+    if (existing !== undefined) {
+      // Reuse only this resource's own managed input; any other input under the id is a collision.
+      if (existing.mode !== "managed" || existing.managedResourceId !== managed.id) throw new Error(`duplicate input id: ${id}`);
+      return existing;
+    }
     return this.#addInput({
       id,
       apiVersion: "v1",

@@ -416,6 +416,14 @@ throws(() => constrained.manage(new ConfigMap({ metadata: { name: "two", namespa
   clash.observe(ConfigMap, { id: "flags", name: "external-flags", namespace: "workload", projection: ["data"], missing: "block-dependent-mutations", source });
   throws(() => defineHandlerOutput(clash, { id: "flags", name: "flags", source }), "duplicate input id: flags");
 
+  // An output declared first under a managed input's derived id cannot stand in
+  // for that managed ConfigMap's watch input.
+  const takeover = domain("handler-managed-takeover");
+  defineHandlerOutput(takeover, { id: "managed-settings", name: "derived", source });
+  const managedSettings = takeover.manage(new ConfigMap({ id: "settings", metadata: { name: "settings", namespace: "workload" }, data: { a: "1" } }), { source });
+  const api = takeover.manage(deployment("api"), { source });
+  throws(() => watch(managedSettings).project("data").rollout(api, { id: "rollout-settings", source }), "duplicate input id: managed-settings");
+
   throws(() => defineHandler(value, {
     id: "sync-flags",
     module: "./handlers/other.ts",
