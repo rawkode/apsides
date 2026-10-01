@@ -214,7 +214,8 @@ most 253 characters and not be `.` or `..`. `data` is a string or a
 `Uint8Array` of valid UTF-8 text; it becomes a `ConfigMap` `data` value. Writes
 are buffered and committed only after the handler returns successfully. Errors
 carry a `code` such as `UNDECLARED_OUTPUT_ID`, `INVALID_KEY` or
-`DATA_TOO_LARGE`.
+`DATA_TOO_LARGE`. The compiler does not check `outputId` against the `<On>`'s
+`outputs`, so an undeclared id fails only at run time.
 
 ### `apsides.log(level, message)`
 

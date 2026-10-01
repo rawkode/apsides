@@ -293,7 +293,9 @@ records are described in [resource inventory](/reference/inventory/#current-limi
   unauthenticated unless a handler embeds a credential in its own source;
   egress is enforced only by the controller, with no generated
   `NetworkPolicy`; fixture mode, and so `aps test --cluster`, does not execute
-  handlers; and no live test performs a handler `fetch`.
+  handlers; no live test performs a handler `fetch`; and the output id passed
+  to `apsides.writeOutput` is a plain string, so an undeclared one fails only
+  at run time (`UNDECLARED_OUTPUT_ID`).
 - Kind-based acceptance and `aps test --cluster` run only on the pinned
   Kubernetes v1.34.3 node image. Servers above the declared minimum are
   accepted but not qualified.
