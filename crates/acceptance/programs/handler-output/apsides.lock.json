@@ -6,8 +6,12 @@
       "sha256": "dafb1ac90f274c44cf148603d135cdca7be0daa563a0c163b049adb0982a9da1"
     },
     {
+      "path": "handlers/summarize-entries.ts",
+      "sha256": "2c62cedb24f37f0460f471fc2ff5155c3d87db27a7d2abba8c71878b31d9f9e9"
+    },
+    {
       "path": "program.tsx",
-      "sha256": "1113c4fa8325139d87a0b1e0ebd3270565fb08adacfb61f7f1e6a93eea108087"
+      "sha256": "ca8d6a508290c7fddac076ca3150fc7130d282b4158709412455fd107ce6581f"
     }
   ],
   "schemaVersion": "apsides.dev/source-lock/v1"

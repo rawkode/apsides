@@ -85,6 +85,11 @@ const derived = useHandlerOutput({ id: "derived-flags", name: "derived-flags" })
     inputs={[raw]} outputs={[derived]} />
 ```
 
+The downstream handler receives the upstream output under the input id
+`output-input-<output id>`, here `event.inputs["output-input-raw-flags"]`, so
+it is typed `HandlerEvent<"output-input-raw-flags">`. An output id longer than
+50 characters is shortened with a hash; `ir.json` lists the exact input id.
+
 A downstream handler only ever sees a fully committed upstream. It waits,
 reporting `handler-upstream-pending`, while any handler that writes one of its
 inputs is queued, failing or retrying, or has outputs that do not all record

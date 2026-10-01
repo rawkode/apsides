@@ -239,11 +239,13 @@ row it answers. In summary:
   Kubernetes state before the reservation and is carried in the committed
   report;
 - the handler scenario deploys `crates/acceptance/programs/handler-output`
-  (one handler with no egress) and shows that the first invocation writes
-  exactly its keys with the revision annotation and the expected field
+  (two chained handlers with no egress) and shows that the first invocation
+  writes exactly its keys with the revision annotation and the expected field
   managers, that a changed input drops a key the handler no longer writes,
   that a key another field manager adds survives the next commit without
-  becoming co-owned, and that restarting the controller rewrites nothing;
+  becoming co-owned, that the chained handler records exactly the output each
+  step settles on, and that restarting the controller rewrites neither
+  output;
 - the phase, uncertain-writer and cleanup scenarios stop `aps deploy` after each
   stored phase and resume it, block activation after the predecessor's
   termination evidence is lost, run last-type cleanup through an unresolved
