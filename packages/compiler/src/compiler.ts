@@ -317,9 +317,10 @@ const typecheckSnapshot = async (author: Map<string, Snapshot>, sdk: Map<string,
  * {@link bundleHandlerModule} resolves anything.
  *
  * Handlers are checked in groups that declare the same outputs, each with
- * `writeOutput` narrowed to that group's output ids, so a module shared by
- * handlers with different outputs may write only the outputs all of them
- * declare.
+ * `writeOutput` narrowed to that group's output ids. Every module a group's
+ * handler modules import is checked in that group, so a module reachable
+ * from handlers with different outputs may name only the outputs all of
+ * them declare; a shared helper takes the id as a `HandlerOutputId`.
  */
 const typecheckHandlers = async (author: Map<string, Snapshot>, sdk: Map<string, Snapshot>, ir: ProductionIr, deno: string): Promise<void> => {
   const modules = [...new Set(ir.handlers.map(handler => handler.module))].sort(order);

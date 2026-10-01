@@ -249,6 +249,31 @@ export default (
       "handlers/sync.ts": header + writer("syncFlags", "flags") + writer("syncExtra", "extra"),
     }, "program.tsx");
     await assert.rejects(compileApsides(shared.sourcePath, shared.output), /deno failed/, "a module shared by handlers with different outputs writes only the outputs they share");
+    // Imported modules are checked with each importing handler's outputs:
+    // a module that writes one handler's output cannot be imported by
+    // another, but a helper taking a HandlerOutputId parameter can.
+    const crossImport = await fixture({
+      "program.tsx": twoHandlers("./handlers/sync-flags.ts#syncFlags", "./handlers/sync-extra.ts#syncExtra"),
+      "handlers/sync-flags.ts": `import { KEY } from "./sync-extra.ts";\n` + header + writer("syncFlags", "flags").replace(`"environment"`, "KEY"),
+      "handlers/sync-extra.ts": header + `export const KEY = "environment";\n` + writer("syncExtra", "extra"),
+    }, "program.tsx");
+    await assert.rejects(compileApsides(crossImport.sourcePath, crossImport.output), /handler type check failed for sync-flags \(apsides\.writeOutput accepts flags\)/, "an imported module is checked with the importing handler's outputs");
+    const helper = `import type { HandlerOutputId } from "@apsides/kubernetes/handler";\nexport function write(id: HandlerOutputId, value: string): void { apsides.writeOutput(id, "environment", value); }\n`;
+    const helperWriter = (name: string, output: string) => `import { write } from "./write.ts";\n${header}export async function ${name}(event: HandlerEvent<"settings">) { write(${JSON.stringify(output)}, event.inputs.settings.data.environment ?? "production"); }\n`;
+    const sharedHelper = await fixture({
+      "program.tsx": twoHandlers("./handlers/sync-flags.ts#syncFlags", "./handlers/sync-extra.ts#syncExtra"),
+      "handlers/sync-flags.ts": helperWriter("syncFlags", "flags"),
+      "handlers/sync-extra.ts": helperWriter("syncExtra", "extra"),
+      "handlers/write.ts": helper,
+    }, "program.tsx");
+    await compileApsides(sharedHelper.sourcePath, sharedHelper.output);
+    const helperMisuse = await fixture({
+      "program.tsx": twoHandlers("./handlers/sync-flags.ts#syncFlags", "./handlers/sync-extra.ts#syncExtra"),
+      "handlers/sync-flags.ts": helperWriter("syncFlags", "extra"),
+      "handlers/sync-extra.ts": helperWriter("syncExtra", "extra"),
+      "handlers/write.ts": helper,
+    }, "program.tsx");
+    await assert.rejects(compileApsides(helperMisuse.sourcePath, helperMisuse.output), /handler type check failed for sync-flags/, "a shared helper still rejects another handler's output id");
 
     // A locked module that only supplies types to a handler is reachable
     // through its erased import type, not an unreachable lock entry.

@@ -131,10 +131,12 @@ faster than the upstream can run.
   declare. `HandlerEvent<"settings">` on a handler whose input is
   `feature-settings`, or an export the module does not have, fails the build.
 - `apsides.writeOutput`'s output id is narrowed to the outputs the `<On>`
-  declares, so an undeclared or computed id fails the build. Handlers are
-  checked in groups that declare the same outputs; a module exporting
-  handlers with different outputs may write only the outputs they all
-  declare, so give such handlers a module each.
+  declares, so an undeclared or computed id fails the build. The check covers
+  the handler's module and every module it imports, so a module reachable
+  from handlers with different outputs may write only the outputs they all
+  declare. Give such handlers a module each, keep shared constants out of
+  modules that write outputs, and have a shared helper take the id as a
+  parameter typed `HandlerOutputId` from `@apsides/kubernetes/handler`.
 
 Validation also rejects a handler that triggers on or reads its own output, and
 any cycle in which handlers feed each other through their outputs; the SDK
