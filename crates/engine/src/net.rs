@@ -122,16 +122,27 @@ const fn is_global_unicast_v6(ip: Ipv6Addr) -> bool {
     if s[0] == 0x2001 && s[1] == 0x0db8 {
         return false;
     }
-    // Discard-only, 100::/64.
-    if s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0 {
+    // Discard-only, 100::/64, and the dummy prefix, 100:0:0:1::/64.
+    if s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] <= 1 {
+        return false;
+    }
+    // Documentation, 3fff::/20.
+    if s[0] == 0x3fff && s[1] & 0xf000 == 0 {
+        return false;
+    }
+    // Segment Routing (SRv6) SIDs, 5f00::/16.
+    if s[0] == 0x5f00 {
         return false;
     }
     // 6to4, 2002::/16.
     if s[0] == 0x2002 {
         return false;
     }
-    // Teredo, 2001:0000::/32.
-    if s[0] == 0x2001 && s[1] == 0x0000 {
+    // IETF protocol assignments, 2001::/23: Teredo (2001::/32),
+    // benchmarking (2001:2::/48), ORCHIDv2 and the rest of the block. A
+    // few of its anycast assignments are globally reachable, but none is
+    // an HTTPS service a handler has reason to call.
+    if s[0] == 0x2001 && s[1] < 0x0200 {
         return false;
     }
     // IPv4-mapped, ::ffff:0:0/96.
@@ -152,6 +163,17 @@ const fn is_global_unicast_v6(ip: Ipv6Addr) -> bool {
         return false;
     }
     true
+}
+
+/// The `Host` header for `declared_host` on `port`: the URI authority,
+/// which carries the port unless it is the HTTPS default (RFC 9110,
+/// section 7.2). `declared_host` is never an IP literal, so no brackets.
+fn host_header(declared_host: &str, port: u16) -> String {
+    if port == 443 {
+        declared_host.to_owned()
+    } else {
+        format!("{declared_host}:{port}")
+    }
 }
 
 #[derive(Debug, Error)]
@@ -560,7 +582,7 @@ pub async fn https_request(
     let mut request_builder = hyper::Request::builder()
         .method(http_method)
         .uri(path_and_query)
-        .header(hyper::header::HOST, declared_host);
+        .header(hyper::header::HOST, host_header(declared_host, port));
     for (name, value) in headers {
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_err| HttpsError::InvalidHeader(name.clone()))?;
@@ -645,7 +667,7 @@ pub async fn https_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_global_unicast, resolver_config_from_resolv_conf};
+    use super::{host_header, is_global_unicast, resolver_config_from_resolv_conf};
     use std::net::IpAddr;
 
     #[test]
@@ -717,6 +739,15 @@ mod tests {
     /// named range in the review's reject list plus a handful of ordinary
     /// public addresses and boundary cases either side of a range.
     #[test]
+    fn host_header_carries_a_non_default_port() {
+        assert_eq!(host_header("api.example.com", 443), "api.example.com");
+        assert_eq!(
+            host_header("other.example.com", 8443),
+            "other.example.com:8443"
+        );
+    }
+
+    #[test]
     fn classifies_every_named_range() -> Result<(), String> {
         let cases: &[(&str, bool)] = &[
             // Ordinary public addresses.
@@ -768,14 +799,24 @@ mod tests {
             ("fc00::1", false),
             ("fd12:3456:789a::1", false),
             ("fec0::1", false),
-            // IPv6 documentation.
+            // IPv6 documentation, both prefixes, with the 3fff::/20 boundary.
             ("2001:db8::1", false),
-            // Discard-only.
+            ("3fff::1", false),
+            ("3fff:fff:ffff::1", false),
+            ("3fff:1000::1", true),
+            // Discard-only and the dummy prefix.
             ("100::1", false),
+            ("100:0:0:1::1", false),
+            // SRv6 SIDs.
+            ("5f00::1", false),
             // 6to4.
             ("2002::1", false),
-            // Teredo.
+            // IETF protocol assignments 2001::/23: Teredo, benchmarking, the
+            // top of the block, and the first address past it.
             ("2001:0:1234::1", false),
+            ("2001:2::1", false),
+            ("2001:1ff:ffff::1", false),
+            ("2001:200::1", true),
             // Embedded IPv4 forms.
             ("::ffff:8.8.8.8", false),
             ("::8.8.8.8", false),
