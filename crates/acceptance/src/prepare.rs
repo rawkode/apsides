@@ -97,9 +97,7 @@ pub async fn prepare(options: &Options) -> Result<Inputs> {
     let mut releases = Vec::new();
     for (name, source) in RELEASES {
         let directory = output.join(name);
-        if directory.exists() {
-            std::fs::remove_dir_all(&directory)?;
-        }
+        remove_tree(&directory)?;
         std::fs::create_dir_all(&directory)?;
         let release = build_release(&Build {
             aps: &aps,
@@ -112,7 +110,7 @@ pub async fn prepare(options: &Options) -> Result<Inputs> {
         .await?;
         sign(&key, &release).await?;
         releases.push(release);
-        reclaim_build_cache(&directory).await?;
+        remove_build_artifacts(&directory)?;
     }
     std::fs::remove_file(&key)?;
 
@@ -255,53 +253,57 @@ async fn build_release(build: &Build<'_>) -> Result<PathBuf> {
 }
 
 /// Reclaim disk after one program's release is built and signed, before the
-/// next program's `aps build` compiles the whole dependency graph again.
+/// next program's `aps build`: removes `build/`, `build.source/` and
+/// `build.native-context/` under `directory` if present, leaving `release/`
+/// (and anything else) untouched.
 ///
-/// [`RELEASES`] builds several programs in the same job. Every one of them
-/// depends on the same `runtime` crate, so every `aps build` recompiles
-/// `crates/engine`'s `deno_core`/`v8` from scratch inside a fresh, `RUN
-/// --network=none cargo build --release` `BuildKit` layer (each program's
-/// differing `controller/src` invalidates `Docker`'s layer cache for every
-/// build after it, by design -- see `scripts/package_oci.py`'s `build()`).
-/// Neither that layer's build cache nor `aps build`'s own
-/// `<artifact>.oci-context` staging directory (which holds `cargo vendor`'s
-/// output -- routinely 700+ MB once `deno_core` is in the dependency graph)
-/// is ever consulted again once `aps release` has copied what it needs out
-/// of `artifact` into `release`: nothing downstream reads `build/` or
-/// `build.oci-context/` (`check.yml`'s "Pack the prepared inputs" step packs
-/// only each program's `release/` directory). Left in place across five
-/// sequential full builds, they are large enough on their own to exhaust a
-/// hosted runner's disk before every program has an image -- observed
-/// directly in CI (`No space left on device` mid-`cargo build`, on a run
-/// whose `reactor` job, building only one program, otherwise passed).
+/// [`RELEASES`] builds several programs in the same job. Each build's
+/// `<artifact>.native-context` holds `cargo vendor`'s output -- routinely
+/// 700+ MB once `deno_core` is in the dependency graph -- and nothing reads
+/// it, `build/` or `build.source/` again once `aps release` has copied what
+/// it needs into `release/` (`check.yml`'s "Pack the prepared inputs" step
+/// packs only each program's `release/` directory). Left in place across five
+/// sequential full builds, they are large enough to exhaust a hosted
+/// runner's disk before every program has an image. The compile's target
+/// directory is the build cache `APSIDES_BUILD_CACHE` names, shared by all
+/// five builds, so it is not removed here.
 ///
 /// # Errors
-/// Fails if a spawned cleanup command cannot run or a directory removal
-/// fails for a reason other than the path already being gone.
-async fn reclaim_build_cache(directory: &Path) -> Result {
-    remove_build_artifacts(directory)?;
-    // The default (non---all) prune only removes cache unreferenced by any
-    // image, which is every layer these `--output type=local` builds
-    // produce (they never tag or push an image), not the base images
-    // "Pull pinned build images" already fetched once for the whole job.
-    Invocation::new("docker")
-        .args(["buildx", "prune", "--force"])
-        .timeout(Duration::from_mins(5))
-        .run()
-        .await?;
+/// Fails if a directory removal fails for a reason other than the path
+/// already being gone.
+fn remove_build_artifacts(directory: &Path) -> Result {
+    for name in ["build", "build.source", "build.native-context"] {
+        remove_tree(&directory.join(name))?;
+    }
     Ok(())
 }
 
-/// The filesystem half of [`reclaim_build_cache`], split out so it is
-/// testable without a `Docker` daemon: removes `build/` and
-/// `build.oci-context/` under `directory` if present, leaving `release/`
-/// (and anything else) untouched.
-fn remove_build_artifacts(directory: &Path) -> Result {
-    for name in ["build", "build.oci-context"] {
-        let path = directory.join(name);
-        if path.exists() {
-            std::fs::remove_dir_all(&path)?;
+/// Removes the directory tree at `path` if it exists, first making every
+/// directory in it writable: `aps build` publishes its native context
+/// read-only.
+///
+/// # Errors
+/// Fails if a permission cannot be changed or the tree cannot be removed.
+pub(crate) fn remove_tree(path: &Path) -> Result {
+    use std::os::unix::fs::PermissionsExt as _;
+    fn writable(directory: &Path) -> std::io::Result<()> {
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o755))?;
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                writable(&entry.path())?;
+            }
         }
+        Ok(())
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {
+            writable(path)?;
+            std::fs::remove_dir_all(path)?;
+        }
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     Ok(())
 }
@@ -401,21 +403,25 @@ pub(crate) fn absolute(path: &Path) -> Result<PathBuf> {
 }
 
 /// Variables `aps build` needs beyond the inherited allowlist: where Cargo,
-/// rustup and Deno keep their caches, and where `scripts/rusty_v8.py`
-/// caches the pinned `rusty_v8` archive it fetches before the `--network=none`
-/// Cargo build (`APSIDES_RUSTY_V8_CACHE`; see `scripts/rusty_v8.py`'s
-/// `default_cache_dir()`). Without forwarding it, `Invocation::start`'s
-/// `env_clear()` drops it, `aps build` falls back to its own default
-/// (`$HOME/.cache/apsides/rusty-v8`, still inherited and so not itself
-/// wrong), and CI's cache step (keyed to the same path this crate's caller
-/// sets `APSIDES_RUSTY_V8_CACHE` to) ends up caching a directory nothing
-/// ever writes to.
-const BUILD_ENV_NAMES: [&str; 5] = [
+/// rustup and Deno keep their caches; which container engine compiles
+/// (`APSIDES_CONTAINER_ENGINE`); where the native build caches the pinned
+/// `rusty_v8` archive it fetches before the network-less compile
+/// (`APSIDES_RUSTY_V8_CACHE`; see `crates/packaging/src/rusty_v8.rs`) and
+/// its cargo target directories (`APSIDES_BUILD_CACHE`); and the
+/// `XDG_CACHE_HOME` both fall back to. Without forwarding them,
+/// `Invocation::start`'s `env_clear()` drops them: the build picks another
+/// engine than the one holding the pinned images, and CI's cache steps
+/// (keyed to the paths this crate's caller sets) end up caching directories
+/// nothing ever writes to.
+const BUILD_ENV_NAMES: [&str; 8] = [
     "CARGO_HOME",
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
     "DENO_DIR",
+    "APSIDES_CONTAINER_ENGINE",
     "APSIDES_RUSTY_V8_CACHE",
+    "APSIDES_BUILD_CACHE",
+    "XDG_CACHE_HOME",
 ];
 
 pub(crate) trait BuildEnvironment {
@@ -432,7 +438,7 @@ impl BuildEnvironment for Invocation {
 /// parameter so a test can supply a fixed one instead of mutating this
 /// process's real environment (`std::env::set_var` is `unsafe` under the
 /// 2024 edition, denied workspace-wide).
-fn envs_for_build_via(
+pub(crate) fn envs_for_build_via(
     invocation: Invocation,
     lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Invocation {
@@ -455,37 +461,57 @@ mod tests {
     }
 
     #[test]
-    fn build_env_names_forward_the_rusty_v8_cache_directory() {
-        assert!(BUILD_ENV_NAMES.contains(&"APSIDES_RUSTY_V8_CACHE"));
+    fn build_env_names_forward_the_engine_and_build_caches() {
+        for name in [
+            "APSIDES_CONTAINER_ENGINE",
+            "APSIDES_RUSTY_V8_CACHE",
+            "APSIDES_BUILD_CACHE",
+            "XDG_CACHE_HOME",
+        ] {
+            assert!(BUILD_ENV_NAMES.contains(&name), "{name} is not forwarded");
+        }
     }
 
-    /// `remove_build_artifacts` deletes `build/` and `build.oci-context/`
-    /// (the `cargo vendor` staging directory `aps build` never needs again
-    /// once `aps release` has copied what it needs into `release/`) without
-    /// touching `release/` or anything else -- the fix for the acceptance
-    /// matrix's five sequential full `deno_core`/`v8` compiles exhausting a
-    /// hosted runner's disk before every program has an image.
+    /// `remove_build_artifacts` deletes `build/`, `build.source/` and the
+    /// read-only `build.native-context/` (the `cargo vendor` staging
+    /// directory `aps build` never needs again once `aps release` has copied
+    /// what it needs into `release/`) without touching `release/` or
+    /// anything else -- the fix for the acceptance matrix's five sequential
+    /// builds exhausting a hosted runner's disk before every program has an
+    /// image.
     #[test]
     fn remove_build_artifacts_deletes_only_the_build_staging_directories() -> Result {
+        use std::os::unix::fs::PermissionsExt as _;
         let program = tempfile::tempdir()?;
         let program = program.path();
         std::fs::create_dir_all(program.join("build/image"))?;
         std::fs::write(program.join("build/build-result.json"), b"{}")?;
-        std::fs::create_dir_all(program.join("build.oci-context/vendor/example"))?;
-        std::fs::write(program.join("build.oci-context/context.json"), b"{}")?;
+        std::fs::create_dir_all(program.join("build.source"))?;
+        std::fs::write(program.join("build.source/build-inputs.json"), b"{}")?;
+        let vendor = program.join("build.native-context/vendor/example");
+        std::fs::create_dir_all(&vendor)?;
+        std::fs::write(vendor.join("lib.rs"), b"")?;
+        for sealed in [
+            vendor,
+            program.join("build.native-context/vendor"),
+            program.join("build.native-context"),
+        ] {
+            std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o555))?;
+        }
         std::fs::create_dir_all(program.join("release"))?;
         std::fs::write(program.join("release/release.json"), b"{}")?;
 
         remove_build_artifacts(program)?;
 
         assert!(!program.join("build").exists());
-        assert!(!program.join("build.oci-context").exists());
+        assert!(!program.join("build.source").exists());
+        assert!(!program.join("build.native-context").exists());
         assert!(program.join("release/release.json").exists());
         Ok(())
     }
 
-    /// Neither directory need exist -- a program whose build already failed,
-    /// or one `reclaim_build_cache` already ran for, is not an error.
+    /// None of the directories need exist -- a program whose build already
+    /// failed, or one they were already removed for, is not an error.
     #[test]
     fn remove_build_artifacts_tolerates_directories_that_are_already_gone() -> Result {
         let program = tempfile::tempdir()?;

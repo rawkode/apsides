@@ -3,8 +3,8 @@
 //! [`run`] creates a kind cluster named `aps-acc-…`, hands the scenario body a
 //! [`Scenario`] holding the admin client, the node and the private state
 //! `aps` is given, collects allowlisted diagnostics if the body fails, deletes
-//! the cluster, confirms by exact name that kind and Docker no longer know it,
-//! and writes the redacted report.
+//! the cluster, confirms by exact name that kind and the container engine no
+//! longer know it, and writes the redacted report.
 
 use crate::{
     Result,
@@ -32,7 +32,8 @@ use std::{
 use test_cluster::{
     NODE_IMAGE,
     cluster::{Cluster, Disposition, Endpoint},
-    process::{Ending, Invocation, Output, Running},
+    engine::{self, EngineCommands as _},
+    process::{Ending, Output, Running},
 };
 
 /// Every cluster this suite creates is named with this prefix.
@@ -382,14 +383,13 @@ fn private_directory() -> Result<tempfile::TempDir> {
     Ok(directory)
 }
 
-/// Whether kind no longer lists the cluster and Docker has no node container
-/// of that name.
+/// Whether kind no longer lists the cluster and the container engine has no
+/// node container of that name.
 async fn cluster_absent(name: &str) -> Result<bool> {
-    let clusters = Invocation::new("kind")
-        .args(["get", "clusters"])
-        .run()
-        .await?;
-    let containers = Invocation::new("docker")
+    let engine = engine::current()?;
+    let clusters = engine.kind().args(["get", "clusters"]).run().await?;
+    let containers = engine
+        .command()
         .args(["ps", "--all", "--quiet", "--filter"])
         .arg(format!("name=^/{name}-control-plane$"))
         .run()

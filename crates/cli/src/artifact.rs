@@ -70,14 +70,9 @@ pub fn emit(plan: &CompiledPlan, output: &Path, stage: &Path) -> Result<()> {
         &mut files,
     )?;
     let runtime_path = assets.join("crates/runtime").canonicalize()?;
-    let manifest = format!(
-        // No `tokio` dependency here: `main.rs` is synchronous (see the
-        // Apsides v0.3 plan, Phase 5c) and calls `runtime::start` directly,
-        // which builds and owns its own tokio runtime internally, after
-        // Landlock lockdown.
-        "[package]\nname = \"controller\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n\n[dependencies]\nruntime = {{ path = {} }}\n",
-        serde_json::to_string(runtime_path.to_str().ok_or("non UTF-8 runtime path")?)?
-    );
+    let manifest = packaging::controller_manifest(&serde_json::to_string(
+        runtime_path.to_str().ok_or("non UTF-8 runtime path")?,
+    )?);
     write(
         output,
         "controller/Cargo.toml",
@@ -306,12 +301,18 @@ pub fn verify(root: &Path) -> Result<Value> {
 }
 
 pub fn prepare_lock(root: &Path) -> Result<()> {
-    let workspace_lock = crate::assets::root()?.join("Cargo.lock");
-    fs::copy(workspace_lock, root.join("controller/Cargo.lock"))?;
+    let assets = crate::assets::root()?;
+    fs::copy(
+        assets.join("Cargo.lock"),
+        root.join("controller/Cargo.lock"),
+    )?;
     // Start from the compiler's own lock. Cargo adds the generated root package
     // without upgrading versions already selected in that lock; resolution is
-    // preparation, and all subsequent native builds require --locked.
-    let output = std::process::Command::new("cargo")
+    // preparation, and all subsequent native builds require --locked. Host
+    // cargo runs with the toolchain the checkout pins (unless RUSTUP_TOOLCHAIN
+    // chooses one), wherever the output is, and never installs one.
+    let output = packaging::HostCargo::locate(&assets)?
+        .command()
         .args([
             "metadata",
             "--offline",
@@ -322,7 +323,18 @@ pub fn prepare_lock(root: &Path) -> Result<()> {
         .arg(root.join("controller/Cargo.toml"))
         .output()?;
     if !output.status.success() {
-        return Err("prepared native dependencies are incomplete; Cargo metadata could not lock the generated controller offline".into());
+        return Err(format!(
+            "prepared native dependencies are incomplete; Cargo metadata could not lock the generated controller offline{}",
+            if String::from_utf8_lossy(&output.stderr).contains("rustup") {
+                format!(
+                    " (rustup could not run the pinned toolchain: install the toolchain named in {}, or set RUSTUP_TOOLCHAIN)",
+                    assets.join("rust-toolchain.toml").display()
+                )
+            } else {
+                String::new()
+            }
+        )
+        .into());
     }
     let mut manifest: Manifest = serde_json::from_value(compiler_core::parse_strict(
         &fs::read_to_string(root.join("manifest.json"))?,

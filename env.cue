@@ -17,7 +17,6 @@ tasks: {
 	}
 	packageCli: {command: "python3", args: ["scripts/package_cli.py", "--output", "work/aps-distribution", "--target-dir", "work/cli-package-target"]}
 	packageCliTest: {command: "python3", args: ["tests/test_package_cli.py"]}
-	packagingTest: {command: "python3", args: ["tests/test_packaging.py"]}
 	cnpgCleanupTypes: {
 		dependsOn: [install]
 		command: "sh"
@@ -51,15 +50,20 @@ tasks: {
 	compilerCoreCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "compiler-core", "--all-targets", "--", "-D", "warnings"]}
 	coordinationCheck: {command: "sh", args: ["-c", "cargo clippy --locked -p coordination --all-targets -- -D warnings && cargo check --locked -p coordination --no-default-features"]}
 	registryRuntimeCheck: {command: "cargo", args: ["check", "--locked", "-p", "platform", "--no-default-features"]}
+	containerTest: {command: "cargo", args: ["test", "--locked", "-p", "container"]}
+	containerCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "container", "--all-targets", "--", "-D", "warnings"]}
+	packagingTest: {command: "cargo", args: ["test", "--locked", "-p", "packaging"]}
+	packagingCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "packaging", "--all-targets", "--", "-D", "warnings"]}
 	testClusterTest: {command: "cargo", args: ["test", "--locked", "-p", "test-cluster"]}
 	testClusterCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "test-cluster", "--all-targets", "--", "-D", "warnings"]}
 	// Refreshes scripts/runtime-base from the registry for the digest in
 	// scripts/runtime-base/reference; the only task that fetches image metadata.
 	runtimeBasePin: {command: "python3", args: ["scripts/runtime_base_pin.py"]}
 	// The fixture release and workload fixture image `aps test --cluster` runs.
-	// Needs Docker, cargo-cyclonedx and the pinned build images already pulled;
-	// see scripts/reactor_fixture.sh. The cluster run also needs kind and the
-	// pinned node and proxy images (docs/guides/build-and-deploy.md).
+	// Needs podman or Docker, cargo-cyclonedx on PATH and the pinned build
+	// images in that engine's store; see scripts/reactor_fixture.sh. The cluster run also needs kind on podman
+	// or Docker and the pinned node and proxy images in that engine's store
+	// (docs/guides/build-and-deploy.md).
 	reactorFixture: {
 		dependsOn: [build, install]
 		command: "sh"
@@ -78,16 +82,17 @@ tasks: {
 	// writes
 	// work/acceptance/inputs.json. Generates the CNPG types itself rather than
 	// depending on the types tasks: a dependency chain two tasks deep makes
-	// cuenv's module evaluation time out. Needs Docker, cargo-cyclonedx on
-	// PATH and the pinned build images local; see docs/reference/ACCEPTANCE.md.
+	// cuenv's module evaluation time out. Needs podman or Docker,
+	// cargo-cyclonedx on PATH and the pinned build images in that engine's
+	// store; see docs/reference/ACCEPTANCE.md.
 	acceptancePrepare: {
 		dependsOn: [build, install]
 		command: "sh"
 		args: ["-c", "deno run --allow-all packages/compiler/src/crds.ts https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_clusters.yaml Cluster examples/cnpg/.aps/crds/cnpg.ts v1 && deno run --allow-all packages/compiler/src/crds.ts https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_clusters.yaml Cluster examples/cnpg/initial/.aps/crds/cnpg.ts v1 && deno run --allow-all packages/compiler/src/crds.ts https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_clusters.yaml Cluster examples/cnpg/cleanup/.aps/crds/cnpg.ts v1 && deno run --allow-all packages/compiler/src/crds.ts https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/config/crd/bases/postgresql.cnpg.io_backups.yaml Backup examples/cnpg/cleanup/.aps/crds/backup.ts v1 && cargo run --locked -p acceptance --bin acceptance-prepare -- --output work/acceptance"]
 	}
 	// Runs every acceptance scenario, each on its own kind cluster, against
-	// what acceptancePrepare wrote. Needs Docker, kind and the pinned kind
-	// node image local. CI runs the same scenarios split across the four
+	// what acceptancePrepare wrote. Needs kind on podman or Docker and the
+	// pinned kind node image in that engine's store. CI runs the same scenarios split across the four
 	// tasks after it.
 	acceptanceTest: {
 		command: "sh"
@@ -111,13 +116,23 @@ tasks: {
 	}
 	// Builds examples/web-application twice with `aps build --cache disabled`
 	// and requires identical outputs, file for file (spec §28
-	// reproducibility). Needs Docker, cargo-cyclonedx on PATH and the pinned
-	// build images local. CI runs it nightly; the compile half runs in the CLI
-	// tests on every change.
+	// reproducibility). Needs podman or Docker, cargo-cyclonedx on PATH and
+	// the pinned build images in that engine's store. CI runs it nightly; the
+	// compile half runs in the CLI tests on every change.
 	reproducibleBuild: {
 		dependsOn: [build, install]
 		command: "cargo"
 		args: ["run", "--locked", "-p", "acceptance", "--bin", "acceptance-reproduce", "--", "--output", "work/reproducible-build"]
+	}
+	// Builds examples/web-application once with Docker and once with podman,
+	// both with `aps build --cache disabled`, and requires identical outputs
+	// apart from the engine each records as a host tool. Needs both engines,
+	// cargo-cyclonedx on PATH and the pinned build images in both stores. CI
+	// runs it nightly.
+	engineParityBuild: {
+		dependsOn: [build, install]
+		command: "cargo"
+		args: ["run", "--locked", "-p", "acceptance", "--bin", "acceptance-reproduce", "--", "--output", "work/engine-parity", "--engines", "docker,podman"]
 	}
 	acceptanceCheck: {command: "cargo", args: ["clippy", "--locked", "-p", "acceptance", "--all-targets", "--", "-D", "warnings"]}
 	runtimeTest: {command: "cargo", args: ["test", "--locked", "-p", "runtime"]}

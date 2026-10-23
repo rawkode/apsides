@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path};
 
-pub const COMPILER_CLOSURE_SCHEMA: &str = "apsides.dev/compiler-closure/v3";
+pub const COMPILER_CLOSURE_SCHEMA: &str = "apsides.dev/compiler-closure/v4";
 const MAX_COMPILER_CLOSURE_BYTES: usize = 8 * 1024 * 1024;
 /// A ceiling on `buildContextFiles.len() + packagingFiles.len()`, not a byte
 /// budget (see [`MAX_COMPILER_CLOSURE_BYTES`] for that): sized for the real
@@ -14,7 +14,7 @@ const MAX_COMPILER_CLOSURE_BYTES: usize = 8 * 1024 * 1024;
 /// once `crates/engine`'s `deno_core`/`v8` are in the dependency graph
 /// (342 locked packages, as of this pin) stages 37,408 files under `vendor/`
 /// alone, plus a few hundred more for the trusted Apsides crate sources and
-/// packaging scripts `validate_native_compiler` below also requires --
+/// packaging code `validate_native_compiler` below also requires --
 /// comfortably over the previous 32,768 ceiling, which rejected every real
 /// release with a correct, non-misleading "native compiler closure is
 /// incomplete or invalid" (the file-count check, not a corrupted document).
@@ -47,18 +47,18 @@ pub struct NativeCompiler {
     pub packaging_files: Vec<CompilerFile>,
     pub build_profile_sha256: String,
     pub host_tools: Vec<HostTool>,
-    pub trusted_cli_code_sha256: String,
     pub approved_runtime: ApprovedRuntime,
     pub rusty_v8: RustyV8,
 }
 
-/// The pinned `v8` crate (`denoland/rusty_v8`) offline build inputs
-/// `scripts/package_oci.py` fetched, SHA-256-verified against
-/// `scripts/rusty-v8/pins.json` and staged into the `--network=none`
+/// The pinned `v8` crate (`denoland/rusty_v8`) offline build inputs.
+///
+/// `crates/packaging` fetches them, SHA-256-verified against
+/// `scripts/rusty-v8/pins.json`, and stages them into the network-less
 /// build context (see `crates/engine`'s `deno_core` dependency). Recorded
 /// by identity, not just as an opaque `build_context_files` entry, so the
 /// compiler closure states what the staged file is.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RustyV8 {
     pub archive: RustyV8Component,
@@ -68,7 +68,7 @@ pub struct RustyV8 {
     pub binding_file: Option<RustyV8Component>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RustyV8Component {
     pub name: String,
@@ -95,7 +95,7 @@ pub struct CompilerFile {
     pub sha256: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HostTool {
     pub role: String,
@@ -103,9 +103,11 @@ pub struct HostTool {
     pub version: String,
 }
 
-/// The runtime base image: its pinned reference, the registry index and
-/// platform manifest that digest names (committed as source pins, since
-/// Docker's classic image store keeps neither), and the image config.
+/// The runtime base image the controller image extends.
+///
+/// It carries its pinned reference, the registry index and platform manifest
+/// that digest names (committed as source pins, since neither Docker's
+/// classic image store nor podman keeps them), and the image config.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApprovedRuntime {
@@ -113,10 +115,6 @@ pub struct ApprovedRuntime {
     pub index_json: String,
     pub manifest_json: String,
     pub config_json: String,
-}
-
-pub(crate) struct ValidatedRuntime {
-    pub config: Value,
 }
 
 fn valid_digest(value: &str) -> bool {
@@ -227,7 +225,7 @@ fn runtime_documents(runtime: &ApprovedRuntime) -> Result<(Value, Value)> {
     Ok((manifest, parse_strict(&runtime.config_json)?))
 }
 
-fn validate_runtime(runtime: &ApprovedRuntime) -> Result<ValidatedRuntime> {
+fn validate_runtime(runtime: &ApprovedRuntime) -> Result<Value> {
     let (manifest, config) = runtime_documents(runtime)?;
     let (os, architecture) = platform(&runtime.base_image.platform)
         .ok_or_else(|| crate::Error::Rejected("unsupported runtime platform".into()))?;
@@ -287,13 +285,24 @@ fn validate_runtime(runtime: &ApprovedRuntime) -> Result<ValidatedRuntime> {
     {
         return reject("approved runtime contains an unsafe or ambiguous environment");
     }
-    Ok(ValidatedRuntime { config })
+    Ok(config)
+}
+
+/// Validate an approved runtime base on its own and return its image config.
+///
+/// This is the runtime half of [`validate_compiler_closure`], for a producer
+/// that checks the base it is about to extend before any closure exists.
+///
+/// # Errors
+/// Rejects an incomplete, oversized, disconnected or unsafe runtime identity.
+pub fn validate_approved_runtime(runtime: &ApprovedRuntime) -> Result<Value> {
+    validate_runtime(runtime)
 }
 
 pub(crate) fn validated_compiler_closure(
     build_inputs: &Value,
     expected_digest: &str,
-) -> Result<(String, ValidatedRuntime)> {
+) -> Result<(String, CompilerClosure)> {
     let object = build_inputs
         .as_object()
         .ok_or_else(|| crate::Error::Rejected("build inputs must be an object".into()))?;
@@ -320,15 +329,38 @@ pub(crate) fn validated_compiler_closure(
     if serde_json::to_value(&closure.authoring_compiler)? != expected_authoring {
         return reject("compiler closure is disconnected from the authoring toolchain receipt");
     }
-    let runtime = validate_native_compiler(&closure.native_compiler)?;
+    validate_native_compiler(&closure.native_compiler)?;
     let actual = digest(&closure)?;
     if !valid_digest(recorded_digest) || recorded_digest != actual || expected_digest != actual {
         return reject("release compiler identity does not match the compiler closure");
     }
-    Ok((actual, runtime))
+    Ok((actual, closure))
 }
 
-fn validate_native_compiler(native: &NativeCompiler) -> Result<ValidatedRuntime> {
+/// The directories the compile container mounts; every build context file
+/// lies under one of them.
+const CONTEXT_DIRECTORIES: [&str; 5] = [
+    ".cargo/",
+    "controller/",
+    "rusty-v8/",
+    "vendor/",
+    "workspace/",
+];
+/// Where the build context stages the `rusty_v8` archive, whatever the
+/// target.
+const RUSTY_V8_ARCHIVE_PATH: &str = "rusty-v8/librusty_v8.a.gz";
+/// The crates whose `Cargo.toml` and `src/` make up the packaging code.
+const PACKAGING_CRATES: [&str; 5] = [
+    "crates/cli/",
+    "crates/compiler-core/",
+    "crates/container/",
+    "crates/packaging/",
+    "crates/release/",
+];
+/// The workspace files the packaging code is built with.
+const PACKAGING_ROOT_FILES: [&str; 2] = ["Cargo.lock", "Cargo.toml"];
+
+fn validate_native_compiler(native: &NativeCompiler) -> Result<()> {
     if !valid_image(&native.builder_image.reference)
         || !matches!(
             native.builder_image.platform.as_str(),
@@ -343,70 +375,17 @@ fn validate_native_compiler(native: &NativeCompiler) -> Result<ValidatedRuntime>
     {
         return reject("native compiler closure is incomplete or invalid");
     }
-    let runtime = validate_runtime(&native.approved_runtime)?;
+    validate_runtime(&native.approved_runtime)?;
     validate_files(&native.build_context_files)?;
     validate_files(&native.packaging_files)?;
-    for required in [
-        ".cargo/config.toml",
-        "Dockerfile",
-        "controller/Cargo.lock",
-        "controller/Cargo.toml",
-        "controller/src/ir.json",
-        "controller/src/main.rs",
-        "workspace/Cargo.toml",
-    ] {
-        if !native
-            .build_context_files
-            .iter()
-            .any(|file| file.path == required)
-        {
-            return reject("native compiler context omits a required build input");
-        }
-    }
-    if !native
-        .build_context_files
-        .iter()
-        .any(|file| file.path.starts_with("vendor/"))
-    {
-        return reject("native compiler context omits vendored dependency sources");
-    }
-    validate_rusty_v8(&native.rusty_v8, &native.build_context_files)?;
-    for required in [
-        "scripts/Dockerfile",
-        "scripts/build.py",
-        "scripts/diagnostics.py",
-        "scripts/extract_binary.py",
-        "scripts/finalize_inputs.py",
-        "scripts/package_oci.py",
-        "scripts/rusty_v8.py",
-        "scripts/sbom.py",
-        "scripts/toolchain_snapshot.py",
-        "crates/cli/Cargo.toml",
-    ] {
-        if !native
-            .packaging_files
-            .iter()
-            .any(|file| file.path == required)
-        {
-            return reject("native compiler closure omits trusted packaging code");
-        }
-    }
-    if native
-        .packaging_files
-        .iter()
-        .any(|file| !file.path.starts_with("scripts/") && !file.path.starts_with("crates/cli/"))
-    {
-        return reject("native compiler packaging manifest contains an unsupported source");
-    }
-    let cli_files: Vec<&CompilerFile> = native
-        .packaging_files
-        .iter()
-        .filter(|file| file.path.starts_with("crates/cli/"))
-        .collect();
-    if cli_files.is_empty() || digest(&cli_files)? != native.trusted_cli_code_sha256 {
-        return reject("trusted CLI code identity does not match the native compiler manifest");
-    }
-    let required_roles = ["buildx", "cargo", "docker", "python", "apsides", "sbom"];
+    validate_build_context(native)?;
+    validate_rusty_v8(
+        &native.rusty_v8,
+        &native.build_context_files,
+        &native.builder_image.platform,
+    )?;
+    validate_packaging_files(&native.packaging_files)?;
+    let required_roles = ["engine", "cargo", "apsides", "sbom"];
     if native.host_tools.len() != required_roles.len()
         || native
             .host_tools
@@ -422,7 +401,91 @@ fn validate_native_compiler(native: &NativeCompiler) -> Result<ValidatedRuntime>
     {
         return reject("native compiler host tool identities are incomplete or ambiguous");
     }
-    Ok(runtime)
+    Ok(())
+}
+
+/// The build context is exactly what the compile container mounts: the
+/// required inputs, vendored sources, nothing outside the mounted
+/// directories, and the lock and platform the rest of the closure names.
+fn validate_build_context(native: &NativeCompiler) -> Result<()> {
+    let files = &native.build_context_files;
+    if files.iter().any(|file| {
+        !CONTEXT_DIRECTORIES
+            .iter()
+            .any(|directory| file.path.starts_with(directory))
+    }) {
+        return reject(
+            "native compiler context contains a file outside the mounted build directories",
+        );
+    }
+    for required in [
+        ".cargo/config.toml",
+        "controller/Cargo.lock",
+        "controller/Cargo.toml",
+        "controller/src/ir.json",
+        "controller/src/main.rs",
+        "workspace/Cargo.toml",
+    ] {
+        if !files.iter().any(|file| file.path == required) {
+            return reject("native compiler context omits a required build input");
+        }
+    }
+    if !files.iter().any(|file| file.path.starts_with("vendor/")) {
+        return reject("native compiler context omits vendored dependency sources");
+    }
+    if !files
+        .iter()
+        .any(|file| file.path == "controller/Cargo.lock" && file.sha256 == native.cargo_lock_sha256)
+    {
+        return reject("native compiler lock identity is not the staged controller/Cargo.lock");
+    }
+    if native.builder_image.platform != native.approved_runtime.base_image.platform {
+        return reject("builder and runtime base platforms differ");
+    }
+    Ok(())
+}
+
+/// The packaging code is the `Cargo.toml` and `src/` of the packaging
+/// crates plus the workspace manifest and lock, and none of it may be
+/// missing.
+fn validate_packaging_files(files: &[CompilerFile]) -> Result<()> {
+    let supported = |path: &str| {
+        PACKAGING_ROOT_FILES.contains(&path)
+            || PACKAGING_CRATES.iter().any(|prefix| {
+                path.strip_prefix(prefix)
+                    .is_some_and(|rest| rest == "Cargo.toml" || rest.starts_with("src/"))
+            })
+    };
+    if files.iter().any(|file| !supported(&file.path)) {
+        return reject("native compiler packaging manifest contains an unsupported source");
+    }
+    let required = PACKAGING_ROOT_FILES
+        .iter()
+        .map(|path| (*path).to_owned())
+        .chain(
+            PACKAGING_CRATES
+                .iter()
+                .map(|prefix| format!("{prefix}Cargo.toml")),
+        )
+        .chain([
+            "crates/container/src/lib.rs".to_owned(),
+            "crates/packaging/src/lib.rs".to_owned(),
+        ]);
+    for path in required {
+        if !files.iter().any(|file| file.path == path) {
+            return reject("native compiler closure omits trusted packaging code");
+        }
+    }
+    Ok(())
+}
+
+/// The Rust target triple a build for `platform` compiles for.
+fn rust_target(platform: &str) -> Option<&'static str> {
+    match platform {
+        "linux/amd64" => Some("x86_64-unknown-linux-gnu"),
+        "linux/arm64" => Some("aarch64-unknown-linux-gnu"),
+        _ => None,
+    }
 }
 
 fn valid_url(value: &str) -> bool {
@@ -460,11 +523,39 @@ fn validate_rusty_v8_component(
 /// The pinned `rusty_v8` archive (and optional binding file) must be
 /// consistent with an entry already validated in `build_context_files`, so
 /// this record cannot claim an identity for a file the network-less build
-/// never actually staged.
-fn validate_rusty_v8(rusty_v8: &RustyV8, build_context_files: &[CompilerFile]) -> Result<()> {
+/// never actually staged. They must be built for the build's platform, the
+/// archive must be staged where the compile reads it, and no other file may
+/// be staged beside them.
+fn validate_rusty_v8(
+    rusty_v8: &RustyV8,
+    build_context_files: &[CompilerFile],
+    platform: &str,
+) -> Result<()> {
     validate_rusty_v8_component(&rusty_v8.archive, build_context_files)?;
     if let Some(binding_file) = &rusty_v8.binding_file {
         validate_rusty_v8_component(binding_file, build_context_files)?;
+    }
+    let target = rust_target(platform);
+    if std::iter::once(&rusty_v8.archive)
+        .chain(&rusty_v8.binding_file)
+        .any(|component| Some(component.target.as_str()) != target)
+    {
+        return reject("rusty_v8 component target differs from the build platform");
+    }
+    if rusty_v8.archive.path != RUSTY_V8_ARCHIVE_PATH {
+        return reject("rusty_v8 archive is not staged at rusty-v8/librusty_v8.a.gz");
+    }
+    let recorded: BTreeSet<&str> = std::iter::once(&rusty_v8.archive)
+        .chain(&rusty_v8.binding_file)
+        .map(|component| component.path.as_str())
+        .collect();
+    let staged: BTreeSet<&str> = build_context_files
+        .iter()
+        .map(|file| file.path.as_str())
+        .filter(|path| path.starts_with("rusty-v8/"))
+        .collect();
+    if staged != recorded {
+        return reject("native compiler context stages rusty-v8 files the closure does not record");
     }
     Ok(())
 }

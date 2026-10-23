@@ -303,9 +303,20 @@ fn validate_binary(root: &Path, manifest: &ReleaseManifest) -> Result<()> {
         return reject("native controller identity differs from the release binary digest");
     }
     let binary = bounded_read(&contained(root, "apsides-controller")?, MAX_BINARY)?;
-    let machine = match manifest.image.platform.as_str() {
+    validate_controller_binary(&binary, &manifest.image.platform)
+}
+
+/// Check that `binary` is a 64-bit little-endian Linux ELF executable for
+/// `platform` (`linux/amd64` or `linux/arm64`).
+///
+/// # Errors
+/// Rejects an unsupported platform and any binary that is not an ELF image
+/// for that platform's machine.
+pub fn validate_controller_binary(binary: &[u8], platform: &str) -> Result<()> {
+    let machine = match platform {
+        "linux/amd64" => 62_u16,
         "linux/arm64" => 183_u16,
-        _ => 62_u16,
+        _ => return reject("unsupported controller architecture"),
     };
     if binary.len() < 64
         || !binary.starts_with(b"\x7fELF\x02\x01")

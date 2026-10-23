@@ -222,8 +222,8 @@ pub struct Test {
     /// Also run the cases that need Kubernetes, on a disposable kind cluster.
     #[arg(long, requires_all = ["release", "fixture_image"])]
     pub cluster: bool,
-    /// OCI archive of the workload fixture image, from
-    /// `docker image save apsides-fixture:local`.
+    /// OCI archive of the workload fixture image, as
+    /// `scripts/reactor_fixture.sh` saves it with podman or Docker.
     #[arg(long, requires = "cluster")]
     pub fixture_image: Option<PathBuf>,
     /// A CRD manifest for a custom resource the program manages; repeat for

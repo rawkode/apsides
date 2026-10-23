@@ -24,9 +24,18 @@ cuenv exec -- python3 scripts/package_cli.py \
 
 The package supports macOS and Linux and includes platform-specific Oxc and
 Rolldown dependencies. Build it on the intended operating system and architecture.
-Deno, Cargo, Python, Docker, the prepared native dependency cache and the
+Deno, Cargo, podman or Docker, the prepared native dependency cache and the
 build profile's pinned SBOM tool remain external prerequisites for their
-respective commands. This is not a self-contained executable.
+respective commands; Python is needed only to run `scripts/package_cli.py`
+itself. This is not a self-contained executable.
+
+`share/apsides` holds the Rust sources `aps build` records as its packaging
+code, plus the manifest and sources of every other workspace member, because
+the copied root `Cargo.toml` lists them all and Cargo will not load a
+workspace with a missing member. `aps build` checks them against the digests compiled into `bin/aps`
+and fails with "this aps was built from different packaging sources" when
+they differ, so the bundle's executable and its assets must come from the
+same packaging run.
 
 Distribution builds resolve assets from their installation prefix. They do not
 fall back to a source checkout or accept an environment override. Before using
@@ -47,7 +56,7 @@ a temporary directory. They check that verification fails when a file is
 added, changed or removed, when a symlink escapes the installation, and when
 the tree exceeds its entry, size or depth limits. One test removes or extends
 each of the compiler, SDK, `deno.lock`, a dependency reached through an
-internal link, the runtime crate and the native builder in turn, and checks
+internal link, the runtime crate and the runtime base pin in turn, and checks
 that the restored tree passes again. `cuenv task packageCliTest` covers the
 packaging script.
 

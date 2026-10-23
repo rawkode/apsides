@@ -40,7 +40,7 @@ const REPLACEMENT: &str = "cleanup refuses to delete a replacement UID";
 /// `Backup` is gone, an unclaimed `Backup` of the same type is untouched, and
 /// the successor's workload Role grants no `Backup` access.
 #[tokio::test]
-#[ignore = "creates a kind cluster; needs Docker, kind and `cuenv task acceptancePrepare`"]
+#[ignore = "creates a kind cluster; needs kind on podman or Docker and `cuenv task acceptancePrepare`"]
 async fn cleanup_waits_for_a_finalizer_then_commits() -> Result {
     scenario::run("cleanup-finalizer", async |scenario| {
         let pair = CleanupPair::load(
@@ -62,7 +62,7 @@ async fn cleanup_waits_for_a_finalizer_then_commits() -> Result {
 /// unchanged and the replacement untouched, preserve the unclaimed `Backup`
 /// and grant the successor's workload Role no `Backup` access.
 #[tokio::test]
-#[ignore = "creates a kind cluster; needs Docker, kind and `cuenv task acceptancePrepare`"]
+#[ignore = "creates a kind cluster; needs kind on podman or Docker and `cuenv task acceptancePrepare`"]
 async fn cleanup_refuses_a_replacement_uid() -> Result {
     scenario::run("cleanup-replacement", async |scenario| {
         let pair = CleanupPair::load(

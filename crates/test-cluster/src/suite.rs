@@ -196,7 +196,8 @@ pub async fn run(options: &Options, interrupt: impl Future<Output = String>) -> 
         }
     };
     progress.runner.kind_version = toolchain.kind_version;
-    progress.runner.docker_server_version = toolchain.docker_server_version;
+    progress.runner.container_engine = toolchain.container_engine.to_owned();
+    progress.runner.container_engine_version = toolchain.container_engine_version;
     progress.runner.node_image_id = toolchain.node_image_id;
 
     let cluster = Cluster::new(options.keep_cluster)?;
@@ -275,7 +276,7 @@ fn inspect_images(
     let fixture_name = format!("{}:local", images::repository(FIXTURE_IMAGE)?);
     if !fixture.names.contains(&fixture_name) {
         return input(format!(
-            "the fixture image archive must be a `docker image save` of {FIXTURE_IMAGE}"
+            "the fixture image archive must be an OCI-layout save of {fixture_name}"
         ));
     }
     Ok((controller, fixture))

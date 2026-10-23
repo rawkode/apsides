@@ -1,7 +1,7 @@
 //! Restricted compiler-image verification using OCI, tar and gzip OSS parsers.
 //! No archive entry is extracted to the host filesystem.
 use crate::{
-    Result,
+    ApprovedRuntime, Result,
     manifest::{MAX_DOCUMENT, ReleaseManifest, bounded_read, contained, json, raw_digest},
     reject,
 };
@@ -14,23 +14,58 @@ pub(crate) const MAX_OCI_BYTES: u64 = 512 * 1024 * 1024;
 const TARGET: &str = "usr/local/bin/apsides-controller";
 const ANCESTORS: &[&str] = &["usr", "usr/local", "usr/local/bin"];
 
-fn approved_runtime(
-    root: &Path,
-    release: &ReleaseManifest,
-) -> Result<crate::compiler::ValidatedRuntime> {
+/// The identity a controller OCI layout must carry: the released manifest
+/// digest and platform, and the IR, native binary and approved runtime base
+/// it was assembled from.
+#[derive(Clone, Copy, Debug)]
+pub struct ControllerImage<'a> {
+    pub image_digest: &'a str,
+    pub platform: &'a str,
+    pub ir_digest: &'a str,
+    pub binary_digest: &'a str,
+    pub approved_runtime: &'a ApprovedRuntime,
+}
+
+pub(crate) fn verify(root: &Path, release: &ReleaseManifest) -> Result<()> {
     let build_inputs = json(
         &bounded_read(&contained(root, "build-inputs.json")?, MAX_DOCUMENT)?,
         "build-inputs.json",
     )?;
-    let (_, runtime) =
+    let (_, closure) =
         crate::compiler::validated_compiler_closure(&build_inputs, &release.compiler_digest)?;
-    Ok(runtime)
+    let archive = bounded_read(&contained(root, "controller.oci.tar")?, MAX_OCI_BYTES)?;
+    let image_digest = release
+        .image
+        .reference
+        .rsplit_once('@')
+        .ok_or_else(|| crate::Error::Rejected("image reference lacks a digest".into()))?
+        .1;
+    verify_controller_image(
+        &archive,
+        &ControllerImage {
+            image_digest,
+            platform: &release.image.platform,
+            ir_digest: &release.ir_digest,
+            binary_digest: &release.binary_digest,
+            approved_runtime: &closure.native_compiler.approved_runtime,
+        },
+    )
 }
 
-pub(crate) fn verify(root: &Path, release: &ReleaseManifest) -> Result<()> {
-    let runtime = approved_runtime(root, release)?;
-    let bytes = bounded_read(&contained(root, "controller.oci.tar")?, MAX_OCI_BYTES)?;
-    let mut archive = tar::Archive::new(bytes.as_slice());
+/// Verify a controller OCI layout tar against the identity it must carry.
+///
+/// The layout must hold exactly one manifest, `expected.image_digest`, whose
+/// config is the approved runtime base config rewritten by
+/// [`controller_runtime_config`] and whose layers are the approved base chain
+/// plus one final layer holding only the controller binary and its ancestors.
+/// No archive entry is extracted to the host filesystem.
+///
+/// # Errors
+/// Rejects an invalid approved runtime, a malformed or oversized archive, and
+/// any layout that differs from the expected controller image.
+pub fn verify_controller_image(archive: &[u8], expected: &ControllerImage<'_>) -> Result<()> {
+    let base_config = crate::compiler::validate_approved_runtime(expected.approved_runtime)?;
+    let mut archive = tar::Archive::new(archive);
     let mut files = BTreeMap::new();
     let mut total = 0_u64;
     for entry in archive.entries()? {
@@ -73,12 +108,7 @@ pub(crate) fn verify(root: &Path, release: &ReleaseManifest) -> Result<()> {
     {
         return reject("unsupported OCI layout version");
     }
-    let image_digest = release
-        .image
-        .reference
-        .rsplit_once('@')
-        .ok_or_else(|| crate::Error::Rejected("image reference lacks a digest".into()))?
-        .1;
+    let image_digest = expected.image_digest;
     let raw = blob(&files, image_digest, None)?;
     let index = json(
         files
@@ -111,9 +141,9 @@ pub(crate) fn verify(root: &Path, release: &ReleaseManifest) -> Result<()> {
         "{}/{}",
         config["os"].as_str().unwrap_or(""),
         config["architecture"].as_str().unwrap_or("")
-    ) != release.image.platform
+    ) != expected.platform
         || config["rootfs"]["type"] != "layers"
-        || config["config"] != expected_config(&runtime.config, &release.ir_digest)?
+        || config["config"] != controller_runtime_config(&base_config, expected.ir_digest)?
     {
         return reject(
             "OCI image runtime command, user or platform differs from the native controller contract",
@@ -123,13 +153,21 @@ pub(crate) fn verify(root: &Path, release: &ReleaseManifest) -> Result<()> {
         &files,
         &value,
         &config,
-        &runtime.config,
-        &release.binary_digest,
+        &base_config,
+        expected.binary_digest,
     )
 }
 
-fn expected_config(base: &Value, ir_digest: &str) -> Result<Value> {
-    let mut config = base["config"]
+/// The controller image's runtime configuration.
+///
+/// This is the approved base image config's `config` object with the
+/// controller entrypoint, the non-root runtime user, `/` as working directory
+/// and the Apsides labels applied, and the base `Cmd` removed.
+///
+/// # Errors
+/// Rejects a base config without a `config` object.
+pub fn controller_runtime_config(base_config: &Value, ir_digest: &str) -> Result<Value> {
+    let mut config = base_config["config"]
         .as_object()
         .ok_or_else(|| crate::Error::Rejected("approved base runtime config missing".into()))?
         .clone();
@@ -140,7 +178,7 @@ fn expected_config(base: &Value, ir_digest: &str) -> Result<Value> {
         serde_json::json!(["/usr/local/bin/apsides-controller"]),
     );
     config.remove("Cmd");
-    let mut labels = base["config"]["Labels"]
+    let mut labels = base_config["config"]["Labels"]
         .as_object()
         .cloned()
         .unwrap_or_default();

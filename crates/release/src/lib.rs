@@ -7,8 +7,16 @@ mod manifest;
 mod oci;
 mod provenance;
 
-pub use compiler::validate_compiler_closure;
-pub use manifest::{IntegrityVerifiedCandidate, ReleaseManifest, ReleaseMode, read_release};
+pub use compiler::{
+    ApprovedRuntime, AuthoringCompiler, BuilderImage, COMPILER_CLOSURE_SCHEMA, CompilerClosure,
+    CompilerFile, HostTool, NativeCompiler, RustyV8, RustyV8Component, validate_approved_runtime,
+    validate_compiler_closure,
+};
+pub use manifest::{
+    IntegrityVerifiedCandidate, ReleaseManifest, ReleaseMode, read_release,
+    validate_controller_binary,
+};
+pub use oci::{ControllerImage, controller_runtime_config, verify_controller_image};
 pub use provenance::{SignaturePolicy, TrustPolicy, VerifierTool, verify_candidate};
 
 #[derive(Debug, thiserror::Error)]

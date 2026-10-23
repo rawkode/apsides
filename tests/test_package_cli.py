@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 
@@ -26,11 +27,16 @@ class PackageCliTests(unittest.TestCase):
         self.assertIn("packages/compiler/src/crds.ts", files)
         self.assertIn("packages/compiler/src/source-lock.ts", files)
         self.assertIn("packages/kubernetes/src/model.ts", files)
-        self.assertIn("scripts/build.py", files)
+        self.assertIn("scripts/runtime-base/reference", files)
+        self.assertIn("crates/packaging/build.rs", files)
+        self.assertFalse(any(path.startswith("scripts/") and path.endswith(".py") for path in files))
         for crate in package_cli.CRATES:
             self.assertIn(f"crates/{crate}/Cargo.toml", files)
             self.assertTrue(any(path.startswith(f"crates/{crate}/src/") for path in files))
         self.assertFalse(any(path.endswith(".test.ts") for path in files))
+        members = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["members"]
+        for member in members:
+            self.assertIn(f"{member}/Cargo.toml", files)
         self.assertFalse(
             any(path.startswith(f"crates/{crate}/tests/") for crate in package_cli.CRATES for path in files)
         )

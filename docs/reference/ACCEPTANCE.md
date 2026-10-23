@@ -8,12 +8,18 @@ accept an individual user's release; `aps test` does that before signing.
 
 ## Running it
 
-The suite needs Docker, [kind](https://kind.sigs.k8s.io/), `cargo-cyclonedx`
-on `PATH` and these images in the local Docker image store, because neither
-`aps build` nor kind pulls:
+Preparing the releases needs podman or Docker, `cargo-cyclonedx` on `PATH`
+and these images in the selected engine's image store, because `aps build`
+does not pull:
 
 - the builder, `rust@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922`;
-- the runtime base named in `scripts/runtime-base/reference`;
+- the runtime base named in `scripts/runtime-base/reference`.
+
+`aps build` uses podman when `podman` is on `PATH` and Docker otherwise
+(`APSIDES_CONTAINER_ENGINE` overrides the choice). The scenarios need
+[kind](https://kind.sigs.k8s.io/) on the engine chosen the same way, and this
+image in that engine's store, because kind does not pull:
+
 - the kind node, `kindest/node:v1.34.3@sha256:08497ee19eace7b4b5348db5c6a1591d7752b164530a36f855cb0f2bdcbadd48`,
   the Kubernetes version the absent-only create contract is qualified on.
   `aps deploy` accepts any server at or above a domain's
@@ -149,12 +155,22 @@ refused by the same verification `aps deploy` runs.
   it once a day and on demand, because two native builds take too long for every
   change. It proves the native build is reproducible on one runner with the
   pinned builder and runtime images; it does not compare builds across machines
-  or architectures.
+  or architectures. `--cache disabled` gives each build a fresh cargo target
+  directory and cargo home, so neither reuses the other's compiled crates.
+- `cuenv task engineParityBuild` runs the same tool with
+  `--engines docker,podman`: the first build compiles with Docker and the
+  second with podman. Every output must be identical except
+  `build-inputs.json`, whose `engine` host tool must differ and whose other host
+  tools must match; once that entry and `compilerClosureDigest` are set aside,
+  the two documents must be equal. The report, in
+  `work/engine-parity/report.json`, names both engines. It needs both engines
+  with the pinned images in both stores, and the `Nightly` workflow runs it in
+  its `engine-parity` job.
 
-BuildKit only compiles the controller; `aps build` assembles the image itself
-from the binary, the pinned runtime base and the profile's `sourceDateEpoch`
-(see [OCI packaging](/reference/oci-packaging/)), so the archive does not
-depend on the Docker driver, the image store or the wall clock.
+The container engine only compiles the controller; `aps build` assembles the
+image itself from the binary, the pinned runtime base and the profile's
+`sourceDateEpoch` (see [OCI packaging](/reference/oci-packaging/)), so the
+archive does not depend on the engine, the image store or the wall clock.
 
 ## Limits
 

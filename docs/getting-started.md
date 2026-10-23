@@ -13,9 +13,9 @@ deploy to a cluster or establish production readiness.
   permission-restricted evaluation
 - the repository's JavaScript dependencies installed with `deno install`
 
-The full native image build also needs Docker BuildKit, locally cached pinned
-builder and runtime images, prepared Cargo dependencies, and
-`cargo-cyclonedx`. Those requirements are covered in [Build and deploy](/guides/build-and-deploy/).
+The full native image build also needs podman or Docker with the pinned
+builder and runtime images in its local image store, prepared Cargo
+dependencies, and `cargo-cyclonedx`. Those requirements are covered in [Build and deploy](/guides/build-and-deploy/).
 
 ## Build the CLI
 
@@ -31,7 +31,8 @@ The Cargo package is `cli`; its binary is `aps`.
 ## Compile the example
 
 Choose a fresh output directory. The compiler refuses to reuse an existing
-source staging directory. On a clean Cargo cache, run `cargo fetch --locked`
+output or `<output>.source` staging directory, which a failed run leaves
+behind; it names the path, so remove it or choose another `--output`. On a clean Cargo cache, run `cargo fetch --locked`
 first; without it, `aps compile` fails with "prepared native dependencies are
 incomplete".
 

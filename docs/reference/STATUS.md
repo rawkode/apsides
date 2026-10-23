@@ -15,13 +15,17 @@ establish narrower properties.
   Deno's language server: nested type and JSX completions, hover documentation,
   zero valid-document diagnostics, and rejection of invalid fields and types.
 - `cuenv task packageCli` builds a relocatable macOS/Linux CLI prefix with
-  compiler dependencies and the native build source closure. Distribution builds
-  verify the exact asset tree against a manifest digest embedded in the executable.
-  Unit tests in `crates/cli/src/assets.rs` check that an added, changed or
-  removed asset fails verification, including the compiler, SDK, lockfile, a
-  linked dependency, the runtime crate and the native builder, and that the
-  restored tree passes again. `cuenv task packageCliTest` covers the packaging
-  script. No test runs a relocated bundle with checkout reads denied.
+  compiler dependencies and the native build source closure: the Rust sources
+  `aps build` records as its packaging code and the runtime base and
+  `rusty_v8` pins. Distribution builds verify the exact asset tree against a
+  manifest digest embedded in the executable, and `aps build` additionally
+  checks that the packaging sources there are the ones the executable was
+  built from. Unit tests in `crates/cli/src/assets.rs` check that an added,
+  changed or removed asset fails verification, including the compiler, SDK,
+  lockfile, a linked dependency, the runtime crate and the runtime base pin,
+  and that the restored tree passes again. `cuenv task packageCliTest` covers
+  the packaging script. No test runs a relocated bundle with checkout reads
+  denied.
 - Imported namespaced resources retain their explicit plural, scope and schema
   digest through compilation and deployment review. Force apply remains a
   per-resource choice requiring explicit policy acceptance, including custom
@@ -45,9 +49,12 @@ establish narrower properties.
   it with denied ambient permissions, validates strict canonical IR, and derives
   effects, capabilities, source metadata, and required reactor cases.
 - Complete builds produce a Linux controller binary, OCI archive, SBOM, compiler
-  closure, build-input record, and integrity manifest. The embedded V8 comes
-  from a pinned `rusty_v8` static archive fetched before the `--network=none`
-  BuildKit step, verified by SHA-256 and recorded in the SBOM and build inputs.
+  closure, build-input record, and integrity manifest. `aps` runs the whole
+  native build itself; only the cargo compile runs in a container, a
+  `--network=none` run of the pinned builder image under podman or Docker.
+  The embedded V8 comes from a pinned `rusty_v8` static archive fetched before
+  the network-less compile run, verified by SHA-256 and recorded in the SBOM
+  and build inputs.
 - `aps compile` writes `surface.json` (`apsides.dev/surface/v1`), including
   `handlers`, `egress`, `outputs` and `kubernetes.minVersion`. `aps diff`
   compares two surfaces and applies an optional review policy
@@ -257,11 +264,16 @@ row it answers. In summary:
 Reproducibility is checked twice: two `aps compile` runs of
 `examples/web-application` must give identical trees in the CLI tests on every
 change, and two cache-disabled `aps build` runs must give identical files,
-including the binary and OCI archive, in the nightly workflow. Both pass. The
-packaging writes the final image layer and config itself, with every timestamp
-set to the build profile's `sourceDateEpoch`, so the OCI archive and image
-digest do not depend on the image store or on when the build ran. The native
-check was last run on Docker's classic (overlay2) image store.
+including the binary and OCI archive, in the nightly workflow. The compile
+check passes. The native check is re-baselining after the move to the Rust
+native build: it has not yet passed on the new pipeline, and an earlier
+statement here that it passed was not supported by a nightly run. The nightly
+`engine-parity` job compares a Docker build with a podman build; it has not
+passed yet either, so identical controllers from the two engines are a design
+goal, not an observed result. The packaging writes the final image layer and
+config itself, with every timestamp set to the build profile's
+`sourceDateEpoch`, so the OCI archive and image digest do not depend on the
+image store or on when the build ran.
 
 `cuenv task authorCompilerTest` checks the declared-input and SES capability
 boundary on every CI run. A program importing a declared module compiles. An

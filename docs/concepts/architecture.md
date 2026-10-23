@@ -120,6 +120,8 @@ See
 | `runtime` | native fixed-plan reconciliation, handler dispatch and output commit, and the synchronous startup with Landlock lockdown |
 | `engine` | the embedded `deno_core`/V8 handler sandbox: isolate limits, the `apsides` operations, egress address vetting and the Landlock primitives |
 | `release` | release integrity, signed provenance, compiler closure and OCI verification |
+| `packaging` | the native build behind `aps build`: build context, network-less compile, image assembly, SBOM and compiler closure |
+| `container` | podman and Docker selection, command lines and output parsing |
 | `inventory` | metadata-only snapshots and SQLite storage |
 | `coordination` | typed immutable stores for claims, transition audits and review metadata |
 | `cli` | `aps` build, verification and deployment commands |
