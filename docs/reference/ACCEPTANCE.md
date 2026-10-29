@@ -39,9 +39,12 @@ cuenv task acceptanceCheck     # Clippy for the suite
 `examples/cnpg/initial`, `examples/cnpg`, `examples/cnpg/cleanup`,
 `crates/acceptance/programs/cnpg-owner` and
 `crates/acceptance/programs/handler-output` with `aps build` and `aps release`,
-signs each release's provenance with an OpenSSH key generated for that run
-(the private key is deleted once all are signed), and writes a trust policy
-approving only that key, the releases' compiler digests and `/usr/bin/ssh-keygen`.
+attests each release's `release.json` through an in-process Sigstore stand-in
+created for that run (`crates/test-sigstore`: a throwaway certificate
+authority and transparency log, no network and no external program), as a
+GitHub-hosted release workflow at the checked-out commit, and writes a trust
+policy approving only that stand-in's trusted root, that workload and the
+releases' compiler digests.
 It verifies every release with `aps verify-release`, fetches the CloudNativePG
 1.30.0 operator manifest and accepts it only with its pinned SHA-256. It writes
 `work/acceptance/inputs.json`, which `acceptanceTest` passes to the scenarios as
@@ -178,9 +181,12 @@ archive does not depend on the engine, the image store or the wall clock.
 - The handler scenario's handler makes no `apsides.fetch` call, so live egress
   is not exercised; the engine's own tests cover `fetch` against local fixture
   servers.
-- The release signer is synthetic: an ephemeral OpenSSH key trusted only by the
-  scenario's own policy. The GitHub Actions attestation path of the trust policy
-  is not exercised.
+- The release signer is synthetic: a Sigstore stand-in trusted only by the
+  run's own policy. Its bundles carry a transparency log entry but no signed
+  certificate timestamp, so the policy does not require certificate
+  transparency, and no scenario exercises timestamp-authority signing times.
+  `crates/release` checks a real public-good GitHub Actions attestation,
+  including certificate transparency, in its unit tests.
 - The issuer credential is a TokenRequest token minted with the cluster's admin
   kubeconfig, not a Pod-bound token or an external OIDC identity.
 - The runtime credential scenario sweeps only the CNPG successor's plan. It

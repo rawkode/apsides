@@ -22,5 +22,7 @@ pub fn command(arguments: &cli::VerifyRelease) -> Result<()> {
         "irDigest": verified.compiled().ir_digest,
         "provenanceDigest": verified.provenance_digest(),
         "trustPolicyDigest": verified.trust_policy_digest(),
+        "transparencyLog": policy.signature.transparency_log,
+        "certificateTransparency": policy.signature.certificate_transparency,
     }))
 }

@@ -3,10 +3,11 @@
 //! `acceptance-prepare` builds releases of `examples/cnpg/initial`,
 //! `examples/cnpg`, `examples/cnpg/cleanup` and the `cnpg-owner` program with
 //! `aps build` and `aps release`, exactly as a user's pipeline would, from a build profile written per run from the repository's
-//! pins. It signs each release's provenance with an OpenSSH key generated for
-//! this run alone, deletes the private key, and writes the trust policy that
-//! approves only that key's public half, the releases' compiler digests and
-//! the system `ssh-keygen`. It also fetches the `CloudNativePG` operator
+//! pins. It attests each release's `release.json` through an in-process
+//! Sigstore stand-in created for this run alone ([`test_sigstore`]), as a
+//! GitHub-hosted release workflow at the checked-out commit, and writes the
+//! trust policy that approves only that stand-in's trusted root, that
+//! workload and the releases' compiler digests. It also fetches the `CloudNativePG` operator
 //! manifest and checks its digest. Everything goes under one output
 //! directory, which is never committed.
 
@@ -20,6 +21,7 @@ use std::{
     time::Duration,
 };
 use test_cluster::process::Invocation;
+use test_sigstore::{Authority, Workload};
 
 /// The builder image `aps build` compiles controllers in.
 pub const BUILDER_IMAGE: &str =
@@ -27,12 +29,6 @@ pub const BUILDER_IMAGE: &str =
 /// The source repository recorded in provenance and approved by the trust
 /// policy.
 pub const REPOSITORY: &str = "https://github.com/rawkode/apsides";
-/// The signer principal the trust policy approves.
-pub const PRINCIPAL: &str = "acceptance@apsides.invalid";
-/// The verifier the trust policy pins; `release` requires a root-owned path.
-pub const VERIFIER: &str = "/usr/bin/ssh-keygen";
-/// The OpenSSH signature namespace `release` verifies provenance under.
-const SIGNATURE_NAMESPACE: &str = "apsides.provenance.v1";
 /// The repository of the controller images the releases record.
 const IMAGE_REPOSITORY: &str = "localhost/apsides/cnpg-controller";
 pub(crate) const BUILD_TIMEOUT: Duration = Duration::from_mins(45);
@@ -84,15 +80,8 @@ pub async fn prepare(options: &Options) -> Result<Inputs> {
         .to_owned();
     let profile = write_profile(&root, &output, &sbom_tool, &platform)?;
 
-    let key = output.join("signing-key");
-    let _ = std::fs::remove_file(&key);
-    let _ = std::fs::remove_file(key.with_extension("pub"));
-    Invocation::new(VERIFIER)
-        .args(["-q", "-t", "ed25519", "-N", "", "-C", PRINCIPAL, "-f"])
-        .arg(&key)
-        .run()
-        .await?;
-    let public = std::fs::read_to_string(key.with_extension("pub"))?;
+    let authority = Authority::new().map_err(|error| signing(&error))?;
+    let workload = Workload::github(REPOSITORY, &commit);
 
     let mut releases = Vec::new();
     for (name, source) in RELEASES {
@@ -108,16 +97,17 @@ pub async fn prepare(options: &Options) -> Result<Inputs> {
             commit: &commit,
         })
         .await?;
-        sign(&key, &release).await?;
+        authority
+            .sign_release(&workload, &release)
+            .map_err(|error| signing(&error))?;
         releases.push(release);
         remove_build_artifacts(&directory)?;
     }
-    std::fs::remove_file(&key)?;
 
     let trust_policy = output.join("trust-policy.json");
     std::fs::write(
         &trust_policy,
-        serde_json::to_vec_pretty(&trust(&releases, &public)?)?,
+        serde_json::to_vec_pretty(&trust(&releases, &authority, &workload)?)?,
     )?;
     for release in &releases {
         Invocation::new(&aps)
@@ -308,24 +298,13 @@ pub(crate) fn remove_tree(path: &Path) -> Result {
     Ok(())
 }
 
-/// Sign `release/provenance.json` into `release/provenance.sig`.
-async fn sign(key: &Path, release: &Path) -> Result {
-    let statement = release.join("provenance.json");
-    let produced = release.join("provenance.json.sig");
-    let _ = std::fs::remove_file(&produced);
-    Invocation::new(VERIFIER)
-        .args(["-Y", "sign", "-n", SIGNATURE_NAMESPACE, "-f"])
-        .arg(key)
-        .arg(&statement)
-        .run()
-        .await?;
-    std::fs::rename(&produced, release.join("provenance.sig"))?;
-    Ok(())
+fn signing(error: &test_sigstore::Error) -> Error {
+    Error::Infrastructure(format!("signing a release: {error}"))
 }
 
-/// The trust policy approving the ephemeral signer, the releases' compiler
-/// digests and the system `ssh-keygen`.
-fn trust(releases: &[PathBuf], public_key: &str) -> Result<Value> {
+/// The trust policy approving `workload`'s signatures under `authority` and
+/// the releases' compiler digests.
+fn trust(releases: &[PathBuf], authority: &Authority, workload: &Workload) -> Result<Value> {
     let mut compilers = Vec::new();
     for release in releases {
         let (manifest, _, _) = release::read_release(release)?;
@@ -335,15 +314,10 @@ fn trust(releases: &[PathBuf], public_key: &str) -> Result<Value> {
     }
     compilers.sort();
     Ok(json!({
-        "schemaVersion": "apsides.dev/trust/v1",
+        "schemaVersion": "apsides.dev/trust/v2",
         "repository": REPOSITORY,
         "approvedCompilerDigests": compilers,
-        "verifier": {"executable": VERIFIER, "sha256": crate::digest(&std::fs::read(VERIFIER)?)},
-        "signature": {
-            "kind": "open-ssh",
-            "principal": PRINCIPAL,
-            "allowedSigners": format!("{PRINCIPAL} {}", public_key.trim()),
-        },
+        "signature": workload.signature_policy(&authority.trusted_root().map_err(|error| signing(&error))?),
     }))
 }
 

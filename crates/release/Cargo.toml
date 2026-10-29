@@ -17,6 +17,14 @@ tempfile = "3"
 tar = "0.4"
 flate2 = "1"
 oci-spec = { version = "0.10", default-features = false, features = ["image"] }
+# Sigstore verification without its aws-lc backend: crypto.rs supplies ring,
+# the workspace's cryptographic library.
+ring = "0.17"
+sigstore-verify = { version = "=0.15.1", default-features = false }
+spki = "0.7"
+
+[dev-dependencies]
+test-sigstore = { path = "../test-sigstore" }
 
 [lints]
 workspace = true

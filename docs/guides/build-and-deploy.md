@@ -206,6 +206,72 @@ so a signing workflow can check a release before handing it to deployment. A
 release carries no test results: run `aps test` for the program before signing
 it.
 
+### Sign a release
+
+`aps release` assembles an unsigned release directory. CI signs it with
+Sigstore by attesting the release's `release.json` and writing the Sigstore
+bundle into the release as `provenance.sigstore.json`. The bundle must hold a
+DSSE envelope with an in-toto SLSA v1 provenance statement whose subject is
+named `release.json` and carries its SHA-256 digest, signed keylessly by the
+CI workload. On GitHub Actions, `actions/attest-build-provenance` with
+`subject-path` pointing at the release's `release.json` produces such a
+bundle; copy the file its `bundle-path` output names into the release. Any
+signer works as long as the subject name is exactly `release.json`.
+
+Apsides never signs and runs no external program to verify: `aps deploy` and
+`aps verify-release` verify the bundle in-process and offline against the
+trusted root in the platform trust policy.
+
+### Trust policy
+
+The platform stores one trust policy per domain (see
+[platform contract](/reference/platform-contract/)); `aps verify-release
+--trust-policy` reads the same document from a file:
+
+```json
+{
+  "schemaVersion": "apsides.dev/trust/v2",
+  "repository": "https://github.com/OWNER/REPO",
+  "approvedCompilerDigests": ["sha256:…"],
+  "signature": {
+    "trustedRoot": { "mediaType": "application/vnd.dev.sigstore.trustedroot+json;version=0.1", "…": "…" },
+    "transparencyLog": true,
+    "certificateTransparency": true,
+    "certificateIdentity": "https://github.com/OWNER/REPO/.github/workflows/release.yml@refs/heads/main",
+    "certificateIssuer": "https://token.actions.githubusercontent.com",
+    "signerDigest": "<commit of the signing workflow>",
+    "sourceRef": "refs/heads/main"
+  }
+}
+```
+
+A release verifies only when all of these hold:
+
+- the bundle verifies under `trustedRoot`: the certificate chains to one of
+  its certificate authorities and was valid at a signing time proven by a log
+  entry or an RFC 3161 timestamp from that root;
+- with `transparencyLog`, the bundle's transparency log inclusion proof
+  verifies against the root's logs; with `certificateTransparency`, the
+  certificate's signed certificate timestamp verifies against the root's
+  certificate transparency logs. Public-good Sigstore supports both. GitHub's
+  Sigstore instance for private repositories supports neither and timestamps
+  every signature instead, so its policy sets both to `false` and its root must
+  list timestamp authorities. A root without the authority a setting needs is
+  rejected;
+- the certificate's subject alternative name and build signer URI equal
+  `certificateIdentity`, and its OIDC issuer equals `certificateIssuer`;
+- its build signer digest equals `signerDigest`, its source repository equals
+  `repository`, its source digest equals the commit `release.json` records,
+  its source ref equals `sourceRef`, and it was issued to a provider-hosted
+  runner, not a self-hosted one. A certificate that lacks any of these claims
+  is rejected;
+- `release.json` names `repository` and one of `approvedCompilerDigests`.
+
+The policy digest recorded when a release is staged is the digest of this
+document as stored, and activation refuses a policy that changed in between,
+so change a domain's trust policy only when no deployment is staged.
+`aps verify-release` reports which of the two transparency checks applied.
+
 `aps deploy` also binds the deployment to the exact surface that was
 reviewed: it independently recomputes the deployment surface from the
 verified release's own IR and requires that digest to equal both the

@@ -31,6 +31,7 @@ serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
 test-cluster = { path = "../test-cluster" }
+test-sigstore = { path = "../test-sigstore" }
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "time"] }
 

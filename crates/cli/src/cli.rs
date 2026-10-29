@@ -272,10 +272,10 @@ pub struct Release {
     /// Image platform recorded in the release manifest.
     #[arg(long)]
     pub platform: String,
-    /// Source repository recorded in provenance.
+    /// Source repository recorded in the release manifest.
     #[arg(long)]
     pub repository: String,
-    /// Source commit recorded in provenance.
+    /// Source commit recorded in the release manifest; provenance must name the same commit.
     #[arg(long)]
     pub commit: String,
     /// Final build inputs, including the compiler closure digest.

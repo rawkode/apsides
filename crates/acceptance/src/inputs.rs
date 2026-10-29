@@ -38,8 +38,8 @@ pub struct Inputs {
     /// domain, one observed `ConfigMap` input, one handler with no egress
     /// that copies the input's keys into its declared output.
     pub handler_output_release: PathBuf,
-    /// The trust policy the releases verify against: the ephemeral signer's
-    /// public key, the approved compiler digests and the pinned verifier.
+    /// The trust policy the releases verify against: the run's Sigstore
+    /// stand-in, the signing workload and the approved compiler digests.
     pub trust_policy: PathBuf,
     /// The `CloudNativePG` operator manifest, byte-for-byte as released.
     pub operator_manifest: PathBuf,
