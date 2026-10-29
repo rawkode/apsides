@@ -267,6 +267,11 @@ A release verifies only when all of these hold:
   is rejected;
 - `release.json` names `repository` and one of `approvedCompilerDigests`.
 
+`signerDigest` pins the commit of the signing workflow. A workflow in the
+release's own repository is read at the commit being released, so its digest
+changes with every release; sign from a reusable workflow in a separate
+repository, called at a pinned commit, so one policy covers every release.
+
 The policy digest recorded when a release is staged is the digest of this
 document as stored, and activation refuses a policy that changed in between,
 so change a domain's trust policy only when no deployment is staged.
@@ -296,8 +301,8 @@ aps deploy --artifact-reference path/to/immutable-reference.json
 An immutable reference resolves the new release with the built-in OCI registry
 client and still performs complete trust-policy verification. It does not
 authorize tags or make OCI mandatory. Registry credentials and an extra CA come
-only from `APSIDES_REGISTRY_USERNAME`, `APSIDES_REGISTRY_PASSWORD` and
-`APSIDES_REGISTRY_CA`; without credentials the registry is accessed
+only from `APSIDES_REGISTRY_HOST`, `APSIDES_REGISTRY_USERNAME`,
+`APSIDES_REGISTRY_PASSWORD` and `APSIDES_REGISTRY_CA`; without credentials the registry is accessed
 anonymously.
 
 The trusted CI job must also provide:

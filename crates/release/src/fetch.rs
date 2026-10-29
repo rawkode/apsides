@@ -81,12 +81,17 @@ pub struct RegistryAccess {
     /// Optional CA certificate file for a private registry, trusted in
     /// addition to the Mozilla roots.
     pub ca_file: Option<PathBuf>,
-    /// Sent to a Bearer token realm or a Basic challenge; anonymous otherwise.
+    /// Sent to a Bearer token realm or a Basic challenge of the one registry
+    /// they name; anonymous otherwise.
     pub credentials: Option<RegistryCredentials>,
 }
 
 #[derive(Clone)]
 pub struct RegistryCredentials {
+    /// The registry host, as release references name it (`ghcr.io`,
+    /// `registry.example:5000`); a reference to any other registry is refused
+    /// rather than sent these credentials.
+    pub registry: String,
     pub username: String,
     pub password: String,
 }
@@ -95,6 +100,7 @@ impl fmt::Debug for RegistryCredentials {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RegistryCredentials")
+            .field("registry", &self.registry)
             .field("username", &self.username)
             .field("password", &"<redacted>")
             .finish()
@@ -197,6 +203,13 @@ fn pull(
     let (host, name) = repository
         .split_once('/')
         .ok_or_else(|| crate::Error::Rejected("invalid immutable OCI release reference".into()))?;
+    if access
+        .credentials
+        .as_ref()
+        .is_some_and(|credentials| credentials.registry != host)
+    {
+        return reject("registry credentials are for a different registry than the reference");
+    }
     // Docker Hub serves the Distribution API from a different host than its name.
     let (host, name) = if host == "docker.io" {
         let name = if name.contains('/') {
@@ -398,10 +411,9 @@ impl Registry<'_> {
             return reject("OCI token realm must use HTTPS");
         }
         authority(realm)?;
-        let scope = challenge.params.get("scope").map_or_else(
-            || format!("repository:{}:pull", self.repository),
-            Clone::clone,
-        );
+        // Pull access to this repository only, whatever scope the registry
+        // suggests.
+        let scope = format!("repository:{}:pull", self.repository);
         let query: Vec<String> = challenge
             .params
             .get("service")
@@ -767,6 +779,10 @@ mod tests {
             })
         }
 
+        fn host(&self) -> String {
+            format!("localhost:{}", self.port)
+        }
+
         fn access(&self) -> RegistryAccess {
             RegistryAccess {
                 ca_file: Some(self.directory.path().join("ca.pem")),
@@ -1007,6 +1023,7 @@ mod tests {
     #[test]
     fn credentials_debug_hides_the_password() {
         let credentials = RegistryCredentials {
+            registry: "ghcr.io".into(),
             username: "ci".into(),
             password: "private-token-canary".into(),
         };
@@ -1089,13 +1106,18 @@ mod tests {
     #[tokio::test]
     async fn credentials_are_sent_only_to_the_token_realm() -> TestResult {
         let manifest = release_image();
-        let credentials = RegistryCredentials {
+        let mut registry = Registry::new(manifest.clone(), &[RELEASE, PAYLOAD]);
+        let unbound = RegistryCredentials {
+            registry: String::new(),
             username: "ci".into(),
             password: "secret".into(),
         };
-        let mut registry = Registry::new(manifest.clone(), &[RELEASE, PAYLOAD]);
-        registry.auth = Auth::TokenFor(basic(&credentials));
+        registry.auth = Auth::TokenFor(basic(&unbound));
         let fake = serve(registry)?;
+        let credentials = RegistryCredentials {
+            registry: fake.host(),
+            ..unbound
+        };
         let reference = fake.reference(&manifest, RELEASE);
         rejected(fetch_release(&reference, &fake.access()).await, FAILED)?;
         let access = RegistryAccess {
@@ -1108,6 +1130,20 @@ mod tests {
                 assert_ne!(request.authorization, Some(basic(&credentials)));
             }
         }
+        // Credentials for another registry are never offered to this one.
+        let elsewhere = RegistryAccess {
+            credentials: Some(RegistryCredentials {
+                registry: "ghcr.io".into(),
+                ..credentials
+            }),
+            ..fake.access()
+        };
+        let before = fake.requests().len();
+        rejected(
+            fetch_release(&reference, &elsewhere).await,
+            "registry credentials are for a different registry than the reference",
+        )?;
+        assert_eq!(fake.requests().len(), before);
         Ok(())
     }
 
@@ -1286,6 +1322,7 @@ mod tests {
             fake.access(),
             RegistryAccess {
                 credentials: Some(RegistryCredentials {
+                    registry: fake.host(),
                     username: "ci".into(),
                     password: "private-token-canary".into(),
                 }),

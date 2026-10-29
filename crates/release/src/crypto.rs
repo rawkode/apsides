@@ -24,7 +24,7 @@ use sigstore_verify::{
 };
 use spki::{SubjectPublicKeyInfoRef, der::Decode as _};
 
-static RING: Ring = Ring;
+static RING: Ring = Ring { name: "ring" };
 
 /// Make ring the provider every Sigstore verification in this process uses.
 ///
@@ -38,8 +38,12 @@ pub(crate) fn install() -> crate::Result<()> {
     }
 }
 
+/// Not zero-sized, so the address `install` compares is this static's own.
 #[derive(Debug)]
-struct Ring;
+struct Ring {
+    #[expect(dead_code, reason = "only gives the static a size")]
+    name: &'static str,
+}
 
 struct RingHash(Context);
 

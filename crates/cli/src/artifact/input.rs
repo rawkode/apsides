@@ -58,9 +58,10 @@ pub async fn open(arguments: &cli::Deploy) -> Result<ArtifactInput> {
     ))
 }
 
-/// Registry settings from `APSIDES_REGISTRY_CA` and the
-/// `APSIDES_REGISTRY_USERNAME`/`APSIDES_REGISTRY_PASSWORD` pair. Without the
-/// pair the registry is accessed anonymously.
+/// Registry settings from `APSIDES_REGISTRY_CA` and the credentials
+/// `APSIDES_REGISTRY_USERNAME`/`APSIDES_REGISTRY_PASSWORD` hold for the one
+/// registry `APSIDES_REGISTRY_HOST` names. Without them the registry is
+/// accessed anonymously.
 fn registry_access(var: impl Fn(&str) -> Option<OsString>) -> Result<RegistryAccess> {
     let text = |name: &str| {
         var(name)
@@ -72,16 +73,18 @@ fn registry_access(var: impl Fn(&str) -> Option<OsString>) -> Result<RegistryAcc
             .transpose()
     };
     let credentials = match (
+        text("APSIDES_REGISTRY_HOST")?,
         text("APSIDES_REGISTRY_USERNAME")?,
         text("APSIDES_REGISTRY_PASSWORD")?,
     ) {
-        (Some(username), Some(password)) => Some(RegistryCredentials { username, password }),
-        (None, None) => None,
+        (Some(registry), Some(username), Some(password)) => Some(RegistryCredentials {
+            registry,
+            username,
+            password,
+        }),
+        (None, None, None) => None,
         _ => {
-            return Err(
-                "set both APSIDES_REGISTRY_USERNAME and APSIDES_REGISTRY_PASSWORD, or neither"
-                    .into(),
-            );
+            return Err("set all of APSIDES_REGISTRY_HOST, APSIDES_REGISTRY_USERNAME and APSIDES_REGISTRY_PASSWORD, or none".into());
         }
     };
     Ok(RegistryAccess {
@@ -138,14 +141,26 @@ mod tests {
         assert!(anonymous.credentials.is_none());
         assert_eq!(anonymous.ca_file, Some(PathBuf::from("/etc/ca.pem")));
         let paired = registry_access(from(&[
+            ("APSIDES_REGISTRY_HOST", "ghcr.io"),
             ("APSIDES_REGISTRY_USERNAME", "ci"),
             ("APSIDES_REGISTRY_PASSWORD", "secret"),
         ]))?;
-        assert!(paired.credentials.is_some_and(
-            |credentials| credentials.username == "ci" && credentials.password == "secret"
-        ));
+        assert!(
+            paired
+                .credentials
+                .is_some_and(|credentials| credentials.registry == "ghcr.io"
+                    && credentials.username == "ci"
+                    && credentials.password == "secret")
+        );
         assert!(registry_access(from(&[("APSIDES_REGISTRY_USERNAME", "ci")])).is_err());
         assert!(registry_access(from(&[("APSIDES_REGISTRY_PASSWORD", "secret")])).is_err());
+        assert!(
+            registry_access(from(&[
+                ("APSIDES_REGISTRY_USERNAME", "ci"),
+                ("APSIDES_REGISTRY_PASSWORD", "secret"),
+            ]))
+            .is_err()
+        );
         Ok(())
     }
     #[test]

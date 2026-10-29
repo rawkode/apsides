@@ -181,7 +181,8 @@ pub(crate) fn verify_bundle(
     {
         return reject("provenance certificate does not name the approved workload and source");
     }
-    if !matches!(claims.runner_environment.as_deref(), Some(runner) if runner != "self-hosted") {
+    if !matches!(claims.runner_environment.as_deref(), Some(runner) if !runner.is_empty() && runner != "self-hosted")
+    {
         return reject("provenance was not signed on a provider-hosted runner");
     }
     // The statement is read from the envelope Sigstore just verified.
