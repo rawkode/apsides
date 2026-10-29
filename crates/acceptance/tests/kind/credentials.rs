@@ -47,7 +47,7 @@ const TOKEN_MARGIN_SECONDS: i64 = 300;
 ///     rollout key appear nowhere in `aps` output, the controllers' logs or
 ///     the inventory database.
 #[tokio::test]
-#[ignore = "creates a kind cluster; needs Docker, kind and `cuenv task acceptancePrepare`"]
+#[ignore = "creates a kind cluster; needs kind on podman or Docker and `cuenv task acceptancePrepare`"]
 async fn the_runtime_credential_holds_exactly_its_declared_capabilities() -> Result {
     scenario::run("runtime-credentials", async |scenario| {
         let pair = Pair::load(

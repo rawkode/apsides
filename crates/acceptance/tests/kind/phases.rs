@@ -31,7 +31,7 @@ use std::{collections::BTreeMap, time::Duration};
 /// one cluster. The Committed-to-inventory gap is covered in process (see
 /// docs/reference/ACCEPTANCE.md).
 #[tokio::test]
-#[ignore = "creates a kind cluster; needs Docker, kind and `cuenv task acceptancePrepare`"]
+#[ignore = "creates a kind cluster; needs kind on podman or Docker and `cuenv task acceptancePrepare`"]
 async fn every_interrupted_phase_resumes_to_commit() -> Result {
     scenario::run("phase-interruption", async |scenario| {
         let pair = Pair::load(

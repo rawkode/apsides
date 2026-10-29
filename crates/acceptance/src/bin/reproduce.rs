@@ -4,13 +4,15 @@
 //! ```sh
 //! cargo run -p acceptance --bin acceptance-reproduce -- \
 //!   --output work/reproducible-build [--source examples/web-application/program.tsx] \
-//!   [--aps target/debug/aps] [--sbom-tool <cargo-cyclonedx>]
+//!   [--aps target/debug/aps] [--sbom-tool <cargo-cyclonedx>] [--engines docker,podman]
 //! ```
 //!
-//! Run from the repository root. `aps build` never pulls, so the builder and
-//! runtime base images must already be local (see docs/reference/ACCEPTANCE.md).
+//! Run from the repository root. `--engines` compiles the first build with
+//! the first engine and the second with the second. `aps build` never pulls,
+//! so the builder and runtime base images must already be in each engine's
+//! store (see docs/reference/ACCEPTANCE.md).
 
-use acceptance::reproduce::{Options, reproduce};
+use acceptance::reproduce::{Options, parse_engines, reproduce};
 use std::{io::Write as _, path::PathBuf, process::ExitCode};
 
 fn main() -> ExitCode {
@@ -31,6 +33,7 @@ fn run() -> Result<PathBuf, String> {
     let mut aps = PathBuf::from("target/debug/aps");
     let mut sbom_tool = None;
     let mut source = PathBuf::from("examples/web-application/program.tsx");
+    let mut engines = None;
     let mut arguments = std::env::args_os().skip(1);
     while let Some(flag) = arguments.next() {
         let value = arguments
@@ -42,6 +45,11 @@ fn run() -> Result<PathBuf, String> {
             Some("--aps") => aps = value,
             Some("--sbom-tool") => sbom_tool = Some(value),
             Some("--source") => source = value,
+            Some("--engines") => {
+                engines = Some(
+                    parse_engines(&value.to_string_lossy()).map_err(|error| error.to_string())?,
+                );
+            }
             _ => return Err(format!("unknown argument {}", flag.to_string_lossy())),
         }
     }
@@ -57,6 +65,7 @@ fn run() -> Result<PathBuf, String> {
         aps,
         sbom_tool,
         source,
+        engines,
     };
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     runtime

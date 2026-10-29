@@ -4,6 +4,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs, path::Path, process::Command};
 
+#[path = "support/closure.rs"]
+mod closure;
+
 /// The one rejection a fixture release gets, whichever marker exposes it.
 const FIXTURE_REJECTED: &str =
     "release rejected: fixture-substituted artifacts cannot be promoted to production";
@@ -510,87 +513,18 @@ fn write_oci_with_base(
 /// dependency closure into the thousands of files -- without needing a real
 /// `cargo vendor` run.
 fn compiler_inputs(padding_entries: usize) -> TestResult<(Value, String)> {
-    let mut build_context_files = vec![
-        json!({"path":".cargo/config.toml","sha256":format!("sha256:{}", "1".repeat(64))}),
-        json!({"path":"Dockerfile","sha256":format!("sha256:{}", "2".repeat(64))}),
-        json!({"path":"controller/Cargo.lock","sha256":format!("sha256:{}", "3".repeat(64))}),
-        json!({"path":"controller/Cargo.toml","sha256":format!("sha256:{}", "4".repeat(64))}),
-        json!({"path":"controller/src/ir.json","sha256":format!("sha256:{}", "5".repeat(64))}),
-        json!({"path":"controller/src/main.rs","sha256":format!("sha256:{}", "6".repeat(64))}),
-        json!({"path":"rusty-v8/librusty_v8.a.gz","sha256":format!("sha256:{}", "9".repeat(64))}),
-        json!({"path":"vendor/example/src/lib.rs","sha256":format!("sha256:{}", "7".repeat(64))}),
-    ];
     // Sorts after "vendor/example/..." ('e' < 's') and before
     // "workspace/..." ('v' < 'w'), keeping buildContextFiles sorted as
     // validate_files requires.
-    for index in 0..padding_entries {
-        build_context_files.push(json!({
-            "path": format!("vendor/synthetic-package-{index:06}/src/generated/module.rs"),
-            "sha256": format!("sha256:{index:064x}"),
-        }));
-    }
-    build_context_files
-        .push(json!({"path":"workspace/Cargo.toml","sha256":format!("sha256:{}", "8".repeat(64))}));
-    let build_context_files = Value::Array(build_context_files);
-    let packaging_files = json!([
-        {"path":"crates/cli/Cargo.toml","sha256":format!("sha256:{}", "1".repeat(64))},
-        {"path":"crates/cli/src/main.rs","sha256":format!("sha256:{}", "1".repeat(64))},
-        {"path":"scripts/Dockerfile","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/build.py","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/diagnostics.py","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/extract_binary.py","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/finalize_inputs.py","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/package_oci.py","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/rusty_v8.py","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/sbom.py","sha256":format!("sha256:{}", "2".repeat(64))},
-        {"path":"scripts/toolchain_snapshot.py","sha256":format!("sha256:{}", "2".repeat(64))}
-    ]);
-    let cli: Vec<Value> = packaging_files
-        .as_array()
-        .ok_or("expected a JSON array")?
-        .iter()
-        .filter(|file| {
-            file["path"]
-                .as_str()
-                .is_some_and(|path| path.starts_with("crates/cli/"))
-        })
-        .cloned()
-        .collect();
-    let approved_runtime = approved_runtime()?;
-    let host_tools: Vec<_> = ["buildx", "cargo", "docker", "python", "apsides", "sbom"]
-        .into_iter()
-        .map(|role| {
-            json!({"role":role,"sha256":format!("sha256:{}", "6".repeat(64)),"version":"1.0"})
+    let padding = (0..padding_entries)
+        .map(|index| {
+            json!({
+                "path": format!("vendor/synthetic-package-{index:06}/src/generated/module.rs"),
+                "sha256": format!("sha256:{index:064x}"),
+            })
         })
         .collect();
-    let rusty_v8 = json!({
-        "archive": {
-            "name": "librusty_v8", "version": "150.4.0", "target": "aarch64-unknown-linux-gnu",
-            "url": "https://github.com/denoland/rusty_v8/releases/download/v150.4.0/librusty_v8_simdutf_release_aarch64-unknown-linux-gnu.a.gz",
-            "sha256": format!("sha256:{}", "9".repeat(64)), "path": "rusty-v8/librusty_v8.a.gz",
-        },
-        "bindingFile": Value::Null,
-    });
-    let closure = json!({
-        "schemaVersion":"apsides.dev/compiler-closure/v3",
-        "authoringCompiler":{"sdk":{"identity":"@apsides/kubernetes","sha256":"sdk"},"toolchain":{"deno":"pinned"}},
-        "nativeCompiler":{
-            "builderImage":{"reference":format!("example.invalid/builder@sha256:{}", "3".repeat(64)),"platform":"linux/arm64"},
-            "cargoLockSha256":format!("sha256:{}", "4".repeat(64)),
-            "buildContextFiles":build_context_files,
-            "packagingFiles":packaging_files,
-            "buildProfileSha256":format!("sha256:{}", "5".repeat(64)),
-            "hostTools":host_tools,
-            "trustedCliCodeSha256":digest(&cli)?,
-            "approvedRuntime":approved_runtime,
-            "rustyV8":rusty_v8
-        }
-    });
-    let identity = digest(&closure)?;
-    Ok((
-        json!({"sdk":closure["authoringCompiler"]["sdk"],"toolchain":closure["authoringCompiler"]["toolchain"],"compilerClosure":closure,"compilerClosureDigest":identity}),
-        identity,
-    ))
+    closure::inputs(padding, &approved_runtime()?)
 }
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;

@@ -20,20 +20,29 @@ MAX_DEPTH = 64
 MAX_FILE_BYTES = 128 * 1024 * 1024
 MAX_TREE_BYTES = 512 * 1024 * 1024
 HASH_CHUNK_BYTES = 1024 * 1024
+# Every root workspace member: the copied Cargo.toml lists them all, and cargo
+# refuses to load a workspace with a missing member.
 CRATES = (
+    "acceptance",
     "cli",
     "compiler-core",
+    "container",
     "coordination",
     "deploy",
     "engine",
     "inventory",
+    "packaging",
     "platform",
     "release",
     "runtime",
+    "test-cluster",
 )
 STATIC_SOURCES = (
     "Cargo.lock",
     "Cargo.toml",
+    # Embeds the packaging source digests `aps build` checks against these
+    # assets (crates/packaging/src/sources.rs).
+    "crates/packaging/build.rs",
     "deno.json",
     "deno.lock",
     "rust-toolchain.toml",
@@ -50,15 +59,6 @@ STATIC_SOURCES = (
     "packages/kubernetes/src/jsx-runtime.ts",
     "packages/kubernetes/src/model.ts",
     "packages/kubernetes/src/runtime.ts",
-    "scripts/Dockerfile",
-    "scripts/build.py",
-    "scripts/diagnostics.py",
-    "scripts/extract_binary.py",
-    "scripts/finalize_inputs.py",
-    "scripts/package_oci.py",
-    "scripts/rusty_v8.py",
-    "scripts/sbom.py",
-    "scripts/toolchain_snapshot.py",
 )
 
 

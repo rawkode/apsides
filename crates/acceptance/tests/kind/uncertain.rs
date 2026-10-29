@@ -33,7 +33,7 @@ const REFUSAL: &str = "live writer set differs from complete protected Pod histo
 /// zero replicas with no Pod, and leave the registry, activation and
 /// inventory `ConfigMap`s and every metadata database row unchanged.
 #[tokio::test]
-#[ignore = "creates a kind cluster; needs Docker, kind and `cuenv task acceptancePrepare`"]
+#[ignore = "creates a kind cluster; needs kind on podman or Docker and `cuenv task acceptancePrepare`"]
 async fn lost_writer_evidence_blocks_activation() -> Result {
     scenario::run("uncertain-writer", async |scenario| {
         let pair = Pair::load(

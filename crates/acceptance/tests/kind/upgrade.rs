@@ -36,7 +36,7 @@ use std::{collections::BTreeMap, time::Duration};
 /// (g) no Secret value, rollout key or issuer token appears in `aps` output,
 ///     the inventory database or the controllers' logs.
 #[tokio::test]
-#[ignore = "creates a kind cluster; needs Docker, kind and `cuenv task acceptancePrepare`"]
+#[ignore = "creates a kind cluster; needs kind on podman or Docker and `cuenv task acceptancePrepare`"]
 async fn cnpg_upgrade_through_the_public_cli() -> Result {
     Box::pin(scenario::run("cnpg-upgrade", async |scenario| {
         let pair = Pair::load(

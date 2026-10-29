@@ -196,7 +196,7 @@ mod verified {
 
         /// Mirrors a packaged installation: compiler, SDK, lockfile, a
         /// dependency reached through an internal link, runtime crate and
-        /// native builder. Each file is removed or extended in turn; the
+        /// runtime base pin. Each file is removed or extended in turn; the
         /// tree must fail verification and pass again once restored.
         #[cfg(unix)]
         #[test]
@@ -212,7 +212,7 @@ mod verified {
                     true,
                 ),
                 ("crates/runtime/src/lib.rs", false),
-                ("scripts/build.py", true),
+                ("scripts/runtime-base/reference", true),
             ];
             for (path, _) in targets {
                 let file = assets.join(path);

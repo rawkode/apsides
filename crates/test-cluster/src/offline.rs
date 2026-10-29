@@ -7,15 +7,21 @@
 //! `iptables` chain there, first in `OUTPUT` and `FORWARD`, that returns only
 //! for loopback, local addresses, established flows and the cluster's Pod and
 //! Service ranges and rejects everything else. Docker's embedded DNS resolver
-//! is refused too, so external names do not resolve. kind exposes each node as
-//! a Docker container, which is how the rules are installed and the node's
-//! canaries run.
+//! is refused too, so external names do not resolve; podman's resolver sits on
+//! the network gateway, which the final `REJECT` already covers. kind exposes
+//! each node as a podman or Docker container, which is how the rules are
+//! installed and the node's canaries run.
+//!
+//! The rules go through whichever `iptables` backend works in the node. The
+//! node image defaults to the legacy backend, which a rootless podman node
+//! cannot use, so there the nft backend kube-proxy already uses takes them.
 
 use crate::{
     Result,
     cluster::{POD_SUBNET, SERVICE_SUBNET},
+    engine::{self, EngineCommands as _},
     infrastructure,
-    process::{Invocation, tail},
+    process::tail,
     report::{NetworkProbe, Reach},
 };
 use std::{fmt::Write as _, time::Duration};
@@ -31,36 +37,69 @@ pub const EXTERNAL_NAME: &str = "registry-1.docker.io";
 /// registry.
 const ABSENT_IMAGE: &str = "docker.io/library/busybox:1.36.1";
 
+/// The `iptables` and `ip6tables` commands that manage a node's rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Backend {
+    v4: &'static str,
+    v6: &'static str,
+}
+
+const DEFAULT_BACKEND: Backend = Backend {
+    v4: "iptables",
+    v6: "ip6tables",
+};
+const NFT_BACKEND: Backend = Backend {
+    v4: "iptables-nft",
+    v6: "ip6tables-nft",
+};
+
+/// The node image's default backend when its tables are usable, otherwise nft.
+async fn backend(node: &str) -> Result<Backend> {
+    let probe = engine::current()?
+        .command()
+        .args(["exec", node, DEFAULT_BACKEND.v4, "-w", "-S", "OUTPUT"])
+        .output()
+        .await?;
+    Ok(if probe.success {
+        DEFAULT_BACKEND
+    } else {
+        NFT_BACKEND
+    })
+}
+
 /// The rules, as one shell script run in the node container.
-fn rules_script() -> String {
+fn rules_script(backend: Backend) -> String {
+    let Backend { v4, v6 } = backend;
     format!(
         "set -eu
-iptables -w -N {CHAIN}
-iptables -w -A {CHAIN} -d {DOCKER_DNS} -j REJECT
-iptables -w -A {CHAIN} -m addrtype --dst-type LOCAL -j RETURN
-iptables -w -A {CHAIN} -o lo -j RETURN
-iptables -w -A {CHAIN} -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
-iptables -w -A {CHAIN} -d {POD_SUBNET} -j RETURN
-iptables -w -A {CHAIN} -d {SERVICE_SUBNET} -j RETURN
-iptables -w -A {CHAIN} -j REJECT
-iptables -w -I OUTPUT 1 -j {CHAIN}
-iptables -w -I FORWARD 1 -j {CHAIN}
-iptables -w -I INPUT 1 -d {DOCKER_DNS} -j REJECT
-ip6tables -w -N {CHAIN}
-ip6tables -w -A {CHAIN} -m addrtype --dst-type LOCAL -j RETURN
-ip6tables -w -A {CHAIN} -o lo -j RETURN
-ip6tables -w -A {CHAIN} -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
-ip6tables -w -A {CHAIN} -j REJECT
-ip6tables -w -I OUTPUT 1 -j {CHAIN}
-ip6tables -w -I FORWARD 1 -j {CHAIN}
+{v4} -w -N {CHAIN}
+{v4} -w -A {CHAIN} -d {DOCKER_DNS} -j REJECT
+{v4} -w -A {CHAIN} -m addrtype --dst-type LOCAL -j RETURN
+{v4} -w -A {CHAIN} -o lo -j RETURN
+{v4} -w -A {CHAIN} -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+{v4} -w -A {CHAIN} -d {POD_SUBNET} -j RETURN
+{v4} -w -A {CHAIN} -d {SERVICE_SUBNET} -j RETURN
+{v4} -w -A {CHAIN} -j REJECT
+{v4} -w -I OUTPUT 1 -j {CHAIN}
+{v4} -w -I FORWARD 1 -j {CHAIN}
+{v4} -w -I INPUT 1 -d {DOCKER_DNS} -j REJECT
+{v6} -w -N {CHAIN}
+{v6} -w -A {CHAIN} -m addrtype --dst-type LOCAL -j RETURN
+{v6} -w -A {CHAIN} -o lo -j RETURN
+{v6} -w -A {CHAIN} -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+{v6} -w -A {CHAIN} -j REJECT
+{v6} -w -I OUTPUT 1 -j {CHAIN}
+{v6} -w -I FORWARD 1 -j {CHAIN}
 "
     )
 }
 
 /// Install the rules in `node` and confirm they sit first.
 pub async fn block(node: &str) -> Result<()> {
-    Invocation::new("docker")
-        .args(["exec", node, "sh", "-c", &rules_script()])
+    let rules = rules_script(backend(node).await?);
+    engine::current()?
+        .command()
+        .args(["exec", node, "sh", "-c", &rules])
         .timeout(Duration::from_secs(60))
         .run()
         .await?;
@@ -69,18 +108,16 @@ pub async fn block(node: &str) -> Result<()> {
 
 /// Fail unless the rules still sit first in every chain they guard.
 pub async fn installed(node: &str) -> Result<()> {
+    let Backend { v4, v6 } = backend(node).await?;
     for (tool, chain, rule) in [
-        ("iptables", "OUTPUT", format!("-A OUTPUT -j {CHAIN}")),
-        ("iptables", "FORWARD", format!("-A FORWARD -j {CHAIN}")),
-        (
-            "iptables",
-            "INPUT",
-            format!("-A INPUT -d {DOCKER_DNS} -j REJECT"),
-        ),
-        ("ip6tables", "OUTPUT", format!("-A OUTPUT -j {CHAIN}")),
-        ("ip6tables", "FORWARD", format!("-A FORWARD -j {CHAIN}")),
+        (v4, "OUTPUT", format!("-A OUTPUT -j {CHAIN}")),
+        (v4, "FORWARD", format!("-A FORWARD -j {CHAIN}")),
+        (v4, "INPUT", format!("-A INPUT -d {DOCKER_DNS} -j REJECT")),
+        (v6, "OUTPUT", format!("-A OUTPUT -j {CHAIN}")),
+        (v6, "FORWARD", format!("-A FORWARD -j {CHAIN}")),
     ] {
-        let listed = Invocation::new("docker")
+        let listed = engine::current()?
+            .command()
             .args(["exec", node, tool, "-w", "-S", chain])
             .run()
             .await?;
@@ -102,10 +139,10 @@ fn first_rule_is(listing: &str, rule: &str) -> bool {
 
 /// Packets the chain's final `REJECT` has matched.
 async fn rejected(node: &str) -> Result<u64> {
-    let listed = Invocation::new("docker")
-        .args([
-            "exec", node, "iptables", "-w", "-L", CHAIN, "-v", "-n", "-x",
-        ])
+    let Backend { v4, .. } = backend(node).await?;
+    let listed = engine::current()?
+        .command()
+        .args(["exec", node, v4, "-w", "-L", CHAIN, "-v", "-n", "-x"])
         .run()
         .await?;
     reject_counter(&listed).ok_or_else(|| {
@@ -126,7 +163,8 @@ fn reject_counter(listing: &str) -> Option<u64> {
 
 /// Run `script` with bash in the node and report whether it exited zero.
 async fn succeeds(node: &str, script: &str) -> Result<(bool, String)> {
-    let output = Invocation::new("docker")
+    let output = engine::current()?
+        .command()
         .args(["exec", node, "bash", "-c", script])
         .timeout(Duration::from_secs(90))
         .output()
@@ -352,7 +390,7 @@ mod tests {
 
     #[test]
     fn the_rules_allow_only_local_cluster_and_established_traffic() {
-        let script = rules_script();
+        let script = rules_script(DEFAULT_BACKEND);
         assert!(script.contains(&format!("-d {POD_SUBNET} -j RETURN")));
         assert!(script.contains(&format!("-d {SERVICE_SUBNET} -j RETURN")));
         assert!(script.contains("-I OUTPUT 1 -j APSIDES-OFFLINE"));
@@ -367,6 +405,20 @@ mod tests {
                 .filter(|line| line.ends_with(&format!("-A {CHAIN} -j REJECT")))
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn the_nft_backend_installs_the_same_rules() {
+        let nft = rules_script(NFT_BACKEND);
+        assert!(
+            nft.lines()
+                .all(|line| !line.starts_with("iptables ") && !line.starts_with("ip6tables "))
+        );
+        assert_eq!(
+            nft.replace("iptables-nft ", "iptables ")
+                .replace("ip6tables-nft ", "ip6tables "),
+            rules_script(DEFAULT_BACKEND)
         );
     }
 

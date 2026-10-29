@@ -59,7 +59,7 @@ const DISPATCH: Duration = Duration::from_secs(180);
 /// After each of (1)-(3), the chained handler's `handler-summary` output
 /// reflects exactly the `handler-derived` data that step settled on.
 #[tokio::test]
-#[ignore = "creates a kind cluster; needs Docker, kind and `cuenv task acceptancePrepare`"]
+#[ignore = "creates a kind cluster; needs kind on podman or Docker and `cuenv task acceptancePrepare`"]
 async fn a_handler_commits_exactly_its_owned_keys_and_seeds_across_a_restart() -> Result {
     scenario::run("handler-output", async |scenario| {
         let candidate = Candidate::read(&scenario.inputs.handler_output_release)?;

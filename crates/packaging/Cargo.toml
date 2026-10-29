@@ -1,0 +1,37 @@
+[package]
+name = "packaging"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+compiler-core = { path = "../compiler-core" }
+container = { path = "../container" }
+release = { path = "../release" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+# Reads engine saves and checks our own layouts; never writes. Every byte
+# aps writes into a tar comes from src/ustar.rs.
+tar = "0.4"
+# MultiGzDecoder for compressed saved layers.
+flate2 = "1"
+regex = "1"
+tempfile = "3"
+thiserror = "2"
+# 3.3.0 is the newest ureq whose requirements are met by versions already in
+# Cargo.lock (rustls 0.23.43 with ring, webpki-roots 1.0.9, base64 0.22.1).
+# Newer 3.x releases bump rustls, webpki-roots and base64 workspace-wide, which
+# also changes the generated controller's Cargo.lock (derived from this lock)
+# and so the controller binary. "rustls" is rustls with ring and the webpki
+# roots; gzip stays off because the archive digest covers the raw body.
+ureq = { version = "=3.3.0", default-features = false, features = ["rustls"] }
+
+[build-dependencies]
+# build.rs embeds the packaging source digests (src/sources.rs).
+sha2 = "0.10"
+
+[lints]
+workspace = true

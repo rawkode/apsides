@@ -63,7 +63,7 @@ try {
   assert.equal(inputs.evaluation.sandbox.moduleLoader, false);
   assert.equal(inputs.evaluation.sandbox.lockdown.localeTaming, "safe");
   assert.equal(inputs.evaluation.sandbox.lockdown.errorTaming, "safe");
-  assert.equal(inputs.compilerClosure.schemaVersion, "apsides.dev/compiler-closure/v3");
+  assert.equal(inputs.compilerClosure.schemaVersion, "apsides.dev/compiler-closure/v4");
   assert.deepEqual(inputs.compilerClosure.authoringCompiler.sdk, inputs.sdk);
   assert.deepEqual(inputs.compilerClosure.authoringCompiler.toolchain, inputs.toolchain);
   assert.equal(inputs.compilerClosure.nativeCompiler, null, "native packaging must finalize the compiler closure");

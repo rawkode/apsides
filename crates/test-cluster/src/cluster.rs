@@ -6,8 +6,10 @@
 //! configuration.
 
 use crate::{
-    NODE_IMAGE, Result, infrastructure,
-    process::{Invocation, tail},
+    NODE_IMAGE, Result,
+    engine::{self, EngineCommands as _},
+    infrastructure,
+    process::tail,
 };
 use kube::{
     Client, Config,
@@ -48,7 +50,8 @@ pub enum Disposition {
 /// The local tools the run depends on, recorded in the report.
 pub struct Toolchain {
     pub kind_version: String,
-    pub docker_server_version: String,
+    pub container_engine: &'static str,
+    pub container_engine_version: String,
     pub node_image_id: String,
 }
 
@@ -94,41 +97,48 @@ fn check_landlock_listed(lsm: &str) -> Result<()> {
     }
 }
 
-/// Check the Docker daemon, kind and the pinned node image before anything is
-/// created, so each missing prerequisite is reported as itself.
+/// Check the container engine, kind and the pinned node image before anything
+/// is created, so each missing prerequisite is reported as itself.
 ///
 /// # Errors
 /// Names the first prerequisite that is missing.
 pub async fn preflight() -> Result<Toolchain> {
     ensure_landlock_available()?;
-    let docker = Invocation::new("docker")
-        .args(["version", "--format", "{{.Server.Version}}"])
+    let engine = engine::current()?;
+    let version = engine
+        .command()
+        .args(["version", "--format", engine.version_format()])
         .timeout(Duration::from_secs(30))
         .output()
         .await?;
-    if !docker.success || docker.stdout.trim().is_empty() {
+    if !version.success || version.stdout.trim().is_empty() {
         return infrastructure(format!(
-            "the Docker daemon is not reachable; start Docker and retry: {}",
-            tail(&docker.stderr, 500)
+            "{} is not reachable; start it and retry: {}",
+            engine.name(),
+            tail(&version.stderr, 500)
         ));
     }
-    let kind = Invocation::new("kind")
+    let kind = engine
+        .kind()
         .arg("version")
         .timeout(Duration::from_secs(30))
         .run()
         .await?;
-    let image = Invocation::new("docker")
+    let image = engine
+        .command()
         .args(["image", "inspect", "--format", "{{.Id}}", NODE_IMAGE])
         .output()
         .await?;
     if !image.success || image.stdout.trim().is_empty() {
         return infrastructure(format!(
-            "the kind node image {NODE_IMAGE} is not in the local Docker image store; pull it before running the suite"
+            "the kind node image {NODE_IMAGE} is not in the local {} image store; pull it before running the suite",
+            engine.name()
         ));
     }
     Ok(Toolchain {
         kind_version: kind.trim().to_owned(),
-        docker_server_version: docker.stdout.trim().to_owned(),
+        container_engine: engine.program(),
+        container_engine_version: version.stdout.trim().to_owned(),
         node_image_id: image.stdout.trim().to_owned(),
     })
 }
@@ -177,7 +187,8 @@ impl Cluster {
     /// # Errors
     /// Fails when the name is taken or kind cannot create the cluster.
     pub async fn create(&self) -> Result<()> {
-        let existing = Invocation::new("kind")
+        let existing = engine::current()?
+            .kind()
             .args(["get", "clusters"])
             .run()
             .await?;
@@ -186,7 +197,8 @@ impl Cluster {
         }
         let config = self.directory.path().join("kind.yaml");
         std::fs::write(&config, kind_config())?;
-        let created = Invocation::new("kind")
+        let created = engine::current()?
+            .kind()
             .args([
                 "create", "cluster", "--name", &self.name, "--image", NODE_IMAGE,
             ])
@@ -229,7 +241,8 @@ impl Cluster {
     /// # Errors
     /// Fails when kind cannot list the cluster's nodes or lists none.
     pub async fn nodes(&self) -> Result<Vec<String>> {
-        let listed = Invocation::new("kind")
+        let listed = engine::current()?
+            .kind()
             .args(["get", "nodes", "--name", &self.name])
             .run()
             .await?;
@@ -320,7 +333,11 @@ impl Cluster {
         if self.keep {
             return Disposition::Kept;
         }
-        let deleted = Invocation::new("kind")
+        let Ok(engine) = engine::current() else {
+            return Disposition::DeleteFailed;
+        };
+        let deleted = engine
+            .kind()
             .args(["delete", "cluster", "--name", &self.name])
             .arg("--kubeconfig")
             .arg(self.admin_kubeconfig())

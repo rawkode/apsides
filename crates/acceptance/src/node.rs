@@ -5,14 +5,18 @@
 //! programs pin by digest (the Envoy proxy and its admin helper, the
 //! `CloudNativePG` operator, `PostgreSQL` and `PostgREST`) are pulled into the
 //! node's containerd by that digest before anything uses them. A host-side
-//! `docker image save` cannot stand in for them: a classic (overlay2) Docker
-//! image store rewrites the manifest on save, so the node would hold the
-//! image under a different digest than the pin.
+//! image save cannot stand in for them: a classic (overlay2) Docker image
+//! store and podman both save a single-platform manifest rather than the
+//! pinned index, so the node would hold the image under a different digest
+//! than the pin.
 
 use crate::{Result, digest, ensure, infrastructure, objects::Objects};
 use serde_json::Value;
 use std::time::Duration;
-use test_cluster::{images, process::Invocation};
+use test_cluster::{
+    engine::{self, EngineCommands as _},
+    images,
+};
 
 /// The node's `os/architecture`, as release manifests record platforms.
 ///
@@ -44,7 +48,8 @@ pub async fn pull(node: &str, reference: &str, platform: &str) -> Result {
         format!("{reference} is not pinned by a SHA-256 digest"),
     )?;
     let canonical = format!("{}@{pinned}", images::repository(reference)?);
-    Invocation::new("docker")
+    engine::current()?
+        .command()
         .args(["exec", node, "ctr", "-n", "k8s.io", "images", "pull"])
         .args(["--platform", platform, &canonical])
         .timeout(Duration::from_secs(600))
@@ -56,7 +61,8 @@ pub async fn pull(node: &str, reference: &str, platform: &str) -> Result {
         &format!("the node to resolve {reference} after pulling it"),
         CRI_SYNC,
         async || {
-            let inspected = Invocation::new("docker")
+            let inspected = engine::current()?
+                .command()
                 .args(["exec", node, "crictl", "inspecti", "-o", "json", reference])
                 .output()
                 .await?;
@@ -113,7 +119,8 @@ pub async fn import_release(
 /// # Errors
 /// Fails when the node lacks the content or it does not match its digest.
 pub async fn index_children(node: &str, index: &str) -> Result<Vec<String>> {
-    let raw = Invocation::new("docker")
+    let raw = engine::current()?
+        .command()
         .args(["exec", node, "ctr", "-n", "k8s.io", "content", "get", index])
         .run()
         .await?;

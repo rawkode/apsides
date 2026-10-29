@@ -12,6 +12,9 @@ concurrency:
 # Hosted runners have about 14 GB free. Debug info and incremental caches
 # for every crate and feature set filled it before the docs build.
 env:
+  # Hosted runners have podman as well; the jobs pull images with docker, so
+  # kind and the test runners must use Docker's store.
+  APSIDES_CONTAINER_ENGINE: docker
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
@@ -59,6 +62,8 @@ jobs:
           cuenv task coordinationTest
           cuenv task inventoryTest
           cuenv task compilerCoreTest
+          cuenv task containerTest
+          cuenv task packagingTest
           cuenv task testClusterTest
       - name: Run Rust lints
         run: |
@@ -68,10 +73,10 @@ jobs:
           cuenv task coordinationCheck
           cuenv task inventoryCheck
           cuenv task compilerCoreCheck
+          cuenv task containerCheck
+          cuenv task packagingCheck
           cuenv task testClusterCheck
           cuenv task acceptanceCheck
-      - name: Run packaging script tests
-        run: cuenv task packagingTest
       - name: Build documentation
         run: cuenv task docsBuild
   reactor:
@@ -95,8 +100,8 @@ jobs:
             /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go \
             /opt/hostedtoolcache/Ruby /usr/local/.ghcup /opt/az
           df -h /
-      # scripts/rusty_v8.py never caches under the checkout (that would be
-      # gitignored `work/`, but also wrong in principle: an installed CLI
+      # aps build never caches the rusty_v8 archive under its assets
+      # (crates/packaging/src/rusty_v8.rs rejects that: an installed CLI
       # distribution's equivalent path is the asset tree
       # crates/cli/src/assets.rs hash-verifies in full); this names the same
       # directory the cache step below persists. `runner.temp` is not
@@ -130,11 +135,11 @@ jobs:
             --output "$RUNNER_TEMP/kind"
           echo 'eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa  '"$RUNNER_TEMP/kind" | sha256sum --check
           chmod +x "$RUNNER_TEMP/kind"
-      # `aps build` fetches the pinned rusty_v8 archive itself (scripts/
-      # rusty_v8.py, before the --network=none Cargo build); caching it
-      # avoids a ~40 MB re-download every run. Keyed on pins.json, so a pin
-      # bump fetches fresh instead of serving a stale entry. Path matches
-      # this job's APSIDES_RUSTY_V8_CACHE above.
+      # `aps build` fetches the pinned rusty_v8 archive itself
+      # (crates/packaging/src/rusty_v8.rs, before the --network=none Cargo
+      # build); caching it avoids a ~40 MB re-download every run. Keyed on
+      # pins.json, so a pin bump fetches fresh instead of serving a stale
+      # entry. Path matches this job's APSIDES_RUSTY_V8_CACHE above.
       - name: Cache the pinned rusty_v8 archive
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -186,8 +191,8 @@ jobs:
             /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go \
             /opt/hostedtoolcache/Ruby /usr/local/.ghcup /opt/az
           df -h /
-      # scripts/rusty_v8.py never caches under the checkout (that would be
-      # gitignored `work/`, but also wrong in principle: an installed CLI
+      # aps build never caches the rusty_v8 archive under its assets
+      # (crates/packaging/src/rusty_v8.rs rejects that: an installed CLI
       # distribution's equivalent path is the asset tree
       # crates/cli/src/assets.rs hash-verifies in full); this names the same
       # directory the cache step below persists. `runner.temp` is not
@@ -195,6 +200,12 @@ jobs:
       # is written to GITHUB_ENV here instead.
       - name: Set the pinned rusty_v8 archive cache directory
         run: echo "APSIDES_RUSTY_V8_CACHE=$RUNNER_TEMP/rusty-v8-cache" >> "$GITHUB_ENV"
+      # The five builds share one cargo target directory, so each reuses what
+      # the previous compiled; it lives under the runner's temporary
+      # directory rather than HOME, and is not persisted between runs
+      # because the runner's disk is tight.
+      - name: Set the shared build cache directory
+        run: echo "APSIDES_BUILD_CACHE=$RUNNER_TEMP/apsides-build" >> "$GITHUB_ENV"
       - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
         with:
           deno-version: v2.9.5
@@ -213,11 +224,11 @@ jobs:
           rustup show active-toolchain
       - name: Install cargo-cyclonedx
         run: cargo install --locked --version 0.5.9 cargo-cyclonedx
-      # `aps build` fetches the pinned rusty_v8 archive itself (scripts/
-      # rusty_v8.py, before the --network=none Cargo build); caching it
-      # avoids a ~40 MB re-download every run. Keyed on pins.json, so a pin
-      # bump fetches fresh instead of serving a stale entry. Path matches
-      # this job's APSIDES_RUSTY_V8_CACHE above.
+      # `aps build` fetches the pinned rusty_v8 archive itself
+      # (crates/packaging/src/rusty_v8.rs, before the --network=none Cargo
+      # build); caching it avoids a ~40 MB re-download every run. Keyed on
+      # pins.json, so a pin bump fetches fresh instead of serving a stale
+      # entry. Path matches this job's APSIDES_RUSTY_V8_CACHE above.
       - name: Cache the pinned rusty_v8 archive
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

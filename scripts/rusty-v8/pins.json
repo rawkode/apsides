@@ -1,5 +1,5 @@
 {
-  "_comment": "Offline-build inputs for the pinned `v8` crate (crates.io package `v8`, the denoland/rusty_v8 bindings; `deno_core` 0.412.0 depends on it indirectly through the `deno_v8` facade crate, which re-exports crate `v8` under the `v8` feature). See crates/engine/Cargo.toml for the deno_core pin and its justification. Wired into the --network=none build by scripts/rusty_v8.py and scripts/package_oci.py's prepare(); see scripts/rusty-v8/README.md and docs/reference/OCI-PACKAGING.md.",
+  "_comment": "Offline-build inputs for the pinned `v8` crate (crates.io package `v8`, the denoland/rusty_v8 bindings; `deno_core` 0.412.0 depends on it indirectly through the `deno_v8` facade crate, which re-exports crate `v8` under the `v8` feature). See crates/engine/Cargo.toml for the deno_core pin and its justification. Wired into the --network=none build by crates/packaging/src/rusty_v8.rs (fetch and verification) and crates/packaging/src/compile.rs (RUSTY_V8_ARCHIVE); see scripts/rusty-v8/README.md and docs/reference/OCI-PACKAGING.md.",
   "denoCoreVersion": "0.412.0",
   "v8CrateVersion": "150.4.0",
   "v8CrateRepository": "https://github.com/denoland/rusty_v8",
@@ -8,7 +8,7 @@
     "RUSTY_V8_SRC_BINDING_PATH": "Not required for these two targets. See bindingFile below."
   },
   "prebuiltVariant": {
-    "_comment": "Which static-lib archive name build.rs asks for is derived from crate features + profile + target, not chosen independently: static_lib_url() in v8-150.4.0/build.rs builds `librusty_v8{features}_{profile}_{target}.a.gz` where `features` is `_simdutf` iff cargo feature `simdutf` is enabled. deno_core 0.412.0's default feature set enables `v8` (-> `deno_v8`'s `v8` feature -> crate `v8` with `simdutf`) and does not enable `v8_enable_pointer_compression` or `v8_enable_sandbox`, and this workspace never builds with `--release` disabled (profile is always the crate's own release/debug choice, which for `cargo build`/`cargo test` without --release is debug; these pins are for a --release build, matching scripts/build.py's production build profile).",
+    "_comment": "Which static-lib archive name build.rs asks for is derived from crate features + profile + target, not chosen independently: static_lib_url() in v8-150.4.0/build.rs builds `librusty_v8{features}_{profile}_{target}.a.gz` where `features` is `_simdutf` iff cargo feature `simdutf` is enabled. deno_core 0.412.0's default feature set enables `v8` (-> `deno_v8`'s `v8` feature -> crate `v8` with `simdutf`) and does not enable `v8_enable_pointer_compression` or `v8_enable_sandbox`, and this workspace never builds with `--release` disabled (profile is always the crate's own release/debug choice, which for `cargo build`/`cargo test` without --release is debug; these pins are for a --release build, matching the `cargo build --frozen --release` that crates/packaging/src/compile.rs runs).",
     "features": ["simdutf"],
     "profile": "release"
   },

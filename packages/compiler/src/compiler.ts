@@ -14,7 +14,7 @@ const OXC_VERSION = "0.58.0";
 const ROLLDOWN_VERSION = "1.0.0-beta.35";
 const SES_VERSION = "2.3.0";
 export const SOURCE_LOCK_SCHEMA = "apsides.dev/source-lock/v1";
-export const COMPILER_CLOSURE_SCHEMA = "apsides.dev/compiler-closure/v3";
+export const COMPILER_CLOSURE_SCHEMA = "apsides.dev/compiler-closure/v4";
 const MAX_MODULES = 128;
 const MAX_MODULE_BYTES = 1024 * 1024;
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
@@ -60,7 +60,6 @@ export interface CompilerClosure {
     readonly packagingFiles: readonly { readonly path: string; readonly sha256: string }[];
     readonly buildProfileSha256: string;
     readonly hostTools: readonly { readonly role: string; readonly sha256: string; readonly version: string }[];
-    readonly trustedCliCodeSha256: string;
     readonly approvedRuntime: unknown;
     readonly rustyV8: unknown;
   };

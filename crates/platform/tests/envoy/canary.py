@@ -8,12 +8,25 @@ import http.client
 import http.server
 import json
 import os
+import shutil
 import socketserver
 import subprocess
 import threading
 import time
 from pathlib import Path
 
+def container_engine():
+    """podman when it is on PATH, Docker otherwise, unless APSIDES_CONTAINER_ENGINE names one.
+
+    Both map host.docker.internal to the host, which the Envoy upstream uses.
+    """
+    engine = os.environ.get("APSIDES_CONTAINER_ENGINE") or ("podman" if shutil.which("podman") else "docker")
+    if engine not in ("podman", "docker"):
+        raise SystemExit("APSIDES_CONTAINER_ENGINE must be podman or docker")
+    return engine
+
+
+ENGINE = container_engine()
 IMAGE = "envoyproxy/envoy@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4"
 STATS_PATH = "/stats?format=json&filter=%5E%28server%5C.live%7Chttp%5C.apsides%5C.downstream_rq_active%7Ccluster%5C.write_api%5C.upstream_rq_%28active%7Ctotal%29%29%24"
 REMOVE = [
@@ -214,7 +227,7 @@ CURL_IMAGE = "curlimages/curl@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af
 def admin(root, path, method="GET"):
     return subprocess.check_output(
         [
-            "docker",
+            ENGINE,
             "run",
             "--rm",
             "--network",
@@ -377,7 +390,7 @@ def main():
         )
     )
     (root / "envoy.json").write_text(json.dumps(config(upstream.server_port)))
-    docker = ["docker"]
+    docker = [ENGINE]
     name = "apsides-envoy-canary-" + str(os.getpid())
     started = False
     try:

@@ -1,7 +1,7 @@
 //! The full cluster suite against a prepared fixture release.
 //!
 //! `cuenv task reactorFixture` prepares the inputs; this test then needs
-//! Docker and kind, and names them through the environment:
+//! kind on podman or Docker, and names them through the environment:
 //!
 //! ```sh
 //! APSIDES_REACTOR_RELEASE=work/reactor/release \
@@ -20,7 +20,7 @@ fn required(name: &str) -> Result<PathBuf> {
 }
 
 #[tokio::test]
-#[ignore = "creates a kind cluster; needs Docker, kind and a fixture release from `cuenv task reactorFixture`"]
+#[ignore = "creates a kind cluster; needs kind on podman or Docker and a fixture release from `cuenv task reactorFixture`"]
 async fn every_generated_case_passes_on_a_disposable_cluster() -> Result {
     let output = tempfile::tempdir()?;
     let options = test_cluster::Options {

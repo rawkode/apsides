@@ -144,8 +144,11 @@ pub struct ArtifactIdentity {
 pub struct Runner {
     pub aps_version: String,
     pub kind_version: String,
-    pub docker_server_version: String,
-    /// The pinned node image reference, and the image ID Docker holds for it.
+    /// The container engine the kind nodes ran on (`podman` or `docker`) and
+    /// its version.
+    pub container_engine: String,
+    pub container_engine_version: String,
+    /// The pinned node image reference, and the image ID the engine holds for it.
     pub node_image: String,
     pub node_image_id: String,
     pub proxy_image: String,

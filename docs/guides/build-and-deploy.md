@@ -48,14 +48,27 @@ Kubernetes version. Compare two of them with `aps diff`; see
 
 Every output directory must be fresh. A build profile is not checked in: prepare
 one with the exact fields documented in [OCI packaging](/reference/oci-packaging/#complete-cli-build).
-The complete build also requires matching locally cached builder/runtime images,
-offline Cargo inputs, Docker BuildKit and the configured `cargo-cyclonedx` executable.
-The controller embeds V8 through `deno_core`; the build fetches the pinned
-`rusty_v8` static archive once, verifies its SHA-256, and records it in the
-build inputs and SBOM, because the BuildKit compile step has no network. See
+The complete build also requires podman or Docker with the pinned builder and
+runtime images in its local image store, offline Cargo inputs and the configured
+`cargo-cyclonedx` executable. It uses podman when `podman` is on `PATH` and
+Docker otherwise; set `APSIDES_CONTAINER_ENGINE` to `podman` or `docker` to
+choose. `aps` prepares the build context, assembles the image and writes the
+SBOM and compiler closure itself; only the cargo compile runs in a container,
+from the builder image with no network. The controller embeds V8 through
+`deno_core`; the build fetches the pinned `rusty_v8` static archive once,
+verifies its SHA-256, and records it in the build inputs and SBOM, because the
+compile has no network. See
 [OCI packaging](/reference/oci-packaging/#the-pinned-rusty_v8-archive). It emits
 `build-result.json`, `image/controller.oci.tar`,
-`linux-binary/apsides-controller`, `sbom/sbom.json` and `build-inputs.json`.
+`linux-binary/apsides-controller`, `sbom/sbom.json` and `build-inputs.json`,
+and keeps the build context beside the output as `<output>.native-context`.
+
+By default the compile reuses a cargo target directory cached under
+`$APSIDES_BUILD_CACHE`, else `$XDG_CACHE_HOME/apsides/build`, else
+`~/.cache/apsides/build`, so a rebuild recompiles only what changed.
+`--cache disabled` compiles in a fresh target directory that is removed
+afterwards; only such builds count as reproducibility evidence. The cache is
+not pruned automatically.
 
 ## Run the reactor tests on a cluster
 
@@ -65,8 +78,9 @@ assembled with `aps release` — and an OCI archive of the workload fixture imag
 built from `scripts/fixture-image`:
 
 ```sh
-docker build --pull=false --network=none --tag apsides-fixture:local scripts/fixture-image
-docker image save --output work/fixture-image.tar apsides-fixture:local
+# podman; with Docker, tag apsides-fixture:local and run `docker image save`.
+podman build --pull=never --network=none --tag docker.io/library/apsides-fixture:local scripts/fixture-image
+podman image save --format oci-archive --output work/fixture-image.tar docker.io/library/apsides-fixture:local
 
 target/debug/aps test --cluster \
   --release path/to/fixture-release \
@@ -84,6 +98,13 @@ controller runs in fixture mode with a token for its generated `ServiceAccount`
 that expires shortly after the run's own deadline. Programs that manage custom
 resources pass each CRD manifest with its own `--crd` flag.
 
+kind runs on podman when `podman` is on `PATH` and on Docker otherwise; set
+`APSIDES_CONTAINER_ENGINE` to `podman` or `docker` to choose. The node and
+proxy images must be in that engine's image store, and
+`scripts/reactor_fixture.sh` builds the workload fixture image with the same
+engine. Rootless podman works: the offline gate then uses the node's nft
+`iptables` backend, because the legacy one is unavailable there.
+
 Before creating the cluster the runner requires the host kernel to list
 `landlock` in `/sys/kernel/security/lsm`: kind nodes share the host kernel, and
 every generated controller locks itself down with Landlock at startup. The
@@ -97,7 +118,8 @@ After the images are imported, the runner blocks egress inside every kind node
 container with an `iptables` chain placed first in `OUTPUT` and `FORWARD`. It
 lets through loopback, the node's own addresses, established connections and
 the cluster's Pod (`10.244.0.0/16`) and Service (`10.96.0.0/16`) ranges, and
-rejects everything else. It also refuses Docker's embedded DNS resolver, so
+rejects everything else. It also refuses Docker's embedded DNS resolver, and
+podman's resolver on the network gateway falls to the final `REJECT`, so
 external names do not resolve. This applies to the node's containerd and
 kubelet and to every Pod. Deny-all `NetworkPolicy` then isolates the workload
 and control namespaces, and the controller may reach only the API server.
@@ -120,7 +142,7 @@ positive control that uses the same method and must succeed:
 | `node-external-tcp-after-cases` | node, after the last case | blocked |
 
 The gate fails if any probe is missing or does not match. It isolates the
-cluster from the network; it does not isolate the Docker host.
+cluster from the network; it does not isolate the container host.
 
 ### Results and exit status
 
@@ -145,7 +167,7 @@ for, and fails the run if it finds a leak.
 | Field | Contents |
 | --- | --- |
 | `status`, `clean`, `failure` | `passed`, `failed` or `interrupted`; `clean` only when it passed and the cluster was deleted; `failure` is `cases`, `infrastructure` or `interrupted` |
-| `runner` | `aps` version, kind version, Docker server version, the pinned node image and its local image ID, the proxy image and its config digest |
+| `runner` | `aps` version, kind version, the container engine and its version, the pinned node image and its local image ID, the proxy image and its config digest |
 | `artifact` | release, fixture IR, production IR and overlay digests, the controller image and its config, and the workload fixture image config |
 | `cluster` | name, disposition (`deleted`, `kept`, `delete-failed` or `not-created`), Pod and Service ranges, and the exported kubeconfig when kept |
 | `isolation` | whether the node rules are installed, every network probe, the controller credential check, image import and the token lifetime |
@@ -166,7 +188,7 @@ expectation. The controller itself is not mutated.
 | 0 | every check passed; with `--keep-cluster` the run is reported as not clean |
 | 1 | a reactor case, the canary scan or the mutation check failed |
 | 2 | the command line was invalid |
-| 3 | infrastructure: Docker, kind, images, isolation, credentials or cleanup failed, so the cases prove nothing |
+| 3 | infrastructure: the container engine, kind, images, isolation, credentials or cleanup failed, so the cases prove nothing |
 | 130 | interrupted by SIGINT or SIGTERM; the cluster is still deleted and the report written |
 
 The cluster is deleted at the end, including after an interruption, unless

@@ -1,14 +1,19 @@
 //! Image archives and their import into the node's containerd.
 //!
 //! Every image the suite runs arrives as a local archive in OCI layout (the
-//! form both the `BuildKit` OCI exporter and `docker image save` write). The
+//! form `aps build`, `docker image save` and
+//! `podman image save --format oci-archive` write). The
 //! runner reads the archive's single manifest and config, imports it with
 //! `ctr images import --digests`, and then asks the node's CRI which image
 //! that digest reference resolves to. Pods name images by that digest
 //! reference and `imagePullPolicy: Never`, so nothing is fetched from a
 //! registry during the run.
 
-use crate::{Error, Result, infrastructure, process::Invocation};
+use crate::{
+    Error, Result,
+    engine::{self, Engine, EngineCommands as _},
+    infrastructure,
+};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use std::{collections::BTreeMap, io::Read as _, path::Path, time::Duration};
@@ -19,6 +24,12 @@ const MAX_METADATA_BYTES: u64 = 4 * 1024 * 1024;
 const MANIFESTS: [&str; 2] = [
     "application/vnd.oci.image.manifest.v1+json",
     "application/vnd.docker.distribution.manifest.v2+json",
+];
+/// Where an archive's index names its image: Docker writes containerd's
+/// annotation, podman the OCI reference name.
+const NAME_ANNOTATIONS: [&str; 2] = [
+    "io.containerd.image.name",
+    "org.opencontainers.image.ref.name",
 ];
 const INDEXES: [&str; 2] = [
     "application/vnd.oci.image.index.v1+json",
@@ -35,7 +46,8 @@ pub struct ArchiveImage {
     /// Digest of the config of the manifest for the requested platform: the
     /// image ID the CRI reports.
     pub config: String,
-    /// Names the archive declares for the image.
+    /// Names the archive declares for the image: containerd's name annotation
+    /// (Docker) or the OCI reference name (podman).
     pub names: Vec<String>,
 }
 
@@ -63,10 +75,9 @@ pub fn inspect(path: &Path, platform: &str) -> Result<ArchiveImage> {
         return infrastructure(format!("{} must hold exactly one image", path.display()));
     };
     let target = digest_field(descriptor)?;
-    let names = descriptor["annotations"]["io.containerd.image.name"]
-        .as_str()
-        .map(str::to_owned)
-        .into_iter()
+    let names = NAME_ANNOTATIONS
+        .iter()
+        .filter_map(|key| descriptor["annotations"][key].as_str().map(str::to_owned))
         .collect();
     let mut selected = blob(path, &target)?;
     if INDEXES.iter().any(|kind| selected["mediaType"] == *kind) {
@@ -119,7 +130,8 @@ fn blob(path: &Path, digest: &str) -> Result<Value> {
 /// # Errors
 /// Fails when the archive cannot be read or containerd rejects it.
 pub async fn import(node: &str, archive: &Path, repository: &str, platform: &str) -> Result<()> {
-    Invocation::new("docker")
+    engine::current()?
+        .command()
         .args([
             "exec", "-i", node, "ctr", "-n", "k8s.io", "images", "import",
         ])
@@ -151,7 +163,8 @@ const CRI_SYNC: Duration = Duration::from_secs(60);
 pub async fn require_resolves(node: &str, reference: &str, config: &str) -> Result<()> {
     let deadline = tokio::time::Instant::now() + CRI_SYNC;
     loop {
-        let output = Invocation::new("docker")
+        let output = engine::current()?
+            .command()
             .args(["exec", node, "crictl", "inspecti", "-o", "json", reference])
             .output()
             .await?;
@@ -198,29 +211,44 @@ pub fn repository(reference: &str) -> Result<String> {
     })
 }
 
-/// A `docker image save` archive of a locally cached image, written into
+/// An OCI-layout archive of a locally cached image, written into
 /// `directory`. The image must already be present: nothing is pulled.
 ///
+/// Docker saves `reference` as its store holds it. podman saves the image by
+/// its ID: podman's archive holds only the single-platform manifest, and
+/// saved under a digest reference it would still carry the pinned index
+/// digest as its name, which then names other content in the node.
+///
 /// # Errors
-/// Fails when the image is not local or Docker cannot save it.
+/// Fails when the image is not local or the engine cannot save it.
 pub async fn save(reference: &str, directory: &Path, file: &str) -> Result<std::path::PathBuf> {
-    let present = Invocation::new("docker")
+    let engine = engine::current()?;
+    let present = engine
+        .command()
         .args(["image", "inspect", "--format", "{{.Id}}", reference])
         .output()
         .await?;
-    if !present.success {
+    let id = present.stdout.trim();
+    if !present.success || id.is_empty() {
         return infrastructure(format!(
-            "{reference} is not in the local Docker image store; pull it before running the suite"
+            "{reference} is not in the local {} image store; pull it before running the suite",
+            engine.name()
         ));
     }
     let path = directory.join(file);
-    Invocation::new("docker")
-        .args(["image", "save", "--output"])
-        .arg(&path)
-        .arg(reference)
-        .timeout(Duration::from_secs(300))
-        .run()
-        .await?;
+    let saved = match engine {
+        Engine::Docker => engine
+            .command()
+            .args(["image", "save", "--output"])
+            .arg(&path)
+            .arg(reference),
+        Engine::Podman => engine
+            .command()
+            .args(["image", "save", "--format", "oci-archive", "--output"])
+            .arg(&path)
+            .arg(id),
+    };
+    saved.timeout(Duration::from_secs(300)).run().await?;
     Ok(path)
 }
 
@@ -338,6 +366,17 @@ mod tests {
         let image = inspect(file.path(), "linux/arm64")?;
         assert_eq!(image.manifest, manifest);
         assert_eq!(image.config, config);
+        assert_eq!(image.names, ["docker.io/library/apsides-fixture:local"]);
+        Ok(())
+    }
+
+    #[test]
+    fn inspection_reads_the_name_podman_writes() -> Result<()> {
+        let (entries, _, _) = layout(
+            &json!({"org.opencontainers.image.ref.name": "docker.io/library/apsides-fixture:local"}),
+        )?;
+        let file = archive(&entries)?;
+        let image = inspect(file.path(), "linux/arm64")?;
         assert_eq!(image.names, ["docker.io/library/apsides-fixture:local"]);
         Ok(())
     }

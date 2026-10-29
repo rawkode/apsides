@@ -14,7 +14,7 @@
 //! that cluster, and the cluster is deleted unless the caller asked to keep
 //! it, including when the run is interrupted.
 //!
-//! [`cluster`], [`images`] and [`process`] are public so other suites that
+//! [`cluster`], [`engine`], [`images`] and [`process`] are public so other suites that
 //! need a disposable kind cluster share them rather than copying them.
 
 mod cases;
@@ -22,6 +22,7 @@ pub mod cluster;
 mod contract;
 mod crds;
 mod driver;
+pub mod engine;
 pub mod images;
 mod manifests;
 mod offline;
@@ -47,7 +48,7 @@ pub const NODE_IMAGE: &str =
     "kindest/node:v1.34.3@sha256:08497ee19eace7b4b5348db5c6a1591d7752b164530a36f855cb0f2bdcbadd48";
 
 /// The image behind the controller's loopback API proxy, the egress sentinel
-/// and the offline gate's probe Pods. It must already be in the local Docker image store.
+/// and the offline gate's probe Pods. It must already be in the container engine's local image store.
 pub const PROXY_IMAGE: &str = "nginxinc/nginx-unprivileged:alpine@sha256:d9083fe47768377ef55dedafd67d4da7c2f2bc2bece7554954f29359deb0dce9";
 
 /// The workload image every fixture IR substitutes for production images.
@@ -77,6 +78,8 @@ pub enum Error {
     Release(#[from] release::Error),
     #[error(transparent)]
     Core(#[from] compiler_core::Error),
+    #[error("container engine: {0}")]
+    Container(#[from] container::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

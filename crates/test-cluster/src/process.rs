@@ -1,4 +1,4 @@
-//! Bounded invocations of `kind`, `docker` and other tools with no API the
+//! Bounded invocations of `kind`, the container engine and other tools with no API the
 //! runner can call directly.
 //!
 //! Each child gets a cleared environment plus an allowlist, a deadline after
@@ -18,7 +18,8 @@ use std::{
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 /// Variables a child may inherit: enough to find the tools and reach the
-/// Docker daemon the caller already selected, nothing that selects a cluster.
+/// podman or Docker service the caller already selected, nothing that selects
+/// a cluster. kind's provider is set per call by [`crate::engine::EngineCommands::kind`].
 const INHERITED: &[&str] = &[
     "PATH",
     "HOME",
@@ -31,7 +32,10 @@ const INHERITED: &[&str] = &[
     "DOCKER_CONFIG",
     "DOCKER_CERT_PATH",
     "DOCKER_TLS_VERIFY",
-    "KIND_EXPERIMENTAL_PROVIDER",
+    "CONTAINER_HOST",
+    "CONTAINER_CONNECTION",
+    "CONTAINERS_CONF",
+    "CONTAINERS_STORAGE_CONF",
 ];
 
 /// Output beyond this is drained and dropped rather than kept in memory.

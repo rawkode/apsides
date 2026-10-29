@@ -15,6 +15,7 @@ distribution = []
 
 [dependencies]
 compiler-core = { path = "../compiler-core" }
+packaging = { path = "../packaging" }
 release = { path = "../release" }
 platform = { path = "../platform", features = ["deployer"] }
 deploy = { path = "../deploy" }

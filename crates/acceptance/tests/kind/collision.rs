@@ -39,7 +39,7 @@ const COLLISION: &str = "new target collides with a protected claim";
 /// `ConfigMap` and every metadata database row are as before, and no
 /// transition or writer of the contender exists.
 #[tokio::test]
-#[ignore = "creates a kind cluster; needs Docker, kind and `cuenv task acceptancePrepare`"]
+#[ignore = "creates a kind cluster; needs kind on podman or Docker and `cuenv task acceptancePrepare`"]
 async fn a_claimed_object_cannot_be_claimed_by_another_domain() -> Result {
     scenario::run("ownership-collision", async |scenario| {
         let owner = Candidate::read(&scenario.inputs.owner_release)?;
