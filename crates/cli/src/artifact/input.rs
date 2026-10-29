@@ -1,7 +1,8 @@
 use crate::{Result, cli};
-use release::{FetchedRelease, OrasTool, ReleaseReference};
+use release::{FetchedRelease, RegistryAccess, RegistryCredentials, ReleaseReference};
 use std::{
     env,
+    ffi::OsString,
     fs::File,
     io::Read as _,
     path::{Path, PathBuf},
@@ -39,8 +40,8 @@ impl ArtifactInput {
 ///
 /// # Errors
 /// Returns an error if both a local artifact and a reference are in play, if
-/// the reference is unbounded, malformed or not immutable, or if the configured
-/// `oras` tool is missing.
+/// the reference is unbounded, malformed or not immutable, if only one of the
+/// registry username and password is set, or if retrieval fails.
 pub async fn open(arguments: &cli::Deploy) -> Result<ArtifactInput> {
     let reference = arguments
         .artifact_reference
@@ -51,19 +52,42 @@ pub async fn open(arguments: &cli::Deploy) -> Result<ArtifactInput> {
         return Ok(ArtifactInput::Local(local));
     };
     let reference = read_reference(&reference)?;
-    let executable = env::var_os("APSIDES_ORAS")
-        .map(PathBuf::from)
-        .ok_or("OCI deployment requires APSIDES_ORAS with an absolute tool path")?;
-    let sha256 = env::var("APSIDES_ORAS_SHA256")
-        .map_err(|_| "OCI deployment requires APSIDES_ORAS_SHA256")?;
-    let tool = OrasTool {
-        executable,
-        sha256,
-        ca_file: env::var_os("APSIDES_REGISTRY_CA").map(PathBuf::from),
-    };
+    let access = registry_access(|name| env::var_os(name))?;
     Ok(ArtifactInput::Fetched(
-        release::fetch_release(&reference, &tool).await?,
+        release::fetch_release(&reference, &access).await?,
     ))
+}
+
+/// Registry settings from `APSIDES_REGISTRY_CA` and the
+/// `APSIDES_REGISTRY_USERNAME`/`APSIDES_REGISTRY_PASSWORD` pair. Without the
+/// pair the registry is accessed anonymously.
+fn registry_access(var: impl Fn(&str) -> Option<OsString>) -> Result<RegistryAccess> {
+    let text = |name: &str| {
+        var(name)
+            .map(|value| {
+                value
+                    .into_string()
+                    .map_err(|_| format!("{name} is not valid UTF-8"))
+            })
+            .transpose()
+    };
+    let credentials = match (
+        text("APSIDES_REGISTRY_USERNAME")?,
+        text("APSIDES_REGISTRY_PASSWORD")?,
+    ) {
+        (Some(username), Some(password)) => Some(RegistryCredentials { username, password }),
+        (None, None) => None,
+        _ => {
+            return Err(
+                "set both APSIDES_REGISTRY_USERNAME and APSIDES_REGISTRY_PASSWORD, or neither"
+                    .into(),
+            );
+        }
+    };
+    Ok(RegistryAccess {
+        ca_file: var("APSIDES_REGISTRY_CA").map(PathBuf::from),
+        credentials,
+    })
 }
 
 fn select_local(local: Option<PathBuf>, reference: Option<&Path>) -> Result<PathBuf> {
@@ -98,6 +122,30 @@ mod tests {
             PathBuf::from("build")
         );
         assert!(select_local(Some("build".into()), Some(Path::new("release-ref.json"))).is_err());
+        Ok(())
+    }
+    #[test]
+    fn registry_credentials_are_paired() -> Result<()> {
+        let from = |pairs: &'static [(&str, &str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        let anonymous = registry_access(from(&[("APSIDES_REGISTRY_CA", "/etc/ca.pem")]))?;
+        assert!(anonymous.credentials.is_none());
+        assert_eq!(anonymous.ca_file, Some(PathBuf::from("/etc/ca.pem")));
+        let paired = registry_access(from(&[
+            ("APSIDES_REGISTRY_USERNAME", "ci"),
+            ("APSIDES_REGISTRY_PASSWORD", "secret"),
+        ]))?;
+        assert!(paired.credentials.is_some_and(
+            |credentials| credentials.username == "ci" && credentials.password == "secret"
+        ));
+        assert!(registry_access(from(&[("APSIDES_REGISTRY_USERNAME", "ci")])).is_err());
+        assert!(registry_access(from(&[("APSIDES_REGISTRY_PASSWORD", "secret")])).is_err());
         Ok(())
     }
     #[test]

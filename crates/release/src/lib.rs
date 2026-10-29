@@ -1,7 +1,9 @@
 mod compiler;
 mod fetch;
 mod fixture;
-pub use fetch::{FetchedRelease, OrasTool, ReleaseReference, fetch_release};
+pub use fetch::{
+    FetchedRelease, RegistryAccess, RegistryCredentials, ReleaseReference, fetch_release,
+};
 pub use fixture::validate_fixture_projection;
 mod crypto;
 mod manifest;

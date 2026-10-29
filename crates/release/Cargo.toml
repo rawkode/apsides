@@ -11,7 +11,7 @@ compiler-core = { path = "../compiler-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tokio = { version = "1", features = ["process", "io-util", "time", "rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["io-util", "time", "rt-multi-thread", "macros"] }
 thiserror = "2"
 tempfile = "3"
 tar = "0.4"
@@ -22,8 +22,18 @@ oci-spec = { version = "0.10", default-features = false, features = ["image"] }
 ring = "0.17"
 sigstore-verify = { version = "=0.15.1", default-features = false }
 spki = "0.7"
+# The in-process OCI registry client, pinned as crates/packaging/Cargo.toml
+# explains: rustls with ring, without bumping rustls, webpki-roots or base64.
+ureq = { version = "=3.3.0", default-features = false, features = ["rustls"] }
+# The Mozilla roots as certificates, so a private registry CA can join them.
+webpki-root-certs = "1"
+# HTTP Basic credentials for a registry or its token realm.
+base64 = "0.22"
 
 [dev-dependencies]
+# An HTTPS registry fake for the fetch tests, on the workspace's ring backend.
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 test-sigstore = { path = "../test-sigstore" }
 
 [lints]

@@ -293,9 +293,12 @@ aps deploy --artifact path/to/verified-release
 aps deploy --artifact-reference path/to/immutable-reference.json
 ```
 
-An immutable reference resolves the new release through an approved ORAS tool
-and still performs complete trust-policy verification. It does not authorize
-tags or make OCI mandatory.
+An immutable reference resolves the new release with the built-in OCI registry
+client and still performs complete trust-policy verification. It does not
+authorize tags or make OCI mandatory. Registry credentials and an extra CA come
+only from `APSIDES_REGISTRY_USERNAME`, `APSIDES_REGISTRY_PASSWORD` and
+`APSIDES_REGISTRY_CA`; without credentials the registry is accessed
+anonymously.
 
 The trusted CI job must also provide:
 
