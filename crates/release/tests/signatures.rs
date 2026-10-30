@@ -1,8 +1,9 @@
 use compiler_core::{canonical_bytes, digest, parse_and_validate};
-use release::{SignaturePolicy, TrustPolicy, VerifierTool, verify_candidate};
+use release::{PROVENANCE_BUNDLE, TrustPolicy, verify_candidate};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fs, path::Path, process::Command};
+use std::{collections::BTreeMap, fs, path::Path};
+use test_sigstore::{Authority, Workload};
 
 #[path = "support/closure.rs"]
 mod closure;
@@ -70,14 +71,22 @@ fn approved_runtime() -> TestResult<Value> {
         "configJson":String::from_utf8(config)?
     }))
 }
-fn command(args: &[&str]) -> TestResult {
-    let output = Command::new("/usr/bin/ssh-keygen").args(args).output()?;
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(())
+const REPOSITORY: &str = "https://github.com/example/apsides";
+
+/// The GitHub Actions run that signs every test release.
+fn workload() -> Workload {
+    Workload::github(REPOSITORY, &"a".repeat(40))
+}
+
+/// The trust policy approving `workload`'s signatures under `authority`, as
+/// the platform would store it.
+fn policy_document(authority: &Authority, compiler: &str) -> TestResult<Value> {
+    Ok(json!({
+        "schemaVersion": "apsides.dev/trust/v2",
+        "repository": REPOSITORY,
+        "approvedCompilerDigests": [compiler],
+        "signature": workload().signature_policy(&authority.trusted_root()?),
+    }))
 }
 /// The compiled documents a release is assembled from, and their digests.
 struct Documents {
@@ -160,75 +169,97 @@ fn release_with_padding(root: &Path, padding_entries: usize) -> TestResult<Trust
         "controller.oci.tar".into(),
         hash(&fs::read(root.join("controller.oci.tar"))?),
     );
-    let manifest = json!({"schemaVersion":"apsides.dev/release/v2","mode":"production","irDigest":plan.ir_digest,"image":{"reference":format!("example.invalid/controller@{}",image_digest),"platform":"linux/arm64"},"source":{"repository":"https://github.com/example/apsides","commit":"a".repeat(40),"inputsDigest":digest(&inputs)?},"compilerDigest":compiler,"binaryDigest":hash(&binary),"files":files});
-    let bytes = write_json(root, "release.json", &manifest)?;
-    write_json(
-        root,
-        "provenance.json",
-        &json!({"_type":"https://in-toto.io/Statement/v1","predicateType":"https://slsa.dev/provenance/v1","subject":[{"name":"release.json","digest":{"sha256":hash(&bytes).trim_start_matches("sha256:")}}],"predicate":{"buildDefinition":{"externalParameters":{"repository":manifest["source"]["repository"],"commit":manifest["source"]["commit"],"compilerDigest":compiler}}}}),
-    )?;
-    let key = root.join("key");
-    command(&[
-        "-q",
-        "-t",
-        "ed25519",
-        "-N",
-        "",
-        "-f",
-        key.to_str().ok_or("path is not valid UTF-8")?,
-    ])?;
-    command(&[
-        "-Y",
-        "sign",
-        "-f",
-        key.to_str().ok_or("path is not valid UTF-8")?,
-        "-n",
-        "apsides.provenance.v1",
-        root.join("provenance.json")
-            .to_str()
-            .ok_or("path is not valid UTF-8")?,
-    ])?;
-    fs::rename(
-        root.join("provenance.json.sig"),
-        root.join("provenance.sig"),
-    )?;
-    Ok(TrustPolicy {
-        schema_version: "apsides.dev/trust/v1".into(),
-        repository: "https://github.com/example/apsides".into(),
-        approved_compiler_digests: vec![compiler],
-        verifier: VerifierTool {
-            executable: "/usr/bin/ssh-keygen".into(),
-            sha256: hash(&fs::read("/usr/bin/ssh-keygen")?),
-        },
-        signature: SignaturePolicy::OpenSsh {
-            principal: "release@example.invalid".into(),
-            allowed_signers: format!(
-                "release@example.invalid {}",
-                fs::read_to_string(root.join("key.pub"))?
-            ),
-        },
-    })
+    let manifest = json!({"schemaVersion":"apsides.dev/release/v2","mode":"production","irDigest":plan.ir_digest,"image":{"reference":format!("example.invalid/controller@{}",image_digest),"platform":"linux/arm64"},"source":{"repository":REPOSITORY,"commit":"a".repeat(40),"inputsDigest":digest(&inputs)?},"compilerDigest":compiler,"binaryDigest":hash(&binary),"files":files});
+    write_json(root, "release.json", &manifest)?;
+    let authority = Authority::shared()?;
+    authority.sign_release(&workload(), root)?;
+    Ok(serde_json::from_value(policy_document(
+        authority, &compiler,
+    )?)?)
 }
 
 #[tokio::test]
-async fn actual_openssh_signature_is_required_and_policy_bound() -> TestResult {
+async fn sigstore_signature_is_required_and_policy_bound() -> TestResult {
     let root = tempfile::tempdir()?;
     let policy = release(root.path())?;
     let verified = verify_candidate(root.path(), &policy).await?;
     assert_eq!(verified.manifest().source.repository, policy.repository);
+    assert_eq!(
+        verified.provenance_digest(),
+        hash(&fs::read(root.path().join(PROVENANCE_BUNDLE))?)
+    );
+    // Activation compares the staged digest with the stored document's.
+    let stored = policy_document(Authority::shared()?, &policy.approved_compiler_digests[0])?;
+    assert_eq!(verified.trust_policy_digest(), digest(&stored)?);
+
     let mut wrong = policy.clone();
-    if let SignaturePolicy::OpenSsh { principal, .. } = &mut wrong.signature {
-        *principal = "intruder@example.invalid".into();
-    }
+    wrong.signature.certificate_identity =
+        format!("{REPOSITORY}/.github/workflows/other.yml@refs/heads/main");
+    assert!(verify_candidate(root.path(), &wrong).await.is_err());
+    wrong = policy.clone();
+    wrong.signature.certificate_issuer = "https://accounts.example.invalid".into();
+    assert!(verify_candidate(root.path(), &wrong).await.is_err());
+    wrong = policy.clone();
+    wrong.signature.signer_digest = "b".repeat(40);
+    assert!(verify_candidate(root.path(), &wrong).await.is_err());
+    wrong = policy.clone();
+    wrong.signature.source_ref = "refs/heads/release".into();
     assert!(verify_candidate(root.path(), &wrong).await.is_err());
     wrong = policy.clone();
     wrong.approved_compiler_digests = vec![hash(b"different compiler")];
     assert!(verify_candidate(root.path(), &wrong).await.is_err());
+    // The authority issues no signed certificate timestamps.
     wrong = policy.clone();
-    wrong.verifier.sha256 = hash(b"different tool");
+    wrong.signature.certificate_transparency = true;
+    wrong.signature.trusted_root["ctlogs"] = wrong.signature.trusted_root["tlogs"].clone();
     assert!(verify_candidate(root.path(), &wrong).await.is_err());
-    fs::write(root.path().join("provenance.sig"), b"not a signature")?;
+    // A policy whose root lacks the authority a requirement needs.
+    wrong = policy.clone();
+    wrong.signature.certificate_transparency = true;
+    assert!(verify_candidate(root.path(), &wrong).await.is_err());
+    wrong = policy.clone();
+    wrong.signature.transparency_log = false;
+    assert!(verify_candidate(root.path(), &wrong).await.is_err());
+    // Another instance's root does not chain this signature.
+    wrong = policy.clone();
+    wrong.signature.trusted_root = Authority::new()?.trusted_root()?;
+    assert!(verify_candidate(root.path(), &wrong).await.is_err());
+
+    let bundle: Value = serde_json::from_slice(&fs::read(root.path().join(PROVENANCE_BUNDLE))?)?;
+    let mut unlogged = bundle.clone();
+    unlogged["verificationMaterial"]["tlogEntries"] = json!([]);
+    fs::write(
+        root.path().join(PROVENANCE_BUNDLE),
+        serde_json::to_vec(&unlogged)?,
+    )?;
     assert!(verify_candidate(root.path(), &policy).await.is_err());
+    fs::write(root.path().join(PROVENANCE_BUNDLE), b"not a bundle")?;
+    assert!(verify_candidate(root.path(), &policy).await.is_err());
+    fs::remove_file(root.path().join(PROVENANCE_BUNDLE))?;
+    assert!(verify_candidate(root.path(), &policy).await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_workload_claim_must_match() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let policy = release(root.path())?;
+    let authority = Authority::shared()?;
+    for change in [
+        |w: &mut Workload| w.runner_environment = "self-hosted".into(),
+        |w: &mut Workload| w.repository = "https://github.com/example/fork".into(),
+        |w: &mut Workload| w.commit = "b".repeat(40),
+        |w: &mut Workload| w.signer_digest = "b".repeat(40),
+        |w: &mut Workload| w.source_ref = "refs/heads/feature".into(),
+        |w: &mut Workload| w.issuer = "https://accounts.example.invalid".into(),
+    ] {
+        let mut signer = workload();
+        change(&mut signer);
+        authority.sign_release(&signer, root.path())?;
+        assert!(verify_candidate(root.path(), &policy).await.is_err());
+    }
+    authority.sign_release(&workload(), root.path())?;
+    verify_candidate(root.path(), &policy).await?;
     Ok(())
 }
 
@@ -302,29 +333,7 @@ async fn altered_payload_and_unsigned_manifest_cannot_be_promoted() -> TestResul
 }
 
 fn resign(root: &Path) -> TestResult {
-    let manifest: Value = serde_json::from_slice(&fs::read(root.join("release.json"))?)?;
-    let mut statement: Value = serde_json::from_slice(&fs::read(root.join("provenance.json"))?)?;
-    statement["subject"][0]["digest"]["sha256"] =
-        json!(hash(&fs::read(root.join("release.json"))?).trim_start_matches("sha256:"));
-    statement["predicate"]["buildDefinition"]["externalParameters"]["compilerDigest"] =
-        manifest["compilerDigest"].clone();
-    write_json(root, "provenance.json", &statement)?;
-    command(&[
-        "-Y",
-        "sign",
-        "-f",
-        root.join("key").to_str().ok_or("path is not valid UTF-8")?,
-        "-n",
-        "apsides.provenance.v1",
-        root.join("provenance.json")
-            .to_str()
-            .ok_or("path is not valid UTF-8")?,
-    ])?;
-    fs::rename(
-        root.join("provenance.json.sig"),
-        root.join("provenance.sig"),
-    )?;
-    Ok(())
+    Authority::shared()?.sign_release(&workload(), root)
 }
 
 #[tokio::test]
@@ -620,84 +629,5 @@ async fn production_requires_explicit_marker_even_with_valid_signature() -> Test
     write_json(root.path(), "release.json", &manifest)?;
     resign(root.path())?;
     assert_eq!(rejection(root.path(), &policy).await?, MARKER_REQUIRED);
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires real ORAS and a disposable TLS registry; verifier fixture only"]
-async fn signed_oci_release_resolves_after_source_workspace_is_removed()
--> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let oras = std::path::PathBuf::from(std::env::var("APSIDES_TEST_ORAS")?);
-    let ca = std::path::PathBuf::from(std::env::var("APSIDES_TEST_REGISTRY_CA")?);
-    let repository = std::env::var("APSIDES_TEST_OCI_REPOSITORY")?;
-    // Validate the destination syntax using an immutable dummy reference before
-    // publishing the test fixture to the explicitly configured disposable registry.
-    release::ReleaseReference {
-        oci: format!("{repository}@{}", hash(b"reference syntax")),
-        release_digest: hash(b"release syntax"),
-    }
-    .validate()?;
-    let source = tempfile::tempdir()?;
-    let policy = release(source.path())?;
-    let manifest_bytes = fs::read(source.path().join("release.json"))?;
-    let (manifest, _, _) = release::read_release(source.path())?;
-    let mut files: Vec<String> = manifest.files.keys().cloned().collect();
-    files.extend([
-        "release.json".into(),
-        "provenance.json".into(),
-        "provenance.sig".into(),
-    ]);
-    assert!(!files.iter().any(|name| name == "key" || name == "key.pub"));
-    let output = Command::new(&oras)
-        .current_dir(source.path())
-        .args([
-            "push",
-            "--plain-http=false",
-            "--no-tty",
-            "--format",
-            "json",
-            "--ca-file",
-        ])
-        .arg(&ca)
-        .arg(format!("{repository}:signed-verifier-fixture"))
-        .args(files)
-        .output()?;
-    if !output.status.success() {
-        return Err("isolated fixture publication failed".into());
-    }
-    let pushed: Value = serde_json::from_slice(&output.stdout)?;
-    let reference = release::ReleaseReference {
-        oci: pushed
-            .get("reference")
-            .and_then(Value::as_str)
-            .ok_or("ORAS did not return an immutable reference")?
-            .into(),
-        release_digest: hash(&manifest_bytes),
-    };
-    let original = source.path().to_owned();
-    source.close()?;
-    assert!(!original.exists());
-    let tool = release::OrasTool {
-        sha256: hash(&fs::read(&oras)?),
-        executable: oras,
-        ca_file: Some(ca),
-    };
-    let fetched = release::fetch_release(&reference, &tool).await?;
-    let verified = release::verify_candidate(fetched.path(), &policy).await?;
-    assert_eq!(verified.release_digest(), reference.release_digest);
-    assert!(!fetched.path().join("key").exists());
-    assert!(!fetched.path().join("key.pub").exists());
-    let mut wrong_policy = policy;
-    if let SignaturePolicy::OpenSsh { principal, .. } = &mut wrong_policy.signature {
-        *principal = "unapproved@example.invalid".into();
-    }
-    assert!(
-        release::verify_candidate(fetched.path(), &wrong_policy)
-            .await
-            .is_err()
-    );
-    let download = fetched.path().to_owned();
-    drop(fetched);
-    assert!(!download.exists());
     Ok(())
 }

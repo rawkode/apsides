@@ -1,4 +1,7 @@
 //! `aps release` — assemble an unsigned release from a verified artifact.
+//!
+//! CI then attests `release.json` with Sigstore and writes the bundle into
+//! the release as [`release::PROVENANCE_BUNDLE`].
 
 pub mod verify;
 
@@ -54,17 +57,9 @@ pub fn command(arguments: &cli::Release) -> Result<()> {
     fs::write(output.join("release.json"), &bytes)?;
     let release_digest = format!("sha256:{:x}", Sha256::digest(&bytes));
     release::read_release(output)?;
-    fs::write(
-        output.join("provenance.json"),
-        canonical_bytes(&json!({
-            "_type":"https://in-toto.io/Statement/v1","predicateType":"https://slsa.dev/provenance/v1",
-            "subject":[{"name":"release.json","digest":{"sha256":release_digest.trim_start_matches("sha256:")}}],
-            "predicate":{"buildDefinition":{"buildType":"https://apsides.dev/build/v1","externalParameters":{"repository":repository,"commit":commit,"compilerDigest":compiler},"internalParameters":{},"resolvedDependencies":[]},
-            "runDetails":{"builder":{"id":"https://apsides.dev/compiler/v1"}}}
-        }))?,
-    )?;
     report::emit(
-        &json!({"status":"assembled-unsigned","releaseDigest":release_digest,"mode":mode,"output":output}),
+        &json!({"status":"assembled-unsigned","releaseDigest":release_digest,"mode":mode,"output":output,
+            "provenance":{"subject":"release.json","bundle":release::PROVENANCE_BUNDLE}}),
     )
 }
 

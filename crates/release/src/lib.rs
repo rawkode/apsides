@@ -1,8 +1,11 @@
 mod compiler;
 mod fetch;
 mod fixture;
-pub use fetch::{FetchedRelease, OrasTool, ReleaseReference, fetch_release};
+pub use fetch::{
+    FetchedRelease, RegistryAccess, RegistryCredentials, ReleaseReference, fetch_release,
+};
 pub use fixture::validate_fixture_projection;
+mod crypto;
 mod manifest;
 mod oci;
 mod provenance;
@@ -17,7 +20,7 @@ pub use manifest::{
     validate_controller_binary,
 };
 pub use oci::{ControllerImage, controller_runtime_config, verify_controller_image};
-pub use provenance::{SignaturePolicy, TrustPolicy, VerifierTool, verify_candidate};
+pub use provenance::{PROVENANCE_BUNDLE, SignaturePolicy, TrustPolicy, verify_candidate};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

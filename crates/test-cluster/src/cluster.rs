@@ -17,6 +17,7 @@ use kube::{
 };
 use serde_json::{Value, json};
 use std::{
+    io::Write as _,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -36,6 +37,10 @@ pub const SERVICE_SUBNET: &str = "10.96.0.0/16";
 
 /// How long the synchronous fallback deletion may take before it is abandoned.
 const DROP_DELETE_SECONDS: u64 = 120;
+
+/// How many times `finish` runs `kind delete cluster`, and the pause between.
+const DELETE_ATTEMPTS: u32 = 3;
+const DELETE_RETRY_PAUSE: Duration = Duration::from_secs(5);
 
 /// What happened to the cluster at the end of the run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -328,6 +333,10 @@ impl Cluster {
 
     /// Delete the cluster unless the caller asked to keep it. Deleting a
     /// cluster kind never finished creating removes whatever it left.
+    ///
+    /// Rootless podman can give up on a node whose processes outlive its
+    /// SIGKILL wait (`given PID did not die within timeout`), leaving the
+    /// container `Stopping`; it exits moments later, so the delete is retried.
     pub async fn finish(mut self) -> Disposition {
         self.finished = true;
         if self.keep {
@@ -336,18 +345,30 @@ impl Cluster {
         let Ok(engine) = engine::current() else {
             return Disposition::DeleteFailed;
         };
-        let deleted = engine
-            .kind()
-            .args(["delete", "cluster", "--name", &self.name])
-            .arg("--kubeconfig")
-            .arg(self.admin_kubeconfig())
-            .timeout(Duration::from_secs(180))
-            .output()
-            .await;
-        match deleted {
-            Ok(output) if output.success => Disposition::Deleted,
-            _ => Disposition::DeleteFailed,
+        for attempt in 1..=DELETE_ATTEMPTS {
+            let failure = match engine
+                .kind()
+                .args(["delete", "cluster", "--name", &self.name])
+                .arg("--kubeconfig")
+                .arg(self.admin_kubeconfig())
+                .timeout(Duration::from_secs(180))
+                .output()
+                .await
+            {
+                Ok(output) if output.success => return Disposition::Deleted,
+                Ok(output) => tail(&output.stderr, 2000),
+                Err(error) => error.to_string(),
+            };
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "deleting cluster {} failed (attempt {attempt} of {DELETE_ATTEMPTS}): {failure}",
+                self.name
+            );
+            if attempt < DELETE_ATTEMPTS {
+                tokio::time::sleep(DELETE_RETRY_PAUSE).await;
+            }
         }
+        Disposition::DeleteFailed
     }
 }
 
@@ -359,7 +380,11 @@ impl Drop for Cluster {
         if self.finished || self.keep {
             return;
         }
+        let Ok(engine) = engine::current() else {
+            return;
+        };
         let Ok(mut child) = std::process::Command::new("kind")
+            .env("KIND_EXPERIMENTAL_PROVIDER", engine.program())
             .args(["delete", "cluster", "--name", &self.name])
             .arg("--kubeconfig")
             .arg(self.admin_kubeconfig())
