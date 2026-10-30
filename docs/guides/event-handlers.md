@@ -130,6 +130,13 @@ faster than the upstream can run.
   its parameter type may not name a trigger or input id the `<On>` does not
   declare. `HandlerEvent<"settings">` on a handler whose input is
   `feature-settings`, or an export the module does not have, fails the build.
+- `apsides.writeOutput`'s output id is narrowed to the outputs the `<On>`
+  declares, so an undeclared or computed id fails the build. The check covers
+  the handler's module and every module it imports, so a module reachable
+  from handlers with different outputs may write only the outputs they all
+  declare. Give such handlers a module each, keep shared constants out of
+  modules that write outputs, and have a shared helper take the id as a
+  parameter typed `HandlerOutputId` from `@apsides/kubernetes/handler`.
 
 Validation also rejects a handler that triggers on or reads its own output, and
 any cycle in which handlers feed each other through their outputs; the SDK
@@ -214,8 +221,8 @@ most 253 characters and not be `.` or `..`. `data` is a string or a
 `Uint8Array` of valid UTF-8 text; it becomes a `ConfigMap` `data` value. Writes
 are buffered and committed only after the handler returns successfully. Errors
 carry a `code` such as `UNDECLARED_OUTPUT_ID`, `INVALID_KEY` or
-`DATA_TOO_LARGE`. The compiler does not check `outputId` against the `<On>`'s
-`outputs`, so an undeclared id fails only at run time.
+`DATA_TOO_LARGE`. `aps compile` accepts only an `outputId` the handler's `<On>`
+declares in `outputs`.
 
 ### `apsides.log(level, message)`
 

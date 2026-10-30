@@ -180,7 +180,7 @@ export const compileApsides = async (sourceFile: string, output: string): Promis
       scope: "Canonical author payload from the digest-locked TypeScript closure evaluated in a pinned SES Compartment with only the hardened declared build input, hosted by the recorded denied-permission Deno runtime.",
       limitation: "This is a bounded source-build contract, not a proof that arbitrary JavaScript is deterministic across unrecorded toolchains or architectures.",
     },
-    typecheck: { engine: "deno", status: "passed", remote: false, npm: false, config: { jsx: "react-jsxdev", jsxImportSource: SDK_PACKAGE, importMap: "generated-local-sdk-only" }, handlers: { ...HANDLER_COMPILER_OPTIONS, declarations: SDK_HANDLER_IMPORT, unavailableGlobals: [...UNAVAILABLE_HANDLER_GLOBALS], eventContracts: true } },
+    typecheck: { engine: "deno", status: "passed", remote: false, npm: false, config: { jsx: "react-jsxdev", jsxImportSource: SDK_PACKAGE, importMap: "generated-local-sdk-only" }, handlers: { ...HANDLER_COMPILER_OPTIONS, declarations: SDK_HANDLER_IMPORT, unavailableGlobals: [...UNAVAILABLE_HANDLER_GLOBALS], eventContracts: true, outputIds: true } },
     bundleSha256: sha256(emittedProgram), evaluationBundleSha256: sha256(first.evaluationBundle), evaluationSourceSha256: sha256(evaluateSource), bundleMapSha256: sha256(canonicalString(bundleMap)),
     handlers: [...handlerBundles.files.entries()].map(([id, code]) => ({ id, path: `handlers/${id}.js`, sha256: sha256(code) })).sort((a,b) => order(a.id,b.id)),
   };
@@ -314,6 +314,12 @@ const typecheckSnapshot = async (author: Map<string, Snapshot>, sdk: Map<string,
  * `queueMicrotask`. Handler modules reach those declarations only through
  * `import type` from `@apsides/kubernetes/handler`, which Oxc erases before
  * {@link bundleHandlerModule} resolves anything.
+ *
+ * Handlers are checked in groups that declare the same outputs, each with
+ * `writeOutput` narrowed to that group's output ids. Every module a group's
+ * handler modules import is checked in that group, so a module reachable
+ * from handlers with different outputs may name only the outputs all of
+ * them declare; a shared helper takes the id as a `HandlerOutputId`.
  */
 const typecheckHandlers = async (author: Map<string, Snapshot>, sdk: Map<string, Snapshot>, ir: ProductionIr, deno: string): Promise<void> => {
   const modules = [...new Set(ir.handlers.map(handler => handler.module))].sort(order);
@@ -329,11 +335,40 @@ const typecheckHandlers = async (author: Map<string, Snapshot>, sdk: Map<string,
     await writeFile(declarations, sdk.get("handler.ts")!.text);
     const denoConfig = join(stage, "deno.json");
     await writeFile(denoConfig, JSON.stringify({ compilerOptions: HANDLER_COMPILER_OPTIONS, imports: { [SDK_HANDLER_IMPORT]: pathToFileURL(declarations).href } }));
-    const contracts = join(stage, "handler-contracts.ts");
-    await writeFile(contracts, handlerContracts(ir.handlers));
-    await run(deno, ["check", "--config", denoConfig, "--no-lock", "--no-npm", "--no-remote", "--deny-import", declarations, ...modules.map(module => join(sourceDir, module)), contracts], "", { ...executionEnvironment });
+    for (const [index, group] of handlerOutputGroups(ir.handlers).entries()) {
+      const contracts = join(stage, `handler-contracts-${index}.ts`);
+      await writeFile(contracts, handlerContracts(group));
+      const outputs = join(stage, `handler-outputs-${index}.ts`);
+      await writeFile(outputs, handlerOutputIds(group[0]!.outputs));
+      const groupModules = [...new Set(group.map(handler => handler.module))].sort(order);
+      try {
+        await run(deno, ["check", "--config", denoConfig, "--no-lock", "--no-npm", "--no-remote", "--deny-import", declarations, outputs, ...groupModules.map(module => join(sourceDir, module)), contracts], "", { ...executionEnvironment });
+      } catch (error) {
+        const allowed = group[0]!.outputs.length === 0 ? "no outputs" : [...group[0]!.outputs].sort(order).join(", ");
+        throw new Error(`handler type check failed for ${group.map(handler => handler.id).join(", ")} (apsides.writeOutput accepts ${allowed}): ${(error as Error).message}`);
+      }
+    }
   } finally { await rm(stage, {recursive:true, force:true}); }
   rejectUnavailableGlobals(author, modules);
+};
+
+/** Handlers grouped by their declared output ids, in IR order. */
+const handlerOutputGroups = (handlers: ProductionIr["handlers"]): ProductionIr["handlers"][] => {
+  const groups = new Map<string, ProductionIr["handlers"]>();
+  for (const handler of handlers) {
+    const key = JSON.stringify([...handler.outputs].sort(order));
+    groups.set(key, [...(groups.get(key) ?? []), handler]);
+  }
+  return [...groups.values()];
+};
+
+/**
+ * Declares the output ids `apsides.writeOutput` accepts in one handler
+ * check; `never` when the handlers declare no outputs.
+ */
+const handlerOutputIds = (outputs: readonly string[]): string => {
+  const ids = outputs.length === 0 ? "never" : [...outputs].sort(order).map(id => JSON.stringify(id)).join(" | ");
+  return `declare global {\n  interface ApsidesHandlerOutputs { readonly ids: ${ids} }\n}\nexport {};\n`;
 };
 
 /**

@@ -181,7 +181,7 @@ export async function syncFlags(event: HandlerEvent<"settings">) {
     const bundle = await readFile(join(typed.output, "handlers", `${ir.handlers[0].id}.js`), "utf8");
     assert.doesNotMatch(bundle, /@apsides\/kubernetes/, "the type-only SDK import is erased from the handler bundle");
     const inputs = JSON.parse(await readFile(join(typed.output, "build-inputs.json"), "utf8"));
-    assert.deepEqual(inputs.typecheck.handlers, { checkJs: true, declarations: "@apsides/kubernetes/handler", lib: ["esnext"], strict: true, unavailableGlobals: ["SharedArrayBuffer"], verbatimModuleSyntax: true, eventContracts: true });
+    assert.deepEqual(inputs.typecheck.handlers, { checkJs: true, declarations: "@apsides/kubernetes/handler", lib: ["esnext"], strict: true, unavailableGlobals: ["SharedArrayBuffer"], verbatimModuleSyntax: true, eventContracts: true, outputIds: true });
 
     const rejected: [string, string, string][] = [
       ["a type error", handlerModule.replace(`"environment", environment`, `"environment", 42`), "a wrong argument type fails the build"],
@@ -193,11 +193,102 @@ export async function syncFlags(event: HandlerEvent<"settings">) {
       ["an input the <On> does not declare", `import type { HandlerEvent } from "@apsides/kubernetes/handler";\nexport async function syncFlags(event: HandlerEvent<"other">) { return event.inputs.other.data; }\n`, "the event contract rejects an undeclared input id"],
       ["an extra input id", `import type { HandlerEvent } from "@apsides/kubernetes/handler";\nexport async function syncFlags(event: HandlerEvent<"settings" | "extra">) { return event.inputs.settings.data; }\n`, "the event contract rejects an input id the handler is not given"],
       ["a missing export", handlerModule.replace("export async function syncFlags", "export async function syncFlag"), "the event contract requires the declared export"],
+      ["an undeclared output id", handlerModule.replace(`writeOutput("flags"`, `writeOutput("other"`), "writeOutput accepts only the outputs the <On> declares"],
+      ["a computed output id", handlerModule.replace(`writeOutput("flags"`, `writeOutput(environment`), "writeOutput rejects an id that is not a declared output's literal"],
     ];
     for (const [label, source, message] of rejected) {
       const broken = await fixture({ "program.tsx": handlerProgram, "handlers/sync-flags.ts": source }, "program.tsx");
       await assert.rejects(compileApsides(broken.sourcePath, broken.output), /deno failed/, `${message} (${label})`);
     }
+
+    const undeclared = await fixture({ "program.tsx": handlerProgram, "handlers/sync-flags.ts": handlerModule.replace(`writeOutput("flags"`, `writeOutput("other"`) }, "program.tsx");
+    await assert.rejects(compileApsides(undeclared.sourcePath, undeclared.output), /apsides\.writeOutput accepts flags\)/, "the failure names the handler's declared outputs");
+
+    // JavaScript handlers get the same output-id check under checkJs: a
+    // declared literal compiles; an undeclared literal, or an id widened to
+    // string, fails.
+    const jsProgram = handlerProgram.replace("./handlers/sync-flags.ts#syncFlags", "./handlers/sync-flags.js#syncFlags");
+    const jsWriter = (statement: string) => `/** @param {import("@apsides/kubernetes/handler").HandlerEvent<"settings">} event */\nexport async function syncFlags(event) {\n  const environment = event.inputs.settings.data.environment ?? "production";\n  ${statement}\n}\n`;
+    const jsValid = await fixture({ "program.tsx": jsProgram, "handlers/sync-flags.js": jsWriter(`apsides.writeOutput("flags", "environment", environment);`) }, "program.tsx");
+    await compileApsides(jsValid.sourcePath, jsValid.output);
+    for (const [label, statement] of [
+      ["an undeclared literal", `apsides.writeOutput("other", "environment", environment);`],
+      ["an id widened to string", `let id = "flags";\n  apsides.writeOutput(id, "environment", environment);`],
+    ] as const) {
+      const jsBroken = await fixture({ "program.tsx": jsProgram, "handlers/sync-flags.js": jsWriter(statement) }, "program.tsx");
+      await assert.rejects(compileApsides(jsBroken.sourcePath, jsBroken.output), /apsides\.writeOutput accepts flags\)/, `a JavaScript handler's output id is checked (${label})`);
+    }
+
+    // A handler that declares no outputs cannot write one.
+    const outputless = handlerProgram.replace(`  const flags = useHandlerOutput({ id: "flags", name: "flags" });\n`, "").replace(" outputs={[flags]}", "").replace("useConfigMap, useHandlerOutput", "useConfigMap");
+    const noOutputs = await fixture({ "program.tsx": outputless, "handlers/sync-flags.ts": handlerModule }, "program.tsx");
+    await assert.rejects(compileApsides(noOutputs.sourcePath, noOutputs.output), /apsides\.writeOutput accepts no outputs/, "a handler without outputs cannot call writeOutput");
+    const readOnly = await fixture({ "program.tsx": outputless, "handlers/sync-flags.ts": handlerModule.replace(`  apsides.writeOutput("flags", "environment", environment);\n`, "") }, "program.tsx");
+    await compileApsides(readOnly.sourcePath, readOnly.output);
+
+    // Handlers with different outputs are checked separately: each module
+    // may write its own handler's outputs. A module exporting both handlers
+    // may write only the outputs they share.
+    const twoHandlers = (first: string, second: string) => `import { Controller, On, useConfigMap, useHandlerOutput } from "@apsides/kubernetes";
+const HandlerApp = () => {
+  const settings = useConfigMap({ id: "settings", name: "settings" });
+  const flags = useHandlerOutput({ id: "flags", name: "flags" });
+  const extra = useHandlerOutput({ id: "extra", name: "extra" });
+  return <>
+    <On id="sync-flags" trigger={settings.changed} handler="${first}" inputs={[settings]} outputs={[flags]} />
+    <On id="sync-extra" trigger={settings.changed} handler="${second}" inputs={[settings]} outputs={[extra]} />
+  </>;
+};
+export default (
+  <Controller id="handlers" namespace="workload" controlNamespace="apsides-system" clusterBinding="fixture" policyRef="platform/test" enforcement="api-bound" budgets={{maxResources:8,maxInputs:8,maxReactions:8,maxObjectBytes:32768,maxQueueDepth:8,maxConcurrentRequests:2}}>
+    <HandlerApp />
+  </Controller>
+);
+`;
+    const writer = (name: string, output: string) => `export async function ${name}(event: HandlerEvent<"settings">) { apsides.writeOutput(${JSON.stringify(output)}, "environment", event.inputs.settings.data.environment ?? "production"); }\n`;
+    const header = `import type { HandlerEvent } from "@apsides/kubernetes/handler";\n`;
+    const separate = await fixture({
+      "program.tsx": twoHandlers("./handlers/sync-flags.ts#syncFlags", "./handlers/sync-extra.ts#syncExtra"),
+      "handlers/sync-flags.ts": header + writer("syncFlags", "flags"),
+      "handlers/sync-extra.ts": header + writer("syncExtra", "extra"),
+    }, "program.tsx");
+    await compileApsides(separate.sourcePath, separate.output);
+    const swapped = await fixture({
+      "program.tsx": twoHandlers("./handlers/sync-flags.ts#syncFlags", "./handlers/sync-extra.ts#syncExtra"),
+      "handlers/sync-flags.ts": header + writer("syncFlags", "extra"),
+      "handlers/sync-extra.ts": header + writer("syncExtra", "extra"),
+    }, "program.tsx");
+    await assert.rejects(compileApsides(swapped.sourcePath, swapped.output), /handler type check failed for sync-flags \(apsides\.writeOutput accepts flags\)/, "a handler cannot write another handler's output");
+    const shared = await fixture({
+      "program.tsx": twoHandlers("./handlers/sync.ts#syncFlags", "./handlers/sync.ts#syncExtra"),
+      "handlers/sync.ts": header + writer("syncFlags", "flags") + writer("syncExtra", "extra"),
+    }, "program.tsx");
+    await assert.rejects(compileApsides(shared.sourcePath, shared.output), /deno failed/, "a module shared by handlers with different outputs writes only the outputs they share");
+    // Imported modules are checked with each importing handler's outputs:
+    // a module that writes one handler's output cannot be imported by
+    // another, but a helper taking a HandlerOutputId parameter can.
+    const crossImport = await fixture({
+      "program.tsx": twoHandlers("./handlers/sync-flags.ts#syncFlags", "./handlers/sync-extra.ts#syncExtra"),
+      "handlers/sync-flags.ts": `import { KEY } from "./sync-extra.ts";\n` + header + writer("syncFlags", "flags").replace(`"environment"`, "KEY"),
+      "handlers/sync-extra.ts": header + `export const KEY = "environment";\n` + writer("syncExtra", "extra"),
+    }, "program.tsx");
+    await assert.rejects(compileApsides(crossImport.sourcePath, crossImport.output), /handler type check failed for sync-flags \(apsides\.writeOutput accepts flags\)/, "an imported module is checked with the importing handler's outputs");
+    const helper = `import type { HandlerOutputId } from "@apsides/kubernetes/handler";\nexport function write(id: HandlerOutputId, value: string): void { apsides.writeOutput(id, "environment", value); }\n`;
+    const helperWriter = (name: string, output: string) => `import { write } from "./write.ts";\n${header}export async function ${name}(event: HandlerEvent<"settings">) { write(${JSON.stringify(output)}, event.inputs.settings.data.environment ?? "production"); }\n`;
+    const sharedHelper = await fixture({
+      "program.tsx": twoHandlers("./handlers/sync-flags.ts#syncFlags", "./handlers/sync-extra.ts#syncExtra"),
+      "handlers/sync-flags.ts": helperWriter("syncFlags", "flags"),
+      "handlers/sync-extra.ts": helperWriter("syncExtra", "extra"),
+      "handlers/write.ts": helper,
+    }, "program.tsx");
+    await compileApsides(sharedHelper.sourcePath, sharedHelper.output);
+    const helperMisuse = await fixture({
+      "program.tsx": twoHandlers("./handlers/sync-flags.ts#syncFlags", "./handlers/sync-extra.ts#syncExtra"),
+      "handlers/sync-flags.ts": helperWriter("syncFlags", "extra"),
+      "handlers/sync-extra.ts": helperWriter("syncExtra", "extra"),
+      "handlers/write.ts": helper,
+    }, "program.tsx");
+    await assert.rejects(compileApsides(helperMisuse.sourcePath, helperMisuse.output), /handler type check failed for sync-flags/, "a shared helper still rejects another handler's output id");
 
     // A locked module that only supplies types to a handler is reachable
     // through its erased import type, not an unreachable lock entry.
